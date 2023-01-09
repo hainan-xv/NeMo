@@ -26,6 +26,7 @@ from nemo.collections.asr.parts.utils import asr_module_utils
 from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
 from nemo.collections.common import tokenizers
 from nemo.utils import logging
+from nemo.collections.nlp.modules.common.tokenizer_utils import get_nmt_tokenizer
 
 
 class ASRBPEMixin(ABC):
@@ -83,7 +84,7 @@ class ASRBPEMixin(ABC):
                 with open_dict(self.cfg.tokenizer):
                     self.cfg.tokenizer.hf_kwargs = tokenizer_cfg.get('hf_kwargs')
 
-        if self.tokenizer_type not in ['bpe', 'wpe']:
+        if self.tokenizer_type not in ['bpe', 'wpe', 'yttm']:
             raise ValueError(
                 "`tokenizer.type` must be either `bpe` for SentencePiece tokenizer or "
                 "`wpe` for BERT based tokenizer"
@@ -140,7 +141,7 @@ class ASRBPEMixin(ABC):
             self.tokenizer.tokenizer.get_vocab = get_vocab
             self.tokenizer.tokenizer.all_special_tokens = self.tokenizer.special_token_to_id
 
-        else:
+        elif self.tokenizer_type == 'wpe':
             # This is a WPE Tokenizer
             # If path from previous registration exists, remove it
             if 'vocab_path' in self.tokenizer_cfg:
@@ -154,6 +155,12 @@ class ASRBPEMixin(ABC):
             if 'vocab_path' in self.tokenizer_cfg:
                 self.tokenizer_cfg.pop('vocab_path')
 
+            if 'special_tokens' in self.tokenizer_cfg:
+                special_tokens = self.tokenizer_cfg['special_tokens']
+
+                if special_tokens is not None:
+                    raise ValueError("`special_tokens` are no longer supported for SentencePiece based tokenizers.")
+
             self.tokenizer = tokenizers.AutoTokenizer(
                 pretrained_model_name='bert-base-cased',
                 vocab_file=self.vocab_path,
@@ -166,6 +173,34 @@ class ASRBPEMixin(ABC):
                 unk_token=self.hf_tokenizer_kwargs.get('unk_token', None),
                 use_fast=self.hf_tokenizer_kwargs.get('use_fast', False),
             )
+        elif self.tokenizer_type == 'yttm':
+            # This is a BPE Tokenizer
+            if 'model_path' in self.tokenizer_cfg:
+                model_path = self.tokenizer_cfg.get('model_path')
+            else:
+                model_path = os.path.join(self.tokenizer_dir, 'tokenizer.model')
+            model_path = self.register_artifact('tokenizer.model_path', model_path)
+            self.model_path = model_path
+
+            special_tokens = None
+            if 'special_tokens' in self.tokenizer_cfg:
+                special_tokens = self.tokenizer_cfg['special_tokens']
+
+                if special_tokens is not None:
+                    raise ValueError("`special_tokens` are no longer supported for SentencePiece based tokenizers.")
+
+            self.tokenizer = get_nmt_tokenizer(
+                library='yttm',
+                tokenizer_model=model_path,
+                bpe_dropout=0.0,
+                model_name=None,
+                vocab_file=None,
+                special_tokens=special_tokens,
+                use_fast=False,
+            )
+
+            def get_vocab():
+                return vocabulary
 
         logging.info(
             "Tokenizer {} initialized with {} tokens".format(
