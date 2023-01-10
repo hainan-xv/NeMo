@@ -794,6 +794,7 @@ class _TarredAudioToTextDataset(IterableDataset):
         self.bos_id = bos_id
         self.pad_id = pad_id
         self.return_sample_id = return_sample_id
+        self.world_size = world_size // 16
 
         audio_tar_filepaths = expand_audio_filepaths(
             audio_tar_filepaths=audio_tar_filepaths,
@@ -929,7 +930,7 @@ class _TarredAudioToTextDataset(IterableDataset):
         return self._dataset.__iter__()
 
     def __len__(self):
-        return len(self.manifest_processor.collection)
+        return int(len(self.manifest_processor.collection) // 2.1)
 
 
 class TarredAudioToCharDataset(_TarredAudioToTextDataset):
