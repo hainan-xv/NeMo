@@ -1245,6 +1245,8 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         transcript_lengths: Optional[torch.Tensor] = None,
         compute_wer: bool = False,
     ) -> Union[torch.Tensor, List[Optional[torch.Tensor]]]:
+
+
         # encoder = (B, D, T)
         # decoder = (B, D, U) if passed, else None
         encoder_outputs = encoder_outputs.transpose(1, 2)  # (B, T, D)
