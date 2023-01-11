@@ -360,7 +360,7 @@ class RNNTBPEWER(Metric):
         self.blank_id = self.decoding.blank_id
         self.tokenizer = self.decoding.tokenizer
 
-        self.add_state("scores", default=torch.tensor(0), dist_reduce_fx='sum', persistent=False)
+        self.add_state("scores", default=torch.tensor(0.0, dtype=torch.float32), dist_reduce_fx='sum', persistent=False)
         self.add_state("words", default=torch.tensor(0), dist_reduce_fx='sum', persistent=False)
 
     def update(
@@ -408,7 +408,7 @@ class RNNTBPEWER(Metric):
         del hypotheses
 
 #        self.scores += torch.tensor(scores, device=self.scores.device, dtype=self.scores.dtype)
-        self.scores += torch.tensor(words, device=self.words.device, dtype=self.words.dtype) * bleu
+        self.scores += torch.tensor(words, device=self.words.device, dtype=torch.float32) * bleu
         self.words += torch.tensor(words, device=self.words.device, dtype=self.words.dtype)
         # return torch.tensor([scores, words]).to(predictions.device)
 
