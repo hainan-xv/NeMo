@@ -304,6 +304,9 @@ class WERBPE(Metric):
             # Compute Levenstein's distance
             scores += editdistance.eval(h_list, r_list)
 
+
+#        self.bleu = corpus_bleu(hypotheses, [references]).score
+
         self.scores = torch.tensor(scores, device=self.scores.device, dtype=self.scores.dtype)
         self.words = torch.tensor(words, device=self.words.device, dtype=self.words.dtype)
         # return torch.tensor([scores, words]).to(predictions.device)
@@ -312,6 +315,7 @@ class WERBPE(Metric):
         scores = self.scores.detach().float()
         words = self.words.detach().float()
         return scores / words, scores, words
+#        return self.bleu, scores, words
 
 
 @dataclass

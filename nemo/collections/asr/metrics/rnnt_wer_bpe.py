@@ -19,6 +19,8 @@ import editdistance
 import torch
 from torchmetrics import Metric
 
+from sacrebleu import corpus_bleu
+
 from nemo.collections.asr.metrics.rnnt_wer import AbstractRNNTDecoding, RNNTDecodingConfig
 from nemo.collections.asr.metrics.wer import move_dimension_to_the_front
 from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis, NBestHypotheses
@@ -401,10 +403,12 @@ class RNNTBPEWER(Metric):
             words += len(r_list)
             # Compute Levenshtein's distance
             scores += editdistance.eval(h_list, r_list)
+        bleu = corpus_bleu(hypotheses, [references]).score
 
         del hypotheses
 
-        self.scores += torch.tensor(scores, device=self.scores.device, dtype=self.scores.dtype)
+#        self.scores += torch.tensor(scores, device=self.scores.device, dtype=self.scores.dtype)
+        self.scores += torch.tensor(words, device=self.words.device, dtype=self.words.dtype) * bleu
         self.words += torch.tensor(words, device=self.words.device, dtype=self.words.dtype)
         # return torch.tensor([scores, words]).to(predictions.device)
 
