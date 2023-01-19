@@ -35,6 +35,7 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 
 from nemo.collections.asr.losses.rnnt_pytorch import MultiblankRNNTLossPytorch, RNNTLossPytorch
+from nemo.collections.asr.losses.rnnt_pytorch import LADRNNTLossPytorch
 from nemo.core.classes import Loss, typecheck
 from nemo.core.neural_types import LabelsType, LengthsType, LogprobsType, LossType, NeuralType
 from nemo.core.utils.numba_utils import NUMBA_INSTALLATION_MESSAGE
@@ -49,6 +50,7 @@ except (ImportError, ModuleNotFoundError):
 
 try:
     from nemo.collections.asr.parts.numba.rnnt_loss import RNNTLossNumba, MultiblankRNNTLossNumba
+    from nemo.collections.asr.parts.numba.rnnt_loss import LADRNNTLossNumba
 
     NUMBA_RNNT_AVAILABLE = True
 except (ImportError, ModuleNotFoundError):
@@ -108,6 +110,20 @@ RNNT_LOSS_RESOLVER = {
         min_version='0.0',
         is_available=True,
         installation_msg="Pure Pytorch implementation of Multiblank RNN-T loss. Slow and for debugging purposes only.",
+    ),
+    "lad_rnnt": RNNTLossConfig(
+        loss_name="lad_rnnt",
+        lib_name="numba",
+        min_version='0.53.0',
+        is_available=NUMBA_RNNT_AVAILABLE,
+        installation_msg=NUMBA_INSTALLATION_MESSAGE,
+    ),
+    "lad_rnnt_pytorch": RNNTLossConfig(
+        loss_name="pytorch",
+        lib_name="torch",
+        min_version='0.0',
+        is_available=True,
+        installation_msg="Pure Pytorch implementation of LAD RNN-T loss. Slow and for debugging purposes only.",
     ),
 }
 
@@ -213,6 +229,30 @@ def resolve_rnnt_loss(loss_name: str, blank_idx: int, loss_kwargs: dict = None) 
             blank=blank_idx, big_blank_durations=big_blank_durations, reduction='none', sigma=sigma
         )
         _warn_unused_additional_kwargs(loss_name, loss_kwargs)
+
+    elif loss_name == 'lad_rnnt':
+        fastemit_lambda = loss_kwargs.pop('fastemit_lambda', 0.0)
+        clamp = loss_kwargs.pop('clamp', -1.0)
+        durations = loss_kwargs.pop('durations', None)
+        sigma = loss_kwargs.pop('sigma', 0.0)
+        omega = loss_kwargs.pop('omega', 0.0)
+        loss_func = LADRNNTLossNumba(
+            blank=blank_idx,
+            durations=durations,
+            reduction='none',
+            fastemit_lambda=fastemit_lambda,
+            clamp=clamp,
+            sigma=sigma,
+            omega=omega,
+        )
+        _warn_unused_additional_kwargs(loss_name, loss_kwargs)
+
+    elif loss_name == 'lad_rnnt_pytorch':
+        durations = loss_kwargs.pop('durations', None)
+        sigma = loss_kwargs.pop('sigma', 0.0)
+        loss_func = LADRNNTLossPytorch(blank=blank_idx, durations=durations, reduction='none', sigma=sigma)
+        _warn_unused_additional_kwargs(loss_name, loss_kwargs)
+
 
     else:
         raise ValueError(
