@@ -25,6 +25,7 @@ from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis, NBestHypothe
 from nemo.collections.common.tokenizers.aggregate_tokenizer import AggregateTokenizer
 from nemo.collections.common.tokenizers.tokenizer_spec import TokenizerSpec
 from nemo.utils import logging
+from sacrebleu import corpus_bleu
 
 __all__ = ['RNNTBPEDecoding', 'RNNTBPEWER']
 
@@ -195,11 +196,11 @@ class RNNTBPEDecoding(AbstractRNNTDecoding):
     """
 
     def __init__(self, decoding_cfg, decoder, joint, tokenizer: TokenizerSpec):
-        blank_id = tokenizer.tokenizer.vocab_size
+        blank_id = tokenizer.tokenizer.vocab_size()
         self.tokenizer = tokenizer
 
         super(RNNTBPEDecoding, self).__init__(
-            decoding_cfg=decoding_cfg, decoder=decoder, joint=joint, blank_id=blank_id + joint.num_extra_outputs
+            decoding_cfg=decoding_cfg, decoder=decoder, joint=joint, blank_id=blank_id # + joint.num_extra_outputs TODO
         )
 
     def _aggregate_token_confidence(self, hypothesis: Hypothesis) -> List[float]:
@@ -358,7 +359,7 @@ class RNNTBPEWER(Metric):
         self.blank_id = self.decoding.blank_id
         self.tokenizer = self.decoding.tokenizer
 
-        self.add_state("scores", default=torch.tensor(0), dist_reduce_fx='sum', persistent=False)
+        self.add_state("scores", default=torch.tensor(0.0, dtype=torch.float32), dist_reduce_fx='sum', persistent=False)
         self.add_state("words", default=torch.tensor(0), dist_reduce_fx='sum', persistent=False)
 
     def update(
@@ -401,10 +402,12 @@ class RNNTBPEWER(Metric):
             words += len(r_list)
             # Compute Levenshtein's distance
             scores += editdistance.eval(h_list, r_list)
+        bleu = corpus_bleu(hypotheses, [references]).score
 
         del hypotheses
 
-        self.scores += torch.tensor(scores, device=self.scores.device, dtype=self.scores.dtype)
+#        self.scores += torch.tensor(scores, device=self.scores.device, dtype=self.scores.dtype)
+        self.scores += torch.tensor(words, device=self.words.device, dtype=torch.float32) * bleu
         self.words += torch.tensor(words, device=self.words.device, dtype=self.words.dtype)
         # return torch.tensor([scores, words]).to(predictions.device)
 

@@ -751,7 +751,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, Exportable):
                 self.wer.update(encoded, encoded_len, transcript, transcript_len)
                 _, scores, words = self.wer.compute()
                 self.wer.reset()
-                tensorboard_logs.update({'training_batch_wer': scores.float() / words})
+                tensorboard_logs.update({'training_batch_bleu': scores.float() / words})
 
         else:
             # If experimental fused Joint-Loss-WER is used
@@ -784,7 +784,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, Exportable):
             }
 
             if compute_wer:
-                tensorboard_logs.update({'training_batch_wer': wer})
+                tensorboard_logs.update({'training_batch_bleu': wer})
 
         # Log items
         self.log_dict(tensorboard_logs)
@@ -840,9 +840,9 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, Exportable):
             wer, wer_num, wer_denom = self.wer.compute()
             self.wer.reset()
 
-            tensorboard_logs['val_wer_num'] = wer_num
-            tensorboard_logs['val_wer_denom'] = wer_denom
-            tensorboard_logs['val_wer'] = wer
+            tensorboard_logs['val_bleu_num'] = wer_num
+            tensorboard_logs['val_bleu_denom'] = wer_denom
+            tensorboard_logs['val_bleu'] = wer
 
         else:
             # If experimental fused Joint-Loss-WER is used
@@ -867,9 +867,9 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, Exportable):
             if loss_value is not None:
                 tensorboard_logs['val_loss'] = loss_value
 
-            tensorboard_logs['val_wer_num'] = wer_num
-            tensorboard_logs['val_wer_denom'] = wer_denom
-            tensorboard_logs['val_wer'] = wer
+            tensorboard_logs['val_bleu_num'] = wer_num
+            tensorboard_logs['val_bleu_denom'] = wer_denom
+            tensorboard_logs['val_bleu'] = wer
 
         self.log('global_step', torch.tensor(self.trainer.global_step, dtype=torch.float32))
 
@@ -878,8 +878,8 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, Exportable):
     def test_step(self, batch, batch_idx, dataloader_idx=0):
         logs = self.validation_step(batch, batch_idx, dataloader_idx=dataloader_idx)
         test_logs = {
-            'test_wer_num': logs['val_wer_num'],
-            'test_wer_denom': logs['val_wer_denom'],
+            'test_bleu_num':   logs['val_bleu_num'],
+            'test_bleu_denom': logs['val_bleu_denom'],
             # 'test_wer': logs['val_wer'],
         }
         if 'val_loss' in logs:
@@ -892,9 +892,9 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, Exportable):
             val_loss_log = {'val_loss': val_loss_mean}
         else:
             val_loss_log = {}
-        wer_num = torch.stack([x['val_wer_num'] for x in outputs]).sum()
-        wer_denom = torch.stack([x['val_wer_denom'] for x in outputs]).sum()
-        tensorboard_logs = {**val_loss_log, 'val_wer': wer_num.float() / wer_denom}
+        wer_num   = torch.stack([x['val_bleu_num'] for x in outputs]).sum()
+        wer_denom = torch.stack([x['val_bleu_denom'] for x in outputs]).sum()
+        tensorboard_logs = {**val_loss_log, 'val_bleu': wer_num.float() / wer_denom}
         return {**val_loss_log, 'log': tensorboard_logs}
 
     def multi_test_epoch_end(self, outputs, dataloader_idx: int = 0):
@@ -903,9 +903,9 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, Exportable):
             test_loss_log = {'test_loss': test_loss_mean}
         else:
             test_loss_log = {}
-        wer_num = torch.stack([x['test_wer_num'] for x in outputs]).sum()
-        wer_denom = torch.stack([x['test_wer_denom'] for x in outputs]).sum()
-        tensorboard_logs = {**test_loss_log, 'test_wer': wer_num.float() / wer_denom}
+        wer_num   = torch.stack([x['test_bleu_num'] for x in outputs]).sum()
+        wer_denom = torch.stack([x['test_bleu_denom'] for x in outputs]).sum()
+        tensorboard_logs = {**test_loss_log, 'test_bleu': wer_num.float() / wer_denom}
         return {**test_loss_log, 'log': tensorboard_logs}
 
     def _setup_transcribe_dataloader(self, config: Dict) -> 'torch.utils.data.DataLoader':

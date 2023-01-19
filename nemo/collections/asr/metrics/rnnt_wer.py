@@ -1082,7 +1082,7 @@ class RNNTDecoding(AbstractRNNTDecoding):
         self, decoding_cfg, decoder, joint, vocabulary,
     ):
         blank_id = (
-            len(vocabulary) + joint.num_extra_outputs
+            len(vocabulary) # + joint.num_extra_outputs TODO(hainanx)
         )  # we need to ensure blank is the last token in the vocab. This is needed for multi-blank RNN-T models.
         self.labels_map = dict([(i, vocabulary[i]) for i in range(len(vocabulary))])
 
@@ -1126,7 +1126,7 @@ class RNNTDecoding(AbstractRNNTDecoding):
         Returns:
             A list of decoded tokens.
         """
-        token_list = [self.labels_map[c] for c in tokens if c < self.blank_id - self.num_extra_outputs]
+        token_list = [self.labels_map[c] for c in tokens if c < self.blank_id] # TODO
         return token_list
 
     def decode_tokens_to_lang(self, tokens: List[int]) -> str:
