@@ -24,6 +24,7 @@ from torchmetrics import Metric
 
 from nemo.collections.asr.metrics.wer import move_dimension_to_the_front
 from nemo.collections.asr.parts.submodules import rnnt_beam_decoding as beam_decode
+from nemo.collections.asr.parts.submodules import multiblank_beam_decoding as multiblank_beam_decode
 from nemo.collections.asr.parts.submodules import rnnt_greedy_decoding as greedy_decode
 from nemo.collections.asr.parts.utils.asr_confidence_utils import ConfidenceConfig, ConfidenceMixin
 from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis, NBestHypotheses
@@ -301,16 +302,29 @@ class AbstractRNNTDecoding(ConfidenceMixin):
 
         elif self.cfg.strategy == 'beam':
 
-            self.decoding = beam_decode.BeamRNNTInfer(
-                decoder_model=decoder,
-                joint_model=joint,
-                beam_size=self.cfg.beam.beam_size,
-                return_best_hypothesis=decoding_cfg.beam.get('return_best_hypothesis', True),
-                search_type='default',
-                score_norm=self.cfg.beam.get('score_norm', True),
-                softmax_temperature=self.cfg.beam.get('softmax_temperature', 1.0),
-                preserve_alignments=self.preserve_alignments,
-            )
+            if self.big_blank_durations is None:
+                self.decoding = beam_decode.BeamRNNTInfer(
+                    decoder_model=decoder,
+                    joint_model=joint,
+                    beam_size=self.cfg.beam.beam_size,
+                    return_best_hypothesis=decoding_cfg.beam.get('return_best_hypothesis', True),
+                    search_type='default',
+                    score_norm=self.cfg.beam.get('score_norm', True),
+                    softmax_temperature=self.cfg.beam.get('softmax_temperature', 1.0),
+                    preserve_alignments=self.preserve_alignments,
+                )
+            else:
+                self.decoding = multiblank_beam_decode.BeamMultiblankInfer(
+                    decoder_model=decoder,
+                    joint_model=joint,
+                    big_blank_durations=self.big_blank_durations,
+                    beam_size=self.cfg.beam.beam_size,
+                    return_best_hypothesis=decoding_cfg.beam.get('return_best_hypothesis', True),
+                    search_type='default',
+                    score_norm=self.cfg.beam.get('score_norm', True),
+                    softmax_temperature=self.cfg.beam.get('softmax_temperature', 1.0),
+                    preserve_alignments=self.preserve_alignments,
+                )
 
         elif self.cfg.strategy == 'tsd':
 

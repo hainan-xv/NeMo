@@ -1605,6 +1605,7 @@ class GreedyMultiblankRNNTInfer(GreedyRNNTInfer):
                 # here we check if it's a big blank and if yes, set the duration variable.
                 if k >= self._blank_index - len(self.big_blank_durations) and k < self._blank_index:
                     big_blank_duration = self.big_blank_durations[self._blank_index - k - 1]
+#                    print("BIGBLANK", big_blank_duration, "at", time_idx)
 
                 if self.preserve_alignments:
                     # insert logprobs into last timestep
