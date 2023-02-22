@@ -413,11 +413,12 @@ class BeamMultiblankInfer(Typing):
                 # skip frames until big_blank_duration == 1.
                 big_blank_duration -= 1
                 continue
+#            print('TAKING FEATURE', i)
             hi = h[:, i : i + 1, :]  # [1, 1, D]
 
             not_blank = True
             symbols_added = 0
-            while not_blank and (symbols_added < self.max_candidates):
+            while not_blank:
                 ytu = self.joint.joint(hi, y) #  # [1, 1, 1, V + 1 + num_big_blanks], no need to run softmax
                 ytu = ytu[0, 0, 0, :]  # [V + 1 + num_big_blanks]
 
@@ -436,7 +437,7 @@ class BeamMultiblankInfer(Typing):
                     not_blank = False
                     if pred < self.blank + len(self.big_blank_durations):
                         # need to subtract 1 here since the loop does the +1 already
-                        big_blank_duration = self.big_blank_durations[self.blank + len(self.big_blank_durations) - pred - 1] - 1
+                        big_blank_duration = self.big_blank_durations[self.blank + len(self.big_blank_durations) - pred - 1]
                     else:
                         big_blank_duration = 1
 #                    print("predicting", pred, "duration", big_blank_duration)
@@ -444,9 +445,11 @@ class BeamMultiblankInfer(Typing):
                     if self.preserve_alignments:
                         # convert Ti-th logits into a torch array
                         alignments.append([])  # blank buffer for next timestep
+#                    print("BIGBLANK", big_blank_duration, "at", i)
                 else:
                     # Update state and current sequence
                     hyp.y_sequence.append(int(pred))
+#                    print("ADDING", int(pred))
                     hyp.score += float(logp)
                     hyp.dec_state = state
                     hyp.timestep.append(i)
@@ -486,8 +489,8 @@ class BeamMultiblankInfer(Typing):
         blank_tensor = torch.tensor([self.blank], device=h.device, dtype=torch.long)
 
         # Precompute some constants for blank position
-        ids = list(range(self.vocab_size + 1))
-        ids.remove(self.blank)
+        ids = list(range(self.vocab_size))
+#        ids.remove(self.blank)
 
         # Used when blank token is first vs last token
         if self.blank == 0:

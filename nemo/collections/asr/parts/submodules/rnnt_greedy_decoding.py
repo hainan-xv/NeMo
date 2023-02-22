@@ -1567,6 +1567,7 @@ class GreedyMultiblankRNNTInfer(GreedyRNNTInfer):
                 # skip frames until big_blank_duration == 1.
                 big_blank_duration -= 1
                 continue
+#            print('TAKING FEATURE', time_idx)
             # Extract encoder embedding at timestep t
             # f = x[time_idx, :, :].unsqueeze(0)  # [1, 1, D]
             f = x.narrow(dim=0, start=time_idx, length=1)
@@ -1634,6 +1635,7 @@ class GreedyMultiblankRNNTInfer(GreedyRNNTInfer):
                     hypothesis.timestep.append(time_idx)
                     hypothesis.dec_state = hidden_prime
                     hypothesis.last_token = k
+#                    print("ADDING", k)
 
                 # Increment token counter.
                 symbols_added += 1
