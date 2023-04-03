@@ -213,6 +213,7 @@ class BeamRNNTInfer(Typing):
         decoder_model: rnnt_abstract.AbstractRNNTDecoder,
         joint_model: rnnt_abstract.AbstractRNNTJoint,
         beam_size: int,
+        batch_size: int = 1,
         search_type: str = 'default',
         score_norm: bool = True,
         return_best_hypothesis: bool = True,
@@ -242,6 +243,7 @@ class BeamRNNTInfer(Typing):
             raise ValueError("Beam search size cannot be less than 1!")
 
         self.beam_size = beam_size
+        self.batch_size = batch_size
         self.score_norm = score_norm
         self.max_candidates = beam_size
 
@@ -525,32 +527,57 @@ class BeamRNNTInfer(Typing):
         Returns:
             nbest_hyps: N-best decoding results
         """
-        if partial_hypotheses is not None:
-            raise NotImplementedError("`partial_hypotheses` support is not supported")
-
         # Initialize states
-
         beam = min(self.beam_size, self.vocab_size)
         beam_k = min(beam, (self.vocab_size - 1))
         blank_tensor = torch.tensor([self.blank], device=h.device, dtype=torch.long)
 
+        print("HERE INPUT SIZE IS", h.shape)
+
+        # Precompute some constants for blank position
+        ids = list(range(self.vocab_size + 1))
+        ids.remove(self.blank)
+
+        # Used when blank token is first vs last token
+        if self.blank == 0:
+            index_incr = 1
+        else:
+            index_incr = 0
+
         # Initialize zero vector states
         dec_state = self.decoder.initialize_state(h)
 
-        batchsize = h.shape[0]
-
-#        # Initialize first hypothesis for the beam (blank)
-#        kept_hyps = [Hypothesis(score=0.0, y_sequence=[self.blank], dec_state=dec_state, timestep=[-1], length=0)]
-
-        hypotheses = rnnt_utils.CudaHypothesesStatelessTransducer(batchsize * beam_k, max_symbols_per_hyp, 1, x.device)
-
+        # Initialize first hypothesis for the beam (blank)
+        kept_hyps = [Hypothesis(score=0.0, y_sequence=[self.blank], dec_state=dec_state, timestep=[-1], length=0)]
         cache = {}
+
+        if partial_hypotheses is not None:
+            if len(partial_hypotheses.y_sequence) > 0:
+                kept_hyps[0].y_sequence = [int(partial_hypotheses.y_sequence[-1].cpu().numpy())]
+                kept_hyps[0].dec_state = partial_hypotheses.dec_state
+                kept_hyps[0].dec_state = _states_to_device(kept_hyps[0].dec_state, h.device)
 
         if self.preserve_alignments:
             kept_hyps[0].alignments = [[]]
 
-        for i in range(int(encoded_lengths)):
-            hi = h[:, i : i + 1, :]  # [1, 1, D]
+        print("encoded_lengths", encoded_lengths)
+
+        bs = encoded_lengths.shape[0]
+        batch2t = torch.zeros([bs], dtype=torch.long, device=encoded_lengths.device)
+
+#        h = h.contiguous()
+
+#        input_feature_workspace = cuda.as_cuda_array(torch.zeros([bs * encoded_lengths.shape[-1]]))
+        input_feature_workspace = torch.zeros([bs, encoded_lengths.shape[-1]], dtype=h.dtype, device=h.device)
+        while not torch.equal(batch2t, encoded_lengths):
+            print("not equal")
+            print(batch2t)
+            print(encoded_lengths)
+
+#            i = torch.min(batch2t).item()
+#        for i in range(int(encoded_lengths)):
+            hi = rnnt_beam_decoding_kernel.get_feature_per_batch[bs, h.shape[2], self.stream_, 0](h, batch2t, input_feature_workspace, h.shape[1], h.shape[2])
+#            hi = h[:, i : i + 1, :]  # [1, 1, D]
             hyps = kept_hyps
             kept_hyps = []
 
@@ -604,7 +631,6 @@ class BeamRNNTInfer(Typing):
 
                         hyps.append(new_hyp)
 
-                    # Determine whether the alignment should be blank or token
                     if self.preserve_alignments:
                         if k == self.blank:
                             new_hyp.alignments[-1].append(
@@ -643,6 +669,8 @@ class BeamRNNTInfer(Typing):
                     hyp.y_sequence = hyp.y_sequence[1:]
 
         return self.sort_nbest(kept_hyps)
+
+
 
 
     def default_beam_search(
