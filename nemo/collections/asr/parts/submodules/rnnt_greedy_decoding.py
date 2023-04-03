@@ -29,6 +29,7 @@
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
+from numba import cuda
 import numpy as np
 import torch
 from omegaconf import DictConfig
@@ -541,6 +542,7 @@ class GreedyBatchedRNNTInfer(_GreedyRNNTInfer):
         decoder_model: rnnt_abstract.AbstractRNNTDecoder,
         joint_model: rnnt_abstract.AbstractRNNTJoint,
         blank_index: int,
+        use_cuda_hyp: bool,
         max_symbols_per_step: Optional[int] = None,
         preserve_alignments: bool = False,
         preserve_frame_confidence: bool = False,
@@ -558,7 +560,10 @@ class GreedyBatchedRNNTInfer(_GreedyRNNTInfer):
 
         # Depending on availability of `blank_as_pad` support
         # switch between more efficient batch decoding technique
-        if self.decoder.blank_as_pad:
+
+        if use_cuda_hyp:
+            self._greedy_decode = self._greedy_decode_cuda_hyp
+        elif self.decoder.blank_as_pad:
             self._greedy_decode = self._greedy_decode_blank_as_pad
         else:
             self._greedy_decode = self._greedy_decode_masked
@@ -606,6 +611,143 @@ class GreedyBatchedRNNTInfer(_GreedyRNNTInfer):
         self.joint.train(joint_training_state)
 
         return (packed_result,)
+
+    def _greedy_decode_cuda_hyp(
+        self,
+        x: torch.Tensor,
+        out_len: torch.Tensor,
+        device: torch.device,
+        partial_hypotheses: Optional[List[rnnt_utils.Hypothesis]] = None,
+        max_symbols_per_hyp: Optional[int] = 512,
+    ):
+        if partial_hypotheses is not None:
+            raise NotImplementedError("`partial_hypotheses` support is not supported")
+
+        with torch.inference_mode():
+            # x: [B, T, D]
+            # out_len: [B]
+            # device: torch.device
+
+            # Initialize list of Hypothesis
+            batchsize = x.shape[0]
+            hypotheses = rnnt_utils.CudaHypothesesStatelessTransducer(batchsize, max_symbols_per_hyp, 1, x.device)
+            #            hypotheses = [
+            #                rnnt_utils.Hypothesis(score=0.0, y_sequence=[], timestep=[], dec_state=None) for _ in range(batchsize)
+            #            ]
+
+            # Initialize Hidden state matrix (shared by entire batch)
+            hidden = None
+
+            # Last Label buffer + Last Label without blank buffer
+            # batch level equivalent of the last_label
+            last_label = torch.full([batchsize, 1], fill_value=self._blank_index, dtype=torch.long, device=device)
+
+            # Get max sequence length
+            max_out_len = out_len.max()
+
+            D = x.shape[-1]
+            f = torch.zeros(
+                [batchsize, 1, D], dtype=x.dtype, device=x.device
+            )  # to store features of hyps for all batch-id/beam-id
+
+            hyp2t = torch.zeros(
+                [batchsize], dtype=torch.long, device=x.device
+            )  # hyp2t[i] represent the time step of i'th hyp in kept_hyps
+            done = torch.zeros([batchsize], dtype=torch.bool, device=x.device)
+            hyp2b = torch.LongTensor([i for i in range(batchsize)]).to(x.device)
+
+            shift = hyp2b  # * x.shape[1]
+
+            x2 = torch.reshape(x, [-1, D])
+
+            bos = True
+            while True:
+                f = torch.reshape(x2[hyp2t + shift * x.shape[1]], [batchsize, -1, D])  # [B, 1, D]
+
+                # Prepare t timestamp batch variables
+                not_blank = True
+                symbols_added = 0
+
+                # Update blank mask with time mask
+                # Batch: [B, T, D], but Bi may have seq len < max(seq_lens_in_batch)
+                # Forcibly mask with "blank" tokens, for all sample where current time step T > seq_len
+
+                # Batch prediction and joint network steps
+                # If very first prediction step, submit SOS tag (blank) to pred_step.
+                # This feeds a zero tensor as input to AbstractRNNTDecoder to prime the state
+                if bos:
+                    g, hidden_prime = self._pred_step(self._SOS, hidden, batch_size=batchsize)
+                    bos = False
+                else:
+                    g, hidden_prime = self._pred_step(last_label, hidden, batch_size=batchsize)
+
+                # Batched joint step - Output = [B, V + 1]
+                # If preserving per-frame confidence, log_normalize must be true
+                logp = self._joint_step(f, g, log_normalize=True if self.preserve_frame_confidence else None)[
+                    :, 0, 0, :
+                ]
+
+                if logp.dtype != torch.float32:
+                    logp = logp.float()
+
+                # Get index k, of max prob for batch
+                v, k = logp.max(1)
+                del g
+
+                # Update blank mask with current predicted blanks
+                # This is accumulating blanks over all time steps T and all target steps min(max_symbols, U)
+                k_is_blank = k == self._blank_index
+                k_is_blank = torch.tensor(k_is_blank, dtype=torch.long)
+
+                # Collect batch indices where blanks occurred now/past
+                blank_indices = (k_is_blank == 1).nonzero(as_tuple=False)
+
+                # Recover prior state for all samples which predicted blank now/past
+                if hidden is not None:
+                    # LSTM has 2 states
+                    hidden_prime = self.decoder.batch_copy_states(hidden_prime, hidden, blank_indices)
+
+                elif len(blank_indices) > 0 and hidden is None:
+                    # Reset state if there were some blank and other non-blank predictions in batch
+                    # Original state is filled with zeros so we just multiply
+                    # LSTM has 2 states
+                    hidden_prime = self.decoder.batch_copy_states(hidden_prime, None, blank_indices, value=0.0)
+
+                # Recover prior predicted label for all samples which predicted blank now/past
+                k[blank_indices] = last_label[blank_indices, 0]
+
+                # Update new label and hidden state for next iteration
+                last_label = k.clone().view(-1, 1)
+                hidden = hidden_prime
+
+                symbols_added += 1
+                hyp2t += k_is_blank
+                done = torch.logical_or(done, (hyp2t >= out_len))
+                not_done_idx = torch.where(done != True)[0]  # .nonzero()
+                hypotheses.scores[not_done_idx] += v[not_done_idx]
+                length_idx = max_symbols_per_hyp * shift
+
+                last_token_idx = hypotheses.ys[length_idx] + length_idx + 1
+                hypotheses.ys[last_token_idx] = k
+                hypotheses.ys[length_idx] += 1 - k_is_blank
+
+                if torch.all(done):
+                    break
+                else:
+                    hyp2t *= torch.logical_not(done)
+                    if not_done_idx.shape[-1] != hyp2t.shape[-1]:
+                        hyp2t = hyp2t[not_done_idx]
+                        hyp2b = hyp2b[not_done_idx]
+                        batchsize = not_done_idx.shape[-1]
+                        shift = hyp2b  # * x.shape[1]
+                        hidden = self.decoder.batch_subset_states(hidden_prime, hidden, not_done_idx)
+                        last_label = last_label[not_done_idx]
+                        out_len = out_len[not_done_idx]
+                        done = done[not_done_idx]
+
+        hypotheses.dec_states = hidden[0].reshape([-1, 1])
+
+        return hypotheses.get_hyps()
 
     def _greedy_decode_blank_as_pad(
         self,
@@ -2202,3 +2344,4 @@ class GreedyBatchedRNNTInferConfig:
     preserve_alignments: bool = False
     preserve_frame_confidence: bool = False
     confidence_method_cfg: Optional[ConfidenceMethodConfig] = None
+    use_cuda_hyp: bool = True

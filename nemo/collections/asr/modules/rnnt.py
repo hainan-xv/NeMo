@@ -302,7 +302,7 @@ class StatelessTransducerDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable):
 
     def initialize_state(self, y: torch.Tensor) -> List[torch.Tensor]:
         batch = y.size(0)
-        state = [torch.ones([batch, self.context_size], dtype=y.dtype, device=y.device) * self.blank_idx]
+        state = [torch.ones([batch, self.context_size - 1], dtype=y.dtype, device=y.device) * self.blank_idx]
         return state
 
     def batch_initialize_states(self, batch_states: List[torch.Tensor], decoder_states: List[List[torch.Tensor]]):
@@ -322,7 +322,7 @@ class StatelessTransducerDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable):
        """
         new_state = torch.stack([s[0] for s in decoder_states])
 
-        return [new_state]
+        return [new_state.reshape([len(decoder_states), -1])]
 
     def batch_select_state(self, batch_states: List[torch.Tensor], idx: int) -> List[List[torch.Tensor]]:
         """Get decoder state from batch of states, for given id.
@@ -335,7 +335,7 @@ class StatelessTransducerDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable):
 
         Returns:
             (tuple): decoder states for given id
-                [(C)]
+                [(1, C)]
         """
         if batch_states is not None:
             states = batch_states[0][idx]
@@ -367,6 +367,35 @@ class StatelessTransducerDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable):
         state_list.append(state_tensor)
 
         return state_list
+
+    def batch_subset_states(
+        self,
+        old_states: List[torch.Tensor],
+        new_states: List[torch.Tensor],
+        ids: List[int],
+        value: Optional[float] = None,
+    ) -> List[torch.Tensor]:
+        """Copy states from new state to old state at certain indices.
+
+        Args:
+            old_states: packed decoder states
+                single element list of (B x C)
+
+            new_states: packed decoder states
+                single element list of (B x C)
+
+            ids (list): List of indices to copy states at.
+
+            value (optional float): If a value should be copied instead of a state slice, a float should be provided
+
+        Returns:
+            batch of decoder states with partial copy at ids (or a specific value).
+                (B x C)
+        """
+
+        ret = [new_states[0][ids, :]]
+
+        return ret
 
     def batch_copy_states(
         self,
