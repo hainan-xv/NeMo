@@ -631,9 +631,6 @@ class GreedyBatchedRNNTInfer(_GreedyRNNTInfer):
             # Initialize list of Hypothesis
             batchsize = x.shape[0]
             hypotheses = rnnt_utils.CudaHypothesesStatelessTransducer(batchsize, max_symbols_per_hyp, 1, x.device)
-            #            hypotheses = [
-            #                rnnt_utils.Hypothesis(score=0.0, y_sequence=[], timestep=[], dec_state=None) for _ in range(batchsize)
-            #            ]
 
             # Initialize Hidden state matrix (shared by entire batch)
             hidden = None

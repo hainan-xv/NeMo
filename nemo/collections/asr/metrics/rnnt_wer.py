@@ -214,7 +214,7 @@ class AbstractRNNTDecoding(ConfidenceMixin):
             if blank_id == 0:
                 raise ValueError("blank_id must equal len(vocabs) for multi-blank RNN-T models")
 
-        possible_strategies = ['greedy', 'greedy_batch', 'beam', 'tsd', 'alsd', 'maes']
+        possible_strategies = ['greedy', 'greedy_batch', 'beam', 'tsd', 'alsd', 'maes', 'cuda_beam']
         if self.cfg.strategy not in possible_strategies:
             raise ValueError(f"Decoding strategy must be one of {possible_strategies}")
 
@@ -223,7 +223,7 @@ class AbstractRNNTDecoding(ConfidenceMixin):
             if self.cfg.strategy in ['greedy', 'greedy_batch']:
                 self.preserve_alignments = self.cfg.greedy.get('preserve_alignments', False)
 
-            elif self.cfg.strategy in ['beam', 'tsd', 'alsd', 'maes']:
+            elif self.cfg.strategy in ['beam', 'tsd', 'alsd', 'maes', 'cuda_beam']:
                 self.preserve_alignments = self.cfg.beam.get('preserve_alignments', False)
 
         # Update compute timestamps
@@ -231,7 +231,7 @@ class AbstractRNNTDecoding(ConfidenceMixin):
             if self.cfg.strategy in ['greedy', 'greedy_batch']:
                 self.compute_timestamps = self.cfg.greedy.get('compute_timestamps', False)
 
-            elif self.cfg.strategy in ['beam', 'tsd', 'alsd', 'maes']:
+            elif self.cfg.strategy in ['beam', 'tsd', 'alsd', 'maes', 'cuda_beam']:
                 self.compute_timestamps = self.cfg.beam.get('compute_timestamps', False)
 
         # Test if alignments are being preserved for RNNT
@@ -247,7 +247,7 @@ class AbstractRNNTDecoding(ConfidenceMixin):
                 self.preserve_frame_confidence = self.cfg.greedy.get('preserve_frame_confidence', False)
                 self.confidence_method_cfg = self.cfg.greedy.get('confidence_method_cfg', None)
 
-            elif self.cfg.strategy in ['beam', 'tsd', 'alsd', 'maes']:
+            elif self.cfg.strategy in ['beam', 'tsd', 'alsd', 'maes', 'cuda_beam']:
                 # Not implemented
                 pass
 
@@ -355,6 +355,25 @@ class AbstractRNNTDecoding(ConfidenceMixin):
                 beam_size=self.cfg.beam.beam_size,
                 return_best_hypothesis=decoding_cfg.beam.get('return_best_hypothesis', True),
                 search_type='maes',
+                score_norm=self.cfg.beam.get('score_norm', True),
+                maes_num_steps=self.cfg.beam.get('maes_num_steps', 2),
+                maes_prefix_alpha=self.cfg.beam.get('maes_prefix_alpha', 1),
+                maes_expansion_gamma=self.cfg.beam.get('maes_expansion_gamma', 2.3),
+                maes_expansion_beta=self.cfg.beam.get('maes_expansion_beta', 2.0),
+                softmax_temperature=self.cfg.beam.get('softmax_temperature', 1.0),
+                preserve_alignments=self.preserve_alignments,
+                ngram_lm_model=self.cfg.beam.get('ngram_lm_model', None),
+                ngram_lm_alpha=self.cfg.beam.get('ngram_lm_alpha', 0.0),
+            )
+
+        elif self.cfg.strategy == 'cuda_beam':
+
+            self.decoding = beam_decode.BeamRNNTInfer(
+                decoder_model=decoder,
+                joint_model=joint,
+                beam_size=self.cfg.beam.beam_size,
+                return_best_hypothesis=decoding_cfg.beam.get('return_best_hypothesis', True),
+                search_type='cuda_beam',
                 score_norm=self.cfg.beam.get('score_norm', True),
                 maes_num_steps=self.cfg.beam.get('maes_num_steps', 2),
                 maes_prefix_alpha=self.cfg.beam.get('maes_prefix_alpha', 1),

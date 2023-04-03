@@ -259,6 +259,8 @@ class BeamRNNTInfer(Typing):
             # self.search_algorithm = self.nsc_beam_search
         elif search_type == "maes":
             self.search_algorithm = self.modified_adaptive_expansion_search
+        elif search_type == "cuda_beam":
+            self.search_algorithm = self.beam_search_cuda_hyp
         else:
             raise NotImplementedError(
                 f"The search type ({search_type}) supplied is not supported!\n"
@@ -369,31 +371,37 @@ class BeamRNNTInfer(Typing):
                     _p = next(self.joint.parameters())
                     dtype = _p.dtype
 
-                    # Decode every sample in the batch independently.
-                    for batch_idx in idx_gen:
-                        inseq = encoder_output[batch_idx : batch_idx + 1, : encoded_lengths[batch_idx], :]  # [1, T, D]
-                        logitlen = encoded_lengths[batch_idx]
+                    if self.search_type != 'cuda_beam':
+                        # Decode every sample in the batch independently.
+                        for batch_idx in idx_gen:
+                            inseq = encoder_output[batch_idx : batch_idx + 1, : encoded_lengths[batch_idx], :]  # [1, T, D]
+                            logitlen = encoded_lengths[batch_idx]
 
-                        if inseq.dtype != dtype:
-                            inseq = inseq.to(dtype=dtype)
+                            if inseq.dtype != dtype:
+                                inseq = inseq.to(dtype=dtype)
 
-                        # Extract partial hypothesis if exists
-                        partial_hypothesis = partial_hypotheses[batch_idx] if partial_hypotheses is not None else None
+                            # Extract partial hypothesis if exists
+                            partial_hypothesis = partial_hypotheses[batch_idx] if partial_hypotheses is not None else None
 
-                        # Execute the specific search strategy
+                            # Execute the specific search strategy
+                            nbest_hyps = self.search_algorithm(
+                                inseq, logitlen, partial_hypotheses=partial_hypothesis
+                            )  # sorted list of hypothesis
+
+                            # Prepare the list of hypotheses
+                            nbest_hyps = pack_hypotheses(nbest_hyps)
+
+                            # Pack the result
+                            if self.return_best_hypothesis:
+                                best_hypothesis = nbest_hyps[0]  # type: Hypothesis
+                            else:
+                                best_hypothesis = NBestHypotheses(nbest_hyps)  # type: NBestHypotheses
+                            hypotheses.append(best_hypothesis)
+                    else:
                         nbest_hyps = self.search_algorithm(
-                            inseq, logitlen, partial_hypotheses=partial_hypothesis
+                            encoder_output, encoded_lengths, partial_hypotheses=None
                         )  # sorted list of hypothesis
 
-                        # Prepare the list of hypotheses
-                        nbest_hyps = pack_hypotheses(nbest_hyps)
-
-                        # Pack the result
-                        if self.return_best_hypothesis:
-                            best_hypothesis = nbest_hyps[0]  # type: Hypothesis
-                        else:
-                            best_hypothesis = NBestHypotheses(nbest_hyps)  # type: NBestHypotheses
-                        hypotheses.append(best_hypothesis)
 
         self.decoder.train(decoder_training_state)
         self.joint.train(joint_training_state)
@@ -504,6 +512,138 @@ class BeamRNNTInfer(Typing):
             hyp.y_sequence = hyp.y_sequence[1:]
 
         return [hyp]
+
+    def beam_search_cuda_hyp(
+        self, h: torch.Tensor, encoded_lengths: torch.Tensor, partial_hypotheses: Optional[Hypothesis] = None,
+        max_symbols_per_hyp: Optional[int] = 512,
+    ) -> List[Hypothesis]:
+        """Beam search implementation.
+
+        Args:
+            x: Encoded speech features (1, T_max, D_enc)
+
+        Returns:
+            nbest_hyps: N-best decoding results
+        """
+        if partial_hypotheses is not None:
+            raise NotImplementedError("`partial_hypotheses` support is not supported")
+
+        # Initialize states
+
+        beam = min(self.beam_size, self.vocab_size)
+        beam_k = min(beam, (self.vocab_size - 1))
+        blank_tensor = torch.tensor([self.blank], device=h.device, dtype=torch.long)
+
+        # Initialize zero vector states
+        dec_state = self.decoder.initialize_state(h)
+
+        batchsize = h.shape[0]
+
+#        # Initialize first hypothesis for the beam (blank)
+#        kept_hyps = [Hypothesis(score=0.0, y_sequence=[self.blank], dec_state=dec_state, timestep=[-1], length=0)]
+
+        hypotheses = rnnt_utils.CudaHypothesesStatelessTransducer(batchsize * beam_k, max_symbols_per_hyp, 1, x.device)
+
+        cache = {}
+
+        if self.preserve_alignments:
+            kept_hyps[0].alignments = [[]]
+
+        for i in range(int(encoded_lengths)):
+            hi = h[:, i : i + 1, :]  # [1, 1, D]
+            hyps = kept_hyps
+            kept_hyps = []
+
+            while True:
+                max_hyp = max(hyps, key=lambda x: x.score)
+                hyps.remove(max_hyp)
+
+                # update decoder state and get next score
+                y, state, lm_tokens = self.decoder.score_hypothesis(max_hyp, cache)  # [1, 1, D]
+
+                # get next token
+                ytu = torch.log_softmax(self.joint.joint(hi, y) / self.softmax_temperature, dim=-1)  # [1, 1, 1, V + 1]
+                ytu = ytu[0, 0, 0, :]  # [V + 1]
+
+                # preserve alignments
+                if self.preserve_alignments:
+                    logprobs = ytu.cpu().clone()
+
+                # remove blank token before top k
+                top_k = ytu[ids].topk(beam_k, dim=-1)
+
+                # Two possible steps - blank token or non-blank token predicted
+                ytu = (
+                    torch.cat((top_k[0], ytu[self.blank].unsqueeze(0))),
+                    torch.cat((top_k[1] + index_incr, blank_tensor)),
+                )
+
+                # for each possible step
+                for logp, k in zip(*ytu):
+                    # construct hypothesis for step
+                    new_hyp = Hypothesis(
+                        score=(max_hyp.score + float(logp)),
+                        y_sequence=max_hyp.y_sequence[:],
+                        dec_state=max_hyp.dec_state,
+                        lm_state=max_hyp.lm_state,
+                        timestep=max_hyp.timestep[:],
+                        length=encoded_lengths,
+                    )
+
+                    if self.preserve_alignments:
+                        new_hyp.alignments = copy.deepcopy(max_hyp.alignments)
+
+                    # if current token is blank, dont update sequence, just store the current hypothesis
+                    if k == self.blank:
+                        kept_hyps.append(new_hyp)
+                    else:
+                        # if non-blank token was predicted, update state and sequence and then search more hypothesis
+                        new_hyp.dec_state = state
+                        new_hyp.y_sequence.append(int(k))
+                        new_hyp.timestep.append(i)
+
+                        hyps.append(new_hyp)
+
+                    # Determine whether the alignment should be blank or token
+                    if self.preserve_alignments:
+                        if k == self.blank:
+                            new_hyp.alignments[-1].append(
+                                (logprobs.clone(), torch.tensor(self.blank, dtype=torch.int32))
+                            )
+                        else:
+                            new_hyp.alignments[-1].append(
+                                (logprobs.clone(), torch.tensor(new_hyp.y_sequence[-1], dtype=torch.int32))
+                            )
+
+                # keep those hypothesis that have scores greater than next search generation
+                hyps_max = float(max(hyps, key=lambda x: x.score).score)
+                kept_most_prob = sorted([hyp for hyp in kept_hyps if hyp.score > hyps_max], key=lambda x: x.score,)
+
+                # If enough hypothesis have scores greater than next search generation,
+                # stop beam search.
+                if len(kept_most_prob) >= beam:
+                    if self.preserve_alignments:
+                        # convert Ti-th logits into a torch array
+                        for kept_h in kept_most_prob:
+                            kept_h.alignments.append([])  # blank buffer for next timestep
+
+                    kept_hyps = kept_most_prob
+                    break
+
+        # Remove trailing empty list of alignments
+        if self.preserve_alignments:
+            for h in kept_hyps:
+                if len(h.alignments[-1]) == 0:
+                    del h.alignments[-1]
+
+        # Remove the original input label if partial hypothesis was provided
+        if partial_hypotheses is not None:
+            for hyp in kept_hyps:
+                if hyp.y_sequence[0] == partial_hypotheses.y_sequence[-1] and len(hyp.y_sequence) > 1:
+                    hyp.y_sequence = hyp.y_sequence[1:]
+
+        return self.sort_nbest(kept_hyps)
+
 
     def default_beam_search(
         self, h: torch.Tensor, encoded_lengths: torch.Tensor, partial_hypotheses: Optional[Hypothesis] = None
