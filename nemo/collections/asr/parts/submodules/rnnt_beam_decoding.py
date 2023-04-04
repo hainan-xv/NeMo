@@ -36,7 +36,13 @@ import torch
 from tqdm import tqdm
 
 from nemo.collections.asr.modules import rnnt_abstract
-from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis, NBestHypotheses, is_prefix, select_k_expansions
+from nemo.collections.asr.parts.utils.rnnt_utils import (
+    HATJointOutput,
+    Hypothesis,
+    NBestHypotheses,
+    is_prefix,
+    select_k_expansions,
+)
 from nemo.core.classes import Typing, typecheck
 from nemo.core.neural_types import AcousticEncodedRepresentation, HypothesisType, LengthsType, NeuralType
 from nemo.utils import logging
@@ -231,6 +237,8 @@ class BeamRNNTInfer(Typing):
         preserve_alignments: bool = False,
         ngram_lm_model: Optional[str] = None,
         ngram_lm_alpha: float = 0.0,
+        hat_subtract_ilm: bool = False,
+        hat_ilm_weight: float = 0.0,
     ):
         self.decoder = decoder_model
         self.joint = joint_model
@@ -330,6 +338,12 @@ class BeamRNNTInfer(Typing):
         else:
             self.ngram_lm = None
 
+        if hat_subtract_ilm:
+            assert hasattr(self.joint, "return_hat_ilm")
+            assert search_type == "maes"
+        self.hat_subtract_ilm = hat_subtract_ilm
+        self.hat_ilm_weight = hat_ilm_weight
+
     @typecheck()
     def __call__(
         self,
@@ -352,6 +366,13 @@ class BeamRNNTInfer(Typing):
         decoder_training_state = self.decoder.training
         joint_training_state = self.joint.training
 
+        # setup hat outputs mode
+        return_hat_ilm_default = False
+        if self.hat_subtract_ilm:
+            assert hasattr(self.joint, "return_hat_ilm")
+            return_hat_ilm_default = self.joint.return_hat_ilm
+            self.joint.return_hat_ilm = self.hat_subtract_ilm
+
         with torch.no_grad():
             # Apply optional preprocessing
             encoder_output = encoder_output.transpose(1, 2)  # (B, T, D)
@@ -360,22 +381,23 @@ class BeamRNNTInfer(Typing):
             self.joint.eval()
 
             hypotheses = []
-            with tqdm(
-                range(encoder_output.size(0)),
-                desc='Beam search progress:',
-                total=encoder_output.size(0),
-                unit='sample',
-            ) as idx_gen:
+            # Freeze the decoder and joint to prevent recording of gradients
+            # during the beam loop.
+            with self.decoder.as_frozen(), self.joint.as_frozen():
 
-                # Freeze the decoder and joint to prevent recording of gradients
-                # during the beam loop.
-                with self.decoder.as_frozen(), self.joint.as_frozen():
+                _p = next(self.joint.parameters())
+                dtype = _p.dtype
 
-                    _p = next(self.joint.parameters())
-                    dtype = _p.dtype
+                if self.search_type != 'cuda_beam':
+                    # Decode every sample in the batch independently.
 
-                    if self.search_type != 'cuda_beam':
-                        # Decode every sample in the batch independently.
+                    with tqdm(
+                        range(encoder_output.size(0)),
+                        desc='Beam search progress:',
+                        total=encoder_output.size(0),
+                        unit='sample',
+                    ) as idx_gen:
+
                         for batch_idx in idx_gen:
                             inseq = encoder_output[batch_idx : batch_idx + 1, : encoded_lengths[batch_idx], :]  # [1, T, D]
                             logitlen = encoded_lengths[batch_idx]
@@ -400,23 +422,25 @@ class BeamRNNTInfer(Typing):
                             else:
                                 best_hypothesis = NBestHypotheses(nbest_hyps)  # type: NBestHypotheses
                             hypotheses.append(best_hypothesis)
-                    else:
-                        nbest_hyps = self.search_algorithm(
-                            encoder_output, encoded_lengths, partial_hypotheses=None
-                        )  # sorted list of hypothesis
-                        # Prepare the list of hypotheses
-                        for i in range(encoder_output.shape[0]):
-                            nbest_hyps_i = pack_hypotheses(nbest_hyps[i])
-                            # Pack the result
-                            if self.return_best_hypothesis:
-                                best_hypothesis = nbest_hyps_i[0]  # type: Hypothesis
-                            else:
-                                best_hypothesis = NBestHypotheses(nbest_hyps_i)  # type: NBestHypotheses
-                            hypotheses.append(best_hypothesis)
+                else:
+                    nbest_hyps = self.search_algorithm(
+                        encoder_output, encoded_lengths, partial_hypotheses=None
+                    )  # sorted list of hypothesis
+                    # Prepare the list of hypotheses
+                    for i in range(encoder_output.shape[0]):
+                        nbest_hyps_i = pack_hypotheses(nbest_hyps[i])
+                        # Pack the result
+                        if self.return_best_hypothesis:
+                            best_hypothesis = nbest_hyps_i[0]  # type: Hypothesis
+                        else:
+                            best_hypothesis = NBestHypotheses(nbest_hyps_i)  # type: NBestHypotheses
+                        hypotheses.append(best_hypothesis)
 
 
         self.decoder.train(decoder_training_state)
         self.joint.train(joint_training_state)
+        if self.hat_subtract_ilm:
+            self.joint.return_hat_ilm = return_hat_ilm_default
 
         return (hypotheses,)
 
@@ -1011,6 +1035,9 @@ class BeamRNNTInfer(Typing):
         Returns:
             nbest_hyps: N-best decoding results
         """
+        # delay this import here instead of at the beginning to avoid circular imports.
+        from nemo.collections.asr.modules.rnnt import RNNTDecoder, StatelessTransducerDecoder
+
         if partial_hypotheses is not None:
             raise NotImplementedError("`partial_hypotheses` support is not supported")
 
@@ -1092,7 +1119,17 @@ class BeamRNNTInfer(Typing):
                         sub_batch_ids.remove(id)
 
                     # extract the states of the sub batch only.
-                    beam_state_ = [beam_state[state_id][:, sub_batch_ids, :] for state_id in range(len(beam_state))]
+                    if isinstance(self.decoder, RNNTDecoder):
+                        # LSTM decoder, state is [layer x batch x hidden]
+                        beam_state_ = [
+                            beam_state[state_id][:, sub_batch_ids, :] for state_id in range(len(beam_state))
+                        ]
+                    elif isinstance(self.decoder, StatelessTransducerDecoder):
+                        # stateless decoder, state is [batch x hidden]
+                        beam_state_ = [beam_state[state_id][sub_batch_ids, :] for state_id in range(len(beam_state))]
+                    else:
+                        raise NotImplementedError("Unknown decoder type.")
+
                 else:
                     # If entire batch was used (none were removed), simply take all the states
                     beam_state_ = beam_state
@@ -1106,7 +1143,14 @@ class BeamRNNTInfer(Typing):
                     for state_id in range(len(beam_state)):
                         # Update the current batch states with the sub-batch states (in the correct indices)
                         # These indices are specified by sub_batch_ids, the ids of samples which were updated.
-                        beam_state[state_id][:, sub_batch_ids, :] = beam_state_[state_id][...]
+                        if isinstance(self.decoder, RNNTDecoder):
+                            # LSTM decoder, state is [layer x batch x hidden]
+                            beam_state[state_id][:, sub_batch_ids, :] = beam_state_[state_id][...]
+                        elif isinstance(self.decoder, StatelessTransducerDecoder):
+                            # stateless decoder, state is [batch x hidden]
+                            beam_state[state_id][sub_batch_ids, :] = beam_state_[state_id][...]
+                        else:
+                            raise NotImplementedError("Unknown decoder type.")
                 else:
                     # If entire batch was updated, simply update all the states
                     beam_state = beam_state_
@@ -1329,9 +1373,8 @@ class BeamRNNTInfer(Typing):
                 beam_dec_out = torch.stack([h.dec_out[-1] for h in hyps])  # [H, 1, D]
 
                 # Extract the log probabilities
-                beam_logp, beam_idx = torch.log_softmax(
-                    self.joint.joint(beam_enc_out, beam_dec_out) / self.softmax_temperature, dim=-1,
-                ).topk(self.max_candidates, dim=-1)
+                ytm, ilm_ytm = self.resolve_joint_output(beam_enc_out, beam_dec_out)
+                beam_logp, beam_idx = ytm.topk(self.max_candidates, dim=-1)
 
                 beam_logp = beam_logp[:, 0, 0, :]  # [B, V + 1]
                 beam_idx = beam_idx[:, 0, 0, :]  # [B, max_candidates]
@@ -1373,7 +1416,12 @@ class BeamRNNTInfer(Typing):
                                     lm_score, new_hyp.ngram_lm_state = self.compute_ngram_score(
                                         hyp.ngram_lm_state, int(k)
                                     )
-                                    new_hyp.score += self.ngram_lm_alpha * lm_score
+                                    if self.hat_subtract_ilm:
+                                        new_hyp.score += self.ngram_lm_alpha * lm_score - float(
+                                            self.hat_ilm_weight * ilm_ytm[i, 0, 0, k]
+                                        )
+                                    else:
+                                        new_hyp.score += self.ngram_lm_alpha * lm_score
 
                                 # TODO: Setup LM
                                 if self.language_model is not None:
@@ -1477,9 +1525,7 @@ class BeamRNNTInfer(Typing):
 
                     else:
                         # Extract the log probabilities
-                        beam_logp = torch.log_softmax(
-                            self.joint.joint(beam_enc_out, beam_dec_out) / self.softmax_temperature, dim=-1,
-                        )
+                        beam_logp, _ = self.resolve_joint_output(beam_enc_out, beam_dec_out)
                         beam_logp = beam_logp[:, 0, 0, :]
 
                         # For all expansions, add the score for the blank label
@@ -1543,6 +1589,24 @@ class BeamRNNTInfer(Typing):
 
         return hypotheses
 
+    def resolve_joint_output(self, enc_out: torch.Tensor, dec_out: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Resolve output types for RNNT and HAT joint models
+        """
+
+        joint_output = self.joint.joint(enc_out, dec_out)
+        if torch.is_tensor(joint_output):
+            ytm = torch.log_softmax(joint_output / self.softmax_temperature, dim=-1)
+            ilm_ytm = None
+        elif self.hat_subtract_ilm and isinstance(joint_output, HATJointOutput):
+            ytm, ilm_ytm = joint_output.hat_logprobs, joint_output.ilm_logprobs
+        else:
+            raise TypeError(
+                f"Joint output ({type(joint_output)}) must be torch.Tensor or HATJointOutput in case of HAT joint"
+            )
+
+        return ytm, ilm_ytm
+
     def prefix_search(
         self, hypotheses: List[Hypothesis], enc_out: torch.Tensor, prefix_alpha: int
     ) -> List[Hypothesis]:
@@ -1557,9 +1621,7 @@ class BeamRNNTInfer(Typing):
                 pref_id = len(hyp_i.y_sequence)
 
                 if is_prefix(hyp_j.y_sequence, hyp_i.y_sequence) and (curr_id - pref_id) <= prefix_alpha:
-                    logp = torch.log_softmax(
-                        self.joint.joint(enc_out, hyp_i.dec_out[-1]) / self.softmax_temperature, dim=-1,
-                    )
+                    logp, ilm_logp = self.resolve_joint_output(enc_out, hyp_i.dec_out[-1])
                     logp = logp[0, 0, 0, :]
                     curr_score = hyp_i.score + float(logp[hyp_j.y_sequence[pref_id]])
                     # Setup ngram LM:
@@ -1567,18 +1629,26 @@ class BeamRNNTInfer(Typing):
                         lm_score, next_state = self.compute_ngram_score(
                             hyp_i.ngram_lm_state, int(hyp_j.y_sequence[pref_id])
                         )
-                        curr_score += self.ngram_lm_alpha * lm_score
+                        if self.hat_subtract_ilm:
+                            curr_score += self.ngram_lm_alpha * lm_score - self.hat_ilm_weight * float(
+                                ilm_logp[0, 0, hyp_j.y_sequence[pref_id]]
+                            )
+                        else:
+                            curr_score += self.ngram_lm_alpha * lm_score
 
                     for k in range(pref_id, (curr_id - 1)):
-                        logp = torch.log_softmax(
-                            self.joint.joint(enc_out, hyp_j.dec_out[k]) / self.softmax_temperature, dim=-1,
-                        )
+                        logp, ilm_logp = self.resolve_joint_output(enc_out, hyp_j.dec_out[k])
                         logp = logp[0, 0, 0, :]
                         curr_score += float(logp[hyp_j.y_sequence[k + 1]])
                         # Setup ngram LM:
                         if self.ngram_lm:
                             lm_score, next_state = self.compute_ngram_score(next_state, int(hyp_j.y_sequence[k + 1]))
-                            curr_score += self.ngram_lm_alpha * lm_score
+                            if self.hat_subtract_ilm:
+                                curr_score += self.ngram_lm_alpha * lm_score - self.hat_ilm_weight * float(
+                                    ilm_logp[0, 0, hyp_j.y_sequence[k + 1]]
+                                )
+                            else:
+                                curr_score += self.ngram_lm_alpha * lm_score
 
                     hyp_j.score = np.logaddexp(hyp_j.score, curr_score)
 
@@ -1628,3 +1698,5 @@ class BeamRNNTInferConfig:
     preserve_alignments: bool = False
     ngram_lm_model: Optional[str] = None
     ngram_lm_alpha: Optional[float] = 0.0
+    hat_subtract_ilm: bool = False
+    hat_ilm_weight: float = 0.0
