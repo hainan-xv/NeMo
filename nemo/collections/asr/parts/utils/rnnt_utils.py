@@ -152,8 +152,8 @@ class CudaHypothesesStatelessTransducer:
         self, n, m, d, device
     ):  # max number of utterance, max_length_per_utterance, dimension of decoder states
         self.scores = torch.zeros([n], dtype=torch.float, device=device)
-#        self.next_ts = torch.zeros([n], dtype=torch.long, device=device)
-#        self.batch_ids = torch.zeros([n], dtype=torch.long, device=device)
+        #        self.next_ts = torch.zeros([n], dtype=torch.long, device=device)
+        #        self.batch_ids = torch.zeros([n], dtype=torch.long, device=device)
         self.ys = torch.zeros([n * m], dtype=torch.long, device=device)
         self.dec_states = torch.zeros([n, d], dtype=torch.long, device=device)
         self.batchsize = n

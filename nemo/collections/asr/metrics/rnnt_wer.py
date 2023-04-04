@@ -436,7 +436,7 @@ class AbstractRNNTDecoding(ConfidenceMixin):
             hypotheses_list = hypotheses_list[0]  # type: List[Hypothesis]
 
         prediction_list = hypotheses_list
-#        print("PREDICTION", prediction_list)
+        #        print("PREDICTION", prediction_list)
 
         if isinstance(prediction_list[0], NBestHypotheses):
             hypotheses = []

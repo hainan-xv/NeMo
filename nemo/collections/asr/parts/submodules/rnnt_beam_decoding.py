@@ -399,14 +399,18 @@ class BeamRNNTInfer(Typing):
                     ) as idx_gen:
 
                         for batch_idx in idx_gen:
-                            inseq = encoder_output[batch_idx : batch_idx + 1, : encoded_lengths[batch_idx], :]  # [1, T, D]
+                            inseq = encoder_output[
+                                batch_idx : batch_idx + 1, : encoded_lengths[batch_idx], :
+                            ]  # [1, T, D]
                             logitlen = encoded_lengths[batch_idx]
 
                             if inseq.dtype != dtype:
                                 inseq = inseq.to(dtype=dtype)
 
                             # Extract partial hypothesis if exists
-                            partial_hypothesis = partial_hypotheses[batch_idx] if partial_hypotheses is not None else None
+                            partial_hypothesis = (
+                                partial_hypotheses[batch_idx] if partial_hypotheses is not None else None
+                            )
 
                             # Execute the specific search strategy
                             nbest_hyps = self.search_algorithm(
@@ -435,7 +439,6 @@ class BeamRNNTInfer(Typing):
                         else:
                             best_hypothesis = NBestHypotheses(nbest_hyps_i)  # type: NBestHypotheses
                         hypotheses.append(best_hypothesis)
-
 
         self.decoder.train(decoder_training_state)
         self.joint.train(joint_training_state)
@@ -550,7 +553,10 @@ class BeamRNNTInfer(Typing):
         return [hyp]
 
     def beam_search_cuda_hyp(
-        self, h: torch.Tensor, encoded_lengths: torch.Tensor, partial_hypotheses: Optional[Hypothesis] = None,
+        self,
+        h: torch.Tensor,
+        encoded_lengths: torch.Tensor,
+        partial_hypotheses: Optional[Hypothesis] = None,
         max_symbols_per_hyp: Optional[int] = 512,
     ) -> List[Hypothesis]:
         """Beam search implementation.
@@ -596,10 +602,6 @@ class BeamRNNTInfer(Typing):
         )  # hyp2t[i] represent the batch-id  of i'th hyp in kept_hyps
         hyp2batch_list_old = [i for i in range(B)]
 
-#        features = torch.zeros(
-#            [B * beam_k * save_factor, 1, D], dtype=h.dtype, device=h.device
-#        )  # to store features of hyps for all batch-id/beam-id
-
         beam_state = self.decoder.initialize_state(torch.zeros(B, device=h.device, dtype=h.dtype))
 
         final_hyps = [
@@ -617,14 +619,12 @@ class BeamRNNTInfer(Typing):
             if num_hyps == 0:
                 break
 
-#            rnnt_beam_decoding_kernel.get_feature_per_batch[num_hyps, D, self.stream_, 0](
-#                h, hyp2t, hyp2batch, features
-#            )
-
             actual_size = hyp2batch.shape[0]
-            assert(actual_size == num_hyps)
+            assert actual_size == num_hyps
 
-            features = torch.reshape(h2[hyp2t[:actual_size] + hyp2batch * h.shape[1]], [actual_size, -1, D])  # [B, 1, D]
+            features = torch.reshape(
+                h2[hyp2t[:actual_size] + hyp2batch * h.shape[1]], [actual_size, -1, D]
+            )  # [B, 1, D]
 
             hyps = kept_hyps
             kept_hyps = []
@@ -667,7 +667,6 @@ class BeamRNNTInfer(Typing):
                         y_sequence=this_hyp.y_sequence[:],
                         dec_state=this_hyp.dec_state,
                         lm_state=this_hyp.lm_state,
-#                        timestep=this_hyp.timestep[:],
                         length=encoded_lengths,
                         next_t=next_t,
                         batch_id=batch_id,
@@ -681,7 +680,6 @@ class BeamRNNTInfer(Typing):
                         state = self.decoder.batch_select_state(beam_state, i)
                         new_hyp.dec_state = state
                         new_hyp.y_sequence.append(k)
-#                        new_hyp.timestep.append(i)
                         batch2hyps[batch_id].append(new_hyp)
 
                     all_scores[batch_id].append(new_hyp.score)
@@ -721,10 +719,7 @@ class BeamRNNTInfer(Typing):
                 hyp2batch = torch.LongTensor(hyp2batch_list).to(encoded_lengths.device)
                 hyp2batch_list_old = hyp2batch_list
 
-#        print("RETURN", [self.sort_nbest(final_hyps[i]) for i in range(B)])
         return [self.sort_nbest(final_hyps[i]) for i in range(B)]
-
-
 
     def default_beam_search(
         self, h: torch.Tensor, encoded_lengths: torch.Tensor, partial_hypotheses: Optional[Hypothesis] = None
