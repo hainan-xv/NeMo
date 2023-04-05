@@ -167,6 +167,42 @@ class CudaHypothesesStatelessTransducer:
             ret.append(hyp)
         return ret
 
+# highly optimized Cuda structure representing hypotheses
+class CudaBeamSearchHypothesesStatelessTransducer:
+    scores: torch.FloatTensor
+    ys: torch.LongTensor
+    dec_states: torch.LongTensor  # since this is for stateless decoder, the "states" stores token id's of last words in the history context.
+    num_hyps: int
+
+    def __init__(
+        self, n, m, num_hyps, d, device
+    ):  # max number of utterance, max_length_per_utterance, dimension of decoder states
+        self.scores = torch.zeros([n], dtype=torch.float, device=device)
+        self.ys = torch.zeros([n * m], dtype=torch.long, device=device)
+        self.dec_states = torch.zeros([n, d], dtype=torch.long, device=device)
+        self.batchsize = n
+        self.m = m
+        self.num_hyps = num_hyps
+
+        self.hyp2t = torch.zeros([num_hyps], dtype=torch.long, device=device)
+        self.hyp2done = torch.zeros([num_hyps], dtype=torch.long, device=device)
+        self.hyp2b = torch.zeros([num_hyps], dtype=torch.long, device=device)
+        for i in range(num_hyps):
+            self.hyp2b[i] = i
+
+    def get_beam_state(self):
+        return [self.dec_states[:self.num_hyps,...]]
+
+    def get_hyps(self):
+        ret = [[] for i in range(self.num_hyps)]
+        m = self.m
+        for i in range(self.num_hyps):
+            hyp = Hypothesis(score=self.scores[i], y_sequence=self.ys[i * m + 1 : i * m + 1 + self.ys[i * m]],)
+            utt_id = i
+            ret[utt_id].append(hyp)
+        return ret
+
+
 
 @dataclass
 class NBestHypotheses:

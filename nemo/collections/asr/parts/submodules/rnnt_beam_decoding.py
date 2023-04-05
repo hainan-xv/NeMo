@@ -35,6 +35,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
+from nemo.collections.asr.parts.utils import rnnt_utils
 from nemo.collections.asr.modules import rnnt_abstract
 from nemo.collections.asr.parts.utils.rnnt_utils import (
     HATJointOutput,
@@ -272,6 +273,7 @@ class BeamRNNTInfer(Typing):
             self.search_algorithm = self.modified_adaptive_expansion_search
         elif search_type == "cuda_beam":
             self.search_algorithm = self.beam_search_cuda_hyp
+#            self.search_algorithm = self.beam_search_batched
         else:
             raise NotImplementedError(
                 f"The search type ({search_type}) supplied is not supported!\n"
@@ -552,7 +554,7 @@ class BeamRNNTInfer(Typing):
 
         return [hyp]
 
-    def beam_search_cuda_hyp(
+    def beam_search_batched(
         self,
         h: torch.Tensor,
         encoded_lengths: torch.Tensor,
@@ -720,6 +722,307 @@ class BeamRNNTInfer(Typing):
                 hyp2batch_list_old = hyp2batch_list
 
         return [self.sort_nbest(final_hyps[i]) for i in range(B)]
+
+    @torch.no_grad()
+    def _pred_step(
+        self,
+        label: Union[torch.Tensor, int],
+        hidden: Optional[torch.Tensor],
+        add_sos: bool = False,
+        batch_size: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Common prediction step based on the AbstractRNNTDecoder implementation.
+
+        Args:
+            label: (int/torch.Tensor): Label or "Start-of-Signal" token.
+            hidden: (Optional torch.Tensor): RNN State vector
+            add_sos (bool): Whether to add a zero vector at the begging as "start of sentence" token.
+            batch_size: Batch size of the output tensor.
+
+        Returns:
+            g: (B, U, H) if add_sos is false, else (B, U + 1, H)
+            hid: (h, c) where h is the final sequence hidden state and c is
+                the final cell state:
+                    h (tensor), shape (L, B, H)
+                    c (tensor), shape (L, B, H)
+        """
+        if isinstance(label, torch.Tensor):
+            # label: [batch, 1]
+            if label.dtype != torch.long:
+                label = label.long()
+
+        else:
+            # Label is an integer
+            if label == self.blank:
+                return self.decoder.predict(None, hidden, add_sos=add_sos, batch_size=batch_size)
+
+            label = label_collate([[label]])
+
+        # output: [B, 1, K]
+        return self.decoder.predict(label, hidden, add_sos=add_sos, batch_size=batch_size)
+
+    def _joint_step(self, enc, pred, log_normalize: Optional[bool] = None):
+        """
+        Common joint step based on AbstractRNNTJoint implementation.
+
+        Args:
+            enc: Output of the Encoder model. A torch.Tensor of shape [B, 1, H1]
+            pred: Output of the Decoder model. A torch.Tensor of shape [B, 1, H2]
+            log_normalize: Whether to log normalize or not. None will log normalize only for CPU.
+
+        Returns:
+             logits of shape (B, T=1, U=1, V + 1)
+        """
+        with torch.no_grad():
+            logits = self.joint.joint(enc, pred)
+
+            if log_normalize is None:
+                if not logits.is_cuda:  # Use log softmax only if on CPU
+                    logits = logits.log_softmax(dim=len(logits.shape) - 1)
+            else:
+                if log_normalize:
+                    logits = logits.log_softmax(dim=len(logits.shape) - 1)
+
+        return logits
+
+    def beam_search_cuda_hyp(
+        self,
+        x: torch.Tensor,
+        encoded_lengths: torch.Tensor,
+        partial_hypotheses: Optional[Hypothesis] = None,
+        max_symbols_per_hyp: Optional[int] = 512,
+    ) -> List[Hypothesis]:
+        """Beam search implementation.
+
+        Args:
+            x: Encoded speech features (1, T_max, D_enc)
+
+        Returns:
+            nbest_hyps: N-best decoding results
+        """
+
+
+        if partial_hypotheses is not None:
+            raise NotImplementedError("`partial_hypotheses` support is not supported")
+
+        B = encoded_lengths.shape[0]
+        D = x.shape[2]
+        beam_k = min(self.beam_size, (self.vocab_size - 1))
+        
+        with torch.inference_mode():
+            kept_hyps = rnnt_utils.CudaBeamSearchHypothesesStatelessTransducer(B * beam_k, max_symbols_per_hyp, B, 1, x.device)
+            expanded_hyps = rnnt_utils.CudaBeamSearchHypothesesStatelessTransducer(B * beam_k * beam_k, max_symbols_per_hyp, B, 1, x.device)
+
+            # Initialize Hidden state matrix (shared by entire batch)
+            hidden = None
+
+            last_label = torch.full([B, 1], fill_value=self.blank, dtype=torch.long, device=x.device)
+            x2 = torch.reshape(x, [-1, D])
+            bos = True
+            while True:
+                f = torch.reshape(x2[kept_hyps.hyp2t + kept_hyps.hyp2b * x.shape[1]], [B, -1, D])  # [B, 1, D]
+                # Prepare t timestamp batch variables
+                not_blank = True
+                symbols_added = 0
+
+                if bos:
+                    g, hidden_prime = self._pred_step(self.blank, hidden, batch_size=B)
+                    bos = False
+                else:
+                    g, hidden_prime = self._pred_step(last_label, hidden, batch_size=B)
+
+                logp = self._joint_step(f, g, log_normalize=True)[
+                    :, 0, 0, :
+                ]
+
+                if logp.dtype != torch.float32:
+                    logp = logp.float()
+
+                v, k = logp.max(1)
+                del g
+
+                k_is_blank = k == self.blank
+                k_is_blank = torch.tensor(k_is_blank, dtype=torch.long)
+                blank_indices = (k_is_blank == 1).nonzero(as_tuple=False)
+
+                # Recover prior state for all samples which predicted blank now/past
+                if hidden is not None:
+                    # LSTM has 2 states
+                    hidden_prime = self.decoder.batch_copy_states(hidden_prime, hidden, blank_indices)
+
+                elif len(blank_indices) > 0 and hidden is None:
+                    hidden_prime = self.decoder.batch_copy_states(hidden_prime, None, blank_indices, value=0.0)
+
+                k[blank_indices] = last_label[blank_indices, 0]
+
+                last_label = k.clone().view(-1, 1)
+                hidden = hidden_prime
+
+                symbols_added += 1
+                kept_hyps.hyp2t[:kept_hyps.num_hyps] += k_is_blank
+
+                kept_hyps.hyp2done = torch.logical_or(kept_hyps.hyp2done, (kept_hyps.hyp2t >= encoded_lengths))
+                not_done_idx = torch.where(kept_hyps.hyp2done != True)[0]  # .nonzero()
+                kept_hyps.scores[not_done_idx] += v[not_done_idx]
+                length_idx = max_symbols_per_hyp * kept_hyps.hyp2b
+
+                last_token_idx = kept_hyps.ys[length_idx] + length_idx + 1
+                kept_hyps.ys[last_token_idx] = k
+                kept_hyps.ys[length_idx] += 1 - k_is_blank
+
+                if torch.all(kept_hyps.hyp2done):
+                    break
+                else:
+                    kept_hyps.hyp2t *= torch.logical_not(kept_hyps.hyp2done)
+                    if not_done_idx.shape[-1] != kept_hyps.hyp2t.shape[-1]:
+                        kept_hyps.hyp2t = kept_hyps.hyp2t[not_done_idx]
+                        kept_hyps.hyp2b = kept_hyps.hyp2b[not_done_idx]
+                        B = not_done_idx.shape[-1]
+                        hidden = self.decoder.batch_subset_states(hidden_prime, hidden, not_done_idx)
+                        last_label = last_label[not_done_idx]
+                        encoded_lengths = encoded_lengths[not_done_idx]
+                        kept_hyps.hyp2done = kept_hyps.hyp2done[not_done_idx]
+
+        kept_hyps.dec_states = hidden[0].reshape([-1, 1])
+
+        return kept_hyps.get_hyps()
+
+
+
+#        # Initialize zero vector states
+#        dec_state = self.decoder.initialize_state(h[0:1, :, :])  # this step only uses h to extract batch size.
+#
+#
+#        kept_hyps = rnnt_utils.CudaBeamSearchHypothesesStatelessTransducer(B * beam_k, max_symbols_per_hyp, B, 1, h.device)
+#        expanded_hyps = rnnt_utils.CudaBeamSearchHypothesesStatelessTransducer(B * beam_k * beam_k, max_symbols_per_hyp, B, 1, h.device)
+#
+#        cache = {}
+#
+#        D = h.shape[-1]
+#
+#        hyp2t = torch.zeros(
+#            [B * beam_k], dtype=torch.long, device=encoded_lengths.device
+#        )  # hyp2t[i] represent the time step of i'th hyp in kept_hyps
+#        hyp2batch = torch.LongTensor([i for i in range(B)]).to(
+#            encoded_lengths.device
+#        )  # hyp2t[i] represent the batch-id  of i'th hyp in kept_hyps
+#        hyp2batch_list_old = [i for i in range(B)]
+#
+#        beam_state = self.decoder.initialize_state(torch.zeros(B, device=h.device, dtype=h.dtype))
+#
+#        final_hyps = [
+#            [] for i in range(B)
+#        ]  # to store hyps that reached the end of utterance for each utterance in the batch
+#        dones = [False for i in range(B)]  # mark i'th utt in the batch has finished inference.
+#
+#        h2 = torch.reshape(h, [-1, D])
+#        num_hyps = B  # in the beginning, each utterance has exactly 1 hyp
+#
+#        while True:
+#            features = torch.reshape(
+#                h2[hyp2t[:num_hyps] + hyp2batch * h.shape[1]], [num_hyps, -1, D]
+#            )  # [B, 1, D]
+#
+#            hyps = kept_hyps
+##            kept_hyps = []
+#
+##            beam_state = self.decoder.batch_initialize_states(beam_state, [hyp.dec_state for hyp in hyps])
+#
+#            beam_state = hyps.get_beam_state()
+#            print('beam_state', beam_state[0].shape)
+#
+#            beam_y, beam_state, _ = self.decoder.batch_score_hypothesis(hyps, cache, beam_state)
+#
+#            ytu = torch.log_softmax(
+#                self.joint.joint(features[:num_hyps, ::], beam_y) / self.softmax_temperature, dim=-1
+#            )  # [num_hyps, 1, 1, V + 1]
+#            ytu = ytu[:, 0, 0, :]  # [num_hyps, V + 1]
+#
+#            top_k = ytu.topk(beam_k, dim=-1)
+#
+#            print('top_k', top_k)
+#
+##            ytus = []
+##            for i in range(num_hyps):
+##                #                for pruning
+##                if False and top_k[0][i, 0].item() > -0.02:  # roughly probability 0.95
+##                    this_ytu = (top_k[0][i, 0:1], top_k[1][i, 0:1])
+##                else:
+##                    this_ytu = (top_k[0][i, :], top_k[1][i, :])
+##                ytus.append(this_ytu)
+#
+##            batch2hyps = [[] for i in range(B)]  # utterance id to a list of actual hyps
+##            all_scores = [[] for i in range(B)]  # utterance id to a list of scores
+#
+#            for i in range(num_hyps):
+#                batch_id = hyp2batch_list_old[i]
+#                if dones[batch_id]:
+#                    continue
+#                this_hyp = hyps[i]
+#
+#                for logp, k in zip(*ytus[i]):
+#                    k = int(k)
+#                    # construct hypothesis for step
+#                    next_t = this_hyp.next_t + (1 if k == self.blank else 0)
+#                    new_hyp = Hypothesis(
+#                        score=(this_hyp.score + float(logp)),
+#                        y_sequence=this_hyp.y_sequence[:],
+#                        dec_state=this_hyp.dec_state,
+#                        lm_state=this_hyp.lm_state,
+#                        length=encoded_lengths,
+#                        next_t=next_t,
+#                        batch_id=batch_id,
+#                    )
+#
+#                    # if current token is blank, dont update sequence, just store the current hypothesis
+#                    if k == self.blank:
+#                        batch2hyps[batch_id].append(new_hyp)
+#                    else:
+#                        # if non-blank token was predicted, update state and sequence and then search more hypothesis
+#                        state = self.decoder.batch_select_state(beam_state, i)
+#                        new_hyp.dec_state = state
+#                        new_hyp.y_sequence.append(k)
+#                        batch2hyps[batch_id].append(new_hyp)
+#
+#                    all_scores[batch_id].append(new_hyp.score)
+#
+#            for i in range(B):
+#                if dones[i]:
+#                    continue
+#
+#                if len(all_scores[i]) == 0:
+#                    # it's possible that more than one but less than beam-size hyps reached the end, and no other hyps survived.
+#                    assert len(final_hyps[i]) > 0
+#                    dones[i] = True
+#                    continue
+#
+#                cutoff = (
+#                    heapq.nlargest(beam_k * save_factor, all_scores[i])[-1]
+#                    if len(all_scores[i]) > beam_k * save_factor
+#                    else float('-inf')
+#                )
+#                filtered_kept_hyps = []
+#                for hyp in batch2hyps[i]:
+#                    if hyp.next_t >= encoded_lengths[i]:
+#                        final_hyps[i].append(hyp)
+#                    elif hyp.score > cutoff:
+#                        filtered_kept_hyps.append(hyp)
+#
+#                if len(final_hyps[i]) >= beam_k * save_factor:
+#                    dones[i] = True
+#
+#                if not dones[i]:
+#                    for i, new_hyp in enumerate(filtered_kept_hyps):
+#                        hyp2t_list.append(new_hyp.next_t)
+#                        hyp2batch_list.append(new_hyp.batch_id)
+#                        kept_hyps.append(new_hyp)
+#
+#                hyp2t = torch.LongTensor(hyp2t_list).to(encoded_lengths.device)
+#                hyp2batch = torch.LongTensor(hyp2batch_list).to(encoded_lengths.device)
+#                hyp2batch_list_old = hyp2batch_list
+#
+#        return [self.sort_nbest(final_hyps[i]) for i in range(B)]
 
     def default_beam_search(
         self, h: torch.Tensor, encoded_lengths: torch.Tensor, partial_hypotheses: Optional[Hypothesis] = None
