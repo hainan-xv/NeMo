@@ -811,82 +811,119 @@ class BeamRNNTInfer(Typing):
         beam_k = min(self.beam_size, (self.vocab_size - 1))
         
         with torch.inference_mode():
-            kept_hyps = rnnt_utils.CudaBeamSearchHypothesesStatelessTransducer(B * beam_k, max_symbols_per_hyp, B, 1, x.device)
-            expanded_hyps = rnnt_utils.CudaBeamSearchHypothesesStatelessTransducer(B * beam_k * beam_k, max_symbols_per_hyp, B, 1, x.device)
-
-            # Initialize Hidden state matrix (shared by entire batch)
+            hyps = rnnt_utils.CudaBeamSearchHypothesesStatelessTransducer(beam_k, max_symbols_per_hyp, B, 1, x.device, self.blank, encoded_lengths)
             hidden = None
-
-            last_label = torch.full([B, 1], fill_value=self.blank, dtype=torch.long, device=x.device)
             x2 = torch.reshape(x, [-1, D])
-            bos = True
             while True:
-                f = torch.reshape(x2[kept_hyps.hyp2t + kept_hyps.hyp2b * x.shape[1]], [B, -1, D])  # [B, 1, D]
-                # Prepare t timestamp batch variables
-                not_blank = True
-                symbols_added = 0
+                print("ANOTHER LOOP")
+                print("hyp2t is", hyps.hyp2t)
+                # getting the features for each hyp
+                f = torch.reshape(x2[hyps.hyp2t + hyps.hyp2b * x.shape[1]], [hyps.num_hyps, 1, D])
+                g, hidden_prime = self._pred_step(hyps.last_label, hidden, batch_size=hyps.num_hyps)
 
-                if bos:
-                    g, hidden_prime = self._pred_step(self.blank, hidden, batch_size=B)
-                    bos = False
-                else:
-                    g, hidden_prime = self._pred_step(last_label, hidden, batch_size=B)
+                print('hidden_prime', hidden_prime)
 
                 logp = self._joint_step(f, g, log_normalize=True)[
                     :, 0, 0, :
                 ]
 
-                if logp.dtype != torch.float32:
-                    logp = logp.float()
+                top_k = logp.topk(beam_k, dim=-1)
 
-                v, k = logp.max(1)
-                del g
+                v, k = torch.reshape(top_k[0], [-1]), torch.reshape(top_k[1], [-1])
 
-                k_is_blank = k == self.blank
-                k_is_blank = torch.tensor(k_is_blank, dtype=torch.long)
+                print("v is", v)
+                print("k is", k)
+
+                hyps.expand()  # make space for each hyp to grow beam_k copies
+
+                k_is_blank = torch.tensor(k == self.blank, dtype=torch.long)
                 blank_indices = (k_is_blank == 1).nonzero(as_tuple=False)
 
-                # Recover prior state for all samples which predicted blank now/past
+                print('k is blank', k_is_blank)
+                print('blank indices', blank_indices)
+
+                expanded_hidden_prime = [torch.reshape(hidden_prime[0].repeat_interleave(beam_k), [-1, 1])]
+
+                print('expanded_hidden_prime', expanded_hidden_prime)
+
                 if hidden is not None:
-                    # LSTM has 2 states
-                    hidden_prime = self.decoder.batch_copy_states(hidden_prime, hidden, blank_indices)
+                    expanded_hidden = [torch.reshape(hidden[0].repeat_interleave(beam_k), [-1, 1])]
+                else:
+                    expanded_hidden = None
 
+#                expanded_blank_indices = torch.reshape(blank_indices.repeat_interleave(beam_k), [-1, 1])
+
+                # Recover prior state for all samples which predicted blank now/past
+                if expanded_hidden is not None:
+                    expanded_hidden_prime = self.decoder.batch_copy_states(expanded_hidden_prime, expanded_hidden, blank_indices)
                 elif len(blank_indices) > 0 and hidden is None:
-                    hidden_prime = self.decoder.batch_copy_states(hidden_prime, None, blank_indices, value=0.0)
+                    expanded_hidden_prime = self.decoder.batch_copy_states(expanded_hidden_prime, None, blank_indices, value=0.0)
 
-                k[blank_indices] = last_label[blank_indices, 0]
+                k[blank_indices] = torch.reshape(hyps.expanded_last_label[blank_indices], k[blank_indices].shape)  # not sure what this is for
+                print('updated k is', k)
 
-                last_label = k.clone().view(-1, 1)
-                hidden = hidden_prime
+                hyps.expanded_last_label = k.clone().view(-1, 1)
+                expanded_hidden = expanded_hidden_prime
 
-                symbols_added += 1
-                kept_hyps.hyp2t[:kept_hyps.num_hyps] += k_is_blank
+                hyps.expanded_hyp2done = torch.logical_or(hyps.expanded_hyp2done, (hyps.expanded_hyp2t >= hyps.expanded_encoded_lengths))
 
-                kept_hyps.hyp2done = torch.logical_or(kept_hyps.hyp2done, (kept_hyps.hyp2t >= encoded_lengths))
-                not_done_idx = torch.where(kept_hyps.hyp2done != True)[0]  # .nonzero()
-                kept_hyps.scores[not_done_idx] += v[not_done_idx]
-                length_idx = max_symbols_per_hyp * kept_hyps.hyp2b
+                print('hyps.expanded_hyp2done', hyps.expanded_hyp2done)
 
-                last_token_idx = kept_hyps.ys[length_idx] + length_idx + 1
-                kept_hyps.ys[last_token_idx] = k
-                kept_hyps.ys[length_idx] += 1 - k_is_blank
+                expanded_not_done_idx = torch.where(hyps.expanded_hyp2done != True)[0]
 
-                if torch.all(kept_hyps.hyp2done):
+                print('expanded_not_done_idx', expanded_not_done_idx)
+
+#                print("scores before", hyps.expanded_scores)
+                hyps.expanded_scores[expanded_not_done_idx] += v[expanded_not_done_idx]
+#                print("scores after", hyps.expanded_scores)
+#                print('h2t before', hyps.expanded_hyp2t)
+
+                hyps.expanded_hyp2t += k_is_blank
+                print('expanded h2t after ', hyps.expanded_hyp2t)
+
+                expanded_length_idx = max_symbols_per_hyp * torch.tensor(range(hyps.expanded_hyp2b.shape[0]), device=hyps.expanded_hyp2b.device)
+                print('expanded_length_idx', expanded_length_idx)
+
+                expanded_last_token_idx = hyps.expanded_ys[expanded_length_idx] + expanded_length_idx + 1
+
+                print('expanded_last_token_idx', expanded_last_token_idx)
+
+                print("before")
+                hyps.print_expanded()
+
+                hyps.expanded_ys[expanded_last_token_idx] = k
+                hyps.expanded_ys[expanded_length_idx] += 1 - k_is_blank
+
+                print("after")
+                hyps.print_expanded()
+
+                hyps.compress()
+
+                print("compressed")
+                hyps.print()
+                hyps.hyp2done = torch.logical_or(hyps.hyp2done, (hyps.hyp2t >= hyps.encoded_lengths))
+
+                not_done_idx = torch.where(hyps.hyp2done != True)[0]
+
+                print('hyps.hyp2done', hyps.hyp2done)
+                print('not_done_idx', not_done_idx)
+
+                if torch.all(hyps.hyp2done):
                     break
                 else:
-                    kept_hyps.hyp2t *= torch.logical_not(kept_hyps.hyp2done)
-                    if not_done_idx.shape[-1] != kept_hyps.hyp2t.shape[-1]:
-                        kept_hyps.hyp2t = kept_hyps.hyp2t[not_done_idx]
-                        kept_hyps.hyp2b = kept_hyps.hyp2b[not_done_idx]
+                    hyps.hyp2t *= torch.logical_not(hyps.hyp2done)
+                    if not_done_idx.shape[-1] != hyps.hyp2t.shape[-1]:
+                        print('adjust')
+                        hyps.hyp2t = hyps.hyp2t[not_done_idx]
+                        hyps.hyp2b = hyps.hyp2b[not_done_idx]
                         B = not_done_idx.shape[-1]
                         hidden = self.decoder.batch_subset_states(hidden_prime, hidden, not_done_idx)
-                        last_label = last_label[not_done_idx]
-                        encoded_lengths = encoded_lengths[not_done_idx]
-                        kept_hyps.hyp2done = kept_hyps.hyp2done[not_done_idx]
+                        hyps.last_label = hyps.last_label[not_done_idx]
 
-        kept_hyps.dec_states = hidden[0].reshape([-1, 1])
+                        hyps.encoded_lengths = hyps.encoded_lengths[not_done_idx]
+                        hyps.hyp2done = hyps.hyp2done[not_done_idx]
 
-        return kept_hyps.get_hyps()
+        return hyps.get_hyps()
 
 
 

@@ -169,20 +169,33 @@ class CudaHypothesesStatelessTransducer:
 
 # highly optimized Cuda structure representing hypotheses
 class CudaBeamSearchHypothesesStatelessTransducer:
-    scores: torch.FloatTensor
-    ys: torch.LongTensor
-    dec_states: torch.LongTensor  # since this is for stateless decoder, the "states" stores token id's of last words in the history context.
-    num_hyps: int
+#    scores: torch.FloatTensor
+#    ys: torch.LongTensor
+#    dec_states: torch.LongTensor  # since this is for stateless decoder, the "states" stores token id's of last words in the history context.
+#    num_hyps: int
+#    begin: bool
 
     def __init__(
-        self, n, m, num_hyps, d, device
+        self, beam, max_length, num_hyps, context_size, device, blank, encoded_lengths
     ):  # max number of utterance, max_length_per_utterance, dimension of decoder states
-        self.scores = torch.zeros([n], dtype=torch.float, device=device)
-        self.ys = torch.zeros([n * m], dtype=torch.long, device=device)
-        self.dec_states = torch.zeros([n, d], dtype=torch.long, device=device)
-        self.batchsize = n
-        self.m = m
-        self.num_hyps = num_hyps
+
+#        n = num_hyps * beam
+        self.scores = torch.zeros([num_hyps], dtype=torch.float, device=device)
+        self.ys = torch.zeros([num_hyps * max_length], dtype=torch.long, device=device)
+        self.dec_states = torch.zeros([num_hyps, context_size], dtype=torch.long, device=device)
+        self.last_label = torch.full([num_hyps, 1], fill_value=blank, dtype=torch.long, device=device)
+        self.encoded_lengths = encoded_lengths
+
+#        n = n * beam
+
+#        self.expanded_scores = torch.zeros([n], dtype=torch.float, device=device)
+#        self.expanded_ys = torch.zeros([n * max_length], dtype=torch.long, device=device)
+#        self.expanded_dec_states = torch.zeros([n, context_size], dtype=torch.long, device=device)
+        
+        self.max_length = max_length
+        self.B = num_hyps   # self.B will not change during processing
+        self.num_hyps = num_hyps   # self.num_hyp will change.
+        self.beam = beam
 
         self.hyp2t = torch.zeros([num_hyps], dtype=torch.long, device=device)
         self.hyp2done = torch.zeros([num_hyps], dtype=torch.long, device=device)
@@ -190,8 +203,87 @@ class CudaBeamSearchHypothesesStatelessTransducer:
         for i in range(num_hyps):
             self.hyp2b[i] = i
 
-    def get_beam_state(self):
-        return [self.dec_states[:self.num_hyps,...]]
+
+        self.begin = True
+
+    def expand(self):
+        # copy each hypothesis beam times, in the expanded_* variables so that
+        # we could grow those hyps in search. 
+
+        self.expanded_scores = self.scores.repeat_interleave(self.beam)
+
+#        self.expanded_ys = self.ys.repeat_interleave(self.beam)
+        self.expanded_ys = torch.reshape(self.ys, [-1, self.max_length]).repeat(1, self.beam)
+        self.expanded_ys = torch.reshape(self.expanded_ys, [-1])
+
+        print('expanded ys')
+        self.print()
+        print(self.ys)
+        print(self.expanded_ys)
+
+        print("expanding...")
+        self.print_expanded()
+
+        self.expanded_dec_states = self.dec_states.repeat_interleave(self.beam)
+        print('dec states')
+        print(self.dec_states)
+        print(self.expanded_dec_states)
+
+        self.expanded_hyp2t = self.hyp2t.repeat_interleave(self.beam)
+        self.expanded_hyp2b = self.hyp2b.repeat_interleave(self.beam)
+        self.expanded_hyp2done = self.hyp2done.repeat_interleave(self.beam)
+        self.expanded_last_label = torch.reshape(self.last_label.repeat_interleave(self.beam), [-1, 1])
+
+        self.expanded_encoded_lengths = torch.reshape(self.encoded_lengths.repeat_interleave(self.beam), [-1])
+
+    def compress(self):
+#        print("HERE compress")
+        if self.begin:
+            self.begin = False
+            self.scores = self.expanded_scores
+            self.ys = self.expanded_ys
+            self.dec_states = self.expanded_dec_states
+            self.hyp2t = self.expanded_hyp2t
+            self.hyp2done = self.expanded_hyp2done
+            self.hyp2b = self.expanded_hyp2b
+            self.last_label = self.expanded_last_label
+            self.num_hyps = self.num_hyps * self.beam
+            self.encoded_lengths = self.expanded_encoded_lengths
+            return
+
+        v, k = torch.reshape(self.expanded_scores, [self.num_hyps, -1]).topk(self.beam, dim=-1)
+#        print("v is", v)
+
+        v, k = torch.reshape(v, [-1]), torch.reshape(k, [-1])
+
+        print("v, k are", v, k)
+
+
+        assert(0)
+
+
+    def print_expanded(self):
+        for i in range(self.num_hyps * self.beam):
+            this_len = self.expanded_ys[i * self.max_length].item()
+            to_print = ''
+            for j in range(this_len):
+                to_print += str(self.expanded_ys[i * self.max_length + 1 + j].item()) + ' '
+            print(i, this_len, to_print)
+                
+        print() 
+
+    def print(self):
+        for i in range(self.num_hyps):
+            this_len = self.ys[i * self.max_length].item()
+            to_print = ''
+            for j in range(this_len):
+                to_print += str(self.ys[i * self.max_length + 1 + j].item()) + ' '
+            print(i, this_len, to_print)
+                
+        print() 
+
+#    def get_beam_state(self):
+#        return [self.dec_states[:self.num_hyps,...]]
 
     def get_hyps(self):
         ret = [[] for i in range(self.num_hyps)]
