@@ -182,10 +182,11 @@ class CudaBeamSearchHypothesesStatelessTransducer:
 #        n = num_hyps * beam
         self.scores = torch.zeros([num_hyps], dtype=torch.float, device=device)
         self.ys = torch.zeros([num_hyps * max_length], dtype=torch.long, device=device)
-        self.dec_states = torch.zeros([num_hyps, context_size], dtype=torch.long, device=device)
+        self.dec_states = torch.zeros([num_hyps, context_size], dtype=torch.long, device=device) + blank
         self.last_label = torch.full([num_hyps, 1], fill_value=blank, dtype=torch.long, device=device)
         self.encoded_lengths = encoded_lengths
 
+        self.context_size = context_size
 #        n = n * beam
 
 #        self.expanded_scores = torch.zeros([n], dtype=torch.float, device=device)
@@ -193,7 +194,7 @@ class CudaBeamSearchHypothesesStatelessTransducer:
 #        self.expanded_dec_states = torch.zeros([n, context_size], dtype=torch.long, device=device)
         
         self.max_length = max_length
-        self.B = num_hyps   # self.B will not change during processing
+        self.B = num_hyps  # number of utterances to decode
         self.num_hyps = num_hyps   # self.num_hyp will change.
         self.beam = beam
 
@@ -205,6 +206,8 @@ class CudaBeamSearchHypothesesStatelessTransducer:
 
 
         self.begin = True
+        self.b2done = []
+        self.b2done_hyps = [[] for i in range(num_hyps)]
 
     def expand(self):
         # copy each hypothesis beam times, in the expanded_* variables so that
@@ -216,18 +219,18 @@ class CudaBeamSearchHypothesesStatelessTransducer:
         self.expanded_ys = torch.reshape(self.ys, [-1, self.max_length]).repeat(1, self.beam)
         self.expanded_ys = torch.reshape(self.expanded_ys, [-1])
 
-        print('expanded ys')
-        self.print()
-        print(self.ys)
-        print(self.expanded_ys)
+#        print('expanded ys')
+#        self.print()
+#        print(self.ys)
+#        print(self.expanded_ys)
 
-        print("expanding...")
-        self.print_expanded()
+#        print("expanding...")
+#        self.print_expanded()
 
-        self.expanded_dec_states = self.dec_states.repeat_interleave(self.beam)
-        print('dec states')
-        print(self.dec_states)
-        print(self.expanded_dec_states)
+        self.expanded_dec_states = torch.reshape(self.dec_states.repeat_interleave(self.beam), [-1, self.context_size])
+#        print('dec states')
+#        print(self.dec_states)
+#        print(self.expanded_dec_states)
 
         self.expanded_hyp2t = self.hyp2t.repeat_interleave(self.beam)
         self.expanded_hyp2b = self.hyp2b.repeat_interleave(self.beam)
@@ -251,15 +254,87 @@ class CudaBeamSearchHypothesesStatelessTransducer:
             self.encoded_lengths = self.expanded_encoded_lengths
             return
 
-        v, k = torch.reshape(self.expanded_scores, [self.num_hyps, -1]).topk(self.beam, dim=-1)
+        v, k = torch.reshape(self.expanded_scores, [self.B, -1]).topk(self.beam, dim=-1)
+
+#        print('k is', k)
+        to_add = torch.reshape(torch.tensor(range(self.B), device=k.device) * self.beam * self.beam, [self.B, 1])
+#        print('add is', to_add)
+        k = torch.reshape(k + to_add, [-1])
+
+        self.ys = torch.reshape(self.expanded_ys, [-1, self.max_length])[k]
+        self.ys = torch.reshape(self.ys, [-1])
+
+        self.scores = self.expanded_scores[k]
+        self.dec_states = self.expanded_dec_states[k]
+        self.hyp2t = self.expanded_hyp2t[k]
+        self.hyp2done = self.expanded_hyp2done[k]
+        self.hyp2b = self.expanded_hyp2b[k]
+        self.last_label = self.expanded_last_label[k]
+        self.encoded_lengths = self.expanded_encoded_lengths[k]
+
+
+#        self.dedup()
+
+    def dedup(self):
+        ys = torch.reshape(self.ys, [self.B * self.beam, self.max_length])
+        for i in range(self.B):
+            ys_i = ys[i * self.beam:(i+1) * self.beam, :ys[i * self.beam,0] + 1]
+#            print("to unique", ys_i)
+#            print(torch.unique(ys_i, dim=0).shape)
+            if torch.unique(ys_i, dim=0).shape[0] == 1:
+                print("DEDUP")
+                self.scores[i * self.beam: i * self.beam + self.beam - 1] -= 99999999.0
+
+
+#        print(self.expanded_scores)
+#        print(k)
+#        print(self.scores)
+
+#        print("new ys is", self.ys)
+#        print('k is', k)
+#        print("old ys is", self.expanded_ys)
+
 #        print("v is", v)
 
-        v, k = torch.reshape(v, [-1]), torch.reshape(k, [-1])
+#        v, k = torch.reshape(v, [-1]), torch.reshape(k, [-1])
 
-        print("v, k are", v, k)
+#        print("v, k are", v, k)
 
 
-        assert(0)
+#        assert(0)
+
+    def clean_up(self, decoder):
+        not_done_idx = torch.where(self.hyp2done != True)[0]
+        done_idx = torch.where(self.hyp2done == True)[0]
+        self.hyp2t *= torch.logical_not(self.hyp2done)
+        if not_done_idx.shape[-1] != self.hyp2t.shape[-1]:
+            print('adjust')
+#            self.hyp2t = self.hyp2t[not_done_idx]
+#            self.hyp2b = self.hyp2b[not_done_idx]
+#            B = not_done_idx.shape[-1]
+#            self.dec_states = decoder.batch_subset_states(self.dec_states, self.dec_states, not_done_idx)
+#            self.last_label = self.last_label[not_done_idx]
+#
+#            self.encoded_lengths = self.encoded_lengths[not_done_idx]
+#            self.hyp2done = self.hyp2done[not_done_idx]
+            self.scores[done_idx] = -9999999999.9 # make the score very bad so this will never show up in the search for next iteration
+
+
+#            print("done idx is", done_idx)
+            m = self.max_length
+            for i in done_idx.tolist():
+#                print(i)
+                b = self.hyp2b[i].item()
+                hyp = Hypothesis(score=self.scores[i], y_sequence=self.ys[i * m + 1 : i * m + 1 + self.ys[i * m]],)
+                self.b2done_hyps[b].append(hyp)
+
+            for b in range(len(self.b2done_hyps)):
+                hyps = self.b2done_hyps[b]
+                if len(hyps) >= self.beam:
+                    self.b2done = True
+                    
+            assert(False)
+
 
 
     def print_expanded(self):
