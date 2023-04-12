@@ -169,17 +169,10 @@ class CudaHypothesesStatelessTransducer:
 
 # highly optimized Cuda structure representing hypotheses
 class CudaBeamSearchHypothesesStatelessTransducer:
-#    scores: torch.FloatTensor
-#    ys: torch.LongTensor
-#    dec_states: torch.LongTensor  # since this is for stateless decoder, the "states" stores token id's of last words in the history context.
-#    num_hyps: int
-#    begin: bool
-
     def __init__(
         self, beam, max_length, num_hyps, context_size, device, blank, encoded_lengths
     ):  # max number of utterance, max_length_per_utterance, dimension of decoder states
 
-#        n = num_hyps * beam
         self.scores = torch.zeros([num_hyps], dtype=torch.float, device=device)
         self.ys = torch.zeros([num_hyps * max_length], dtype=torch.long, device=device)
         self.dec_states = torch.zeros([num_hyps, context_size], dtype=torch.long, device=device) + blank
@@ -206,7 +199,8 @@ class CudaBeamSearchHypothesesStatelessTransducer:
 
 
         self.begin = True
-        self.b2done = []
+        self.b2done = [False for i in range(num_hyps)]
+        self.num_b_not_done = self.B
         self.b2done_hyps = [[] for i in range(num_hyps)]
 
     def expand(self):
@@ -308,7 +302,7 @@ class CudaBeamSearchHypothesesStatelessTransducer:
         done_idx = torch.where(self.hyp2done == True)[0]
         self.hyp2t *= torch.logical_not(self.hyp2done)
         if not_done_idx.shape[-1] != self.hyp2t.shape[-1]:
-            print('adjust')
+#            print('adjust')
 #            self.hyp2t = self.hyp2t[not_done_idx]
 #            self.hyp2b = self.hyp2b[not_done_idx]
 #            B = not_done_idx.shape[-1]
@@ -325,15 +319,21 @@ class CudaBeamSearchHypothesesStatelessTransducer:
             for i in done_idx.tolist():
 #                print(i)
                 b = self.hyp2b[i].item()
-                hyp = Hypothesis(score=self.scores[i], y_sequence=self.ys[i * m + 1 : i * m + 1 + self.ys[i * m]],)
-                self.b2done_hyps[b].append(hyp)
+#                print('b is', b)
+                if not self.b2done[b] and len(self.b2done_hyps[b]) < self.beam:
+                    hyp = Hypothesis(score=self.scores[i], y_sequence=self.ys[i * m + 1 : i * m + 1 + self.ys[i * m]],)
+                    self.b2done_hyps[b].append(hyp)
+
 
             for b in range(len(self.b2done_hyps)):
                 hyps = self.b2done_hyps[b]
-                if len(hyps) >= self.beam:
-                    self.b2done = True
+                if len(hyps) >= self.beam and not self.b2done[b]:
+                    self.b2done[b] = True
+                    self.hyp2done[b * self.beam:b*self.beam + self.beam] = True
+                    self.num_b_not_done -= 1
                     
-            assert(False)
+            if  self.num_b_not_done == 0:
+                return True
 
 
 
@@ -361,13 +361,15 @@ class CudaBeamSearchHypothesesStatelessTransducer:
 #        return [self.dec_states[:self.num_hyps,...]]
 
     def get_hyps(self):
-        ret = [[] for i in range(self.num_hyps)]
-        m = self.m
-        for i in range(self.num_hyps):
-            hyp = Hypothesis(score=self.scores[i], y_sequence=self.ys[i * m + 1 : i * m + 1 + self.ys[i * m]],)
-            utt_id = i
-            ret[utt_id].append(hyp)
-        return ret
+#        ret = [[] for i in range(self.num_hyps)]
+#        m = self.max_length
+#        for i in range(self.num_hyps):
+#            hyp = Hypothesis(score=self.scores[i], y_sequence=self.ys[i * m + 1 : i * m + 1 + self.ys[i * m]],)
+#            utt_id = i
+#            ret[utt_id].append(hyp)
+#        return ret
+
+        return self.b2done_hyps
 
 
 

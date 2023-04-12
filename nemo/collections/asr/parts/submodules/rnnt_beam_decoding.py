@@ -791,7 +791,7 @@ class BeamRNNTInfer(Typing):
         x: torch.Tensor,
         encoded_lengths: torch.Tensor,
         partial_hypotheses: Optional[Hypothesis] = None,
-        max_symbols_per_hyp: Optional[int] = 512,
+        max_symbols_per_hyp: Optional[int] = 2048,
     ) -> List[Hypothesis]:
         """Beam search implementation.
 
@@ -815,18 +815,10 @@ class BeamRNNTInfer(Typing):
 #            hidden = None
             x2 = torch.reshape(x, [-1, D])
             while True:
-                print("ANOTHER LOOP")
-                print("hyp2t is", hyps.hyp2t)
                 # getting the features for each hyp
                 f = torch.reshape(x2[hyps.hyp2t + hyps.hyp2b * x.shape[1]], [hyps.num_hyps, 1, D])
-#                print('old dec state', hyps.dec_states)
-#                print('last label', hyps.last_label)
                 g, hidden_prime = self._pred_step(hyps.last_label, [hyps.dec_states], batch_size=hyps.num_hyps)
                 hyps.dec_states = hidden_prime[0]
-#                print('new dec state', hyps.dec_states)
-#
-#                print('hidden_prime', hidden_prime)
-
                 logp = self._joint_step(f, g, log_normalize=True)[
                     :, 0, 0, :
                 ]
@@ -835,82 +827,38 @@ class BeamRNNTInfer(Typing):
 
                 v, k = torch.reshape(top_k[0], [-1]), torch.reshape(top_k[1], [-1])
 
-#                print("v is", v)
-#                print("k is", k)
-
                 hyps.expand()  # make space for each hyp to grow beam_k copies
 
                 k_is_blank = torch.tensor(k == self.blank, dtype=torch.long)
                 blank_indices = (k_is_blank == 1).nonzero(as_tuple=False)
 
-#                print('k is blank', k_is_blank)
-#                print('blank indices', blank_indices)
-
                 expanded_hidden_prime = [torch.reshape(hidden_prime[0].repeat_interleave(beam_k), [-1, 1])]
-
-#                print('expanded_hidden_prime', expanded_hidden_prime)
-
-#                expanded_hidden = [torch.reshape(hidden[0].repeat_interleave(beam_k), [-1, 1])]
-
-#                expanded_blank_indices = torch.reshape(blank_indices.repeat_interleave(beam_k), [-1, 1])
-
-                # Recover prior state for all samples which predicted blank now/past
-#                if expanded_hidden is not None:
                 expanded_hidden_prime = self.decoder.batch_copy_states(expanded_hidden_prime, expanded_hidden_prime, blank_indices)
-#                elif len(blank_indices) > 0 and hidden is None:
-#                    expanded_hidden_prime = self.decoder.batch_copy_states(expanded_hidden_prime, None, blank_indices, value=0.0)
-#
                 k[blank_indices] = torch.reshape(hyps.expanded_last_label[blank_indices], k[blank_indices].shape)  # not sure what this is for
-#                print('updated k is', k)
-
                 hyps.expanded_last_label = k.clone().view(-1, 1)
                 expanded_hidden = expanded_hidden_prime
-
                 hyps.expanded_hyp2done = torch.logical_or(hyps.expanded_hyp2done, (hyps.expanded_hyp2t >= hyps.expanded_encoded_lengths))
-
-#                print('hyps.expanded_hyp2done', hyps.expanded_hyp2done)
-
                 expanded_not_done_idx = torch.where(hyps.expanded_hyp2done != True)[0]
-
-#                print('expanded_not_done_idx', expanded_not_done_idx)
-
-#                print("scores before", hyps.expanded_scores)
                 hyps.expanded_scores[expanded_not_done_idx] += v[expanded_not_done_idx]
-#                print("scores after", hyps.expanded_scores)
-#                print('h2t before', hyps.expanded_hyp2t)
-
                 hyps.expanded_hyp2t += k_is_blank
-#                print('expanded h2t after ', hyps.expanded_hyp2t)
-
                 expanded_length_idx = max_symbols_per_hyp * torch.tensor(range(hyps.expanded_hyp2b.shape[0]), device=hyps.expanded_hyp2b.device)
-#                print('expanded_length_idx', expanded_length_idx)
-
                 expanded_last_token_idx = hyps.expanded_ys[expanded_length_idx] + expanded_length_idx + 1
-
-#                print('expanded_last_token_idx', expanded_last_token_idx)
-#
-#                print("before")
-                hyps.print_expanded()
+#                hyps.print_expanded()
+               
+#                print("bug", expanded_last_token_idx)
+#                print( hyps.expanded_ys.shape)
 
                 hyps.expanded_ys[expanded_last_token_idx] = k
-                hyps.expanded_ys[expanded_length_idx] += 1 - k_is_blank
-
-#                print("after")
-                hyps.print_expanded()
-
+                hyps.expanded_ys[expanded_length_idx] += (1 - k_is_blank) * (hyps.expanded_hyp2done != True)
+#                hyps.print_expanded()
                 hyps.compress()
-
-                print("compressed")
-                hyps.print()
+#                hyps.print()
                 hyps.hyp2done = torch.logical_or(hyps.hyp2done, (hyps.hyp2t >= hyps.encoded_lengths))
 
-                print('hyps.hyp2done', hyps.hyp2done)
-#                print('not_done_idx', not_done_idx)
-
-                if torch.all(hyps.hyp2done):
+#                if torch.all(hyps.hyp2done):
+#                    break
+                if hyps.clean_up(self.decoder):
                     break
-
-                hyps.clean_up(self.decoder)
 
         return hyps.get_hyps()
 
