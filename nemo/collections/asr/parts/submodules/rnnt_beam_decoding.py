@@ -791,7 +791,7 @@ class BeamRNNTInfer(Typing):
         x: torch.Tensor,
         encoded_lengths: torch.Tensor,
         partial_hypotheses: Optional[Hypothesis] = None,
-        max_symbols_per_hyp: Optional[int] = 2048,
+        max_symbols_per_hyp: Optional[int] = 512,
     ) -> List[Hypothesis]:
         """Beam search implementation.
 
@@ -843,160 +843,19 @@ class BeamRNNTInfer(Typing):
                 hyps.expanded_hyp2t += k_is_blank
                 expanded_length_idx = max_symbols_per_hyp * torch.tensor(range(hyps.expanded_hyp2b.shape[0]), device=hyps.expanded_hyp2b.device)
                 expanded_last_token_idx = hyps.expanded_ys[expanded_length_idx] + expanded_length_idx + 1
-#                hyps.print_expanded()
-               
-#                print("bug", expanded_last_token_idx)
-#                print( hyps.expanded_ys.shape)
 
                 hyps.expanded_ys[expanded_last_token_idx] = k
                 hyps.expanded_ys[expanded_length_idx] += (1 - k_is_blank) * (hyps.expanded_hyp2done != True)
-#                hyps.print_expanded()
                 hyps.compress()
-#                hyps.print()
                 hyps.hyp2done = torch.logical_or(hyps.hyp2done, (hyps.hyp2t >= hyps.encoded_lengths))
 
-#                if torch.all(hyps.hyp2done):
-#                    break
-                if hyps.clean_up(self.decoder):
+                hyps.clean_up(self.decoder)
+
+                if hyps.num_b_not_done == 0:
                     break
 
         return hyps.get_hyps()
 
-
-
-#        # Initialize zero vector states
-#        dec_state = self.decoder.initialize_state(h[0:1, :, :])  # this step only uses h to extract batch size.
-#
-#
-#        kept_hyps = rnnt_utils.CudaBeamSearchHypothesesStatelessTransducer(B * beam_k, max_symbols_per_hyp, B, 1, h.device)
-#        expanded_hyps = rnnt_utils.CudaBeamSearchHypothesesStatelessTransducer(B * beam_k * beam_k, max_symbols_per_hyp, B, 1, h.device)
-#
-#        cache = {}
-#
-#        D = h.shape[-1]
-#
-#        hyp2t = torch.zeros(
-#            [B * beam_k], dtype=torch.long, device=encoded_lengths.device
-#        )  # hyp2t[i] represent the time step of i'th hyp in kept_hyps
-#        hyp2batch = torch.LongTensor([i for i in range(B)]).to(
-#            encoded_lengths.device
-#        )  # hyp2t[i] represent the batch-id  of i'th hyp in kept_hyps
-#        hyp2batch_list_old = [i for i in range(B)]
-#
-#        beam_state = self.decoder.initialize_state(torch.zeros(B, device=h.device, dtype=h.dtype))
-#
-#        final_hyps = [
-#            [] for i in range(B)
-#        ]  # to store hyps that reached the end of utterance for each utterance in the batch
-#        dones = [False for i in range(B)]  # mark i'th utt in the batch has finished inference.
-#
-#        h2 = torch.reshape(h, [-1, D])
-#        num_hyps = B  # in the beginning, each utterance has exactly 1 hyp
-#
-#        while True:
-#            features = torch.reshape(
-#                h2[hyp2t[:num_hyps] + hyp2batch * h.shape[1]], [num_hyps, -1, D]
-#            )  # [B, 1, D]
-#
-#            hyps = kept_hyps
-##            kept_hyps = []
-#
-##            beam_state = self.decoder.batch_initialize_states(beam_state, [hyp.dec_state for hyp in hyps])
-#
-#            beam_state = hyps.get_beam_state()
-#            print('beam_state', beam_state[0].shape)
-#
-#            beam_y, beam_state, _ = self.decoder.batch_score_hypothesis(hyps, cache, beam_state)
-#
-#            ytu = torch.log_softmax(
-#                self.joint.joint(features[:num_hyps, ::], beam_y) / self.softmax_temperature, dim=-1
-#            )  # [num_hyps, 1, 1, V + 1]
-#            ytu = ytu[:, 0, 0, :]  # [num_hyps, V + 1]
-#
-#            top_k = ytu.topk(beam_k, dim=-1)
-#
-#            print('top_k', top_k)
-#
-##            ytus = []
-##            for i in range(num_hyps):
-##                #                for pruning
-##                if False and top_k[0][i, 0].item() > -0.02:  # roughly probability 0.95
-##                    this_ytu = (top_k[0][i, 0:1], top_k[1][i, 0:1])
-##                else:
-##                    this_ytu = (top_k[0][i, :], top_k[1][i, :])
-##                ytus.append(this_ytu)
-#
-##            batch2hyps = [[] for i in range(B)]  # utterance id to a list of actual hyps
-##            all_scores = [[] for i in range(B)]  # utterance id to a list of scores
-#
-#            for i in range(num_hyps):
-#                batch_id = hyp2batch_list_old[i]
-#                if dones[batch_id]:
-#                    continue
-#                this_hyp = hyps[i]
-#
-#                for logp, k in zip(*ytus[i]):
-#                    k = int(k)
-#                    # construct hypothesis for step
-#                    next_t = this_hyp.next_t + (1 if k == self.blank else 0)
-#                    new_hyp = Hypothesis(
-#                        score=(this_hyp.score + float(logp)),
-#                        y_sequence=this_hyp.y_sequence[:],
-#                        dec_state=this_hyp.dec_state,
-#                        lm_state=this_hyp.lm_state,
-#                        length=encoded_lengths,
-#                        next_t=next_t,
-#                        batch_id=batch_id,
-#                    )
-#
-#                    # if current token is blank, dont update sequence, just store the current hypothesis
-#                    if k == self.blank:
-#                        batch2hyps[batch_id].append(new_hyp)
-#                    else:
-#                        # if non-blank token was predicted, update state and sequence and then search more hypothesis
-#                        state = self.decoder.batch_select_state(beam_state, i)
-#                        new_hyp.dec_state = state
-#                        new_hyp.y_sequence.append(k)
-#                        batch2hyps[batch_id].append(new_hyp)
-#
-#                    all_scores[batch_id].append(new_hyp.score)
-#
-#            for i in range(B):
-#                if dones[i]:
-#                    continue
-#
-#                if len(all_scores[i]) == 0:
-#                    # it's possible that more than one but less than beam-size hyps reached the end, and no other hyps survived.
-#                    assert len(final_hyps[i]) > 0
-#                    dones[i] = True
-#                    continue
-#
-#                cutoff = (
-#                    heapq.nlargest(beam_k * save_factor, all_scores[i])[-1]
-#                    if len(all_scores[i]) > beam_k * save_factor
-#                    else float('-inf')
-#                )
-#                filtered_kept_hyps = []
-#                for hyp in batch2hyps[i]:
-#                    if hyp.next_t >= encoded_lengths[i]:
-#                        final_hyps[i].append(hyp)
-#                    elif hyp.score > cutoff:
-#                        filtered_kept_hyps.append(hyp)
-#
-#                if len(final_hyps[i]) >= beam_k * save_factor:
-#                    dones[i] = True
-#
-#                if not dones[i]:
-#                    for i, new_hyp in enumerate(filtered_kept_hyps):
-#                        hyp2t_list.append(new_hyp.next_t)
-#                        hyp2batch_list.append(new_hyp.batch_id)
-#                        kept_hyps.append(new_hyp)
-#
-#                hyp2t = torch.LongTensor(hyp2t_list).to(encoded_lengths.device)
-#                hyp2batch = torch.LongTensor(hyp2batch_list).to(encoded_lengths.device)
-#                hyp2batch_list_old = hyp2batch_list
-#
-#        return [self.sort_nbest(final_hyps[i]) for i in range(B)]
 
     def default_beam_search(
         self, h: torch.Tensor, encoded_lengths: torch.Tensor, partial_hypotheses: Optional[Hypothesis] = None
