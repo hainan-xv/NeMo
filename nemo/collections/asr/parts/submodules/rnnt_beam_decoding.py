@@ -257,7 +257,7 @@ class BeamRNNTInfer(Typing):
         self.score_norm = score_norm
         self.max_candidates = beam_size
 
-        if self.beam_size == 1:
+        if self.beam_size == 1 and search_type != "cuda_beam":
             logging.info("Beam size of 1 was used, switching to sample level `greedy_search`")
             self.search_algorithm = self.greedy_search
         elif search_type == "default":
@@ -273,7 +273,7 @@ class BeamRNNTInfer(Typing):
             self.search_algorithm = self.modified_adaptive_expansion_search
         elif search_type == "cuda_beam":
             self.search_algorithm = self.beam_search_cuda_hyp
-#            self.search_algorithm = self.beam_search_batched
+        #            self.search_algorithm = self.beam_search_batched
         else:
             raise NotImplementedError(
                 f"The search type ({search_type}) supplied is not supported!\n"
@@ -802,52 +802,81 @@ class BeamRNNTInfer(Typing):
             nbest_hyps: N-best decoding results
         """
 
-
         if partial_hypotheses is not None:
             raise NotImplementedError("`partial_hypotheses` support is not supported")
 
         B = encoded_lengths.shape[0]
         D = x.shape[2]
         beam_k = min(self.beam_size, (self.vocab_size - 1))
-        
+
         with torch.inference_mode():
-            hyps = rnnt_utils.CudaBeamSearchHypothesesStatelessTransducer(beam_k, max_symbols_per_hyp, B, 1, x.device, self.blank, encoded_lengths)
-#            hidden = None
+            hyps = rnnt_utils.CudaBeamSearchHypothesesStatelessTransducer(
+                beam_k, max_symbols_per_hyp, B, 1, x.device, self.blank, encoded_lengths
+            )
             x2 = torch.reshape(x, [-1, D])
+
+            begin_expanded_length_idx = max_symbols_per_hyp * torch.tensor(range(B * beam_k), device=hyps.hyp2b.device)
+
+            expanded_length_idx = max_symbols_per_hyp * torch.tensor(
+                range(B * beam_k * beam_k), device=hyps.hyp2b.device
+            )
+
+            begin = True
+
             while True:
                 # getting the features for each hyp
                 f = torch.reshape(x2[hyps.hyp2t + hyps.hyp2b * x.shape[1]], [hyps.num_hyps, 1, D])
                 g, hidden_prime = self._pred_step(hyps.last_label, [hyps.dec_states], batch_size=hyps.num_hyps)
                 hyps.dec_states = hidden_prime[0]
-                logp = self._joint_step(f, g, log_normalize=True)[
-                    :, 0, 0, :
-                ]
-
+                logp = self._joint_step(f, g, log_normalize=True)[:, 0, 0, :]
                 top_k = logp.topk(beam_k, dim=-1)
-
                 v, k = torch.reshape(top_k[0], [-1]), torch.reshape(top_k[1], [-1])
 
-                hyps.expand()  # make space for each hyp to grow beam_k copies
-
+                hyps.expand()
                 k_is_blank = torch.tensor(k == self.blank, dtype=torch.long)
                 blank_indices = (k_is_blank == 1).nonzero(as_tuple=False)
 
                 expanded_hidden_prime = [torch.reshape(hidden_prime[0].repeat_interleave(beam_k), [-1, 1])]
-                expanded_hidden_prime = self.decoder.batch_copy_states(expanded_hidden_prime, expanded_hidden_prime, blank_indices)
-                k[blank_indices] = torch.reshape(hyps.expanded_last_label[blank_indices], k[blank_indices].shape)  # not sure what this is for
+                expanded_hidden_prime = self.decoder.batch_copy_states(
+                    expanded_hidden_prime, expanded_hidden_prime, blank_indices
+                )
+
+                k[blank_indices] = torch.reshape(
+                    hyps.expanded_last_label[blank_indices], k[blank_indices].shape
+                )
+
                 hyps.expanded_last_label = k.clone().view(-1, 1)
-                expanded_hidden = expanded_hidden_prime
-                hyps.expanded_hyp2done = torch.logical_or(hyps.expanded_hyp2done, (hyps.expanded_hyp2t >= hyps.expanded_encoded_lengths))
+
+                if begin:
+                    hyps.expanded_hyp2done = torch.logical_or(
+                        hyps.expanded_hyp2done, (hyps.expanded_hyp2t >= hyps.beam_encoded_lengths)
+                    )
+                else:
+                    hyps.expanded_hyp2done = torch.logical_or(
+                        hyps.expanded_hyp2done, (hyps.expanded_hyp2t >= hyps.beam_beam_encoded_lengths)
+                    )
+
                 expanded_not_done_idx = torch.where(hyps.expanded_hyp2done != True)[0]
                 hyps.expanded_scores[expanded_not_done_idx] += v[expanded_not_done_idx]
                 hyps.expanded_hyp2t += k_is_blank
-                expanded_length_idx = max_symbols_per_hyp * torch.tensor(range(hyps.expanded_hyp2b.shape[0]), device=hyps.expanded_hyp2b.device)
-                expanded_last_token_idx = hyps.expanded_ys[expanded_length_idx] + expanded_length_idx + 1
 
-                hyps.expanded_ys[expanded_last_token_idx] = k
-                hyps.expanded_ys[expanded_length_idx] += (1 - k_is_blank) * (hyps.expanded_hyp2done != True)
+                if begin:
+                    expanded_last_token_idx = (
+                        hyps.expanded_ys[begin_expanded_length_idx] + begin_expanded_length_idx + 1
+                    )
+                    hyps.expanded_ys[expanded_last_token_idx] = k
+                    hyps.expanded_ys[begin_expanded_length_idx] += (1 - k_is_blank) * (hyps.expanded_hyp2done != True)
+                else:
+                    expanded_last_token_idx = hyps.expanded_ys[expanded_length_idx] + expanded_length_idx + 1
+                    hyps.expanded_ys[expanded_last_token_idx] = k
+                    hyps.expanded_ys[expanded_length_idx] += (1 - k_is_blank) * (hyps.expanded_hyp2done != True)
+
                 hyps.compress()
-                hyps.hyp2done = torch.logical_or(hyps.hyp2done, (hyps.hyp2t >= hyps.encoded_lengths))
+                if begin:
+                    hyps.hyp2done = torch.logical_or(hyps.hyp2done, (hyps.hyp2t >= hyps.beam_encoded_lengths))
+                    begin = False
+                else:
+                    hyps.hyp2done = torch.logical_or(hyps.hyp2done, (hyps.hyp2t >= hyps.beam_encoded_lengths))
 
                 hyps.clean_up(self.decoder)
 
@@ -855,7 +884,6 @@ class BeamRNNTInfer(Typing):
                     break
 
         return hyps.get_hyps()
-
 
     def default_beam_search(
         self, h: torch.Tensor, encoded_lengths: torch.Tensor, partial_hypotheses: Optional[Hypothesis] = None

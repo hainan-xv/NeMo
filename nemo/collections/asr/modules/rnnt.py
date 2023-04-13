@@ -510,8 +510,10 @@ class StatelessTransducerDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable):
         return batch_y, batch_states, lm_tokens
 
     def batch_score_cuda_hypothesis(
-        self, hypotheses: rnnt_utils.CudaBeamSearchHypothesesStatelessTransducer,
-        cache: Dict[Tuple[int], Any], batch_states: List[torch.Tensor]
+        self,
+        hypotheses: rnnt_utils.CudaBeamSearchHypothesesStatelessTransducer,
+        cache: Dict[Tuple[int], Any],
+        batch_states: List[torch.Tensor],
     ) -> Tuple[torch.Tensor, List[torch.Tensor], torch.Tensor]:
         """
         Used for batched beam search algorithms. Similar to score_hypothesis method.
