@@ -823,27 +823,34 @@ class BeamRNNTInfer(Typing):
 
             begin = True
 
+            begin_shift = hyps.hyp2b * x.shape[1]
+            shift = hyps.beam_hyp2b * x.shape[1]
+
             while True:
                 # getting the features for each hyp
-                f = torch.reshape(x2[hyps.hyp2t + hyps.hyp2b * x.shape[1]], [hyps.num_hyps, 1, D])
+                if begin:
+                    f = torch.reshape(x2[hyps.hyp2t + begin_shift], [hyps.num_hyps, 1, D])
+                else:
+                    f = torch.reshape(x2[hyps.hyp2t + shift], [hyps.num_hyps, 1, D])
+
                 g, hidden_prime = self._pred_step(hyps.last_label, [hyps.dec_states], batch_size=hyps.num_hyps)
-                hyps.dec_states = hidden_prime[0]
+
                 logp = self._joint_step(f, g, log_normalize=True)[:, 0, 0, :]
                 top_k = logp.topk(beam_k, dim=-1)
+
                 v, k = torch.reshape(top_k[0], [-1]), torch.reshape(top_k[1], [-1])
 
                 hyps.expand()
+
                 k_is_blank = torch.tensor(k == self.blank, dtype=torch.long)
                 blank_indices = (k_is_blank == 1).nonzero(as_tuple=False)
-
-                expanded_hidden_prime = [torch.reshape(hidden_prime[0].repeat_interleave(beam_k), [-1, 1])]
-                expanded_hidden_prime = self.decoder.batch_copy_states(
-                    expanded_hidden_prime, expanded_hidden_prime, blank_indices
-                )
 
                 k[blank_indices] = torch.reshape(
                     hyps.expanded_last_label[blank_indices], k[blank_indices].shape
                 )
+
+                expanded_hidden_prime = torch.reshape(hidden_prime[0].repeat_interleave(beam_k), [-1, 1])
+                hyps.expanded_dec_states = self.decoder.batch_copy_states([expanded_hidden_prime], [hyps.dec_states], blank_indices)[0]
 
                 hyps.expanded_last_label = k.clone().view(-1, 1)
 
@@ -857,6 +864,7 @@ class BeamRNNTInfer(Typing):
                     )
 
                 expanded_not_done_idx = torch.where(hyps.expanded_hyp2done != True)[0]
+
                 hyps.expanded_scores[expanded_not_done_idx] += v[expanded_not_done_idx]
                 hyps.expanded_hyp2t += k_is_blank
 
@@ -878,7 +886,7 @@ class BeamRNNTInfer(Typing):
                 else:
                     hyps.hyp2done = torch.logical_or(hyps.hyp2done, (hyps.hyp2t >= hyps.beam_encoded_lengths))
 
-                hyps.clean_up(self.decoder)
+                hyps.clean_up()
 
                 if hyps.num_b_not_done == 0:
                     break

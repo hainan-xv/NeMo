@@ -755,6 +755,7 @@ class GreedyBatchedRNNTInfer(_GreedyRNNTInfer):
     ):
         if partial_hypotheses is not None:
             raise NotImplementedError("`partial_hypotheses` support is not supported")
+#        print("HEREHEREHERE")
 
         with torch.inference_mode():
             # x: [B, T, D]
@@ -817,6 +818,9 @@ class GreedyBatchedRNNTInfer(_GreedyRNNTInfer):
                         g, hidden_prime = self._pred_step(self._SOS, hidden, batch_size=batchsize)
                     else:
                         # Perform batch step prediction of decoder, getting new states and scores ("g")
+
+#                        print('hidden....', hidden[0] if hidden is not None else None)
+#                        print('last_label', last_label)
                         g, hidden_prime = self._pred_step(last_label, hidden, batch_size=batchsize)
 
                     # Batched joint step - Output = [B, V + 1]

@@ -190,6 +190,7 @@ class CudaBeamSearchHypothesesStatelessTransducer:
         self.hyp2t = torch.zeros([num_hyps], dtype=torch.long, device=device)
         self.hyp2done = torch.zeros([num_hyps], dtype=torch.long, device=device)
         self.hyp2b = torch.zeros([num_hyps], dtype=torch.long, device=device)
+
         for i in range(num_hyps):
             self.hyp2b[i] = i
 
@@ -200,6 +201,11 @@ class CudaBeamSearchHypothesesStatelessTransducer:
 
         self.beam_beam_encoded_lengths = torch.reshape(self.encoded_lengths.repeat_interleave(self.beam * self.beam), [-1])
         self.beam_encoded_lengths = torch.reshape(self.encoded_lengths.repeat_interleave(self.beam), [-1])
+
+        self.shift = torch.reshape(torch.tensor(range(self.B), device=self.hyp2t.device) * self.beam * self.beam, [self.B, 1])
+  
+        self.beam_hyp2b = self.hyp2b.repeat_interleave(self.beam)
+#        self.beam_beam_hyp2b = self.hyp2b.repeat_interleave(self.beam * self.beam)
 
     def expand(self):
         # copy each hypothesis beam times, in the expanded_* variables so that
@@ -213,7 +219,6 @@ class CudaBeamSearchHypothesesStatelessTransducer:
         self.expanded_dec_states = torch.reshape(self.dec_states.repeat_interleave(self.beam), [-1, self.context_size])
 
         self.expanded_hyp2t = self.hyp2t.repeat_interleave(self.beam)
-        self.expanded_hyp2b = self.hyp2b.repeat_interleave(self.beam)
         self.expanded_hyp2done = self.hyp2done.repeat_interleave(self.beam)
         self.expanded_last_label = torch.reshape(self.last_label.repeat_interleave(self.beam), [-1, 1])
 
@@ -225,7 +230,7 @@ class CudaBeamSearchHypothesesStatelessTransducer:
             self.dec_states = self.expanded_dec_states
             self.hyp2t = self.expanded_hyp2t
             self.hyp2done = self.expanded_hyp2done
-            self.hyp2b = self.expanded_hyp2b
+#            self.hyp2b = self.beam_hyp2b
             self.last_label = self.expanded_last_label
             self.num_hyps = self.num_hyps * self.beam
 #            self.encoded_lengths = self.expanded_encoded_lengths
@@ -233,8 +238,7 @@ class CudaBeamSearchHypothesesStatelessTransducer:
 
         v, k = torch.reshape(self.expanded_scores, [self.B, -1]).topk(self.beam, dim=-1)
 
-        to_add = torch.reshape(torch.tensor(range(self.B), device=k.device) * self.beam * self.beam, [self.B, 1])
-        k = torch.reshape(k + to_add, [-1])
+        k = torch.reshape(k + self.shift, [-1])
 
         self.ys = torch.reshape(self.expanded_ys, [-1, self.max_length])[k]
         self.ys = torch.reshape(self.ys, [-1])
@@ -243,7 +247,7 @@ class CudaBeamSearchHypothesesStatelessTransducer:
         self.dec_states = self.expanded_dec_states[k]
         self.hyp2t = self.expanded_hyp2t[k]
         self.hyp2done = self.expanded_hyp2done[k]
-        self.hyp2b = self.expanded_hyp2b[k]
+#        self.hyp2b = self.expanded_hyp2b[k]
         self.last_label = self.expanded_last_label[k]
 
     #        self.dedup()
@@ -273,7 +277,7 @@ class CudaBeamSearchHypothesesStatelessTransducer:
 
     #        assert(0)
 
-    def clean_up(self, decoder):
+    def clean_up(self):
         not_done_idx = torch.where(self.hyp2done != True)[0]
         done_idx = torch.where(self.hyp2done == True)[0]
         self.hyp2t *= torch.logical_not(self.hyp2done)
@@ -295,7 +299,7 @@ class CudaBeamSearchHypothesesStatelessTransducer:
             m = self.max_length
             for i in done_idx.tolist():
                 #                print(i)
-                b = self.hyp2b[i].item()
+                b = self.beam_hyp2b[i].item()
                 #                print('b is', b)
                 if not self.b2done[b] and len(self.b2done_hyps[b]) < self.beam:
                     hyp = Hypothesis(score=self.scores[i], y_sequence=self.ys[i * m + 1 : i * m + 1 + self.ys[i * m]],)
