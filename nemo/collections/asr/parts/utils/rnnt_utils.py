@@ -250,7 +250,7 @@ class CudaBeamSearchHypothesesStatelessTransducer:
 #        self.hyp2b = self.expanded_hyp2b[k]
         self.last_label = self.expanded_last_label[k]
 
-    #        self.dedup()
+        self.dedup()
 
     def dedup(self):
         ys = torch.reshape(self.ys, [self.B * self.beam, self.max_length])

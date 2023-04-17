@@ -850,7 +850,7 @@ class BeamRNNTInfer(Typing):
                 )
 
                 expanded_hidden_prime = torch.reshape(hidden_prime[0].repeat_interleave(beam_k), [-1, 1])
-                hyps.expanded_dec_states = self.decoder.batch_copy_states([expanded_hidden_prime], [hyps.dec_states], blank_indices)[0]
+                hyps.expanded_dec_states = self.decoder.batch_copy_states([expanded_hidden_prime], [hyps.expanded_dec_states], blank_indices)[0]
 
                 hyps.expanded_last_label = k.clone().view(-1, 1)
 
