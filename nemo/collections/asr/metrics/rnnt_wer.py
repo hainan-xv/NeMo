@@ -351,6 +351,7 @@ class AbstractRNNTDecoding(ConfidenceMixin):
             self.decoding = beam_decode.BeamRNNTInfer(
                 decoder_model=decoder,
                 joint_model=joint,
+                big_blank_durations=self.big_blank_durations,
                 beam_size=self.cfg.beam.beam_size,
                 return_best_hypothesis=decoding_cfg.beam.get('return_best_hypothesis', True),
                 search_type='maes',
