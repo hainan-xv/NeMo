@@ -57,6 +57,7 @@ class SentencePieceTokenizer(TokenizerSpec):
             self.add_special_tokens(special_tokens)
 
     def text_to_tokens(self, text):
+        text = text[::-1]
         if self.legacy:
             tokens = []
             idx = 0
@@ -82,11 +83,12 @@ class SentencePieceTokenizer(TokenizerSpec):
                 idx = next_idx + len(next_token)
 
             tokens.extend(self.tokenizer.encode_as_pieces(text[idx:]))
-            return tokens
+            return tokens[::-1]
 
-        return self.tokenizer.encode_as_pieces(text)
+        return self.tokenizer.encode_as_pieces(text)[::-1]
 
     def text_to_ids(self, text):
+        text = text[::-1]
         if self.legacy:
             ids = []
             idx = 0
@@ -112,20 +114,22 @@ class SentencePieceTokenizer(TokenizerSpec):
                 idx = next_idx + len(next_token)
 
             ids.extend(self.tokenizer.encode_as_ids(text[idx:]))
-            return ids
+            return ids[::-1]
 
-        return self.tokenizer.encode_as_ids(text)
+        return self.tokenizer.encode_as_ids(text)[::-1]
 
     def tokens_to_text(self, tokens):
         if isinstance(tokens, np.ndarray):
             tokens = tokens.tolist()
 
-        return self.tokenizer.decode_pieces(tokens)
+        tokens = tokens[::-1]
+        return self.tokenizer.decode_pieces(tokens)[::-1]
 
     def ids_to_text(self, ids):
         if isinstance(ids, np.ndarray):
             ids = ids.tolist()
 
+        ids = ids[::-1]
         if self.legacy:
             text = ""
             last_i = 0
@@ -137,9 +141,9 @@ class SentencePieceTokenizer(TokenizerSpec):
                     last_i = i + 1
 
             text += self.tokenizer.decode_ids(ids[last_i:])
-            return text.strip()
+            return text.strip()[::-1]
 
-        return self.tokenizer.decode_ids(ids)
+        return self.tokenizer.decode_ids(ids)[::-1]
 
     def token_to_id(self, token):
         if self.legacy and token in self.special_token_to_id:
@@ -396,3 +400,31 @@ def create_spt_model(
         for token in vocab:
             f.write(f"{token}\n")
     return f'{output_dir}/tokenizer.model', vocab_file
+
+if __name__ == "__main__":
+    t = SentencePieceTokenizer("/home/hainanx/nemo_exps_local/tokenizer_reversed/tokenizer_spe_bpe_v1024/tokenizer.model")
+    for sentence in open("/home/hainanx/libri_dev.txt", 'r'):
+        sentence = sentence.strip()
+
+# test text_to_tokens() and tokens_to_text()
+        tokens = t.text_to_tokens(sentence)
+#        print(tokens)
+        reconstructed_sentence = t.tokens_to_text(tokens)
+        if not sentence == reconstructed_sentence or True:
+            print("token not equal")
+            print(sentence)
+            print(' '.join(tokens))
+            print(reconstructed_sentence)
+#            exit(-1)
+
+# test text_to_ids() and ids_to_text()
+        ids = t.text_to_ids(sentence)
+        reconstructed_sentence = t.ids_to_text(ids)
+        if not sentence == reconstructed_sentence:
+            print("id not equal")
+            print(sentence)
+            print(reconstructed_sentence)
+            exit(-1)
+#        print(' '.join(tokens))
+
+    print("greedy testing successful")
