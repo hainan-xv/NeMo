@@ -84,6 +84,7 @@ def compute_alphas_kernel_wordware(
     maxU: int,
     alphabet_size: int,
     blank_: int,
+    is_special: torch.Tensor,
 ):
     """
     Compute alpha (forward variable) probabilities over the transduction step.

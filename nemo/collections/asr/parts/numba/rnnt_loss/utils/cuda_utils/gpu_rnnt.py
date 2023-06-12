@@ -338,7 +338,6 @@ class GPURNNTWORDAWARE:
         assert(is_special is not None)
         self.is_special_ = torch.Tensor(is_special, dtype=torch.long, device=workspace.device)
 
-        print("HERE")
         print(self.is_special_)
         self.stream_ = stream  # type: cuda.cudadrv.driver.Stream
 

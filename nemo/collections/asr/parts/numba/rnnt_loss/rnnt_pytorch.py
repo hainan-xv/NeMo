@@ -527,7 +527,7 @@ def get_special(vocab_file):
     n = 0
     res = []
     for line in f:
-        res.append(line.startswith('▁'))
+        res.append(int(line.startswith('▁')))
 
     return res
 
@@ -554,9 +554,6 @@ class WORDAWARERNNTLossNumba(Module):
         assert vocab_file is not None
 
         self.is_special = get_special(vocab_file)
-
-        print("HERE is_special")
-        print(self.is_special)
 
         self.loss = _WORDAWARERNNTNumba.apply
 
