@@ -577,6 +577,25 @@ class WORDAWARERNNTLossNumba(Module):
             # log_softmax is computed within GPU version.
             acts = torch.nn.functional.log_softmax(acts, -1)
 
+        # now replacing acts[:,:,:,blank] as -inf if history word is not "special"
+
+        labels_cpu = labels.cpu()
+        labels_cpu.apply_(lambda val: self.is_special[val])
+
+        label_add_inf = 1 - labels_cpu.to(labels.device)  # if not EOW, then make blank INF
+        label_add_inf = label_add_inf.reshape([label_add_inf.shape[0], 1, label_add_inf.shape[-1]])
+
+#        print("HERE NOW LABELS", label_add_inf.shape)
+#        print("HERE ACT SHAPE", acts.shape)
+
+#        print("actshape", acts[:,:,1:,self.blank].shape)
+#        print("minus shape", label_add_inf.shape)
+        acts[:,:,1:,self.blank] -= label_add_inf * 99999.0
+
+
+#        label_is_special = self.is_special[labels]
+#        print("HERE label is", label_is_special)
+
         return self.loss(
             acts, labels, act_lens, label_lens, self.blank, self.reduction, self.fastemit_lambda, self.clamp, self.is_special
         )

@@ -336,9 +336,10 @@ class GPURNNTWORDAWARE:
         self.num_threads_ = num_threads
 
         assert(is_special is not None)
-        self.is_special_ = torch.Tensor(is_special, dtype=torch.long, device=workspace.device)
+#        print('HERE is special', is_special)
+        self.is_special = torch.LongTensor(is_special).to(workspace.device)
 
-        print(self.is_special_)
+#        print(self.is_special_)
         self.stream_ = stream  # type: cuda.cudadrv.driver.Stream
 
         if num_threads > 0:
@@ -418,7 +419,7 @@ class GPURNNTWORDAWARE:
         self.log_softmax(acts, denom)
 
         # Compute alphas
-        gpu_rnnt_kernel.compute_alphas_kernel_wordaware[self.minibatch_, self.maxU_, self.stream_, 0](
+        gpu_rnnt_kernel.compute_alphas_kernel[self.minibatch_, self.maxU_, self.stream_, 0](
             acts,
             denom,
             alphas,
@@ -431,12 +432,11 @@ class GPURNNTWORDAWARE:
             self.maxU_,
             self.alphabet_size_,
             self.blank_,
-            self.is_special
         )
 
         if training:
             # Compute betas
-            gpu_rnnt_kernel.compute_betas_kernel_wordware[self.minibatch_, self.maxU_, self.stream_, 0](
+            gpu_rnnt_kernel.compute_betas_kernel[self.minibatch_, self.maxU_, self.stream_, 0](
                 acts,
                 denom,
                 betas,
@@ -449,13 +449,12 @@ class GPURNNTWORDAWARE:
                 self.maxU_,
                 self.alphabet_size_,
                 self.blank_,
-                self.is_special
             )
 
             # Compute gradient
             grad_blocks_per_grid = self.minibatch_ * self.maxT_ * self.maxU_
             grad_threads_per_block = gpu_rnnt_kernel.GPU_RNNT_THREAD_SIZE
-            gpu_rnnt_kernel.compute_grad_kernel_wordaware[grad_blocks_per_grid, grad_threads_per_block, self.stream_, 0](
+            gpu_rnnt_kernel.compute_grad_kernel[grad_blocks_per_grid, grad_threads_per_block, self.stream_, 0](
                 grads,
                 acts,
                 denom,
@@ -472,7 +471,6 @@ class GPURNNTWORDAWARE:
                 self.blank_,
                 self.fastemit_lambda_,
                 self.clamp_,
-                self.is_special
             )
 
         # // cost copy, negate (for log likelihood) and update with additional regularizers

@@ -484,6 +484,7 @@ class RNNTLoss(Loss):
         self._loss.reduction = None
 
         # Compute RNNT loss
+
         loss = self._loss(acts=log_probs, labels=targets, act_lens=input_lengths, label_lens=target_lengths)
 
         # Loss reduction can be dynamic, so reset it after call

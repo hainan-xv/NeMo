@@ -71,7 +71,7 @@ def logp_duration(acts: torch.Tensor, maxT: int, maxU: int, num_durations: int, 
 
 
 @cuda.jit()
-def compute_alphas_kernel_wordware(
+def compute_alphas_kernel_wordaware(
     acts: torch.Tensor,
     denom: torch.Tensor,
     alphas: torch.Tensor,
