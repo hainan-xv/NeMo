@@ -585,12 +585,8 @@ class WORDAWARERNNTLossNumba(Module):
         label_add_inf = 1 - labels_cpu.to(labels.device)  # if not EOW, then make blank INF
         label_add_inf = label_add_inf.reshape([label_add_inf.shape[0], 1, label_add_inf.shape[-1]])
 
-#        print("HERE NOW LABELS", label_add_inf.shape)
-#        print("HERE ACT SHAPE", acts.shape)
-
-#        print("actshape", acts[:,:,1:,self.blank].shape)
-#        print("minus shape", label_add_inf.shape)
-        acts[:,:,1:,self.blank] -= label_add_inf * 99999.0
+#        acts[:,:,1:,self.blank] -= label_add_inf * 99999.0
+        acts[:,:,1:,self.blank] = acts[:,:,1:,self.blank] * (1 - label_add_inf) - label_add_inf * 99999.0
 
 
 #        label_is_special = self.is_special[labels]
