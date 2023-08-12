@@ -569,6 +569,7 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
         self,
         prednet: Dict[str, Any],
         vocab_size: int,
+        word2pinyin_map: List[int],
         normalization_mode: Optional[str] = None,
         random_state_sampling: bool = False,
         blank_as_pad: bool = True,
@@ -601,6 +602,19 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
             dropout=dropout,
             rnn_hidden_size=prednet.get("rnn_hidden_size", -1),
         )
+        pred_n_hidden=self.pred_hidden
+
+        assert len(word2pinyin_map) == vocab_size
+        pinyin_size = max(word2pinyin_map) + 1
+
+        if self.blank_as_pad:
+            self.word_embed = torch.nn.Embedding(vocab_size + 1, pred_n_hidden // 2, padding_idx=self.blank_idx)
+            self.pinyin_embed = torch.nn.Embedding(pinyin_size, pred_n_hidden // 2)
+        else:
+            assert False
+
+        self.pinyin_map = torch.LongTensor(word2pinyin_map)
+
         self._rnnt_export = False
 
     @typecheck()
@@ -682,7 +696,15 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
                 y = y.to(device)
 
             # (B, U) -> (B, U, H)
-            y = self.prediction["embed"](y)
+            if self.pinyin_map.device != device:
+                self.pinyin_map = self.pinyin_map.to(device)
+
+            pinyin_y = self.pinyin_map[y]
+
+            y = self.word_embed(y)
+            y_pinyin = self.pinyin_embed(pinyin_y)
+            y = torch.concat([y, y_pinyin], dim=-1)
+
         else:
             # Y is not provided, assume zero tensor with shape [B, 1, H] is required
             # Emulates output of embedding of pad token.
@@ -692,6 +714,8 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
                 B = batch_size
 
             y = torch.zeros((B, 1, self.pred_hidden), device=device, dtype=dtype)
+
+        assert(y.shape[-1] == self.pred_hidden)
 
         # Prepend blank "start of sequence" symbol (zero tensor)
         if add_sos:
@@ -709,6 +733,7 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
 
         # Forward step through RNN
         y = y.transpose(0, 1)  # (U + 1, B, H)
+
         g, hid = self.prediction["dec_rnn"](y, state)
         g = g.transpose(0, 1)  # (B, U + 1, H)
 
@@ -719,6 +744,8 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
             g = self.forward_enabled_adapters(g)
 
         return g, hid
+
+
 
     def _predict_modules(
         self,
@@ -750,14 +777,10 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
             dropout: Whether to apply dropout to RNN.
             rnn_hidden_size: the hidden size of the RNN, if not specified, pred_n_hidden would be used
         """
-        if self.blank_as_pad:
-            embed = torch.nn.Embedding(vocab_size + 1, pred_n_hidden, padding_idx=self.blank_idx)
-        else:
-            embed = torch.nn.Embedding(vocab_size, pred_n_hidden)
 
         layers = torch.nn.ModuleDict(
             {
-                "embed": embed,
+#                "embed": embed,
                 "dec_rnn": rnn.rnn(
                     input_size=pred_n_hidden,
                     hidden_size=rnn_hidden_size if rnn_hidden_size > 0 else pred_n_hidden,
