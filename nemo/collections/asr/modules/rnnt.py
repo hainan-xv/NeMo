@@ -608,8 +608,10 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
         pinyin_size = max(word2pinyin_map) + 1
 
         if self.blank_as_pad:
-            self.word_embed = torch.nn.Embedding(vocab_size + 1, pred_n_hidden // 2, padding_idx=self.blank_idx)
-            self.pinyin_embed = torch.nn.Embedding(pinyin_size, pred_n_hidden // 2)
+#            self.word_embed = torch.nn.Embedding(vocab_size + 1, int(pred_n_hidden * 0.2), padding_idx=self.blank_idx)
+#            self.pinyin_embed = torch.nn.Embedding(pinyin_size, pred_n_hidden - int(pred_n_hidden * 0.2))
+            self.word_embed = torch.nn.Embedding(vocab_size + 1, 1, padding_idx=self.blank_idx)
+            self.pinyin_embed = torch.nn.Embedding(pinyin_size, pred_n_hidden - 1)
         else:
             assert False
 
