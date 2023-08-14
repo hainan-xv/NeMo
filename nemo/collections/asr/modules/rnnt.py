@@ -30,7 +30,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from omegaconf import DictConfig, OmegaConf
-
+import random
 from nemo.collections.asr.modules import rnnt_abstract
 from nemo.collections.asr.parts.submodules import stateless_net
 from nemo.collections.asr.parts.utils import adapter_utils, rnnt_utils
@@ -1199,6 +1199,7 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         self,
         jointnet: Dict[str, Any],
         num_classes: int,
+        word2pinyin_map: List[int],
         num_extra_outputs: int = 0,
         vocabulary: Optional[List] = None,
         log_softmax: Optional[bool] = None,
@@ -1256,6 +1257,15 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
             activation=self.activation,
             dropout=dropout,
         )
+
+        assert len(word2pinyin_map) == num_classes
+        pinyin_size = max(word2pinyin_map) + 1
+        word2pinyin_map.append(pinyin_size)
+        pinyin_size += 1
+
+        self.word_embed = torch.nn.Linear(self.joint_hidden // 2, num_classes + 1) #, 16)
+        self.pinyin_embed = torch.nn.Linear(self.joint_hidden // 2, pinyin_size, bias=False)
+        self.pinyin_map = torch.LongTensor(word2pinyin_map)
 
         # Flag needed for RNNT export support
         self._rnnt_export = False
@@ -1448,7 +1458,21 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         if self.is_adapter_available():
             inp = self.forward_enabled_adapters(inp)
 
-        res = self.joint_net(inp)  # [B, T, U, V + 1]
+#        if not self.training:
+#            final_emb = torch.concat([self.pinyin_embed.weight[self.pinyin_map], self.word_embed.weight], dim=-1).transpose(0, 1)
+#        else:
+#            r = random.randint(0, 2)
+#
+#            if r == 0:
+#                final_emb = torch.concat([self.pinyin_embed.weight[self.pinyin_map] * 0, self.word_embed.weight], dim=-1).transpose(0, 1)
+#            elif r == 1:
+#                final_emb = torch.concat([self.pinyin_embed.weight[self.pinyin_map], self.word_embed.weight * 0], dim=-1).transpose(0, 1)
+#            else:
+#                final_emb = torch.concat([self.pinyin_embed.weight[self.pinyin_map], self.word_embed.weight], dim=-1).transpose(0, 1)
+                
+        final_emb = torch.concat([self.pinyin_embed.weight[self.pinyin_map], 0 * self.word_embed.weight], dim=-1).transpose(0, 1)
+
+        res = torch.matmul(self.joint_net(inp), final_emb) + self.word_embed.bias
 
         del inp
 
@@ -1501,7 +1525,7 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         layers = (
             [activation]
             + ([torch.nn.Dropout(p=dropout)] if dropout else [])
-            + [torch.nn.Linear(joint_n_hidden, num_classes)]
+#            + [torch.nn.Linear(joint_n_hidden, num_classes)]
         )
         return pred, enc, torch.nn.Sequential(*layers)
 
