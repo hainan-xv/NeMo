@@ -571,8 +571,6 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
         vocab_size: int,
         word2pinyin_map: List[int],
         word2tone_map: List[int],
-        word_embsize: int,
-        tone_embsize: int,
         normalization_mode: Optional[str] = None,
         random_state_sampling: bool = False,
         blank_as_pad: bool = True,
@@ -617,9 +615,9 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
 #            self.word_embed = torch.nn.Embedding(vocab_size + 1, int(pred_n_hidden * 0.2), padding_idx=self.blank_idx)
 #            self.pinyin_embed = torch.nn.Embedding(pinyin_size, pred_n_hidden - int(pred_n_hidden * 0.2))
 
-            self.word_embed = torch.nn.Embedding(vocab_size + 1, word_embsize, padding_idx=self.blank_idx)
-            self.pinyin_embed = torch.nn.Embedding(pinyin_size, pred_n_hidden - tone_embsize - word_embsize)
-            self.tone_embed = torch.nn.Embedding(tone_size, tone_embsize)
+            self.word_embed = torch.nn.Embedding(vocab_size + 1, pred_n_hidden, padding_idx=self.blank_idx)
+            self.pinyin_embed = torch.nn.Embedding(pinyin_size, pred_n_hidden)
+            self.tone_embed = torch.nn.Embedding(tone_size, pred_n_hidden)
         else:
             assert False
 
@@ -718,7 +716,7 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
             y_word = self.word_embed(y)
             y_pinyin = self.pinyin_embed(pinyin_y)
             y_tone = self.tone_embed(tone_y)
-            y = torch.concat([y_word, y_pinyin, y_tone], dim=-1)
+            y = y_word + y_pinyin + y_tone
 
         else:
             # Y is not provided, assume zero tensor with shape [B, 1, H] is required
@@ -1214,8 +1212,6 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         num_classes: int,
         word2pinyin_map: List[int],
         word2tone_map: List[int],
-        word_embsize: int,
-        tone_embsize: int,
         num_extra_outputs: int = 0,
         vocabulary: Optional[List] = None,
         log_softmax: Optional[bool] = None,
@@ -1286,9 +1282,9 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         word2tone_map.append(tone_size)
         tone_size += 1
 
-        self.word_embed = torch.nn.Linear(word_embsize, num_classes + 1)
-        self.pinyin_embed = torch.nn.Linear(self.joint_hidden - word_embsize - tone_embsize, pinyin_size, bias=False)
-        self.tone_embed = torch.nn.Linear(tone_embsize, tone_size, bias=False)
+        self.word_embed = torch.nn.Linear(self.joint_hidden, num_classes + 1)
+        self.pinyin_embed = torch.nn.Linear(self.joint_hidden, pinyin_size, bias=False)
+        self.tone_embed = torch.nn.Linear(self.joint_hidden, tone_size, bias=False)
         self.pinyin_map = torch.LongTensor(word2pinyin_map)
         self.tone_map = torch.LongTensor(word2tone_map)
 
@@ -1483,7 +1479,7 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         if self.is_adapter_available():
             inp = self.forward_enabled_adapters(inp)
 
-        final_emb = torch.concat([self.pinyin_embed.weight[self.pinyin_map], self.tone_embed.weight[self.tone_map], self.word_embed.weight], dim=-1).transpose(0, 1)
+        final_emb = (self.pinyin_embed.weight[self.pinyin_map] + self.tone_embed.weight[self.tone_map] + self.word_embed.weight).transpose(0, 1)
 
         res = torch.matmul(self.joint_net(inp), final_emb) + self.word_embed.bias
 
