@@ -569,8 +569,9 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
         self,
         prednet: Dict[str, Any],
         vocab_size: int,
-        word2pinyin_map: List[int],
-        word2tone_map: List[int],
+        extra_feature_map1: List[int] = None,
+        extra_feature_map2: List[int] = None,
+        extra_feature_map3: List[int] = None,
         normalization_mode: Optional[str] = None,
         random_state_sampling: bool = False,
         blank_as_pad: bool = True,
@@ -605,24 +606,32 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
         )
         pred_n_hidden=self.pred_hidden
 
-        assert len(word2pinyin_map) == vocab_size
-        assert len(word2tone_map) == vocab_size
-        pinyin_size = max(word2pinyin_map) + 1
-        tone_size = max(word2tone_map) + 1
-        assert tone_size == 6 # 5 tones + unknown for non-chinese words
+        self.maps = []
+        self.maps_outsize = []
+
+        if extra_feature_map1 is not None:
+            self.maps.append(extra_feature_map1)
+        if extra_feature_map2 is not None:
+            self.maps.append(extra_feature_map2)
+        if extra_feature_map3 is not None:
+            self.maps.append(extra_feature_map3)
+
+        for i in range(len(self.maps)):
+            assert len(self.maps[i]) == vocab_size
+            self.maps_outsize.append(max(self.maps[i]) + 1)
+
+        self.extra_embeds = [None] * len(self.maps)
+        self.extra_maps = [None] * len(self.maps)
 
         if self.blank_as_pad:
-#            self.word_embed = torch.nn.Embedding(vocab_size + 1, int(pred_n_hidden * 0.2), padding_idx=self.blank_idx)
-#            self.pinyin_embed = torch.nn.Embedding(pinyin_size, pred_n_hidden - int(pred_n_hidden * 0.2))
-
             self.word_embed = torch.nn.Embedding(vocab_size + 1, pred_n_hidden, padding_idx=self.blank_idx)
-            self.pinyin_embed = torch.nn.Embedding(pinyin_size, pred_n_hidden)
-            self.tone_embed = torch.nn.Embedding(tone_size, pred_n_hidden)
+
+            for i in range(len(self.maps)):
+                self.extra_embeds[i] = torch.nn.Embedding(self.maps_outsize[i], pred_n_hidden)
+                self.extra_maps[i] = torch.LongTensor(self.maps[i])
+
         else:
             assert False
-
-        self.pinyin_map = torch.LongTensor(word2pinyin_map)
-        self.tone_map = torch.LongTensor(word2tone_map)
 
         self._rnnt_export = False
 
@@ -704,19 +713,18 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
             if y.device != device:
                 y = y.to(device)
 
+            if len(self.extra_maps) > 0 and self.extra_maps[0].device != device:
+                for i in range(len(self.maps)):
+                    self.extra_maps[i] = self.extra_maps[i].to(device)
+                    self.extra_embeds[i] = self.extra_embeds[i].to(device)
+
+            y_final = self.word_embed(y)
             # (B, U) -> (B, U, H)
-            if self.pinyin_map.device != device:
-                self.pinyin_map = self.pinyin_map.to(device)
-            if self.tone_map.device != device:
-                self.tone_map = self.tone_map.to(device)
-
-            pinyin_y = self.pinyin_map[y]
-            tone_y = self.tone_map[y]
-
-            y_word = self.word_embed(y)
-            y_pinyin = self.pinyin_embed(pinyin_y)
-            y_tone = self.tone_embed(tone_y)
-            y = y_word + y_pinyin + y_tone
+            for i in range(len(self.maps)):
+                y_i = self.extra_maps[i][y]
+                y_emb = self.extra_embeds[i](y_i)
+                y_final = y_final + y_emb
+            y = y_final
 
         else:
             # Y is not provided, assume zero tensor with shape [B, 1, H] is required
@@ -1210,8 +1218,9 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         self,
         jointnet: Dict[str, Any],
         num_classes: int,
-        word2pinyin_map: List[int],
-        word2tone_map: List[int],
+        extra_feature_map1: List[int] = None,
+        extra_feature_map2: List[int] = None,
+        extra_feature_map3: List[int] = None,
         num_extra_outputs: int = 0,
         vocabulary: Optional[List] = None,
         log_softmax: Optional[bool] = None,
@@ -1270,23 +1279,29 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
             dropout=dropout,
         )
 
-        assert len(word2pinyin_map) == num_classes
-        assert len(word2tone_map) == num_classes
-        pinyin_size = max(word2pinyin_map) + 1
-        tone_size = max(word2tone_map) + 1
-        assert tone_size == 6 # 5 tones + unknown for non-chinese words
+        self.maps = []
+        self.maps_outsize = []
 
-        word2pinyin_map.append(pinyin_size)
-        pinyin_size += 1
+        if extra_feature_map1 is not None:
+            self.maps.append(extra_feature_map1)
+        if extra_feature_map2 is not None:
+            self.maps.append(extra_feature_map2)
+        if extra_feature_map3 is not None:
+            self.maps.append(extra_feature_map3)
 
-        word2tone_map.append(tone_size)
-        tone_size += 1
+        for i in range(len(self.maps)):
+            assert len(self.maps[i]) == num_classes 
+            self.maps[i].append(max(self.maps[i]) + 1)
+            self.maps_outsize.append(max(self.maps[i]) + 1)
+
+        self.extra_embeds = [None] * len(self.maps)
+        self.extra_maps = [None] * len(self.maps)
+
+        for i in range(len(self.maps)):
+            self.extra_embeds[i] = torch.nn.Linear(self.joint_hidden, self.maps_outsize[i])
+            self.extra_maps[i] = torch.LongTensor(self.maps[i])
 
         self.word_embed = torch.nn.Linear(self.joint_hidden, num_classes + 1)
-        self.pinyin_embed = torch.nn.Linear(self.joint_hidden, pinyin_size, bias=False)
-        self.tone_embed = torch.nn.Linear(self.joint_hidden, tone_size, bias=False)
-        self.pinyin_map = torch.LongTensor(word2pinyin_map)
-        self.tone_map = torch.LongTensor(word2tone_map)
 
         # Flag needed for RNNT export support
         self._rnnt_export = False
@@ -1479,9 +1494,16 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         if self.is_adapter_available():
             inp = self.forward_enabled_adapters(inp)
 
-        final_emb = (self.pinyin_embed.weight[self.pinyin_map] + self.tone_embed.weight[self.tone_map] + self.word_embed.weight).transpose(0, 1)
+        if len(self.extra_maps) > 0 and self.extra_maps[0].device != inp.device:
+            for i in range(len(self.maps)):
+                self.extra_embeds[i] = self.extra_embeds[i].to(inp.device)
+                self.extra_maps[i] = self.extra_maps[i].to(inp.device)
 
-        res = torch.matmul(self.joint_net(inp), final_emb) + self.word_embed.bias
+        joint_out = self.joint_net(inp)
+        res = self.word_embed(joint_out)
+
+        for i in range(len(self.maps)):
+            res += self.extra_embeds[i](joint_out)[:,:,:,self.extra_maps[i]]
 
         del inp
 
