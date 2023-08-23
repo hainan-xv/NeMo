@@ -610,7 +610,6 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
         self.maps = []
         self.maps_outsize = []
 
-
         if extra_feature_map1 is not None:
             self.maps.append(extra_feature_map1)
         if extra_feature_map2 is not None:
@@ -622,7 +621,7 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
             assert len(self.maps[i]) == vocab_size
             self.maps_outsize.append(max(self.maps[i]) + 1)
 
-        self.extra_embeds = [None] * len(self.maps)
+        self.extra_embeds = torch.nn.ModuleList([None] * len(self.maps))
         self.extra_maps = [None] * len(self.maps)
 
         if self.blank_as_pad:
@@ -1310,7 +1309,7 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
             self.maps[i].append(max(self.maps[i]) + 1)
             self.maps_outsize.append(max(self.maps[i]) + 1)
 
-        self.extra_embeds = [None] * len(self.maps)
+        self.extra_embeds = torch.nn.ModuleList([None] * len(self.maps))
         self.extra_maps = [None] * len(self.maps)
 
         for i in range(len(self.maps)):
