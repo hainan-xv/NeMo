@@ -624,7 +624,6 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
 
         self.extra_embeds = [None] * len(self.maps)
         self.extra_maps = [None] * len(self.maps)
-        self.extra_weights = [None] * len(self.maps)
 
         if self.blank_as_pad:
             self.word_embed = torch.nn.Embedding(vocab_size + 1, pred_n_hidden, padding_idx=self.blank_idx) if use_word_embedding else None
@@ -635,7 +634,6 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
             for i in range(len(self.maps)):
                 self.extra_embeds[i] = torch.nn.Embedding(self.maps_outsize[i], pred_n_hidden)
                 self.extra_maps[i] = torch.LongTensor(self.maps[i])
-                self.extra_weights[i] = torch.nn.Parameter(torch.zeros(1))
 
         else:
             assert False
@@ -724,7 +722,6 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
                 for i in range(len(self.maps)):
                     self.extra_maps[i] = self.extra_maps[i].to(device)
                     self.extra_embeds[i] = self.extra_embeds[i].to(device)
-                    self.extra_weights[i] = self.extra_weights[i].to(device)
 
             if self.word_embed is not None:
                 y_final = self.word_embed(y)
@@ -732,17 +729,17 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
                 for i in range(len(self.maps)):
                     y_i = self.extra_maps[i][y]
                     y_emb = self.extra_embeds[i](y_i)
-                    y_final = y_final + y_emb * torch.sigmoid(self.extra_weights[i])
+                    y_final = y_final + y_emb
                 y = y_final
             else:
                 y_i = self.extra_maps[0][y]
                 y_emb = self.extra_embeds[0](y_i)
-                y_final = y_emb * torch.sigmoid(self.extra_weights[0])
+                y_final = y_emb
 
                 for i in range(1, len(self.maps)):
                     y_i = self.extra_maps[i][y]
                     y_emb = self.extra_embeds[i](y_i)
-                    y_final = y_final + y_emb * torch.sigmoid(self.extra_weights[i])
+                    y_final = y_final + y_emb
                 y = y_final
 
         else:
@@ -1315,12 +1312,10 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
 
         self.extra_embeds = [None] * len(self.maps)
         self.extra_maps = [None] * len(self.maps)
-        self.extra_weights = [None] * len(self.maps)
 
         for i in range(len(self.maps)):
             self.extra_embeds[i] = torch.nn.Linear(self.joint_hidden, self.maps_outsize[i])
             self.extra_maps[i] = torch.LongTensor(self.maps[i])
-            self.extra_weights[i] = torch.nn.Parameter(torch.zeros(1))
 
         self.word_embed = torch.nn.Linear(self.joint_hidden, num_classes + 1)
 
@@ -1519,13 +1514,12 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
             for i in range(len(self.maps)):
                 self.extra_embeds[i] = self.extra_embeds[i].to(inp.device)
                 self.extra_maps[i]   = self.extra_maps[i].to(inp.device)
-                self.extra_weights[i] = self.extra_weights[i].to(inp.device)
 
         joint_out = self.joint_net(inp)
         res = self.word_embed(joint_out)
 
         for i in range(len(self.maps)):
-            res = res + self.extra_embeds[i](joint_out)[:,:,:,self.extra_maps[i]] * torch.sigmoid(self.extra_weights[i])
+            res = res + self.extra_embeds[i](joint_out)[:,:,:,self.extra_maps[i]]
 
         del inp
 
