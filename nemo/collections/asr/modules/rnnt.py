@@ -1518,7 +1518,7 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         res = self.word_embed(joint_out)
 
         for i in range(len(self.maps)):
-            res = res + self.extra_embeds[i](joint_out)[:,:,:,self.extra_maps[i]]
+            res = res + self.extra_embeds[i](joint_out)[:,:,:,self.extra_maps[i].clone()].clone()
 
         del inp
 
