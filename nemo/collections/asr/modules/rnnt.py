@@ -126,8 +126,6 @@ class StatelessPETDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable):
             self.id2subword[len(self.id2subword)] = subword
             self.isTerminal.append(subword[-1] == '▁' or subword[-1] == '>')
 
-        print('is terminal', self.isTerminal)
-
         self.phone2id['nothing'] = 0
 
         for line in open(dictfile):
@@ -142,8 +140,6 @@ class StatelessPETDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable):
             self.word2pron[word] = phones
             phoneids = [self.phone2id[i] for i in phones]
             self.word2phoneid[word] = phoneids
-#            print("word is", word)
-#            print(phones, phoneids)
 
 
     def __init__(
@@ -174,23 +170,25 @@ class StatelessPETDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable):
             **{
                 "context_size": context_size,
                 "vocab_size": vocab_size,
-                "emb_dim": self.pred_hidden,
+                "emb_dim": self.pred_hidden // 2,
                 "blank_idx": self.blank_idx,
                 "normalization_mode": normalization_mode,
                 "dropout": dropout,
             }
         )
 
+        print("SIZE", self.pred_hidden // 2)
+
         num_phones = len(self.phone2id)
 
 #        print("num_phones", num_phones)
 #        print("phone_context_size", phone_context_size)
 
-        self.pet_prediction = self._predict_modules(
+        self.pet_prediction = self._predict_modules_pet(
             **{
                 "context_size": phone_context_size,
                 "vocab_size": num_phones,
-                "emb_dim": self.pred_hidden,
+                "emb_dim": self.pred_hidden // 2,
                 "blank_idx": num_phones,
                 "normalization_mode": normalization_mode,
                 "dropout": dropout,
@@ -201,15 +199,12 @@ class StatelessPETDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable):
 
     @typecheck()
     def forward(self, targets, target_length, states=None):
-
-#        print('calling forward', targets.shape, target_length)
-
         target_list = targets.tolist()
         B = targets.shape[0]
         U = targets.shape[1]
         b2u2w = [{} for i in range(B)]
         b2u2p = [[[0 for i in range(self.phone_context_size)] for j in range(U)] for i in range(B)]
-#        phone_targets = [[] * B]
+
         for b in range(B):
             cur_word = ''
             for u in range(target_length[b]):
@@ -222,15 +217,12 @@ class StatelessPETDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable):
                     if len(pron) < self.phone_context_size:
                         pron = [0 for i in range(self.phone_context_size - len(pron))] + pron
                     b2u2p[b][u] = pron
-#                    print('getting word', cur_word, pron)
                     cur_word = ''
                 else:
                     pron = [0 for i in range(self.phone_context_size)]
                     b2u2p[b][u] = pron
 
-#        print('b2u2w', b2u2w)
         b2u2p_tensor = torch.LongTensor(b2u2p).to(targets.device)
-#        print('b2u2p', b2u2p_tensor.shape)
                     
         # y: (B, U)
         y = rnn.label_collate(targets)
@@ -244,6 +236,8 @@ class StatelessPETDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable):
 
         g, state = self.predict(y, state=states, add_sos=add_sos)  # (B, U, D)
         g_pet, state_pet = self.predict_pet(b2u2p_tensor, state=states_pet, add_sos=add_sos)  # (B, U, D)
+
+        g = torch.concat([g, g_pet], dim=-1)
         g = g.transpose(1, 2)  # (B, D, U)
 
         return g, target_length, state
@@ -299,7 +293,7 @@ class StatelessPETDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable):
             if y.device != device:
                 y = y.to(device)
 
-            y, state = self.prediction(y, state)
+            y, state = self.pet_prediction(y, state)
 
         else:
             # Y is not provided, assume zero tensor with shape [B, 1, D] is required
@@ -309,7 +303,7 @@ class StatelessPETDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable):
             else:
                 B = batch_size
 
-            y = torch.zeros((B, 1, self.pred_hidden), device=device, dtype=dtype)
+            y = torch.zeros((B, 1, self.pred_hidden // 2), device=device, dtype=dtype)
 
         # Prepend blank "start of sequence" symbol (zero tensor)
         if add_sos:
@@ -383,7 +377,7 @@ class StatelessPETDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable):
             else:
                 B = batch_size
 
-            y = torch.zeros((B, 1, self.pred_hidden), device=device, dtype=dtype)
+            y = torch.zeros((B, 1, self.pred_hidden // 2), device=device, dtype=dtype)
 
         # Prepend blank "start of sequence" symbol (zero tensor)
         if add_sos:
@@ -408,6 +402,20 @@ class StatelessPETDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable):
         """
 
         net = stateless_net.StatelessNet(**kwargs)
+        return net
+
+    def _predict_modules_pet(self, **kwargs):
+        """
+        Prepare the trainable parameters of the Prediction Network.
+
+        Args:
+            vocab_size: Vocab size (excluding the blank token).
+            pred_n_hidden: Hidden size of the RNNs.
+            norm: Type of normalization to perform in RNN.
+            dropout: Whether to apply dropout to RNN.
+        """
+
+        net = stateless_net.PETStatelessNet(**kwargs)
         return net
 
     def score_hypothesis(

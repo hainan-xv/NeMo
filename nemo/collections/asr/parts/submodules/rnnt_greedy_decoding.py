@@ -140,6 +140,34 @@ class _GreedyRNNTInfer(Typing, ConfidenceMeasureMixin):
             "partial_hypotheses": [NeuralType(elements_type=HypothesisType(), optional=True)],  # must always be last
         }
 
+    def read_dictionary(self, vocabfile, dictfile):
+        self.word2pron = {}
+        self.id2subword = {}
+        self.phone2id = {}
+        self.word2phoneid = {}
+        self.isTerminal = []
+
+        for line in open(vocabfile):
+            words = line.split()
+            subword = words[0][::-1] if words[0] != '<unk>' else '<unk>'
+            self.id2subword[len(self.id2subword)] = subword
+            self.isTerminal.append(subword[-1] == '▁' or subword[-1] == '>')
+
+        self.phone2id['nothing'] = 0
+
+        for line in open(dictfile):
+            words = line.split()
+            word = words[0]
+            phones = words[1:]
+            
+            for phone in phones:
+                if phone not in self.phone2id:
+                    self.phone2id[phone] = len(self.phone2id)
+
+            self.word2pron[word] = phones
+            phoneids = [self.phone2id[i] for i in phones]
+            self.word2phoneid[word] = phoneids
+
     @property
     def output_types(self):
         """Returns definitions of module output ports.
@@ -150,6 +178,9 @@ class _GreedyRNNTInfer(Typing, ConfidenceMeasureMixin):
         self,
         decoder_model: rnnt_abstract.AbstractRNNTDecoder,
         joint_model: rnnt_abstract.AbstractRNNTJoint,
+        vocab_file: str,
+        dict_file: str,
+        phone_context_size: int,
         blank_index: int,
         max_symbols_per_step: Optional[int] = None,
         preserve_alignments: bool = False,
@@ -159,12 +190,15 @@ class _GreedyRNNTInfer(Typing, ConfidenceMeasureMixin):
         super().__init__()
         self.decoder = decoder_model
         self.joint = joint_model
+        self.phone_context_size = phone_context_size
 
         self._blank_index = blank_index
         self._SOS = blank_index  # Start of single index
         self.max_symbols = max_symbols_per_step
         self.preserve_alignments = preserve_alignments
         self.preserve_frame_confidence = preserve_frame_confidence
+
+        self.read_dictionary(vocab_file, dict_file)
 
         # set confidence calculation measure
         self._init_confidence_measure(confidence_measure_cfg)
@@ -175,6 +209,7 @@ class _GreedyRNNTInfer(Typing, ConfidenceMeasureMixin):
     @torch.no_grad()
     def _pred_step(
         self,
+        cur_words,
         label: Union[torch.Tensor, int],
         hidden: Optional[torch.Tensor],
         add_sos: bool = False,
@@ -204,12 +239,40 @@ class _GreedyRNNTInfer(Typing, ConfidenceMeasureMixin):
         else:
             # Label is an integer
             if label == self._SOS:
-                return self.decoder.predict(None, hidden, add_sos=add_sos, batch_size=batch_size)
+                p1 = self.decoder.predict(None, hidden, add_sos=add_sos, batch_size=batch_size)
+
+                y = torch.zeros([1, 1, self.phone_context_size], dtype=torch.long)
+
+                p2 = self.decoder.predict_pet(y, hidden, add_sos=add_sos, batch_size=batch_size)
+                return torch.concat([p1[0], p2[0]], dim=-1), p1[1]
 
             label = label_collate([[label]])
 
+        phones = [0 for i in range(self.phone_context_size)]
+        cur_word = cur_words[0]
+
+#        print("CUR WORD IS", cur_word)
+
+        if cur_word != "" and ( cur_word[-1] == '▁' or cur_word[-1] == '>' ):
+            if cur_word[-1] == '▁':
+                cur_word = cur_word[:-1]
+
+            pron = self.word2phoneid[cur_word] if cur_word in self.word2phoneid else [0]
+
+            if len(pron) > self.phone_context_size:
+                phones = pron[-self.phone_context_size:]
+            else:
+                phones[-len(pron):] = pron
+
+#        print("PHONES ARE", phones)
+        y = torch.LongTensor(phones)
+        y = torch.reshape(y, [1, 1, -1])
+
         # output: [B, 1, K]
-        return self.decoder.predict(label, hidden, add_sos=add_sos, batch_size=batch_size)
+        p1 = self.decoder.predict(label, hidden, add_sos=add_sos, batch_size=batch_size)
+        p2 = self.decoder.predict_pet(y, None, add_sos=add_sos, batch_size=batch_size)
+#        print("p1 p2 shapes", p1[0].shape, p2[0].shape)
+        return torch.concat([p1[0], p2[0]], dim=-1), p1[1]
 
     def _joint_step(self, enc, pred, log_normalize: Optional[bool] = None):
         """
@@ -301,6 +364,9 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
         self,
         decoder_model: rnnt_abstract.AbstractRNNTDecoder,
         joint_model: rnnt_abstract.AbstractRNNTJoint,
+        vocab_file: str,
+        dict_file: str,
+        phone_context_size: int,
         blank_index: int,
         max_symbols_per_step: Optional[int] = None,
         preserve_alignments: bool = False,
@@ -310,6 +376,9 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
         super().__init__(
             decoder_model=decoder_model,
             joint_model=joint_model,
+            vocab_file=vocab_file,
+            dict_file=dict_file,
+            phone_context_size=phone_context_size,
             blank_index=blank_index,
             max_symbols_per_step=max_symbols_per_step,
             preserve_alignments=preserve_alignments,
@@ -394,6 +463,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
             hypothesis.frame_confidence = [[]]
 
         # For timestep t in X_t
+        cur_word = ""
         for time_idx in range(out_len):
             # Extract encoder embedding at timestep t
             # f = x[time_idx, :, :].unsqueeze(0)  # [1, 1, D]
@@ -412,7 +482,8 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                     last_label = label_collate([[hypothesis.last_token]])
 
                 # Perform prediction network and joint network steps.
-                g, hidden_prime = self._pred_step(last_label, hypothesis.dec_state)
+                g, hidden_prime = self._pred_step([cur_word], last_label, hypothesis.dec_state)
+#                print("g shape", g.shape)
                 # If preserving per-frame confidence, log_normalize must be true
                 logp = self._joint_step(f, g, log_normalize=True if self.preserve_frame_confidence else None)[
                     0, 0, 0, :
@@ -455,6 +526,11 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                     hypothesis.timestep.append(time_idx)
                     hypothesis.dec_state = hidden_prime
                     hypothesis.last_token = k
+                    cur_word += self.id2subword[k]
+#                    print("CUR WORD is", cur_word)
+
+                if len(cur_word) > 0 and (cur_word[-1] == '▁' or cur_word[-1] == '>'):
+                    cur_word = ''
 
                 # Increment token counter.
                 symbols_added += 1

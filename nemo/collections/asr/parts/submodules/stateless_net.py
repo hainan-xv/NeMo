@@ -162,10 +162,7 @@ class PETStatelessNet(torch.nn.Module):
             # dimensions evenly among all history contexts. E.g. if total embedding
             # size is 200, and context_size is 2, then we allocate 150 dimensions
             # to the last word, and 50 dimensions to the second-to-last word.
-            if i != 0:
-                embed_size = emb_dim - (emb_dim // self.context_size) * (self.context_size - 1)
-            else:
-                embed_size = emb_dim // self.context_size
+            embed_size = emb_dim // self.context_size
 
             embed = torch.nn.Embedding(vocab_size + 1, embed_size, padding_idx=blank_idx)
             embeds.append(embed)
@@ -191,44 +188,10 @@ class PETStatelessNet(torch.nn.Module):
         """
         outs = []
 
-        [B, U] = y.shape
-        appended_y = y
-        if state != None:
-            appended_y = torch.concat([state[0], y], axis=1)
-            context_size = appended_y.shape[1]
-
-            if context_size < self.context_size:
-                # This is the case at the beginning of an utterance where we have
-                # seen less words than context_size. In this case, we need to pad
-                # it to the right length.
-                padded_state = torch.ones([B, self.context_size], dtype=torch.long, device=y.device) * self.blank_idx
-                padded_state[:, self.context_size - context_size :] = appended_y
-            elif context_size == self.context_size + 1:
-                padded_state = appended_y[:, 1:]
-                # This is the case where the previous state already has reached context_size.
-                # We need to truncate the history by omitting the 0'th token.
-            else:
-                # Context has just the right size. Copy directly.
-                padded_state = appended_y
-
-            for i in range(self.context_size):
-                out = self.embeds[i](padded_state[:, self.context_size - 1 - i : self.context_size - i])
-                outs.append(out)
-        else:
-            for i in range(self.context_size):
-                out = self.embeds[i](y)
-
-                if i != 0:
-                    out[:, i:, :] = out[
-                        :, :-i, :
-                    ].clone()  # needs clone() here or it might complain about src and dst mem location have overlaps.
-                    out[:, :i, :] *= 0.0
-                outs.append(out)
-
-        out = self.dropout(torch.concat(outs, axis=-1))
+        [B, U, C] = y.shape
+        out = self.embeds[0](y)
+        out = torch.reshape(out, [B, U, -1])
+        out = self.dropout(out)
         out = self.norm(out)
 
-        state = None
-        if y is not None:
-            state = [appended_y[:, appended_y.shape[1] - self.context_size + 1 :]]
-        return out, state
+        return out, None
