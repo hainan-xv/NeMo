@@ -45,6 +45,5 @@ from nemo.collections.asr.modules.rnnt import (
     RNNTJoint,
     SampledRNNTJoint,
     StatelessPETDecoder,
-    StatelessTransducerDecoder,
 )
 from nemo.collections.asr.modules.squeezeformer_encoder import SqueezeformerEncoder, SqueezeformerEncoderAdapter

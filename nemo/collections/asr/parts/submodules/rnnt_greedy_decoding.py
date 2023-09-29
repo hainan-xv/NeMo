@@ -159,7 +159,7 @@ class _GreedyRNNTInfer(Typing, ConfidenceMeasureMixin):
             words = line.split()
             word = words[0]
             phones = words[1:]
-            
+
             for phone in phones:
                 if phone not in self.phone2id:
                     self.phone2id[phone] = len(self.phone2id)
@@ -243,15 +243,13 @@ class _GreedyRNNTInfer(Typing, ConfidenceMeasureMixin):
 
                 y = torch.zeros([1, 1, self.phone_context_size], dtype=torch.long)
 
-                p2 = self.decoder.predict_pet(y, hidden, add_sos=add_sos, batch_size=batch_size)
-                return torch.concat([p1[0], p2[0]], dim=-1), p1[1]
+#                p2 = self.decoder.predict_pet(y, add_sos=add_sos, batch_size=batch_size)
+                return torch.concat([p1[0], p1[0]], dim=-1), p1[1]
 
             label = label_collate([[label]])
 
         phones = [0 for i in range(self.phone_context_size)]
         cur_word = cur_words[0]
-
-#        print("CUR WORD IS", cur_word)
 
         if cur_word != "" and ( cur_word[-1] == '▁' or cur_word[-1] == '>' ):
             if cur_word[-1] == '▁':
@@ -264,15 +262,14 @@ class _GreedyRNNTInfer(Typing, ConfidenceMeasureMixin):
             else:
                 phones[-len(pron):] = pron
 
-#        print("PHONES ARE", phones)
         y = torch.LongTensor(phones)
-        y = torch.reshape(y, [1, 1, -1])
+        y = torch.reshape(y, [1, 1, self.phone_context_size])
 
         # output: [B, 1, K]
         p1 = self.decoder.predict(label, hidden, add_sos=add_sos, batch_size=batch_size)
-        p2 = self.decoder.predict_pet(y, None, add_sos=add_sos, batch_size=batch_size)
-#        print("p1 p2 shapes", p1[0].shape, p2[0].shape)
-        return torch.concat([p1[0], p2[0]], dim=-1), p1[1]
+        p2 = self.decoder.predict_pet(y, add_sos=add_sos, batch_size=batch_size)
+
+        return torch.concat([p1[0], p2], dim=-1), p1[1]
 
     def _joint_step(self, enc, pred, log_normalize: Optional[bool] = None):
         """
@@ -483,7 +480,6 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
 
                 # Perform prediction network and joint network steps.
                 g, hidden_prime = self._pred_step([cur_word], last_label, hypothesis.dec_state)
-#                print("g shape", g.shape)
                 # If preserving per-frame confidence, log_normalize must be true
                 logp = self._joint_step(f, g, log_normalize=True if self.preserve_frame_confidence else None)[
                     0, 0, 0, :
@@ -527,7 +523,6 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                     hypothesis.dec_state = hidden_prime
                     hypothesis.last_token = k
                     cur_word += self.id2subword[k]
-#                    print("CUR WORD is", cur_word)
 
                 if len(cur_word) > 0 and (cur_word[-1] == '▁' or cur_word[-1] == '>'):
                     cur_word = ''
