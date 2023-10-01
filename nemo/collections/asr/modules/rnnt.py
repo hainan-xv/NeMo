@@ -308,7 +308,7 @@ class StatelessPETDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable):
             start = None  # makes del call later easier
 
         del start
-        y = y * 0.0
+        y = y
         return y
 
     def predict(
