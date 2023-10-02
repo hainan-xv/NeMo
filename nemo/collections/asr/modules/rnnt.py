@@ -113,11 +113,9 @@ class StatelessPETDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable):
         self._rnnt_export = True
         super()._prepare_for_export(**kwargs)
 
-    def read_dictionary(self, vocabfile, dictfile):
-        self.word2pron = {}
+    def read_vocab(self, vocabfile):
         self.id2subword = []
-        self.phone2id = {}
-        self.word2phoneid = {}
+        self.char2id = {}
         self.isTerminal = []
 
         for line in open(vocabfile):
@@ -126,20 +124,16 @@ class StatelessPETDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable):
             self.id2subword.append(subword)
             self.isTerminal.append(subword[-1] == '▁' or subword[-1] == '>')
 
-        self.phone2id['nothing'] = 0
+        self.char2id[' '] = 0
 
-        for line in open(dictfile):
-            words = line.split()
-            word = words[0]
-            phones = words[1:]
+        for subword in self.id2subword:
+            if subword is not '<unk>':
+                if subword[-1] == '▁':
+                    subword = subword[:-1]
 
-            for phone in phones:
-                if phone not in self.phone2id:
-                    self.phone2id[phone] = len(self.phone2id)
-
-            self.word2pron[word] = phones
-            phoneids = [self.phone2id[i] for i in phones]
-            self.word2phoneid[word] = phoneids
+                for char in subword:
+                    if char not in self.char2id:
+                        self.char2id[char] = len(self.char2id)
 
 
     def __init__(
@@ -147,18 +141,17 @@ class StatelessPETDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable):
         prednet: Dict[str, Any],
         vocab_size: int,
         vocab_file: str,
-        dict_file: str,
         context_size: int = 1,
-        phone_context_size: int = 1,
+        char_context_size: int = 1,
         normalization_mode: Optional[str] = None,
     ):
         # Required arguments
         self.pred_hidden = prednet['pred_hidden']
         self.blank_idx = vocab_size
         self.context_size = context_size
-        self.phone_context_size = phone_context_size
+        self.char_context_size = char_context_size
 
-        self.read_dictionary(vocab_file, dict_file)
+        self.read_vocab(vocab_file)
 
         # Initialize the model (blank token increases vocab size by 1)
         super().__init__(vocab_size=vocab_size, blank_idx=self.blank_idx, blank_as_pad=True)
@@ -177,14 +170,14 @@ class StatelessPETDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable):
             }
         )
 
-        num_phones = len(self.phone2id)
+        num_chars = len(self.char2id)
 
         self.pet_prediction = self._predict_modules_pet(
             **{
-                "context_size": phone_context_size,
-                "vocab_size": num_phones,
+                "context_size": char_context_size,
+                "vocab_size": num_chars,
                 "emb_dim": self.pred_hidden // 2,
-                "blank_idx": num_phones,
+                "blank_idx": num_chars,
                 "normalization_mode": normalization_mode,
                 "dropout": dropout,
             }
@@ -198,25 +191,24 @@ class StatelessPETDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable):
         B = targets.shape[0]
         U = targets.shape[1]
         b2u2w = [{} for i in range(B)]
-        b2u2p = [[[0 for i in range(self.phone_context_size)] for j in range(U)] for i in range(B)]
-#        b2u2p = [[[0 for i in range(self.phone_context_size)] for j in range(U)] for i in range(B)]
+        b2u2p = [[[0 for i in range(self.char_context_size)] for j in range(U)] for i in range(B)]
 
         for b in range(B):
             cur_word = ''
             for u in range(target_length[b]):
                 cur_word += self.id2subword[target_list[b][u]]
                 if self.isTerminal[target_list[b][u]]:
-                    if cur_word[-1] == '▁':
-                        cur_word = cur_word[:-1]
-                    b2u2w[b][u] = cur_word
-                    pron = self.word2phoneid[cur_word][-self.phone_context_size:] if cur_word in self.word2phoneid else [0]
-                    if len(pron) < self.phone_context_size:
-                        pron = [0 for i in range(self.phone_context_size - len(pron))] + pron
-                    b2u2p[b][u] = pron
+                    if cur_word == '<unk>':
+                        b2u2p[b][u] = [0 for i in range(self.char_context_size)]
+                    else:
+                        if cur_word[-1] == '▁':
+                            cur_word = cur_word[:-1]
+                        b2u2w[b][u] = cur_word
+                        charids = [self.char2id[i] for i in cur_word]
+                        if len(charids) < self.char_context_size:
+                            charids = [0 for i in range(self.char_context_size - len(charids))] + charids
+                        b2u2p[b][u] = charids
                     cur_word = ''
-#                else:
-#                    pron = [0 for i in range(self.phone_context_size)]
-#                    b2u2p[b][u] = pron
 
         b2u2p_tensor = torch.LongTensor(b2u2p).to(targets.device)
 

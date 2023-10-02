@@ -140,33 +140,29 @@ class _GreedyRNNTInfer(Typing, ConfidenceMeasureMixin):
             "partial_hypotheses": [NeuralType(elements_type=HypothesisType(), optional=True)],  # must always be last
         }
 
-    def read_dictionary(self, vocabfile, dictfile):
-        self.word2pron = {}
-        self.id2subword = {}
-        self.phone2id = {}
-        self.word2phoneid = {}
+    def read_vocab(self, vocabfile):
+        self.id2subword = []
+        self.char2id = {}
         self.isTerminal = []
 
         for line in open(vocabfile):
             words = line.split()
             subword = words[0][::-1] if words[0] != '<unk>' else '<unk>'
-            self.id2subword[len(self.id2subword)] = subword
+            self.id2subword.append(subword)
             self.isTerminal.append(subword[-1] == '▁' or subword[-1] == '>')
 
-        self.phone2id['nothing'] = 0
+        self.char2id[' '] = 0
 
-        for line in open(dictfile):
-            words = line.split()
-            word = words[0]
-            phones = words[1:]
+        for subword in self.id2subword:
+            if subword is not '<unk>':
+                if subword[-1] == '▁':
+                    subword = subword[:-1]
 
-            for phone in phones:
-                if phone not in self.phone2id:
-                    self.phone2id[phone] = len(self.phone2id)
+                for char in subword:
+                    if char not in self.char2id:
+                        self.char2id[char] = len(self.char2id)
 
-            self.word2pron[word] = phones
-            phoneids = [self.phone2id[i] for i in phones]
-            self.word2phoneid[word] = phoneids
+
 
     @property
     def output_types(self):
@@ -180,7 +176,7 @@ class _GreedyRNNTInfer(Typing, ConfidenceMeasureMixin):
         joint_model: rnnt_abstract.AbstractRNNTJoint,
         vocab_file: str,
         dict_file: str,
-        phone_context_size: int,
+        char_context_size: int,
         blank_index: int,
         max_symbols_per_step: Optional[int] = None,
         preserve_alignments: bool = False,
@@ -190,7 +186,7 @@ class _GreedyRNNTInfer(Typing, ConfidenceMeasureMixin):
         super().__init__()
         self.decoder = decoder_model
         self.joint = joint_model
-        self.phone_context_size = phone_context_size
+        self.char_context_size = char_context_size
 
         self._blank_index = blank_index
         self._SOS = blank_index  # Start of single index
@@ -198,7 +194,7 @@ class _GreedyRNNTInfer(Typing, ConfidenceMeasureMixin):
         self.preserve_alignments = preserve_alignments
         self.preserve_frame_confidence = preserve_frame_confidence
 
-        self.read_dictionary(vocab_file, dict_file)
+        self.read_vocab(vocab_file)
 
         # set confidence calculation measure
         self._init_confidence_measure(confidence_measure_cfg)
@@ -244,21 +240,21 @@ class _GreedyRNNTInfer(Typing, ConfidenceMeasureMixin):
 
             label = label_collate([[label]])
 
-        phones = [0 for i in range(self.phone_context_size)]
+        chars = [0 for i in range(self.char_context_size)]
 
         if cur_word != "" and ( cur_word[-1] == '▁' or cur_word[-1] == '>' ):
             if cur_word[-1] == '▁':
                 cur_word = cur_word[:-1]
 
-            pron = self.word2phoneid[cur_word] if cur_word in self.word2phoneid else [0]
+            chars = [self.char2id[i] for i in cur_word] if cur_word is not '<unk>' else [0 for i in range(self.char_context_size]]
 
-            if len(pron) > self.phone_context_size:
-                phones = pron[-self.phone_context_size:]
+            if len(chars) > self.char_context_size:
+                chars = chars[-self.char_context_size:]
             else:
-                phones[-len(pron):] = pron
+                chars = [0 for i in range(self.char_context_size - len(chars)] + chars
 
-        y = torch.LongTensor(phones)
-        y = torch.reshape(y, [1, 1, self.phone_context_size])
+        y = torch.LongTensor(chars)
+        y = torch.reshape(y, [1, 1, self.char_context_size])
 
         # output: [B, 1, K]
         p1 = self.decoder.predict(label, hidden, add_sos=add_sos, batch_size=batch_size)
@@ -358,7 +354,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
         joint_model: rnnt_abstract.AbstractRNNTJoint,
         vocab_file: str,
         dict_file: str,
-        phone_context_size: int,
+        char_context_size: int,
         blank_index: int,
         max_symbols_per_step: Optional[int] = None,
         preserve_alignments: bool = False,
@@ -370,7 +366,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
             joint_model=joint_model,
             vocab_file=vocab_file,
             dict_file=dict_file,
-            phone_context_size=phone_context_size,
+            char_context_size=char_context_size,
             blank_index=blank_index,
             max_symbols_per_step=max_symbols_per_step,
             preserve_alignments=preserve_alignments,
