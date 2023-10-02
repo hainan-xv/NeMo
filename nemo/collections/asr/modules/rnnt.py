@@ -209,7 +209,7 @@ class StatelessPETDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable):
                     if cur_word[-1] == '▁':
                         cur_word = cur_word[:-1]
                     b2u2w[b][u] = cur_word
-                    pron = self.word2phoneid[cur_word][-self.phone_context_size:]
+                    pron = self.word2phoneid[cur_word][-self.phone_context_size:] if cur_word in self.word2phoneid else [0]
                     if len(pron) < self.phone_context_size:
                         pron = [0 for i in range(self.phone_context_size - len(pron))] + pron
                     b2u2p[b][u] = pron
