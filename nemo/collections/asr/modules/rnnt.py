@@ -115,7 +115,7 @@ class StatelessPETDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable):
 
     def read_dictionary(self, vocabfile, dictfile):
         self.word2pron = {}
-        self.id2subword = {}
+        self.id2subword = []
         self.phone2id = {}
         self.word2phoneid = {}
         self.isTerminal = []
@@ -123,7 +123,7 @@ class StatelessPETDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable):
         for line in open(vocabfile):
             words = line.split()
             subword = words[0][::-1] if words[0] != '<unk>' else '<unk>'
-            self.id2subword[len(self.id2subword)] = subword
+            self.id2subword.append(subword)
             self.isTerminal.append(subword[-1] == '▁' or subword[-1] == '>')
 
         self.phone2id['nothing'] = 0
@@ -199,6 +199,7 @@ class StatelessPETDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable):
         U = targets.shape[1]
         b2u2w = [{} for i in range(B)]
         b2u2p = [[[0 for i in range(self.phone_context_size)] for j in range(U)] for i in range(B)]
+#        b2u2p = [[[0 for i in range(self.phone_context_size)] for j in range(U)] for i in range(B)]
 
         for b in range(B):
             cur_word = ''
@@ -213,9 +214,9 @@ class StatelessPETDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable):
                         pron = [0 for i in range(self.phone_context_size - len(pron))] + pron
                     b2u2p[b][u] = pron
                     cur_word = ''
-                else:
-                    pron = [0 for i in range(self.phone_context_size)]
-                    b2u2p[b][u] = pron
+#                else:
+#                    pron = [0 for i in range(self.phone_context_size)]
+#                    b2u2p[b][u] = pron
 
         b2u2p_tensor = torch.LongTensor(b2u2p).to(targets.device)
 
@@ -287,7 +288,7 @@ class StatelessPETDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable):
             if y.device != device:
                 y = y.to(device)
 
-            y = self.pet_prediction(y)[0]
+            y = self.pet_prediction(y)
 
         else:
             # Y is not provided, assume zero tensor with shape [B, 1, D] is required

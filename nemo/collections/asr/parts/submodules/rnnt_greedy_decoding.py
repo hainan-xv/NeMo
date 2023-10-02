@@ -209,7 +209,7 @@ class _GreedyRNNTInfer(Typing, ConfidenceMeasureMixin):
     @torch.no_grad()
     def _pred_step(
         self,
-        cur_words,
+        cur_word,
         label: Union[torch.Tensor, int],
         hidden: Optional[torch.Tensor],
         add_sos: bool = False,
@@ -240,16 +240,11 @@ class _GreedyRNNTInfer(Typing, ConfidenceMeasureMixin):
             # Label is an integer
             if label == self._SOS:
                 p1 = self.decoder.predict(None, hidden, add_sos=add_sos, batch_size=batch_size)
-
-                y = torch.zeros([1, 1, self.phone_context_size], dtype=torch.long)
-
-#                p2 = self.decoder.predict_pet(y, add_sos=add_sos, batch_size=batch_size)
-                return torch.concat([p1[0], p1[0]], dim=-1), p1[1]
+                return torch.concat([p1[0], p1[0]], dim=-1), p1[1]  # BOS uses an all-zero state; no need to run pet_predict
 
             label = label_collate([[label]])
 
         phones = [0 for i in range(self.phone_context_size)]
-        cur_word = cur_words[0]
 
         if cur_word != "" and ( cur_word[-1] == '▁' or cur_word[-1] == '>' ):
             if cur_word[-1] == '▁':
@@ -479,7 +474,11 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                     last_label = label_collate([[hypothesis.last_token]])
 
                 # Perform prediction network and joint network steps.
-                g, hidden_prime = self._pred_step([cur_word], last_label, hypothesis.dec_state)
+                g, hidden_prime = self._pred_step(cur_word, last_label, hypothesis.dec_state)
+
+                if len(cur_word) > 0 and (cur_word[-1] == '▁' or cur_word[-1] == '>'):
+                    cur_word = ''
+
                 # If preserving per-frame confidence, log_normalize must be true
                 logp = self._joint_step(f, g, log_normalize=True if self.preserve_frame_confidence else None)[
                     0, 0, 0, :
@@ -524,8 +523,6 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                     hypothesis.last_token = k
                     cur_word += self.id2subword[k]
 
-                if len(cur_word) > 0 and (cur_word[-1] == '▁' or cur_word[-1] == '>'):
-                    cur_word = ''
 
                 # Increment token counter.
                 symbols_added += 1

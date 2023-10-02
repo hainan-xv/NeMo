@@ -195,4 +195,4 @@ class PETStatelessNet(torch.nn.Module):
 #        out = self.norm(out)
         out = torch.reshape(out, [B, U, -1])
 
-        return out, None
+        return out
