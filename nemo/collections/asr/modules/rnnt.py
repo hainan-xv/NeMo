@@ -198,13 +198,12 @@ class StatelessPETDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable):
             for u in range(target_length[b]):
                 cur_word += self.id2subword[target_list[b][u]]
                 if self.isTerminal[target_list[b][u]]:
-                    if cur_word == '<unk>':
+                    if cur_word[-1] != '▁':
                         b2u2p[b][u] = [0 for i in range(self.char_context_size)]
                     else:
-                        if cur_word[-1] == '▁':
-                            cur_word = cur_word[:-1]
+                        cur_word = cur_word[:-1]
                         b2u2w[b][u] = cur_word
-                        charids = [self.char2id[i] for i in cur_word]
+                        charids = [self.char2id[i] for i in cur_word[-self.char_context_size:]]
                         if len(charids) < self.char_context_size:
                             charids = [0 for i in range(self.char_context_size - len(charids))] + charids
                         b2u2p[b][u] = charids

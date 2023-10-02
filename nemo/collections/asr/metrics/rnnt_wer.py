@@ -278,9 +278,8 @@ class AbstractRNNTDecoding(ConfidenceMixin):
                         preserve_alignments=self.preserve_alignments,
                         preserve_frame_confidence=self.preserve_frame_confidence,
                         confidence_measure_cfg=self.confidence_measure_cfg,
-                        dict_file=self.cfg.greedy.get('dict_file'),
                         vocab_file=self.cfg.greedy.get('vocab_file'),
-                        phone_context_size=self.cfg.greedy.get('phone_context_size'),
+                        char_context_size=self.cfg.greedy.get('char_context_size'),
                     )
                 else:
                     self.decoding = greedy_decode.GreedyTDTInfer(

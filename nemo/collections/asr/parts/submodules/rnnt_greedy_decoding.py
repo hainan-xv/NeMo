@@ -175,7 +175,6 @@ class _GreedyRNNTInfer(Typing, ConfidenceMeasureMixin):
         decoder_model: rnnt_abstract.AbstractRNNTDecoder,
         joint_model: rnnt_abstract.AbstractRNNTJoint,
         vocab_file: str,
-        dict_file: str,
         char_context_size: int,
         blank_index: int,
         max_symbols_per_step: Optional[int] = None,
@@ -242,16 +241,20 @@ class _GreedyRNNTInfer(Typing, ConfidenceMeasureMixin):
 
         chars = [0 for i in range(self.char_context_size)]
 
-        if cur_word != "" and ( cur_word[-1] == '▁' or cur_word[-1] == '>' ):
-            if cur_word[-1] == '▁':
+        if cur_word != "":
+            if cur_word[-1] == '▁': # or cur_word[-1] == '>' ):
                 cur_word = cur_word[:-1]
 
-            chars = [self.char2id[i] for i in cur_word] if cur_word is not '<unk>' else [0 for i in range(self.char_context_size]]
+#                print('cur word is', cur_word)
+                chars = [self.char2id[i] for i in cur_word] if cur_word is not '<unk>' else [0 for i in range(self.char_context_size)]
 
-            if len(chars) > self.char_context_size:
-                chars = chars[-self.char_context_size:]
+                if len(chars) > self.char_context_size:
+                    chars = chars[-self.char_context_size:]
+                else:
+                    chars = [0 for i in range(self.char_context_size - len(chars))] + chars
             else:
-                chars = [0 for i in range(self.char_context_size - len(chars)] + chars
+                chars = [0 for i in range(self.char_context_size)]
+
 
         y = torch.LongTensor(chars)
         y = torch.reshape(y, [1, 1, self.char_context_size])
@@ -353,7 +356,6 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
         decoder_model: rnnt_abstract.AbstractRNNTDecoder,
         joint_model: rnnt_abstract.AbstractRNNTJoint,
         vocab_file: str,
-        dict_file: str,
         char_context_size: int,
         blank_index: int,
         max_symbols_per_step: Optional[int] = None,
@@ -365,7 +367,6 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
             decoder_model=decoder_model,
             joint_model=joint_model,
             vocab_file=vocab_file,
-            dict_file=dict_file,
             char_context_size=char_context_size,
             blank_index=blank_index,
             max_symbols_per_step=max_symbols_per_step,
