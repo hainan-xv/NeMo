@@ -476,9 +476,6 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                 # Perform prediction network and joint network steps.
                 g, hidden_prime = self._pred_step(cur_word, last_label, hypothesis.dec_state)
 
-                if len(cur_word) > 0 and (cur_word[-1] == '▁' or cur_word[-1] == '>'):
-                    cur_word = ''
-
                 # If preserving per-frame confidence, log_normalize must be true
                 logp = self._joint_step(f, g, log_normalize=True if self.preserve_frame_confidence else None)[
                     0, 0, 0, :
@@ -521,6 +518,9 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                     hypothesis.timestep.append(time_idx)
                     hypothesis.dec_state = hidden_prime
                     hypothesis.last_token = k
+                    if len(cur_word) > 0 and (cur_word[-1] == '▁' or cur_word[-1] == '>'):
+                        cur_word = ''
+
                     cur_word += self.id2subword[k]
 
 
