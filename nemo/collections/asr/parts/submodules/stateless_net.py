@@ -148,9 +148,9 @@ class PETStatelessNet(torch.nn.Module):
         self.vocab_size = vocab_size
         self.emb_dim = emb_dim
         self.dropout = torch.nn.Dropout(dropout)
-        self.norm = torch.nn.Identity()
-        if normalization_mode == 'layer':
-            self.norm = torch.nn.LayerNorm(emb_dim, elementwise_affine=False)
+#        self.norm = torch.nn.Identity()
+#        if normalization_mode == 'layer':
+        self.norm = torch.nn.LayerNorm(emb_dim, elementwise_affine=False)
 
         embeds = []
         for i in range(self.context_size):
@@ -192,7 +192,7 @@ class PETStatelessNet(torch.nn.Module):
         y_is_non_zero = torch.tensor(y != 0, dtype=torch.float)
         out = self.embeds[0](y) * torch.reshape(y_is_non_zero, [B, U, C, 1])
         out = self.dropout(out)
-#        out = self.norm(out)
+        out = self.norm(out)
         out = torch.reshape(out, [B, U, -1])
 
         return out
