@@ -190,24 +190,20 @@ class StatelessPETDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable):
         target_list = targets.tolist()
         B = targets.shape[0]
         U = targets.shape[1]
-        b2u2w = [{} for i in range(B)]
         b2u2p = [[[0 for i in range(self.char_context_size)] for j in range(U)] for i in range(B)]
 
         for b in range(B):
             cur_word = ''
             for u in range(target_length[b]):
-                cur_word += self.id2subword[target_list[b][u]]
+                cur_word = self.id2subword[target_list[b][u]]
                 if self.isTerminal[target_list[b][u]]:
-                    if cur_word[-1] != '▁':
-                        b2u2p[b][u] = [0 for i in range(self.char_context_size)]
-                    else:
+                    if cur_word[-1] == '▁':
                         cur_word = cur_word[:-1]
-                        b2u2w[b][u] = cur_word
-                        charids = [self.char2id[i] for i in cur_word[-self.char_context_size:]]
-                        if len(charids) < self.char_context_size:
-                            charids = [0 for i in range(self.char_context_size - len(charids))] + charids
-                        b2u2p[b][u] = charids
-                    cur_word = ''
+
+                    charids = [self.char2id[i] for i in cur_word[-self.char_context_size:]]
+                    if len(charids) < self.char_context_size:
+                        charids = [0 for i in range(self.char_context_size - len(charids))] + charids
+                    b2u2p[b][u] = charids
 
         b2u2p_tensor = torch.LongTensor(b2u2p).to(targets.device)
 
