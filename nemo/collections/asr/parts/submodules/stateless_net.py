@@ -192,7 +192,7 @@ class PETStatelessNet(torch.nn.Module):
         y_is_non_zero = torch.tensor(y != 0, dtype=torch.float)
         out = self.embeds[0](y) * torch.reshape(y_is_non_zero, [B, U, C, 1])
         out = self.dropout(out)
-        out = self.norm(out)
         out = torch.reshape(out, [B, U, -1])
+        out = self.norm(out)
 
         return out

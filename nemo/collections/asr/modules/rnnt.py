@@ -199,7 +199,7 @@ class StatelessPETDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable):
                 if self.isTerminal[target_list[b][u]]:
                     if cur_word[-1] == '▁':
                         cur_word = cur_word[:-1]
-
+                if cur_word is not '':
                     charids = [self.char2id[i] for i in cur_word[-self.char_context_size:]]
                     if len(charids) < self.char_context_size:
                         charids = [0 for i in range(self.char_context_size - len(charids))] + charids
