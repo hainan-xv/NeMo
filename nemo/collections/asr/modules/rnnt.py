@@ -199,9 +199,9 @@ class StatelessPETDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable):
         U = targets.shape[1]
         b2u2w = [{} for i in range(B)]
         b2u2p = [[[0 for i in range(self.phone_context_size)] for j in range(U)] for i in range(B)]
-#        b2u2p = [[[0 for i in range(self.phone_context_size)] for j in range(U)] for i in range(B)]
 
         for b in range(B):
+            pron = None
             cur_word = ''
             for u in range(target_length[b]):
                 cur_word += self.id2subword[target_list[b][u]]
@@ -214,9 +214,10 @@ class StatelessPETDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable):
                         pron = [0 for i in range(self.phone_context_size - len(pron))] + pron
                     b2u2p[b][u] = pron
                     cur_word = ''
-#                else:
-#                    pron = [0 for i in range(self.phone_context_size)]
-#                    b2u2p[b][u] = pron
+                else:
+                    if pron is None:
+                        pron = [0 for i in range(self.phone_context_size)]
+                    b2u2p[b][u] = pron
 
         b2u2p_tensor = torch.LongTensor(b2u2p).to(targets.device)
 
