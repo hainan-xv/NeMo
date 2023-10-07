@@ -209,7 +209,7 @@ class _GreedyRNNTInfer(Typing, ConfidenceMeasureMixin):
     @torch.no_grad()
     def _pred_step(
         self,
-        cur_word,
+        last_word,
         label: Union[torch.Tensor, int],
         hidden: Optional[torch.Tensor],
         add_sos: bool = False,
@@ -246,11 +246,11 @@ class _GreedyRNNTInfer(Typing, ConfidenceMeasureMixin):
 
         phones = [0 for i in range(self.phone_context_size)]
 
-        if cur_word != "" and ( cur_word[-1] == '▁' or cur_word[-1] == '>' ):
-            if cur_word[-1] == '▁':
-                cur_word = cur_word[:-1]
+        if last_word != "" and ( last_word[-1] == '▁' or last_word[-1] == '>' ):
+            if last_word[-1] == '▁':
+                last_word = last_word[:-1]
 
-            pron = self.word2phoneid[cur_word] if cur_word in self.word2phoneid else [0]
+            pron = self.word2phoneid[last_word] if last_word in self.word2phoneid else [0]
 
             if len(pron) > self.phone_context_size:
                 phones = pron[-self.phone_context_size:]
@@ -455,7 +455,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
             hypothesis.frame_confidence = [[]]
 
         # For timestep t in X_t
-        cur_word = ""
+        last_word = ""
         for time_idx in range(out_len):
             # Extract encoder embedding at timestep t
             # f = x[time_idx, :, :].unsqueeze(0)  # [1, 1, D]
@@ -474,7 +474,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                     last_label = label_collate([[hypothesis.last_token]])
 
                 # Perform prediction network and joint network steps.
-                g, hidden_prime = self._pred_step(cur_word, last_label, hypothesis.dec_state)
+                g, hidden_prime = self._pred_step(last_word, last_label, hypothesis.dec_state)
 
                 # If preserving per-frame confidence, log_normalize must be true
                 logp = self._joint_step(f, g, log_normalize=True if self.preserve_frame_confidence else None)[
@@ -518,10 +518,10 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                     hypothesis.timestep.append(time_idx)
                     hypothesis.dec_state = hidden_prime
                     hypothesis.last_token = k
-                    if len(cur_word) > 0 and (cur_word[-1] == '▁' or cur_word[-1] == '>'):
-                        cur_word = ''
+                    if len(last_word) > 0 and (last_word[-1] == '▁' or last_word[-1] == '>'):
+                        last_word = ''
 
-                    cur_word += self.id2subword[k]
+                    last_word += self.id2subword[k]
 
 
                 # Increment token counter.
