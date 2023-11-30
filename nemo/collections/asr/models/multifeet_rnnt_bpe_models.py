@@ -43,7 +43,10 @@ class MultiFeetEncDecRNNTBPEModel(EncDecRNNTBPEModel, ASRBPEMixin):
     def __init__(self, cfg: DictConfig, trainer: Trainer = None):
         super().__init__(cfg, trainer)
 
-        print("THIS IS A MULTIFEET MODEL")
+#        print("THIS IS A MULTIFEET MODEL")
+#        print("CFG IS", cfg)
+#        print("cfg.decoder", cfg.decoder.context_size)
+        cfg.decoder.context_size = 1
         self.model2 = EncDecRNNTBPEModel(cfg, trainer)
         self.model2.encoder = None
 
@@ -145,7 +148,7 @@ class MultiFeetEncDecRNNTBPEModel(EncDecRNNTBPEModel, ASRBPEMixin):
             tensorboard_logs = {
                 'train_loss': loss_value,
                 'train_loss1': loss_value1,
-                'train_loss21': loss_value2,
+                'train_loss2': loss_value2,
                 'learning_rate': self._optimizer.param_groups[0]['lr'],
                 'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
             }
