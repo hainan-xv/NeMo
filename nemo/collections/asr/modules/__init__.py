@@ -41,8 +41,10 @@ from nemo.collections.asr.modules.msdd_diarizer import MSDD_module
 from nemo.collections.asr.modules.rnn_encoder import RNNEncoder
 from nemo.collections.asr.modules.rnnt import (
     RNNTDecoder,
+    RNNTDualDecoder,
     RNNTDecoderJointSSL,
     RNNTJoint,
+    RNNTDualJoint,
     SampledRNNTJoint,
     StatelessTransducerDecoder,
 )

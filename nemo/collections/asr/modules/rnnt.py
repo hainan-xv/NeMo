@@ -525,25 +525,25 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
             Therefore, it is not recommended to disable this flag.
     """
 
-    @property
-    def input_types(self):
-        """Returns definitions of module input ports.
-        """
-        return {
-            "targets": NeuralType(('B', 'T'), LabelsType()),
-            "target_length": NeuralType(tuple('B'), LengthsType()),
-            "states": [NeuralType(('D', 'B', 'D'), ElementType(), optional=True)],  # must always be last
-        }
-
-    @property
-    def output_types(self):
-        """Returns definitions of module output ports.
-        """
-        return {
-            "outputs": NeuralType(('B', 'D', 'T'), EmbeddedTextType()),
-            "prednet_lengths": NeuralType(tuple('B'), LengthsType()),
-            "states": [NeuralType((('D', 'B', 'D')), ElementType(), optional=True)],  # must always be last
-        }
+#    @property
+#    def input_types(self):
+#        """Returns definitions of module input ports.
+#        """
+#        return {
+#            "targets": NeuralType(('B', 'T'), LabelsType()),
+#            "target_length": NeuralType(tuple('B'), LengthsType()),
+#            "states": [NeuralType(('D', 'B', 'D'), ElementType(), optional=True)],  # must always be last
+#        }
+#
+#    @property
+#    def output_types(self):
+#        """Returns definitions of module output ports.
+#        """
+#        return {
+#            "outputs": NeuralType(('B', 'D', 'T'), EmbeddedTextType()),
+#            "prednet_lengths": NeuralType(tuple('B'), LengthsType()),
+#            "states": [NeuralType((('D', 'B', 'D')), ElementType(), optional=True)],  # must always be last
+#        }
 
     def input_example(self, max_batch=1, max_dim=1):
         """
@@ -615,6 +615,12 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
         else:
             add_sos = True
 
+        print("targets.shape should be 2", targets.shape)
+        if states is not None:
+            print("states.shape should be 3", states.shape)
+
+        tmp = self.predict(y, state=states, add_sos=add_sos)  # (B, U, D)
+        print("tmp size", len(tmp))
         g, states = self.predict(y, state=states, add_sos=add_sos)  # (B, U, D)
         g = g.transpose(1, 2)  # (B, D, U)
 
@@ -709,6 +715,7 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
 
         # Forward step through RNN
         y = y.transpose(0, 1)  # (U + 1, B, H)
+#        print("here state is", state)
         g, hid = self.prediction["dec_rnn"](y, state)
         g = g.transpose(0, 1)  # (B, U + 1, H)
 
@@ -717,6 +724,10 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
         # Adapter module forward step
         if self.is_adapter_available():
             g = self.forward_enabled_adapters(g)
+
+#        print("hid is", hid)
+#        print("HERE RETURN!", g.shape)
+#        print("HERE RETURN2", len(hid))
 
         return g, hid
 
@@ -1059,6 +1070,43 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
         return cfg
 
 
+class RNNTDualDecoder(RNNTDecoder):
+    def __init__(
+        self,
+        prednet: Dict[str, Any],
+        vocab_size: int,
+        normalization_mode: Optional[str] = None,
+        random_state_sampling: bool = False,
+        blank_as_pad: bool = True,
+
+        context_size: int = 1,
+        stateless_normalization_mode: Optional[str] = None,
+    ):
+        super().__init__(prednet, vocab_size, normalization_mode, random_state_sampling, blank_as_pad)
+
+        self.stateless = StatelessTransducerDecoder(prednet, vocab_size, context_size, stateless_normalization_mode)
+
+
+    @typecheck()
+    def forward(self, targets, target_length, states=None, states_stateless=None):
+
+        g, target_length, state = super().forward(targets=targets, target_length=target_length, states=states)
+        g2, target_length2, state_stateless = self.stateless.forward(targets=targets, target_length=target_length, states=states_stateless)
+        return g, target_length, state,  g2, target_length2, state_stateless
+
+    def dual_predict(
+        self,
+        y: Optional[torch.Tensor] = None,
+        state: Optional[List[torch.Tensor]] = None,
+        state_stateless: Optional[List[torch.Tensor]] = None,
+        add_sos: bool = True,
+        batch_size: Optional[int] = None,
+    ):
+        a, b = super().predict(y, state, add_sos, batch_size)
+        c, d = self.stateless.predict(y, state_stateless, add_sos, batch_size)
+        return a, b, c, d
+
+
 class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin):
     """A Recurrent Neural Network Transducer Joint Network (RNN-T Joint Network).
     An RNN-T Joint network, comprised of a feedforward model.
@@ -1126,6 +1174,7 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         return {
             "encoder_outputs": NeuralType(('B', 'D', 'T'), AcousticEncodedRepresentation()),
             "decoder_outputs": NeuralType(('B', 'D', 'T'), EmbeddedTextType()),
+            "decoder_outputs2": NeuralType(('B', 'D', 'T'), EmbeddedTextType()),
             "encoder_lengths": NeuralType(tuple('B'), LengthsType(), optional=True),
             "transcripts": NeuralType(('B', 'T'), LabelsType(), optional=True),
             "transcript_lengths": NeuralType(tuple('B'), LengthsType(), optional=True),
@@ -1243,6 +1292,7 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         self,
         encoder_outputs: torch.Tensor,
         decoder_outputs: Optional[torch.Tensor],
+        decoder_outputs2: Optional[torch.Tensor],
         encoder_lengths: Optional[torch.Tensor] = None,
         transcripts: Optional[torch.Tensor] = None,
         transcript_lengths: Optional[torch.Tensor] = None,
@@ -1377,7 +1427,7 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
 
             return losses, wer, wer_num, wer_denom
 
-    def joint(self, f: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
+    def joint(self, f: torch.Tensor, g: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
         """
         Compute the joint step of the network.
 
@@ -1536,6 +1586,8 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
     def set_fused_batch_size(self, fused_batch_size):
         self._fused_batch_size = fused_batch_size
 
+class RNNTDualJoint(RNNTJoint):
+    pass
 
 class RNNTDecoderJoint(torch.nn.Module, Exportable):
     """

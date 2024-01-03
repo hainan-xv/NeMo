@@ -177,6 +177,7 @@ class _GreedyRNNTInfer(Typing, ConfidenceMeasureMixin):
         self,
         label: Union[torch.Tensor, int],
         hidden: Optional[torch.Tensor],
+        hidden_stateless: Optional[torch.Tensor],
         add_sos: bool = False,
         batch_size: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -204,14 +205,14 @@ class _GreedyRNNTInfer(Typing, ConfidenceMeasureMixin):
         else:
             # Label is an integer
             if label == self._SOS:
-                return self.decoder.predict(None, hidden, add_sos=add_sos, batch_size=batch_size)
+                return self.decoder.predict(None, hidden, hidden_stateless, add_sos=add_sos, batch_size=batch_size)
 
             label = label_collate([[label]])
 
         # output: [B, 1, K]
-        return self.decoder.predict(label, hidden, add_sos=add_sos, batch_size=batch_size)
+        return self.decoder.predict(label, hidden, hidden_stateless, add_sos=add_sos, batch_size=batch_size)
 
-    def _joint_step(self, enc, pred, log_normalize: Optional[bool] = None):
+    def _joint_step(self, enc, pred, pred_stateless, log_normalize: Optional[bool] = None):
         """
         Common joint step based on AbstractRNNTJoint implementation.
 
@@ -224,7 +225,7 @@ class _GreedyRNNTInfer(Typing, ConfidenceMeasureMixin):
              logits of shape (B, T=1, U=1, V + 1)
         """
         with torch.no_grad():
-            logits = self.joint.joint(enc, pred)
+            logits = self.joint.joint(enc, pred, pred_stateless)
 
             if log_normalize is None:
                 if not logits.is_cuda:  # Use log softmax only if on CPU
@@ -630,6 +631,7 @@ class GreedyBatchedRNNTInfer(_GreedyRNNTInfer):
 
             # Initialize Hidden state matrix (shared by entire batch)
             hidden = None
+            hidden_stateless = None
 
             # If alignments need to be preserved, register a dangling list to hold the values
             if self.preserve_alignments:
@@ -675,14 +677,14 @@ class GreedyBatchedRNNTInfer(_GreedyRNNTInfer):
                     # If very first prediction step, submit SOS tag (blank) to pred_step.
                     # This feeds a zero tensor as input to AbstractRNNTDecoder to prime the state
                     if time_idx == 0 and symbols_added == 0 and hidden is None:
-                        g, hidden_prime = self._pred_step(self._SOS, hidden, batch_size=batchsize)
+                        g, hidden_prime, g_stateless, hidden_prime_stateless, = self._pred_step(self._SOS, hidden, hidden_stateless, batch_size=batchsize)
                     else:
                         # Perform batch step prediction of decoder, getting new states and scores ("g")
-                        g, hidden_prime = self._pred_step(last_label, hidden, batch_size=batchsize)
+                        g, hidden_prime, g_stateless, hidden_prime_stateless, = self._pred_step(last_label, hidden, hidden_stateless, batch_size=batchsize)
 
                     # Batched joint step - Output = [B, V + 1]
                     # If preserving per-frame confidence, log_normalize must be true
-                    logp = self._joint_step(f, g, log_normalize=True if self.preserve_frame_confidence else None)[
+                    logp = self._joint_step(f, g, g_stateless, log_normalize=True if self.preserve_frame_confidence else None)[
                         :, 0, 0, :
                     ]
 
@@ -765,6 +767,9 @@ class GreedyBatchedRNNTInfer(_GreedyRNNTInfer):
                         if hidden is not None:
                             # LSTM has 2 states
                             hidden_prime = self.decoder.batch_copy_states(hidden_prime, hidden, blank_indices)
+
+                        if hidden_stateless is not None:
+                            hidden_prime_stateless = self.decoder.stateless.batch_copy_states(hidden_prime_stateless, hidden_stateless, blank_indices)
 
                         elif len(blank_indices) > 0 and hidden is None:
                             # Reset state if there were some blank and other non-blank predictions in batch
