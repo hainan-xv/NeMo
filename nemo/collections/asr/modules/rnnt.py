@@ -1075,14 +1075,14 @@ class RNNTDualDecoder(RNNTDecoder):
     ):
         super().__init__(prednet, vocab_size, normalization_mode, random_state_sampling, blank_as_pad)
 
-        self.stateless = StatelessTransducerDecoder(prednet, vocab_size, context_size, stateless_normalization_mode)
+        self.stateless = torch.nn.ModuleList([StatelessTransducerDecoder(prednet, vocab_size, context_size, stateless_normalization_mode)])
 
 
     @typecheck()
     def forward(self, targets, target_length, states=None, states_stateless=None):
 
         g, target_length, state = super().forward(targets=targets, target_length=target_length, states=states)
-        g_stateless, _, state_stateless = self.stateless.forward(targets=targets, target_length=target_length, states=states_stateless)
+        g_stateless, _, state_stateless = self.stateless[0].forward(targets=targets, target_length=target_length, states=states_stateless)
         return g, target_length, state, g_stateless, state_stateless
 
     def dual_predict(
@@ -1094,7 +1094,7 @@ class RNNTDualDecoder(RNNTDecoder):
         batch_size: Optional[int] = None,
     ):
         a, b = super().predict(y, state, add_sos, batch_size)
-        c, d = self.stateless.predict(y, state_stateless, add_sos, batch_size)
+        c, d = self.stateless[0].predict(y, state_stateless, add_sos, batch_size)
         return a, b, c, d
 
 
