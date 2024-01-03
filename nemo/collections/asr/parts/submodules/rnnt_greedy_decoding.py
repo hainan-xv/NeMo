@@ -205,12 +205,12 @@ class _GreedyRNNTInfer(Typing, ConfidenceMeasureMixin):
         else:
             # Label is an integer
             if label == self._SOS:
-                return self.decoder.predict(None, hidden, hidden_stateless, add_sos=add_sos, batch_size=batch_size)
+                return self.decoder.dual_predict(None, hidden, hidden_stateless, add_sos=add_sos, batch_size=batch_size)
 
             label = label_collate([[label]])
 
         # output: [B, 1, K]
-        return self.decoder.predict(label, hidden, hidden_stateless, add_sos=add_sos, batch_size=batch_size)
+        return self.decoder.dual_predict(label, hidden, hidden_stateless, add_sos=add_sos, batch_size=batch_size)
 
     def _joint_step(self, enc, pred, pred_stateless, log_normalize: Optional[bool] = None):
         """

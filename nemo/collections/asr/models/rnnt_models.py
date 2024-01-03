@@ -677,7 +677,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel):
         del signal
 
         # During training, loss must be computed, so decoder forward is necessary
-        decoder, target_length, states, decoder2, target_length2, states2 = self.decoder(targets=transcript, target_length=transcript_len)
+        decoder, target_length, states, decoder_stateless, states_stateless = self.decoder(targets=transcript, target_length=transcript_len)
 
         if hasattr(self, '_trainer') and self._trainer is not None:
             log_every_n_steps = self._trainer.log_every_n_steps
@@ -689,7 +689,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel):
         # If experimental fused Joint-Loss-WER is not used
         if not self.joint.fuse_loss_wer:
             # Compute full joint and loss
-            joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder, decoder_outputs2=decoder2)
+            joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder, decoder_outputs_stateless=decoder_stateless)
             loss_value = self.loss(
                 log_probs=joint, targets=transcript, input_lengths=encoded_len, target_lengths=target_length
             )
@@ -724,7 +724,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel):
             loss_value, wer, _, _ = self.joint(
                 encoder_outputs=encoded,
                 decoder_outputs=decoder,
-                decoder_outputs2=decoder2,
+                decoder_outputs_stateless=decoder_stateless,
                 encoder_lengths=encoded_len,
                 transcripts=transcript,
                 transcript_lengths=transcript_len,
@@ -813,14 +813,14 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel):
                 decoded, target_len, states = self.decoder(targets=transcript, target_length=transcript_len)
             else:
                 decoded = None
-                decoded2 = None
+                decoded_stateless = None
                 target_len = transcript_len
 
             # Fused joint step
             loss_value, wer, wer_num, wer_denom = self.joint(
                 encoder_outputs=encoded,
                 decoder_outputs=decoded,
-                decoder_outputs2=decoded2,
+                decoder_outputs_stateless=decoded_stateless,
                 encoder_lengths=encoded_len,
                 transcripts=transcript,
                 transcript_lengths=target_len,

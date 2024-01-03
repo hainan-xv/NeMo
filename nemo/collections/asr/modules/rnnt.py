@@ -615,12 +615,7 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
         else:
             add_sos = True
 
-        print("targets.shape should be 2", targets.shape)
-        if states is not None:
-            print("states.shape should be 3", states.shape)
-
         tmp = self.predict(y, state=states, add_sos=add_sos)  # (B, U, D)
-        print("tmp size", len(tmp))
         g, states = self.predict(y, state=states, add_sos=add_sos)  # (B, U, D)
         g = g.transpose(1, 2)  # (B, D, U)
 
@@ -715,7 +710,6 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
 
         # Forward step through RNN
         y = y.transpose(0, 1)  # (U + 1, B, H)
-#        print("here state is", state)
         g, hid = self.prediction["dec_rnn"](y, state)
         g = g.transpose(0, 1)  # (B, U + 1, H)
 
@@ -725,9 +719,6 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
         if self.is_adapter_available():
             g = self.forward_enabled_adapters(g)
 
-#        print("hid is", hid)
-#        print("HERE RETURN!", g.shape)
-#        print("HERE RETURN2", len(hid))
 
         return g, hid
 
@@ -1091,8 +1082,8 @@ class RNNTDualDecoder(RNNTDecoder):
     def forward(self, targets, target_length, states=None, states_stateless=None):
 
         g, target_length, state = super().forward(targets=targets, target_length=target_length, states=states)
-        g2, target_length2, state_stateless = self.stateless.forward(targets=targets, target_length=target_length, states=states_stateless)
-        return g, target_length, state,  g2, target_length2, state_stateless
+        g_stateless, _, state_stateless = self.stateless.forward(targets=targets, target_length=target_length, states=states_stateless)
+        return g, target_length, state, g_stateless, state_stateless
 
     def dual_predict(
         self,
@@ -1174,7 +1165,7 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         return {
             "encoder_outputs": NeuralType(('B', 'D', 'T'), AcousticEncodedRepresentation()),
             "decoder_outputs": NeuralType(('B', 'D', 'T'), EmbeddedTextType()),
-            "decoder_outputs2": NeuralType(('B', 'D', 'T'), EmbeddedTextType()),
+            "decoder_outputs_stateless": NeuralType(('B', 'D', 'T'), EmbeddedTextType()),
             "encoder_lengths": NeuralType(tuple('B'), LengthsType(), optional=True),
             "transcripts": NeuralType(('B', 'T'), LabelsType(), optional=True),
             "transcript_lengths": NeuralType(tuple('B'), LengthsType(), optional=True),
@@ -1272,7 +1263,7 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         # Optional arguments
         dropout = jointnet.get('dropout', 0.0)
 
-        self.pred, self.enc, self.joint_net = self._joint_net_modules(
+        self.pred, self.pred_lm, self.enc, self.joint_net = self._joint_net_modules(
             num_classes=self._num_classes,  # add 1 for blank symbol
             pred_n_hidden=self.pred_hidden,
             enc_n_hidden=self.encoder_hidden,
@@ -1292,7 +1283,7 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         self,
         encoder_outputs: torch.Tensor,
         decoder_outputs: Optional[torch.Tensor],
-        decoder_outputs2: Optional[torch.Tensor],
+        decoder_outputs_stateless: Optional[torch.Tensor],
         encoder_lengths: Optional[torch.Tensor] = None,
         transcripts: Optional[torch.Tensor] = None,
         transcript_lengths: Optional[torch.Tensor] = None,
@@ -1304,6 +1295,7 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
 
         if decoder_outputs is not None:
             decoder_outputs = decoder_outputs.transpose(1, 2)  # (B, U, D)
+            decoder_outputs_stateless = decoder_outputs_stateless.transpose(1, 2)  # (B, U, D)
 
         if not self._fuse_loss_wer:
             if decoder_outputs is None:
@@ -1361,16 +1353,18 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
 
                     # sub_dec = decoder_outputs[begin:end, ...]  # [sub-batch, U, D]
                     sub_dec = decoder_outputs.narrow(dim=0, start=begin, length=int(end - begin))  # [sub-batch, U, D]
+                    sub_dec_stateless = decoder_outputs_stateless.narrow(dim=0, start=begin, length=int(end - begin))  # [sub-batch, U, D]
 
                     # Reduce decoder length to preserve computation
                     # Decoder: [sub-batch, U, D] -> [sub-batch, U', D]; U' < U
                     if sub_dec.shape[1] != max_sub_transcript_length + 1:
                         sub_dec = sub_dec.narrow(dim=1, start=0, length=int(max_sub_transcript_length + 1))
+                        sub_dec_stateless = sub_dec_stateless.narrow(dim=1, start=0, length=int(max_sub_transcript_length + 1))
 
                     # Perform joint => [sub-batch, T', U', V + 1]
-                    sub_joint = self.joint(sub_enc, sub_dec)
+                    sub_joint = self.joint(sub_enc, sub_dec, sub_dec_stateless)
 
-                    del sub_dec
+                    del sub_dec, sub_dec_stateless
 
                     # Reduce transcript length to correct alignment
                     # Transcript: [sub-batch, L] -> [sub-batch, L']; L' <= L
@@ -1427,7 +1421,7 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
 
             return losses, wer, wer_num, wer_denom
 
-    def joint(self, f: torch.Tensor, g: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
+    def joint(self, f: torch.Tensor, g_lstm: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
         """
         Compute the joint step of the network.
 
@@ -1457,6 +1451,9 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         Returns:
             Logits / log softmaxed tensor of shape (B, T, U, V + 1).
         """
+
+#        print("HERE", f.shape, g.shape, g_lstm.shape)
+
         # f = [B, T, H1]
         f = self.enc(f)
         f.unsqueeze_(dim=2)  # (B, T, 1, H)
@@ -1474,6 +1471,11 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
             inp = self.forward_enabled_adapters(inp)
 
         res = self.joint_net(inp)  # [B, T, U, V + 1]
+
+        g_lstm = self.pred_lm(g_lstm)
+        g_lstm.unsqueeze_(dim=1)  # (B, 1, U, H)
+
+        res[:,:,:,:-1] += g_lstm
 
         del inp
 
@@ -1509,6 +1511,7 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
             dropout: Dropout value to apply to joint.
         """
         pred = torch.nn.Linear(pred_n_hidden, joint_n_hidden)
+        pred_lm = torch.nn.Linear(pred_n_hidden, num_classes - 1)
         enc = torch.nn.Linear(enc_n_hidden, joint_n_hidden)
 
         if activation not in ['relu', 'sigmoid', 'tanh']:
@@ -1528,7 +1531,10 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
             + ([torch.nn.Dropout(p=dropout)] if dropout else [])
             + [torch.nn.Linear(joint_n_hidden, num_classes)]
         )
-        return pred, enc, torch.nn.Sequential(*layers)
+
+        layers_lm = (
+            [activation] + [pred_lm])
+        return pred, torch.nn.Sequential(*layers_lm), enc, torch.nn.Sequential(*layers)
 
     # Adapter method overrides
     def add_adapter(self, name: str, cfg: DictConfig):
