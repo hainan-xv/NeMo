@@ -19,7 +19,7 @@ import editdistance
 import torch
 from torchmetrics import Metric
 
-from nemo.collections.asr.metrics.rnnt_wer import AbstractRNNTDecoding, RNNTDecodingConfig
+from nemo.collections.asr.metrics.lm_rnnt_wer import AbstractLMRNNTDecoding, LMRNNTDecodingConfig
 from nemo.collections.asr.metrics.wer import move_dimension_to_the_front
 from nemo.collections.asr.parts.submodules import rnnt_beam_decoding
 from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis, NBestHypotheses
@@ -27,10 +27,10 @@ from nemo.collections.common.tokenizers.aggregate_tokenizer import AggregateToke
 from nemo.collections.common.tokenizers.tokenizer_spec import TokenizerSpec
 from nemo.utils import logging
 
-__all__ = ['RNNTBPEDecoding', 'RNNTBPEWER']
+__all__ = ['LMRNNTBPEDecoding', 'LMRNNTBPEWER']
 
 
-class RNNTBPEDecoding(AbstractRNNTDecoding):
+class LMRNNTBPEDecoding(AbstractLMRNNTDecoding):
     """
     Used for performing RNN-T auto-regressive decoding of the Decoder+Joint network given the encoder state.
 
@@ -196,7 +196,7 @@ class RNNTBPEDecoding(AbstractRNNTDecoding):
         tokenizer: The tokenizer which will be used for decoding.
     """
 
-    def __init__(self, decoding_cfg, decoder, joint, tokenizer: TokenizerSpec):
+    def __init__(self, decoding_cfg, decoder, lm, joint, tokenizer: TokenizerSpec):
         blank_id = tokenizer.tokenizer.vocab_size  # RNNT or TDT models.
 
         # multi-blank RNNTs
@@ -205,8 +205,8 @@ class RNNTBPEDecoding(AbstractRNNTDecoding):
 
         self.tokenizer = tokenizer
 
-        super(RNNTBPEDecoding, self).__init__(
-            decoding_cfg=decoding_cfg, decoder=decoder, joint=joint, blank_id=blank_id
+        super(LMRNNTBPEDecoding, self).__init__(
+            decoding_cfg=decoding_cfg, decoder=decoder, lm=lm, joint=joint, blank_id=blank_id
         )
 
         if isinstance(self.decoding, rnnt_beam_decoding.BeamRNNTInfer):
@@ -319,7 +319,7 @@ class RNNTBPEDecoding(AbstractRNNTDecoding):
 
 
 
-class RNNTBPEWER(Metric):
+class LMRNNTBPEWER(Metric):
     """
     This metric computes numerator and denominator for Overall Word Error Rate (WER) between prediction and reference texts.
     When doing distributed training/evaluation the result of res=WER(predictions, targets, target_lengths) calls
@@ -343,7 +343,7 @@ class RNNTBPEWER(Metric):
             return {'val_loss': val_loss_mean, 'log': tensorboard_logs}
 
     Args:
-        decoding: RNNTBPEDecoding object that will perform autoregressive decoding of the RNNT model.
+        decoding: LMRNNTBPEDecoding object that will perform autoregressive decoding of the RNNT model.
         batch_dim_index: Index of the batch dimension.
         use_cer: Whether to use Character Error Rate isntead of Word Error Rate.
         log_prediction: Whether to log a single decoded sample per call.
@@ -357,13 +357,13 @@ class RNNTBPEWER(Metric):
 
     def __init__(
         self,
-        decoding: RNNTBPEDecoding,
+        decoding: LMRNNTBPEDecoding,
         batch_dim_index=0,
         use_cer: bool = False,
         log_prediction: bool = True,
         dist_sync_on_step=False,
     ):
-        super(RNNTBPEWER, self).__init__(dist_sync_on_step=dist_sync_on_step)
+        super(LMRNNTBPEWER, self).__init__(dist_sync_on_step=dist_sync_on_step)
         self.decoding = decoding
         self.batch_dim_index = batch_dim_index
         self.use_cer = use_cer
@@ -426,5 +426,5 @@ class RNNTBPEWER(Metric):
         return wer, self.scores.detach(), self.words.detach()
 
 @dataclass
-class RNNTBPEDecodingConfig(RNNTDecodingConfig):
+class LMRNNTBPEDecodingConfig(LMRNNTDecodingConfig):
     pass
