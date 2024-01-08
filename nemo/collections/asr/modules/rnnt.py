@@ -1911,6 +1911,8 @@ class LMRNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixi
         h.unsqueeze_(dim=1)  # (B, 1, U, H)
 
 
+        inp = f + g  # [B, T, U, H]
+
         del f, g
 
         # Forward adapter modules on joint hidden
@@ -1920,7 +1922,6 @@ class LMRNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixi
         res = self.joint_net(inp)  # [B, T, U, V + 1]
 
         if random.uniform(0.0, 1.0) > 0.5:
-#            inp = f + g  # [B, T, U, H]
             res[:,:,:,:-1] += h
         else:
             res[:,:,:,:-1] = h + res[:,:,:,:-1] * 0
