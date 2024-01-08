@@ -29,6 +29,9 @@
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
+
+import random
+
 from omegaconf import DictConfig, OmegaConf
 
 from nemo.collections.asr.modules import rnnt_abstract
@@ -1907,7 +1910,10 @@ class LMRNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixi
         h = self.lm(h)
         h.unsqueeze_(dim=1)  # (B, 1, U, H)
 
-        inp = f + g  # [B, T, U, H]
+        if random.uniform(0.0, 1.0) > 0.5:
+            inp = f + g  # [B, T, U, H]
+        else:
+            inp = f * 0 + g  # [B, T, U, H]
 
         del f, g
 

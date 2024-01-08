@@ -984,12 +984,6 @@ class EncDecLMRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel):
                     norm = param.grad.norm()
                     param.grad.data.div_(norm)
 
-# TODO(hainanx) might need to take a look later
-#        if self._optim_normalize_lm_norm:
-#            for param_name, param in self.lm.named_parameters():
-#                if param.grad is not None:
-#                    norm = param.grad.norm()
-#                    param.grad.data.div_(norm)
 
         if self._optim_normalize_joint_norm:
             for param_name, param in self.joint.named_parameters():
