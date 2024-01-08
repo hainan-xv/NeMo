@@ -1921,10 +1921,14 @@ class LMRNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixi
 
         res = self.joint_net(inp)  # [B, T, U, V + 1]
 
-        if random.uniform(0.0, 1.0) > 0.5:
-            res[:,:,:,:-1] += h
+        if self.training:
+            if random.uniform(0.0, 1.0) > 0.5:
+                res[:,:,:,:-1] += h
+            else:
+                res[:,:,:,:-1] = h + res[:,:,:,:-1] * 0
+
         else:
-            res[:,:,:,:-1] = h + res[:,:,:,:-1] * 0
+            res[:,:,:,:-1] += h
 
         del inp
 
