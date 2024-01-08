@@ -1910,10 +1910,6 @@ class LMRNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixi
         h = self.lm(h)
         h.unsqueeze_(dim=1)  # (B, 1, U, H)
 
-        if random.uniform(0.0, 1.0) > 0.5:
-            inp = f + g  # [B, T, U, H]
-        else:
-            inp = f * 0 + g  # [B, T, U, H]
 
         del f, g
 
@@ -1923,7 +1919,11 @@ class LMRNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixi
 
         res = self.joint_net(inp)  # [B, T, U, V + 1]
 
-        res[:,:,:,:-1] += h
+        if random.uniform(0.0, 1.0) > 0.5:
+#            inp = f + g  # [B, T, U, H]
+            res[:,:,:,:-1] += h
+        else:
+            res[:,:,:,:-1] = h + res[:,:,:,:-1] * 0
 
         del inp
 
