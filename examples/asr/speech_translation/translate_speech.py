@@ -186,7 +186,8 @@ def main(cfg: TranslationConfig) -> Union[TranslationConfig, List[str]]:
     # translate audio
     with autocast():
         with torch.no_grad():
-            translations = asr_model.translate(
+#            translations = asr_model.translate(
+            translations = asr_model.transcribe(
                 paths2audio_files=filepaths, batch_size=cfg.batch_size, return_hypotheses=return_hypotheses,
             )
 

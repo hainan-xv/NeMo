@@ -258,9 +258,15 @@ class EncDecTransfModelBPE(ASRModel, ExportableEncDecModel, ASRBPEMixin):
                         input_signal=test_batch[0].to(device), input_signal_length=test_batch[1].to(device)
                     )
 
+                    batch_size = test_batch[0].shape[0]
+
+                    dec_input = [self.tokenizer.bos_id] + self.tokenizer.tokens_to_ids("▁<en>")
+
+                    decoder_input_ids = torch.LongTensor(dec_input).repeat([batch_size, 1]).to(device)
+
                     beam_hypotheses = (
                         self.beam_search(
-                            encoder_hidden_states=enc_states, encoder_input_mask=enc_mask, return_beam_scores=False
+                            encoder_hidden_states=enc_states, encoder_input_mask=enc_mask, return_beam_scores=False, decoder_input_ids=decoder_input_ids
                         )
                         .detach()
                         .cpu()
