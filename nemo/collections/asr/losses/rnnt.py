@@ -51,7 +51,7 @@ except (ImportError, ModuleNotFoundError):
     WARP_RNNT_AVAILABLE = False
 
 try:
-    from nemo.collections.asr.parts.numba.rnnt_loss import MultiblankRNNTLossNumba, RNNTLossNumba, TDTLossNumba
+    from nemo.collections.asr.parts.numba.rnnt_loss import MultiblankRNNTLossNumba, RNNTLossNumba, TDTLossNumba, WORDAWARERNNTLossNumba
 
     NUMBA_RNNT_AVAILABLE = True
 except (ImportError, ModuleNotFoundError):
@@ -100,6 +100,14 @@ RNNT_LOSS_RESOLVER = {
         is_available=NUMBA_RNNT_AVAILABLE,
         installation_msg=NUMBA_INSTALLATION_MESSAGE,
         force_float32=False,  # This is only temporarily false, will be dynamically updated during resolution
+    ),
+    "wordaware_rnnt": RNNTLossConfig(
+        loss_name="wordaware_rnnt",
+        lib_name="numba",
+        min_version='0.53.0',
+        is_available=NUMBA_RNNT_AVAILABLE,
+        installation_msg=NUMBA_INSTALLATION_MESSAGE,
+        force_float32=True,
     ),
     "pytorch": RNNTLossConfig(
         loss_name="pytorch",
@@ -264,6 +272,13 @@ def resolve_rnnt_loss(loss_name: str, blank_idx: int, loss_kwargs: dict = None) 
         fastemit_lambda = loss_kwargs.pop('fastemit_lambda', 0.0)
         clamp = loss_kwargs.pop('clamp', -1.0)
         loss_func = RNNTLossNumba(blank=blank_idx, reduction='none', fastemit_lambda=fastemit_lambda, clamp=clamp)
+        _warn_unused_additional_kwargs(loss_name, loss_kwargs)
+
+    elif loss_name == 'wordaware_rnnt':
+        fastemit_lambda = loss_kwargs.pop('fastemit_lambda', 0.0)
+        clamp = loss_kwargs.pop('clamp', -1.0)
+        vocab_file = loss_kwargs.pop('vocab_file', None)
+        loss_func = WORDAWARERNNTLossNumba(blank=blank_idx, reduction='none', fastemit_lambda=fastemit_lambda, clamp=clamp, vocab_file=vocab_file)
         _warn_unused_additional_kwargs(loss_name, loss_kwargs)
 
     elif loss_name == 'pytorch':
@@ -488,6 +503,7 @@ class RNNTLoss(Loss):
         self._loss.reduction = None
 
         # Compute RNNT loss
+
         loss = self._loss(acts=log_probs, labels=targets, act_lens=input_lengths, label_lens=target_lengths)
 
         # Loss reduction can be dynamic, so reset it after call

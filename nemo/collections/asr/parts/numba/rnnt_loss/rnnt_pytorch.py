@@ -34,7 +34,7 @@ from torch.nn import Module
 from nemo.collections.asr.parts.numba.rnnt_loss import rnnt
 from nemo.collections.asr.parts.numba.rnnt_loss.utils.cpu_utils import cpu_rnnt
 
-__all__ = ['rnnt_loss', 'RNNTLossNumba', 'MultiblankRNNTLossNumba', 'TDTLossNumba']
+__all__ = ['rnnt_loss', 'WORDAWARERNNTLossNumba' 'RNNTLossNumba', 'MultiblankRNNTLossNumba', 'TDTLossNumba']
 
 
 class _RNNTNumba(Function):
@@ -49,6 +49,8 @@ class _RNNTNumba(Function):
             FastEmit: Low-latency Streaming ASR with Sequence-level Emission Regularization.
         """
         is_cuda = acts.is_cuda
+
+        assert(False)
 
         certify_inputs(acts, labels, act_lens, label_lens)
         if clamp < 0:
@@ -89,6 +91,61 @@ class _RNNTNumba(Function):
         if grad_output is not None and ctx.grads is not None:
             grad_output = grad_output.view(-1, 1, 1, 1).to(ctx.grads)
             return ctx.grads.mul_(grad_output), None, None, None, None, None, None, None
+
+
+class _WORDAWARERNNTNumba(Function):
+    @staticmethod
+    def forward(ctx, acts, labels, act_lens, label_lens, blank, reduction, fastemit_lambda, clamp, is_special):
+        """
+        log_probs: Tensor of (batch x seqLength x labelLength x outputDim) containing output from network
+        labels: 2 dimensional Tensor containing all the targets of the batch with zero padded
+        act_lens: Tensor of size (batch) containing size of each output sequence from the network
+        label_lens: Tensor of (batch) containing label length of each example
+        fastemit_lambda: Float scaling factor for FastEmit regularization. Refer to
+            FastEmit: Low-latency Streaming ASR with Sequence-level Emission Regularization.
+        """
+        is_cuda = acts.is_cuda
+
+        certify_inputs(acts, labels, act_lens, label_lens)
+        if clamp < 0:
+            raise ValueError("`clamp` must be 0.0 or positive float value.")
+
+        loss_func = rnnt.wordaware_rnnt_loss_gpu if is_cuda else rnnt.rnnt_loss_cpu
+        grads = torch.zeros_like(acts) if acts.requires_grad else None
+        minibatch_size = acts.size(0)
+        costs = torch.zeros(minibatch_size, device=acts.device, dtype=acts.dtype)
+
+        loss_func(
+            acts,
+            labels=labels,
+            input_lengths=act_lens,
+            label_lengths=label_lens,
+            costs=costs,
+            grads=grads,
+            blank_label=blank,
+            fastemit_lambda=fastemit_lambda,
+            clamp=clamp,
+            is_special=is_special,
+            num_threads=0,
+        )
+
+        if reduction in ['sum', 'mean']:
+            costs = costs.sum().unsqueeze_(-1)
+            if reduction == 'mean':
+                costs /= minibatch_size
+
+                if grads is not None:
+                    grads /= minibatch_size
+
+        ctx.grads = grads
+
+        return costs
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        if grad_output is not None and ctx.grads is not None:
+            grad_output = grad_output.view(-1, 1, 1, 1).to(ctx.grads)
+            return ctx.grads.mul_(grad_output), None, None, None, None, None, None, None, None
 
 
 class _TDTNumba(Function):
@@ -293,6 +350,37 @@ def rnnt_loss(
     return _RNNTNumba.apply(acts, labels, act_lens, label_lens, blank, reduction, fastemit_lambda, clamp)
 
 
+def wordaware_rnnt_loss(
+    acts, labels, act_lens, label_lens, blank=0, reduction='mean', fastemit_lambda: float = 0.0, clamp: float = 0.0, is_special: list = None
+):
+    """RNN Transducer Loss (functional form)
+    Args:
+        acts: Tensor of (batch x seqLength x labelLength x outputDim) containing output from network
+        labels: 2 dimensional Tensor containing all the targets of the batch with zero padded
+        act_lens: Tensor of size (batch) containing size of each output sequence from the network
+        label_lens: Tensor of (batch) containing label length of each example
+        blank (int, optional): blank label. Default: 0.
+        reduction (string, optional): Specifies the reduction to apply to the output:
+            'none' | 'mean' | 'sum'. 'none': no reduction will be applied,
+            'mean': the output losses will be divided by the target lengths and
+            then the mean over the batch is taken. Default: 'mean'
+    """
+    if not acts.is_cuda:
+        # Since CPU requires log_softmax to be computed explicitly, we need to perform grad clipping
+        # *after* we have obtained the gradients of loss(logsoftmax()).
+        # This is highly wasteful since it requires a copy of the entire joint tensor which is expensive.
+        # CUDA version is much more efficient since it performs an inplace logsoftmax, and therefore
+        # can inplace clamp the gradient.
+        if clamp > 0.0:
+            acts = cpu_rnnt.LogSoftmaxGradModification.apply(acts, clamp)
+
+        # NOTE manually done log_softmax for CPU version,
+        # log_softmax is computed within GPU version.
+        acts = torch.nn.functional.log_softmax(acts, -1)
+
+    return _WORDAWARERNNTNumba.apply(acts, labels, act_lens, label_lens, blank, reduction, fastemit_lambda, clamp, is_special)
+
+
 def multiblank_rnnt_loss(
     acts,
     labels,
@@ -435,6 +523,82 @@ class RNNTLossNumba(Module):
         return self.loss(
             acts, labels, act_lens, label_lens, self.blank, self.reduction, self.fastemit_lambda, self.clamp
         )
+
+
+def get_special(vocab_file):
+    f = open(vocab_file, 'r')
+    n = 0
+    res = []
+    for line in f:
+        res.append(int(line.startswith('▁')))
+
+    return res
+
+class WORDAWARERNNTLossNumba(Module):
+    """
+    Parameters:
+        blank (int, optional): blank label. Default: 0.
+        reduction (string, optional): Specifies the reduction to apply to the output:
+            'none' | 'mean' | 'sum'. 'none': no reduction will be applied,
+            'mean': the output losses will be divided by the target lengths and
+            then the mean over the batch is taken. Default: 'mean'
+        fastemit_lambda: Float scaling factor for FastEmit regularization. Refer to
+                FastEmit: Low-latency Streaming ASR with Sequence-level Emission Regularization.
+        clamp: Float value. When set to value >= 0.0, will clamp the gradient to [-clamp, clamp].
+    """
+
+    def __init__(self, blank=0, reduction='mean', fastemit_lambda: float = 0.0, clamp: float = -1, vocab_file: str = None):
+        super(WORDAWARERNNTLossNumba, self).__init__()
+        self.blank = blank
+        self.fastemit_lambda = fastemit_lambda
+        self.clamp = float(clamp) if clamp > 0 else 0.0
+        self.reduction = reduction
+        self.vocab_file = vocab_file
+        assert vocab_file is not None
+
+        self.is_special = get_special(vocab_file)
+
+        self.loss = _WORDAWARERNNTNumba.apply
+
+    def forward(self, acts, labels, act_lens, label_lens):
+        """
+        log_probs: Tensor of (batch x seqLength x labelLength x outputDim) containing output from network
+        labels: 2 dimensional Tensor containing all the targets of the batch with zero padded
+        act_lens: Tensor of size (batch) containing size of each output sequence from the network
+        label_lens: Tensor of (batch) containing label length of each example
+        """
+        if not acts.is_cuda:
+            # Since CPU requires log_softmax to be computed explicitly, we need to perform grad clipping
+            # *after* we have obtained the gradients of loss(logsoftmax()).
+            # This is highly wasteful since it requires a copy of the entire joint tensor which is expensive.
+            # CUDA version is much more efficient since it performs an inplace logsoftmax, and therefore
+            # can inplace clamp the gradient.
+            if self.clamp > 0.0:
+                acts = cpu_rnnt.LogSoftmaxGradModification.apply(acts, self.clamp)
+
+            # NOTE manually done log_softmax for CPU version,
+            # log_softmax is computed within GPU version.
+            acts = torch.nn.functional.log_softmax(acts, -1)
+
+        # now replacing acts[:,:,:,blank] as -inf if history word is not "special"
+
+        labels_cpu = labels.cpu()
+        labels_cpu.apply_(lambda val: self.is_special[val])
+
+        label_add_inf = 1 - labels_cpu.to(labels.device)  # if not EOW, then make blank INF
+        label_add_inf = label_add_inf.reshape([label_add_inf.shape[0], 1, label_add_inf.shape[-1]])
+
+#        acts[:,:,1:,self.blank] -= label_add_inf * 99999.0
+        acts[:,:,1:,self.blank] = acts[:,:,1:,self.blank] * (1 - label_add_inf) - label_add_inf * 99999.0
+
+
+#        label_is_special = self.is_special[labels]
+#        print("HERE label is", label_is_special)
+
+        return self.loss(
+            acts, labels, act_lens, label_lens, self.blank, self.reduction, self.fastemit_lambda, self.clamp, self.is_special
+        )
+
 
 
 class MultiblankRNNTLossNumba(Module):
