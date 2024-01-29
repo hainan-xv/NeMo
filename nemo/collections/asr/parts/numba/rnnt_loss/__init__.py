@@ -16,6 +16,6 @@ from nemo.collections.asr.parts.numba.rnnt_loss.rnnt import rnnt_loss_cpu, rnnt_
 from nemo.collections.asr.parts.numba.rnnt_loss.rnnt_pytorch import (
     MultiblankRNNTLossNumba,
     RNNTLossNumba,
-    WORDAWARERNNTLossNumba,
     TDTLossNumba,
+    WordawareTDTLossNumba,
 )

@@ -51,7 +51,7 @@ except (ImportError, ModuleNotFoundError):
     WARP_RNNT_AVAILABLE = False
 
 try:
-    from nemo.collections.asr.parts.numba.rnnt_loss import MultiblankRNNTLossNumba, RNNTLossNumba, TDTLossNumba, WORDAWARERNNTLossNumba
+    from nemo.collections.asr.parts.numba.rnnt_loss import MultiblankRNNTLossNumba, RNNTLossNumba, TDTLossNumba, WordawareTDTLossNumba
 
     NUMBA_RNNT_AVAILABLE = True
 except (ImportError, ModuleNotFoundError):
@@ -101,8 +101,8 @@ RNNT_LOSS_RESOLVER = {
         installation_msg=NUMBA_INSTALLATION_MESSAGE,
         force_float32=False,  # This is only temporarily false, will be dynamically updated during resolution
     ),
-    "wordaware_rnnt": RNNTLossConfig(
-        loss_name="wordaware_rnnt",
+    "wordaware_tdt": RNNTLossConfig(
+        loss_name="wordaware_tdt",
         lib_name="numba",
         min_version='0.53.0',
         is_available=NUMBA_RNNT_AVAILABLE,
@@ -274,11 +274,24 @@ def resolve_rnnt_loss(loss_name: str, blank_idx: int, loss_kwargs: dict = None) 
         loss_func = RNNTLossNumba(blank=blank_idx, reduction='none', fastemit_lambda=fastemit_lambda, clamp=clamp)
         _warn_unused_additional_kwargs(loss_name, loss_kwargs)
 
-    elif loss_name == 'wordaware_rnnt':
+    elif loss_name == 'wordaware_tdt':
         fastemit_lambda = loss_kwargs.pop('fastemit_lambda', 0.0)
         clamp = loss_kwargs.pop('clamp', -1.0)
         vocab_file = loss_kwargs.pop('vocab_file', None)
-        loss_func = WORDAWARERNNTLossNumba(blank=blank_idx, reduction='none', fastemit_lambda=fastemit_lambda, clamp=clamp, vocab_file=vocab_file)
+        durations = loss_kwargs.pop('durations', None)
+        sigma = loss_kwargs.pop('sigma', 0.0)
+        omega = loss_kwargs.pop('omega', 0.0)
+#        loss_func = WordawareTDTLossNumba(blank=blank_idx, reduction='none', fastemit_lambda=fastemit_lambda, clamp=clamp, vocab_file=vocab_file)
+        loss_func = WordawareTDTLossNumba(
+            blank=blank_idx,
+            durations=durations,
+            reduction='none',
+            fastemit_lambda=fastemit_lambda,
+            clamp=clamp,
+            sigma=sigma,
+            omega=omega,
+            vocab_file=vocab_file,
+        )
         _warn_unused_additional_kwargs(loss_name, loss_kwargs)
 
     elif loss_name == 'pytorch':
