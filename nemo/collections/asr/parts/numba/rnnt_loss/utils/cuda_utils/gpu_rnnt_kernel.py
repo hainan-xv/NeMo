@@ -1295,7 +1295,11 @@ def compute_wordaware_tdt_alphas_kernel(
         label = labels[u - 1]
         if is_special[label]:
             allow_blank = True
-    elif u == 0 or u == U - 1:
+    elif u == 0:
+        allow_blank = True
+    elif u == U - 1:
+        label = labels[u]
+        assert(is_special[label])
         allow_blank = True
 
     # Ordinary alpha calculations, broadcast across B=b and U=u
@@ -1484,8 +1488,11 @@ def compute_wordaware_tdt_betas_kernel(
         label = labels[u]
         if is_special[label]:
             allow_blank = True
-
-    elif u == 0 or u == U - 1:
+    elif u == 0:
+        allow_blank = True
+    elif u == U - 1:
+        label = labels[u]
+        assert(is_special[label])
         allow_blank = True
 
     # sync until all betas are initialized
