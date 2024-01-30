@@ -34,7 +34,7 @@ from torch.nn import Module
 from nemo.collections.asr.parts.numba.rnnt_loss import rnnt
 from nemo.collections.asr.parts.numba.rnnt_loss.utils.cpu_utils import cpu_rnnt
 
-__all__ = ['rnnt_loss', 'RNNTLossNumba', 'MultiblankRNNTLossNumba', 'TDTLossNumba', 'WordawareMultiblankLossNumba']
+__all__ = ['rnnt_loss', 'RNNTLossNumba', 'MultiblankRNNTLossNumba', 'TDTLossNumba', 'WordawareMultiblankRNNTLossNumba']
 
 
 class _RNNTNumba(Function):
@@ -221,7 +221,7 @@ class _WordawareMultiblankRNNTNumba(Function):
             raise ValueError("`clamp` must be 0.0 or positive float value.")
 
         if is_cuda:
-            loss_func = rnnt.multiblank_rnnt_loss_gpu
+            loss_func = rnnt.wordaware_multiblank_rnnt_loss_gpu
         else:
             raise NotImplementedError()
 
@@ -568,6 +568,82 @@ def get_special(vocab_file):
         res.append(is_special)
 
     return res
+
+
+class WordawareMultiblankRNNTLossNumba(Module):
+    """
+    Parameters:
+        blank (int): standard blank label.
+        big_blank_durations: list of durations for multi-blank transducer, e.g.
+            [2, 4, 8].
+        sigma: hyper-parameter for logit under-normalization method for training
+            multi-blank transducers. Recommended value 0.05.
+        Refer to https://arxiv.org/pdf/2211.03541 for detailed explanations for
+            the above parameters;
+        reduction (string, optional): Specifies the reduction to apply to the output:
+            'none' | 'mean' | 'sum'. 'none': no reduction will be applied,
+            'mean': the output losses will be divided by the target lengths and
+            then the mean over the batch is taken. Default: 'mean'
+        fastemit_lambda: Float scaling factor for FastEmit regularization. Refer to
+                FastEmit: Low-latency Streaming ASR with Sequence-level Emission Regularization.
+        clamp: Float value. When set to value >= 0.0, will clamp the gradient to [-clamp, clamp].
+    """
+
+    def __init__(
+        self,
+        blank,
+        big_blank_durations,
+        reduction='mean',
+        fastemit_lambda: float = 0.0,
+        clamp: float = -1,
+        sigma: float = 0.0,
+        vocab_file: str = '',
+    ):
+        super(WordawareMultiblankRNNTLossNumba, self).__init__()
+        self.blank = blank
+        self.big_blank_durations = big_blank_durations
+        self.fastemit_lambda = fastemit_lambda
+        self.clamp = float(clamp) if clamp > 0 else 0.0
+        self.reduction = reduction
+        self.loss = _WordawareMultiblankRNNTNumba.apply
+        self.sigma = sigma
+        self.vocab_file = vocab_file
+        assert vocab_file is not ''
+        self.is_special = get_special(vocab_file)
+
+    def forward(self, acts, labels, act_lens, label_lens):
+        """
+        log_probs: Tensor of (batch x seqLength x labelLength x outputDim) containing output from network
+        labels: 2 dimensional Tensor containing all the targets of the batch with zero padded
+        act_lens: Tensor of size (batch) containing size of each output sequence from the network
+        label_lens: Tensor of (batch) containing label length of each example
+        """
+        if not acts.is_cuda:
+            # Since CPU requires log_softmax to be computed explicitly, we need to perform grad clipping
+            # *after* we have obtained the gradients of loss(logsoftmax()).
+            # This is highly wasteful since it requires a copy of the entire joint tensor which is expensive.
+            # CUDA version is much more efficient since it performs an inplace logsoftmax, and therefore
+            # can inplace clamp the gradient.
+            if self.clamp > 0.0:
+                acts = cpu_rnnt.LogSoftmaxGradModification.apply(acts, self.clamp)
+
+            # NOTE manually done log_softmax for CPU version,
+            # log_softmax is computed within GPU version.
+            acts = torch.nn.functional.log_softmax(acts, -1)
+
+        return self.loss(
+            acts,
+            labels,
+            act_lens,
+            label_lens,
+            self.blank,
+            self.big_blank_durations,
+            self.reduction,
+            self.fastemit_lambda,
+            self.clamp,
+            self.sigma,
+            self.is_special,
+        )
 
 
 class MultiblankRNNTLossNumba(Module):

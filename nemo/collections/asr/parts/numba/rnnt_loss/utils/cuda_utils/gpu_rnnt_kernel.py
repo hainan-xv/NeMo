@@ -1223,34 +1223,34 @@ def compute_multiblank_grad_kernel(
             idx += GPU_RNNT_THREAD_SIZE
 
 
+
 @cuda.jit()
-def compute_wordaware_tdt_alphas_kernel(
+def compute_wordaware_multiblank_alphas_kernel(
     acts: torch.Tensor,
-    duration_acts: torch.Tensor,
     denom: torch.Tensor,
     sigma: float,
     alphas: torch.Tensor,
     llForward: torch.Tensor,
     xlen: torch.Tensor,
     ylen: torch.Tensor,
-    mlabels: torch.Tensor,  # [B]
+    mlabels: torch.Tensor,
     minibatch: int,
     maxT: int,
     maxU: int,
     alphabet_size: int,
     blank_: int,
-    durations: torch.Tensor,
-    num_durations: int,
+    big_blank_duration: torch.Tensor,
+    num_big_blanks: int,
     is_special: torch.Tensor,
 ):
     """
-    Compute alpha (forward variable) probabilities over the transduction step.
+    Compute alpha (forward variable) probabilities for multi-blank transducuer loss (https://arxiv.org/pdf/2211.03541).
 
     Args:
-        acts: Tensor of shape [B, T, U, V] flattened. Represents the logprobs activation tensor for tokens.
-        duration_acts: Tensor of shape [B, T, U, D] flattened. Represents the logprobs activation tensor for duration.
-        denom: Tensor of shape [B, T, U] flattened. Represents the denominator of the logprobs activation tensor for tokens.
-
+        acts: Tensor of shape [B, T, U, V + 1 + num_big_blanks] flattened. Represents the logprobs activation tensor.
+        denom: Tensor of shape [B, T, U] flattened. Represents the denominator of the logprobs activation tensor
+            across entire vocabulary.
+        sigma: Hyper-parameter for logit-undernormalization technique for training multi-blank transducers.
         alphas: Zero tensor of shape [B, T, U]. Will be updated inside the kernel with the forward variable
             probabilities.
         llForward: Zero tensor of shape [B]. Represents the log-likelihood of the forward pass.
@@ -1265,7 +1265,9 @@ def compute_wordaware_tdt_alphas_kernel(
         maxT: The maximum possible acoustic sequence length. Represents T in the logprobs tensor.
         maxU: The maximum possible target sequence length. Represents U in the logprobs tensor.
         alphabet_size: The vocabulary dimension V+1 (inclusive of RNNT blank).
-        blank_: Index of the TDT blank token in the vocabulary. Must be the last token in the vocab.
+        blank_: Index of the RNNT standard blank token in the vocabulary.
+        big_blank_durations: Vector of supported big blank durations of the model.
+        num_big_blanks: Number of big blanks of the model.
 
     Updates:
         Kernel inplace updates the following inputs:
@@ -1280,8 +1282,6 @@ def compute_wordaware_tdt_alphas_kernel(
 
     labels: torch.Tensor = mlabels[b]  # mb label start point, equivalent to mlabels + b * (maxU - 1)
     offset = b * maxT * maxU  # pointer indexing offset
-
-    # alphas += offset # pointer offset, ignored since we explicitly add offset
 
     # Initilize alpha[b, t=0, u=0] for all b in B
     if u == 0:
@@ -1298,127 +1298,112 @@ def compute_wordaware_tdt_alphas_kernel(
     elif u == 0:
         allow_blank = True
     elif u == U - 1:
-        label = labels[u]
+        label = labels[u - 1]
         assert(is_special[label])
         allow_blank = True
 
+
     # Ordinary alpha calculations, broadcast across B=b and U=u
     # Look up forward variable calculation from rnnt_numpy.forward_pass()
+    # Note: because of the logit under-normalization, everytime logp() is called,
+    # it is always followed by a `-sigma` term.
     for n in range(1, T + U - 1):
         t = n - u
 
         if u == 0:
-            # when u == 0, we only consider blank emissions.
+            # for t in range(1, T) step to initialize alphas[b, t, 0]
             if t > 0 and t < T:
-                alphas[offset + t * maxU + u] = -INF
-
-                for i in range(1, num_durations):  # skip 0 since blank emission has to advance by at least one
-                    if t >= durations[i]:
-                        alphas[offset + t * maxU + u] = rnnt_helper.log_sum_exp(
-                            alphas[offset + t * maxU + u],  # the current alpha value
-                            alphas[offset + (t - durations[i]) * maxU + u]  # alpha(t - duration, u)
-                            + logp(
-                                denom, acts, maxT, maxU, alphabet_size, b, t - durations[i], u, blank_
-                            )  # logp of blank emission
-                            - sigma  #  logit under-normalization
-                            + logp_duration(
-                                duration_acts, maxT, maxU, num_durations, b, t - durations[i], u, i
-                            ),  # logp of duration
-                        )
-                    else:
-                        break  # since durations are in ascending order, when we encounter a duration that is too large, then
-                        # there is no need to check larger durations after that.
-
-        elif u < U:
-            # when t == 0, we only consider the non-blank emission.
-            if t == 0:
-                alphas[offset + u] = (
-                    alphas[offset + u - 1]  # alpha(t, u - 1)
-                    + logp(
-                        denom, acts, maxT, maxU, alphabet_size, b, t, u - 1, labels[u - 1]
-                    )  # logp of token emission
-                    - sigma  # logit under-normalization
-                    + logp_duration(
-                        duration_acts, maxT, maxU, num_durations, b, t, u - 1, 0
-                    )  # t = 0, so it must be duration = 0. Therefore the last argument passed to logp_duration() is 0.
+                alphas[offset + t * maxU + u] = (
+                    alphas[offset + (t - 1) * maxU + u]
+                    + logp(denom, acts, maxT, maxU, alphabet_size, b, t - 1, 0, blank_)
+                    - sigma
                 )
 
-            # now we have t != 0 and u != 0, and we need to consider both non-blank and blank emissions.
+                # Now add the weights for big blanks.
+                for i in range(num_big_blanks):
+                    if t >= big_blank_duration[i]:
+                        alphas[offset + t * maxU + u] = rnnt_helper.log_sum_exp(
+                            alphas[offset + t * maxU + u],
+                            alphas[offset + (t - big_blank_duration[i]) * maxU + u]
+                            + logp(
+                                denom, acts, maxT, maxU, alphabet_size, b, t - big_blank_duration[i], 0, blank_ - 1 - i
+                            )
+                            - sigma,
+                        )
+
+        elif u < U:
+            # for u in range(1, U) step to initialize alphas[b, 0, u]
+            if t == 0:
+                alphas[offset + u] = (
+                    alphas[offset + u - 1]
+                    + logp(denom, acts, maxT, maxU, alphabet_size, b, 0, u - 1, labels[u - 1])
+                    - sigma
+                )
+
+            # for t in range(1, T) for u in range(1, U) step to compute alphas[b, t, u]
             elif t > 0 and t < T:
-                no_emit = -INF  # no_emit stores the score for all blank emissions.
+                no_emit = -INF
+                if allow_blank:
+                    no_emit = (
+                        alphas[offset + (t - 1) * maxU + u]
+                        + logp(denom, acts, maxT, maxU, alphabet_size, b, t - 1, u, blank_)
+                        - sigma
+                    )
+                emit = (
+                    alphas[offset + t * maxU + u - 1]
+                    + logp(denom, acts, maxT, maxU, alphabet_size, b, t, u - 1, labels[u - 1])
+                    - sigma
+                )
+
+                alphas[offset + t * maxU + u] = rnnt_helper.log_sum_exp(emit, no_emit)
 
                 if allow_blank:
-                    for i in range(1, num_durations):
-                        if t >= durations[i]:
-                            no_emit = rnnt_helper.log_sum_exp(
-                                no_emit,  # current score
-                                alphas[offset + (t - durations[i]) * maxU + u]  # alpha(t - duration, u)
+                    # Now add the weights for big blanks.
+                    for i in range(num_big_blanks):
+                        if t >= big_blank_duration[i]:
+                            # big-blank weight here is
+                            # alpha(t - duration, u) * p(big-blank | t - duration, u) / exp(sigma), in log domain
+                            # do this all all big-blanks if the above condition is met
+                            big_blank_no_emit = (
+                                alphas[offset + (t - big_blank_duration[i]) * maxU + u]
                                 + logp(
-                                    denom, acts, maxT, maxU, alphabet_size, b, t - durations[i], u, blank_
-                                )  # logp of blank emission
-                                - sigma  #  logit under-normalization
-                                + logp_duration(
-                                    duration_acts, maxT, maxU, num_durations, b, t - durations[i], u, i
-                                ),  # logp of duration
+                                    denom, acts, maxT, maxU, alphabet_size, b, t - big_blank_duration[i], u, blank_ - 1 - i
+                                )
+                                - sigma
                             )
-
-                        else:
-                            break  # we can exit the loop early here, same as the case for u == 0 above.
-
-                emit = -INF  # emit stores the score for non-blank emissions.
-                for i in range(0, num_durations):
-                    if t >= durations[i]:
-                        emit = rnnt_helper.log_sum_exp(
-                            emit,  # current score
-                            alphas[offset + (t - durations[i]) * maxU + u - 1]  # alpha(t - duration, u - 1)
-                            + logp(
-                                denom, acts, maxT, maxU, alphabet_size, b, t - durations[i], u - 1, labels[u - 1]
-                            )  # logp of non-blank emission
-                            - sigma  #  logit under-normalization
-                            + logp_duration(
-                                duration_acts, maxT, maxU, num_durations, b, t - durations[i], u - 1, i
-                            ),  # logp of duration
-                        )
-                    else:
-                        break  # we can exit the loop early here, same as the case for u == 0 above.
-
-                # combining blank and non-blank emissions.
-                alphas[offset + t * maxU + u] = rnnt_helper.log_sum_exp(emit, no_emit)
+                            alphas[offset + t * maxU + u] = rnnt_helper.log_sum_exp(
+                                alphas[offset + t * maxU + u], big_blank_no_emit
+                            )
 
         # sync across all B=b and U=u
         cuda.syncthreads()
 
-    # After final sync, the forward log-likelihood can be computed as the summataion of
-    # alpha(T - duration, U - 1) + logp(blank, duration | t - duration, U - 1), over different durations.
+    # After final sync, alphas[b, T-1, U - 1] + logprobs[b, T-1, U-1, blank] + denom[b, T-1, U-1] gives
+    # log-likelihood of forward pass.
     if u == 0:
-        # first we consider duration = 1
         loglike = (
             alphas[offset + (T - 1) * maxU + U - 1]
             + logp(denom, acts, maxT, maxU, alphabet_size, b, T - 1, U - 1, blank_)
             - sigma
-            + logp_duration(duration_acts, maxT, maxU, num_durations, b, T - 1, U - 1, 1)
         )
 
-        # then we add the scores for duration > 1, if such durations are possible given the audio lengths.
-        for i in range(2, num_durations):
-            if T >= durations[i]:
+        # Now add the weights for big blanks for the final weight computation.
+        for i in range(num_big_blanks):
+            if T >= big_blank_duration[i]:
                 big_blank_loglike = (
-                    alphas[offset + (T - durations[i]) * maxU + U - 1]
-                    + logp(denom, acts, maxT, maxU, alphabet_size, b, T - durations[i], U - 1, blank_)
+                    alphas[offset + (T - big_blank_duration[i]) * maxU + U - 1]
+                    + logp(denom, acts, maxT, maxU, alphabet_size, b, T - big_blank_duration[i], U - 1, blank_ - 1 - i)
                     - sigma
-                    + logp_duration(duration_acts, maxT, maxU, num_durations, b, T - durations[i], U - 1, i)
                 )
                 loglike = rnnt_helper.log_sum_exp(loglike, big_blank_loglike)
-            else:
-                break
 
         llForward[b] = loglike
+        print("forward", b, loglike)
 
 
 @cuda.jit()
-def compute_wordaware_tdt_betas_kernel(
+def compute_wordaware_multiblank_betas_kernel(
     acts: torch.Tensor,
-    duration_acts: torch.Tensor,
     denom: torch.Tensor,
     sigma: float,
     betas: torch.Tensor,
@@ -1431,18 +1416,18 @@ def compute_wordaware_tdt_betas_kernel(
     maxU: int,
     alphabet_size: int,
     blank_: int,
-    durations: torch.Tensor,
-    num_durations: int,
+    big_blank_duration: torch.Tensor,
+    num_big_blanks: int,
     is_special: torch.Tensor,
 ):
     """
-    Compute beta (backward variable) probabilities over the transduction step.
+    Compute beta (backward variable) probabilities for multi-blank transducer loss (https://arxiv.org/pdf/2211.03541).
 
     Args:
-        acts: Tensor of shape [B, T, U, V] flattened. Represents the logprobs activation tensor for tokens.
-        duration_acts: Tensor of shape [B, T, U, D] flattened. Represents the logprobs activation tensor for duations.
+        acts: Tensor of shape [B, T, U, V + 1 + num-big-blanks] flattened. Represents the logprobs activation tensor.
         denom: Tensor of shape [B, T, U] flattened. Represents the denominator of the logprobs activation tensor
             across entire vocabulary.
+        sigma: Hyper-parameter for logit-undernormalization technique for training multi-blank transducers.
         betas: Zero tensor of shape [B, T, U]. Will be updated inside the kernel with the backward variable
             probabilities.
         llBackward: Zero tensor of shape [B]. Represents the log-likelihood of the backward pass.
@@ -1457,7 +1442,9 @@ def compute_wordaware_tdt_betas_kernel(
         maxT: The maximum possible acoustic sequence length. Represents T in the logprobs tensor.
         maxU: The maximum possible target sequence length. Represents U in the logprobs tensor.
         alphabet_size: The vocabulary dimension V+1 (inclusive of RNNT blank).
-        blank_: Index of the RNNT blank token in the vocabulary. Generally the first or last token in the vocab.
+        blank_: Index of the RNNT standard blank token in the vocabulary.
+        big_blank_durations: Vector of supported big blank durations of the model.
+        num_big_blanks: Number of big blanks of the model.
 
     Updates:
         Kernel inplace updates the following inputs:
@@ -1473,25 +1460,24 @@ def compute_wordaware_tdt_betas_kernel(
     labels: torch.Tensor = mlabels[b]  # mb label start point, equivalent to mlabels + b * (maxU - 1)
     offset = b * maxT * maxU  # pointer indexing offset
 
-    # betas += offset # pointer offset, ignored since we explicitly add offset
+    # Note: just like the alphas, because of the logit under-normalization, everytime
+    # logp() is called, it is always followed by a `-sigma` term.
 
     # Initilize beta[b, t=T-1, u=U-1] for all b in B with log_probs[b, t=T-1, u=U-1, blank]
     if u == 0:
         betas[offset + (T - 1) * maxU + U - 1] = (
-            logp(denom, acts, maxT, maxU, alphabet_size, b, T - 1, U - 1, blank_)
-            - sigma
-            + logp_duration(duration_acts, maxT, maxU, num_durations, b, T - 1, U - 1, 1)
+            logp(denom, acts, maxT, maxU, alphabet_size, b, T - 1, U - 1, blank_) - sigma
         )
 
     allow_blank = False
     if u >= 1 and u < U - 1:
-        label = labels[u]
+        label = labels[u - 1]
         if is_special[label]:
             allow_blank = True
     elif u == 0:
         allow_blank = True
     elif u == U - 1:
-        label = labels[u]
+        label = labels[u - 1]
         assert(is_special[label])
         allow_blank = True
 
@@ -1503,91 +1489,90 @@ def compute_wordaware_tdt_betas_kernel(
     for n in range(T + U - 2, -1, -1):
         t = n - u
 
-        if u == U - 1:
-            # u == U - 1, we only consider blank emissions.
-            if t >= 0 and t + 1 < T:
-                betas[offset + t * maxU + U - 1] = -INF
-                for i in range(1, num_durations):
-                    # although similar, the computation for beta's is slightly more complex for boundary cases.
-                    # the following two cases correspond to whether t is exactly certain duration away from T.
-                    # and they have slightly different update rules.
-
-                    if t + durations[i] < T:
-                        betas[offset + t * maxU + U - 1] = rnnt_helper.log_sum_exp(
-                            betas[offset + t * maxU + U - 1],
-                            betas[
-                                offset + (t + durations[i]) * maxU + U - 1
-                            ]  # beta[t, U - 1] depends on the value beta[t + duration, U - 1] here.
-                            + logp(denom, acts, maxT, maxU, alphabet_size, b, t, U - 1, blank_)  # log prob of blank
-                            + logp_duration(
-                                duration_acts, maxT, maxU, num_durations, b, t, U - 1, i
-                            )  # log prob of duration (durations[i])
-                            - sigma,  # for logit undernormalization
-                        )
-                    elif t + durations[i] == T:
-                        betas[offset + t * maxU + U - 1] = rnnt_helper.log_sum_exp(
-                            betas[offset + t * maxU + U - 1],
-                            # here we have one fewer term than the "if" block above. This could be seen as having "0" here since
-                            # beta[t + duration, U - 1] isn't defined because t + duration is out of bound.
-                            logp(denom, acts, maxT, maxU, alphabet_size, b, t, U - 1, blank_)  # log prob of blank
-                            + logp_duration(
-                                duration_acts, maxT, maxU, num_durations, b, t, U - 1, i
-                            )  # log prob of duration (durations[i])
-                            - sigma,  # for logit undernormalization. Basically every time sigma shows up is because of logit undernormalization.
-                        )
-
-        elif u < U - 1:
-            if t == T - 1:
-                # t == T - 1, so we only consider non-blank with duration 0. (Note, we can't have blank emissions with duration = 0)
-                betas[offset + (T - 1) * maxU + u] = (
-                    betas[offset + (T - 1) * maxU + u + 1]
-                    + logp(denom, acts, maxT, maxU, alphabet_size, b, T - 1, u, labels[u])  # non-blank log prob
-                    + logp_duration(duration_acts, maxT, maxU, num_durations, b, T - 1, u, 0)  # log prob of duration 0
+        if u == (U - 1):
+            # for t in reversed(range(T - 1)) step to initialize betas[b, t, U-1]
+            if t >= 0 and t < (T - 1):
+                # beta[t, U - 1] = beta[t + 1, U - 1] * p(blank | t, U - 1) / exp(sigma)
+                # this part is the same as regular RNN-T.
+            
+                betas[offset + t * maxU + U - 1] = (
+                    betas[offset + (t + 1) * maxU + U - 1]
+                    + logp(denom, acts, maxT, maxU, alphabet_size, b, t, U - 1, blank_)
                     - sigma
                 )
 
-            elif t >= 0 and t < T - 1:
-                # now we need to consider both blank andnon-blanks. Similar to alphas, we first compute them separately with no_emit and emit.
-                no_emit = -INF
-                if allow_blank:
-                    for i in range(1, num_durations):
-                        if t + durations[i] < T:
-                            no_emit = rnnt_helper.log_sum_exp(
-                                no_emit,
-                                betas[offset + (t + durations[i]) * maxU + u]
-                                + logp(denom, acts, maxT, maxU, alphabet_size, b, t, u, blank_)
-                                + logp_duration(duration_acts, maxT, maxU, num_durations, b, t, u, i)
-                                - sigma,
-                            )
-
-                emit = -INF
-                for i in range(0, num_durations):
-                    if t + durations[i] < T:
-                        emit = rnnt_helper.log_sum_exp(
-                            emit,
-                            betas[offset + (t + durations[i]) * maxU + u + 1]
-                            + logp(denom, acts, maxT, maxU, alphabet_size, b, t, u, labels[u])
-                            + logp_duration(duration_acts, maxT, maxU, num_durations, b, t, u, i)
+                # now add the weights from big blanks
+                for i in range(num_big_blanks):
+                    if t + big_blank_duration[i] < T:
+                        # adding to beta[t, U - 1] of weight (in log domain),
+                        # beta[t + duration, U - 1] * p(big-blank | t, U - 1) / exp(sigma)
+                        betas[offset + t * maxU + U - 1] = rnnt_helper.log_sum_exp(
+                            betas[offset + t * maxU + U - 1],
+                            betas[offset + (t + big_blank_duration[i]) * maxU + U - 1]
+                            + logp(denom, acts, maxT, maxU, alphabet_size, b, t, U - 1, blank_ - 1 - i)
                             - sigma,
                         )
+                    elif t + big_blank_duration[i] == T and big_blank_duration[i] != 1:
+                        # adding to beta[T - duration, U - 1] of weight (in log domain),
+                        # p(big-blank | T - duration, U - 1) / exp(sigma)
+                        betas[offset + t * maxU + U - 1] = rnnt_helper.log_sum_exp(
+                            betas[offset + t * maxU + U - 1],
+                            logp(denom, acts, maxT, maxU, alphabet_size, b, t, U - 1, blank_ - 1 - i) - sigma,
+                        )
 
-                # combining all blank emissions and all non-blank emissions.
+        elif u < U:
+            if t == T - 1:
+                # for u in reversed(range(U - 1)) step to initialize betas[b, T-1, u]
+                betas[offset + (T - 1) * maxU + u] = (
+                    betas[offset + (T - 1) * maxU + u + 1]
+                    + logp(denom, acts, maxT, maxU, alphabet_size, b, T - 1, u, labels[u])
+                    - sigma
+                )
+            elif (t >= 0) and (t < T - 1):
+                # for t in reversed(range(T - 1)) for u in reversed(range(U - 1)) step to compute betas[b, t, u]
+                no_emit = -INF
+                if allow_blank:
+                    no_emit = (
+                        betas[offset + (t + 1) * maxU + u]
+                        + logp(denom, acts, maxT, maxU, alphabet_size, b, t, u, blank_)
+                        - sigma
+                    )
+                emit = (
+                    betas[offset + t * maxU + u + 1]
+                    + logp(denom, acts, maxT, maxU, alphabet_size, b, t, u, labels[u])
+                    - sigma
+                )
                 betas[offset + t * maxU + u] = rnnt_helper.log_sum_exp(emit, no_emit)
+
+                if allow_blank:
+                    # now add the weights from big blanks
+                    for i in range(num_big_blanks):
+                        if t < T - big_blank_duration[i]:
+                            # added weight for the big-blank,
+                            # beta[t + duration, u] * p(big-blank | t, u) / exp(sigma)
+                            big_blank_no_emit = (
+                                betas[offset + (t + big_blank_duration[i]) * maxU + u]
+                                + logp(denom, acts, maxT, maxU, alphabet_size, b, t, u, blank_ - 1 - i)
+                                - sigma
+                            )
+                            betas[offset + t * maxU + u] = rnnt_helper.log_sum_exp(
+                                betas[offset + t * maxU + u], big_blank_no_emit
+                            )
 
         # sync across all B=b and U=u
         cuda.syncthreads()
 
-    # After final sync, betas[b, 0, 0] gives log-likelihood of backward pass, same with conventional Transducers.
+    # After final sync, betas[b, 0, 0] gives
+    # log-likelihood of backward pass.
     if u == 0:
         llBackward[b] = betas[offset]
+        print("backwad", b, betas[offset])
 
 
 @cuda.jit()
-def compute_wordaware_tdt_grad_kernel(
-    label_grads: torch.Tensor,
-    duration_grads: torch.Tensor,
+def compute_wordaware_multiblank_grad_kernel(
+    grads: torch.Tensor,
     acts: torch.Tensor,
-    duration_acts: torch.Tensor,
     denom: torch.Tensor,
     sigma: float,
     alphas: torch.Tensor,
@@ -1601,23 +1586,22 @@ def compute_wordaware_tdt_grad_kernel(
     maxU: int,
     alphabet_size: int,
     blank_: int,
-    durations: torch.Tensor,
-    num_durations: int,
+    big_blank_duration: torch.Tensor,
+    num_big_blanks: int,
     fastemit_lambda: float,
     clamp: float,
     is_special: torch.Tensor,
 ):
     """
-    Compute gradients over the transduction step.
+    Compute gradients for multi-blank transducer loss (https://arxiv.org/pdf/2211.03541).
 
     Args:
-        grads: Zero Tensor of shape [B, T, U, V] to store gradients for tokens.
-        duration_grads: Zero Tensor of shape [B, T, U, D] to store gradients for durations.
-
-        acts: Tensor of shape [B, T, U, V] flattened. Represents the logprobs activation tensor for tokens.
-        duration_acts: Tensor of shape [B, T, U, D] flattened. Represents the logprobs activation tensor for durations.
+        grads: Zero Tensor of shape [B, T, U, V + 1 + num_big_blanks]. Is updated by this kernel to contain the gradients
+            of this batch of samples.
+        acts: Tensor of shape [B, T, U, V + 1 + num_big_blanks] flattened. Represents the logprobs activation tensor.
         denom: Tensor of shape [B, T, U] flattened. Represents the denominator of the logprobs activation tensor
             across entire vocabulary.
+        sigma: Hyper-parameter for logit-undernormalization technique for training multi-blank transducers.
         alphas: Alpha variable, contains forward probabilities. A tensor of shape [B, T, U].
         betas: Beta varoable, contains backward probabilities. A tensor of shape [B, T, U].
         logll: Log-likelihood of the forward variable, represented as a vector of shape [B].
@@ -1636,6 +1620,8 @@ def compute_wordaware_tdt_grad_kernel(
         fastemit_lambda: Float scaling factor for FastEmit regularization. Refer to
             FastEmit: Low-latency Streaming ASR with Sequence-level Emission Regularization.
         clamp: Float value. When set to value >= 0.0, will clamp the gradient to [-clamp, clamp].
+        big_blank_durations: Vector of supported big blank durations of the model.
+        num_big_blanks: Number of big blanks of the model.
 
     Updates:
         Kernel inplace updates the following inputs:
@@ -1661,40 +1647,18 @@ def compute_wordaware_tdt_grad_kernel(
 
     # Buffered gradient calculations, broadcast across B=b, T=t and U=u, looped over V with some constant stride.
     # Look up gradient calculation from rnnt_numpy.compute_gradient()
-
-    allow_blank = False
-    if u >= 1 and u < U - 1:
-        label = labels[u]
-        if is_special[label]:
-            allow_blank = True
-    elif u == 0 or u == U - 1:
-        allow_blank = True
-
     if t < T and u < U:
-        logpk_blank = (
-            denom[col] + acts[col * alphabet_size + blank_] - sigma
-        )  # whenever sigma is used, it is for logit under-normalization.
-
-        if not allow_blank:
-            logpk_blank = -10000
-
-        if idx < num_durations:
-            grad = 0.0
-            if t + durations[idx] < T and u < U - 1:  # for label
-                logpk_label = denom[col] + acts[col * alphabet_size + labels[u]] - sigma
-                grad -= math.exp(alphas[col] + betas[col + 1 + durations[idx] * maxU] + logpk_label - logll[mb])
-
-            if allow_blank and t + durations[idx] < T and idx > 0:  # for blank in the middle
-                grad -= math.exp(alphas[col] + betas[col + durations[idx] * maxU] + logpk_blank - logll[mb])
-
-            if t + durations[idx] == T and idx >= 1 and u == U - 1:  # for blank as the last symbol
-                if logpk_blank < -999:
-                    print('not right', logpk_blank)
-
-                grad -= math.exp(alphas[col] + logpk_blank - logll[mb])
-
-            grad = grad * math.exp(duration_acts[col * num_durations + idx])
-            duration_grads[col * num_durations + idx] = grad
+        allow_blank = False
+        if u >= 1 and u < U - 1:
+            label = labels[u - 1]
+            if is_special[label]:
+                allow_blank = True
+        elif u == 0:
+            allow_blank = True
+        elif u == U - 1:
+            label = labels[u - 1]
+            assert(is_special[label])
+            allow_blank = True
 
         # For cuda kernels, maximum number of threads per block is limited to some value.
         # However, it may be the case that vocabulary size is larger than this limit
@@ -1710,25 +1674,24 @@ def compute_wordaware_tdt_grad_kernel(
             # initialize the grad of the sample acts[b, t, u, v]
             grad = math.exp(alphas[col] + betas[col] + logpk - logll[mb])
 
+            # In all of the following computation, whenever logpk is used, we
+            # need to subtract sigma based on our derivation of the gradient of
+            # the logit under-normalization method.
+
             # If FastEmit regularization is enabled, calculate the gradeint of probability of predicting the next label
             # at the current timestep.
             # The formula for this is Equation 9 in https://arxiv.org/abs/2010.11148, multiplied by the log probability
             # of the current step (t, u), normalized by the total log likelihood.
             # Once the gradient has been calculated, scale it by `fastemit_lambda`, as in Equation 10.
-            if fastemit_lambda > 0.0 and u < U - 1:
-                fastemit_grad = 0.0
-
-                for i in range(0, num_durations):
-                    if allow_blank and t + durations[i] < T:
-                        fastemit_grad += fastemit_lambda * math.exp(
-                            alphas[col]  # alphas(t, u)
-                            + (denom[col] + acts[col * alphabet_size + labels[u]])  # log prob of token emission
-                            + duration_acts[col * num_durations + i]  # duration log-prob
-                            + betas[col + 1 + durations[i] * maxU]  # betas(t, u+1)
-                            + logpk  # log Pr(k|t, u)
-                            - sigma  # for logit under-normalization
-                            - logll[mb]  # total log likelihood for normalization
-                        )
+            if fastemit_lambda > 0.0 and u < U - 1 and allow_blank:
+                fastemit_grad = fastemit_lambda * math.exp(
+                    alphas[col]  # alphas(t, u)
+                    + (denom[col] + acts[col * alphabet_size + labels[u]])
+                    + betas[col + 1]  # betas(t, u+1)
+                    + logpk  # log Pr(k|t, u)
+                    - sigma
+                    - logll[mb]  # total log likelihood for normalization
+                )
             else:
                 fastemit_grad = 0.0
 
@@ -1736,56 +1699,55 @@ def compute_wordaware_tdt_grad_kernel(
             grad = grad + fastemit_grad
 
             # grad to last blank transition
-            # grad[b, T-1, U-1, v=blank] -= exp(alphas[b, t, u] + logpk - sigma - logll[b] + logp(duration) for all possible non-zero durations.
-            if idx == blank_ and u == U - 1:
-                for i in range(1, num_durations):
-                    if t == T - durations[i]:
-                        grad -= math.exp(
-                            alphas[col] + logpk - sigma - logll[mb] + duration_acts[col * num_durations + i]
-                        )
+            # grad[b, T-1, U-1, v=blank] -= exp(alphas[b, t, u) + logpk - sigma - logll[b])
+            if (idx == blank_) and (t == T - 1) and (u == U - 1):
+                grad -= math.exp(alphas[col] + logpk - sigma - logll[mb])
+            else:
+                # this is one difference of the multi-blank gradient from standard RNN-T
+                # gradient -- basically, wherever the blank_ symbol is addressed in the
+                # original code, we need to do similar things to big blanks, and we need
+                # to change the if conditions to match the duration of the big-blank.
+                # grad[b, T-duration, U-1, v=big-blank] -= exp(alphas[b, t, u) + logpk - sigma - logll[b])
+                for i in range(num_big_blanks):
+                    if (idx == blank_ - 1 - i) and (t == T - big_blank_duration[i]) and (u == U - 1):
+                        grad -= math.exp(alphas[col] + logpk - sigma - logll[mb])
 
             # grad of blank across t < T;
-            # grad[b, t<T-1, u, v=blank] -= exp(alphas[b, t, u] + logpk - sigma + logp_duration - logll[b] + betas[b, t + duration, u]) for all non-zero durations
-            if idx == blank_ and allow_blank:
-                for i in range(1, num_durations):
-                    if t < T - durations[i]:
-                        grad -= math.exp(
-                            alphas[col]
-                            + logpk
-                            - sigma
-                            - logll[mb]
-                            + betas[col + maxU * durations[i]]
-                            + duration_acts[col * num_durations + i]
-                        )
+            # grad[b, t<T-1, u, v=blank] -= exp(alphas[b, t, u] + logpk - sigma - logll[b] betas[b, t + 1, u])
+            if allow_blank:
+                if (idx == blank_) and (t < T - 1):
+                    grad -= math.exp(alphas[col] + logpk - sigma - logll[mb] + betas[col + maxU])
+                else:
+                    # This is another difference between multi-blank and RNN-T gradients.
+                    # Now we consider gradients for big-blanks.
+                    # grad[b, t<T-duration, u, v=big-blank] -= exp(alphas[b, t, u] + logpk - sigma - logll[b] + betas[b, t + duration, u])
+                    for i in range(num_big_blanks):
+                        if (idx == blank_ - 1 - i) and (t < T - big_blank_duration[i]):
+                            grad -= math.exp(
+                                alphas[col] + logpk - sigma - logll[mb] + betas[col + big_blank_duration[i] * maxU]
+                            )
 
             # grad of correct token across u < U;
-            # grad[b, t, u<U-1, v=label[u]] -= exp(alphas[b, t, u] + logpk - sigma + logp_duration - logll[b] + betas[b, t + duration, u + 1]) for all blank durations.
+            # grad[b, t, u<U-1, v=label[u]] -= exp(alphas[b, t, u] + logpk - sigma - logll[b] + betas[b, t, u+1])
             # Scale the gradient by (1.0 + FastEmit_lambda) in log space, then exponentiate
-            if u < U - 1 and idx == labels[u]:
+            if (u < U - 1) and (idx == labels[u]):
                 # exp(log(1 + fastemit_lambda) + ...) is numerically more stable than
                 # multiplying (1.0 + fastemit_lambda) with result.
-                for i in range(num_durations):
-                    if t + durations[i] < T:
-                        grad -= math.exp(
-                            math.log1p(fastemit_lambda)
-                            + alphas[col]
-                            + logpk
-                            - sigma
-                            - logll[mb]
-                            + betas[col + 1 + maxU * durations[i]]
-                            + duration_acts[col * num_durations + i]
-                        )
+                grad -= math.exp(
+                    math.log1p(fastemit_lambda) + alphas[col] + logpk - sigma - logll[mb] + betas[col + 1]
+                )
 
             # update grads[b, t, u, v] = grad
-            label_grads[col * alphabet_size + idx] = grad
+            grads[col * alphabet_size + idx] = grad
 
             # clamp gradient (if needed)
             if clamp > 0.0:
-                g = label_grads[col * alphabet_size + idx]
+                g = grads[col * alphabet_size + idx]
                 g = min(g, clamp)
                 g = max(g, -clamp)
-                label_grads[col * alphabet_size + idx] = g
+                grads[col * alphabet_size + idx] = g
 
             # update internal index through the thread_buffer;
             # until idx < V + 1, such that entire vocabulary has been updated.
             idx += GPU_RNNT_THREAD_SIZE
+

@@ -24,7 +24,7 @@ from nemo.collections.asr.parts.numba.rnnt_loss.rnnt_pytorch import (
     MultiblankRNNTLossNumba,
     RNNTLossNumba,
     TDTLossNumba,
-#    WordawareMultiblankLossNumba,
+    WordawareMultiblankRNNTLossNumba,
 )
 from nemo.core.utils import numba_utils
 from nemo.core.utils.numba_utils import __NUMBA_MINIMUM_VERSION__
@@ -127,11 +127,15 @@ class TestMultiblankRNNTLoss:
             acts = torch.rand([B, T, U, V + 1 + len(big_blank_durations)])
             labels = [[random.randrange(0, V) for i in range(U - 1)] for j in range(B)]
 
-            fn_pt = MultiblankRNNTLossNumba(
+            for i in range(len(labels)):
+                labels[i][-1] = 1
+
+            fn_pt = WordawareMultiblankRNNTLossNumba(
                 blank=V + len(big_blank_durations),
                 reduction='sum',
                 big_blank_durations=big_blank_durations,
                 sigma=sigma,
+                vocab_file='/home/hainanx/nemo_exps_local/tokenizer_reversed/tokenizer_spe_bpe_v256/tokenizer.vocab'
             )
             pt_cost, pt_grads = wrap_and_call(fn_pt, acts, labels, device)
 
