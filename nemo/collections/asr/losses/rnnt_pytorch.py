@@ -374,7 +374,7 @@ class MultiblankRNNTLossPytorch(Loss):
         return log_prob, log_alpha
 
 
-class WordawwareMultiblankRNNTLossPytorch(Loss):
+class WordawareMultiblankRNNTLossPytorch(Loss):
     """
     Pure Python implementation of multi-blank transducer loss (https://arxiv.org/pdf/2211.03541.pdf)
     """
@@ -422,6 +422,11 @@ class WordawwareMultiblankRNNTLossPytorch(Loss):
 
         return losses
 
+
+    def logsumexp(self, a, b):
+        ret = torch.logsumexp(torch.stack([a, b]), dim=0)
+        return ret
+
     def compute_forward_prob(self, acts, labels, act_lens, label_lens):
         B, T, U, _ = acts.shape
 
@@ -440,7 +445,7 @@ class WordawwareMultiblankRNNTLossPytorch(Loss):
                             for i, d in enumerate(self.big_blank_durations):
                                 if t >= d:
                                     tt = log_alpha[b, t - d, u] + acts[b, t - d, 0, self.blank - 1 - i]
-                                    log_alpha[b, t, u] = torch.logsumexp(1.0 * log_alpha[b, t, u], tt)
+                                    log_alpha[b, t, u] = self.logsumexp(1.0 * log_alpha[b, t, u], tt)
 
                     else:
                         if t == 0:
@@ -472,13 +477,13 @@ class WordawwareMultiblankRNNTLossPytorch(Loss):
                             log_alpha[b, t, u] = log_alpha[b, t, u - 1] + acts[b, t, u - 1, labels[b, u - 1]]
 
                             tt = log_alpha[b, t - 1, u] + acts[b, t - 1, u, self.blank]
-                            log_alpha[b, t, u] = torch.logsumexp(1.0 * log_alpha[b, t, u], tt)
+                            log_alpha[b, t, u] = self.logsumexp(1.0 * log_alpha[b, t, u], tt)
 
                             # now we go over all big blanks. They need to be considered if current t >= blank duration d.
                             for i, d in enumerate(self.big_blank_durations):
                                 if t >= d:
                                     tt = log_alpha[b, t - d, u] + acts[b, t - d, u, self.blank - 1 - i]
-                                    log_alpha[b, t, u] = torch.logsumexp(1.0 * log_alpha[b, t, u], tt)
+                                    log_alpha[b, t, u] = self.logsumexp(1.0 * log_alpha[b, t, u], tt)
 
         log_probs = []
         for b in range(B):

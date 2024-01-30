@@ -34,7 +34,7 @@ from torch.nn import Module
 from nemo.collections.asr.parts.numba.rnnt_loss import rnnt
 from nemo.collections.asr.parts.numba.rnnt_loss.utils.cpu_utils import cpu_rnnt
 
-__all__ = ['rnnt_loss', 'RNNTLossNumba', 'MultiblankRNNTLossNumba', 'TDTLossNumba', 'WordawareTDTLossNumba']
+__all__ = ['rnnt_loss', 'RNNTLossNumba', 'MultiblankRNNTLossNumba', 'TDTLossNumba', 'WordawareMultiblankLossNumba']
 
 
 class _RNNTNumba(Function):
@@ -90,112 +90,6 @@ class _RNNTNumba(Function):
             grad_output = grad_output.view(-1, 1, 1, 1).to(ctx.grads)
             return ctx.grads.mul_(grad_output), None, None, None, None, None, None, None
 
-
-class _WordawareTDTNumba(Function):
-    """
-    Numba class for Token-and-Duration Transducer (TDT) loss (https://arxiv.org/abs/2304.06795)
-    """
-
-    @staticmethod
-    def forward(
-        ctx,
-        label_acts,
-        duration_acts,
-        labels,
-        act_lens,
-        label_lens,
-        blank,
-        durations,
-        reduction,
-        fastemit_lambda,
-        clamp,
-        sigma,
-        omega,
-        is_special,
-    ):
-        """
-        log_probs: Tensor of (batch x seqLength x labelLength x outputDim) containing output from network
-        labels: 2 dimensional Tensor containing all the targets of the batch with zero padded
-        act_lens: Tensor of size (batch) containing size of each output sequence from the network
-        label_lens: Tensor of (batch) containing label length of each example
-        fastemit_lambda: Float scaling factor for FastEmit regularization. Refer to
-            FastEmit: Low-latency Streaming ASR with Sequence-level Emission Regularization.
-        durations: list of durations for TDT model, must include 0 and 1, e.g.
-            [0, 1, 2, 3, 4].
-        sigma: hyper-parameter for logit under-normalization method for training
-            TDT models. Recommended value 0.05.
-        omega: probability for sampling the standard RNN-T loss.
-        Refer to https://arxiv.org/abs/2304.06795 for detailed explanations for
-            the above parameters;
-        """
-        is_cuda = label_acts.is_cuda
-
-        certify_inputs(label_acts, labels, act_lens, label_lens)
-        if clamp < 0:
-            raise ValueError("`clamp` must be 0.0 or positive float value.")
-
-        if is_cuda:
-            loss_func = rnnt.wordaware_tdt_loss_gpu
-        else:
-            raise ValueError("TDT is not yet implemented for non CUDA computation.")
-
-        label_grads = torch.zeros_like(label_acts) if label_acts.requires_grad else None
-        duration_grads = torch.zeros_like(duration_acts) if duration_acts.requires_grad else None
-        minibatch_size = label_acts.size(0)
-        costs = torch.zeros(minibatch_size, device=label_acts.device, dtype=label_acts.dtype)
-
-        loss_func(
-            label_acts,
-            duration_acts,
-            labels=labels,
-            input_lengths=act_lens,
-            label_lengths=label_lens,
-            costs=costs,
-            label_grads=label_grads,
-            duration_grads=duration_grads,
-            blank_label=blank,
-            durations=durations,
-            fastemit_lambda=fastemit_lambda,
-            clamp=clamp,
-            sigma=sigma,
-            omega=omega,
-            num_threads=0,
-            is_special=is_special,
-        )
-
-        if reduction in ['sum', 'mean']:
-            costs = costs.sum().unsqueeze_(-1)
-            if reduction == 'mean':
-                costs /= minibatch_size
-
-                if label_grads is not None:
-                    label_grads /= minibatch_size
-                    duration_grads /= minibatch_size
-
-        ctx.label_grads = label_grads
-        ctx.duration_grads = duration_grads
-
-        return costs
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        if grad_output is not None and ctx.label_grads is not None:
-            grad_output = grad_output.view(-1, 1, 1, 1).to(ctx.label_grads)
-            return (
-                ctx.label_grads.mul_(grad_output),
-                ctx.duration_grads.mul_(grad_output),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
 
 
 class _TDTNumba(Function):
@@ -302,6 +196,74 @@ class _TDTNumba(Function):
             )
 
 
+class _WordawareMultiblankRNNTNumba(Function):
+    """
+    Numba class for multi-blank transducer loss (https://arxiv.org/pdf/2211.03541.pdf)
+    """
+
+    @staticmethod
+    def forward(
+        ctx, acts, labels, act_lens, label_lens, blank, big_blank_durations, reduction, fastemit_lambda, clamp, sigma, is_special
+    ):
+        """
+        big_blank_durations: list of durations for multi-blank transducer, e.g.
+            [2, 4, 8].
+        sigma: hyper-parameter for logit under-normalization method for training
+            multi-blank transducers. Recommended value 0.05.
+        Refer to https://arxiv.org/pdf/2211.03541 for detailed explanations for
+            the above parameters;
+        For other parameters for this class, refer to comment for class _RNNTNumba
+        """
+        is_cuda = acts.is_cuda
+
+        certify_inputs(acts, labels, act_lens, label_lens)
+        if clamp < 0:
+            raise ValueError("`clamp` must be 0.0 or positive float value.")
+
+        if is_cuda:
+            loss_func = rnnt.multiblank_rnnt_loss_gpu
+        else:
+            raise NotImplementedError()
+
+        grads = torch.zeros_like(acts) if acts.requires_grad else None
+        minibatch_size = acts.size(0)
+        costs = torch.zeros(minibatch_size, device=acts.device, dtype=acts.dtype)
+
+        loss_func(
+            acts,
+            labels=labels,
+            input_lengths=act_lens,
+            label_lengths=label_lens,
+            costs=costs,
+            grads=grads,
+            blank_label=blank,
+            big_blank_durations=big_blank_durations,
+            fastemit_lambda=fastemit_lambda,
+            clamp=clamp,
+            sigma=sigma,
+            num_threads=0,
+            is_special=is_special
+        )
+
+        if reduction in ['sum', 'mean']:
+            costs = costs.sum().unsqueeze_(-1)
+            if reduction == 'mean':
+                costs /= minibatch_size
+
+                if grads is not None:
+                    grads /= minibatch_size
+
+        ctx.grads = grads
+
+        return costs
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        if grad_output is not None and ctx.grads is not None:
+            grad_output = grad_output.view(-1, 1, 1, 1).to(ctx.grads)
+            return ctx.grads.mul_(grad_output), None, None, None, None, None, None, None, None, None, None, None
+
+
 class _MultiblankRNNTNumba(Function):
     """
     Numba class for multi-blank transducer loss (https://arxiv.org/pdf/2211.03541.pdf)
@@ -400,6 +362,56 @@ def rnnt_loss(
     return _RNNTNumba.apply(acts, labels, act_lens, label_lens, blank, reduction, fastemit_lambda, clamp)
 
 
+def wordaware_multiblank_rnnt_loss(
+    acts,
+    labels,
+    act_lens,
+    label_lens,
+    blank,
+    big_blank_durations=[],
+    reduction='mean',
+    fastemit_lambda: float = 0.0,
+    clamp: float = 0.0,
+):
+    """
+    Multi-blank RNN Transducer (https://arxiv.org/pdf/2211.03541.pdf) Loss (functional form)
+    Args:
+        acts: Tensor of (batch x seqLength x labelLength x outputDim) containing output from network
+        labels: 2 dimensional Tensor containing all the targets of the batch with zero padded
+        act_lens: Tensor of size (batch) containing size of each output sequence from the network
+        label_lens: Tensor of (batch) containing label length of each example
+        blank (int): standard blank label.
+        big_blank_durations: list of durations for multi-blank transducer, e.g.
+            [2, 4, 8].
+        sigma: hyper-parameter for logit under-normalization method for training
+            multi-blank transducers. Recommended value 0.05.
+        Refer to https://arxiv.org/pdf/2211.03541 for detailed explanations for
+            the last two params.
+        reduction (string, optional): Specifies the reduction to apply to the output:
+            'none' | 'mean' | 'sum'. 'none': no reduction will be applied,
+            'mean': the output losses will be divided by the target lengths and
+            then the mean over the batch is taken. Default: 'mean'
+    """
+    if not acts.is_cuda:
+        # Since CPU requires log_softmax to be computed explicitly, we need to perform grad clipping
+        # *after* we have obtained the gradients of loss(logsoftmax()).
+        # This is highly wasteful since it requires a copy of the entire joint tensor which is expensive.
+        # CUDA version is much more efficient since it performs an inplace logsoftmax, and therefore
+        # can inplace clamp the gradient.
+        if clamp > 0.0:
+            acts = cpu_rnnt.LogSoftmaxGradModification.apply(acts, clamp)
+
+        # NOTE manually done log_softmax for CPU version,
+        # log_softmax is computed within GPU version.
+        acts = torch.nn.functional.log_softmax(acts, -1)
+
+    return _WordawareMultiblankRNNTNumba.apply(
+        acts, labels, act_lens, label_lens, blank, big_blank_durations, reduction, fastemit_lambda, clamp, is_special
+    )
+
+
+
+
 def multiblank_rnnt_loss(
     acts,
     labels,
@@ -448,52 +460,6 @@ def multiblank_rnnt_loss(
     )
 
 
-def wordaware_tdt_loss(
-    acts,
-    labels,
-    act_lens,
-    label_lens,
-    blank,
-    durations=[],
-    reduction='mean',
-    fastemit_lambda: float = 0.0,
-    clamp: float = 0.0,
-):
-    """
-    TDT RNN Transducer (https://arxiv.org/abs/2304.06795) Loss (functional form)
-    Args:
-        acts: Tensor of (batch x seqLength x labelLength x outputDim) containing output from network
-        labels: 2 dimensional Tensor containing all the targets of the batch with zero padded
-        act_lens: Tensor of size (batch) containing size of each output sequence from the network
-        label_lens: Tensor of (batch) containing label length of each example
-        blank (int): standard blank label.
-        durations: list of durations for TDT model, e.g.
-            [0,1,2,3,4].
-        sigma: hyper-parameter for logit under-normalization method for training
-            multi-blank transducers. Recommended value 0.05.
-        Refer to https://arxiv.org/abs/2304.06795 for detailed explanations for
-            the last two params.
-        reduction (string, optional): Specifies the reduction to apply to the output:
-            'none' | 'mean' | 'sum'. 'none': no reduction will be applied,
-            'mean': the output losses will be divided by the target lengths and
-            then the mean over the batch is taken. Default: 'mean'
-    """
-    if not acts.is_cuda:
-        # Since CPU requires log_softmax to be computed explicitly, we need to perform grad clipping
-        # *after* we have obtained the gradients of loss(logsoftmax()).
-        # This is highly wasteful since it requires a copy of the entire joint tensor which is expensive.
-        # CUDA version is much more efficient since it performs an inplace logsoftmax, and therefore
-        # can inplace clamp the gradient.
-        if clamp > 0.0:
-            acts = cpu_rnnt.LogSoftmaxGradModification.apply(acts, clamp)
-
-        # NOTE manually done log_softmax for CPU version,
-        # log_softmax is computed within GPU version.
-        acts = torch.nn.functional.log_softmax(acts, -1)
-
-    return _WordawareTDTNumba.apply(
-        acts, labels, act_lens, label_lens, blank, durations, reduction, fastemit_lambda, clamp
-    )
 
 
 def tdt_loss(
