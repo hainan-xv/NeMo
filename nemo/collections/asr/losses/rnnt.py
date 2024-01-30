@@ -35,7 +35,12 @@ from typing import Any, Callable, Dict, List, Optional, Set
 import torch
 from omegaconf import DictConfig, OmegaConf
 
-from nemo.collections.asr.losses.rnnt_pytorch import MultiblankRNNTLossPytorch, RNNTLossPytorch, TDTLossPytorch, WordawareMultiblankRNNTLossPytorch
+from nemo.collections.asr.losses.rnnt_pytorch import (
+    MultiblankRNNTLossPytorch,
+    RNNTLossPytorch,
+    TDTLossPytorch,
+    WordawareMultiblankRNNTLossPytorch,
+)
 from nemo.core.classes import Loss, typecheck
 from nemo.core.neural_types import LabelsType, LengthsType, LogprobsType, LossType, NeuralType
 from nemo.core.utils import numba_utils
@@ -50,17 +55,17 @@ try:
 except (ImportError, ModuleNotFoundError):
     WARP_RNNT_AVAILABLE = False
 
-try:
-    from nemo.collections.asr.parts.numba.rnnt_loss import (
-        MultiblankRNNTLossNumba,
-        RNNTLossNumba,
-        TDTLossNumba,
-        WordawareMultiblankLossNumba,
-    )
+# try:
+from nemo.collections.asr.parts.numba.rnnt_loss import (
+    MultiblankRNNTLossNumba,
+    RNNTLossNumba,
+    TDTLossNumba,
+    WordawareMultiblankRNNTLossNumba,
+)
 
-    NUMBA_RNNT_AVAILABLE = True
-except (ImportError, ModuleNotFoundError):
-    NUMBA_RNNT_AVAILABLE = False
+NUMBA_RNNT_AVAILABLE = True
+# except (ImportError, ModuleNotFoundError):
+#    NUMBA_RNNT_AVAILABLE = False
 
 try:
     from nemo.collections.asr.parts.k2.graph_transducer import GraphRnntLoss
@@ -285,7 +290,7 @@ def resolve_rnnt_loss(loss_name: str, blank_idx: int, loss_kwargs: dict = None) 
         vocab_file = loss_kwargs.pop('vocab_file', None)
         big_blank_durations = loss_kwargs.pop('big_blank_durations', None)
         sigma = loss_kwargs.pop('sigma', 0.0)
-        loss_func = WordawareMultiblankLossNumba(
+        loss_func = WordawareMultiblankRNNTLossNumba(
             blank=blank_idx,
             big_blank_durations=big_blank_durations,
             reduction='none',

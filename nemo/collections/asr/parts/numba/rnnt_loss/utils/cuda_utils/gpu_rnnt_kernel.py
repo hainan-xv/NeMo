@@ -1223,7 +1223,6 @@ def compute_multiblank_grad_kernel(
             idx += GPU_RNNT_THREAD_SIZE
 
 
-
 @cuda.jit()
 def compute_wordaware_multiblank_alphas_kernel(
     acts: torch.Tensor,
@@ -1299,9 +1298,8 @@ def compute_wordaware_multiblank_alphas_kernel(
         allow_blank = True
     elif u == U - 1:
         label = labels[u - 1]
-        assert(is_special[label])
+        assert is_special[label]
         allow_blank = True
-
 
     # Ordinary alpha calculations, broadcast across B=b and U=u
     # Look up forward variable calculation from rnnt_numpy.forward_pass()
@@ -1367,7 +1365,15 @@ def compute_wordaware_multiblank_alphas_kernel(
                             big_blank_no_emit = (
                                 alphas[offset + (t - big_blank_duration[i]) * maxU + u]
                                 + logp(
-                                    denom, acts, maxT, maxU, alphabet_size, b, t - big_blank_duration[i], u, blank_ - 1 - i
+                                    denom,
+                                    acts,
+                                    maxT,
+                                    maxU,
+                                    alphabet_size,
+                                    b,
+                                    t - big_blank_duration[i],
+                                    u,
+                                    blank_ - 1 - i,
                                 )
                                 - sigma
                             )
@@ -1398,7 +1404,7 @@ def compute_wordaware_multiblank_alphas_kernel(
                 loglike = rnnt_helper.log_sum_exp(loglike, big_blank_loglike)
 
         llForward[b] = loglike
-        print("forward", b, loglike)
+#        print("forward", b, loglike)
 
 
 @cuda.jit()
@@ -1478,7 +1484,7 @@ def compute_wordaware_multiblank_betas_kernel(
         allow_blank = True
     elif u == U - 1:
         label = labels[u - 1]
-        assert(is_special[label])
+        assert is_special[label]
         allow_blank = True
 
     # sync until all betas are initialized
@@ -1494,7 +1500,7 @@ def compute_wordaware_multiblank_betas_kernel(
             if t >= 0 and t < (T - 1):
                 # beta[t, U - 1] = beta[t + 1, U - 1] * p(blank | t, U - 1) / exp(sigma)
                 # this part is the same as regular RNN-T.
-            
+
                 betas[offset + t * maxU + U - 1] = (
                     betas[offset + (t + 1) * maxU + U - 1]
                     + logp(denom, acts, maxT, maxU, alphabet_size, b, t, U - 1, blank_)
@@ -1566,7 +1572,7 @@ def compute_wordaware_multiblank_betas_kernel(
     # log-likelihood of backward pass.
     if u == 0:
         llBackward[b] = betas[offset]
-        print("backwad", b, betas[offset])
+#        print("backwad", b, betas[offset])
 
 
 @cuda.jit()
@@ -1657,7 +1663,7 @@ def compute_wordaware_multiblank_grad_kernel(
             allow_blank = True
         elif u == U - 1:
             label = labels[u - 1]
-            assert(is_special[label])
+            assert is_special[label]
             allow_blank = True
 
         # For cuda kernels, maximum number of threads per block is limited to some value.
@@ -1750,4 +1756,3 @@ def compute_wordaware_multiblank_grad_kernel(
             # update internal index through the thread_buffer;
             # until idx < V + 1, such that entire vocabulary has been updated.
             idx += GPU_RNNT_THREAD_SIZE
-

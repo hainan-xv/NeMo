@@ -422,7 +422,6 @@ class WordawareMultiblankRNNTLossPytorch(Loss):
 
         return losses
 
-
     def logsumexp(self, a, b):
         ret = torch.logsumexp(torch.stack([a, b]), dim=0)
         return ret
@@ -502,6 +501,3 @@ def get_special(vocab_file):
         res.append(is_special)
 
     return res
-
-
-

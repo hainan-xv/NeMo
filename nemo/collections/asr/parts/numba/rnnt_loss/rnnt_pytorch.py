@@ -91,7 +91,6 @@ class _RNNTNumba(Function):
             return ctx.grads.mul_(grad_output), None, None, None, None, None, None, None
 
 
-
 class _TDTNumba(Function):
     """
     Numba class for Token-and-Duration Transducer (TDT) loss (https://arxiv.org/abs/2304.06795)
@@ -203,7 +202,18 @@ class _WordawareMultiblankRNNTNumba(Function):
 
     @staticmethod
     def forward(
-        ctx, acts, labels, act_lens, label_lens, blank, big_blank_durations, reduction, fastemit_lambda, clamp, sigma, is_special
+        ctx,
+        acts,
+        labels,
+        act_lens,
+        label_lens,
+        blank,
+        big_blank_durations,
+        reduction,
+        fastemit_lambda,
+        clamp,
+        sigma,
+        is_special,
     ):
         """
         big_blank_durations: list of durations for multi-blank transducer, e.g.
@@ -242,7 +252,7 @@ class _WordawareMultiblankRNNTNumba(Function):
             clamp=clamp,
             sigma=sigma,
             num_threads=0,
-            is_special=is_special
+            is_special=is_special,
         )
 
         if reduction in ['sum', 'mean']:
@@ -410,8 +420,6 @@ def wordaware_multiblank_rnnt_loss(
     )
 
 
-
-
 def multiblank_rnnt_loss(
     acts,
     labels,
@@ -458,8 +466,6 @@ def multiblank_rnnt_loss(
     return _MultiblankRNNTNumba.apply(
         acts, labels, act_lens, label_lens, blank, big_blank_durations, reduction, fastemit_lambda, clamp
     )
-
-
 
 
 def tdt_loss(

@@ -1276,4 +1276,3 @@ class WordawareMultiblankGPURNNT(GPURNNT):
         bigblank_durations = self.big_blank_workspace[: self.num_big_blanks]
 
         return used_offset, (denom, alphas, betas, llForward, llBackward, bigblank_durations)
-
