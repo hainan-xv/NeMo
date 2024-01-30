@@ -35,7 +35,7 @@ from typing import Any, Callable, Dict, List, Optional, Set
 import torch
 from omegaconf import DictConfig, OmegaConf
 
-from nemo.collections.asr.losses.rnnt_pytorch import MultiblankRNNTLossPytorch, RNNTLossPytorch, TDTLossPytorch, WordawareTDTLossPytorch
+from nemo.collections.asr.losses.rnnt_pytorch import MultiblankRNNTLossPytorch, RNNTLossPytorch, TDTLossPytorch, WordawareMultiblankLossPytorch
 from nemo.core.classes import Loss, typecheck
 from nemo.core.neural_types import LabelsType, LengthsType, LogprobsType, LossType, NeuralType
 from nemo.core.utils import numba_utils
@@ -55,7 +55,7 @@ try:
         MultiblankRNNTLossNumba,
         RNNTLossNumba,
         TDTLossNumba,
-        WordawareTDTLossNumba,
+        WordawareMultiblankLossNumba,
     )
 
     NUMBA_RNNT_AVAILABLE = True
@@ -106,8 +106,8 @@ RNNT_LOSS_RESOLVER = {
         installation_msg=NUMBA_INSTALLATION_MESSAGE,
         force_float32=False,  # This is only temporarily false, will be dynamically updated during resolution
     ),
-    "wordaware_tdt": RNNTLossConfig(
-        loss_name="wordaware_tdt",
+    "wordaware_multiblank": RNNTLossConfig(
+        loss_name="wordaware_multiblank",
         lib_name="numba",
         min_version='0.53.0',
         is_available=NUMBA_RNNT_AVAILABLE,
@@ -279,22 +279,19 @@ def resolve_rnnt_loss(loss_name: str, blank_idx: int, loss_kwargs: dict = None) 
         loss_func = RNNTLossNumba(blank=blank_idx, reduction='none', fastemit_lambda=fastemit_lambda, clamp=clamp)
         _warn_unused_additional_kwargs(loss_name, loss_kwargs)
 
-    elif loss_name == 'wordaware_tdt':
+    elif loss_name == 'wordaware_multiblank':
         fastemit_lambda = loss_kwargs.pop('fastemit_lambda', 0.0)
         clamp = loss_kwargs.pop('clamp', -1.0)
         vocab_file = loss_kwargs.pop('vocab_file', None)
-        durations = loss_kwargs.pop('durations', None)
+        big_blank_durations = loss_kwargs.pop('big_blank_durations', None)
         sigma = loss_kwargs.pop('sigma', 0.0)
-        omega = loss_kwargs.pop('omega', 0.0)
-        #        loss_func = WordawareTDTLossNumba(blank=blank_idx, reduction='none', fastemit_lambda=fastemit_lambda, clamp=clamp, vocab_file=vocab_file)
-        loss_func = WordawareTDTLossNumba(
+        loss_func = WordawareMultiblankLossNumba(
             blank=blank_idx,
-            durations=durations,
+            big_blank_durations=big_blank_durations,
             reduction='none',
             fastemit_lambda=fastemit_lambda,
             clamp=clamp,
             sigma=sigma,
-            omega=omega,
             vocab_file=vocab_file,
         )
         _warn_unused_additional_kwargs(loss_name, loss_kwargs)
