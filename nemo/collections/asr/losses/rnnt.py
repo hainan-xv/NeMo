@@ -35,7 +35,7 @@ from typing import Any, Callable, Dict, List, Optional, Set
 import torch
 from omegaconf import DictConfig, OmegaConf
 
-from nemo.collections.asr.losses.rnnt_pytorch import MultiblankRNNTLossPytorch, RNNTLossPytorch, TDTLossPytorch
+from nemo.collections.asr.losses.rnnt_pytorch import MultiblankRNNTLossPytorch, RNNTLossPytorch, TDTLossPytorch, WordawareTDTLossPytorch
 from nemo.core.classes import Loss, typecheck
 from nemo.core.neural_types import LabelsType, LengthsType, LogprobsType, LossType, NeuralType
 from nemo.core.utils import numba_utils
@@ -51,7 +51,12 @@ except (ImportError, ModuleNotFoundError):
     WARP_RNNT_AVAILABLE = False
 
 try:
-    from nemo.collections.asr.parts.numba.rnnt_loss import MultiblankRNNTLossNumba, RNNTLossNumba, TDTLossNumba, WordawareTDTLossNumba
+    from nemo.collections.asr.parts.numba.rnnt_loss import (
+        MultiblankRNNTLossNumba,
+        RNNTLossNumba,
+        TDTLossNumba,
+        WordawareTDTLossNumba,
+    )
 
     NUMBA_RNNT_AVAILABLE = True
 except (ImportError, ModuleNotFoundError):
@@ -281,7 +286,7 @@ def resolve_rnnt_loss(loss_name: str, blank_idx: int, loss_kwargs: dict = None) 
         durations = loss_kwargs.pop('durations', None)
         sigma = loss_kwargs.pop('sigma', 0.0)
         omega = loss_kwargs.pop('omega', 0.0)
-#        loss_func = WordawareTDTLossNumba(blank=blank_idx, reduction='none', fastemit_lambda=fastemit_lambda, clamp=clamp, vocab_file=vocab_file)
+        #        loss_func = WordawareTDTLossNumba(blank=blank_idx, reduction='none', fastemit_lambda=fastemit_lambda, clamp=clamp, vocab_file=vocab_file)
         loss_func = WordawareTDTLossNumba(
             blank=blank_idx,
             durations=durations,

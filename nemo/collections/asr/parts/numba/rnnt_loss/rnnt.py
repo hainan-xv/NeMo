@@ -235,6 +235,7 @@ def rnnt_loss_gpu(
     del gpu_workspace, wrapper
     return True
 
+
 def wordaware_tdt_loss_gpu(
     label_acts: torch.Tensor,
     duration_acts: torch.Tensor,
@@ -362,7 +363,6 @@ def wordaware_tdt_loss_gpu(
 
     del gpu_workspace, tdt_workspace, wrapper
     return True
-
 
 
 def tdt_loss_gpu(

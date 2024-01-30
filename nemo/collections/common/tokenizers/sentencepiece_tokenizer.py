@@ -402,23 +402,26 @@ def create_spt_model(
             f.write(f"{token}\n")
     return f'{output_dir}/tokenizer.model', vocab_file
 
+
 if __name__ == "__main__":
-    t = SentencePieceTokenizer("/home/hainanx/nemo_exps_local/tokenizer_reversed/tokenizer_spe_bpe_v1024/tokenizer.model")
+    t = SentencePieceTokenizer(
+        "/home/hainanx/nemo_exps_local/tokenizer_reversed/tokenizer_spe_bpe_v1024/tokenizer.model"
+    )
     for sentence in open("/home/hainanx/libri_dev.txt", 'r'):
         sentence = sentence.strip()
 
-# test text_to_tokens() and tokens_to_text()
+        # test text_to_tokens() and tokens_to_text()
         tokens = t.text_to_tokens(sentence)
-#        print(tokens)
+        #        print(tokens)
         reconstructed_sentence = t.tokens_to_text(tokens)
         if not sentence == reconstructed_sentence or True:
             print("token not equal")
             print(sentence)
             print(' '.join(tokens))
             print(reconstructed_sentence)
-#            exit(-1)
+        #            exit(-1)
 
-# test text_to_ids() and ids_to_text()
+        # test text_to_ids() and ids_to_text()
         ids = t.text_to_ids(sentence)
         reconstructed_sentence = t.ids_to_text(ids)
         if not sentence == reconstructed_sentence:
@@ -426,6 +429,6 @@ if __name__ == "__main__":
             print(sentence)
             print(reconstructed_sentence)
             exit(-1)
-#        print(' '.join(tokens))
+    #        print(' '.join(tokens))
 
     print("greedy testing successful")

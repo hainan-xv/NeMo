@@ -293,7 +293,6 @@ class GPURNNT:
         return used_offset, (denom, alphas, betas, llForward, llBackward)
 
 
-
 class MultiblankGPURNNT(GPURNNT):
     def __init__(
         self,
@@ -808,7 +807,6 @@ class GPUTDT(GPURNNT):
         return used_offset, (denom, alphas, betas, llForward, llBackward, durations)
 
 
-
 class GPUWordawareTDT(GPURNNT):
     def __init__(
         self,
@@ -907,7 +905,7 @@ class GPUWordawareTDT(GPURNNT):
 
         # Compute alphas
         gpu_rnnt_kernel.compute_wordaware_tdt_alphas_kernel[self.minibatch_, self.maxU_, self.stream_, 0](
-#        gpu_rnnt_kernel.compute_tdt_alphas_kernel[self.minibatch_, self.maxU_, self.stream_, 0](
+            #        gpu_rnnt_kernel.compute_tdt_alphas_kernel[self.minibatch_, self.maxU_, self.stream_, 0](
             label_acts,
             duration_acts,
             denom,
@@ -929,53 +927,55 @@ class GPUWordawareTDT(GPURNNT):
 
         if training:
             # Compute betas
-                gpu_rnnt_kernel.compute_wordaware_tdt_betas_kernel[self.minibatch_, self.maxU_, self.stream_, 0](
-                    label_acts,
-                    duration_acts,
-                    denom,
-                    self.sigma,
-                    betas,
-                    llBackward,
-                    input_lengths,
-                    label_lengths,
-                    labels,
-                    self.minibatch_,
-                    self.maxT_,
-                    self.maxU_,
-                    self.alphabet_size_,
-                    self.blank_,
-                    durations,
-                    self.num_durations,
-                    self.is_special,
-                )
+            gpu_rnnt_kernel.compute_wordaware_tdt_betas_kernel[self.minibatch_, self.maxU_, self.stream_, 0](
+                label_acts,
+                duration_acts,
+                denom,
+                self.sigma,
+                betas,
+                llBackward,
+                input_lengths,
+                label_lengths,
+                labels,
+                self.minibatch_,
+                self.maxT_,
+                self.maxU_,
+                self.alphabet_size_,
+                self.blank_,
+                durations,
+                self.num_durations,
+                self.is_special,
+            )
 
-                # Compute gradient
-                grad_blocks_per_grid = self.minibatch_ * self.maxT_ * self.maxU_
-                grad_threads_per_block = gpu_rnnt_kernel.GPU_RNNT_THREAD_SIZE
-                gpu_rnnt_kernel.compute_wordaware_tdt_grad_kernel[grad_blocks_per_grid, grad_threads_per_block, self.stream_, 0](
-                    label_grads,
-                    duration_grads,
-                    label_acts,
-                    duration_acts,
-                    denom,
-                    self.sigma,
-                    alphas,
-                    betas,
-                    llForward,
-                    input_lengths,
-                    label_lengths,
-                    labels,
-                    self.minibatch_,
-                    self.maxT_,
-                    self.maxU_,
-                    self.alphabet_size_,
-                    self.blank_,
-                    durations,
-                    self.num_durations,
-                    self.fastemit_lambda_,
-                    self.clamp_,
-                    self.is_special,
-                )
+            # Compute gradient
+            grad_blocks_per_grid = self.minibatch_ * self.maxT_ * self.maxU_
+            grad_threads_per_block = gpu_rnnt_kernel.GPU_RNNT_THREAD_SIZE
+            gpu_rnnt_kernel.compute_wordaware_tdt_grad_kernel[
+                grad_blocks_per_grid, grad_threads_per_block, self.stream_, 0
+            ](
+                label_grads,
+                duration_grads,
+                label_acts,
+                duration_acts,
+                denom,
+                self.sigma,
+                alphas,
+                betas,
+                llForward,
+                input_lengths,
+                label_lengths,
+                labels,
+                self.minibatch_,
+                self.maxT_,
+                self.maxU_,
+                self.alphabet_size_,
+                self.blank_,
+                durations,
+                self.num_durations,
+                self.fastemit_lambda_,
+                self.clamp_,
+                self.is_special,
+            )
 
         # // cost copy, negate (for log likelihood) and update with additional regularizers
         # This needs to be done via CUDA, because we used temporary memory llForward

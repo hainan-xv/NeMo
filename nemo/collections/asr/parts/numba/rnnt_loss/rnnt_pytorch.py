@@ -197,6 +197,7 @@ class _WordawareTDTNumba(Function):
                 None,
             )
 
+
 class _TDTNumba(Function):
     """
     Numba class for Token-and-Duration Transducer (TDT) loss (https://arxiv.org/abs/2304.06795)
@@ -399,7 +400,6 @@ def rnnt_loss(
     return _RNNTNumba.apply(acts, labels, act_lens, label_lens, blank, reduction, fastemit_lambda, clamp)
 
 
-
 def multiblank_rnnt_loss(
     acts,
     labels,
@@ -447,6 +447,7 @@ def multiblank_rnnt_loss(
         acts, labels, act_lens, label_lens, blank, big_blank_durations, reduction, fastemit_lambda, clamp
     )
 
+
 def wordaware_tdt_loss(
     acts,
     labels,
@@ -490,7 +491,10 @@ def wordaware_tdt_loss(
         # log_softmax is computed within GPU version.
         acts = torch.nn.functional.log_softmax(acts, -1)
 
-    return _WordawareTDTNumba.apply(acts, labels, act_lens, label_lens, blank, durations, reduction, fastemit_lambda, clamp)
+    return _WordawareTDTNumba.apply(
+        acts, labels, act_lens, label_lens, blank, durations, reduction, fastemit_lambda, clamp
+    )
+
 
 def tdt_loss(
     acts,
@@ -598,8 +602,6 @@ def get_special(vocab_file):
         res.append(is_special)
 
     return res
-
-
 
 
 class MultiblankRNNTLossNumba(Module):
@@ -795,7 +797,6 @@ def certify_inputs(log_probs, labels, lengths, label_lengths):
         raise ValueError(f"Input length mismatch! Given T: {T}, Expected max T from input lengths: {max_T}")
     if U != max_U + 1:
         raise ValueError(f"Output length mismatch! Given U: {U}, Expected max U from target lengths: {max_U} + 1")
-
 
 
 class WordawareTDTLossNumba(Module):
