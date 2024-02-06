@@ -260,7 +260,8 @@ class EncDecTransfModelBPE(ASRModel, ExportableEncDecModel, ASRBPEMixin):
 
                     batch_size = test_batch[0].shape[0]
 
-                    dec_input = [self.tokenizer.bos_id] + self.tokenizer.tokens_to_ids("▁<en>")
+                    dec_input = [self.tokenizer.bos_id] + self.tokenizer.tokens_to_ids("▁<de>")
+#                    dec_input = [self.tokenizer.bos_id] + self.tokenizer.tokens_to_ids("▁<en>")
 
                     decoder_input_ids = torch.LongTensor(dec_input).repeat([batch_size, 1]).to(device)
 
