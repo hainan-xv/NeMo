@@ -361,12 +361,12 @@ class GreedyBatchedRNNTHainanComputer(ConfidenceMethodMixin):
             if first_step:
                 # start of the loop, SOS symbol is passed into prediction network, state is None
                 # we need to separate this for torch.jit
-                decoder_output, state, *_ = self.decoder.predict(
+                decoder_output, new_state, *_ = self.decoder.predict(
                     labels.unsqueeze(1), None, add_sos=False, batch_size=batch_size
                 )
                 first_step = False
             else:
-                decoder_output, state, *_ = self.decoder.predict(
+                decoder_output, new_state, *_ = self.decoder.predict(
                     labels.unsqueeze(1), state, add_sos=False, batch_size=batch_size
                 )
             decoder_output = self.joint.project_prednet(decoder_output)  # do not recalculate joint projection
@@ -378,22 +378,12 @@ class GreedyBatchedRNNTHainanComputer(ConfidenceMethodMixin):
                 .squeeze(1)
                 .squeeze(1)
             )
-            scores, labels = logits.max(-1)
+            scores, new_labels = logits.max(-1)
 
             # search for non-blank labels using joint, advancing time indices for blank labels
             # checking max_symbols is not needed, since we already forced advancing time indices for such cases
-            blank_mask = labels == self._blank_index
+            blank_mask = new_labels == self._blank_index
             time_indices_current_labels.copy_(time_indices, non_blocking=True)
-            if use_alignments:
-                if self.preserve_frame_confidence:
-                    logits = F.log_softmax(logits, dim=-1)
-                alignments.add_results_masked_(
-                    active_mask=active_mask,
-                    time_indices=time_indices_current_labels,
-                    logits=logits if self.preserve_alignments else None,
-                    labels=labels if self.preserve_alignments else None,
-                    confidence=self._get_confidence_tensor(logits) if self.preserve_frame_confidence else None,
-                )
 
             # advance_mask is a mask for current batch for searching non-blank labels;
             # each element is True if non-blank symbol is not yet found AND we can increase the time index
@@ -402,61 +392,24 @@ class GreedyBatchedRNNTHainanComputer(ConfidenceMethodMixin):
             torch.less(time_indices, out_len, out=active_mask)
             torch.logical_and(active_mask, blank_mask, out=advance_mask)
 
-            # inner loop: find next non-blank labels (if exist)
-            while advance_mask.any():
-                # same as: time_indices_current_labels[advance_mask] = time_indices[advance_mask], but non-blocking
-                # store current time indices to use further for storing the results
-                torch.where(advance_mask, time_indices, time_indices_current_labels, out=time_indices_current_labels)
-                logits = (
-                    self.joint.joint_after_projection(
-                        x[batch_indices, safe_time_indices].unsqueeze(1), decoder_output,
-                    )
-                    .squeeze(1)
-                    .squeeze(1)
-                )
-                # get labels (greedy) and scores from current logits, replace labels/scores with new
-                # labels[advance_mask] are blank, and we are looking for non-blank labels
-                more_scores, more_labels = logits.max(-1)
-                # same as: labels[advance_mask] = more_labels[advance_mask], but non-blocking
-                torch.where(advance_mask, more_labels, labels, out=labels)
-                # same as: scores[advance_mask] = more_scores[advance_mask], but non-blocking
-                torch.where(advance_mask, more_scores, scores, out=scores)
-
-                if use_alignments:
-                    if self.preserve_frame_confidence:
-                        logits = F.log_softmax(logits, dim=-1)
-                    alignments.add_results_masked_(
-                        active_mask=advance_mask,
-                        time_indices=time_indices_current_labels,
-                        logits=logits if self.preserve_alignments else None,
-                        labels=more_labels if self.preserve_alignments else None,
-                        confidence=self._get_confidence_tensor(logits) if self.preserve_frame_confidence else None,
-                    )
-
-                blank_mask = labels == self._blank_index
-                time_indices += blank_mask
-                torch.minimum(time_indices, last_timesteps, out=safe_time_indices)
-                torch.less(time_indices, out_len, out=active_mask)
-                torch.logical_and(active_mask, blank_mask, out=advance_mask)
-
             # stage 3: filter labels and state, store hypotheses
             # select states for hyps that became inactive (is it necessary?)
             # this seems to be redundant, but used in the `loop_frames` output
             torch.ne(active_mask, active_mask_prev, out=became_inactive_mask)
             self.decoder.batch_replace_states_mask(
-                src_states=state, dst_states=last_decoder_state, mask=became_inactive_mask,
+                src_states=new_state, dst_states=last_decoder_state, mask=became_inactive_mask,
             )
 
             # store hypotheses
             if self.max_symbols is not None:
                 # pre-allocated memory, no need for checks
-                batched_hyps.add_results_masked_no_checks_(
-                    active_mask, labels, time_indices_current_labels, scores,
+                batched_hyps.add_results_raw_no_checks_(
+                    active_mask, blank_mask, advance_mask, new_labels, time_indices_current_labels, scores,
                 )
             else:
                 # auto-adjusted storage
-                batched_hyps.add_results_masked_(
-                    active_mask, labels, time_indices_current_labels, scores,
+                batched_hyps.add_results_raw_(
+                    active_mask, blank_mask, advance_mask, new_labels, time_indices_current_labels, scores,
                 )
 
             # stage 4: to avoid looping, go to next frame after max_symbols emission
@@ -467,7 +420,7 @@ class GreedyBatchedRNNTHainanComputer(ConfidenceMethodMixin):
                     active_mask,
                     torch.logical_and(
                         torch.logical_and(
-                            labels != self._blank_index, batched_hyps.last_timestep_lasts >= self.max_symbols,
+                            new_labels != self._blank_index, batched_hyps.last_timestep_lasts >= self.max_symbols,
                         ),
                         batched_hyps.last_timestep == time_indices,
                     ),
@@ -477,6 +430,11 @@ class GreedyBatchedRNNTHainanComputer(ConfidenceMethodMixin):
                 torch.minimum(time_indices, last_timesteps, out=safe_time_indices)
                 # same as: active_mask = time_indices < out_len
                 torch.less(time_indices, out_len, out=active_mask)
-        if use_alignments:
-            return batched_hyps, alignments, last_decoder_state
+
+            labels = new_labels * ~blank_mask + labels * blank_mask
+
+            self.decoder.batch_replace_states_mask(
+                src_states=new_state, dst_states=state, mask=~blank_mask,
+            )
+            
         return batched_hyps, None, last_decoder_state

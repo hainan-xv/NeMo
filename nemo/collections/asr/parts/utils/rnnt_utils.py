@@ -381,6 +381,43 @@ class BatchedHyps:
         # increase lengths
         self.current_lengths += active_mask
 
+    def add_results_raw_(
+        self, active_mask: torch.Tensor, blank_mask: torch.Tensor, advance_mask: torch.Tensor, labels: torch.Tensor, time_indices: torch.Tensor, scores: torch.Tensor
+    ):
+        if (self.current_lengths + active_mask).max() >= self._max_length:
+            self._allocate_more()
+        self.add_results_raw_no_checks_(
+            active_mask=active_mask, blank_mask=blank_mask, advance_mask=advance_mask, labels=labels, time_indices=time_indices, scores=scores
+        )
+
+    def add_results_raw_no_checks_(
+        self, active_mask: torch.Tensor, blank_mask: torch.Tensor, advance_mask: torch.Tensor, labels: torch.Tensor, time_indices: torch.Tensor, scores: torch.Tensor
+    ):
+        # label can be blank
+        torch.where(active_mask, self.scores + scores, self.scores, out=self.scores)
+
+        # store transcript and timesteps
+        self.transcript[self._batch_indices, self.current_lengths] = labels
+        # store last observed timestep + number of observation for the current timestep
+        # if last_timestep == time_indices, increase; else set to 1
+        torch.where(
+            torch.logical_and(advance_mask, self.last_timestep == time_indices),
+            self.last_timestep_lasts + 1,
+            self.last_timestep_lasts,
+            out=self.last_timestep_lasts,
+        )
+        torch.where(
+            torch.logical_and(advance_mask, self.last_timestep != time_indices),
+            self._ones_batch,
+            self.last_timestep_lasts,
+            out=self.last_timestep_lasts,
+        )
+        # same as: self.last_timestep[active_mask] = time_indices[active_mask], but non-blocking
+        torch.where(active_mask, time_indices, self.last_timestep, out=self.last_timestep)
+        # increase lengths
+        self.current_lengths += active_mask * ~blank_mask
+
+
 
 class BatchedAlignments:
     """
