@@ -34,7 +34,7 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 
 from nemo.collections.asr.modules import rnnt_abstract
-from nemo.collections.asr.parts.submodules.rnnt_loop_labels_computer import GreedyBatchedRNNTLoopLabelsComputer
+from nemo.collections.asr.parts.submodules.rnnt_loop_labels_computer import GreedyBatchedRNNTLoopLabelsComputer, GreedyBatchedRNNTHainanComputer
 from nemo.collections.asr.parts.utils import rnnt_utils
 from nemo.collections.asr.parts.utils.asr_confidence_utils import ConfidenceMethodConfig, ConfidenceMethodMixin
 from nemo.collections.common.parts.rnn import label_collate
@@ -588,6 +588,7 @@ class GreedyBatchedRNNTInfer(_GreedyRNNTInfer):
         preserve_frame_confidence: bool = False,
         confidence_method_cfg: Optional[DictConfig] = None,
         loop_labels: bool = False,
+        hainan_algo: bool = False,
     ):
         super().__init__(
             decoder_model=decoder_model,
@@ -602,11 +603,24 @@ class GreedyBatchedRNNTInfer(_GreedyRNNTInfer):
         # Depending on availability of `blank_as_pad` support
         # switch between more efficient batch decoding technique
         self._decoding_computer = None
+        print("HERE", self.decoder.blank_as_pad, loop_labels, hainan_algo)
         if self.decoder.blank_as_pad:
-            if loop_labels:
+            if loop_labels and not hainan_algo:
                 # default (faster) algo: loop over labels
                 self._greedy_decode = self._greedy_decode_blank_as_pad_loop_labels
                 self._decoding_computer = GreedyBatchedRNNTLoopLabelsComputer(
+                    decoder=self.decoder,
+                    joint=self.joint,
+                    blank_index=self._blank_index,
+                    max_symbols_per_step=self.max_symbols,
+                    preserve_alignments=preserve_alignments,
+                    preserve_frame_confidence=preserve_frame_confidence,
+                    confidence_method_cfg=confidence_method_cfg,
+                )
+            elif loop_labels and hainan_algo:
+                # default (faster) algo: loop over labels
+                self._greedy_decode = self._greedy_decode_blank_as_pad_loop_labels
+                self._decoding_computer = GreedyBatchedRNNTHainanComputer(
                     decoder=self.decoder,
                     joint=self.joint,
                     blank_index=self._blank_index,
