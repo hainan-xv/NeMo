@@ -354,21 +354,17 @@ class GreedyBatchedRNNTHainanComputer(ConfidenceMethodMixin):
         became_inactive_mask = torch.empty_like(active_mask)
 
         # loop while there are active utterances
-        first_step = True
+
+        decoder_output, new_state, *_ = self.decoder.predict(
+            labels.unsqueeze(1), None, add_sos=False, batch_size=batch_size
+        )
+        decoder_output = self.joint.project_prednet(decoder_output)  # do not recalculate joint projection
+
         while active_mask.any():
             active_mask_prev.copy_(active_mask, non_blocking=True)
             # stage 1: get decoder (prediction network) output
-            if first_step:
-                # start of the loop, SOS symbol is passed into prediction network, state is None
-                # we need to separate this for torch.jit
-                decoder_output, new_state, *_ = self.decoder.predict(
-                    labels.unsqueeze(1), None, add_sos=False, batch_size=batch_size
-                )
-                first_step = False
-            else:
-                decoder_output, new_state, *_ = self.decoder.predict(
-                    labels.unsqueeze(1), state, add_sos=False, batch_size=batch_size
-                )
+
+
             decoder_output = self.joint.project_prednet(decoder_output)  # do not recalculate joint projection
 
             # stage 2: get joint output, iteratively seeking for non-blank labels
@@ -431,10 +427,28 @@ class GreedyBatchedRNNTHainanComputer(ConfidenceMethodMixin):
                 # same as: active_mask = time_indices < out_len
                 torch.less(time_indices, out_len, out=active_mask)
 
+
+#            labels = new_labels
             labels = new_labels * ~blank_mask + labels * blank_mask
+#            if not blank_mask.all():
+
 
             self.decoder.batch_replace_states_mask(
                 src_states=new_state, dst_states=state, mask=~blank_mask,
             )
+
+            decoder_output, new_state, *_ = self.decoder.predict(
+                labels.unsqueeze(1), state, add_sos=False, batch_size=batch_size
+            )
+
+#                print("state is", state)
+#                print("blank_mask is", blank_mask)
+#                states_needed_to_update = self.decoder.mask_select_states(state, ~blank_mask)
+#                print("states_needed_to_update is", states_needed_to_update)
+
+#            decoder_output, states_neede_to_update, *_ = self.decoder.predict(
+#                labels.unsqueeze(1), states_needed_to_update, add_sos=False, batch_size=batch_size
+#            )
+
             
         return batched_hyps, None, last_decoder_state
