@@ -1102,6 +1102,30 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
 
         return old_states
 
+    def batch_subset_states(
+        self,
+        states: List[torch.Tensor],
+        ids: List[int],
+    ) -> List[torch.Tensor]:
+        """Copy states from new state to old state at certain indices.
+        Args:
+            old_states: packed decoder states
+                single element list of (B x C)
+            new_states: packed decoder states
+                single element list of (B x C)
+            ids (list): List of indices to copy states at.
+            value (optional float): If a value should be copied instead of a state slice, a float should be provided
+        Returns:
+            batch of decoder states with partial copy at ids (or a specific value).
+                (B x C)
+        """
+
+        ret = [states[0][:, ids, :], states[1][:, ids, :]]
+
+        return ret
+
+
+
     def mask_select_states(
         self, states: Tuple[torch.Tensor, torch.Tensor], mask: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:

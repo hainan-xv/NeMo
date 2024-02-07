@@ -333,7 +333,7 @@ class GreedyBatchedRNNTHainanComputer(ConfidenceMethodMixin):
         )
 
         # initial state, needed for torch.jit to compile (cannot handle None)
-        prev_state = self.decoder.initialize_state(x)
+#        prev_state = self.decoder.initialize_state(x)
         # indices of elements in batch (constant)
         batch_indices = torch.arange(batch_size, dtype=torch.long, device=device)
         # last found labels - initially <SOS> (<blank>) symbol
@@ -433,19 +433,32 @@ class GreedyBatchedRNNTHainanComputer(ConfidenceMethodMixin):
 
             # if we run decoder.predict again, it will double count those utterance that emit blanks. So the solution is,
 
+#            if not blank_mask.all():
+#                idx = torch.nonzero(~blank_mask).reshape([-1])
+#                state2 = self.decoder.mask_select_states(state, mask=~blank_mask)  # states w.r.t non-blank emissions. need to update them
+#                decoder_output2, state2, *_ = self.decoder.predict(
+#                    labels[~blank_mask].unsqueeze(1), state2, add_sos=False, batch_size=batch_size
+#                )
+#
+#
+#                decoder_output2 = self.joint.project_prednet(decoder_output2)  # do not recalculate joint projection
+#                decoder_output[idx,:,:] = decoder_output2
+#
+#                state[0][:,idx,:] = state2[0]
+#                state[1][:,idx,:] = state2[1]
+
             if not blank_mask.all():
-                # prev_state = state, for uttenraces that emit non-blank, does not reflect new_label; by later running predict it reflect new label
-                #            = prev_state, for utterances that emit blank, also doeesn't reflect new_label
-                # for those utterances that emit actual label (non-blank), replace 'prev_state' with content in 'state'
-                # otherwise remains the same
-                self.decoder.batch_replace_states_mask(
-                    src_states=state, dst_states=prev_state, mask=~blank_mask,
+                state2 = self.decoder.mask_select_states(state, mask=~blank_mask)  # states w.r.t non-blank emissions. need to update them
+                decoder_output2, state2, *_ = self.decoder.predict(
+                    labels[~blank_mask].unsqueeze(1), state2, add_sos=False, batch_size=batch_size
                 )
 
-                decoder_output, state, *_ = self.decoder.predict(
-                    labels.unsqueeze(1), prev_state, add_sos=False, batch_size=batch_size
-                )
-                decoder_output = self.joint.project_prednet(decoder_output)  # do not recalculate joint projection
+
+                decoder_output2 = self.joint.project_prednet(decoder_output2)  # do not recalculate joint projection
+                decoder_output[~blank_mask,:,:] = decoder_output2
+
+                state[0][:,~blank_mask,:] = state2[0]
+                state[1][:,~blank_mask,:] = state2[1]
 
             
         return batched_hyps, None, last_decoder_state
