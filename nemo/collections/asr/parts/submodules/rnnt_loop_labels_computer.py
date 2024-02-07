@@ -333,7 +333,7 @@ class GreedyBatchedRNNTHainanComputer(ConfidenceMethodMixin):
         )
 
         # initial state, needed for torch.jit to compile (cannot handle None)
-        new_state = self.decoder.initialize_state(x)
+        prev_state = self.decoder.initialize_state(x)
         # indices of elements in batch (constant)
         batch_indices = torch.arange(batch_size, dtype=torch.long, device=device)
         # last found labels - initially <SOS> (<blank>) symbol
@@ -363,9 +363,6 @@ class GreedyBatchedRNNTHainanComputer(ConfidenceMethodMixin):
         while active_mask.any():
             active_mask_prev.copy_(active_mask, non_blocking=True)
             # stage 1: get decoder (prediction network) output
-
-
-            decoder_output = self.joint.project_prednet(decoder_output)  # do not recalculate joint projection
 
             # stage 2: get joint output, iteratively seeking for non-blank labels
             # blank label in `labels` tensor means "end of hypothesis" (for this index)
@@ -427,28 +424,28 @@ class GreedyBatchedRNNTHainanComputer(ConfidenceMethodMixin):
                 # same as: active_mask = time_indices < out_len
                 torch.less(time_indices, out_len, out=active_mask)
 
-
-#            labels = new_labels
             labels = new_labels * ~blank_mask + labels * blank_mask
-#            if not blank_mask.all():
 
+            # now the goal is 'state' should reflect tokens in labels. Problem is
+            # currently, state reflects tokens before this emission. that is,
+            # if an utterance emits blank, then the content in 'state' already reflect labels and need no change;
+            # otherwise state is old and needs updates.
 
-            self.decoder.batch_replace_states_mask(
-                src_states=state, dst_states=new_state, mask=~blank_mask,
-            )
+            # if we run decoder.predict again, it will double count those utterance that emit blanks. So the solution is,
 
-            decoder_output, state, *_ = self.decoder.predict(
-                labels.unsqueeze(1), new_state, add_sos=False, batch_size=batch_size
-            )
+            if not blank_mask.all():
+                # prev_state = state, for uttenraces that emit non-blank, does not reflect new_label; by later running predict it reflect new label
+                #            = prev_state, for utterances that emit blank, also doeesn't reflect new_label
+                # for those utterances that emit actual label (non-blank), replace 'prev_state' with content in 'state'
+                # otherwise remains the same
+                self.decoder.batch_replace_states_mask(
+                    src_states=state, dst_states=prev_state, mask=~blank_mask,
+                )
 
-#                print("state is", state)
-#                print("blank_mask is", blank_mask)
-#                states_needed_to_update = self.decoder.mask_select_states(state, ~blank_mask)
-#                print("states_needed_to_update is", states_needed_to_update)
-
-#            decoder_output, states_neede_to_update, *_ = self.decoder.predict(
-#                labels.unsqueeze(1), states_needed_to_update, add_sos=False, batch_size=batch_size
-#            )
+                decoder_output, state, *_ = self.decoder.predict(
+                    labels.unsqueeze(1), prev_state, add_sos=False, batch_size=batch_size
+                )
+                decoder_output = self.joint.project_prednet(decoder_output)  # do not recalculate joint projection
 
             
         return batched_hyps, None, last_decoder_state
