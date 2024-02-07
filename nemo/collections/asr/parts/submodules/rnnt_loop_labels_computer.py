@@ -371,11 +371,11 @@ class GreedyBatchedRNNTHainanComputer(ConfidenceMethodMixin):
                 .squeeze(1)
                 .squeeze(1)
             )
-            scores, new_labels = logits.max(-1)
+            scores, labels = logits.max(-1)
 
             # search for non-blank labels using joint, advancing time indices for blank labels
             # checking max_symbols is not needed, since we already forced advancing time indices for such cases
-            blank_mask = new_labels == self._blank_index
+            blank_mask = labels == self._blank_index
             time_indices_current_labels.copy_(time_indices, non_blocking=True)
 
             # advance_mask is a mask for current batch for searching non-blank labels;
@@ -397,12 +397,12 @@ class GreedyBatchedRNNTHainanComputer(ConfidenceMethodMixin):
             if self.max_symbols is not None:
                 # pre-allocated memory, no need for checks
                 batched_hyps.add_results_raw_no_checks_(
-                    active_mask, blank_mask, advance_mask, new_labels, time_indices_current_labels, scores,
+                    active_mask, blank_mask, advance_mask, labels, time_indices_current_labels, scores,
                 )
             else:
                 # auto-adjusted storage
                 batched_hyps.add_results_raw_(
-                    active_mask, blank_mask, advance_mask, new_labels, time_indices_current_labels, scores,
+                    active_mask, blank_mask, advance_mask, labels, time_indices_current_labels, scores,
                 )
 
             # stage 4: to avoid looping, go to next frame after max_symbols emission
@@ -413,7 +413,7 @@ class GreedyBatchedRNNTHainanComputer(ConfidenceMethodMixin):
                     active_mask,
                     torch.logical_and(
                         torch.logical_and(
-                            new_labels != self._blank_index, batched_hyps.last_timestep_lasts >= self.max_symbols,
+                            labels != self._blank_index, batched_hyps.last_timestep_lasts >= self.max_symbols,
                         ),
                         batched_hyps.last_timestep == time_indices,
                     ),
@@ -424,35 +424,11 @@ class GreedyBatchedRNNTHainanComputer(ConfidenceMethodMixin):
                 # same as: active_mask = time_indices < out_len
                 torch.less(time_indices, out_len, out=active_mask)
 
-            labels = new_labels * ~blank_mask + labels * blank_mask
-
-            # now the goal is 'state' should reflect tokens in labels. Problem is
-            # currently, state reflects tokens before this emission. that is,
-            # if an utterance emits blank, then the content in 'state' already reflect labels and need no change;
-            # otherwise state is old and needs updates.
-
-            # if we run decoder.predict again, it will double count those utterance that emit blanks. So the solution is,
-
-#            if not blank_mask.all():
-#                idx = torch.nonzero(~blank_mask).reshape([-1])
-#                state2 = self.decoder.mask_select_states(state, mask=~blank_mask)  # states w.r.t non-blank emissions. need to update them
-#                decoder_output2, state2, *_ = self.decoder.predict(
-#                    labels[~blank_mask].unsqueeze(1), state2, add_sos=False, batch_size=batch_size
-#                )
-#
-#
-#                decoder_output2 = self.joint.project_prednet(decoder_output2)  # do not recalculate joint projection
-#                decoder_output[idx,:,:] = decoder_output2
-#
-#                state[0][:,idx,:] = state2[0]
-#                state[1][:,idx,:] = state2[1]
-
             if not blank_mask.all():
                 state2 = self.decoder.mask_select_states(state, mask=~blank_mask)  # states w.r.t non-blank emissions. need to update them
                 decoder_output2, state2, *_ = self.decoder.predict(
                     labels[~blank_mask].unsqueeze(1), state2, add_sos=False, batch_size=batch_size
                 )
-
 
                 decoder_output2 = self.joint.project_prednet(decoder_output2)  # do not recalculate joint projection
                 decoder_output[~blank_mask,:,:] = decoder_output2
