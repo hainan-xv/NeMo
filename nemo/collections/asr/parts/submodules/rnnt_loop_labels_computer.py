@@ -333,7 +333,7 @@ class GreedyBatchedRNNTHainanComputer(ConfidenceMethodMixin):
         )
 
         # initial state, needed for torch.jit to compile (cannot handle None)
-        state = self.decoder.initialize_state(x)
+        new_state = self.decoder.initialize_state(x)
         # indices of elements in batch (constant)
         batch_indices = torch.arange(batch_size, dtype=torch.long, device=device)
         # last found labels - initially <SOS> (<blank>) symbol
@@ -355,7 +355,7 @@ class GreedyBatchedRNNTHainanComputer(ConfidenceMethodMixin):
 
         # loop while there are active utterances
 
-        decoder_output, new_state, *_ = self.decoder.predict(
+        decoder_output, state, *_ = self.decoder.predict(
             labels.unsqueeze(1), None, add_sos=False, batch_size=batch_size
         )
         decoder_output = self.joint.project_prednet(decoder_output)  # do not recalculate joint projection
@@ -393,7 +393,7 @@ class GreedyBatchedRNNTHainanComputer(ConfidenceMethodMixin):
             # this seems to be redundant, but used in the `loop_frames` output
             torch.ne(active_mask, active_mask_prev, out=became_inactive_mask)
             self.decoder.batch_replace_states_mask(
-                src_states=new_state, dst_states=last_decoder_state, mask=became_inactive_mask,
+                src_states=state, dst_states=last_decoder_state, mask=became_inactive_mask,
             )
 
             # store hypotheses
@@ -434,11 +434,11 @@ class GreedyBatchedRNNTHainanComputer(ConfidenceMethodMixin):
 
 
             self.decoder.batch_replace_states_mask(
-                src_states=new_state, dst_states=state, mask=~blank_mask,
+                src_states=state, dst_states=new_state, mask=~blank_mask,
             )
 
-            decoder_output, new_state, *_ = self.decoder.predict(
-                labels.unsqueeze(1), state, add_sos=False, batch_size=batch_size
+            decoder_output, state, *_ = self.decoder.predict(
+                labels.unsqueeze(1), new_state, add_sos=False, batch_size=batch_size
             )
 
 #                print("state is", state)
