@@ -17,6 +17,7 @@ import json
 import os
 from dataclasses import dataclass, is_dataclass
 from typing import List, Optional, Union
+from dataclasses import field
 
 import pytorch_lightning as pl
 import torch
@@ -63,11 +64,11 @@ python translate_speech.py \
 """
 
 
-#@dataclass
-#class ModelChangeConfig:
-#
-#    # Sub-config for changes specific to the Conformer Encoder
-#    conformer: ConformerChangeConfig = ConformerChangeConfig()
+@dataclass
+class ModelChangeConfig:
+
+    # Sub-config for changes specific to the Conformer Encoder
+    conformer: ConformerChangeConfig = field(default_factory=lambda: ConformerChangeConfig())
 
 
 @dataclass
