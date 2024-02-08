@@ -209,18 +209,19 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             }
         )
 
-    @property
-    def output_types(self):
-        """Returns definitions of module output ports."""
-        return OrderedDict(
-            {
-                "outputs": NeuralType(('B', 'D', 'T'), AcousticEncodedRepresentation()),
-                "encoded_lengths": NeuralType(tuple('B'), LengthsType()),
-                "cache_last_channel_next": NeuralType(('D', 'B', 'T', 'D'), ChannelType(), optional=True),
-                "cache_last_time_next": NeuralType(('D', 'B', 'D', 'T'), ChannelType(), optional=True),
-                "cache_last_channel_next_len": NeuralType(tuple('B'), LengthsType(), optional=True),
-            }
-        )
+#    @property
+#    def output_types(self):
+#        """Returns definitions of module output ports."""
+#        return OrderedDict(
+#            {
+#                "outputs": NeuralType(('B', 'D', 'T'), AcousticEncodedRepresentation()),
+#                "encoded_lengths": NeuralType(tuple('B'), LengthsType()),
+#                "outputs": NeuralType(('B', 'D', 'T'), AcousticEncodedRepresentation()),
+#                "cache_last_channel_next": NeuralType(('D', 'B', 'T', 'D'), ChannelType(), optional=True),
+#                "cache_last_time_next": NeuralType(('D', 'B', 'D', 'T'), ChannelType(), optional=True),
+#                "cache_last_channel_next_len": NeuralType(tuple('B'), LengthsType(), optional=True),
+#            }
+#        )
 
     @property
     def output_types_for_export(self):
@@ -253,6 +254,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         self,
         feat_in,
         n_layers,
+        middle_output_layer,
         d_model,
         feat_out=-1,
         causal_downsampling=False,
@@ -290,6 +292,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         d_ff = d_model * ff_expansion_factor
         self.d_model = d_model
         self.n_layers = n_layers
+        self.middle_output_layer = middle_output_layer
         self._feat_in = feat_in
         self.att_context_style = att_context_style
         self.subsampling_factor = subsampling_factor
@@ -609,6 +612,9 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                     device=audio_signal.device,
                 )
 
+            if lth == self.middle_output_layer:
+                another_return = audio_signal
+
             # saving tensors if required for interctc loss
             if self.is_access_enabled():
                 if self.interctc_capture_at_layers is None:
@@ -631,6 +637,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             audio_signal, length = self.reduction_subsampling(x=audio_signal, lengths=length)
 
         audio_signal = torch.transpose(audio_signal, 1, 2)
+        another_return = torch.transpose(another_return, 1, 2)
         length = length.to(dtype=torch.int64)
 
         if cache_last_channel is not None:
@@ -639,12 +646,13 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             return (
                 audio_signal,
                 length,
+                another_return,
                 cache_last_channel_next,
                 cache_last_time_next,
                 torch.clamp(cache_last_channel_len + cache_keep_size, max=cache_len),
             )
         else:
-            return audio_signal, length
+            return audio_signal, length, another_return
 
     def update_max_seq_length(self, seq_length: int, device):
         # Find global max audio length across all nodes
