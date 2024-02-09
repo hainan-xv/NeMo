@@ -852,6 +852,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel):
 
             # Add auxiliary losses, if registered
             loss_value = self.add_auxiliary_losses(loss_value)
+            inter_loss_value = self.add_auxiliary_losses(inter_loss_value)
 
             # Reset access registry
             if AccessMixin.is_access_enabled():
@@ -859,12 +860,14 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel):
 
             tensorboard_logs = {
                 'train_loss': loss_value,
+                'inter_train_loss': inter_loss_value,
                 'learning_rate': self._optimizer.param_groups[0]['lr'],
                 'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
             }
 
             if compute_wer:
                 tensorboard_logs.update({'training_batch_wer': wer})
+                tensorboard_logs.update({'inter_training_batch_wer': inter_wer})
 
         # Log items
         self.log_dict(tensorboard_logs)
@@ -935,9 +938,12 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel):
 
             if self.compute_eval_loss:
                 decoded, target_len, states = self.decoder(targets=transcript, target_length=transcript_len)
+                inter_decoded, inter_target_len, inter_states = self.inter_decoder(targets=transcript, target_length=transcript_len)
             else:
                 decoded = None
+                inter_decoded = None
                 target_len = transcript_len
+                inter_target_len = transcript_len
 
             # Fused joint step
             loss_value, wer, wer_num, wer_denom = self.joint(
@@ -949,12 +955,27 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel):
                 compute_wer=compute_wer,
             )
 
+            # Fused joint step
+            inter_loss_value, inter_wer, inter_wer_num, inter_wer_denom = self.inter_joint(
+                encoder_outputs=inter_encoded,
+                decoder_outputs=decoded,
+                encoder_lengths=encoded_len,
+                transcripts=transcript,
+                transcript_lengths=target_len,
+                compute_wer=compute_wer,
+            )
+
             if loss_value is not None:
                 tensorboard_logs['val_loss'] = loss_value
+                tensorboard_logs['inter_val_loss'] = inter_loss_value
 
             tensorboard_logs['val_wer_num'] = wer_num
             tensorboard_logs['val_wer_denom'] = wer_denom
             tensorboard_logs['val_wer'] = wer
+
+            tensorboard_logs['inter_val_wer_num'] = inter_wer_num
+            tensorboard_logs['inter_val_wer_denom'] = inter_wer_denom
+            tensorboard_logs['inter_val_wer'] = inter_wer
 
         self.log('global_step', torch.tensor(self.trainer.global_step, dtype=torch.float32))
 
