@@ -93,7 +93,7 @@ class AudioText(_Collection):
 
     OUTPUT_TYPE = collections.namedtuple(
         typename='AudioTextEntity',
-        field_names='id audio_file duration text_tokens offset text_raw speaker orig_sr lang',
+        field_names='id audio_file duration text_tokens translated_text_tokens offset text_raw translated_text_raw speaker orig_sr lang',
     )
 
     def __init__(
@@ -102,6 +102,7 @@ class AudioText(_Collection):
         audio_files: List[str],
         durations: List[float],
         texts: List[str],
+        translated_texts: List[str],
         offsets: List[str],
         speakers: List[Optional[int]],
         orig_sampling_rates: List[Optional[int]],
@@ -138,8 +139,8 @@ class AudioText(_Collection):
         if index_by_file_id:
             self.mapping = {}
 
-        for id_, audio_file, duration, offset, text, speaker, orig_sr, token_labels, lang in zip(
-            ids, audio_files, durations, offsets, texts, speakers, orig_sampling_rates, token_labels, langs
+        for id_, audio_file, duration, offset, text, translated_text, speaker, orig_sr, token_labels, lang in zip(
+            ids, audio_files, durations, offsets, texts, translated_texts, speakers, orig_sampling_rates, token_labels, langs
         ):
             # Duration filters.
             if min_duration is not None and duration < min_duration:
@@ -169,6 +170,21 @@ class AudioText(_Collection):
                 else:
                     text_tokens = []
 
+                if translated_text != '':
+                    if hasattr(parser, "is_aggregate") and parser.is_aggregate and isinstance(translated_text, str):
+                        if lang is not None:
+                            text_tokens = parser(translated_text, lang)
+                        # for future use if want to add language bypass to audio_to_text classes
+                        # elif hasattr(parser, "lang") and parser.lang is not None:
+                        #    text_tokens = parser(text, parser.lang)
+                        else:
+                            raise ValueError("lang required in manifest when using aggregate tokenizers")
+                    else:
+                        translated_text_tokens = parser(translated_text)
+                else:
+                    translated_text_tokens = []
+
+
                 if text_tokens is None:
                     duration_filtered += duration
                     num_filtered += 1
@@ -176,7 +192,7 @@ class AudioText(_Collection):
 
             total_duration += duration
 
-            data.append(output_type(id_, audio_file, duration, text_tokens, offset, text, speaker, orig_sr, lang))
+            data.append(output_type(id_, audio_file, duration, text_tokens, translated_text_tokens, offset, text, translated_text, speaker, orig_sr, lang))
             if index_by_file_id:
                 file_id, _ = os.path.splitext(os.path.basename(audio_file))
                 if file_id not in self.mapping:
@@ -320,7 +336,8 @@ class ASRAudioText(AudioText):
             **kwargs: Kwargs to pass to `AudioText` constructor.
         """
 
-        ids, audio_files, durations, texts, offsets, = (
+        ids, audio_files, durations, texts, translated_texts, offsets, = (
+            [],
             [],
             [],
             [],
@@ -328,18 +345,22 @@ class ASRAudioText(AudioText):
             [],
         )
         speakers, orig_srs, token_labels, langs = [], [], [], []
+
+        print('manifests_files is', manifests_files)
+
         for item in manifest.item_iter(manifests_files):
             ids.append(item['id'])
             audio_files.append(item['audio_file'])
             durations.append(item['duration'])
             texts.append(item['text'])
+            translated_texts.append(item['translated_text'])
             offsets.append(item['offset'])
             speakers.append(item['speaker'])
             orig_srs.append(item['orig_sr'])
             token_labels.append(item['token_labels'])
             langs.append(item['lang'])
         super().__init__(
-            ids, audio_files, durations, texts, offsets, speakers, orig_srs, token_labels, langs, *args, **kwargs
+            ids, audio_files, durations, texts, translated_texts, offsets, speakers, orig_srs, token_labels, langs, *args, **kwargs
         )
 
 

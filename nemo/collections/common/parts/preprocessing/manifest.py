@@ -160,6 +160,7 @@ def __parse_item(line: str, manifest_file: str) -> Dict[str, Any]:
         video_file=item.get('video_file', None),
         duration=item['duration'],
         text=item['text'],
+        translated_text=item['translated_text'],
         rttm_file=item['rttm_file'],
         feature_file=item['feature_file'],
         offset=item.get('offset', None),
