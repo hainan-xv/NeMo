@@ -326,10 +326,25 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
             dist_sync_on_step=True,
         )
 
+        self.inter_decoding = RNNTBPEDecoding(
+            decoding_cfg=self.cfg.decoding, decoder=self.inter_decoder, joint=self.inter_joint, tokenizer=self.tokenizer,
+        )
+
+        # Setup wer object
+        self.inter_wer = WER(
+            decoding=self.inter_decoding,
+            batch_dim_index=0,
+            use_cer=self._cfg.get('use_cer', False),
+            log_prediction=self._cfg.get('log_prediction', True),
+            dist_sync_on_step=True,
+        )
+
         # Setup fused Joint step if flag is set
         if self.joint.fuse_loss_wer:
             self.joint.set_loss(self.loss)
             self.joint.set_wer(self.wer)
+            self.inter_joint.set_loss(self.inter_loss)
+            self.inter_joint.set_wer(self.inter_wer)
 
     def change_vocabulary(
         self,
@@ -392,14 +407,23 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
         del self.joint
         self.joint = EncDecRNNTBPEModel.from_config_dict(new_joint_config)
 
+        del self.inter_joint
+        self.inter_joint = EncDecRNNTBPEModel.from_config_dict(new_joint_config)
+
         decoder_config = self.decoder.to_config_dict()
         new_decoder_config = copy.deepcopy(decoder_config)
         new_decoder_config.vocab_size = len(vocabulary)
         del self.decoder
         self.decoder = EncDecRNNTBPEModel.from_config_dict(new_decoder_config)
 
+        del self.inter_decoder
+        self.inter_decoder = EncDecRNNTBPEModel.from_config_dict(new_decoder_config)
+
         del self.loss
         self.loss = RNNTLoss(num_classes=self.joint.num_classes_with_blank - 1)
+
+        del self.inter_loss
+        self.inter_loss = RNNTLoss(num_classes=self.joint.num_classes_with_blank - 1)
 
         if decoding_cfg is None:
             # Assume same decoding config as before
@@ -422,12 +446,26 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
             dist_sync_on_step=True,
         )
 
+        self.inter_decoding = RNNTBPEDecoding(
+            decoding_cfg=decoding_cfg, decoder=self.inter_decoder, joint=self.inter_joint, tokenizer=self.tokenizer,
+        )
+
+        self.inter_wer = WER(
+            decoding=self.inter_decoding,
+            batch_dim_index=self.inter_wer.batch_dim_index,
+            use_cer=self.inter_wer.use_cer,
+            log_prediction=self.inter_wer.log_prediction,
+            dist_sync_on_step=True,
+        )
+
         # Setup fused Joint step
         if self.joint.fuse_loss_wer or (
             self.decoding.joint_fused_batch_size is not None and self.decoding.joint_fused_batch_size > 0
         ):
             self.joint.set_loss(self.loss)
             self.joint.set_wer(self.wer)
+            self.inter_joint.set_loss(self.inter_loss)
+            self.inter_joint.set_wer(self.inter_wer)
 
         # Update config
         with open_dict(self.cfg.joint):
@@ -478,14 +516,29 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
             dist_sync_on_step=True,
         )
 
+        self.inter_decoding = RNNTBPEDecoding(
+            decoding_cfg=decoding_cfg, decoder=self.inter_decoder, joint=self.inter_joint, tokenizer=self.tokenizer,
+        )
+
+        self.inter_wer = WER(
+            decoding=self.inter_decoding,
+            batch_dim_index=self.inter_wer.batch_dim_index,
+            use_cer=self.inter_wer.use_cer,
+            log_prediction=self.inter_wer.log_prediction,
+            dist_sync_on_step=True,
+        )
+
         # Setup fused Joint step
         if self.joint.fuse_loss_wer or (
             self.decoding.joint_fused_batch_size is not None and self.decoding.joint_fused_batch_size > 0
         ):
             self.joint.set_loss(self.loss)
             self.joint.set_wer(self.wer)
+            self.inter_joint.set_loss(self.inter_loss)
+            self.inter_joint.set_wer(self.inter_wer)
 
         self.joint.temperature = decoding_cfg.get('temperature', 1.0)
+        self.inter_joint.temperature = decoding_cfg.get('temperature', 1.0)
 
         # Update config
         with open_dict(self.cfg.decoding):

@@ -109,8 +109,9 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel):
             decoding_cfg=self.cfg.decoding, decoder=self.decoder, joint=self.joint, vocabulary=self.joint.vocabulary,
         )
         self.inter_decoding = RNNTDecoding(
-            decoding_cfg=self.cfg.decoding, decoder=self.inter_decoder, joint=self.inter_joint, vocabulary=self.joint.vocabulary,
+            decoding_cfg=self.cfg.decoding, decoder=self.inter_decoder, joint=self.inter_joint, vocabulary=self.inter_joint.vocabulary,
         )
+
         # Setup WER calculation
         self.wer = WER(
             decoding=self.decoding,
@@ -300,6 +301,8 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel):
             self.encoder.freeze()
             self.decoder.freeze()
             self.joint.freeze()
+            self.inter_decoder.freeze()
+            self.inter_joint.freeze()
             logging_level = logging.get_verbosity()
             logging.set_verbosity(logging.WARNING)
             # Work in tmp directory - will store manifest file there
@@ -351,6 +354,8 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel):
                 self.encoder.unfreeze()
                 self.decoder.unfreeze()
                 self.joint.unfreeze()
+                self.inter_decoder.unfreeze()
+                self.inter_joint.unfreeze()
         return hypotheses, all_hypotheses
 
     def change_vocabulary(self, new_vocabulary: List[str], decoding_cfg: Optional[DictConfig] = None):
@@ -506,6 +511,18 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel):
             dist_sync_on_step=True,
         )
 
+        self.inter_decoding = RNNTDecoding(
+            decoding_cfg=decoding_cfg, decoder=self.inter_decoder, joint=self.inter_joint, vocabulary=self.inter_joint.vocabulary,
+        )
+
+        self.inter_wer = WER(
+            decoding=self.inter_decoding,
+            batch_dim_index=self.wer.batch_dim_index,
+            use_cer=self.wer.use_cer,
+            log_prediction=self.wer.log_prediction,
+            dist_sync_on_step=True,
+        )
+
         # Setup fused Joint step
         if self.joint.fuse_loss_wer or (
             self.decoding.joint_fused_batch_size is not None and self.decoding.joint_fused_batch_size > 0
@@ -513,7 +530,11 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel):
             self.joint.set_loss(self.loss)
             self.joint.set_wer(self.wer)
 
+            self.inter_joint.set_loss(self.inter_loss)
+            self.inter_joint.set_wer(self.inter_wer)
+
         self.joint.temperature = decoding_cfg.get('temperature', 1.0)
+        self.inter_joint.temperature = decoding_cfg.get('temperature', 1.0)
 
         # Update config
         with open_dict(self.cfg.decoding):
