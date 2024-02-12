@@ -25,7 +25,7 @@ from datasets import load_dataset
 
 from nemo.collections.common.tokenizers.tokenizer_spec import TokenizerSpec
 from nemo.collections.nlp.data.language_modeling.megatron.dataset_utils import get_samples_mapping
-from nemo.collections.nlp.data.language_modeling.text_memmap_dataset import JSONLMemMapDataset
+from nemo.collections.nlp.data.language_modeling.text_memmap_dataset import JSONLMemMapDataset, OnlineSampleMapping
 from nemo.core.classes import Dataset
 from nemo.utils import logging
 
@@ -39,6 +39,7 @@ class GPTSFTDataset(Dataset):
         tokenizer: TokenizerSpec,
         max_seq_length: int = 1024,
         min_seq_length: int = 1,
+        pad_seq_length_to_mult: int = 16,
         add_bos: bool = False,
         add_eos: bool = True,
         add_sep: bool = False,
@@ -88,6 +89,7 @@ class GPTSFTDataset(Dataset):
         self.file_path = file_path
         self.max_seq_length = max_seq_length
         self.min_seq_length = min_seq_length
+        self.pad_seq_length_to_mult = pad_seq_length_to_mult
         self.add_bos = add_bos
         self.add_eos = add_eos
         self.add_sep = add_sep
@@ -158,6 +160,7 @@ class GPTSFTDataset(Dataset):
 
     def _build_samples_mapping(self):
         if self.max_num_samples is not None:
+            osm = OnlineSampleMapping(dataset_size=len(self.indexed_dataset), num_samples=self.max_num_samples)
             self.samples_mapping = get_samples_mapping(
                 indexed_dataset=self.indexed_dataset,
                 data_prefix=self.file_path,
@@ -169,6 +172,7 @@ class GPTSFTDataset(Dataset):
                 name=self.file_path.split('/')[-1],
                 binary_head=False,
                 index_mapping_dir=self.index_mapping_dir,
+                samples_mapping=osm,
             )
         else:
             self.samples_mapping = None
@@ -440,7 +444,7 @@ class GPTSFTDataset(Dataset):
         if self.pad_to_max_length:
             max_length = self.max_seq_length
         else:
-            max_length = min(self.max_seq_length, self._ceil_to_nearest(max_length, 16))
+            max_length = min(self.max_seq_length, self._ceil_to_nearest(max_length, self.pad_seq_length_to_mult))
         assert max_length <= self.max_seq_length
 
         attention_mask = [self._create_attention_mask(max_length) for _ in batch]
@@ -534,7 +538,7 @@ class GPTSFTPackedDataset(GPTSFTDataset):
             # for many datasets in practice, all packed sequence lengths are very close to the
             # target length (2048, 4096, 8192), so there is very minimal padding
             max_length = max(len(l) for l in input_ids)
-            max_length = min(self.max_seq_length, self._ceil_to_nearest(max_length, 16))
+            max_length = min(self.max_seq_length, self._ceil_to_nearest(max_length, self.pad_seq_length_to_mult))
         assert max_length <= self.max_seq_length
 
         position_ids: List[List[int]] = []

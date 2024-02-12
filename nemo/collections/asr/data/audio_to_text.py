@@ -74,8 +74,6 @@ def _speech_collate_fn(batch, pad_id):
     max_tokens_len = max(tokens_lengths).item()
     max_tokens_len2 = max(tokens_lengths2).item()
 
-    print("tokens_lengths2", tokens_lengths2)
-    print("max_tokens_len2", max_tokens_len2)
     audio_signal, tokens, tokens2 = [], [], []
     for b in batch:
         if len(b) == 5:
@@ -100,7 +98,6 @@ def _speech_collate_fn(batch, pad_id):
             pad = (0, max_tokens_len2 - tokens_j_len)
             tokens_j = torch.nn.functional.pad(tokens_j, pad, value=pad_id)
 
-        print('adding tokens_j', tokens_j.shape)
         tokens2.append(tokens_j)
 
     if has_audio:
@@ -111,7 +108,6 @@ def _speech_collate_fn(batch, pad_id):
     tokens = torch.stack(tokens)
     tokens_lengths = torch.stack(tokens_lengths)
     tokens2 = torch.stack(tokens2)
-    print('tokens2 is', tokens2)
     tokens_lengths2 = torch.stack(tokens_lengths2)
     if sample_ids is None:
         return audio_signal, audio_lengths, tokens, tokens_lengths, tokens2, tokens_lengths2
@@ -1011,8 +1007,9 @@ class _TarredAudioToTextDataset(IterableDataset):
             t = [self.bos_id] + t
             tl += 1
 
-            t2 = [self.bos_id] + t
+            t2 = [self.bos_id] + t2
             tl2 += 1
+
         if self.eos_id is not None:
             t = t + [self.eos_id]
             tl += 1

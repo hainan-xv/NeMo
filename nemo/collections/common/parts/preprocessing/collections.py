@@ -173,7 +173,7 @@ class AudioText(_Collection):
                 if translated_text != '':
                     if hasattr(parser, "is_aggregate") and parser.is_aggregate and isinstance(translated_text, str):
                         if lang is not None:
-                            text_tokens = parser(translated_text, lang)
+                            translated_text_tokens = parser(translated_text, lang)
                         # for future use if want to add language bypass to audio_to_text classes
                         # elif hasattr(parser, "lang") and parser.lang is not None:
                         #    text_tokens = parser(text, parser.lang)
