@@ -68,6 +68,7 @@ def item_iter(
         manifests_files = [manifests_files]
 
     if parse_func is None:
+        print("default parse_func")
         parse_func = __parse_item
 
     k = -1
@@ -130,6 +131,8 @@ def __parse_item(line: str, manifest_file: str) -> Dict[str, Any]:
         item['text'] = item['normalized_text']
     else:
         item['text'] = ""
+
+    assert('translated_text' in item)
 
     # Optional RTTM file
     if 'rttm_file' in item:
