@@ -997,19 +997,27 @@ class _TarredAudioToTextDataset(IterableDataset):
         # Text features
         t, tl = manifest_entry.text_tokens, len(manifest_entry.text_tokens)
 
+        t2, tl2 = manifest_entry.translated_text_tokens, len(manifest_entry.translated_text_tokens)
+
         self.manifest_processor.process_text_by_sample(sample=manifest_entry)
+        self.manifest_processor.process_translated_text_by_sample(sample=manifest_entry)
 
         if self.bos_id is not None:
             t = [self.bos_id] + t
             tl += 1
+
+            t2 = [self.bos_id] + t
+            tl2 += 1
         if self.eos_id is not None:
             t = t + [self.eos_id]
             tl += 1
+            t2 = t2 + [self.eos_id]
+            tl2 += 1
 
         if self.return_sample_id:
-            return f, fl, torch.tensor(t).long(), torch.tensor(tl).long(), manifest_idx
+            return f, fl, torch.tensor(t).long(), torch.tensor(tl).long(), torch.tensor(t2).long(), torch.tensor(tl2).long(), manifest_idx
         else:
-            return f, fl, torch.tensor(t).long(), torch.tensor(tl).long()
+            return f, fl, torch.tensor(t).long(), torch.tensor(tl).long(), torch.tensor(t2).long(), torch.tensor(tl2).long()
 
     def get_manifest_sample(self, sample_id):
         return self.manifest_processor.collection[sample_id]
