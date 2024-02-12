@@ -327,7 +327,10 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
         )
 
         self.inter_decoding = RNNTBPEDecoding(
-            decoding_cfg=self.cfg.decoding, decoder=self.inter_decoder, joint=self.inter_joint, tokenizer=self.tokenizer,
+            decoding_cfg=self.cfg.decoding,
+            decoder=self.inter_decoder,
+            joint=self.inter_joint,
+            tokenizer=self.tokenizer,
         )
 
         # Setup wer object

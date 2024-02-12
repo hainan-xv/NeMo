@@ -196,7 +196,6 @@ class ASRManifestProcessor:
         return t, tl
 
 
-
 def expand_sharded_filepaths(sharded_filepaths, shard_strategy: str, world_size: int, global_rank: int):
     valid_shard_strategies = ['scatter', 'replicate']
     if shard_strategy not in valid_shard_strategies:
@@ -515,9 +514,24 @@ class _AudioTextDataset(Dataset):
         t2, tl2 = self.manifest_processor.process_translated_text_by_sample(sample=sample)
 
         if self.return_sample_id:
-            output = f, fl, torch.tensor(t).long(), torch.tensor(tl).long(), torch.tensor(t2).long(), torch.tensor(tl2).long(), index
+            output = (
+                f,
+                fl,
+                torch.tensor(t).long(),
+                torch.tensor(tl).long(),
+                torch.tensor(t2).long(),
+                torch.tensor(tl2).long(),
+                index,
+            )
         else:
-            output = f, fl, torch.tensor(t).long(), torch.tensor(tl).long(), torch.tensor(t2).long(), torch.tensor(tl2).long()
+            output = (
+                f,
+                fl,
+                torch.tensor(t).long(),
+                torch.tensor(tl).long(),
+                torch.tensor(t2).long(),
+                torch.tensor(tl2).long(),
+            )
 
         return output
 
@@ -1017,9 +1031,24 @@ class _TarredAudioToTextDataset(IterableDataset):
             tl2 += 1
 
         if self.return_sample_id:
-            return f, fl, torch.tensor(t).long(), torch.tensor(tl).long(), torch.tensor(t2).long(), torch.tensor(tl2).long(), manifest_idx
+            return (
+                f,
+                fl,
+                torch.tensor(t).long(),
+                torch.tensor(tl).long(),
+                torch.tensor(t2).long(),
+                torch.tensor(tl2).long(),
+                manifest_idx,
+            )
         else:
-            return f, fl, torch.tensor(t).long(), torch.tensor(tl).long(), torch.tensor(t2).long(), torch.tensor(tl2).long()
+            return (
+                f,
+                fl,
+                torch.tensor(t).long(),
+                torch.tensor(tl).long(),
+                torch.tensor(t2).long(),
+                torch.tensor(tl2).long(),
+            )
 
     def get_manifest_sample(self, sample_id):
         return self.manifest_processor.collection[sample_id]

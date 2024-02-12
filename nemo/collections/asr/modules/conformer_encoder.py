@@ -209,19 +209,19 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             }
         )
 
-#    @property
-#    def output_types(self):
-#        """Returns definitions of module output ports."""
-#        return OrderedDict(
-#            {
-#                "outputs": NeuralType(('B', 'D', 'T'), AcousticEncodedRepresentation()),
-#                "encoded_lengths": NeuralType(tuple('B'), LengthsType()),
-#                "outputs": NeuralType(('B', 'D', 'T'), AcousticEncodedRepresentation()),
-#                "cache_last_channel_next": NeuralType(('D', 'B', 'T', 'D'), ChannelType(), optional=True),
-#                "cache_last_time_next": NeuralType(('D', 'B', 'D', 'T'), ChannelType(), optional=True),
-#                "cache_last_channel_next_len": NeuralType(tuple('B'), LengthsType(), optional=True),
-#            }
-#        )
+    #    @property
+    #    def output_types(self):
+    #        """Returns definitions of module output ports."""
+    #        return OrderedDict(
+    #            {
+    #                "outputs": NeuralType(('B', 'D', 'T'), AcousticEncodedRepresentation()),
+    #                "encoded_lengths": NeuralType(tuple('B'), LengthsType()),
+    #                "outputs": NeuralType(('B', 'D', 'T'), AcousticEncodedRepresentation()),
+    #                "cache_last_channel_next": NeuralType(('D', 'B', 'T', 'D'), ChannelType(), optional=True),
+    #                "cache_last_time_next": NeuralType(('D', 'B', 'D', 'T'), ChannelType(), optional=True),
+    #                "cache_last_channel_next_len": NeuralType(tuple('B'), LengthsType(), optional=True),
+    #            }
+    #        )
 
     @property
     def output_types_for_export(self):

@@ -17,7 +17,7 @@ import json
 import os
 import tempfile
 from abc import abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from math import ceil, floor
 from typing import Any, Dict, List, Optional, Union
 
@@ -39,7 +39,6 @@ from nemo.core.classes.common import PretrainedModelInfo, typecheck
 from nemo.core.neural_types import *
 from nemo.utils import logging, model_utils
 from nemo.utils.cast_utils import cast_all
-from dataclasses import field
 
 __all__ = ['EncDecClassificationModel', 'EncDecRegressionModel']
 

@@ -140,7 +140,16 @@ class AudioText(_Collection):
             self.mapping = {}
 
         for id_, audio_file, duration, offset, text, translated_text, speaker, orig_sr, token_labels, lang in zip(
-            ids, audio_files, durations, offsets, texts, translated_texts, speakers, orig_sampling_rates, token_labels, langs
+            ids,
+            audio_files,
+            durations,
+            offsets,
+            texts,
+            translated_texts,
+            speakers,
+            orig_sampling_rates,
+            token_labels,
+            langs,
         ):
             # Duration filters.
             if min_duration is not None and duration < min_duration:
@@ -184,7 +193,6 @@ class AudioText(_Collection):
                 else:
                     translated_text_tokens = []
 
-
                 if text_tokens is None:
                     duration_filtered += duration
                     num_filtered += 1
@@ -192,7 +200,21 @@ class AudioText(_Collection):
 
             total_duration += duration
 
-            data.append(output_type(id_, audio_file, duration, text_tokens, translated_text_tokens, offset, text, translated_text, speaker, orig_sr, lang))
+            data.append(
+                output_type(
+                    id_,
+                    audio_file,
+                    duration,
+                    text_tokens,
+                    translated_text_tokens,
+                    offset,
+                    text,
+                    translated_text,
+                    speaker,
+                    orig_sr,
+                    lang,
+                )
+            )
             if index_by_file_id:
                 file_id, _ = os.path.splitext(os.path.basename(audio_file))
                 if file_id not in self.mapping:
@@ -360,7 +382,18 @@ class ASRAudioText(AudioText):
             token_labels.append(item['token_labels'])
             langs.append(item['lang'])
         super().__init__(
-            ids, audio_files, durations, texts, translated_texts, offsets, speakers, orig_srs, token_labels, langs, *args, **kwargs
+            ids,
+            audio_files,
+            durations,
+            texts,
+            translated_texts,
+            offsets,
+            speakers,
+            orig_srs,
+            token_labels,
+            langs,
+            *args,
+            **kwargs,
         )
 
 

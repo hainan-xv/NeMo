@@ -14,7 +14,7 @@
 
 import contextlib
 import os
-from dataclasses import dataclass, is_dataclass
+from dataclasses import dataclass, field, is_dataclass
 from typing import List, Optional, Union
 
 import pytorch_lightning as pl
@@ -37,8 +37,6 @@ from nemo.collections.asr.parts.utils.transcribe_utils import (
 )
 from nemo.core.config import hydra_runner
 from nemo.utils import logging
-from dataclasses import field
-
 
 """
 Transcribe audio file on a single CPU/GPU. Useful for transcription of moderate amounts of audio data.
@@ -107,7 +105,7 @@ python transcribe_speech.py \
 class ModelChangeConfig:
 
     # Sub-config for changes specific to the Conformer Encoder
-#    conformer: ConformerChangeConfig = ConformerChangeConfig()
+    #    conformer: ConformerChangeConfig = ConformerChangeConfig()
     conformer: ConformerChangeConfig = field(default_factory=lambda: ConformerChangeConfig())
 
 
@@ -167,7 +165,7 @@ class TranscriptionConfig:
     att_context_size: Optional[list] = None
 
     # Use this for model-specific changes before transcription
-#    model_change: ModelChangeConfig = field(default_factory=ModelChangeConfig())
+    #    model_change: ModelChangeConfig = field(default_factory=ModelChangeConfig())
     model_change: ModelChangeConfig = field(default_factory=lambda: ModelChangeConfig())
 
     # Config for word / character error rate calculation

@@ -15,9 +15,8 @@
 import contextlib
 import json
 import os
-from dataclasses import dataclass, is_dataclass
+from dataclasses import dataclass, field, is_dataclass
 from typing import List, Optional, Union
-from dataclasses import field
 
 import pytorch_lightning as pl
 import torch
@@ -187,7 +186,7 @@ def main(cfg: TranslationConfig) -> Union[TranslationConfig, List[str]]:
     # translate audio
     with autocast():
         with torch.no_grad():
-#            translations = asr_model.translate(
+            #            translations = asr_model.translate(
             translations = asr_model.transcribe(
                 paths2audio_files=filepaths, batch_size=cfg.batch_size, return_hypotheses=return_hypotheses,
             )
