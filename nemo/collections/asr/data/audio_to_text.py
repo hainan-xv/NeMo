@@ -74,6 +74,7 @@ def _speech_collate_fn(batch, pad_id):
     max_tokens_len = max(tokens_lengths).item()
     max_tokens_len2 = max(tokens_lengths2).item()
 
+    print("tokens_lengths2", tokens_lengths2)
     print("max_tokens_len2", max_tokens_len2)
     audio_signal, tokens, tokens2 = [], [], []
     for b in batch:
