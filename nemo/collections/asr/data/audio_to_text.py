@@ -111,6 +111,7 @@ def _speech_collate_fn(batch, pad_id):
     tokens = torch.stack(tokens)
     tokens_lengths = torch.stack(tokens_lengths)
     tokens2 = torch.stack(tokens2)
+    print('tokens2 is', tokens2)
     tokens_lengths2 = torch.stack(tokens_lengths2)
     if sample_ids is None:
         return audio_signal, audio_lengths, tokens, tokens_lengths, tokens2, tokens_lengths2
