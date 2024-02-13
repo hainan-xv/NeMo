@@ -29,6 +29,7 @@ from nemo.collections.asr.data.audio_to_text_dali import AudioToCharDALIDataset,
 from nemo.collections.asr.data.audio_to_text_lhotse import LhotseSpeechToTextBpeDataset
 from nemo.collections.asr.losses.rnnt import RNNTLoss, resolve_rnnt_default_loss_name
 from nemo.collections.asr.metrics.wer import WER
+from sacrebleu import corpus_bleu
 from nemo.collections.asr.models.asr_model import ASRModel, ExportableEncDecModel
 from nemo.collections.asr.modules.rnnt import RNNTDecoderJoint
 from nemo.collections.asr.parts.mixins import (
@@ -882,7 +883,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         return list(zip(sample_id, best_hyp_text))
 
     def validation_pass(self, batch, batch_idx, dataloader_idx=0):
-        signal, signal_len, transcript, transcript_len, translated_transcript, translated_transcript_len = batch
+        signal, signal_len, translated_transcript, translated_transcript_len, transcript, transcript_len = batch
 
         # forward() only performs encoder forward
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
@@ -925,6 +926,34 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             tensorboard_logs['val_wer_denom'] = wer_denom
             tensorboard_logs['val_wer'] = wer
 
+            if self.compute_eval_loss:
+                inter_decoder, inter_target_length, inter_states = self.inter_decoder(
+                    targets=transcript, target_length=transcript_len
+                )
+                inter_joint = self.inter_joint(encoder_outputs=inter_encoded, decoder_outputs=inter_decoder)
+
+                inter_loss_value = self.inter_loss(
+                    log_probs=inter_joint,
+                    targets=transcript,
+                    input_lengths=encoded_len,
+                    target_lengths=inter_target_length,
+                )
+
+                tensorboard_logs['inter_val_loss'] = inter_loss_value
+
+            self.inter_wer.update(
+                predictions=inter_encoded,
+                predictions_lengths=encoded_len,
+                targets=transcript,
+                targets_lengths=transcript_len,
+            )
+            inter_wer, inter_wer_num, inter_wer_denom = self.inter_wer.compute()
+            self.inter_wer.reset()
+
+            tensorboard_logs['inter_val_wer_num'] = inter_wer_num
+            tensorboard_logs['inter_val_wer_denom'] = inter_wer_denom
+            tensorboard_logs['inter_val_wer'] = inter_wer
+
         else:
             # If experimental fused Joint-Loss-WER is used
             compute_wer = True
@@ -955,7 +984,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             # Fused joint step
             inter_loss_value, inter_wer, inter_wer_num, inter_wer_denom = self.inter_joint(
                 encoder_outputs=inter_encoded,
-                decoder_outputs=decoded,
+                decoder_outputs=inter_decoded,
                 encoder_lengths=encoded_len,
                 transcripts=transcript,
                 transcript_lengths=inter_target_len,
@@ -999,11 +1028,18 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         if self.compute_eval_loss:
             val_loss_mean = torch.stack([x['val_loss'] for x in outputs]).mean()
             val_loss_log = {'val_loss': val_loss_mean}
+
+            inter_val_loss_mean = torch.stack([x['inter_val_loss'] for x in outputs]).mean()
+            inter_val_loss_log = {'inter_val_loss': inter_val_loss_mean}
         else:
             val_loss_log = {}
+            inter_val_loss_log = {}
         wer_num = torch.stack([x['val_wer_num'] for x in outputs]).sum()
         wer_denom = torch.stack([x['val_wer_denom'] for x in outputs]).sum()
-        tensorboard_logs = {**val_loss_log, 'val_wer': wer_num.float() / wer_denom}
+
+        inter_wer_num = torch.stack([x['inter_val_wer_num'] for x in outputs]).sum()
+        inter_wer_denom = torch.stack([x['inter_val_wer_denom'] for x in outputs]).sum()
+        tensorboard_logs = {**val_loss_log, 'val_wer': wer_num.float() / wer_denom, 'inter_val_wer': inter_wer_num.float() / inter_wer_denom}
         return {**val_loss_log, 'log': tensorboard_logs}
 
     def multi_test_epoch_end(self, outputs, dataloader_idx: int = 0):
