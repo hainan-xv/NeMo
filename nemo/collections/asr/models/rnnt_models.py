@@ -1056,8 +1056,8 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
     """ Transcription related methods """
 
     def _transcribe_forward(self, batch: Any, trcfg: TranscribeConfig):
-        encoded, encoded_len = self.forward(input_signal=batch[0], input_signal_length=batch[1])
-        output = dict(encoded=encoded, encoded_len=encoded_len)
+        encoded, encoded_len, inter_encoded = self.forward(input_signal=batch[0], input_signal_length=batch[1])
+        output = dict(encoded=encoded, encoded_len=encoded_len, inter_encoded=inter_encoded)
         return output
 
     def _transcribe_output_processing(
