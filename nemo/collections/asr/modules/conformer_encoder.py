@@ -572,24 +572,14 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                 cache_last_channel_cur = None
                 cache_last_time_cur = None
 
-            if lth == self.middle_output_layer + 1:
-                audio_signal = layer(
-                    x=audio_signal.detach(),
-                    att_mask=att_mask,
-                    pos_emb=pos_emb,
-                    pad_mask=pad_mask,
-                    cache_last_channel=cache_last_channel_cur,
-                    cache_last_time=cache_last_time_cur,
-                )
-            else:
-                audio_signal = layer(
-                    x=audio_signal,
-                    att_mask=att_mask,
-                    pos_emb=pos_emb,
-                    pad_mask=pad_mask,
-                    cache_last_channel=cache_last_channel_cur,
-                    cache_last_time=cache_last_time_cur,
-                )
+            audio_signal = layer(
+                x=audio_signal,
+                att_mask=att_mask,
+                pos_emb=pos_emb,
+                pad_mask=pad_mask,
+                cache_last_channel=cache_last_channel_cur,
+                cache_last_time=cache_last_time_cur,
+            )
 
             if cache_last_channel_cur is not None:
                 (audio_signal, cache_last_channel_cur, cache_last_time_cur) = audio_signal

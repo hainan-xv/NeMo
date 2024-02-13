@@ -157,7 +157,7 @@ class TranscriptionConfig:
     rnnt_decoding: RNNTDecodingConfig = field(default_factory=lambda: RNNTDecodingConfig(fused_batch_size=-1))
 
     # Decoding strategy for AED models
-    multitask_decoding: MultiTaskDecodingConfig = MultiTaskDecodingConfig()
+    multitask_decoding: MultiTaskDecodingConfig = field(default_factory=lambda: MultiTaskDecodingConfig())
 
     # decoder type: ctc or rnnt, can be used to switch between CTC and RNNT decoder for Hybrid RNNT/CTC models
     decoder_type: Optional[str] = None
