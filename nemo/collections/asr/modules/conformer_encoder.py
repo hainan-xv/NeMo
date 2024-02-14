@@ -256,6 +256,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         n_layers,
         middle_output_layer,
         d_model,
+        middle_detach=False,
         feat_out=-1,
         causal_downsampling=False,
         subsampling='striding',
@@ -293,6 +294,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         self.d_model = d_model
         self.n_layers = n_layers
         self.middle_output_layer = middle_output_layer
+        self.middle_detach = middle_detach
         self._feat_in = feat_in
         self.att_context_style = att_context_style
         self.subsampling_factor = subsampling_factor
@@ -615,6 +617,9 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
 
             if lth == self.middle_output_layer:
                 another_return = audio_signal
+
+                if self.middle_detach:
+                    audio_signal = audio_signal.detach()
 
             # saving tensors if required for interctc loss
             if self.is_access_enabled():
