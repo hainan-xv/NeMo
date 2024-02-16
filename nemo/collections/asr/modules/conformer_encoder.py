@@ -254,7 +254,6 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         self,
         feat_in,
         n_layers,
-        middle_output_layer,
         d_model,
         middle_detach=False,
         feat_out=-1,
@@ -288,6 +287,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         global_tokens: int = 0,
         global_tokens_spacing: int = 1,
         global_attn_separate: bool = False,
+        middle_output_layer: int = -1,
     ):
         super().__init__()
         d_ff = d_model * ff_expansion_factor
