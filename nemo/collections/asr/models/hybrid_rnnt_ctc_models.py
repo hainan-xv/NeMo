@@ -517,9 +517,9 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin):
             wer, wer_num, wer_denom = self.wer.compute()
             self.wer.reset()
 
-            tensorboard_logs['val_wer_num'] = wer_num
-            tensorboard_logs['val_wer_denom'] = wer_denom
-            tensorboard_logs['val_wer'] = wer
+            tensorboard_logs['val_bleu_num'] = wer_num
+            tensorboard_logs['val_bleu_denom'] = wer_denom
+            tensorboard_logs['val_bleu'] = wer
 
         else:
             # If experimental fused Joint-Loss-WER is used
@@ -543,9 +543,9 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin):
             if loss_value is not None:
                 tensorboard_logs['val_loss'] = loss_value
 
-            tensorboard_logs['val_wer_num'] = wer_num
-            tensorboard_logs['val_wer_denom'] = wer_denom
-            tensorboard_logs['val_wer'] = wer
+            tensorboard_logs['val_bleu_num'] = wer_num
+            tensorboard_logs['val_bleu_denom'] = wer_denom
+            tensorboard_logs['val_bleu'] = wer
 
         log_probs = self.ctc_decoder(encoder_output=encoded)
         if self.compute_eval_loss:
@@ -561,9 +561,9 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin):
         )
         ctc_wer, ctc_wer_num, ctc_wer_denom = self.ctc_wer.compute()
         self.ctc_wer.reset()
-        tensorboard_logs['val_wer_num_ctc'] = ctc_wer_num
-        tensorboard_logs['val_wer_denom_ctc'] = ctc_wer_denom
-        tensorboard_logs['val_wer_ctc'] = ctc_wer
+        tensorboard_logs['val_bleu_num_ctc'] = ctc_wer_num
+        tensorboard_logs['val_bleu_denom_ctc'] = ctc_wer_denom
+        tensorboard_logs['val_bleu_ctc'] = ctc_wer
 
         self.log('global_step', torch.tensor(self.trainer.global_step, dtype=torch.float32))
 
@@ -611,13 +611,13 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin):
             val_loss_log = {'val_loss': val_loss_mean}
         else:
             val_loss_log = {}
-        wer_num = torch.stack([x['val_wer_num'] for x in outputs]).sum()
-        wer_denom = torch.stack([x['val_wer_denom'] for x in outputs]).sum()
-        tensorboard_logs = {**val_loss_log, 'val_wer': wer_num.float() / wer_denom}
+        wer_num = torch.stack([x['val_bleu_num'] for x in outputs]).sum()
+        wer_denom = torch.stack([x['val_bleu_denom'] for x in outputs]).sum()
+        tensorboard_logs = {**val_loss_log, 'val_bleu': wer_num.float() / wer_denom}
         if self.ctc_loss_weight > 0:
-            ctc_wer_num = torch.stack([x['val_wer_num_ctc'] for x in outputs]).sum()
-            ctc_wer_denom = torch.stack([x['val_wer_denom_ctc'] for x in outputs]).sum()
-            tensorboard_logs['val_wer_ctc'] = ctc_wer_num.float() / ctc_wer_denom
+            ctc_wer_num = torch.stack([x['val_bleu_num_ctc'] for x in outputs]).sum()
+            ctc_wer_denom = torch.stack([x['val_bleu_denom_ctc'] for x in outputs]).sum()
+            tensorboard_logs['val_bleu_ctc'] = ctc_wer_num.float() / ctc_wer_denom
         metrics = {**val_loss_log, 'log': tensorboard_logs}
         self.finalize_interctc_metrics(metrics, outputs, prefix="val_")
         return metrics
