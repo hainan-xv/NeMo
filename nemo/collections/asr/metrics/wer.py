@@ -340,7 +340,6 @@ class WER(Metric):
                 scores += self.sacre_bleu([h], [[r]]) * len(r.split())
                 words += len(r.split())
 
-
         self.scores = torch.tensor(scores, device=self.scores.device, dtype=self.scores.dtype)
         self.words = torch.tensor(words, device=self.words.device, dtype=self.words.dtype)
 

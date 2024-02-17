@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 from omegaconf import DictConfig, OmegaConf, open_dict
 from pytorch_lightning import Trainer
+from sacrebleu import corpus_bleu
 from tqdm.auto import tqdm
 
 from nemo.collections.asr.data import audio_to_text_dataset
@@ -29,7 +30,6 @@ from nemo.collections.asr.data.audio_to_text_dali import AudioToCharDALIDataset,
 from nemo.collections.asr.data.audio_to_text_lhotse import LhotseSpeechToTextBpeDataset
 from nemo.collections.asr.losses.rnnt import RNNTLoss, resolve_rnnt_default_loss_name
 from nemo.collections.asr.metrics.wer import WER
-from sacrebleu import corpus_bleu
 from nemo.collections.asr.models.asr_model import ASRModel, ExportableEncDecModel
 from nemo.collections.asr.modules.rnnt import RNNTDecoderJoint
 from nemo.collections.asr.parts.mixins import (
@@ -77,9 +77,6 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         self.decoder = EncDecRNNTModel.from_config_dict(self.cfg.decoder)
         self.joint = EncDecRNNTModel.from_config_dict(self.cfg.joint)
 
-        self.inter_decoder = EncDecRNNTModel.from_config_dict(self.cfg.decoder)
-        self.inter_joint = EncDecRNNTModel.from_config_dict(self.cfg.joint)
-
         # Setup RNNT Loss
         loss_name, loss_kwargs = self.extract_rnnt_loss_cfg(self.cfg.get("loss", None))
 
@@ -98,13 +95,6 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             reduction=self.cfg.get("rnnt_reduction", "mean_batch"),
         )
 
-        self.inter_loss = RNNTLoss(  # later changeto CTC?
-            num_classes=num_classes,
-            loss_name=loss_name,
-            loss_kwargs=loss_kwargs,
-            reduction=self.cfg.get("rnnt_reduction", "mean_batch"),
-        )
-
         if hasattr(self.cfg, 'spec_augment') and self._cfg.spec_augment is not None:
             self.spec_augmentation = EncDecRNNTModel.from_config_dict(self.cfg.spec_augment)
         else:
@@ -114,25 +104,11 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         self.decoding = RNNTDecoding(
             decoding_cfg=self.cfg.decoding, decoder=self.decoder, joint=self.joint, vocabulary=self.joint.vocabulary,
         )
-        self.inter_decoding = RNNTDecoding(
-            decoding_cfg=self.cfg.decoding,
-            decoder=self.inter_decoder,
-            joint=self.inter_joint,
-            vocabulary=self.inter_joint.vocabulary,
-        )
 
         # Setup WER calculation
         self.wer = WER(
             decoding=self.decoding,
             use_bleu=True,
-            batch_dim_index=0,
-            use_cer=self._cfg.get('use_cer', False),
-            log_prediction=self._cfg.get('log_prediction', True),
-            dist_sync_on_step=True,
-        )
-
-        self.inter_wer = WER(
-            decoding=self.inter_decoding,
             batch_dim_index=0,
             use_cer=self._cfg.get('use_cer', False),
             log_prediction=self._cfg.get('log_prediction', True),
@@ -151,8 +127,6 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         ):
             self.joint.set_loss(self.loss)
             self.joint.set_wer(self.wer)
-            self.inter_joint.set_loss(self.inter_loss)
-            self.inter_joint.set_wer(self.inter_wer)
 
         # Setup optimization normalization (if provided in config)
         self.setup_optim_normalization()
@@ -340,27 +314,9 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             del self.decoder
             self.decoder = EncDecRNNTModel.from_config_dict(new_decoder_config)
 
-            joint_config = self.inter_joint.to_config_dict()
-            new_joint_config = copy.deepcopy(joint_config)
-            new_joint_config['vocabulary'] = new_vocabulary
-            new_joint_config['num_classes'] = len(new_vocabulary)
-            del self.inter_joint
-            self.inter_joint = EncDecRNNTModel.from_config_dict(new_joint_config)
-
-            decoder_config = self.inter_decoder.to_config_dict()
-            new_decoder_config = copy.deepcopy(decoder_config)
-            new_decoder_config.vocab_size = len(new_vocabulary)
-            del self.inter_decoder
-            self.inter_decoder = EncDecRNNTModel.from_config_dict(new_decoder_config)
-
             del self.loss
             loss_name, loss_kwargs = self.extract_rnnt_loss_cfg(self.cfg.get('loss', None))
             self.loss = RNNTLoss(
-                num_classes=self.joint.num_classes_with_blank - 1, loss_name=loss_name, loss_kwargs=loss_kwargs
-            )
-            del self.inter_loss
-            loss_name, loss_kwargs = self.extract_rnnt_loss_cfg(self.cfg.get('loss', None))
-            self.inter_loss = RNNTLoss(
                 num_classes=self.joint.num_classes_with_blank - 1, loss_name=loss_name, loss_kwargs=loss_kwargs
             )
 
@@ -386,42 +342,22 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 dist_sync_on_step=True,
             )
 
-            self.inter_decoding = RNNTDecoding(
-                decoding_cfg=decoding_cfg,
-                decoder=self.inter_decoder,
-                joint=self.inter_joint,
-                vocabulary=self.inter_joint.vocabulary,
-            )
-
-            self.inter_wer = WER(
-                decoding=self.inter_decoding,
-                batch_dim_index=self.inter_wer.batch_dim_index,
-                use_cer=self.inter_wer.use_cer,
-                log_prediction=self.inter_wer.log_prediction,
-                dist_sync_on_step=True,
-            )
-
             # Setup fused Joint step
             if self.joint.fuse_loss_wer or (
                 self.decoding.joint_fused_batch_size is not None and self.decoding.joint_fused_batch_size > 0
             ):
                 self.joint.set_loss(self.loss)
                 self.joint.set_wer(self.wer)
-                self.inter_joint.set_loss(self.inter_loss)
-                self.inter_joint.set_wer(self.inter_wer)
 
             # Update config
             with open_dict(self.cfg.joint):
                 self.cfg.joint = new_joint_config
-                self.inter_cfg.joint = new_joint_config
 
             with open_dict(self.cfg.decoder):
                 self.cfg.decoder = new_decoder_config
-                self.cfg.inter_decoder = new_decoder_config
 
             with open_dict(self.cfg.decoding):
                 self.cfg.decoding = decoding_cfg
-                self.cfg.inter_decoding = decoding_cfg
 
             ds_keys = ['train_ds', 'validation_ds', 'test_ds']
             for key in ds_keys:
@@ -462,21 +398,6 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             dist_sync_on_step=True,
         )
 
-        self.inter_decoding = RNNTDecoding(
-            decoding_cfg=decoding_cfg,
-            decoder=self.inter_decoder,
-            joint=self.inter_joint,
-            vocabulary=self.inter_joint.vocabulary,
-        )
-
-        self.inter_wer = WER(
-            decoding=self.inter_decoding,
-            batch_dim_index=self.wer.batch_dim_index,
-            use_cer=self.wer.use_cer,
-            log_prediction=self.wer.log_prediction,
-            dist_sync_on_step=True,
-        )
-
         # Setup fused Joint step
         if self.joint.fuse_loss_wer or (
             self.decoding.joint_fused_batch_size is not None and self.decoding.joint_fused_batch_size > 0
@@ -484,11 +405,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             self.joint.set_loss(self.loss)
             self.joint.set_wer(self.wer)
 
-            self.inter_joint.set_loss(self.inter_loss)
-            self.inter_joint.set_wer(self.inter_wer)
-
         self.joint.temperature = decoding_cfg.get('temperature', 1.0)
-        self.inter_joint.temperature = decoding_cfg.get('temperature', 1.0)
 
         # Update config
         with open_dict(self.cfg.decoding):
@@ -716,9 +633,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         if self.spec_augmentation is not None and self.training:
             processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
 
-        encoded, encoded_len = self.encoder(
-            audio_signal=processed_signal, length=processed_signal_length
-        )
+        encoded, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
 
         return encoded, encoded_len
 
@@ -732,19 +647,14 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
         # forward() only performs encoder forward
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
-            encoded, encoded_len, inter_encoded = self.forward(
-                processed_signal=signal, processed_signal_length=signal_len
-            )
+            encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
         else:
-            encoded, encoded_len, inter_encoded = self.forward(input_signal=signal, input_signal_length=signal_len)
+            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
         del signal
 
         # During training, loss must be computed, so decoder forward is necessary
         decoder, translated_target_length, states = self.decoder(
             targets=translated_transcript, target_length=translated_transcript_len
-        )
-        inter_decoder, inter_target_length, inter_states = self.inter_decoder(
-            targets=transcript, target_length=transcript_len
         )
 
         if hasattr(self, '_trainer') and self._trainer is not None:
@@ -768,25 +678,12 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             # Add auxiliary losses, if registered
             loss_value = self.add_auxiliary_losses(loss_value)
 
-            inter_joint = self.inter_joint(encoder_outputs=inter_encoded, decoder_outputs=inter_decoder)
-            inter_loss_value = self.inter_loss(
-                log_probs=inter_joint,
-                targets=transcript,
-                input_lengths=encoded_len,
-                target_lengths=inter_target_length,
-            )
-
-            # Add auxiliary losses, if registered
-            inter_loss_value = self.add_auxiliary_losses(inter_loss_value)
-
             # Reset access registry
             if AccessMixin.is_access_enabled():
                 AccessMixin.reset_registry(self)
 
             tensorboard_logs = {
-                'main_train_loss': loss_value,
-                'inter_train_loss': inter_loss_value,
-                'total_train_loss': loss_value + inter_loss_value,
+                'train_loss': loss_value,
                 'learning_rate': self._optimizer.param_groups[0]['lr'],
                 'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
             }
@@ -801,16 +698,6 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 _, scores, words = self.wer.compute()
                 self.wer.reset()
                 tensorboard_logs.update({'training_batch_bleu': scores.float() / words})
-
-                self.inter_wer.update(
-                    predictions=inter_encoded,
-                    predictions_lengths=encoded_len,
-                    targets=transcript,
-                    targets_lengths=transcript_len,
-                )
-                _, scores, words = self.inter_wer.compute()
-                self.inter_wer.reset()
-                tensorboard_logs.update({'inter_training_batch_wer': scores.float() / words})
 
         else:
             # If experimental fused Joint-Loss-WER is used
@@ -829,18 +716,8 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 compute_wer=compute_wer,
             )
 
-            inter_loss_value, inter_wer, _, _ = self.inter_joint(
-                encoder_outputs=inter_encoded,
-                decoder_outputs=inter_decoder,
-                encoder_lengths=encoded_len,
-                transcripts=transcript,
-                transcript_lengths=transcript_len,
-                compute_wer=compute_wer,
-            )
-
             # Add auxiliary losses, if registered
             loss_value = self.add_auxiliary_losses(loss_value)
-            inter_loss_value = self.add_auxiliary_losses(inter_loss_value)
 
             # Reset access registry
             if AccessMixin.is_access_enabled():
@@ -848,14 +725,12 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
             tensorboard_logs = {
                 'train_loss': loss_value,
-                'inter_train_loss': inter_loss_value,
                 'learning_rate': self._optimizer.param_groups[0]['lr'],
                 'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
             }
 
             if compute_wer:
                 tensorboard_logs.update({'training_batch_bleu': wer})
-                tensorboard_logs.update({'inter_training_batch_wer': inter_wer})
 
         # Log items
         self.log_dict(tensorboard_logs)
@@ -864,18 +739,16 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         if self._optim_normalize_joint_txu:
             self._optim_normalize_txu = [encoded_len.max(), transcript_len.max()]
 
-        return {'loss': loss_value + inter_loss_value}
+        return {'loss': loss_value}
 
     def predict_step(self, batch, batch_idx, dataloader_idx=0):
         signal, signal_len, transcript, transcript_len, sample_id = batch
 
         # forward() only performs encoder forward
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
-            encoded, encoded_len, inter_encoded = self.forward(
-                processed_signal=signal, processed_signal_length=signal_len
-            )
+            encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
         else:
-            encoded, encoded_len, inter_encoded = self.forward(input_signal=signal, input_signal_length=signal_len)
+            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
         del signal
 
         best_hyp_text, all_hyp_text = self.decoding.rnnt_decoder_predictions_tensor(
@@ -890,11 +763,9 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
         # forward() only performs encoder forward
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
-            encoded, encoded_len, inter_encoded = self.forward(
-                processed_signal=signal, processed_signal_length=signal_len
-            )
+            encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
         else:
-            encoded, encoded_len, inter_encoded = self.forward(input_signal=signal, input_signal_length=signal_len)
+            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
         del signal
 
         tensorboard_logs = {}
@@ -929,34 +800,6 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             tensorboard_logs['val_bleu_denom'] = wer_denom
             tensorboard_logs['bleu_wer'] = wer
 
-            if self.compute_eval_loss:
-                inter_decoder, inter_target_length, inter_states = self.inter_decoder(
-                    targets=transcript, target_length=transcript_len
-                )
-                inter_joint = self.inter_joint(encoder_outputs=inter_encoded, decoder_outputs=inter_decoder)
-
-                inter_loss_value = self.inter_loss(
-                    log_probs=inter_joint,
-                    targets=transcript,
-                    input_lengths=encoded_len,
-                    target_lengths=inter_target_length,
-                )
-
-                tensorboard_logs['inter_val_loss'] = inter_loss_value
-
-            self.inter_wer.update(
-                predictions=inter_encoded,
-                predictions_lengths=encoded_len,
-                targets=transcript,
-                targets_lengths=transcript_len,
-            )
-            inter_wer, inter_wer_num, inter_wer_denom = self.inter_wer.compute()
-            self.inter_wer.reset()
-
-            tensorboard_logs['inter_val_wer_num'] = inter_wer_num
-            tensorboard_logs['inter_val_wer_denom'] = inter_wer_denom
-            tensorboard_logs['inter_val_wer'] = inter_wer
-
         else:
             # If experimental fused Joint-Loss-WER is used
             compute_wer = True
@@ -965,14 +808,9 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 decoded, target_len, states = self.decoder(
                     targets=translated_transcript, target_length=translated_transcript_len
                 )
-                inter_decoded, inter_target_len, inter_states = self.inter_decoder(
-                    targets=transcript, target_length=transcript_len
-                )
             else:
                 decoded = None
-                inter_decoded = None
                 translated_target_len = translated_transcript_len
-                inter_target_len = transcript_len
 
             # Fused joint step
             loss_value, wer, wer_num, wer_denom = self.joint(
@@ -984,27 +822,12 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 compute_wer=compute_wer,
             )
 
-            # Fused joint step
-            inter_loss_value, inter_wer, inter_wer_num, inter_wer_denom = self.inter_joint(
-                encoder_outputs=inter_encoded,
-                decoder_outputs=inter_decoded,
-                encoder_lengths=encoded_len,
-                transcripts=transcript,
-                transcript_lengths=inter_target_len,
-                compute_wer=compute_wer,
-            )
-
             if loss_value is not None:
                 tensorboard_logs['val_loss'] = loss_value
-                tensorboard_logs['inter_val_loss'] = inter_loss_value
 
             tensorboard_logs['val_bleu_num'] = wer_num
             tensorboard_logs['val_bleu_denom'] = wer_denom
             tensorboard_logs['val_bleu'] = wer
-
-            tensorboard_logs['inter_val_wer_num'] = inter_wer_num
-            tensorboard_logs['inter_val_wer_denom'] = inter_wer_denom
-            tensorboard_logs['inter_val_wer'] = inter_wer
 
         self.log('global_step', torch.tensor(self.trainer.global_step, dtype=torch.float32))
 
@@ -1032,17 +855,12 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             val_loss_mean = torch.stack([x['val_loss'] for x in outputs]).mean()
             val_loss_log = {'val_loss': val_loss_mean}
 
-            inter_val_loss_mean = torch.stack([x['inter_val_loss'] for x in outputs]).mean()
-            inter_val_loss_log = {'inter_val_loss': inter_val_loss_mean}
         else:
             val_loss_log = {}
-            inter_val_loss_log = {}
         wer_num = torch.stack([x['val_bleu_num'] for x in outputs]).sum()
         wer_denom = torch.stack([x['val_bleu_denom'] for x in outputs]).sum()
 
-        inter_wer_num = torch.stack([x['inter_val_wer_num'] for x in outputs]).sum()
-        inter_wer_denom = torch.stack([x['inter_val_wer_denom'] for x in outputs]).sum()
-        tensorboard_logs = {**val_loss_log, 'val_bleu': wer_num.float() / wer_denom, 'inter_val_wer': inter_wer_num.float() / inter_wer_denom}
+        tensorboard_logs = {**val_loss_log, 'val_bleu': wer_num.float() / wer_denom}
         return {**val_loss_log, 'log': tensorboard_logs}
 
     def multi_test_epoch_end(self, outputs, dataloader_idx: int = 0):
@@ -1059,8 +877,8 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
     """ Transcription related methods """
 
     def _transcribe_forward(self, batch: Any, trcfg: TranscribeConfig):
-        encoded, encoded_len, inter_encoded = self.forward(input_signal=batch[0], input_signal_length=batch[1])
-        output = dict(encoded=encoded, encoded_len=encoded_len, inter_encoded=inter_encoded)
+        encoded, encoded_len = self.forward(input_signal=batch[0], input_signal_length=batch[1])
+        output = dict(encoded=encoded, encoded_len=encoded_len)
         return output
 
     def _transcribe_output_processing(
