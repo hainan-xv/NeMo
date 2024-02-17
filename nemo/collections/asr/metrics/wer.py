@@ -18,6 +18,7 @@ import editdistance
 import jiwer
 import torch
 from torchmetrics import Metric
+from torchmetrics.text import SacreBLEUScore
 
 from nemo.collections.asr.parts.submodules.ctc_decoding import AbstractCTCDecoding
 from nemo.collections.asr.parts.submodules.rnnt_decoding import AbstractRNNTDecoding
@@ -253,9 +254,12 @@ class WER(Metric):
         fold_consecutive=True,
         batch_dim_index=0,
         dist_sync_on_step=False,
+        use_bleu=False,
     ):
         super().__init__(dist_sync_on_step=dist_sync_on_step)
 
+        self.use_bleu = use_bleu
+        self.sacre_bleu = SacreBLEUScore()
         self.decoding = decoding
         self.use_cer = use_cer
         self.log_prediction = log_prediction
@@ -319,16 +323,23 @@ class WER(Metric):
             logging.info(f"reference:{references[0]}")
             logging.info(f"predicted:{hypotheses[0]}")
 
-        for h, r in zip(hypotheses, references):
-            if self.use_cer:
-                h_list = list(h)
-                r_list = list(r)
-            else:
-                h_list = h.split()
-                r_list = r.split()
-            words += len(r_list)
-            # Compute Levenstein's distance
-            scores += editdistance.eval(h_list, r_list)
+        if not self.use_bleu:
+            for h, r in zip(hypotheses, references):
+                if self.use_cer:
+                    h_list = list(h)
+                    r_list = list(r)
+                else:
+                    h_list = h.split()
+                    r_list = r.split()
+                words += len(r_list)
+                # Compute Levenstein's distance
+                scores += editdistance.eval(h_list, r_list)
+        else:
+            for h, r in zip(hypotheses, references):
+                print("h and r", h, "AND", r)
+                scores += self.sacre_bleu([h], [[r]]) * len(r.split())
+                words += len(r.split())
+
 
         self.scores = torch.tensor(scores, device=self.scores.device, dtype=self.scores.dtype)
         self.words = torch.tensor(words, device=self.words.device, dtype=self.words.dtype)

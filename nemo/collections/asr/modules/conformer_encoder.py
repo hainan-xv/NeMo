@@ -255,7 +255,6 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         feat_in,
         n_layers,
         d_model,
-        middle_detach=False,
         feat_out=-1,
         causal_downsampling=False,
         subsampling='striding',
@@ -287,14 +286,11 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         global_tokens: int = 0,
         global_tokens_spacing: int = 1,
         global_attn_separate: bool = False,
-        middle_output_layer: int = -1,
     ):
         super().__init__()
         d_ff = d_model * ff_expansion_factor
         self.d_model = d_model
         self.n_layers = n_layers
-        self.middle_output_layer = middle_output_layer
-        self.middle_detach = middle_detach
         self._feat_in = feat_in
         self.att_context_style = att_context_style
         self.subsampling_factor = subsampling_factor
@@ -615,12 +611,6 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                     device=audio_signal.device,
                 )
 
-            if lth == self.middle_output_layer:
-                another_return = audio_signal
-
-                if self.middle_detach:
-                    audio_signal = audio_signal.detach()
-
             # saving tensors if required for interctc loss
             if self.is_access_enabled():
                 if self.interctc_capture_at_layers is None:
@@ -643,7 +633,6 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             audio_signal, length = self.reduction_subsampling(x=audio_signal, lengths=length)
 
         audio_signal = torch.transpose(audio_signal, 1, 2)
-        another_return = torch.transpose(another_return, 1, 2)
         length = length.to(dtype=torch.int64)
 
         if cache_last_channel is not None:
@@ -658,7 +647,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                 torch.clamp(cache_last_channel_len + cache_keep_size, max=cache_len),
             )
         else:
-            return audio_signal, length, another_return
+            return audio_signal, length
 
     def update_max_seq_length(self, seq_length: int, device):
         # Find global max audio length across all nodes

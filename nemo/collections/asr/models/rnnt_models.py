@@ -124,6 +124,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         # Setup WER calculation
         self.wer = WER(
             decoding=self.decoding,
+            use_bleu=True,
             batch_dim_index=0,
             use_cer=self._cfg.get('use_cer', False),
             log_prediction=self._cfg.get('log_prediction', True),
@@ -378,6 +379,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
             self.wer = WER(
                 decoding=self.decoding,
+                use_bleu=True,
                 batch_dim_index=self.wer.batch_dim_index,
                 use_cer=self.wer.use_cer,
                 log_prediction=self.wer.log_prediction,
@@ -453,6 +455,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
         self.wer = WER(
             decoding=self.decoding,
+            use_bleu=True,
             batch_dim_index=self.wer.batch_dim_index,
             use_cer=self.wer.use_cer,
             log_prediction=self.wer.log_prediction,
@@ -713,11 +716,11 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         if self.spec_augmentation is not None and self.training:
             processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
 
-        encoded, encoded_len, another_encoded = self.encoder(
+        encoded, encoded_len = self.encoder(
             audio_signal=processed_signal, length=processed_signal_length
         )
 
-        return encoded, encoded_len, another_encoded
+        return encoded, encoded_len
 
     # PTL-specific methods
     def training_step(self, batch, batch_nb):
@@ -797,7 +800,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 )
                 _, scores, words = self.wer.compute()
                 self.wer.reset()
-                tensorboard_logs.update({'training_batch_wer': scores.float() / words})
+                tensorboard_logs.update({'training_batch_bleu': scores.float() / words})
 
                 self.inter_wer.update(
                     predictions=inter_encoded,
@@ -851,7 +854,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             }
 
             if compute_wer:
-                tensorboard_logs.update({'training_batch_wer': wer})
+                tensorboard_logs.update({'training_batch_bleu': wer})
                 tensorboard_logs.update({'inter_training_batch_wer': inter_wer})
 
         # Log items
@@ -922,9 +925,9 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             wer, wer_num, wer_denom = self.wer.compute()
             self.wer.reset()
 
-            tensorboard_logs['val_wer_num'] = wer_num
-            tensorboard_logs['val_wer_denom'] = wer_denom
-            tensorboard_logs['val_wer'] = wer
+            tensorboard_logs['val_bleu_num'] = wer_num
+            tensorboard_logs['val_bleu_denom'] = wer_denom
+            tensorboard_logs['bleu_wer'] = wer
 
             if self.compute_eval_loss:
                 inter_decoder, inter_target_length, inter_states = self.inter_decoder(
@@ -995,9 +998,9 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 tensorboard_logs['val_loss'] = loss_value
                 tensorboard_logs['inter_val_loss'] = inter_loss_value
 
-            tensorboard_logs['val_wer_num'] = wer_num
-            tensorboard_logs['val_wer_denom'] = wer_denom
-            tensorboard_logs['val_wer'] = wer
+            tensorboard_logs['val_bleu_num'] = wer_num
+            tensorboard_logs['val_bleu_denom'] = wer_denom
+            tensorboard_logs['val_bleu'] = wer
 
             tensorboard_logs['inter_val_wer_num'] = inter_wer_num
             tensorboard_logs['inter_val_wer_denom'] = inter_wer_denom
@@ -1034,12 +1037,12 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         else:
             val_loss_log = {}
             inter_val_loss_log = {}
-        wer_num = torch.stack([x['val_wer_num'] for x in outputs]).sum()
-        wer_denom = torch.stack([x['val_wer_denom'] for x in outputs]).sum()
+        wer_num = torch.stack([x['val_bleu_num'] for x in outputs]).sum()
+        wer_denom = torch.stack([x['val_bleu_denom'] for x in outputs]).sum()
 
         inter_wer_num = torch.stack([x['inter_val_wer_num'] for x in outputs]).sum()
         inter_wer_denom = torch.stack([x['inter_val_wer_denom'] for x in outputs]).sum()
-        tensorboard_logs = {**val_loss_log, 'val_wer': wer_num.float() / wer_denom, 'inter_val_wer': inter_wer_num.float() / inter_wer_denom}
+        tensorboard_logs = {**val_loss_log, 'val_bleu': wer_num.float() / wer_denom, 'inter_val_wer': inter_wer_num.float() / inter_wer_denom}
         return {**val_loss_log, 'log': tensorboard_logs}
 
     def multi_test_epoch_end(self, outputs, dataloader_idx: int = 0):

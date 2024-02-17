@@ -368,8 +368,6 @@ class ASRAudioText(AudioText):
         )
         speakers, orig_srs, token_labels, langs = [], [], [], []
 
-        print('manifests_files is', manifests_files)
-
         for item in manifest.item_iter(manifests_files):
             ids.append(item['id'])
             audio_files.append(item['audio_file'])

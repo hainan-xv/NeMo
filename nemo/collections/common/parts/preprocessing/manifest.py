@@ -68,7 +68,6 @@ def item_iter(
         manifests_files = [manifests_files]
 
     if parse_func is None:
-        print("default parse_func")
         parse_func = __parse_item
 
     k = -1
