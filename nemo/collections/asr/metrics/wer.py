@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from typing import List, Tuple, Union
-
+from torchmetrics.text import SacreBLEUScore
 import editdistance
 import jiwer
 import torch
@@ -261,7 +261,7 @@ class WER(Metric):
         self.log_prediction = log_prediction
         self.fold_consecutive = fold_consecutive
         self.batch_dim_index = batch_dim_index
-
+        self.sacre_bleu = SacreBLEUScore()
         self.decode = None
         if isinstance(self.decoding, AbstractRNNTDecoding):
             self.decode = lambda predictions, predictions_lengths: self.decoding.rnnt_decoder_predictions_tensor(
@@ -320,15 +320,8 @@ class WER(Metric):
             logging.info(f"predicted:{hypotheses[0]}")
 
         for h, r in zip(hypotheses, references):
-            if self.use_cer:
-                h_list = list(h)
-                r_list = list(r)
-            else:
-                h_list = h.split()
-                r_list = r.split()
-            words += len(r_list)
-            # Compute Levenstein's distance
-            scores += editdistance.eval(h_list, r_list)
+            scores += self.sacre_bleu([h], [[r]]) * len(r.split())
+            words += len(r.split())
 
         self.scores = torch.tensor(scores, device=self.scores.device, dtype=self.scores.dtype)
         self.words = torch.tensor(words, device=self.words.device, dtype=self.words.dtype)

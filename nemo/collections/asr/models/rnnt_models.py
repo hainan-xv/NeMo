@@ -686,7 +686,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 )
                 _, scores, words = self.wer.compute()
                 self.wer.reset()
-                tensorboard_logs.update({'training_batch_wer': scores.float() / words})
+                tensorboard_logs.update({'training_batch_bleu': scores.float() / words})
 
         else:
             # If experimental fused Joint-Loss-WER is used
@@ -719,7 +719,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             }
 
             if compute_wer:
-                tensorboard_logs.update({'training_batch_wer': wer})
+                tensorboard_logs.update({'training_batch_bleu': wer})
 
         # Log items
         self.log_dict(tensorboard_logs)
@@ -780,9 +780,9 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             wer, wer_num, wer_denom = self.wer.compute()
             self.wer.reset()
 
-            tensorboard_logs['val_wer_num'] = wer_num
-            tensorboard_logs['val_wer_denom'] = wer_denom
-            tensorboard_logs['val_wer'] = wer
+            tensorboard_logs['val_bleu_num'] = wer_num
+            tensorboard_logs['val_bleu_denom'] = wer_denom
+            tensorboard_logs['val_bleu'] = wer
 
         else:
             # If experimental fused Joint-Loss-WER is used
@@ -807,9 +807,9 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             if loss_value is not None:
                 tensorboard_logs['val_loss'] = loss_value
 
-            tensorboard_logs['val_wer_num'] = wer_num
-            tensorboard_logs['val_wer_denom'] = wer_denom
-            tensorboard_logs['val_wer'] = wer
+            tensorboard_logs['val_bleu_num'] = wer_num
+            tensorboard_logs['val_bleu_denom'] = wer_denom
+            tensorboard_logs['val_bleu'] = wer
 
         self.log('global_step', torch.tensor(self.trainer.global_step, dtype=torch.float32))
 
@@ -838,9 +838,9 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             val_loss_log = {'val_loss': val_loss_mean}
         else:
             val_loss_log = {}
-        wer_num = torch.stack([x['val_wer_num'] for x in outputs]).sum()
-        wer_denom = torch.stack([x['val_wer_denom'] for x in outputs]).sum()
-        tensorboard_logs = {**val_loss_log, 'val_wer': wer_num.float() / wer_denom}
+        wer_num = torch.stack([x['val_bleu_num'] for x in outputs]).sum()
+        wer_denom = torch.stack([x['val_bleu_denom'] for x in outputs]).sum()
+        tensorboard_logs = {**val_loss_log, 'val_bleu': wer_num.float() / wer_denom}
         return {**val_loss_log, 'log': tensorboard_logs}
 
     def multi_test_epoch_end(self, outputs, dataloader_idx: int = 0):
@@ -849,9 +849,9 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             test_loss_log = {'test_loss': test_loss_mean}
         else:
             test_loss_log = {}
-        wer_num = torch.stack([x['test_wer_num'] for x in outputs]).sum()
-        wer_denom = torch.stack([x['test_wer_denom'] for x in outputs]).sum()
-        tensorboard_logs = {**test_loss_log, 'test_wer': wer_num.float() / wer_denom}
+        wer_num = torch.stack([x['test_bleu_num'] for x in outputs]).sum()
+        wer_denom = torch.stack([x['test_bleu_denom'] for x in outputs]).sum()
+        tensorboard_logs = {**test_loss_log, 'test_bleu': wer_num.float() / wer_denom}
         return {**test_loss_log, 'log': tensorboard_logs}
 
     """ Transcription related methods """
