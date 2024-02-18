@@ -325,6 +325,7 @@ class WER(Metric):
 
         if not self.use_bleu:
             for h, r in zip(hypotheses, references):
+#                print("WER h and r", h, "AND", r)
                 if self.use_cer:
                     h_list = list(h)
                     r_list = list(r)
@@ -336,7 +337,7 @@ class WER(Metric):
                 scores += editdistance.eval(h_list, r_list)
         else:
             for h, r in zip(hypotheses, references):
-#                print("h and r", h, "AND", r)
+#                print("BLEU h and r", h, "AND", r)
                 scores += self.sacre_bleu([h], [[r]]) * len(r.split())
                 words += len(r.split())
 

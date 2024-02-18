@@ -348,7 +348,7 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin):
         if self.is_interctc_enabled():
             AccessMixin.set_access_enabled(access_enabled=True)
 
-        signal, signal_len, transcript, transcript_len, inter_transcript, inter_transcript_len = batch
+        signal, signal_len, transcript, transcript_len, translated_transcript, translated_transcript_len = batch
 
         # forward() only performs encoder forward
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
@@ -358,7 +358,7 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin):
         del signal
 
         # During training, loss must be computed, so decoder forward is necessary
-        decoder, target_length, states = self.decoder(targets=transcript, target_length=transcript_len)
+        decoder, target_length, states = self.decoder(targets=translated_transcript, target_length=translated_transcript_len)
 
         if hasattr(self, '_trainer') and self._trainer is not None:
             log_every_n_steps = self._trainer.log_every_n_steps
@@ -377,7 +377,7 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin):
             # Compute full joint and loss
             joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder)
             loss_value = self.loss(
-                log_probs=joint, targets=transcript, input_lengths=encoded_len, target_lengths=target_length
+                log_probs=joint, targets=translated_transcript, input_lengths=encoded_len, target_lengths=target_length
             )
 
             # Add auxiliary losses, if registered
@@ -392,8 +392,8 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin):
                 self.wer.update(
                     predictions=encoded,
                     predictions_lengths=encoded_len,
-                    targets=transcript,
-                    targets_lengths=transcript_len,
+                    targets=translated_transcript,
+                    targets_lengths=translated_transcript_len,
                 )
                 _, scores, words = self.wer.compute()
                 self.wer.reset()
@@ -405,8 +405,8 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin):
                 encoder_outputs=encoded,
                 decoder_outputs=decoder,
                 encoder_lengths=encoded_len,
-                transcripts=transcript,
-                transcript_lengths=transcript_len,
+                transcripts=translated_transcript,
+                transcript_lengths=translated_transcript_len,
                 compute_wer=compute_wer,
             )
 
@@ -419,12 +419,13 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin):
             }
 
             if compute_wer:
-                tensorboard_logs.update({'training_batch_wer': wer})
+                tensorboard_logs.update({'training_batch_bleu': wer})
 
+#        print('HERE self.ctc_loss_weight is', self.ctc_loss_weight)
         if self.ctc_loss_weight > 0:
             log_probs = self.ctc_decoder(encoder_output=encoded)
             ctc_loss = self.ctc_loss(
-                log_probs=log_probs, targets=inter_transcript, input_lengths=encoded_len, target_lengths=inter_transcript_len
+                log_probs=log_probs, targets=transcript, input_lengths=encoded_len, target_lengths=transcript_len
             )
             tensorboard_logs['train_rnnt_loss'] = loss_value
             tensorboard_logs['train_ctc_loss'] = ctc_loss
@@ -432,13 +433,13 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin):
             if compute_wer:
                 self.ctc_wer.update(
                     predictions=log_probs,
-                    targets=inter_transcript,
-                    targets_lengths=inter_transcript_len,
+                    targets=transcript,
+                    targets_lengths=transcript_len,
                     predictions_lengths=encoded_len,
                 )
                 ctc_wer, _, _ = self.ctc_wer.compute()
                 self.ctc_wer.reset()
-                tensorboard_logs.update({'training_batch_wer_ctc': ctc_wer})
+                tensorboard_logs.update({'training_batch_bleu_ctc': ctc_wer})
 
         # note that we want to apply interctc independent of whether main ctc
         # loss is used or not (to allow rnnt + interctc training).
@@ -446,7 +447,7 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin):
         # layer with weight of ``0.1``, the total loss will be
         # ``loss = 0.9 * (0.3 * ctc_loss + 0.7 * rnnt_loss) + 0.1 * interctc_loss``
         loss_value, additional_logs = self.add_interctc_losses(
-            loss_value, inter_transcript, inter_transcript_len, compute_wer=compute_wer
+            loss_value, transcript, transcript_len, compute_wer=compute_wer
         )
         tensorboard_logs.update(additional_logs)
         tensorboard_logs['train_loss'] = loss_value
@@ -485,7 +486,7 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin):
         if self.is_interctc_enabled():
             AccessMixin.set_access_enabled(access_enabled=True)
 
-        signal, signal_len, transcript, transcript_len, inter_transcript, inter_transcript_len = batch
+        signal, signal_len, transcript, transcript_len, translated_transcript, translated_transcript_len = batch
 
         # forward() only performs encoder forward
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
@@ -500,19 +501,19 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin):
         # If experimental fused Joint-Loss-WER is not used
         if not self.joint.fuse_loss_wer:
             if self.compute_eval_loss:
-                decoder, target_length, states = self.decoder(targets=transcript, target_length=transcript_len)
+                decoder, target_length, states = self.decoder(targets=translated_transcript, target_length=translated_transcript_len)
                 joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder)
 
                 loss_value = self.loss(
-                    log_probs=joint, targets=transcript, input_lengths=encoded_len, target_lengths=target_length
+                    log_probs=joint, targets=translated_transcript, input_lengths=encoded_len, target_lengths=target_length
                 )
                 tensorboard_logs['val_loss'] = loss_value
 
             self.wer.update(
                 predictions=encoded,
                 predictions_lengths=encoded_len,
-                targets=transcript,
-                targets_lengths=transcript_len,
+                targets=translated_transcript,
+                targets_lengths=translated_transcript_len,
             )
             wer, wer_num, wer_denom = self.wer.compute()
             self.wer.reset()
@@ -526,17 +527,17 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin):
             compute_wer = True
 
             if self.compute_eval_loss:
-                decoded, target_len, states = self.decoder(targets=transcript, target_length=transcript_len)
+                decoded, target_len, states = self.decoder(targets=translated_transcript, target_length=translated_transcript_len)
             else:
                 decoded = None
-                target_len = transcript_len
+                target_len = translated_transcript_len
 
             # Fused joint step
             loss_value, wer, wer_num, wer_denom = self.joint(
                 encoder_outputs=encoded,
                 decoder_outputs=decoded,
                 encoder_lengths=encoded_len,
-                transcripts=transcript,
+                transcripts=translated_transcript,
                 transcript_lengths=target_len,
                 compute_wer=compute_wer,
             )
@@ -550,7 +551,7 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin):
         log_probs = self.ctc_decoder(encoder_output=encoded)
         if self.compute_eval_loss:
             ctc_loss = self.ctc_loss(
-                log_probs=log_probs, targets=transcript, input_lengths=encoded_len, target_lengths=transcript_len
+                log_probs=log_probs, targets=translated_transcript, input_lengths=encoded_len, target_lengths=translated_transcript_len
             )
             tensorboard_logs['val_ctc_loss'] = ctc_loss
             tensorboard_logs['val_rnnt_loss'] = loss_value
@@ -561,9 +562,9 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin):
         )
         ctc_wer, ctc_wer_num, ctc_wer_denom = self.ctc_wer.compute()
         self.ctc_wer.reset()
-        tensorboard_logs['val_wer_num_ctc'] = ctc_wer_num
-        tensorboard_logs['val_wer_denom_ctc'] = ctc_wer_denom
-        tensorboard_logs['val_wer_ctc'] = ctc_wer
+        tensorboard_logs['val_bleu_num_ctc'] = ctc_wer_num
+        tensorboard_logs['val_bleu_denom_ctc'] = ctc_wer_denom
+        tensorboard_logs['val_bleu_ctc'] = ctc_wer
 
         self.log('global_step', torch.tensor(self.trainer.global_step, dtype=torch.float32))
 
