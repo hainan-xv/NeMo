@@ -336,7 +336,7 @@ class WER(Metric):
                 scores += editdistance.eval(h_list, r_list)
         else:
             for h, r in zip(hypotheses, references):
-                print("h and r", h, "AND", r)
+#                print("h and r", h, "AND", r)
                 scores += self.sacre_bleu([h], [[r]]) * len(r.split())
                 words += len(r.split())
 
