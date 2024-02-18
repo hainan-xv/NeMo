@@ -90,7 +90,7 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin):
         self.cur_decoder = "rnnt"
 
         # setting up interCTC loss (from InterCTCMixin)
-        self.setup_interctc(decoder_name='ctc_decoder', loss_name='ctc_loss', wer_name='ctc_wer')
+        self.setup_interctc(decoder_name='ctc_decoder', loss_name='ctc_loss', wer_name='ctc_bleu')
 
     @torch.no_grad()
     def transcribe(
@@ -397,7 +397,7 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin):
                 )
                 _, scores, words = self.wer.compute()
                 self.wer.reset()
-                tensorboard_logs.update({'training_batch_wer': scores.float() / words})
+                tensorboard_logs.update({'training_batch_bleu': scores.float() / words})
 
         else:  # If fused Joint-Loss-WER is used
             # Fused joint step
@@ -419,7 +419,7 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin):
             }
 
             if compute_wer:
-                tensorboard_logs.update({'training_batch_wer': wer})
+                tensorboard_logs.update({'training_batch_bleu': wer})
 
         if self.ctc_loss_weight > 0:
             log_probs = self.ctc_decoder(encoder_output=encoded)
@@ -438,7 +438,7 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin):
                 )
                 ctc_wer, _, _ = self.ctc_wer.compute()
                 self.ctc_wer.reset()
-                tensorboard_logs.update({'training_batch_wer_ctc': ctc_wer})
+                tensorboard_logs.update({'training_batch_bleu_ctc': ctc_wer})
 
         # note that we want to apply interctc independent of whether main ctc
         # loss is used or not (to allow rnnt + interctc training).
@@ -628,14 +628,14 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin):
             test_loss_log = {'test_loss': test_loss_mean}
         else:
             test_loss_log = {}
-        wer_num = torch.stack([x['test_wer_num'] for x in outputs]).sum()
-        wer_denom = torch.stack([x['test_wer_denom'] for x in outputs]).sum()
-        tensorboard_logs = {**test_loss_log, 'test_wer': wer_num.float() / wer_denom}
+        wer_num = torch.stack([x['test_bleu_num'] for x in outputs]).sum()
+        wer_denom = torch.stack([x['test_bleu_denom'] for x in outputs]).sum()
+        tensorboard_logs = {**test_loss_log, 'test_bleu': wer_num.float() / wer_denom}
 
         if self.ctc_loss_weight > 0:
-            ctc_wer_num = torch.stack([x['test_wer_num_ctc'] for x in outputs]).sum()
-            ctc_wer_denom = torch.stack([x['test_wer_denom_ctc'] for x in outputs]).sum()
-            tensorboard_logs['test_wer_ctc'] = ctc_wer_num.float() / ctc_wer_denom
+            ctc_wer_num = torch.stack([x['test_bleu_num_ctc'] for x in outputs]).sum()
+            ctc_wer_denom = torch.stack([x['test_bleu_denom_ctc'] for x in outputs]).sum()
+            tensorboard_logs['test_bleu_ctc'] = ctc_wer_num.float() / ctc_wer_denom
 
         metrics = {**test_loss_log, 'log': tensorboard_logs}
         self.finalize_interctc_metrics(metrics, outputs, prefix="test_")
