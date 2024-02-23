@@ -395,11 +395,12 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin):
                     targets=translated_transcript,
                     targets_lengths=translated_transcript_len,
                 )
-                _, scores, words = self.bleu.compute()
+                bleu = self.bleu.compute(return_all_metrics=False)['bleu']
                 self.bleu.reset()
-                tensorboard_logs.update({'training_batch_bleu': scores.float() / words})
+                tensorboard_logs.update({'training_batch_bleu': bleu})
 
         else:  # If fused Joint-Loss-WER is used
+            assert(0)
             # Fused joint step
             loss_value, wer, _, _ = self.joint(
                 encoder_outputs=encoded,
@@ -515,12 +516,10 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin):
                 targets=translated_transcript,
                 targets_lengths=translated_transcript_len,
             )
-            wer, wer_num, wer_denom = self.bleu.compute()
+            bleu_returns = self.bleu.compute(prefix='val_')
             self.bleu.reset()
 
-            tensorboard_logs['val_bleu_num'] = wer_num
-            tensorboard_logs['val_bleu_denom'] = wer_denom
-            tensorboard_logs['val_bleu'] = wer
+            tensorboard_logs = {**tensorboard_logs, **bleu_returns}
 
         else:
             # If experimental fused Joint-Loss-WER is used
