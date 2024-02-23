@@ -296,7 +296,8 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
 
         # Initialize a dummy vocabulary
 #        vocabulary = self.tokenizer.tokenizer.get_vocab()
-        if 'vocab' in list(self.tokenizer.tokenizer.__dict__.keys()):
+#        print("self.tokenizer.tokenizer is", self.tokenizer.tokenizer)
+        if hasattr(self.tokenizer.tokenizer, 'vocab') and callable(self.tokenizer.tokenizer.vocab):
             vocabulary = self.tokenizer.tokenizer.vocab()
         else:
             vocabulary = self.tokenizer.tokenizer.get_vocab()
