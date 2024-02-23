@@ -296,7 +296,11 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
 
         # Initialize a dummy vocabulary
 #        vocabulary = self.tokenizer.tokenizer.get_vocab()
-        vocabulary = self.tokenizer.tokenizer.vocab()
+        if 'vocab' in list(self.tokenizer.tokenizer.__dict__.keys()):
+            vocabulary = self.tokenizer.tokenizer.vocab()
+        else:
+            vocabulary = self.tokenizer.tokenizer.get_vocab()
+            
 
         # Set the new vocabulary
         with open_dict(cfg):
