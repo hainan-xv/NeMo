@@ -26,7 +26,54 @@ from nemo.collections.asr.parts.utils import asr_module_utils
 from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
 from nemo.collections.common import tokenizers
 from nemo.utils import logging
-from nemo.collections.nlp.modules.common.tokenizer_utils import get_nmt_tokenizer
+#from nemo.collections.nlp.modules.common.tokenizer_utils import get_nmt_tokenizer
+
+from nemo.collections.common.tokenizers.youtokentome_tokenizer import YouTokenToMeTokenizer
+from typing import Dict, List, Optional
+
+def get_nmt_tokenizer(
+    library: str = 'yttm',
+    model_name: Optional[str] = None,
+    tokenizer_model: Optional[str] = None,
+    vocab_file: Optional[str] = None,
+    merges_file: Optional[str] = None,
+    special_tokens: Optional[Dict[str, str]] = None,
+    use_fast: Optional[bool] = False,
+    bpe_dropout: Optional[float] = 0.0,
+    r2l: Optional[bool] = False,
+    legacy: Optional[bool] = False,
+    delimiter: Optional[str] = None,
+):
+    """
+    Args:
+        model_name: if using a pretrained model from NeMo, HuggingFace, or Megatron
+        tokenizer_model: tokenizer model file of sentencepiece or youtokentome
+        special_tokens: dict of special tokens
+        vocab_file: path to vocab file
+        use_fast: (only for HuggingFace AutoTokenizer) set to True to use fast HuggingFace tokenizer
+        bpe_dropout: (only supported by YTTM tokenizer) BPE dropout tries to corrupt the standard segmentation procedure
+            of BPE to help model better learn word compositionality and become robust to segmentation errors.
+            It has empirically been shown to improve inference time BLEU scores.
+        r2l: Whether to return subword IDs from right to left
+    """
+    if special_tokens is None:
+        special_tokens_dict = {}
+    else:
+        special_tokens_dict = special_tokens
+
+    if (library != 'byte-level') and (
+        model_name is None and (tokenizer_model is None or not os.path.isfile(tokenizer_model))
+    ):
+        raise ValueError("No Tokenizer path provided or file does not exist!")
+
+    if library == 'yttm':
+        logging.info(f'Getting YouTokenToMeTokenizer with model: {tokenizer_model} with r2l: {r2l}.')
+        return YouTokenToMeTokenizer(model_path=tokenizer_model, bpe_dropout=bpe_dropout, r2l=r2l)
+    else:
+        raise NotImplementedError(
+            'Currently we only support "yttm", "huggingface", "sentencepiece", "megatron", and "byte-level" tokenizer'
+            'libraries.'
+        )
 
 
 class ASRBPEMixin(ABC):

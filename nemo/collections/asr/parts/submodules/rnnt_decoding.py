@@ -1350,7 +1350,7 @@ class RNNTBPEDecoding(AbstractRNNTDecoding):
     """
 
     def __init__(self, decoding_cfg, decoder, joint, tokenizer: TokenizerSpec):
-        blank_id = tokenizer.tokenizer.vocab_size  # RNNT or TDT models.
+        blank_id = tokenizer.tokenizer.vocab_size()  # RNNT or TDT models.
 
         # multi-blank RNNTs
         if hasattr(decoding_cfg, 'model_type') and decoding_cfg.model_type == 'multiblank':
