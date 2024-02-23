@@ -131,6 +131,9 @@ def __parse_item(line: str, manifest_file: str) -> Dict[str, Any]:
     else:
         item['text'] = ""
 
+    if 'translated_text' not in item:
+        assert(0)
+
     # Optional RTTM file
     if 'rttm_file' in item:
         pass
@@ -160,6 +163,7 @@ def __parse_item(line: str, manifest_file: str) -> Dict[str, Any]:
         video_file=item.get('video_file', None),
         duration=item['duration'],
         text=item['text'],
+        translated_text=item['translated_text'],
         rttm_file=item['rttm_file'],
         feature_file=item['feature_file'],
         offset=item.get('offset', None),
