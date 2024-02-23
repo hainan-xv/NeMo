@@ -59,25 +59,27 @@ def _speech_collate_fn(batch, pad_id):
                assumes the signals are 1d torch tensors (i.e. mono audio).
     """
     packed_batch = list(zip(*batch))
-    if len(packed_batch) == 5:
-        _, audio_lengths, _, tokens_lengths, sample_ids = packed_batch
-    elif len(packed_batch) == 4:
+    if len(packed_batch) == 7:
+        _, audio_lengths, _, tokens_lengths, _, tokens_lengths2, sample_ids = packed_batch
+    elif len(packed_batch) == 6:
         sample_ids = None
-        _, audio_lengths, _, tokens_lengths = packed_batch
+        _, audio_lengths, _, tokens_lengths, _, tokens_lengths2 = packed_batch
     else:
-        raise ValueError("Expects 4 or 5 tensors in the batch!")
+        raise ValueError("Expects 6 or 7 tensors in the batch!")
     max_audio_len = 0
     has_audio = audio_lengths[0] is not None
     if has_audio:
         max_audio_len = max(audio_lengths).item()
-    max_tokens_len = max(tokens_lengths).item()
 
-    audio_signal, tokens = [], []
+    max_tokens_len = max(tokens_lengths).item()
+    max_tokens_len2 = max(tokens_lengths2).item()
+
+    audio_signal, tokens, tokens2 = [], [], []
     for b in batch:
         if len(b) == 5:
-            sig, sig_len, tokens_i, tokens_i_len, _ = b
+            sig, sig_len, tokens_i, tokens_i_len, tokens_j, tokens_j_len, _ = b
         else:
-            sig, sig_len, tokens_i, tokens_i_len = b
+            sig, sig_len, tokens_i, tokens_i_len, tokens_j, tokens_j_len = b
         if has_audio:
             sig_len = sig_len.item()
             if sig_len < max_audio_len:
@@ -85,10 +87,18 @@ def _speech_collate_fn(batch, pad_id):
                 sig = torch.nn.functional.pad(sig, pad)
             audio_signal.append(sig)
         tokens_i_len = tokens_i_len.item()
+        tokens_j_len = tokens_j_len.item()
+
         if tokens_i_len < max_tokens_len:
             pad = (0, max_tokens_len - tokens_i_len)
             tokens_i = torch.nn.functional.pad(tokens_i, pad, value=pad_id)
         tokens.append(tokens_i)
+
+        if tokens_j_len < max_tokens_len2:
+            pad = (0, max_tokens_len2 - tokens_j_len)
+            tokens_j = torch.nn.functional.pad(tokens_j, pad, value=pad_id)
+
+        tokens2.append(tokens_j)
 
     if has_audio:
         audio_signal = torch.stack(audio_signal)
@@ -97,11 +107,13 @@ def _speech_collate_fn(batch, pad_id):
         audio_signal, audio_lengths = None, None
     tokens = torch.stack(tokens)
     tokens_lengths = torch.stack(tokens_lengths)
+    tokens2 = torch.stack(tokens2)
+    tokens_lengths2 = torch.stack(tokens_lengths2)
     if sample_ids is None:
-        return audio_signal, audio_lengths, tokens, tokens_lengths
+        return audio_signal, audio_lengths, tokens, tokens_lengths, tokens2, tokens_lengths2
     else:
         sample_ids = torch.tensor(sample_ids, dtype=torch.int32)
-        return audio_signal, audio_lengths, tokens, tokens_lengths, sample_ids
+        return audio_signal, audio_lengths, tokens, tokens_lengths, tokens2, tokens_lengths2, sample_ids
 
 
 class ASRManifestProcessor:
@@ -157,10 +169,22 @@ class ASRManifestProcessor:
     def process_text_by_file_id(self, file_id: str) -> Tuple[List[int], int]:
         manifest_idx = self.collection.mapping[file_id][0]
         sample = self.collection[manifest_idx]
-        return self.process_text_by_sample(sample)
+        return self.process_text_by_sample(sample), self.process_translated_text_by_sample(sample)
 
     def process_text_by_sample(self, sample: collections.ASRAudioText.OUTPUT_TYPE) -> Tuple[List[int], int]:
         t, tl = sample.text_tokens, len(sample.text_tokens)
+
+        if self.bos_id is not None:
+            t = [self.bos_id] + t
+            tl += 1
+        if self.eos_id is not None:
+            t = t + [self.eos_id]
+            tl += 1
+
+        return t, tl
+
+    def process_translated_text_by_sample(self, sample: collections.ASRAudioText.OUTPUT_TYPE) -> Tuple[List[int], int]:
+        t, tl = sample.translated_text_tokens, len(sample.translated_text_tokens)
 
         if self.bos_id is not None:
             t = [self.bos_id] + t
@@ -423,6 +447,8 @@ class _AudioTextDataset(Dataset):
             'a_sig_length': NeuralType(tuple('B'), LengthsType()),
             'transcripts': NeuralType(('B', 'T'), LabelsType()),
             'transcript_length': NeuralType(tuple('B'), LengthsType()),
+            'translated_transcripts': NeuralType(('B', 'T'), LabelsType()),
+            'translated_transcript_length': NeuralType(tuple('B'), LengthsType()),
             'sample_id': NeuralType(tuple('B'), LengthsType(), optional=True),
         }
 
@@ -485,11 +511,27 @@ class _AudioTextDataset(Dataset):
         f, fl = features, torch.tensor(features.shape[0]).long()
 
         t, tl = self.manifest_processor.process_text_by_sample(sample=sample)
+        t2, tl2 = self.manifest_processor.process_translated_text_by_sample(sample=sample)
 
         if self.return_sample_id:
-            output = f, fl, torch.tensor(t).long(), torch.tensor(tl).long(), index
+            output = (
+                f,
+                fl,
+                torch.tensor(t).long(),
+                torch.tensor(tl).long(),
+                torch.tensor(t2).long(),
+                torch.tensor(tl2).long(),
+                index,
+            )
         else:
-            output = f, fl, torch.tensor(t).long(), torch.tensor(tl).long()
+            output = (
+                f,
+                fl,
+                torch.tensor(t).long(),
+                torch.tensor(tl).long(),
+                torch.tensor(t2).long(),
+                torch.tensor(tl2).long(),
+            )
 
         return output
 
@@ -542,6 +584,8 @@ class AudioToCharDataset(_AudioTextDataset):
             'a_sig_length': NeuralType(tuple('B'), LengthsType()),
             'transcripts': NeuralType(('B', 'T'), LabelsType()),
             'transcript_length': NeuralType(tuple('B'), LengthsType()),
+            'translated_transcripts': NeuralType(('B', 'T'), LabelsType()),
+            'translated_transcript_length': NeuralType(tuple('B'), LengthsType()),
             'sample_id': NeuralType(tuple('B'), LengthsType(), optional=True),
         }
 
@@ -636,6 +680,8 @@ class AudioToBPEDataset(_AudioTextDataset):
             'a_sig_length': NeuralType(tuple('B'), LengthsType()),
             'transcripts': NeuralType(('B', 'T'), LabelsType()),
             'transcript_length': NeuralType(tuple('B'), LengthsType()),
+            'translated_transcripts': NeuralType(('B', 'T'), LabelsType()),
+            'translated_transcript_length': NeuralType(tuple('B'), LengthsType()),
             'sample_id': NeuralType(tuple('B'), LengthsType(), optional=True),
         }
 
@@ -966,19 +1012,43 @@ class _TarredAudioToTextDataset(IterableDataset):
         # Text features
         t, tl = manifest_entry.text_tokens, len(manifest_entry.text_tokens)
 
+        t2, tl2 = manifest_entry.translated_text_tokens, len(manifest_entry.translated_text_tokens)
+
         self.manifest_processor.process_text_by_sample(sample=manifest_entry)
+        self.manifest_processor.process_translated_text_by_sample(sample=manifest_entry)
 
         if self.bos_id is not None:
             t = [self.bos_id] + t
             tl += 1
+
+            t2 = [self.bos_id] + t2
+            tl2 += 1
+
         if self.eos_id is not None:
             t = t + [self.eos_id]
             tl += 1
+            t2 = t2 + [self.eos_id]
+            tl2 += 1
 
         if self.return_sample_id:
-            return f, fl, torch.tensor(t).long(), torch.tensor(tl).long(), manifest_idx
+            return (
+                f,
+                fl,
+                torch.tensor(t).long(),
+                torch.tensor(tl).long(),
+                torch.tensor(t2).long(),
+                torch.tensor(tl2).long(),
+                manifest_idx,
+            )
         else:
-            return f, fl, torch.tensor(t).long(), torch.tensor(tl).long()
+            return (
+                f,
+                fl,
+                torch.tensor(t).long(),
+                torch.tensor(tl).long(),
+                torch.tensor(t2).long(),
+                torch.tensor(tl2).long(),
+            )
 
     def get_manifest_sample(self, sample_id):
         return self.manifest_processor.collection[sample_id]
