@@ -72,7 +72,7 @@ class WarmupPolicy(_LRScheduler):
         if step <= self.warmup_steps and self.warmup_steps > 0:
             return self._get_warmup_lr(step)
 
-        if step > self.max_steps:
+        if (self.max_steps is not None) and (step > self.max_steps):
             return [self.min_lr for _ in self.base_lrs]
 
         return self._get_lr(step)
@@ -832,8 +832,13 @@ def prepare_lr_scheduler(
         monitor = 'loss'
 
     # Store exact max_steps if it is provided
-    if 'max_steps' in scheduler_config and scheduler_config['max_steps'] is not None:
-        max_steps = scheduler_config['max_steps']
+    max_steps_from_cfg = scheduler_config.get('max_steps')
+    if max_steps_from_cfg is not None:
+        if max_steps_from_cfg == -1:
+            logging.warning('`max_steps` is set to -1 in the scheduler config, scheduler will not be instantiated')
+            return None
+        assert max_steps_from_cfg >= 0, "`max_steps` must be a non-negative integer"
+        max_steps = max_steps_from_cfg
 
     elif 't_max_epochs' in scheduler_config:
         # Compute effective max_steps if t_max_epochs is provided
@@ -975,5 +980,6 @@ AVAILABLE_SCHEDULERS = {
 }
 
 EPOCH_SCHEDULERS = {
+    'ExponentialLR': pt_scheduler.ExponentialLR,
     'ReduceLROnPlateau': pt_scheduler.ReduceLROnPlateau,
 }

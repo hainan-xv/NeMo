@@ -178,13 +178,17 @@ class DialogueGPTClassificationModel(NLPModel):
         return {'loss': loss}
 
     def validation_step(self, batch, batch_idx):
-        return self.eval_step_helper(batch=batch)
+        loss = self.eval_step_helper(batch=batch)
+        self.validation_step_outputs.append(loss)
+        return loss
 
-    def validation_epoch_end(self, outputs):
-        self.eval_epoch_end(outputs, mode='val')
+    def on_validation_epoch_end(self):
+        self.eval_epoch_end(self.validation_step_outputs, mode='val')
+        self.validation_step_outputs.clear()  # free memory
 
-    def test_epoch_end(self, outputs):
-        self.eval_epoch_end(outputs, mode='test')
+    def on_test_epoch_end(self):
+        self.eval_epoch_end(self.test_step_outputs, mode='test')
+        self.test_step_outputs.clear()  # free memory
 
     def eval_epoch_end(self, outputs, mode='val'):
 
@@ -261,7 +265,9 @@ class DialogueGPTClassificationModel(NLPModel):
                 torch.save(self.language_model.state_dict(), filename)
 
     def test_step(self, batch, batch_idx):
-        return self.eval_step_helper(batch=batch, mode='test')
+        loss = self.eval_step_helper(batch=batch, mode='test')
+        self.test_step_outputs.append(loss)
+        return loss
 
     # for inference only
     def predict_step(self, batch, batch_idx, dataloader_idx=None):
@@ -291,7 +297,7 @@ class DialogueGPTClassificationModel(NLPModel):
 
     def get_virtual_prompt_ids_for_megatron_gpt(self, input_ids):
         if (
-            self.cfg.virtual_prompt_style == VirtualPromptStyle.PROMPT_TUNING
+            self.cfg.virtual_prompt_style == VirtualPromptStyle.P_TUNING
             or not self.prompt_learning
             or self.trainer.testing
         ):
@@ -712,10 +718,12 @@ class DialogueGPTClassificationModel(NLPModel):
     def setup(self, stage=None):
         super().setup(stage)
         if self.cfg.library == "megatron" and self.prompt_learning and stage == "fit":
-            if self.cfg.virtual_prompt_style == VirtualPromptStyle.PROMPT_TUNING:
-                self.language_model.init_new_prompts()
-            else:
+            if self.cfg.virtual_prompt_style == VirtualPromptStyle.P_TUNING:
                 self.language_model.init_prompt_encoder()
+            else:
+                raise ValueError(
+                    "Use model.virtual_prompt_style='p-tuning' with model.p_tuning.encoder_type='embedding' to enable prompt-tuning."
+                )
 
     def update_data_dirs(self, data_dir: str, dialogues_example_dir: str):
         """

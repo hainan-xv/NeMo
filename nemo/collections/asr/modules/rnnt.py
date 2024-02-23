@@ -302,7 +302,7 @@ class StatelessTransducerDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable):
 
     def initialize_state(self, y: torch.Tensor) -> List[torch.Tensor]:
         batch = y.size(0)
-        state = [torch.ones([batch, self.context_size], dtype=y.dtype, device=y.device) * self.blank_idx]
+        state = [torch.ones([batch, self.context_size], dtype=torch.long, device=y.device) * self.blank_idx]
         return state
 
     def batch_initialize_states(self, batch_states: List[torch.Tensor], decoder_states: List[List[torch.Tensor]]):
@@ -368,6 +368,21 @@ class StatelessTransducerDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable):
 
         return state_list
 
+    @classmethod
+    def batch_replace_states_mask(
+        cls, src_states: list[torch.Tensor], dst_states: list[torch.Tensor], mask: torch.Tensor,
+    ):
+        """Replace states in dst_states with states from src_states using the mask"""
+        # same as `dst_states[0][mask] = src_states[0][mask]`, but non-blocking
+        torch.where(mask.unsqueeze(-1), src_states[0], dst_states[0], out=dst_states[0])
+
+    def batch_split_states(self, batch_states: list[torch.Tensor]) -> list[list[torch.Tensor]]:
+        """
+        Split states into a list of states.
+        Useful for splitting the final state for converting results of the decoding algorithm to Hypothesis class.
+        """
+        return [sub_state.split(1, dim=0) for sub_state in batch_states]
+
     def batch_copy_states(
         self,
         old_states: List[torch.Tensor],
@@ -397,6 +412,22 @@ class StatelessTransducerDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable):
             old_states[0][ids, :] = new_states[0][ids, :]
 
         return old_states
+
+    def mask_select_states(
+        self, states: Optional[List[torch.Tensor]], mask: torch.Tensor
+    ) -> Optional[List[torch.Tensor]]:
+        """
+        Return states by mask selection
+        Args:
+            states: states for the batch
+            mask: boolean mask for selecting states; batch dimension should be the same as for states
+
+        Returns:
+            states filtered by mask
+        """
+        if states is None:
+            return None
+        return [states[0][mask]]
 
     def batch_score_hypothesis(
         self, hypotheses: List[rnnt_utils.Hypothesis], cache: Dict[Tuple[int], Any], batch_states: List[torch.Tensor]
@@ -774,31 +805,32 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
         )
         return layers
 
-    def initialize_state(self, y: torch.Tensor) -> List[torch.Tensor]:
+    def initialize_state(self, y: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Initialize the state of the RNN layers, with same dtype and device as input `y`.
+        Initialize the state of the LSTM layers, with same dtype and device as input `y`.
+        LSTM accepts a tuple of 2 tensors as a state.
 
         Args:
             y: A torch.Tensor whose device the generated states will be placed on.
 
         Returns:
-            List of torch.Tensor, each of shape [L, B, H], where
+            Tuple of 2 tensors, each of shape [L, B, H], where
                 L = Number of RNN layers
                 B = Batch size
                 H = Hidden size of RNN.
         """
         batch = y.size(0)
         if self.random_state_sampling and self.training:
-            state = [
+            state = (
                 torch.randn(self.pred_rnn_layers, batch, self.pred_hidden, dtype=y.dtype, device=y.device),
                 torch.randn(self.pred_rnn_layers, batch, self.pred_hidden, dtype=y.dtype, device=y.device),
-            ]
+            )
 
         else:
-            state = [
+            state = (
                 torch.zeros(self.pred_rnn_layers, batch, self.pred_hidden, dtype=y.dtype, device=y.device),
                 torch.zeros(self.pred_rnn_layers, batch, self.pred_hidden, dtype=y.dtype, device=y.device),
-            ]
+            )
         return state
 
     def score_hypothesis(
@@ -1014,6 +1046,29 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
 
         return state_list
 
+    @classmethod
+    def batch_replace_states_mask(
+        cls,
+        src_states: Tuple[torch.Tensor, torch.Tensor],
+        dst_states: Tuple[torch.Tensor, torch.Tensor],
+        mask: torch.Tensor,
+    ):
+        """Replace states in dst_states with states from src_states using the mask"""
+        # same as `dst_states[i][mask] = src_states[i][mask]`, but non-blocking
+        # we need to cast, since LSTM is calculated in fp16 even if autocast to bfloat16 is enabled
+        dtype = dst_states[0].dtype
+        torch.where(mask.unsqueeze(0).unsqueeze(-1), src_states[0].to(dtype), dst_states[0], out=dst_states[0])
+        torch.where(mask.unsqueeze(0).unsqueeze(-1), src_states[1].to(dtype), dst_states[1], out=dst_states[1])
+
+    def batch_split_states(
+        self, batch_states: Tuple[torch.Tensor, torch.Tensor]
+    ) -> list[Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Split states into a list of states.
+        Useful for splitting the final state for converting results of the decoding algorithm to Hypothesis class.
+        """
+        return list(zip(batch_states[0].split(1, dim=1), batch_states[1].split(1, dim=1)))
+
     def batch_copy_states(
         self,
         old_states: List[torch.Tensor],
@@ -1046,6 +1101,21 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
                 old_states[state_id][:, ids, :] += value
 
         return old_states
+
+    def mask_select_states(
+        self, states: Tuple[torch.Tensor, torch.Tensor], mask: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Return states by mask selection
+        Args:
+            states: states for the batch
+            mask: boolean mask for selecting states; batch dimension should be the same as for states
+
+        Returns:
+            states filtered by mask
+        """
+        # LSTM in PyTorch returns a tuple of 2 tensors as a state
+        return states[0][:, mask], states[1][:, mask]
 
     # Adapter method overrides
     def add_adapter(self, name: str, cfg: DictConfig):
@@ -1235,6 +1305,9 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         # Flag needed for RNNT export support
         self._rnnt_export = False
 
+        # to change, requires running ``model.temperature = T`` explicitly
+        self.temperature = 1.0
+
     @typecheck()
     def forward(
         self,
@@ -1291,8 +1364,8 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
                 # Extract the sub batch inputs
                 # sub_enc = encoder_outputs[begin:end, ...]
                 # sub_transcripts = transcripts[begin:end, ...]
-                sub_enc = encoder_outputs.narrow(dim=0, start=begin, length=end - begin)
-                sub_transcripts = transcripts.narrow(dim=0, start=begin, length=end - begin)
+                sub_enc = encoder_outputs.narrow(dim=0, start=begin, length=int(end - begin))
+                sub_transcripts = transcripts.narrow(dim=0, start=begin, length=int(end - begin))
 
                 sub_enc_lens = encoder_lengths[begin:end]
                 sub_transcript_lens = transcript_lengths[begin:end]
@@ -1306,15 +1379,15 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
                     # Reduce encoder length to preserve computation
                     # Encoder: [sub-batch, T, D] -> [sub-batch, T', D]; T' < T
                     if sub_enc.shape[1] != max_sub_enc_length:
-                        sub_enc = sub_enc.narrow(dim=1, start=0, length=max_sub_enc_length)
+                        sub_enc = sub_enc.narrow(dim=1, start=0, length=int(max_sub_enc_length))
 
                     # sub_dec = decoder_outputs[begin:end, ...]  # [sub-batch, U, D]
-                    sub_dec = decoder_outputs.narrow(dim=0, start=begin, length=end - begin)  # [sub-batch, U, D]
+                    sub_dec = decoder_outputs.narrow(dim=0, start=begin, length=int(end - begin))  # [sub-batch, U, D]
 
                     # Reduce decoder length to preserve computation
                     # Decoder: [sub-batch, U, D] -> [sub-batch, U', D]; U' < U
                     if sub_dec.shape[1] != max_sub_transcript_length + 1:
-                        sub_dec = sub_dec.narrow(dim=1, start=0, length=max_sub_transcript_length + 1)
+                        sub_dec = sub_dec.narrow(dim=1, start=0, length=int(max_sub_transcript_length + 1))
 
                     # Perform joint => [sub-batch, T', U', V + 1]
                     sub_joint = self.joint(sub_enc, sub_dec)
@@ -1324,7 +1397,7 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
                     # Reduce transcript length to correct alignment
                     # Transcript: [sub-batch, L] -> [sub-batch, L']; L' <= L
                     if sub_transcripts.shape[1] != max_sub_transcript_length:
-                        sub_transcripts = sub_transcripts.narrow(dim=1, start=0, length=max_sub_transcript_length)
+                        sub_transcripts = sub_transcripts.narrow(dim=1, start=0, length=int(max_sub_transcript_length))
 
                     # Compute sub batch loss
                     # preserve loss reduction type
@@ -1356,7 +1429,12 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
                     sub_transcripts = sub_transcripts.detach()
 
                     # Update WER on each process without syncing
-                    self.wer.update(sub_enc, sub_enc_lens, sub_transcripts, sub_transcript_lens)
+                    self.wer.update(
+                        predictions=sub_enc,
+                        predictions_lengths=sub_enc_lens,
+                        targets=sub_transcripts,
+                        targets_lengths=sub_transcript_lens,
+                    )
 
                 del sub_enc, sub_transcripts, sub_enc_lens, sub_transcript_lens
 
@@ -1376,9 +1454,33 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
 
             return losses, wer, wer_num, wer_denom
 
-    def joint(self, f: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
+    def project_encoder(self, encoder_output: torch.Tensor) -> torch.Tensor:
         """
-        Compute the joint step of the network.
+        Project the encoder output to the joint hidden dimension.
+
+        Args:
+            encoder_output: A torch.Tensor of shape [B, T, D]
+
+        Returns:
+            A torch.Tensor of shape [B, T, H]
+        """
+        return self.enc(encoder_output)
+
+    def project_prednet(self, prednet_output: torch.Tensor) -> torch.Tensor:
+        """
+        Project the Prediction Network (Decoder) output to the joint hidden dimension.
+
+        Args:
+            prednet_output: A torch.Tensor of shape [B, U, D]
+
+        Returns:
+            A torch.Tensor of shape [B, U, H]
+        """
+        return self.pred(prednet_output)
+
+    def joint_after_projection(self, f: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
+        """
+        Compute the joint step of the network after projection.
 
         Here,
         B = Batch size
@@ -1406,14 +1508,8 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         Returns:
             Logits / log softmaxed tensor of shape (B, T, U, V + 1).
         """
-        # f = [B, T, H1]
-        f = self.enc(f)
-        f.unsqueeze_(dim=2)  # (B, T, 1, H)
-
-        # g = [B, U, H2]
-        g = self.pred(g)
-        g.unsqueeze_(dim=1)  # (B, 1, U, H)
-
+        f = f.unsqueeze(dim=2)  # (B, T, 1, H)
+        g = g.unsqueeze(dim=1)  # (B, 1, U, H)
         inp = f + g  # [B, T, U, H]
 
         del f, g
@@ -1432,10 +1528,16 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         # If log_softmax is automatic
         if self.log_softmax is None:
             if not res.is_cuda:  # Use log softmax only if on CPU
-                res = res.log_softmax(dim=-1)
+                if self.temperature != 1.0:
+                    res = (res / self.temperature).log_softmax(dim=-1)
+                else:
+                    res = res.log_softmax(dim=-1)
         else:
             if self.log_softmax:
-                res = res.log_softmax(dim=-1)
+                if self.temperature != 1.0:
+                    res = (res / self.temperature).log_softmax(dim=-1)
+                else:
+                    res = res.log_softmax(dim=-1)
 
         return res
 
@@ -1524,7 +1626,7 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
 
     @property
     def fused_batch_size(self):
-        return self._fuse_loss_wer
+        return self._fused_batch_size
 
     def set_fused_batch_size(self, fused_batch_size):
         self._fused_batch_size = fused_batch_size
@@ -1760,8 +1862,8 @@ class SampledRNNTJoint(RNNTJoint):
             # Extract the sub batch inputs
             # sub_enc = encoder_outputs[begin:end, ...]
             # sub_transcripts = transcripts[begin:end, ...]
-            sub_enc = encoder_outputs.narrow(dim=0, start=begin, length=end - begin)
-            sub_transcripts = transcripts.narrow(dim=0, start=begin, length=end - begin)
+            sub_enc = encoder_outputs.narrow(dim=0, start=begin, length=int(end - begin))
+            sub_transcripts = transcripts.narrow(dim=0, start=begin, length=int(end - begin))
 
             sub_enc_lens = encoder_lengths[begin:end]
             sub_transcript_lens = transcript_lengths[begin:end]
@@ -1775,20 +1877,20 @@ class SampledRNNTJoint(RNNTJoint):
                 # Reduce encoder length to preserve computation
                 # Encoder: [sub-batch, T, D] -> [sub-batch, T', D]; T' < T
                 if sub_enc.shape[1] != max_sub_enc_length:
-                    sub_enc = sub_enc.narrow(dim=1, start=0, length=max_sub_enc_length)
+                    sub_enc = sub_enc.narrow(dim=1, start=0, length=int(max_sub_enc_length))
 
                 # sub_dec = decoder_outputs[begin:end, ...]  # [sub-batch, U, D]
-                sub_dec = decoder_outputs.narrow(dim=0, start=begin, length=end - begin)  # [sub-batch, U, D]
+                sub_dec = decoder_outputs.narrow(dim=0, start=begin, length=int(end - begin))  # [sub-batch, U, D]
 
                 # Reduce decoder length to preserve computation
                 # Decoder: [sub-batch, U, D] -> [sub-batch, U', D]; U' < U
                 if sub_dec.shape[1] != max_sub_transcript_length + 1:
-                    sub_dec = sub_dec.narrow(dim=1, start=0, length=max_sub_transcript_length + 1)
+                    sub_dec = sub_dec.narrow(dim=1, start=0, length=int(max_sub_transcript_length + 1))
 
                 # Reduce transcript length to correct alignment
                 # Transcript: [sub-batch, L] -> [sub-batch, L']; L' <= L
                 if sub_transcripts.shape[1] != max_sub_transcript_length:
-                    sub_transcripts = sub_transcripts.narrow(dim=1, start=0, length=max_sub_transcript_length)
+                    sub_transcripts = sub_transcripts.narrow(dim=1, start=0, length=int(max_sub_transcript_length))
 
                 # Perform sampled joint => [sub-batch, T', U', {V' < V} + 1}]
                 sub_joint, sub_transcripts_remapped = self.sampled_joint(
@@ -1835,7 +1937,12 @@ class SampledRNNTJoint(RNNTJoint):
                 sub_transcripts = sub_transcripts.detach()
 
                 # Update WER on each process without syncing
-                self.wer.update(sub_enc, sub_enc_lens, sub_transcripts, sub_transcript_lens)
+                self.wer.update(
+                    predictions=sub_enc,
+                    predictions_lengths=sub_enc_lens,
+                    targets=sub_transcripts,
+                    targets_lengths=sub_transcript_lens,
+                )
 
             del sub_enc, sub_transcripts, sub_enc_lens, sub_transcript_lens
 

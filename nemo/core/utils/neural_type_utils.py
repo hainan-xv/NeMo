@@ -13,11 +13,14 @@
 # limitations under the License.
 
 from collections import defaultdict
+from typing import Dict, List, Optional
 
 from nemo.core.neural_types import AxisKind, NeuralType
 
 
-def get_io_names(types, disabled_names):
+def get_io_names(types: Optional[Dict[str, NeuralType]], disabled_names: List[str]) -> List[str]:
+    if types is None:
+        return []
     names = list(types.keys())
     for name in disabled_names:
         if name in names:
@@ -59,7 +62,8 @@ def extract_dynamic_axes(name: str, ntype: NeuralType):
 
 def get_dynamic_axes(types, names):
     dynamic_axes = defaultdict(list)
-    for name in names:
-        if name in types:
-            dynamic_axes.update(extract_dynamic_axes(name, types[name]))
+    if names is not None:
+        for name in names:
+            if name in types:
+                dynamic_axes.update(extract_dynamic_axes(name, types[name]))
     return dynamic_axes

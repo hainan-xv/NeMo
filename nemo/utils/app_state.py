@@ -54,6 +54,9 @@ class AppState(metaclass=Singleton):
         self._data_parallel_size = None
         self._data_parallel_group = None
         self._megatron_checkpoint_version = None
+        self._use_fp8 = False
+        self._context_parallel_size = None
+        self._init_mpi_proc_gruop = False
 
         self._random_seed = None
 
@@ -345,6 +348,54 @@ class AppState(metaclass=Singleton):
                 group:  Data parallel group.
         """
         self._data_parallel_group = group
+
+    @property
+    def use_fp8(self):
+        """ Property returns the use of fp8 precision.
+            Returns:
+                Use of FP8.
+        """
+        return self._use_fp8
+
+    @use_fp8.setter
+    def use_fp8(self, use_fp8):
+        """ Property sets the use of fp8 precision.
+            Args:
+                use_fp8:  Use of FP8.
+        """
+        self._use_fp8 = use_fp8
+
+    @property
+    def context_parallel_size(self):
+        """ Property returns the number of GPUs in each context parallel group.
+            Returns:
+                Number of GPUs in each context parallel group.
+        """
+        return self._context_parallel_size
+
+    @context_parallel_size.setter
+    def context_parallel_size(self, size):
+        """ Property sets the number of GPUs in each context parallel group.
+            Args:
+                size (int):  Number of GPUs in each context parallel group.
+        """
+        self._context_parallel_size = size
+
+    @property
+    def init_mpi_proc_group(self):
+        """ Property sets the initialization of mpi process group.
+            Returns:
+                Initialize mpi process group.
+        """
+        return self._init_mpi_proc_group
+
+    @init_mpi_proc_group.setter
+    def init_mpi_proc_group(self, init_mpi_proc_group):
+        """ Property sets the initialization of mpi process group.
+            Args:
+                init_mpi_proc_group:  Initialize mpi process group.
+        """
+        self._init_mpi_proc_group = init_mpi_proc_group
 
     @property
     def random_seed(self):

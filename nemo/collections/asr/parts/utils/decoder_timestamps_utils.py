@@ -21,9 +21,14 @@ import torch
 from omegaconf import OmegaConf
 
 import nemo.collections.asr as nemo_asr
-from nemo.collections.asr.metrics.wer import WER, CTCDecoding, CTCDecodingConfig
-from nemo.collections.asr.metrics.wer_bpe import WERBPE, CTCBPEDecoding, CTCBPEDecodingConfig
+from nemo.collections.asr.metrics.wer import WER
 from nemo.collections.asr.models import EncDecCTCModel, EncDecCTCModelBPE
+from nemo.collections.asr.parts.submodules.ctc_decoding import (
+    CTCBPEDecoding,
+    CTCBPEDecodingConfig,
+    CTCDecoding,
+    CTCDecodingConfig,
+)
 from nemo.collections.asr.parts.utils.audio_utils import get_samples
 from nemo.collections.asr.parts.utils.speaker_utils import audio_rttm_map, get_uniqname_from_filepath
 from nemo.collections.asr.parts.utils.streaming_utils import AudioFeatureIterator, FrameBatchASR
@@ -44,7 +49,7 @@ def if_none_get_default(param, default_value):
     return (param, default_value)[param is None]
 
 
-class WERBPE_TS(WERBPE):
+class WERBPE_TS(WER):
     """
     This is WERBPE_TS class that is modified for generating word_timestamps with logits.
     The functions in WER class is modified to save the word_timestamps whenever BPE token
@@ -95,9 +100,9 @@ class WERBPE_TS(WERBPE):
 
             hypothesis = self.decode_tokens_to_str_with_ts(decoded_prediction)
             hypothesis = hypothesis.replace(unk, '')
-            word_ts = self.get_ts_from_decoded_prediction(decoded_prediction, hypothesis, char_ts)
+            word_ts, word_seq = self.get_ts_from_decoded_prediction(decoded_prediction, hypothesis, char_ts)
 
-            hypotheses.append(hypothesis)
+            hypotheses.append(" ".join(word_seq))
             timestamps.append(timestamp_list)
             word_timestamps.append(word_ts)
         return hypotheses, timestamps, word_timestamps
@@ -110,7 +115,9 @@ class WERBPE_TS(WERBPE):
         token_list = self.decoding.tokenizer.ids_to_tokens(tokens)
         return token_list
 
-    def get_ts_from_decoded_prediction(self, decoded_prediction: List[str], hypothesis: List[str], char_ts: List[str]):
+    def get_ts_from_decoded_prediction(
+        self, decoded_prediction: List[str], hypothesis: str, char_ts: List[str]
+    ) -> Tuple[List[List[float]], List[str]]:
         decoded_char_list = self.decoding.tokenizer.ids_to_tokens(decoded_prediction)
         stt_idx, end_idx = 0, len(decoded_char_list) - 1
         stt_ch_idx, end_ch_idx = 0, 0
@@ -122,10 +129,8 @@ class WERBPE_TS(WERBPE):
             # If the symbol is space and not an end of the utterance, move on
             if idx != end_idx and (space == ch and space in decoded_char_list[idx + 1]):
                 continue
-            # If the symbol is unkown symbol such as '<unk>' symbol, move on
-            elif ch in ['<unk>']:
-                continue
 
+            # If the word does not containg space (the start of the word token), keep counting
             if (idx == stt_idx or space == decoded_char_list[idx - 1] or (space in ch and len(ch) > 1)) and (
                 ch != space
             ):
@@ -133,15 +138,20 @@ class WERBPE_TS(WERBPE):
                 stt_ch_idx = idx
                 word_open_flag = True
 
-            if word_open_flag and ch != space and (idx == end_idx or space in decoded_char_list[idx + 1]):
+            # If this char has `word_open_flag=True` and meets any of one of the following condition:
+            # (1) last word (2) unknown word (3) start symbol in the following word,
+            # close the `word_open_flag` and add the word to the `word_seq` list.
+            close_cond = idx == end_idx or ch in ['<unk>'] or space in decoded_char_list[idx + 1]
+            if (word_open_flag and ch != space) and close_cond:
                 _end = round(char_ts[idx] + self.time_stride, 2)
                 end_ch_idx = idx
                 word_open_flag = False
                 word_ts.append([_stt, _end])
                 stitched_word = ''.join(decoded_char_list[stt_ch_idx : end_ch_idx + 1]).replace(space, '')
                 word_seq.append(stitched_word)
+
         assert len(word_ts) == len(hypothesis.split()), "Text hypothesis does not match word timestamps."
-        return word_ts
+        return word_ts, word_seq
 
 
 class WER_TS(WER):
@@ -227,7 +237,7 @@ def get_wer_feat_logit(audio_file_path, asr, frame_len, tokens_per_chunk, delay,
     return hyp, tokens, log_prob
 
 
-class FrameBatchASR_Logits(FrameBatchASR):
+class FrameBatchASRLogits(FrameBatchASR):
     """
     A class for streaming frame-based ASR.
     Inherits from FrameBatchASR and adds new capability of returning the logit output.
@@ -255,10 +265,9 @@ class FrameBatchASR_Logits(FrameBatchASR):
         self.set_frame_reader(frame_reader)
 
     @torch.no_grad()
-    def _get_batch_preds(self):
+    def _get_batch_preds(self, keep_logits):
         device = self.asr_model.device
         for batch in iter(self.data_loader):
-
             feat_signal, feat_signal_len = batch
             feat_signal, feat_signal_len = feat_signal.to(device), feat_signal_len.to(device)
             log_probs, encoded_len, predictions = self.asr_model(
@@ -267,9 +276,12 @@ class FrameBatchASR_Logits(FrameBatchASR):
             preds = torch.unbind(predictions)
             for pred in preds:
                 self.all_preds.append(pred.cpu().numpy())
+            # Always keep logits in FrameBatchASRLogits
+            _ = keep_logits
             log_probs_tup = torch.unbind(log_probs)
             for log_prob in log_probs_tup:
                 self.all_logprobs.append(log_prob)
+            del log_probs, log_probs_tup
             del encoded_len
             del predictions
 
@@ -423,10 +435,12 @@ class ASRDecoderTimeStamps:
         )
 
         with torch.cuda.amp.autocast():
-            transcript_logits_list = asr_model.transcribe(
-                self.audio_file_list, batch_size=self.asr_batch_size, logprobs=True
-            )
+            transcript_hyps_list = asr_model.transcribe(
+                self.audio_file_list, batch_size=self.asr_batch_size, return_hypotheses=True
+            )  # type: List[nemo_asr.parts.Hypothesis]
+            transcript_logits_list = [hyp.alignments for hyp in transcript_hyps_list]
             for idx, logit_np in enumerate(transcript_logits_list):
+                logit_np = logit_np.cpu().numpy()
                 uniq_id = get_uniqname_from_filepath(self.audio_file_list[idx])
                 if self.beam_search_decoder:
                     logging.info(
@@ -549,10 +563,12 @@ class ASRDecoderTimeStamps:
         )
 
         with torch.cuda.amp.autocast():
-            transcript_logits_list = asr_model.transcribe(
-                self.audio_file_list, batch_size=self.asr_batch_size, logprobs=True
-            )
+            transcript_hyps_list = asr_model.transcribe(
+                self.audio_file_list, batch_size=self.asr_batch_size, return_hypotheses=True
+            )  # type: List[nemo_asr.parts.Hypothesis]
+            transcript_logits_list = [hyp.alignments for hyp in transcript_hyps_list]
             for idx, logit_np in enumerate(transcript_logits_list):
+                log_prob = logit_np.cpu().numpy()
                 uniq_id = get_uniqname_from_filepath(self.audio_file_list[idx])
                 if self.beam_search_decoder:
                     logging.info(
@@ -630,7 +646,7 @@ class ASRDecoderTimeStamps:
             log_prediction=asr_model._cfg.get("log_prediction", False),
         )
 
-        frame_asr = FrameBatchASR_Logits(
+        frame_asr = FrameBatchASRLogits(
             asr_model=asr_model,
             frame_len=self.chunk_len_in_sec,
             total_buffer=self.total_buffer_in_secs,

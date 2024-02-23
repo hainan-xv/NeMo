@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import concurrent
+import itertools
 import multiprocessing
 import os
-import shutil
+import random
 import warnings
 from typing import Dict, Iterable, List, Optional, Tuple, Union
 
@@ -29,20 +31,30 @@ from omegaconf import DictConfig, OmegaConf
 from scipy.signal import convolve
 from scipy.signal.windows import cosine, hamming, hann
 from scipy.spatial.transform import Rotation
-from scipy.stats import halfnorm
-from tqdm import tqdm, trange
+from tqdm import tqdm
 
+from nemo.collections.asr.parts.preprocessing.perturb import process_augmentations
 from nemo.collections.asr.parts.preprocessing.segment import AudioSegment
-from nemo.collections.asr.parts.utils.audio_utils import db2mag, mag2db, pow2db, rms
-from nemo.collections.asr.parts.utils.manifest_utils import (
-    create_manifest,
-    create_segment_manifest,
-    read_manifest,
-    write_ctm,
-    write_manifest,
-    write_text,
+from nemo.collections.asr.parts.utils.audio_utils import db2mag, generate_approximate_noise_field, mag2db, pow2db, rms
+from nemo.collections.asr.parts.utils.data_simulation_utils import (
+    DataAnnotator,
+    SpeechSampler,
+    build_speaker_samples_map,
+    get_background_noise,
+    get_cleaned_base_path,
+    get_random_offset_index,
+    get_speaker_ids,
+    get_speaker_samples,
+    get_split_points_in_alignments,
+    load_speaker_sample,
+    normalize_audio,
+    per_speaker_normalize,
+    perturb_audio,
+    read_audio_from_buffer,
+    read_noise_manifest,
 )
-from nemo.collections.asr.parts.utils.speaker_utils import labels_to_rttmfile
+from nemo.collections.asr.parts.utils.manifest_utils import read_manifest, write_manifest
+from nemo.collections.asr.parts.utils.speaker_utils import get_overlap_range, is_overlap, merge_float_intervals
 from nemo.utils import logging
 
 try:
@@ -60,53 +72,48 @@ except ImportError:
     GPURIR = False
 
 
-def clamp_min_list(target_list: List[float], min_val: float) -> List[float]:
-    """
-    Clamp numbers in the given list with `min_val`.
-    Args:
-        target_list (list):
-            List containing floating point numbers
-        min_val (float):
-            Desired minimum value to clamp the numbers in `target_list`
-
-    Returns:
-        (list) List containing clamped numbers
-    """
-    return [max(x, min_val) for x in target_list]
-
-
-def clamp_max_list(target_list: List[float], max_val: float) -> List[float]:
-    """
-    Clamp numbers in the given list with `max_val`.
-    Args:
-        target_list (list):
-            List containing floating point numbers
-        min_val (float):
-            Desired maximum value to clamp the numbers in `target_list`
-
-    Returns:
-        (list) List containing clamped numbers
-    """
-    return [min(x, max_val) for x in target_list]
-
-
 class MultiSpeakerSimulator(object):
     """
     Multispeaker Audio Session Simulator - Simulates multispeaker audio sessions using single-speaker audio files and 
     corresponding word alignments.
 
+    Change Log:
+    v1.0: Dec 2022
+        - First working verison, supports multispeaker simulation with overlaps, silence and RIR
+        v1.0.1: Feb 2023
+            - Multi-GPU support for speed up 
+            - Faster random sampling routine 
+            - Fixed sentence duration bug 
+            - Silence and overlap length sampling algorithms are updated to guarantee `mean_silence` approximation
+        v1.0.2: March 2023
+            - Added support for segment-level gain perturbation and session-level white-noise perturbation
+            - Modified speaker sampling mechanism to include as many speakers as possible in each data-generation run
+            - Added chunking mechanism to avoid freezing in multiprocessing processes
+
+    v1.1.0 March 2023
+        - Faster audio-file loading with maximum audio duration parameter
+        - Re-organized MultiSpeakerSimulator class and moved util functions to util files.
+        v1.1.1 March 2023
+            - Changed `silence_mean` to use exactly the same sampling equation as `overlap_mean`.
+
+
     Args:
         cfg: OmegaConf configuration loaded from yaml file.
 
     Parameters:
-    manifest_filepath (str): Manifest file with paths to single speaker audio files
-    sr (int): Sampling rate of the input audio files from the manifest
-    random_seed (int): Seed to random number generator
+      manifest_filepath (str): Manifest file with paths to single speaker audio files
+      sr (int): Sampling rate of the input audio files from the manifest
+      random_seed (int): Seed to random number generator
+
     session_config:
       num_speakers (int): Number of unique speakers per multispeaker audio session
       num_sessions (int): Number of sessions to simulate
-      session_length (int): Length of each simulated multispeaker audio session (seconds)
+      session_length (int): Length of each simulated multispeaker audio session (seconds). Short sessions 
+                            (e.g. ~240 seconds) tend to fall short of the expected overlap-ratio and silence-ratio.
+    
     session_params:
+      max_audio_read_sec (int): The maximum audio length in second when loading an audio file. 
+                                The bigger the number, the slower the reading speed. Should be greater than 2.5 second.
       sentence_length_params (list): k,p values for a negative_binomial distribution which is sampled to get the 
                                      sentence length (in number of words)
       dominance_var (float): Variance in speaker dominance (where each speaker's dominance is sampled from a normal 
@@ -115,13 +122,21 @@ class MultiSpeakerSimulator(object):
       min_dominance (float): Minimum percentage of speaking time per speaker (note that this can cause the dominance of 
                              the other speakers to be slightly reduced)
       turn_prob (float): Probability of switching speakers after each utterance
-      mean_overlap (float): Mean proportion of overlap in the overall speaking time (overlap lengths are sampled from 
-                            half normal distribution)
-      mean_silence (float): Mean proportion of silence to speaking time in the audio session (overlap lengths are 
-                            sampled from half normal distribution)
-      overlap_prob (float): Proportion of overlap occurrences versus silence between utterances (used to balance the 
-                            length of silence gaps and overlapping segments, so a value close to 
-                            `mean_overlap`/(`mean_silence`+`mean_overlap`) is suggested)
+
+      mean_silence (float): Mean proportion of silence to speaking time in the audio session. Should be in range [0, 1).
+      mean_silence_var (float): Variance for mean silence in all audio sessions. 
+                                This value should be 0 <= mean_silence_var < mean_silence * (1 - mean_silence).
+      per_silence_var (float):  Variance for each silence in an audio session, set large values (e.g., 20) for de-correlation.
+      per_silence_min (float): Minimum duration for each silence, default to 0.
+      per_silence_max (float): Maximum duration for each silence, default to -1 for no maximum.
+      mean_overlap (float): Mean proportion of overlap in the overall non-silence duration. Should be in range [0, 1) and 
+                            recommend [0, 0.15] range for accurate results.
+      mean_overlap_var (float): Variance for mean overlap in all audio sessions. 
+                                This value should be 0 <= mean_overlap_var < mean_overlap * (1 - mean_overlap).
+      per_overlap_var (float): Variance for per overlap in each session, set large values to de-correlate silence lengths 
+                               with the latest speech segment lengths
+      per_overlap_min (float): Minimum per overlap duration in seconds
+      per_overlap_max (float): Maximum per overlap duration in seconds, set -1 for no maximum
       start_window (bool): Whether to window the start of sentences to smooth the audio signal (and remove silence at 
                             the start of the clip)
       window_type (str): Type of windowing used when segmenting utterances ("hamming", "hann", "cosine")
@@ -138,19 +153,41 @@ class MultiSpeakerSimulator(object):
       min_volume (float): Minimum speaker volume (only used when variable normalization is used)
       max_volume (float): Maximum speaker volume (only used when variable normalization is used)
       end_buffer (float): Buffer at the end of the session to leave blank
+    
     outputs:
       output_dir (str): Output directory for audio sessions and corresponding label files
-      output_filename (str): Output filename for the wav and rttm files
+      output_filename (str): Output filename for the wav and RTTM files
       overwrite_output (bool): If true, delete the output directory if it exists
       output_precision (int): Number of decimal places in output files
+    
     background_noise: 
       add_bg (bool): Add ambient background noise if true
       background_manifest (str): Path to background noise manifest file
-      snr (int): SNR for background noise (using average speaker power)
+      snr (int): SNR for background noise (using average speaker power), set `snr_min` and `snr_max` values to enable random SNR
+      snr_min (int):  Min random SNR for background noise (using average speaker power), set `null` to use fixed SNR
+      snr_max (int):  Max random SNR for background noise (using average speaker power), set `null` to use fixed SNR
+    
+    segment_augmentor:
+      add_seg_aug (bool): Set True to enable augmentation on each speech segment (Default: False)
+      segmentor:
+        gain:
+            prob (float): Probability range (uniform distribution) gain augmentation for individual segment
+            min_gain_dbfs (float): minimum gain in terms of dB
+            max_gain_dbfs (float): maximum gain in terms of dB
+
+    session_augmentor:
+      add_sess_aug: (bool) set True to enable audio augmentation on the whole session (Default: False)
+      segmentor:
+        white_noise:
+            prob (float): Probability of adding white noise (Default: 1.0)
+            min_level (float): minimum gain in terms of dB
+            max_level (float): maximum gain in terms of dB
+
     speaker_enforcement:
       enforce_num_speakers (bool): Enforce that all requested speakers are present in the output wav file
       enforce_time (list): Percentage of the way through the audio session that enforcement mode is triggered (sampled 
                            between time 1 and 2)
+    
     segment_manifest: (parameters for regenerating the segment manifest file)
       window (float): Window length for segmentation
       shift (float): Shift length for segmentation 
@@ -160,12 +197,19 @@ class MultiSpeakerSimulator(object):
 
     def __init__(self, cfg):
         self._params = cfg
+        self.annotator = DataAnnotator(cfg)
+        self.sampler = SpeechSampler(cfg)
         # internal params
         self._manifest = read_manifest(self._params.data_simulator.manifest_filepath)
+        self._speaker_samples = build_speaker_samples_map(self._manifest)
+        self._noise_samples = []
         self._sentence = None
         self._text = ""
         self._words = []
         self._alignments = []
+        # minimum number of alignments for a manifest to be considered valid
+        self._min_alignment_count = 2
+        self._merged_speech_intervals = []
         # keep track of furthest sample per speaker to avoid overlapping same speaker
         self._furthest_sample = [0 for n in range(self._params.data_simulator.session_config.num_speakers)]
         # use to ensure overlap percentage is correct
@@ -173,26 +217,136 @@ class MultiSpeakerSimulator(object):
         # creating manifests during online data simulation
         self.base_manifest_filepath = None
         self.segment_manifest_filepath = None
+        self._max_audio_read_sec = self._params.data_simulator.session_params.max_audio_read_sec
+        self._turn_prob_min = self._params.data_simulator.session_params.get("turn_prob_min", 0.5)
         # variable speaker volume
         self._volume = None
-        self._check_args()  # error check arguments
+        self._speaker_ids = None
+        self._device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        self._audio_read_buffer_dict = {}
+        self.add_missing_overlap = self._params.data_simulator.session_params.get("add_missing_overlap", False)
+
+        if (
+            self._params.data_simulator.segment_augmentor.get("augmentor", None)
+            and self._params.data_simulator.segment_augmentor.add_seg_aug
+        ):
+            self.segment_augmentor = process_augmentations(
+                augmenter=self._params.data_simulator.segment_augmentor.augmentor
+            )
+        else:
+            self.segment_augmentor = None
+
+        if (
+            self._params.data_simulator.session_augmentor.get("augmentor", None)
+            and self._params.data_simulator.session_augmentor.add_sess_aug
+        ):
+            self.session_augmentor = process_augmentations(
+                augmenter=self._params.data_simulator.session_augmentor.augmentor
+            )
+        else:
+            self.session_augmentor = None
+
+        # Error check the input arguments for simulation
+        self._check_args()
+
+        # Initialize speaker permutations to maximize the number of speakers in the created dataset
+        self._permutated_speaker_inds = self._init_speaker_permutations(
+            num_sess=self._params.data_simulator.session_config.num_sessions,
+            num_speakers=self._params.data_simulator.session_config.num_speakers,
+            all_speaker_ids=self._speaker_samples.keys(),
+            random_seed=self._params.data_simulator.random_seed,
+        )
+
+        # Intialize multiprocessing related variables
+        self.num_workers = self._params.get("num_workers", 1)
+        self.multiprocessing_chunksize = self._params.data_simulator.get('multiprocessing_chunksize', 10000)
+        self.chunk_count = self._init_chunk_count()
+
+    def _init_speaker_permutations(self, num_sess: int, num_speakers: int, all_speaker_ids: List, random_seed: int):
+        """
+        Initialize the speaker permutations for the number of speakers in the session.
+        When generating the simulated sessions, we want to include as many speakers as possible.
+        This function generates a set of permutations that can be used to sweep all speakers in 
+        the source dataset to make sure we maximize the total number of speakers included in 
+        the simulated sessions.
+
+        Args:
+            num_sess (int): Number of sessions to generate
+            num_speakers (int): Number of speakers in each session
+            all_speaker_ids (list): List of all speaker IDs
+
+        Returns:
+            permuted_inds (np.array): 
+                Array of permuted speaker indices to use for each session
+                Dimensions: (num_sess, num_speakers)
+        """
+        np.random.seed(random_seed)
+        all_speaker_id_counts = len(list(all_speaker_ids))
+
+        # Calculate how many permutations are needed
+        perm_set_count = int(np.ceil(num_speakers * num_sess / all_speaker_id_counts))
+
+        target_count = num_speakers * num_sess
+        for count in range(perm_set_count):
+            if target_count < all_speaker_id_counts:
+                seq_len = target_count
+            else:
+                seq_len = all_speaker_id_counts
+            if seq_len <= 0:
+                raise ValueError(f"seq_len is {seq_len} at count {count} and should be greater than 0")
+
+            if count == 0:
+                permuted_inds = np.random.permutation(len(all_speaker_ids))[:seq_len]
+            else:
+                permuted_inds = np.hstack((permuted_inds, np.random.permutation(len(all_speaker_ids))[:seq_len]))
+            target_count -= seq_len
+
+        logging.info(f"Total {all_speaker_id_counts} speakers in the source dataset.")
+        logging.info(f"Initialized speaker permutations for {num_sess} sessions with {num_speakers} speakers each.")
+        return permuted_inds.reshape(num_sess, num_speakers)
+
+    def _init_chunk_count(self):
+        """
+        Initialize the chunk count for multi-processing to prevent over-flow of job counts.
+        The multi-processing pipeline can freeze if there are more than approximately 10,000 jobs 
+        in the pipeline at the same time.        
+        """
+        return int(np.ceil(self._params.data_simulator.session_config.num_sessions / self.multiprocessing_chunksize))
 
     def _check_args(self):
         """
         Checks YAML arguments to ensure they are within valid ranges.
         """
-        if self._params.data_simulator.session_config.num_speakers < 2:
-            raise Exception("At least two speakers are required for multispeaker audio sessions (num_speakers < 2)")
+        if self._params.data_simulator.session_config.num_speakers < 1:
+            raise Exception("At least one speaker is required for making audio sessions (num_speakers < 1)")
         if (
             self._params.data_simulator.session_params.turn_prob < 0
             or self._params.data_simulator.session_params.turn_prob > 1
         ):
             raise Exception("Turn probability is outside of [0,1]")
         if (
-            self._params.data_simulator.session_params.overlap_prob < 0
-            or self._params.data_simulator.session_params.overlap_prob > 1
+            self._params.data_simulator.session_params.turn_prob < 0
+            or self._params.data_simulator.session_params.turn_prob > 1
         ):
-            raise Exception("Overlap probability is outside of [0,1]")
+            raise Exception("Turn probability is outside of [0,1]")
+        elif (
+            self._params.data_simulator.session_params.turn_prob < self._turn_prob_min
+            and self._params.data_simulator.speaker_enforcement.enforce_num_speakers == True
+        ):
+            logging.warning(
+                "Turn probability is less than {self._turn_prob_min} while enforce_num_speakers=True, which may result in excessive session lengths. Forcing turn_prob to 0.5."
+            )
+            self._params.data_simulator.session_params.turn_prob = self._turn_prob_min
+        if self._params.data_simulator.session_params.max_audio_read_sec < 2.5:
+            raise Exception("Max audio read time must be greater than 2.5 seconds")
+
+        if self._params.data_simulator.session_params.sentence_length_params[0] <= 0:
+            raise Exception(
+                "k (number of success until the exp. ends) in Sentence length parameter value must be a positive number"
+            )
+
+        if not (0 < self._params.data_simulator.session_params.sentence_length_params[1] <= 1):
+            raise Exception("p (success probability) value in sentence length parameter must be in range (0,1]")
 
         if (
             self._params.data_simulator.session_params.mean_overlap < 0
@@ -204,6 +358,30 @@ class MultiSpeakerSimulator(object):
             or self._params.data_simulator.session_params.mean_silence > 1
         ):
             raise Exception("Mean silence is outside of [0,1]")
+        if self._params.data_simulator.session_params.mean_silence_var < 0:
+            raise Exception("Mean silence variance is not below 0")
+        if (
+            self._params.data_simulator.session_params.mean_silence > 0
+            and self._params.data_simulator.session_params.mean_silence_var
+            >= self._params.data_simulator.session_params.mean_silence
+            * (1 - self._params.data_simulator.session_params.mean_silence)
+        ):
+            raise Exception("Mean silence variance should be lower than mean_silence * (1-mean_silence)")
+        if self._params.data_simulator.session_params.per_silence_var < 0:
+            raise Exception("Per silence variance is below 0")
+
+        if self._params.data_simulator.session_params.mean_overlap_var < 0:
+            raise Exception("Mean overlap variance is not larger than 0")
+        if (
+            self._params.data_simulator.session_params.mean_overlap > 0
+            and self._params.data_simulator.session_params.mean_overlap_var
+            >= self._params.data_simulator.session_params.mean_overlap
+            * (1 - self._params.data_simulator.session_params.mean_overlap)
+        ):
+            raise Exception("Mean overlap variance should be lower than mean_overlap * (1-mean_overlap)")
+        if self._params.data_simulator.session_params.per_overlap_var < 0:
+            raise Exception("Per overlap variance is not larger than 0")
+
         if (
             self._params.data_simulator.session_params.min_dominance < 0
             or self._params.data_simulator.session_params.min_dominance > 1
@@ -228,76 +406,23 @@ class MultiSpeakerSimulator(object):
             raise Exception("Number of speakers times minimum dominance is greater than 1")
 
         if (
-            self._params.data_simulator.session_params.overlap_prob
-            / self._params.data_simulator.session_params.turn_prob
-            > 1
-        ):
-            raise Exception("Overlap probability / turn probability is greater than 1")
-        if (
-            self._params.data_simulator.session_params.overlap_prob
-            / self._params.data_simulator.session_params.turn_prob
-            == 1
-            and self._params.data_simulator.session_params.mean_silence > 0
-        ):
-            raise Exception("Overlap probability / turn probability is equal to 1 and mean silence is greater than 0")
-
-        if (
             self._params.data_simulator.session_params.window_type not in ['hamming', 'hann', 'cosine']
-            and self._params.data_simulator.session_params.window_type != None
+            and self._params.data_simulator.session_params.window_type is not None
         ):
             raise Exception("Incorrect window type provided")
 
-    def _get_speaker_ids(self) -> List[str]:
-        """
-        Randomly select speaker IDs from the loaded manifest file.
+        if len(self._manifest) == 0:
+            raise Exception("Manifest file is empty. Check that the source path is correct.")
 
-        Returns:
-            speaker_ids (list): Speaker IDs
+    def clean_up(self):
         """
-        speaker_ids = []
-        s = 0
-        while s < self._params.data_simulator.session_config.num_speakers:
-            file = self._manifest[np.random.randint(0, len(self._manifest) - 1)]
-            speaker_id = file['speaker_id']
-            if speaker_id not in speaker_ids:  # ensure speaker IDs are not duplicated
-                speaker_ids.append(speaker_id)
-                s += 1
-        return speaker_ids
-
-    def _get_speaker_samples(self, speaker_ids: List[str]) -> Dict[str, list]:
+        Clear the system memory. Cache data for audio files and alignments are removed.
         """
-        Get a list of the samples for each of the specified speakers.
-
-        Args:
-            speaker_ids (list): LibriSpeech speaker IDs for each speaker in the current session.
-        Returns:
-            speaker_lists (dict): Dictionary of manifest lines per speaker
-        """
-        speaker_lists = {}
-        for i in range(self._params.data_simulator.session_config.num_speakers):
-            speaker_lists[str(speaker_ids[i])] = []
-        # loop over manifest and add files corresponding to each speaker to each sublist
-        for file in self._manifest:
-            new_speaker_id = file['speaker_id']
-            if new_speaker_id in speaker_ids:
-                speaker_lists[str(new_speaker_id)].append(file)
-        return speaker_lists
-
-    def _load_speaker_sample(self, speaker_lists: List[dict], speaker_ids: List[str], speaker_turn: int) -> str:
-        """
-        Load a sample for the selected speaker ID.
-
-        Args:
-            speaker_lists (list): List of samples for each speaker in the session.
-            speaker_ids (list): LibriSpeech speaker IDs for each speaker in the current session.
-            speaker_turn (int): Current speaker turn.
-        Returns:
-            file_path (str): Path to the desired audio file
-        """
-        speaker_id = speaker_ids[speaker_turn]
-        file_id = np.random.randint(0, len(speaker_lists[str(speaker_id)]) - 1)
-        file_path = speaker_lists[str(speaker_id)][file_id]
-        return file_path
+        self._sentence = None
+        self._words = []
+        self._alignments = []
+        self._audio_read_buffer_dict = {}
+        torch.cuda.empty_cache()
 
     def _get_speaker_dominance(self) -> List[float]:
         """
@@ -313,12 +438,12 @@ class MultiSpeakerSimulator(object):
             scale=self._params.data_simulator.session_params.dominance_var,
             size=self._params.data_simulator.session_config.num_speakers,
         )
-        dominance = clamp_min_list(dominance, 0)
+        dominance = np.clip(dominance, a_min=0, a_max=np.inf)
         # normalize while maintaining minimum dominance
         total = np.sum(dominance)
         if total == 0:
             for i in range(len(dominance)):
-                dominance[i] += min_dominance
+                dominance[i] += self._params.data_simulator.session_params.min_dominance
         # scale accounting for min_dominance which has to be added after
         dominance = (dominance / total) * (
             1
@@ -338,7 +463,7 @@ class MultiSpeakerSimulator(object):
     ) -> Tuple[List[float], bool]:
         """
         Increase speaker dominance for unrepresented speakers (used only in enforce mode).
-        Increases the dominance for these speakers by the input factor (and then renormalizes the probabilities to 1).
+        Increases the dominance for these speakers by the input factor (and then re-normalizes the probabilities to 1).
 
         Args:
             base_speaker_dominance (list): Dominance values for each speaker.
@@ -382,8 +507,11 @@ class MultiSpeakerSimulator(object):
                 scale=self._params.data_simulator.session_params.normalization_var,
                 size=self._params.data_simulator.session_config.num_speakers,
             )
-            self._volume = clamp_min_list(self._volume, self._params.data_simulator.session_params.min_volume)
-            self._volume = clamp_max_list(self._volume, self._params.data_simulator.session_params.max_volume)
+            self._volume = np.clip(
+                np.array(self._volume),
+                a_min=self._params.data_simulator.session_params.min_volume,
+                a_max=self._params.data_simulator.session_params.max_volume,
+            ).tolist()
 
     def _get_next_speaker(self, prev_speaker: int, dominance: List[float]) -> int:
         """
@@ -395,16 +523,23 @@ class MultiSpeakerSimulator(object):
         Returns:
             prev_speaker/speaker_turn (int): Speaker turn
         """
-        if np.random.uniform(0, 1) > self._params.data_simulator.session_params.turn_prob and prev_speaker != None:
+        if self._params.data_simulator.session_config.num_speakers == 1:
+            prev_speaker = 0 if prev_speaker is None else prev_speaker
             return prev_speaker
         else:
-            speaker_turn = prev_speaker
-            while speaker_turn == prev_speaker:  # ensure another speaker goes next
-                rand = np.random.uniform(0, 1)
-                speaker_turn = 0
-                while rand > dominance[speaker_turn]:
-                    speaker_turn += 1
-            return speaker_turn
+            if (
+                np.random.uniform(0, 1) > self._params.data_simulator.session_params.turn_prob
+                and prev_speaker is not None
+            ):
+                return prev_speaker
+            else:
+                speaker_turn = prev_speaker
+                while speaker_turn == prev_speaker:  # ensure another speaker goes next
+                    rand = np.random.uniform(0, 1)
+                    speaker_turn = 0
+                    while rand > dominance[speaker_turn]:
+                        speaker_turn += 1
+                return speaker_turn
 
     def _get_window(self, window_amount: int, start: bool = False):
         """
@@ -425,6 +560,9 @@ class MultiSpeakerSimulator(object):
             window = cosine(window_amount * 2)
         else:
             raise Exception("Incorrect window type provided")
+
+        window = torch.from_numpy(window).to(self._device)
+
         # return the first half or second half of the window
         if start:
             return window[:window_amount]
@@ -456,30 +594,29 @@ class MultiSpeakerSimulator(object):
         return start_cutoff, window_amount
 
     def _get_end_buffer_and_window(
-        self, current_sr: int, remaining_duration_sr: int, remaining_len_audio_file: int
+        self, current_sample_cursor: int, remaining_dur_samples: int, remaining_len_audio_file: int
     ) -> Tuple[int, int]:
         """
         Get the end buffer and window length for smoothing the end of the sentence.
 
         Args:
-            current_sr (int): Current location in the target file (in terms of number of samples).
-            remaining_duration_sr (int): Remaining duration in the target file (in terms of number of samples).
+            current_sample_cursor (int): Current location in the target file (in terms of number of samples).
+            remaining_dur_samples (int): Remaining duration in the target file (in terms of number of samples).
             remaining_len_audio_file (int): Length remaining in audio file (in terms of number of samples).
         Returns:
             release_buffer (int): Amount after the end of the last alignment to include
             window_amount (int): Window length
         """
-
         window_amount = int(self._params.data_simulator.session_params.window_size * self._params.data_simulator.sr)
         release_buffer = int(
             self._params.data_simulator.session_params.release_buffer * self._params.data_simulator.sr
         )
 
-        if current_sr + release_buffer > remaining_duration_sr:
-            release_buffer = remaining_duration_sr - current_sr
+        if current_sample_cursor + release_buffer > remaining_dur_samples:
+            release_buffer = remaining_dur_samples - current_sample_cursor
             window_amount = 0
-        elif current_sr + window_amount + release_buffer > remaining_duration_sr:
-            window_amount = remaining_duration_sr - current_sr - release_buffer
+        elif current_sample_cursor + window_amount + release_buffer > remaining_dur_samples:
+            window_amount = remaining_dur_samples - current_sample_cursor - release_buffer
 
         if remaining_len_audio_file < release_buffer:
             release_buffer = remaining_len_audio_file
@@ -489,118 +626,158 @@ class MultiSpeakerSimulator(object):
 
         return release_buffer, window_amount
 
+    def _check_missing_speakers(self, num_missing: int = 0):
+        """
+        Check if any speakers were not included in the clip and display a warning.
+
+        Args:
+            num_missing (int): Number of missing speakers.
+        """
+        for k in range(len(self._furthest_sample)):
+            if self._furthest_sample[k] == 0:
+                num_missing += 1
+        if num_missing != 0:
+            warnings.warn(
+                f"{self._params.data_simulator.session_config.num_speakers - num_missing}"
+                f"speakers were included in the clip instead of the requested amount of "
+                f"{self._params.data_simulator.session_config.num_speakers}"
+            )
+
     def _add_file(
         self,
-        file: dict,
-        audio_file: torch.Tensor,
-        sentence_duration: int,
-        max_sentence_duration: int,
-        max_sentence_duration_sr: int,
+        audio_manifest: dict,
+        audio_file,
+        sentence_word_count: int,
+        max_word_count_in_sentence: int,
+        max_samples_in_sentence: int,
+        random_offset: bool = False,
     ) -> Tuple[int, torch.Tensor]:
         """
         Add audio file to current sentence (up to the desired number of words). 
         Uses the alignments to segment the audio file.
+        NOTE: 0 index is always silence in `audio_manifest['words']`, so we choose `offset_idx=1` as the first word
 
         Args:
-            file (dict): Line from manifest file for current audio file
+            audio_manifest (dict): Line from manifest file for current audio file
             audio_file (tensor): Current loaded audio file
-            sentence_duration (int): Running count for number of words in sentence
-            max_sentence_duration (int): Maximum count for number of words in sentence
-            max_sentence_duration_sr (int): Maximum length for sentence in terms of samples
+            sentence_word_count (int): Running count for number of words in sentence
+            max_word_count_in_sentence (int): Maximum count for number of words in sentence
+            max_samples_in_sentence (int): Maximum length for sentence in terms of samples
+        
         Returns:
-            sentence_duration+nw (int): Running word count
+            sentence_word_count+current_word_count (int): Running word count
             len(self._sentence) (tensor): Current length of the audio file
         """
-        if (
-            sentence_duration == 0
-        ) and self._params.data_simulator.session_params.start_window:  # cut off the start of the sentence
-            first_alignment = int(file['alignments'][0] * self._params.data_simulator.sr)
-            start_cutoff, start_window_amount = self._get_start_buffer_and_window(first_alignment)
+        # In general, random offset is not needed since random silence index has already been chosen
+        if random_offset:
+            offset_idx = np.random.randint(low=1, high=len(audio_manifest['words']))
         else:
-            start_cutoff = 0
+            offset_idx = 1
 
-        # ensure the desired number of words are added and the length of the output session isn't exceeded
-        sentence_duration_sr = len(self._sentence)
-        remaining_duration_sr = max_sentence_duration_sr - sentence_duration_sr
-        remaining_duration = max_sentence_duration - sentence_duration
-        prev_dur_sr, dur_sr = 0, 0
-        nw, i = 0, 0
-        while nw < remaining_duration and dur_sr < remaining_duration_sr and i < len(file['words']):
-            dur_sr = int(file['alignments'][i] * self._params.data_simulator.sr) - start_cutoff
-            if dur_sr > remaining_duration_sr:
+        first_alignment = int(audio_manifest['alignments'][offset_idx - 1] * self._params.data_simulator.sr)
+        start_cutoff, start_window_amount = self._get_start_buffer_and_window(first_alignment)
+        if not self._params.data_simulator.session_params.start_window:  # cut off the start of the sentence
+            start_window_amount = 0
+
+        # Ensure the desired number of words are added and the length of the output session isn't exceeded
+        sentence_samples = len(self._sentence)
+
+        remaining_dur_samples = max_samples_in_sentence - sentence_samples
+        remaining_duration = max_word_count_in_sentence - sentence_word_count
+        prev_dur_samples, dur_samples, curr_dur_samples = 0, 0, 0
+        current_word_count = 0
+        word_idx = offset_idx
+        silence_count = 1
+        while (
+            current_word_count < remaining_duration
+            and dur_samples < remaining_dur_samples
+            and word_idx < len(audio_manifest['words'])
+        ):
+            dur_samples = int(audio_manifest['alignments'][word_idx] * self._params.data_simulator.sr) - start_cutoff
+
+            # check the length of the generated sentence in terms of sample count (int).
+            if curr_dur_samples + dur_samples > remaining_dur_samples:
+                # if the upcoming loop will exceed the remaining sample count, break out of the loop.
                 break
 
-            word = file['words'][i]
+            word = audio_manifest['words'][word_idx]
+
+            if silence_count > 0 and word == "":
+                break
+
             self._words.append(word)
             self._alignments.append(
-                float(sentence_duration_sr * 1.0 / self._params.data_simulator.sr)
+                float(sentence_samples * 1.0 / self._params.data_simulator.sr)
                 - float(start_cutoff * 1.0 / self._params.data_simulator.sr)
-                + file['alignments'][i]
+                + audio_manifest['alignments'][word_idx]
             )
 
             if word == "":
-                i += 1
+                word_idx += 1
+                silence_count += 1
                 continue
             elif self._text == "":
                 self._text += word
             else:
                 self._text += " " + word
-            i += 1
-            nw += 1
-            prev_dur_sr = dur_sr
+
+            word_idx += 1
+            current_word_count += 1
+            prev_dur_samples = dur_samples
+            curr_dur_samples += dur_samples
 
         # add audio clip up to the final alignment
-        if (
-            sentence_duration == 0
-        ) and self._params.data_simulator.session_params.window_type != None:  # cut off the start of the sentence
+        if self._params.data_simulator.session_params.window_type is not None:  # cut off the start of the sentence
             if start_window_amount > 0:  # include window
                 window = self._get_window(start_window_amount, start=True)
+                self._sentence = self._sentence.to(self._device)
                 self._sentence = torch.cat(
                     (
                         self._sentence,
-                        np.multiply(audio_file[start_cutoff : start_cutoff + start_window_amount], window),
+                        torch.multiply(audio_file[start_cutoff : start_cutoff + start_window_amount], window),
                     ),
                     0,
                 )
             self._sentence = torch.cat(
-                (self._sentence, audio_file[start_cutoff + start_window_amount : start_cutoff + prev_dur_sr]), 0
-            )
+                (self._sentence, audio_file[start_cutoff + start_window_amount : start_cutoff + prev_dur_samples],), 0,
+            ).to(self._device)
+
         else:
-            self._sentence = torch.cat((self._sentence, audio_file[:prev_dur_sr]), 0)
+            self._sentence = torch.cat(
+                (self._sentence, audio_file[start_cutoff : start_cutoff + prev_dur_samples]), 0
+            ).to(self._device)
 
         # windowing at the end of the sentence
-        if (i < len(file['words'])) and self._params.data_simulator.session_params.window_type != None:
+        if (
+            word_idx < len(audio_manifest['words'])
+        ) and self._params.data_simulator.session_params.window_type is not None:
             release_buffer, end_window_amount = self._get_end_buffer_and_window(
-                prev_dur_sr, remaining_duration_sr, len(audio_file[start_cutoff + prev_dur_sr :])
+                prev_dur_samples, remaining_dur_samples, len(audio_file[start_cutoff + prev_dur_samples :]),
             )
             self._sentence = torch.cat(
-                (self._sentence, audio_file[start_cutoff + prev_dur_sr : start_cutoff + prev_dur_sr + release_buffer]),
+                (
+                    self._sentence,
+                    audio_file[start_cutoff + prev_dur_samples : start_cutoff + prev_dur_samples + release_buffer],
+                ),
                 0,
-            )
+            ).to(self._device)
+
             if end_window_amount > 0:  # include window
                 window = self._get_window(end_window_amount, start=False)
-                self._sentence = torch.cat(
-                    (
-                        self._sentence,
-                        np.multiply(
-                            audio_file[
-                                start_cutoff
-                                + prev_dur_sr
-                                + release_buffer : start_cutoff
-                                + prev_dur_sr
-                                + release_buffer
-                                + end_window_amount
-                            ],
-                            window,
-                        ),
-                    ),
-                    0,
-                )
+                sig_start = start_cutoff + prev_dur_samples + release_buffer
+                sig_end = start_cutoff + prev_dur_samples + release_buffer + end_window_amount
+                windowed_audio_file = torch.multiply(audio_file[sig_start:sig_end], window)
+                self._sentence = torch.cat((self._sentence, windowed_audio_file), 0).to(self._device)
 
-        return sentence_duration + nw, len(self._sentence)
+        del audio_file
+        return sentence_word_count + current_word_count, len(self._sentence)
 
     def _build_sentence(
-        self, speaker_turn: int, speaker_ids: List[str], speaker_lists: List[dict], max_sentence_duration_sr: int
+        self,
+        speaker_turn: int,
+        speaker_ids: List[str],
+        speaker_wav_align_map: Dict[str, list],
+        max_samples_in_sentence: int,
     ):
         """
         Build a new sentence by attaching utterance samples together until the sentence has reached a desired length. 
@@ -609,8 +786,8 @@ class MultiSpeakerSimulator(object):
         Args:
             speaker_turn (int): Current speaker turn.
             speaker_ids (list): LibriSpeech speaker IDs for each speaker in the current session.
-            speaker_lists (list): List of samples for each speaker in the session.
-            max_sentence_duration_sr (int): Maximum length for sentence in terms of samples
+            speaker_wav_align_map (dict): Dictionary containing speaker IDs and their corresponding wav filepath and alignments.
+            max_samples_in_sentence (int): Maximum length for sentence in terms of samples
         """
         # select speaker length
         sl = (
@@ -622,110 +799,98 @@ class MultiSpeakerSimulator(object):
         )
 
         # initialize sentence, text, words, alignments
-        self._sentence = torch.zeros(0)
+        self._sentence = torch.zeros(0, dtype=torch.float64, device=self._device)
         self._text = ""
-        self._words = []
-        self._alignments = []
-        sentence_duration = sentence_duration_sr = 0
+        self._words, self._alignments = [], []
+        sentence_word_count, sentence_samples = 0, 0
 
         # build sentence
-        while sentence_duration < sl and sentence_duration_sr < max_sentence_duration_sr:
-            file = self._load_speaker_sample(speaker_lists, speaker_ids, speaker_turn)
-            audio_file, sr = sf.read(file['audio_filepath'])
-            audio_file = torch.from_numpy(audio_file)
-            if audio_file.ndim > 1:
-                audio_file = torch.mean(audio_file, 1, False)
-            sentence_duration, sentence_duration_sr = self._add_file(
-                file, audio_file, sentence_duration, sl, max_sentence_duration_sr
+        while sentence_word_count < sl and sentence_samples < max_samples_in_sentence:
+            audio_manifest = load_speaker_sample(
+                speaker_wav_align_map=speaker_wav_align_map,
+                speaker_ids=speaker_ids,
+                speaker_turn=speaker_turn,
+                min_alignment_count=self._min_alignment_count,
             )
 
-        # look for split locations
-        splits = []
-        new_start = 0
-        for i in range(len(self._words)):
-            if self._words[i] == "" and i != 0 and i != len(self._words) - 1:
-                silence_length = self._alignments[i] - self._alignments[i - 1]
-                if (
-                    silence_length > 2 * self._params.data_simulator.session_params.split_buffer
-                ):  # split utterance on silence
-                    new_end = self._alignments[i - 1] + self._params.data_simulator.session_params.split_buffer
-                    splits.append(
-                        [
-                            int(new_start * self._params.data_simulator.sr),
-                            int(new_end * self._params.data_simulator.sr),
-                        ]
-                    )
-                    new_start = self._alignments[i] - self._params.data_simulator.session_params.split_buffer
-        splits.append([int(new_start * self._params.data_simulator.sr), len(self._sentence)])
+            offset_index = get_random_offset_index(
+                audio_manifest=audio_manifest,
+                audio_read_buffer_dict=self._audio_read_buffer_dict,
+                offset_min=0,
+                max_audio_read_sec=self._max_audio_read_sec,
+                min_alignment_count=self._min_alignment_count,
+            )
+
+            audio_file, sr, audio_manifest = read_audio_from_buffer(
+                audio_manifest=audio_manifest,
+                buffer_dict=self._audio_read_buffer_dict,
+                offset_index=offset_index,
+                device=self._device,
+                max_audio_read_sec=self._max_audio_read_sec,
+                min_alignment_count=self._min_alignment_count,
+                read_subset=True,
+            )
+
+            # Step 6-2: Add optional perturbations to the specific audio segment (i.e. to `self._sentnece`)
+            if self._params.data_simulator.segment_augmentor.add_seg_aug:
+                audio_file = perturb_audio(audio_file, sr, self.segment_augmentor, device=self._device)
+
+            sentence_word_count, sentence_samples = self._add_file(
+                audio_manifest, audio_file, sentence_word_count, sl, max_samples_in_sentence
+            )
 
         # per-speaker normalization (accounting for active speaker time)
-        if self._params.data_simulator.session_params.normalize:
-            if torch.max(torch.abs(self._sentence)) > 0:
-                split_length = split_sum = 0
-                for split in splits:
-                    split_length += len(self._sentence[split[0] : split[1]])
-                    split_sum += torch.sum(self._sentence[split[0] : split[1]] ** 2)
-                average_rms = torch.sqrt(split_sum * 1.0 / split_length)
-                self._sentence = self._sentence / (1.0 * average_rms) * self._volume[speaker_turn]
+        if self._params.data_simulator.session_params.normalize and torch.max(torch.abs(self._sentence)) > 0:
+            splits = get_split_points_in_alignments(
+                words=self._words,
+                alignments=self._alignments,
+                split_buffer=self._params.data_simulator.session_params.split_buffer,
+                sr=self._params.data_simulator.sr,
+                sentence_audio_len=len(self._sentence),
+            )
+            self._sentence = per_speaker_normalize(
+                sentence_audio=self._sentence,
+                splits=splits,
+                speaker_turn=speaker_turn,
+                volume=self._volume,
+                device=self._device,
+            )
 
-    # returns new overlapped (or shifted) start position
     def _add_silence_or_overlap(
         self,
         speaker_turn: int,
         prev_speaker: int,
         start: int,
         length: int,
-        session_length_sr: int,
-        prev_length_sr: int,
+        session_len_samples: int,
+        prev_len_samples: int,
         enforce: bool,
     ) -> int:
         """
         Returns new overlapped (or shifted) start position after inserting overlap or silence.
 
         Args:
-            speaker_turn (int): Current speaker turn.
-            prev_speaker (int): Previous speaker turn.
+            speaker_turn (int): The integer index of the current speaker turn.
+            prev_speaker (int): The integer index of the previous speaker turn.
             start (int): Current start of the audio file being inserted.
             length (int): Length of the audio file being inserted.
-            session_length_sr (int): Running length of the session in terms of number of samples
-            prev_length_sr (int): Length of previous sentence (in terms of number of samples)
+            session_len_samples (int): Maximum length of the session in terms of number of samples
+            prev_len_samples (int): Length of previous sentence (in terms of number of samples)
             enforce (bool): Whether speaker enforcement mode is being used
         Returns:
             new_start (int): New starting position in the session accounting for overlap or silence
         """
-        overlap_prob = self._params.data_simulator.session_params.overlap_prob / (
-            self._params.data_simulator.session_params.turn_prob
-        )  # accounting for not overlapping the same speaker
-        mean_overlap_percent = (
-            self._params.data_simulator.session_params.mean_overlap
-            / (1 + self._params.data_simulator.session_params.mean_overlap)
-        ) / self._params.data_simulator.session_params.overlap_prob
-        mean_silence_percent = self._params.data_simulator.session_params.mean_silence / (
-            1 - self._params.data_simulator.session_params.overlap_prob
-        )
+        running_len_samples = start + length
+        # `length` is the length of the current sentence to be added, so not included in self.sampler.running_speech_len_samples
+        non_silence_len_samples = self.sampler.running_speech_len_samples + length
 
-        # overlap
-        if prev_speaker != speaker_turn and prev_speaker != None and np.random.uniform(0, 1) < overlap_prob:
-            overlap_percent = halfnorm(loc=0, scale=mean_overlap_percent * np.sqrt(np.pi) / np.sqrt(2)).rvs()
-            desired_overlap_amount = int(prev_length_sr * overlap_percent)
+        # compare silence and overlap ratios
+        add_overlap = self.sampler.silence_vs_overlap_selector(running_len_samples, non_silence_len_samples)
+
+        # choose overlap if this speaker is not the same as the previous speaker and add_overlap is True.
+        if prev_speaker != speaker_turn and prev_speaker is not None and add_overlap:
+            desired_overlap_amount = self.sampler.sample_from_overlap_model(non_silence_len_samples)
             new_start = start - desired_overlap_amount
-
-            # reinject missing overlap to ensure desired overlap percentage is met
-            if self._missing_overlap > 0 and overlap_percent < 1:
-                rand = int(
-                    prev_length_sr
-                    * np.random.uniform(
-                        0, 1 - overlap_percent / (1 + self._params.data_simulator.session_params.mean_overlap)
-                    )
-                )
-                if rand > self._missing_overlap:
-                    new_start -= self._missing_overlap
-                    desired_overlap_amount += self._missing_overlap
-                    self._missing_overlap = 0
-                else:
-                    new_start -= rand
-                    desired_overlap_amount += rand
-                    self._missing_overlap -= rand
 
             # avoid overlap at start of clip
             if new_start < 0:
@@ -739,235 +904,141 @@ class MultiSpeakerSimulator(object):
                 self._missing_overlap += self._furthest_sample[speaker_turn] - new_start
                 new_start = self._furthest_sample[speaker_turn]
 
-            prev_start = start - prev_length_sr
+            prev_start = start - prev_len_samples
             prev_end = start
             new_end = new_start + length
-            overlap_amount = 0
-            if prev_start < new_start and new_end > prev_end:
-                overlap_amount = prev_end - new_start
-            elif prev_start < new_start and new_end < prev_end:
-                overlap_amount = new_end - new_start
-            elif prev_start > new_start and new_end < prev_end:
-                overlap_amount = new_end - prev_start
-            elif prev_start > new_start and new_end > prev_end:
-                overlap_amount = prev_end - prev_start
 
-            overlap_amount = max(overlap_amount, 0)
+            # check overlap amount to calculate the actual amount of generated overlaps
+            overlap_amount = 0
+            if is_overlap([prev_start, prev_end], [new_start, new_end]):
+                overlap_range = get_overlap_range([prev_start, prev_end], [new_start, new_end])
+                overlap_amount = max(overlap_range[1] - overlap_range[0], 0)
+
             if overlap_amount < desired_overlap_amount:
                 self._missing_overlap += desired_overlap_amount - overlap_amount
+            self.sampler.running_overlap_len_samples += overlap_amount
 
+        # if we are not adding overlap, add silence
         else:
-            # add silence
-            silence_percent = halfnorm(loc=0, scale=mean_silence_percent * np.sqrt(np.pi) / np.sqrt(2)).rvs()
-            silence_amount = int(length * silence_percent)
-
-            if start + length + silence_amount > session_length_sr and not enforce:
-                new_start = session_length_sr - length
+            silence_amount = self.sampler.sample_from_silence_model(running_len_samples)
+            if start + length + silence_amount > session_len_samples and not enforce:
+                new_start = max(session_len_samples - length, start)
             else:
                 new_start = start + silence_amount
-
         return new_start
 
-    def _get_background(self, len_array: int, power_array: float) -> torch.Tensor:
+    def _get_session_meta_data(self, array: np.ndarray, snr: float) -> dict:
         """
-        Augment with background noise (inserting ambient background noise up to the desired SNR for the full clip).
+        Get meta data for the current session.
 
         Args:
-            len_array (int): Length of background noise required.
-            avg_power_array (float): Average power of the audio file.
+            array (np.ndarray): audio array
+            snr (float): signal-to-noise ratio
+
         Returns:
-            bg_array (tensor): Tensor containing background noise
+            dict: meta data 
         """
-
-        manifest = read_manifest(self._params.data_simulator.background_noise.background_manifest)
-        bg_array = torch.zeros(len_array)
-        desired_snr = self._params.data_simulator.background_noise.snr
-        ratio = 10 ** (desired_snr / 20)
-        desired_avg_power_noise = power_array / ratio
-        running_len = 0
-        while running_len < len_array:  # build background audio stream (the same length as the full file)
-            file_id = np.random.randint(0, len(manifest) - 1)
-            file = manifest[file_id]
-            audio_file, sr = sf.read(file['audio_filepath'])
-            audio_file = torch.from_numpy(audio_file)
-            if audio_file.ndim > 1:
-                audio_file = torch.mean(audio_file, 1, False)
-
-            if running_len + len(audio_file) < len_array:
-                end_audio_file = running_len + len(audio_file)
-            else:
-                end_audio_file = len_array
-
-            pow_audio_file = torch.mean(audio_file[: end_audio_file - running_len] ** 2)
-            scaled_audio_file = audio_file[: end_audio_file - running_len] * torch.sqrt(
-                desired_avg_power_noise / pow_audio_file
-            )
-
-            bg_array[running_len:end_audio_file] = scaled_audio_file
-            running_len = end_audio_file
-
-        return bg_array
-
-    def _create_new_rttm_entry(self, start: int, end: int, speaker_id: int) -> List[str]:
-        """
-        Create new RTTM entries (to write to output rttm file)
-
-        Args:
-            start (int): Current start of the audio file being inserted.
-            end (int): End of the audio file being inserted.
-            speaker_id (int): LibriSpeech speaker ID for the current entry.
-        Returns:
-            rttm_list (list): List of rttm entries
-        """
-        rttm_list = []
-        new_start = start
-        # look for split locations
-        for i in range(len(self._words)):
-            if self._words[i] == "" and i != 0 and i != len(self._words) - 1:
-                silence_length = self._alignments[i] - self._alignments[i - 1]
-                if (
-                    silence_length > 2 * self._params.data_simulator.session_params.split_buffer
-                ):  # split utterance on silence
-                    new_end = start + self._alignments[i - 1] + self._params.data_simulator.session_params.split_buffer
-                    s = float(round(new_start, self._params.data_simulator.outputs.output_precision))
-                    e = float(round(new_end, self._params.data_simulator.outputs.output_precision))
-                    rttm_list.append(f"{s} {e} {speaker_id}")
-                    new_start = start + self._alignments[i] - self._params.data_simulator.session_params.split_buffer
-
-        s = float(round(new_start, self._params.data_simulator.outputs.output_precision))
-        e = float(round(end, self._params.data_simulator.outputs.output_precision))
-        rttm_list.append(f"{s} {e} {speaker_id}")
-        return rttm_list
-
-    def _create_new_json_entry(
-        self, wav_filename: str, start: int, length: int, speaker_id: int, rttm_filepath: str, ctm_filepath: str
-    ) -> dict:
-        """
-        Create new JSON entries (to write to output json file).
-
-        Args:
-            wav_filename (str): Output wav filepath.
-            start (int): Current start of the audio file being inserted.
-            length (int): Length of the audio file being inserted.
-            speaker_id (int): LibriSpeech speaker ID for the current entry.
-            rttm_filepath (str): Output rttm filepath.
-            ctm_filepath (str): Output ctm filepath.
-        Returns:
-            dict (dict): JSON entry
-        """
-        start = float(round(start, self._params.data_simulator.outputs.output_precision))
-        length = float(round(length, self._params.data_simulator.outputs.output_precision))
-        meta = {
-            "audio_filepath": wav_filename,
-            "offset": start,
-            "duration": length,
-            "label": speaker_id,
-            "text": self._text,
-            "num_speakers": self._params.data_simulator.session_config.num_speakers,
-            "rttm_filepath": rttm_filepath,
-            "ctm_filepath": ctm_filepath,
-            "uem_filepath": None,
+        meta_data = {
+            "duration": array.shape[0] / self._params.data_simulator.sr,
+            "silence_mean": self.sampler.sess_silence_mean,
+            "overlap_mean": self.sampler.sess_overlap_mean,
+            "bg_snr": snr,
+            "speaker_ids": self._speaker_ids,
+            "speaker_volumes": list(self._volume),
         }
-        return meta
+        return meta_data
 
-    def _create_new_ctm_entry(self, session_name: str, speaker_id: int, start: int) -> List[str]:
+    def _get_session_silence_from_rttm(self, rttm_list: List[str], running_len_samples: int):
         """
-        Create new CTM entry (to write to output ctm file)
+        Calculate the total speech and silence duration in the current session using RTTM file.
 
         Args:
-            session_name (str): Current session name.
-            start (int): Current start of the audio file being inserted.
-            speaker_id (int): LibriSpeech speaker ID for the current entry.
-        Returns:
-            arr (list): List of ctm entries
-        """
-        arr = []
-        start = float(round(start, self._params.data_simulator.outputs.output_precision))
-        for i in range(len(self._words)):
-            word = self._words[i]
-            if (
-                word != ""
-            ):  # note that using the current alignments the first word is always empty, so there is no error from indexing the array with i-1
-                align1 = float(
-                    round(self._alignments[i - 1] + start, self._params.data_simulator.outputs.output_precision)
-                )
-                align2 = float(
-                    round(
-                        self._alignments[i] - self._alignments[i - 1],
-                        self._params.data_simulator.outputs.output_precision,
-                    )
-                )
-                text = f"{session_name} {speaker_id} {align1} {align2} {word} 0\n"
-                arr.append((align1, text))
-        return arr
-
-    def create_base_manifest_ds(self) -> str:
-        """
-        Create base diarization manifest file for online data simulation.
+            rttm_list (list):
+                List of RTTM timestamps
+            running_len_samples (int):
+                Total number of samples generated so far in the current session
 
         Returns:
-            self.base_manifest_filepath (str): Path to manifest file
+            sess_speech_len_rttm (int):
+                The total number of speech samples in the current session
+            sess_silence_len_rttm (int):
+                The total number of silence samples in the current session
         """
-        basepath = self._params.data_simulator.outputs.output_dir
-        wav_path = os.path.join(basepath, 'synthetic_wav.list')
-        text_path = os.path.join(basepath, 'synthetic_txt.list')
-        rttm_path = os.path.join(basepath, 'synthetic_rttm.list')
-        ctm_path = os.path.join(basepath, 'synthetic_ctm.list')
-        manifest_filepath = os.path.join(basepath, 'base_manifest.json')
+        all_sample_list = []
+        for x_raw in rttm_list:
+            x = [token for token in x_raw.split()]
+            all_sample_list.append([float(x[0]), float(x[1])])
 
-        create_manifest(
-            wav_path,
-            manifest_filepath,
-            text_path=text_path,
-            rttm_path=rttm_path,
-            ctm_path=ctm_path,
-            add_duration=False,
-        )
+        self._merged_speech_intervals = merge_float_intervals(all_sample_list)
+        total_speech_in_secs = sum([x[1] - x[0] for x in self._merged_speech_intervals])
+        total_silence_in_secs = running_len_samples / self._params.data_simulator.sr - total_speech_in_secs
+        sess_speech_len = int(total_speech_in_secs * self._params.data_simulator.sr)
+        sess_silence_len = int(total_silence_in_secs * self._params.data_simulator.sr)
+        return sess_speech_len, sess_silence_len
 
-        self.base_manifest_filepath = manifest_filepath
-        return self.base_manifest_filepath
-
-    def create_segment_manifest_ds(self) -> str:
+    def _add_sentence_to_array(
+        self, start: int, length: int, array: torch.Tensor, is_speech: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, int]:
         """
-        Create segmented diarization manifest file for online data simulation.
+        Add a sentence to the session array containing time-series signal.
+
+        Args:
+            start (int): Starting position in the session
+            length (int): Length of the sentence
+            array (torch.Tensor): Session array
+            is_speech (torch.Tensor): Session array containing speech/non-speech labels
 
         Returns:
-            self.segment_manifest_filepath (str): Path to manifest file
+            array (torch.Tensor): Session array in torch.Tensor format
+            is_speech (torch.Tensor): Session array containing speech/non-speech labels in torch.Tensor format
         """
-        basepath = self._params.data_simulator.outputs.output_dir
-        output_manifest_filepath = os.path.join(basepath, 'segment_manifest.json')
-        input_manifest_filepath = self.base_manifest_filepath
-        window = self._params.data_simulator.segment_manifest.window
-        shift = self._params.data_simulator.segment_manifest.shift
-        step_count = self._params.data_simulator.segment_manifest.step_count
-        deci = self._params.data_simulator.segment_manifest.deci
+        end = start + length
+        if end > len(array):  # only occurs in enforce mode
+            array = torch.nn.functional.pad(array, (0, end - len(array)))
+            is_speech = torch.nn.functional.pad(is_speech, (0, end - len(is_speech)))
+        array[start:end] += self._sentence
+        is_speech[start:end] = 1
+        return array, is_speech, end
 
-        create_segment_manifest(input_manifest_filepath, output_manifest_filepath, window, shift, step_count, deci)
-
-        self.segment_manifest_filepath = output_manifest_filepath
-        return self.segment_manifest_filepath
-
-    def _generate_session(self, idx: int, basepath: str, filename: str, enforce_counter: int = 2):
+    def _generate_session(
+        self,
+        idx: int,
+        basepath: str,
+        filename: str,
+        speaker_ids: List[str],
+        speaker_wav_align_map: Dict[str, list],
+        noise_samples: list,
+        device: torch.device,
+        enforce_counter: int = 2,
+    ):
         """
+        _generate_session function without RIR simulation.
         Generate a multispeaker audio session and corresponding label files.
 
         Args:
             idx (int): Index for current session (out of total number of sessions).
             basepath (str): Path to output directory.
             filename (str): Filename for output files.
+            speaker_ids (list): List of speaker IDs that will be used in this session.
+            speaker_wav_align_map (dict): Dictionary containing speaker IDs and their corresponding wav filepath and alignments.
+            noise_samples (list): List of randomly sampled noise source files that will be used for generating this session.
+            device (torch.device): Device to use for generating this session.
             enforce_counter (int): In enforcement mode, dominance is increased by a factor of enforce_counter for unrepresented speakers
         """
-        speaker_ids = self._get_speaker_ids()  # randomly select speaker IDs
+        random_seed = self._params.data_simulator.random_seed
+        np.random.seed(random_seed + idx)
+
+        self._device = device
         speaker_dominance = self._get_speaker_dominance()  # randomly determine speaker dominance
         base_speaker_dominance = np.copy(speaker_dominance)
-        speaker_lists = self._get_speaker_samples(speaker_ids)  # get list of samples per speaker
         self._set_speaker_volume()
 
-        running_length_sr, prev_length_sr = 0, 0
+        running_len_samples, prev_len_samples = 0, 0
         prev_speaker = None
-        rttm_list, json_list, ctm_list = [], [], []
+        self.annotator.init_annotation_lists()
+        self._noise_samples = noise_samples
         self._furthest_sample = [0 for n in range(self._params.data_simulator.session_config.num_speakers)]
-        self._missing_overlap = 0
+        self._missing_silence = 0
 
         # hold enforce until all speakers have spoken
         enforce_time = np.random.uniform(
@@ -976,142 +1047,232 @@ class MultiSpeakerSimulator(object):
         )
         enforce = self._params.data_simulator.speaker_enforcement.enforce_num_speakers
 
-        session_length_sr = int(
+        session_len_samples = int(
             (self._params.data_simulator.session_config.session_length * self._params.data_simulator.sr)
         )
-        array = torch.zeros(session_length_sr)
-        is_bg = torch.zeros(session_length_sr)
+        array = torch.zeros(session_len_samples).to(self._device)
+        is_speech = torch.zeros(session_len_samples).to(self._device)
 
-        while running_length_sr < session_length_sr or enforce:
-            # enforce num_speakers
-            if running_length_sr > enforce_time * session_length_sr and enforce:
+        self.sampler.get_session_silence_mean()
+        self.sampler.get_session_overlap_mean()
+
+        while running_len_samples < session_len_samples or enforce:
+            # Step 1: Prepare parameters for sentence generation
+            # Enforce speakers depending on running length
+            if running_len_samples > enforce_time * session_len_samples and enforce:
                 speaker_dominance, enforce = self._increase_speaker_dominance(base_speaker_dominance, enforce_counter)
                 if enforce:
                     enforce_counter += 1
 
-            # select speaker
+            # Step 2: Select a speaker
             speaker_turn = self._get_next_speaker(prev_speaker, speaker_dominance)
 
-            # build sentence (only add if remaining length >  specific time)
-            max_sentence_duration_sr = session_length_sr - running_length_sr
+            # Calculate parameters for building a sentence (only add if remaining length >  specific time)
+            max_samples_in_sentence = session_len_samples - running_len_samples
             if enforce:
-                max_sentence_duration_sr = float('inf')
+                max_samples_in_sentence = float('inf')
             elif (
-                max_sentence_duration_sr
+                max_samples_in_sentence
                 < self._params.data_simulator.session_params.end_buffer * self._params.data_simulator.sr
             ):
                 break
-            self._build_sentence(speaker_turn, speaker_ids, speaker_lists, max_sentence_duration_sr)
 
+            # Step 3: Generate a sentence
+            self._build_sentence(speaker_turn, speaker_ids, speaker_wav_align_map, max_samples_in_sentence)
             length = len(self._sentence)
+
+            # Step 4: Generate a timestamp for either silence or overlap
             start = self._add_silence_or_overlap(
-                speaker_turn, prev_speaker, running_length_sr, length, session_length_sr, prev_length_sr, enforce
+                speaker_turn=speaker_turn,
+                prev_speaker=prev_speaker,
+                start=running_len_samples,
+                length=length,
+                session_len_samples=session_len_samples,
+                prev_len_samples=prev_len_samples,
+                enforce=enforce,
             )
-            end = start + length
-            if end > len(array):  # only occurs in enforce mode
-                array = torch.nn.functional.pad(array, (0, end - len(array)))
-                is_bg = torch.nn.functional.pad(is_bg, (0, end - len(is_bg)))
-            array[start:end] += self._sentence
-            is_bg[start:end] = 1
+            # step 5: add sentence to array
+            array, is_speech, end = self._add_sentence_to_array(
+                start=start, length=length, array=array, is_speech=is_speech,
+            )
 
-            # build entries for output files
-            new_rttm_entries = self._create_new_rttm_entry(
-                start / self._params.data_simulator.sr, end / self._params.data_simulator.sr, speaker_ids[speaker_turn]
+            # Step 6: Build entries for output files
+            new_rttm_entries = self.annotator.create_new_rttm_entry(
+                words=self._words,
+                alignments=self._alignments,
+                start=start / self._params.data_simulator.sr,
+                end=end / self._params.data_simulator.sr,
+                speaker_id=speaker_ids[speaker_turn],
             )
-            for entry in new_rttm_entries:
-                rttm_list.append(entry)
-            new_json_entry = self._create_new_json_entry(
-                os.path.join(basepath, filename + '.wav'),
-                start / self._params.data_simulator.sr,
-                length / self._params.data_simulator.sr,
-                speaker_ids[speaker_turn],
-                os.path.join(basepath, filename + '.rttm'),
-                os.path.join(basepath, filename + '.ctm'),
-            )
-            json_list.append(new_json_entry)
-            new_ctm_entries = self._create_new_ctm_entry(
-                filename, speaker_ids[speaker_turn], start / self._params.data_simulator.sr
-            )
-            for entry in new_ctm_entries:
-                ctm_list.append(entry)
 
-            running_length_sr = np.maximum(running_length_sr, end)
-            self._furthest_sample[speaker_turn] = running_length_sr
+            self.annotator.annote_lists['rttm'].extend(new_rttm_entries)
+
+            new_json_entry = self.annotator.create_new_json_entry(
+                text=self._text,
+                wav_filename=os.path.join(basepath, filename + '.wav'),
+                start=start / self._params.data_simulator.sr,
+                length=length / self._params.data_simulator.sr,
+                speaker_id=speaker_ids[speaker_turn],
+                rttm_filepath=os.path.join(basepath, filename + '.rttm'),
+                ctm_filepath=os.path.join(basepath, filename + '.ctm'),
+            )
+            self.annotator.annote_lists['json'].append(new_json_entry)
+
+            new_ctm_entries = self.annotator.create_new_ctm_entry(
+                words=self._words,
+                alignments=self._alignments,
+                session_name=filename,
+                speaker_id=speaker_ids[speaker_turn],
+                start=int(start / self._params.data_simulator.sr),
+            )
+
+            self.annotator.annote_lists['ctm'].extend(new_ctm_entries)
+
+            running_len_samples = np.maximum(running_len_samples, end)
+            (
+                self.sampler.running_speech_len_samples,
+                self.sampler.running_silence_len_samples,
+            ) = self._get_session_silence_from_rttm(
+                rttm_list=self.annotator.annote_lists['rttm'], running_len_samples=running_len_samples
+            )
+
+            self._furthest_sample[speaker_turn] = running_len_samples
             prev_speaker = speaker_turn
-            prev_length_sr = length
+            prev_len_samples = length
 
-        # background noise augmentation
+        # Step 7-1: Add optional perturbations to the whole session, such as white noise.
+        if self._params.data_simulator.session_augmentor.add_sess_aug:
+            # NOTE: This perturbation is not reflected in the session SNR in meta dictionary.
+            array = perturb_audio(array, self._params.data_simulator.sr, self.session_augmentor, device=array.device)
+
+        # Step 7-2: Additive background noise from noise manifest files
         if self._params.data_simulator.background_noise.add_bg:
-            avg_power_array = torch.mean(array[is_bg == 1] ** 2)
-            bg = self._get_background(len(array), avg_power_array)
-            array += bg
+            if len(self._noise_samples) > 0:
+                avg_power_array = torch.mean(array[is_speech == 1] ** 2)
+                bg, snr = get_background_noise(
+                    len_array=len(array),
+                    power_array=avg_power_array,
+                    noise_samples=self._noise_samples,
+                    audio_read_buffer_dict=self._audio_read_buffer_dict,
+                    snr_min=self._params.data_simulator.background_noise.snr_min,
+                    snr_max=self._params.data_simulator.background_noise.snr_max,
+                    background_noise_snr=self._params.data_simulator.background_noise.snr,
+                    seed=(random_seed + idx),
+                    device=self._device,
+                )
+                array += bg
+            else:
+                raise ValueError('No background noise samples found in self._noise_samples.')
+        else:
+            snr = "N/A"
 
-        array = array / (1.0 * torch.max(torch.abs(array)))  # normalize wav file to avoid clipping
+        # Step 7: Normalize and write to disk
+        array = normalize_audio(array)
+
+        if torch.is_tensor(array):
+            array = array.cpu().numpy()
         sf.write(os.path.join(basepath, filename + '.wav'), array, self._params.data_simulator.sr)
-        labels_to_rttmfile(rttm_list, filename, self._params.data_simulator.outputs.output_dir)
-        write_manifest(os.path.join(basepath, filename + '.json'), json_list)
-        write_ctm(os.path.join(basepath, filename + '.ctm'), ctm_list)
-        write_text(os.path.join(basepath, filename + '.txt'), ctm_list)
 
-    def generate_sessions(self):
+        self.annotator.write_annotation_files(
+            basepath=basepath, filename=filename, meta_data=self._get_session_meta_data(array=array, snr=snr),
+        )
+
+        # Step 8: Clean up memory
+        del array
+        self.clean_up()
+        return basepath, filename
+
+    def generate_sessions(self, random_seed: int = None):
         """
         Generate several multispeaker audio sessions and corresponding list files.
+
+        Args:
+            random_seed (int): random seed for reproducibility
         """
         logging.info(f"Generating Diarization Sessions")
-        np.random.seed(self._params.data_simulator.random_seed)
+        if random_seed is None:
+            random_seed = self._params.data_simulator.random_seed
+        np.random.seed(random_seed)
+
         output_dir = self._params.data_simulator.outputs.output_dir
 
-        # delete output directory if it exists or throw warning
-        if os.path.isdir(output_dir) and os.listdir(output_dir):
-            if self._params.data_simulator.outputs.overwrite_output:
-                shutil.rmtree(output_dir)
-                os.mkdir(output_dir)
+        basepath = get_cleaned_base_path(
+            output_dir, overwrite_output=self._params.data_simulator.outputs.overwrite_output
+        )
+        OmegaConf.save(self._params, os.path.join(output_dir, "params.yaml"))
+
+        tp = concurrent.futures.ProcessPoolExecutor(max_workers=self.num_workers)
+        futures = []
+
+        num_sessions = self._params.data_simulator.session_config.num_sessions
+        source_noise_manifest = read_noise_manifest(
+            add_bg=self._params.data_simulator.background_noise.add_bg,
+            background_manifest=self._params.data_simulator.background_noise.background_manifest,
+        )
+        queue = []
+
+        # add radomly sampled arguments to a list(queue) for multiprocessing
+        for sess_idx in range(num_sessions):
+            filename = self._params.data_simulator.outputs.output_filename + f"_{sess_idx}"
+            speaker_ids = get_speaker_ids(
+                sess_idx=sess_idx,
+                speaker_samples=self._speaker_samples,
+                permutated_speaker_inds=self._permutated_speaker_inds,
+            )
+            speaker_wav_align_map = get_speaker_samples(speaker_ids=speaker_ids, speaker_samples=self._speaker_samples)
+            noise_samples = self.sampler.sample_noise_manifest(noise_manifest=source_noise_manifest)
+
+            if torch.cuda.is_available():
+                device = torch.device(f"cuda:{sess_idx % torch.cuda.device_count()}")
             else:
-                raise Exception("Output directory is nonempty and overwrite_output = false")
-        elif not os.path.isdir(output_dir):
-            os.mkdir(output_dir)
+                device = self._device
+            queue.append((sess_idx, basepath, filename, speaker_ids, speaker_wav_align_map, noise_samples, device))
 
-        # only add root if paths are relative
-        if not os.path.isabs(output_dir):
-            ROOT = os.getcwd()
-            basepath = os.path.join(ROOT, output_dir)
-        else:
-            basepath = output_dir
+        # for multiprocessing speed, we avoid loading potentially huge manifest list and speaker sample files into each process.
+        if self.num_workers > 1:
+            self._manifest = None
+            self._speaker_samples = None
 
-        wavlist = open(os.path.join(basepath, "synthetic_wav.list"), "w")
-        rttmlist = open(os.path.join(basepath, "synthetic_rttm.list"), "w")
-        jsonlist = open(os.path.join(basepath, "synthetic_json.list"), "w")
-        ctmlist = open(os.path.join(basepath, "synthetic_ctm.list"), "w")
-        textlist = open(os.path.join(basepath, "synthetic_txt.list"), "w")
+        # Chunk the sessions into smaller chunks for very large number of sessions (10K+ sessions)
+        for chunk_idx in range(self.chunk_count):
+            futures = []
+            stt_idx, end_idx = (
+                chunk_idx * self.multiprocessing_chunksize,
+                min((chunk_idx + 1) * self.multiprocessing_chunksize, num_sessions),
+            )
+            for sess_idx in range(stt_idx, end_idx):
+                self._furthest_sample = [0 for n in range(self._params.data_simulator.session_config.num_speakers)]
+                self._audio_read_buffer_dict = {}
+                if self.num_workers > 1:
+                    futures.append(tp.submit(self._generate_session, *queue[sess_idx]))
+                else:
+                    futures.append(queue[sess_idx])
 
-        for i in trange(self._params.data_simulator.session_config.num_sessions):
-            self._furthest_sample = [0 for n in range(self._params.data_simulator.session_config.num_speakers)]
-            self._missing_overlap = 0
+            if self.num_workers > 1:
+                generator = concurrent.futures.as_completed(futures)
+            else:
+                generator = futures
 
-            filename = self._params.data_simulator.outputs.output_filename + f"_{i}"
-            self._generate_session(i, basepath, filename)
+            for future in tqdm(
+                generator,
+                desc=f"[{chunk_idx+1}/{self.chunk_count}] Waiting jobs from {stt_idx+1: 2} to {end_idx: 2}",
+                unit="jobs",
+                total=len(futures),
+            ):
+                if self.num_workers > 1:
+                    basepath, filename = future.result()
+                else:
+                    self._noise_samples = self.sampler.sample_noise_manifest(noise_manifest=source_noise_manifest,)
+                    basepath, filename = self._generate_session(*future)
 
-            wavlist.write(os.path.join(basepath, filename + '.wav\n'))
-            rttmlist.write(os.path.join(basepath, filename + '.rttm\n'))
-            jsonlist.write(os.path.join(basepath, filename + '.json\n'))
-            ctmlist.write(os.path.join(basepath, filename + '.ctm\n'))
-            textlist.write(os.path.join(basepath, filename + '.txt\n'))
+                self.annotator.add_to_filename_lists(basepath=basepath, filename=filename)
 
-            # throw error if number of speakers is less than requested
-            num_missing = 0
-            for k in range(len(self._furthest_sample)):
-                if self._furthest_sample[k] == 0:
-                    num_missing += 1
-            if num_missing != 0:
-                warnings.warn(
-                    f"{self._params.data_simulator.session_config.num_speakers-num_missing} speakers were included in the clip instead of the requested amount of {self._params.data_simulator.session_config.num_speakers}"
-                )
+                # throw warning if number of speakers is less than requested
+                self._check_missing_speakers()
 
-        wavlist.close()
-        rttmlist.close()
-        jsonlist.close()
-        ctmlist.close()
-        textlist.close()
+        tp.shutdown()
+        self.annotator.write_filelist_files(basepath=basepath)
+        logging.info(f"Data simulation has been completed, results saved at: {basepath}")
 
 
 class RIRMultiSpeakerSimulator(MultiSpeakerSimulator):
@@ -1193,7 +1354,7 @@ class RIRMultiSpeakerSimulator(MultiSpeakerSimulator):
             and self._params.data_simulator.rir_generation.mic_config.mic_pattern != 'omni'
         ):
             raise Exception("Microphone orientations must be provided if mic_pattern != omni")
-        if self._params.data_simulator.rir_generation.mic_config.orV_rcv != None:
+        if self._params.data_simulator.rir_generation.mic_config.orV_rcv is not None:
             if len(self._params.data_simulator.rir_generation.mic_config.orV_rcv) != len(
                 self._params.data_simulator.rir_generation.mic_config.pos_rcv
             ):
@@ -1202,7 +1363,7 @@ class RIRMultiSpeakerSimulator(MultiSpeakerSimulator):
                 if len(sublist) != 3:
                     raise Exception("Three coordinates must be provided for orientations")
 
-    def _generate_rir_gpuRIR(self) -> Tuple[torch.Tensor, int]:
+    def _generate_rir_gpuRIR(self):
         """
         Create simulated RIR using the gpuRIR library
 
@@ -1347,7 +1508,17 @@ class RIRMultiSpeakerSimulator(MultiSpeakerSimulator):
             output_sound.append(torch.tensor(out_channel))
         return output_sound, length
 
-    def _generate_session(self, idx: int, basepath: str, filename: str, enforce_counter: int = 2):
+    def _generate_session(
+        self,
+        idx: int,
+        basepath: str,
+        filename: str,
+        speaker_ids: list,
+        speaker_wav_align_map: dict,
+        noise_samples: list,
+        device: torch.device,
+        enforce_counter: int = 2,
+    ):
         """
         Generate a multispeaker audio session and corresponding label files.
 
@@ -1355,19 +1526,25 @@ class RIRMultiSpeakerSimulator(MultiSpeakerSimulator):
             idx (int): Index for current session (out of total number of sessions).
             basepath (str): Path to output directory.
             filename (str): Filename for output files.
+            speaker_ids (list): List of speaker IDs that will be used in this session.
+            speaker_wav_align_map (dict): Dictionary containing speaker IDs and their corresponding wav filepath and alignments.
+            noise_samples (list): List of randomly sampled noise source files that will be used for generating this session.
+            device (torch.device): Device to use for generating this session.
             enforce_counter (int): In enforcement mode, dominance is increased by a factor of enforce_counter for unrepresented speakers
         """
-        speaker_ids = self._get_speaker_ids()  # randomly select speaker IDs
+        random_seed = self._params.data_simulator.random_seed
+        np.random.seed(random_seed + idx)
+
+        self._device = device
         speaker_dominance = self._get_speaker_dominance()  # randomly determine speaker dominance
         base_speaker_dominance = np.copy(speaker_dominance)
-        speaker_lists = self._get_speaker_samples(speaker_ids)  # get list of samples per speaker
         self._set_speaker_volume()
 
-        running_length_sr, prev_length_sr = 0, 0  # starting point for each sentence
+        running_len_samples, prev_len_samples = 0, 0  # starting point for each sentence
         prev_speaker = None
-        rttm_list, json_list, ctm_list = [], [], []
+        self.annotator.init_annotation_lists()
+        self._noise_samples = noise_samples
         self._furthest_sample = [0 for n in range(self._params.data_simulator.session_config.num_speakers)]
-        self._missing_overlap = 0
 
         # Room Impulse Response Generation (performed once per batch of sessions)
         if self._params.data_simulator.rir_generation.toolkit == 'gpuRIR':
@@ -1384,57 +1561,73 @@ class RIRMultiSpeakerSimulator(MultiSpeakerSimulator):
         )
         enforce = self._params.data_simulator.speaker_enforcement.enforce_num_speakers
 
-        session_length_sr = int(
+        session_len_samples = int(
             (self._params.data_simulator.session_config.session_length * self._params.data_simulator.sr)
         )
-        array = torch.zeros((session_length_sr, self._params.data_simulator.rir_generation.mic_config.num_channels))
-        is_bg = torch.zeros(session_length_sr)
+        array = torch.zeros((session_len_samples, self._params.data_simulator.rir_generation.mic_config.num_channels))
+        is_speech = torch.zeros(session_len_samples)
 
-        while running_length_sr < session_length_sr or enforce:
-            # enforce num_speakers
-            if running_length_sr > enforce_time * session_length_sr and enforce:
+        while running_len_samples < session_len_samples or enforce:
+            # Step 1: Prepare parameters for sentence generation
+            # Enforce speakers depending on running length
+            if running_len_samples > enforce_time * session_len_samples and enforce:
                 speaker_dominance, enforce = self._increase_speaker_dominance(base_speaker_dominance, enforce_counter)
                 if enforce:
                     enforce_counter += 1
 
-            # select speaker
+            # Step 2: Select a speaker
             speaker_turn = self._get_next_speaker(prev_speaker, speaker_dominance)
 
-            # build sentence (only add if remaining length >  specific time)
-            max_sentence_duration_sr = (
-                session_length_sr - running_length_sr - RIR_pad
+            # Calculate parameters for building a sentence (only add if remaining length >  specific time)
+            max_samples_in_sentence = (
+                session_len_samples - running_len_samples - RIR_pad
             )  # sentence will be RIR_len - 1 longer than the audio was pre-augmentation
             if enforce:
-                max_sentence_duration_sr = float('inf')
+                max_samples_in_sentence = float('inf')
             elif (
-                max_sentence_duration_sr
+                max_samples_in_sentence
                 < self._params.data_simulator.session_params.end_buffer * self._params.data_simulator.sr
             ):
                 break
-            self._build_sentence(speaker_turn, speaker_ids, speaker_lists, max_sentence_duration_sr)
+
+            # Step 3: Generate a sentence
+            self._build_sentence(speaker_turn, speaker_ids, speaker_wav_align_map, max_samples_in_sentence)
             augmented_sentence, length = self._convolve_rir(self._sentence, speaker_turn, RIR)
 
+            # Step 4: Generate a time-stamp for either silence or overlap
             start = self._add_silence_or_overlap(
-                speaker_turn, prev_speaker, running_length_sr, length, session_length_sr, prev_length_sr, enforce
+                speaker_turn=speaker_turn,
+                prev_speaker=prev_speaker,
+                start=running_len_samples,
+                length=length,
+                session_len_samples=session_len_samples,
+                prev_len_samples=prev_len_samples,
+                enforce=enforce,
             )
+            # step 5: add sentence to array
             end = start + length
             if end > len(array):
                 array = torch.nn.functional.pad(array, (0, 0, 0, end - len(array)))
-                is_bg = torch.nn.functional.pad(is_bg, (0, end - len(is_bg)))
-
-            is_bg[start:end] = 1
+                is_speech = torch.nn.functional.pad(is_speech, (0, end - len(is_speech)))
+            is_speech[start:end] = 1
 
             for channel in range(self._params.data_simulator.rir_generation.mic_config.num_channels):
                 len_ch = len(augmented_sentence[channel])  # accounts for how channels are slightly different lengths
                 array[start : start + len_ch, channel] += augmented_sentence[channel]
 
-            # build entries for output files
-            new_rttm_entries = self._create_new_rttm_entry(
-                start / self._params.data_simulator.sr, end / self._params.data_simulator.sr, speaker_ids[speaker_turn]
+            # Step 6: Build entries for output files
+            new_rttm_entries = self.annotator.create_new_rttm_entry(
+                self._words,
+                self._alignments,
+                start / self._params.data_simulator.sr,
+                end / self._params.data_simulator.sr,
+                speaker_ids[speaker_turn],
             )
-            for entry in new_rttm_entries:
-                rttm_list.append(entry)
-            new_json_entry = self._create_new_json_entry(
+
+            self.annotator.annote_lists['rttm'].extend(new_rttm_entries)
+
+            new_json_entry = self.annotator.create_new_json_entry(
+                self._text,
                 os.path.join(basepath, filename + '.wav'),
                 start / self._params.data_simulator.sr,
                 length / self._params.data_simulator.sr,
@@ -1442,33 +1635,61 @@ class RIRMultiSpeakerSimulator(MultiSpeakerSimulator):
                 os.path.join(basepath, filename + '.rttm'),
                 os.path.join(basepath, filename + '.ctm'),
             )
-            json_list.append(new_json_entry)
-            new_ctm_entries = self._create_new_ctm_entry(
+            self.annotator.annote_lists['json'].append(new_json_entry)
+
+            new_ctm_entries = self.annotator.create_new_ctm_entry(
                 filename, speaker_ids[speaker_turn], start / self._params.data_simulator.sr
             )
-            for entry in new_ctm_entries:
-                ctm_list.append(entry)
+            self.annotator.annote_lists['ctm'].extend(new_ctm_entries)
 
-            running_length_sr = np.maximum(running_length_sr, end)
-            self._furthest_sample[speaker_turn] = running_length_sr
+            running_len_samples = np.maximum(running_len_samples, end)
+            self._furthest_sample[speaker_turn] = running_len_samples
             prev_speaker = speaker_turn
-            prev_length_sr = length
+            prev_len_samples = length
 
-        # background noise augmentation
+        # Step 7-1: Add optional perturbations to the whole session, such as white noise.
+        if self._params.data_simulator.session_augmentor.add_sess_aug:
+            # NOTE: This perturbation is not reflected in the session SNR in meta dictionary.
+            array = perturb_audio(array, self._params.data_simulator.sr, self.session_augmentor)
+
+        # Step 7-2: Additive background noise from noise manifest files
         if self._params.data_simulator.background_noise.add_bg:
-            avg_power_array = torch.mean(array[is_bg == 1] ** 2)
+            if len(self._noise_samples) > 0:
+                avg_power_array = torch.mean(array[is_speech == 1] ** 2)
+                bg, snr = get_background_noise(
+                    len_array=len(array),
+                    power_array=avg_power_array,
+                    noise_samples=self._noise_samples,
+                    audio_read_buffer_dict=self._audio_read_buffer_dict,
+                    snr_min=self._params.data_simulator.background_noise.snr_min,
+                    snr_max=self._params.data_simulator.background_noise.snr_max,
+                    background_noise_snr=self._params.data_simulator.background_noise.snr,
+                    seed=(random_seed + idx),
+                    device=self._device,
+                )
+                array += bg
             length = array.shape[0]
-            bg = self._get_background(length, avg_power_array)
+            bg, snr = self._get_background(length, avg_power_array)
             augmented_bg, _ = self._convolve_rir(bg, -1, RIR)
             for channel in range(self._params.data_simulator.rir_generation.mic_config.num_channels):
                 array[:, channel] += augmented_bg[channel][:length]
+        else:
+            snr = "N/A"
 
-        array = array / (1.0 * torch.max(torch.abs(array)))  # normalize wav file to avoid clipping
+        # Step 7: Normalize and write to disk
+        array = normalize_audio(array)
+
+        if torch.is_tensor(array):
+            array = array.cpu().numpy()
         sf.write(os.path.join(basepath, filename + '.wav'), array, self._params.data_simulator.sr)
-        labels_to_rttmfile(rttm_list, filename, self._params.data_simulator.outputs.output_dir)
-        write_manifest(os.path.join(basepath, filename + '.json'), json_list)
-        write_ctm(os.path.join(basepath, filename + '.ctm'), ctm_list)
-        write_text(os.path.join(basepath, filename + '.txt'), ctm_list)
+
+        self.annotator.write_annotation_files(
+            basepath=basepath, filename=filename, meta_data=self._get_session_meta_data(array=array, snr=snr),
+        )
+
+        del array
+        self.clean_up()
+        return basepath, filename
 
 
 def check_angle(key: str, val: Union[float, Iterable[float]]) -> bool:
@@ -1759,7 +1980,7 @@ class ArrayGeometry(object):
 
 
 def convert_placement_to_range(
-    placement: Dict, room_dim: Iterable[float], object_radius: float = 0
+    placement: dict, room_dim: Iterable[float], object_radius: float = 0
 ) -> List[List[float]]:
     """Given a placement dictionary, return ranges for each dimension.
 
@@ -1773,6 +1994,9 @@ def convert_placement_to_range(
     """
     if not np.all(np.array(room_dim) > 0):
         raise ValueError(f'Room dimensions must be positive: {room_dim}')
+
+    if object_radius < 0:
+        raise ValueError(f'Object radius must be non-negative: {object_radius}')
 
     placement_range = [None] * 3
     min_to_wall = placement.get('min_to_wall', 0)
@@ -1898,7 +2122,13 @@ class RIRCorpusGenerator(object):
         if mic_cfg is None:
             raise ValueError('Mic configuration not provided')
 
-        for key in ['positions', 'placement', 'orientation']:
+        if mic_cfg.get('positions') == 'random':
+            # Only num_mics and placement are required
+            mic_cfg_keys = ['num_mics', 'placement']
+        else:
+            mic_cfg_keys = ['positions', 'placement', 'orientation']
+
+        for key in mic_cfg_keys:
             if key not in mic_cfg:
                 raise ValueError(f'Mic array {key} not provided')
 
@@ -1929,27 +2159,7 @@ class RIRCorpusGenerator(object):
 
         room_cfg = self.cfg.room
 
-        # width, length, height
-        room_dim = np.zeros(3)
-
-        # prepare dimensions
-        for idx, key in enumerate(['width', 'length', 'height']):
-            # get configured dimension
-            dim = room_cfg.dim[key]
-
-            # set a value
-            if dim is None:
-                raise ValueError(f'Room {key} needs to be a scalar or a range, currently it is None')
-            elif np.isscalar(dim):
-                assert dim > 0, f'Dimension should be positive for {key}: {dim}'
-                room_dim[idx] = dim
-            elif len(dim) == 2:
-                assert 0 < dim[0] <= dim[1], f'Expecting two non-decreasing values for {key}, received {dim}'
-                room_dim[idx] = self.random.uniform(low=dim[0], high=dim[1])
-            else:
-                raise ValueError(f'Unexpected value for {key}: {dim}')
-
-        # prepare rt60
+        # Prepare rt60
         if room_cfg.rt60 is None:
             raise ValueError(f'Room RT60 needs to be a scalar or a range, currently it is None')
 
@@ -1964,8 +2174,45 @@ class RIRCorpusGenerator(object):
         else:
             raise ValueError(f'Unexpected value for RT60: {room_cfg.rt60}')
 
-        # Get parameters from size and RT60
-        room_absorption, room_max_order = pra.inverse_sabine(rt60, room_dim)
+        # Generate a room with random dimensions
+        num_retries = self.cfg.get('num_retries', 20)
+
+        for n in range(num_retries):
+
+            # width, length, height
+            room_dim = np.zeros(3)
+
+            # prepare dimensions
+            for idx, key in enumerate(['width', 'length', 'height']):
+                # get configured dimension
+                dim = room_cfg.dim[key]
+
+                # set a value
+                if dim is None:
+                    raise ValueError(f'Room {key} needs to be a scalar or a range, currently it is None')
+                elif np.isscalar(dim):
+                    assert dim > 0, f'Dimension should be positive for {key}: {dim}'
+                    room_dim[idx] = dim
+                elif len(dim) == 2:
+                    assert 0 < dim[0] <= dim[1], f'Expecting two non-decreasing values for {key}, received {dim}'
+                    # Reduce dimension if the previous attempt failed
+                    room_dim[idx] = self.random.uniform(low=dim[0], high=dim[1] - n * (dim[1] - dim[0]) / num_retries)
+                else:
+                    raise ValueError(f'Unexpected value for {key}: {dim}')
+
+            try:
+                # Get parameters from size and RT60
+                room_absorption, room_max_order = pra.inverse_sabine(rt60, room_dim)
+                break
+            except Exception as e:
+                logging.debug('Inverse sabine failed: %s', str(e))
+                # Inverse sabine may fail if the room is too large for the selected RT60.
+                # Try again by generate a smaller room.
+                room_absorption = room_max_order = None
+                continue
+
+        if room_absorption is None or room_max_order is None:
+            raise RuntimeError(f'Evaluation of parameters failed for RT60 {rt60}s and room size {room_dim}.')
 
         # Return the required values
         room_params = {
@@ -1989,43 +2236,64 @@ class RIRCorpusGenerator(object):
             Randomly placed microphone array.
         """
         mic_cfg = self.cfg.mic_array
-        mic_array = ArrayGeometry(mic_cfg.positions)
 
-        # Randomize center placement
-        center = np.zeros(3)
-        placement_range = convert_placement_to_range(
-            placement=mic_cfg.placement, room_dim=room_dim, object_radius=mic_array.radius
-        )
+        if mic_cfg.positions == 'random':
+            # Create a radom set of microphones
+            num_mics = mic_cfg.num_mics
+            mic_positions = []
 
-        for idx in range(len(center)):
-            center[idx] = self.random.uniform(low=placement_range[idx][0], high=placement_range[idx][1])
+            # Each microphone is placed individually
+            placement_range = convert_placement_to_range(
+                placement=mic_cfg.placement, room_dim=room_dim, object_radius=0
+            )
 
-        # Place the array at the configured center point
-        mic_array.translate(to=center)
+            # Randomize mic placement
+            for m in range(num_mics):
+                position_m = [None] * 3
+                for idx in range(3):
+                    position_m[idx] = self.random.uniform(low=placement_range[idx][0], high=placement_range[idx][1])
+                mic_positions.append(position_m)
 
-        # Randomize orientation
-        orientation = dict()
-        for key in ['yaw', 'roll', 'pitch']:
-            # angle for current orientation
-            angle = mic_cfg.orientation[key]
+            mic_array = ArrayGeometry(mic_positions)
 
-            if angle is None:
-                raise ValueError(f'Mic array {key} should be a scalar or a range, currently it is set to None.')
+        else:
+            mic_array = ArrayGeometry(mic_cfg.positions)
 
-            # check it's within the expected range
-            check_angle(key, angle)
+            # Randomize center placement
+            center = np.zeros(3)
+            placement_range = convert_placement_to_range(
+                placement=mic_cfg.placement, room_dim=room_dim, object_radius=mic_array.radius
+            )
 
-            if np.isscalar(angle):
-                orientation[key] = angle
-            elif len(angle) == 2:
-                assert angle[0] <= angle[1], f"Expecting two non-decreasing values for {key}, received {angle}"
-                # generate integer values, for easier bucketing, if necessary
-                orientation[key] = self.random.uniform(low=angle[0], high=angle[1])
-            else:
-                raise ValueError(f'Unexpected value for orientation {key}: {angle}')
+            for idx in range(len(center)):
+                center[idx] = self.random.uniform(low=placement_range[idx][0], high=placement_range[idx][1])
 
-        # Rotate the array to match the selected orientation
-        mic_array.rotate(**orientation)
+            # Place the array at the configured center point
+            mic_array.translate(to=center)
+
+            # Randomize orientation
+            orientation = dict()
+            for key in ['yaw', 'roll', 'pitch']:
+                # angle for current orientation
+                angle = mic_cfg.orientation[key]
+
+                if angle is None:
+                    raise ValueError(f'Mic array {key} should be a scalar or a range, currently it is set to None.')
+
+                # check it's within the expected range
+                check_angle(key, angle)
+
+                if np.isscalar(angle):
+                    orientation[key] = angle
+                elif len(angle) == 2:
+                    assert angle[0] <= angle[1], f"Expecting two non-decreasing values for {key}, received {angle}"
+                    # generate integer values, for easier bucketing, if necessary
+                    orientation[key] = self.random.uniform(low=angle[0], high=angle[1])
+                else:
+                    raise ValueError(f'Unexpected value for orientation {key}: {angle}')
+
+            # Rotate the array to match the selected orientation
+            mic_array.rotate(**orientation)
 
         return mic_array
 
@@ -2107,8 +2375,10 @@ class RIRCorpusGenerator(object):
                 examples.append(example)
 
             # Simulation
-            num_workers = self.cfg.num_workers
-            if num_workers is not None and num_workers > 1:
+            if (num_workers := self.cfg.get('num_workers')) is None:
+                num_workers = os.cpu_count() - 1
+
+            if num_workers > 1:
                 logging.info(f'Simulate using {num_workers} workers')
                 with multiprocessing.Pool(processes=num_workers) as pool:
                     metadata = list(tqdm(pool.imap(simulate_room_kwargs, examples), total=len(examples)))
@@ -2592,22 +2862,23 @@ class RIRMixGenerator(object):
         # interference configuration
         interference_cfg = self.cfg.get('interference')
         if not interference_cfg:
-            raise ValueError(
-                'Interference configuration not provided. Expecting audio manifests in format {subset: path_to_manifest}'
-            )
-        interference_probability = interference_cfg.get('interference_probability', 0)
-        max_num_interferers = interference_cfg.get('max_num_interferers', 0)
-        min_azimuth_to_target = interference_cfg.get('min_azimuth_to_target', 0)
-        if interference_probability is not None:
-            if interference_probability < 0:
-                raise ValueError(f'Interference probability must be non-negative. Current value: {interference_prob}')
-            elif interference_probability > 0:
-                assert (
-                    max_num_interferers is not None and max_num_interferers > 0
-                ), f'Max number of interferers must be positive. Current value: {max_num_interferers}'
-                assert (
-                    min_azimuth_to_target is not None and min_azimuth_to_target >= 0
-                ), f'Min azimuth to target must be non-negative'
+            logging.info('Interference configuration not provided.')
+        else:
+            interference_probability = interference_cfg.get('interference_probability', 0)
+            max_num_interferers = interference_cfg.get('max_num_interferers', 0)
+            min_azimuth_to_target = interference_cfg.get('min_azimuth_to_target', 0)
+            if interference_probability is not None:
+                if interference_probability < 0:
+                    raise ValueError(
+                        f'Interference probability must be non-negative. Current value: {interference_prob}'
+                    )
+                elif interference_probability > 0:
+                    assert (
+                        max_num_interferers is not None and max_num_interferers > 0
+                    ), f'Max number of interferers must be positive. Current value: {max_num_interferers}'
+                    assert (
+                        min_azimuth_to_target is not None and min_azimuth_to_target >= 0
+                    ), f'Min azimuth to target must be non-negative'
 
         # mix configuration
         mix_cfg = self.cfg.get('mix')
@@ -2617,71 +2888,6 @@ class RIRMixGenerator(object):
             raise ValueError('Reference microphone not defined.')
         if 'ref_mic_rms' not in mix_cfg:
             raise ValueError('Reference microphone RMS not defined.')
-
-    def get_audio_list(
-        self, metadata: List[dict], min_duration: float, manifest_filepath: str = None, duration_eps: float = 0.01
-    ) -> List[dict]:
-        """Prepare a list of audio files with duration of at least min_duration.
-        Audio files are randomly selected from manifest metadata.
-
-        If a selected file is longer than required duration, then a random offset is selected
-        before taking a min_duration segment.
-        If a selected file is shorter than the required duration, then a the whole file is selected
-        and a next file is randomly selected.
-        Needs manifest filepath to support relative path resolution.
-
-        Args:
-            metadata: metadata loaded from a manifest file
-            min_duration: minimal duration for the output file
-            manifest_filepath: path to the manifest file, used to resolve relative paths.
-                               For relative paths, manifest parent directory is assume to
-                               be the base directory.
-            duration_eps: A small extra duration selected from each file. This is to make
-                          sure that the signal will be long enough even if it needs to be
-                          resampled, etc.
-        
-        Returns:
-            List of audio files with some metadata (offset, duration).
-        """
-        # load a bit more than required, to compensate to floor rounding
-        # when loading samples from a file
-        total_duration = additional_duration = 0
-
-        audio_list = []
-
-        while total_duration < min_duration + additional_duration:
-
-            data = self.random.choice(metadata)
-            audio_filepath = data['audio_filepath']
-            if not os.path.isabs(audio_filepath) and manifest_filepath is not None:
-                manifest_dir = os.path.dirname(manifest_filepath)
-                audio_filepath = os.path.join(manifest_dir, audio_filepath)
-
-            remaining_duration = min_duration - total_duration + additional_duration
-
-            # select a random offset
-            if data['duration'] <= remaining_duration:
-                # take the whole noise file
-                offset = 0
-                duration = data['duration']
-                additional_duration += duration_eps
-            else:
-                # select a random offset in seconds
-                max_offset = data['duration'] - remaining_duration
-                offset = self.random.uniform(low=0, high=max_offset)
-                duration = remaining_duration
-
-            audio_example = {
-                'audio_filepath': audio_filepath,
-                'offset': offset,
-                'duration': duration,
-                'type': data.get('type'),
-            }
-
-            audio_list.append(audio_example)
-            total_duration += duration
-
-        return audio_list
 
     def generate_target(self, subset: str) -> dict:
         """
@@ -2709,41 +2915,81 @@ class RIRMixGenerator(object):
         Returns:
             Dictionary with target configuration, including room, source index, and audio information.
         """
+        # Utility function
+        def select_target_source(room_metadata, room_indices):
+            """Find a room and a source that satisfies the constraints.
+            """
+            for room_index in room_indices:
+                # Select room
+                room_data = room_metadata[room_index]
+
+                # Candidate sources
+                sources = self.random.choice(room_data['num_sources'], size=self.num_retries, replace=False)
+
+                # Select target source in this room
+                for source in sources:
+                    # Check constraints
+                    constraints_met = []
+                    for constraint in ['azimuth', 'elevation', 'distance']:
+                        if self.cfg.target.get(constraint) is not None:
+                            # Check that the selected source is in the range
+                            source_value = room_data[f'source_{constraint}'][source]
+                            if self.cfg.target[constraint][0] <= source_value <= self.cfg.target[constraint][1]:
+                                constraints_met.append(True)
+                            else:
+                                constraints_met.append(False)
+                                # No need to check the remaining constraints
+                                break
+
+                    # Check if a feasible source is found
+                    if all(constraints_met):
+                        # A feasible source has been found
+                        return source, room_index
+
+            return None, None
+
         # Prepare room & source position
         room_metadata = self.metadata[subset]['room']
-
-        for _ in range(self.num_retries):
-            # Select room
-            room_index = self.random.integers(low=0, high=len(room_metadata))
-            room_data = room_metadata[room_index]
-
-            # Select target source in this room
-            for _ in range(self.num_retries):
-                # Select a source for the target
-                source = self.random.integers(low=0, high=room_data['num_sources'])
-                # Check constraints
-                for constraint in ['azimuth', 'elevation', 'distance']:
-                    if self.cfg.target.get(constraint) is None:
-                        continue
-                    else:
-                        # Check that the selected source is in the range
-                        source_value = room_data[f'source_{constraint}'][source]
-                        if self.cfg.target[constraint][0] <= source_value <= self.cfg.target[constraint][1]:
-                            continue
-                        else:
-                            # Pick a new one
-                            source = None
-                            break
-
-            if source is not None:
-                # A feasible source has been found
-                break
+        room_indices = self.random.choice(len(room_metadata), size=self.num_retries, replace=False)
+        source, room_index = select_target_source(room_metadata, room_indices)
 
         if source is None:
             raise RuntimeError(f'Could not find a feasible source given target constraints {self.cfg.target}')
 
-        # Prepare audio data
-        audio_data = self.random.choice(self.metadata[subset]['target'])
+        room_data = room_metadata[room_index]
+
+        # Optional: select subset of channels
+        num_available_mics = len(room_data['mic_positions'])
+        if 'mic_array' in self.cfg:
+            num_mics = self.cfg.mic_array['num_mics']
+            mic_selection = self.cfg.mic_array['selection']
+
+            if mic_selection == 'random':
+                logging.debug('Randomly selecting %d mics', num_mics)
+                selected_mics = self.random.choice(num_available_mics, size=num_mics, replace=False)
+            elif isinstance(mic_selection, Iterable):
+                logging.debug('Using explicitly selected mics: %s', str(mic_selection))
+                assert (
+                    0 <= min(mic_selection) < num_available_mics
+                ), f'Expecting mic_selection in range [0,{num_available_mics}), current value: {mic_selection}'
+                selected_mics = np.array(mic_selection)
+            else:
+                raise ValueError(f'Unexpected value for mic_selection: {mic_selection}')
+        else:
+            logging.debug('Using all %d available mics', num_available_mics)
+            num_mics = num_available_mics
+            selected_mics = np.arange(num_mics)
+
+        # Double-check the number of mics is as expected
+        assert (
+            len(selected_mics) == num_mics
+        ), f'Expecting {num_mics} mics, but received {len(selected_mics)} mics: {selected_mics}'
+        logging.debug('Selected mics: %s', str(selected_mics))
+
+        # Calculate distance from the source to each microphone
+        mic_positions = np.array(room_data['mic_positions'])[selected_mics]
+        source_position = np.array(room_data['source_position'][source])
+        distance_source_to_mic = np.linalg.norm(mic_positions - source_position, axis=1)
 
         # Handle relative paths
         room_filepath = room_data['room_filepath']
@@ -2751,48 +2997,24 @@ class RIRMixGenerator(object):
             manifest_dir = os.path.dirname(self.cfg.room[subset])
             room_filepath = os.path.join(manifest_dir, room_filepath)
 
-        audio_filepath = audio_data['audio_filepath']
-        if not os.path.isabs(audio_filepath):
-            manifest_dir = os.path.dirname(self.cfg.target[subset])
-            audio_filepath = os.path.join(manifest_dir, audio_filepath)
-
         target_cfg = {
             'room_index': int(room_index),
             'room_filepath': room_filepath,
             'source': source,
             'rt60': room_data['rir_rt60_measured'][source],
-            'num_mics': len(room_data['mic_positions']),
+            'selected_mics': selected_mics.tolist(),
+            # Positions
+            'source_position': source_position.tolist(),
+            'mic_positions': mic_positions.tolist(),
+            # Relative to center of the array
             'azimuth': room_data['source_azimuth'][source],
             'elevation': room_data['source_elevation'][source],
             'distance': room_data['source_distance'][source],
-            'audio_filepath': audio_filepath,
-            'text': audio_data.get('text'),
-            'duration': audio_data['duration'],
+            # Relative to mics
+            'distance_source_to_mic': distance_source_to_mic,
         }
 
         return target_cfg
-
-    def generate_noise(self, subset: str, target_cfg: dict) -> List[dict]:
-        """
-        Prepare a list of dictionaries with noise configuration.
-
-        Args:
-            subset: string denoting a subset which will be used to select noise audio.
-            target_cfg: dictionary with target configuration. This is used determine
-                        the minimal required duration for the noise signal.
-        
-        Returns:
-            List of dictionary with noise configuration, including audio information
-            for one or more noise files.
-        """
-        if (noise_metadata := self.metadata[subset]['noise']) is None:
-            return None
-
-        noise_cfg = self.get_audio_list(
-            noise_metadata, min_duration=target_cfg['duration'], manifest_filepath=self.cfg.noise[subset]
-        )
-
-        return noise_cfg
 
     def generate_interference(self, subset: str, target_cfg: dict) -> List[dict]:
         """
@@ -2866,14 +3088,11 @@ class RIRMixGenerator(object):
             # Current source setup
             interfering_source = {
                 'source': source,
+                'selected_mics': target_cfg['selected_mics'],
+                'position': room_data['source_position'][source],
                 'azimuth': room_data['source_azimuth'][source],
                 'elevation': room_data['source_elevation'][source],
                 'distance': room_data['source_distance'][source],
-                'audio': self.get_audio_list(
-                    interference_metadata,
-                    min_duration=target_cfg['duration'],
-                    manifest_filepath=self.cfg.interference[subset],
-                ),
             }
 
             # Done with interference for this source
@@ -2881,7 +3100,7 @@ class RIRMixGenerator(object):
 
         return interference_cfg
 
-    def generate_mix(self, subset: str) -> dict:
+    def generate_mix(self, subset: str, target_cfg: dict) -> dict:
         """Generate scaling parameters for mixing
         the target speech at the microphone, background noise
         and interference signal at the microphone.
@@ -2896,6 +3115,7 @@ class RIRMixGenerator(object):
 
         Args:
             subset: string denoting the subset of configuration
+            target_cfg: dictionary with target configuration
 
         Returns:
             Dictionary containing configured RSNR, RSIR, ref_mic
@@ -2903,13 +3123,13 @@ class RIRMixGenerator(object):
         """
         mix_cfg = dict()
 
-        for key in ['rsnr', 'rsir', 'ref_mic', 'ref_mic_rms']:
+        for key in ['rsnr', 'rsir', 'ref_mic', 'ref_mic_rms', 'min_duration']:
             if key in self.cfg.mix[subset]:
                 # Take the value from subset config
-                value = self.cfg.mix[subset][key]
+                value = self.cfg.mix[subset].get(key)
             else:
                 # Take the global value
-                value = self.cfg.mix[key]
+                value = self.cfg.mix.get(key)
 
             if value is None:
                 mix_cfg[key] = None
@@ -2921,6 +3141,13 @@ class RIRMixGenerator(object):
             else:
                 # Select one of the multiple values
                 mix_cfg[key] = self.random.choice(value)
+
+        if mix_cfg['ref_mic'] == 'closest':
+            # Select the closest mic as the reference
+            mix_cfg['ref_mic'] = np.argmin(target_cfg['distance_source_to_mic'])
+
+        # Configuration for saving individual components
+        mix_cfg['save'] = OmegaConf.to_object(self.cfg.mix['save']) if 'save' in self.cfg.mix else {}
 
         return mix_cfg
 
@@ -2963,9 +3190,8 @@ class RIRMixGenerator(object):
             for n_example in tqdm(range(num_examples), total=num_examples, desc=f'Preparing {subset}'):
                 # prepare configuration
                 target_cfg = self.generate_target(subset)
-                noise_cfg = self.generate_noise(subset, target_cfg)
                 interference_cfg = self.generate_interference(subset, target_cfg)
-                mix_cfg = self.generate_mix(subset)
+                mix_cfg = self.generate_mix(subset, target_cfg)
 
                 # base file name
                 base_output_filepath = os.path.join(output_dir_subset, f'{subset}_example_{n_example:09d}')
@@ -2974,7 +3200,6 @@ class RIRMixGenerator(object):
                 example = {
                     'sample_rate': self.sample_rate,
                     'target_cfg': target_cfg,
-                    'noise_cfg': noise_cfg,
                     'interference_cfg': interference_cfg,
                     'mix_cfg': mix_cfg,
                     'base_output_filepath': base_output_filepath,
@@ -2982,14 +3207,33 @@ class RIRMixGenerator(object):
 
                 examples.append(example)
 
+            # Audio data
+            audio_metadata = {
+                'target': self.metadata[subset]['target'],
+                'target_dir': os.path.dirname(self.cfg.target[subset]),  # manifest_dir
+                'noise': self.metadata[subset]['noise'],
+                'noise_dir': os.path.dirname(self.cfg.noise[subset]),  # manifest_dir
+            }
+
+            if interference_cfg is not None:
+                audio_metadata.update(
+                    {
+                        'interference': self.metadata[subset]['interference'],
+                        'interference_dir': os.path.dirname(self.cfg.interference[subset]),  # manifest_dir
+                    }
+                )
+
             # Simulation
-            num_workers = self.cfg.num_workers
+            if (num_workers := self.cfg.get('num_workers')) is None:
+                num_workers = os.cpu_count() - 1
+
             if num_workers is not None and num_workers > 1:
                 logging.info(f'Simulate using {num_workers} workers')
+                examples_and_audio_metadata = zip(examples, itertools.repeat(audio_metadata, len(examples)))
                 with multiprocessing.Pool(processes=num_workers) as pool:
                     metadata = list(
                         tqdm(
-                            pool.imap(simulate_room_mix_kwargs, examples),
+                            pool.imap(simulate_room_mix_helper, examples_and_audio_metadata),
                             total=len(examples),
                             desc=f'Simulating {subset}',
                         )
@@ -2998,10 +3242,10 @@ class RIRMixGenerator(object):
                 logging.info('Simulate using a single worker')
                 metadata = []
                 for example in tqdm(examples, total=len(examples), desc=f'Simulating {subset}'):
-                    metadata.append(simulate_room_mix(**example))
+                    metadata.append(simulate_room_mix(**example, audio_metadata=audio_metadata))
 
             # Save manifest
-            manifest_filepath = os.path.join(output_dir, f'{subset}_manifest.json')
+            manifest_filepath = os.path.join(output_dir, f'{os.path.basename(output_dir)}_{subset}.json')
 
             if os.path.exists(manifest_filepath) and os.path.isfile(manifest_filepath):
                 raise RuntimeError(f'Manifest config file exists: {manifest_filepath}')
@@ -3015,7 +3259,7 @@ class RIRMixGenerator(object):
             write_manifest(manifest_filepath, metadata)
 
             # Generate plots with information about generated data
-            plot_filepath = os.path.join(output_dir, f'{subset}_info.png')
+            plot_filepath = os.path.join(output_dir, f'{os.path.basename(output_dir)}_{subset}_info.png')
 
             if os.path.exists(plot_filepath) and os.path.isfile(plot_filepath):
                 raise RuntimeError(f'Plot file exists: {plot_filepath}')
@@ -3052,6 +3296,7 @@ def convolve_rir(signal: np.ndarray, rir: np.ndarray) -> np.ndarray:
         out = np.zeros((num_samples, num_channels))
         for m in range(num_channels):
             out[:, m] = convolve(signal, rir[:, m])[:num_samples]
+
     else:
         raise RuntimeError(f'RIR with {rir.ndim} not supported')
 
@@ -3117,7 +3362,7 @@ def simultaneously_active_rms(
     x: np.ndarray,
     y: np.ndarray,
     sample_rate: float,
-    rms_threshold_db: float = -40,
+    rms_threshold_db: float = -60,
     window_len_ms: float = 200,
     min_active_duration: float = 0.5,
 ) -> Tuple[float, float]:
@@ -3204,43 +3449,198 @@ def scaled_disturbance(
     return scaled_disturbance
 
 
-def load_audio_from_multiple_files(items: List[Dict], sample_rate: int, total_len: int) -> np.ndarray:
-    """Load an audio from multiple files and concatenate into a single signal.
+def prepare_source_signal(
+    signal_type: str,
+    sample_rate: int,
+    audio_data: List[dict],
+    audio_dir: Optional[str] = None,
+    min_duration: Optional[int] = None,
+    ref_signal: Optional[np.ndarray] = None,
+    mic_positions: Optional[np.ndarray] = None,
+    num_retries: int = 10,
+) -> tuple:
+    """Prepare an audio signal for a source.
 
     Args:
-        items: list of dictionaries, each item has audio_filepath, offset, and duration
-        sample_rate: desired sample rate of the signal
-        total_len: total length in samples
+        signal_type: 'point' or 'diffuse'
+        sample_rate: Sampling rate for the signal
+        audio_data: List of audio items, each is a dictionary with audio_filepath, duration, offset and optionally text
+        audio_dir: Base directory for resolving paths, e.g., manifest basedir
+        min_duration: Minimal duration to be loaded if ref_signal is not provided, in seconds
+        ref_signal: Optional, used to determine the length of the signal
+        mic_positions: Optional, used to prepare approximately diffuse signal
+        num_retries: Number of retries when selecting the source files
 
     Returns:
-        Numpy array, shape (total_len, num_channels)
+        (audio_signal, metadata), where audio_signal is an ndarray and metadata is a dictionary
+        with audio filepaths, durations and offsets
     """
-    if items is None:
-        # Nothing is provided
+    if not signal_type in ['point', 'diffuse']:
+        raise ValueError(f'Unexpected signal type {signal_type}.')
+
+    if audio_data is None:
+        # No data to load
         return None
 
-    signal = None
-    samples_to_load = total_len
-    # if necessary, load multiple from files
-    for item in items:
-        check_min_sample_rate(item['audio_filepath'], sample_rate)
-        # load the pre-defined segment
-        segment = AudioSegment.from_file(
-            item['audio_filepath'], target_sr=sample_rate, offset=item['offset'], duration=item['duration'],
-        )
-        # not perfect, since different files may have different distributions
-        segment_samples = normalize_max(segment.samples)
-        # concatenate
-        signal = np.concatenate((signal, segment_samples)) if signal is not None else segment_samples
-        # remaining samples
-        samples_to_load -= len(segment_samples)
+    metadata = {}
 
-        if samples_to_load <= 0:
-            break
-    # trim to length
-    signal = signal[:total_len, ...]
+    if ref_signal is None:
+        audio_signal = None
+        # load at least one sample if min_duration is not provided
+        samples_to_load = int(min_duration * sample_rate) if min_duration is not None else 1
+        source_signals_metadata = {'audio_filepath': [], 'duration': [], 'offset': [], 'text': []}
 
-    return signal
+        while samples_to_load > 0:
+            # Select a random item and load the audio
+            item = random.choice(audio_data)
+
+            audio_filepath = item['audio_filepath']
+            if not os.path.isabs(audio_filepath) and audio_dir is not None:
+                audio_filepath = os.path.join(audio_dir, audio_filepath)
+
+            # Load audio
+            check_min_sample_rate(audio_filepath, sample_rate)
+            audio_segment = AudioSegment.from_file(
+                audio_file=audio_filepath,
+                target_sr=sample_rate,
+                duration=item['duration'],
+                offset=item.get('offset', 0),
+            )
+
+            if signal_type == 'point':
+                if audio_segment.num_channels > 1:
+                    raise RuntimeError(
+                        f'Expecting single-channel source signal, but received {audio_segment.num_channels}. File: {audio_filepath}'
+                    )
+            else:
+                raise ValueError(f'Unexpected signal type {signal_type}.')
+
+            source_signals_metadata['audio_filepath'].append(audio_filepath)
+            source_signals_metadata['duration'].append(item['duration'])
+            source_signals_metadata['duration'].append(item.get('offset', 0))
+            source_signals_metadata['text'].append(item.get('text'))
+
+            # not perfect, since different files may have different distributions
+            segment_samples = normalize_max(audio_segment.samples)
+            # concatenate
+            audio_signal = (
+                np.concatenate((audio_signal, segment_samples)) if audio_signal is not None else segment_samples
+            )
+            # remaining samples
+            samples_to_load -= len(segment_samples)
+
+        # Finally, we need only the metadata for the complete signal
+        metadata = {
+            'duration': sum(source_signals_metadata['duration']),
+            'offset': 0,
+        }
+
+        # Add text only if all source signals have text
+        if all([isinstance(tt, str) for tt in source_signals_metadata['text']]):
+            metadata['text'] = ' '.join(source_signals_metadata['text'])
+    else:
+        # Load a signal with total_len samples and ensure it has enough simultaneous activity/overlap with ref_signal
+        # Concatenate multiple files if necessary
+        total_len = len(ref_signal)
+
+        for n in range(num_retries):
+
+            audio_signal = None
+            source_signals_metadata = {'audio_filepath': [], 'duration': [], 'offset': []}
+
+            if signal_type == 'point':
+                samples_to_load = total_len
+            elif signal_type == 'diffuse':
+                # Load longer signal so it can be reshaped into (samples, mics) and
+                # used to generate approximately diffuse noise field
+                num_mics = len(mic_positions)
+                samples_to_load = num_mics * total_len
+
+            while samples_to_load > 0:
+                # Select an audio file
+                item = random.choice(audio_data)
+
+                audio_filepath = item['audio_filepath']
+                if not os.path.isabs(audio_filepath) and audio_dir is not None:
+                    audio_filepath = os.path.join(audio_dir, audio_filepath)
+
+                # Load audio signal
+                check_min_sample_rate(audio_filepath, sample_rate)
+
+                if (max_offset := item['duration'] - np.ceil(samples_to_load / sample_rate)) > 0:
+                    # Load with a random offset if the example is longer than samples_to_load
+                    offset = random.uniform(0, max_offset)
+                    duration = -1
+                else:
+                    # Load the whole file
+                    offset, duration = 0, item['duration']
+                audio_segment = AudioSegment.from_file(
+                    audio_file=audio_filepath, target_sr=sample_rate, duration=duration, offset=offset
+                )
+
+                # Prepare a single-channel signal
+                if audio_segment.num_channels == 1:
+                    # Take all samples
+                    segment_samples = audio_segment.samples
+                else:
+                    # Take a random channel
+                    selected_channel = random.choice(range(audio_segment.num_channels))
+                    segment_samples = audio_segment.samples[:, selected_channel]
+
+                source_signals_metadata['audio_filepath'].append(audio_filepath)
+                source_signals_metadata['duration'].append(len(segment_samples) / sample_rate)
+                source_signals_metadata['offset'].append(offset)
+
+                # not perfect, since different files may have different distributions
+                segment_samples = normalize_max(segment_samples)
+                # concatenate
+                audio_signal = (
+                    np.concatenate((audio_signal, segment_samples)) if audio_signal is not None else segment_samples
+                )
+                # remaining samples
+                samples_to_load -= len(segment_samples)
+
+            if signal_type == 'diffuse' and num_mics > 1:
+                try:
+                    # Trim and reshape to num_mics to prepare num_mics source signals
+                    audio_signal = audio_signal[: num_mics * total_len].reshape(num_mics, -1).T
+
+                    # Make spherically diffuse noise
+                    audio_signal = generate_approximate_noise_field(
+                        mic_positions=np.array(mic_positions), noise_signal=audio_signal, sample_rate=sample_rate
+                    )
+                except Exception as e:
+                    logging.info('Failed to generate approximate noise field: %s', str(e))
+                    logging.info('Try again.')
+                    # Try again
+                    audio_signal, source_signals_metadata = None, {}
+                    continue
+
+            # Trim to length
+            audio_signal = audio_signal[:total_len, ...]
+
+            # Include the channel dimension if the reference includes it
+            if ref_signal.ndim == 2 and audio_signal.ndim == 1:
+                audio_signal = audio_signal[:, None]
+
+            try:
+                # Signal and ref_signal should be simultaneously active
+                simultaneously_active_rms(ref_signal, audio_signal, sample_rate=sample_rate)
+                # We have enough overlap
+                break
+            except Exception as e:
+                # Signal and ref_signal are not overlapping, try again
+                logging.info('Exception: %s', str(e))
+                logging.info('Signals are not overlapping, try again.')
+                audio_signal, source_signals_metadata = None, {}
+                continue
+
+    if audio_signal is None:
+        logging.warning('Audio signal not set: %s.', signal_type)
+
+    metadata['source_signals'] = source_signals_metadata
+
+    return audio_signal, metadata
 
 
 def check_min_sample_rate(filepath: str, sample_rate: float):
@@ -3262,9 +3662,9 @@ def check_min_sample_rate(filepath: str, sample_rate: float):
 def simulate_room_mix(
     sample_rate: int,
     target_cfg: dict,
-    noise_cfg: List[dict],
     interference_cfg: dict,
     mix_cfg: dict,
+    audio_metadata: dict,
     base_output_filepath: str,
     max_amplitude: float = 0.999,
     eps: float = 1e-16,
@@ -3282,6 +3682,7 @@ def simulate_room_mix(
                           index 
         mix_cfg: Dictionary with the mixture configuration. Includes RSNR, RSIR,
                  ref_mic and ref_mic_rms.
+        audio_metadata: Dictionary with a list of files for target, noise and interference
         base_output_filepath: All output audio files will be saved with this prefix by
                               adding a diffierent suffix for each component, e.g., _mic.wav.
         max_amplitude: Maximum amplitude of the mic signal, used to prevent clipping.
@@ -3293,7 +3694,9 @@ def simulate_room_mix(
         output manifest file.
     """
     # Local utilities
-    def load_rir(room_filepath: str, source: int, sample_rate: float, rir_key: str = 'rir') -> np.ndarray:
+    def load_rir(
+        room_filepath: str, source: int, selected_mics: list, sample_rate: float, rir_key: str = 'rir'
+    ) -> np.ndarray:
         """Load a RIR and check that the sample rate is matching the desired sample rate
 
         Args:
@@ -3310,31 +3713,84 @@ def simulate_room_mix(
             raise RuntimeError(
                 f'RIR sample rate ({sample_rate}) is not matching the expected sample rate ({sample_rate}). File: {room_filepath}'
             )
-        return rir
+        return rir[:, selected_mics]
+
+    def get_early_rir(
+        rir: np.ndarray, rir_anechoic: np.ndarray, sample_rate: int, early_duration: float = 0.050
+    ) -> np.ndarray:
+        """Return only the early part of the RIR.
+        """
+        early_len = int(early_duration * sample_rate)
+        direct_path_delay = np.min(np.argmax(rir_anechoic, axis=0))
+        rir_early = rir.copy()
+        rir_early[direct_path_delay + early_len :, :] = 0
+        return rir_early
+
+    def save_audio(
+        base_path: str,
+        tag: str,
+        audio_signal: Optional[np.ndarray],
+        sample_rate: int,
+        save: str = 'all',
+        ref_mic: Optional[int] = None,
+        format: str = 'wav',
+        subtype: str = 'float',
+    ):
+        """Save audio signal and return filepath.
+        """
+        if (audio_signal is None) or (not save):
+            return None
+
+        if save == 'ref_mic':
+            # save only ref_mic
+            audio_signal = audio_signal[:, ref_mic]
+
+        audio_filepath = base_path + f'_{tag}.{format}'
+        sf.write(audio_filepath, audio_signal, sample_rate, subtype)
+
+        return audio_filepath
 
     # Target RIRs
-    target_rir = load_rir(target_cfg['room_filepath'], source=target_cfg['source'], sample_rate=sample_rate)
-    target_rir_anechoic = load_rir(
-        target_cfg['room_filepath'], source=target_cfg['source'], sample_rate=sample_rate, rir_key='anechoic'
+    target_rir = load_rir(
+        target_cfg['room_filepath'],
+        source=target_cfg['source'],
+        selected_mics=target_cfg['selected_mics'],
+        sample_rate=sample_rate,
     )
+    target_rir_anechoic = load_rir(
+        target_cfg['room_filepath'],
+        source=target_cfg['source'],
+        sample_rate=sample_rate,
+        selected_mics=target_cfg['selected_mics'],
+        rir_key='anechoic',
+    )
+    target_rir_early = get_early_rir(rir=target_rir, rir_anechoic=target_rir_anechoic, sample_rate=sample_rate)
 
     # Target signals
-    check_min_sample_rate(target_cfg['audio_filepath'], sample_rate)
-    target_segment = AudioSegment.from_file(
-        target_cfg['audio_filepath'], target_sr=sample_rate, duration=target_cfg['duration']
+    target_signal, target_metadata = prepare_source_signal(
+        signal_type='point',
+        sample_rate=sample_rate,
+        audio_data=audio_metadata['target'],
+        audio_dir=audio_metadata['target_dir'],
+        min_duration=mix_cfg['min_duration'],
     )
-    if target_segment.num_channels > 1:
-        raise RuntimeError(
-            f'Expecting single-channel source signal, but received {target_segment.num_channels}. File: {target_cfg["audio_filepath"]}'
-        )
-    target_signal = normalize_max(target_segment.samples)
+    source_signals_metadata = {'target': target_metadata['source_signals']}
 
-    # Convolve
+    # Convolve target
     target_reverberant = convolve_rir(target_signal, target_rir)
     target_anechoic = convolve_rir(target_signal, target_rir_anechoic)
+    target_early = convolve_rir(target_signal, target_rir_early)
 
     # Prepare noise signal
-    noise = load_audio_from_multiple_files(noise_cfg, sample_rate=sample_rate, total_len=len(target_reverberant))
+    noise, noise_metadata = prepare_source_signal(
+        signal_type='diffuse',
+        sample_rate=sample_rate,
+        mic_positions=target_cfg['mic_positions'],
+        audio_data=audio_metadata['noise'],
+        audio_dir=audio_metadata['noise_dir'],
+        ref_signal=target_reverberant,
+    )
+    source_signals_metadata['noise'] = noise_metadata['source_signals']
 
     # Prepare interference signal
     if interference_cfg is None:
@@ -3342,20 +3798,31 @@ def simulate_room_mix(
     else:
         # Load interference signals
         interference = 0
+        source_signals_metadata['interference'] = []
         for i_cfg in interference_cfg:
-            # Load signal
-            i_signal = load_audio_from_multiple_files(
-                i_cfg['audio'], sample_rate=sample_rate, total_len=len(target_reverberant)
+            # Load single-channel signal for directional interference
+            i_signal, i_metadata = prepare_source_signal(
+                signal_type='point',
+                sample_rate=sample_rate,
+                audio_data=audio_metadata['interference'],
+                audio_dir=audio_metadata['interference_dir'],
+                ref_signal=target_signal,
             )
+            source_signals_metadata['interference'].append(i_metadata['source_signals'])
             # Load RIR from the same room as the target, but a difference source
-            i_rir = load_rir(target_cfg['room_filepath'], source=i_cfg['source'], sample_rate=sample_rate)
-            # Convolve
+            i_rir = load_rir(
+                target_cfg['room_filepath'],
+                source=i_cfg['source'],
+                selected_mics=i_cfg['selected_mics'],
+                sample_rate=sample_rate,
+            )
+            # Convolve interference
             i_reverberant = convolve_rir(i_signal, i_rir)
             # Sum
             interference += i_reverberant
 
     # Scale and add components of the signal
-    mix = target_reverberant.copy()
+    mic = target_reverberant.copy()
 
     if noise is not None:
         noise = scaled_disturbance(
@@ -3366,7 +3833,7 @@ def simulate_room_mix(
             ref_channel=mix_cfg['ref_mic'],
         )
         # Update mic signal
-        mix += noise
+        mic += noise
 
     if interference is not None:
         interference = scaled_disturbance(
@@ -3377,13 +3844,13 @@ def simulate_room_mix(
             ref_channel=mix_cfg['ref_mic'],
         )
         # Update mic signal
-        mix += interference
+        mic += interference
 
     # Set the final mic signal level
-    mix_rms = rms(mix[:, mix_cfg['ref_mic']])
-    global_gain = db2mag(mix_cfg['ref_mic_rms']) / (mix_rms + eps)
-    mix_max = np.max(np.abs(mix))
-    if (clipped_max := mix_max * global_gain) > max_amplitude:
+    mic_rms = rms(mic[:, mix_cfg['ref_mic']])
+    global_gain = db2mag(mix_cfg['ref_mic_rms']) / (mic_rms + eps)
+    mic_max = np.max(np.abs(mic))
+    if (clipped_max := mic_max * global_gain) > max_amplitude:
         # Downscale the global gain to prevent clipping + adjust ref_mic_rms accordingly
         clipping_prevention_gain = max_amplitude / clipped_max
         global_gain *= clipping_prevention_gain
@@ -3395,76 +3862,71 @@ def simulate_room_mix(
             mag2db(clipping_prevention_gain),
         )
 
-    # scale all signal components
-    mix *= global_gain
-    target_reverberant *= global_gain
-    target_anechoic *= global_gain
-    if noise is not None:
-        noise *= global_gain
-    if interference is not None:
-        interference *= global_gain
-
     # save signals
-    mic_filepath = base_output_filepath + '_mic.wav'
-    sf.write(mic_filepath, mix, sample_rate, 'float')
-
-    target_reverberant_filepath = base_output_filepath + '_target_reverberant.wav'
-    sf.write(target_reverberant_filepath, target_reverberant, sample_rate, 'float')
-
-    target_anechoic_filepath = base_output_filepath + '_target_anechoic.wav'
-    sf.write(target_anechoic_filepath, target_anechoic, sample_rate, 'float')
-
-    if noise is not None:
-        noise_filepath = base_output_filepath + '_noise.wav'
-        sf.write(noise_filepath, noise, sample_rate, 'float')
-    else:
-        noise_filepath = None
-
-    if interference is not None:
-        interference_filepath = base_output_filepath + '_interference.wav'
-        sf.write(interference_filepath, interference, sample_rate, 'float')
-    else:
-        interference_filepath = None
-
-    # calculate DRR
-    direct_path_delay = np.argmax(target_rir_anechoic, axis=0)
-    drr = calculate_drr(target_rir, sample_rate, direct_path_delay)
-
-    metadata = {
-        'audio_filepath': mic_filepath,
-        'target_reverberant_filepath': target_reverberant_filepath,
-        'target_anechoic_filepath': target_anechoic_filepath,
-        'noise_filepath': noise_filepath,
-        'interference_filepath': interference_filepath,
-        'text': target_cfg.get('text'),
-        'duration': target_cfg['duration'],
-        'target_cfg': target_cfg,
-        'noise_cfg': noise_cfg,
-        'interference_cfg': interference_cfg,
-        'mix_cfg': mix_cfg,
-        'rt60': target_cfg.get('rt60'),
-        'drr': drr,
-        'rsnr': None if noise_cfg is None else mix_cfg['rsnr'],
-        'rsir': None if interference_cfg is None else mix_cfg['rsir'],
+    signals = {
+        'mic': mic,
+        'target_reverberant': target_reverberant,
+        'target_anechoic': target_anechoic,
+        'target_early': target_early,
+        'noise': noise,
+        'interference': interference,
     }
+
+    metadata = {}
+
+    for tag, signal in signals.items():
+
+        if signal is not None:
+            # scale all signal components with the global gain
+            signal = global_gain * signal
+
+        audio_filepath = save_audio(
+            base_path=base_output_filepath,
+            tag=tag,
+            audio_signal=signal,
+            sample_rate=sample_rate,
+            save=mix_cfg['save'].get(tag, 'all'),
+            ref_mic=mix_cfg['ref_mic'],
+            format=mix_cfg['save'].get('format', 'wav'),
+            subtype=mix_cfg['save'].get('subtype', 'float'),
+        )
+
+        if tag == 'mic':
+            metadata['audio_filepath'] = audio_filepath
+        else:
+            metadata[tag + '_filepath'] = audio_filepath
+
+    # Add metadata
+    metadata.update(
+        {
+            'text': target_metadata.get('text'),
+            'duration': target_metadata['duration'],
+            'target_cfg': target_cfg,
+            'interference_cfg': interference_cfg,
+            'mix_cfg': mix_cfg,
+            'ref_channel': mix_cfg.get('ref_mic'),
+            'rt60': target_cfg.get('rt60'),
+            'drr': calculate_drr(target_rir, sample_rate, n_direct=np.argmax(target_rir_anechoic, axis=0)),
+            'rsnr': None if noise is None else mix_cfg['rsnr'],
+            'rsir': None if interference is None else mix_cfg['rsir'],
+            'source_signals': source_signals_metadata,
+        }
+    )
 
     return convert_numpy_to_serializable(metadata)
 
 
-def simulate_room_mix_kwargs(kwargs: dict) -> dict:
-    """Wrapper around `simulate_room_mix` to handle kwargs.
-    
-    `pool.map(simulate_room_kwargs, examples)` would be
-    equivalent to `pool.starstarmap(simulate_room_mix, examples)`
-    if `starstarmap` would exist.
+def simulate_room_mix_helper(example_and_audio_metadata: tuple) -> dict:
+    """Wrapper around `simulate_room_mix` for pool.imap.
 
     Args:
-        kwargs: kwargs that are forwarded to `simulate_room_mix`
+        args: example and audio_metadata that are forwarded to `simulate_room_mix`
 
     Returns:
         Dictionary with metadata, see `simulate_room_mix`
     """
-    return simulate_room_mix(**kwargs)
+    example, audio_metadata = example_and_audio_metadata
+    return simulate_room_mix(**example, audio_metadata=audio_metadata)
 
 
 def plot_mix_manifest_info(filepath: str, plot_filepath: str = None):
@@ -3503,8 +3965,11 @@ def plot_mix_manifest_info(filepath: str, plot_filepath: str = None):
         drr += data['drr']  # average DRR across all mics
 
         # noise
-        rsnr.append(data['rsnr'])
-        rsir.append(data['rsir'])
+        if data['rsnr'] is not None:
+            rsnr.append(data['rsnr'])
+
+        if data['rsir'] is not None:
+            rsir.append(data['rsir'])
 
     # plot
     plt.figure(figsize=(12, 6))
@@ -3543,21 +4008,21 @@ def plot_mix_manifest_info(filepath: str, plot_filepath: str = None):
     plt.hist(drr, label='DRR')
     plt.xlabel('DRR / dB')
     plt.ylabel('# examples')
-    plt.title('DRR (average over mics)')
+    plt.title('DRR [avg over mics]')
 
-    if not any([val is None for val in rsnr]):
+    if len(rsnr) > 0:
         plt.subplot(2, 4, 7)
         plt.hist(rsnr, label='RSNR')
         plt.xlabel('RSNR / dB')
         plt.ylabel('# examples')
-        plt.title('RSNR')
+        plt.title(f'RSNR [{100 * len(rsnr) / len(rt60):.0f}% ex]')
 
-    if not any([val is None for val in rsir]):
+    if len(rsir):
         plt.subplot(2, 4, 8)
         plt.hist(rsir, label='RSIR')
         plt.xlabel('RSIR / dB')
         plt.ylabel('# examples')
-        plt.title('RSIR')
+        plt.title(f'RSIR [{100 * len(rsir) / len(rt60):.0f}% ex]')
 
     for n in range(8):
         plt.subplot(2, 4, n + 1)

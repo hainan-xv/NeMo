@@ -5,7 +5,7 @@ Exporting Models
 ----------------
 
 Most of the NeMo models can be exported to ONNX or TorchScript to be deployed for inference in optimized execution environments, such as Riva or Triton Inference Server.  
-Export interface is provided by the ``Exportable`` mix-in class. If a model extends ``Exportable``, it can be exported by:
+Export interface is provided by the :class:`~nemo.core.classes.exportable.Exportable` mix-in class. If a model extends :class:`~nemo.core.classes.exportable.Exportable`, it can be exported by:
 
 .. code-block:: Python
 
@@ -15,6 +15,8 @@ Export interface is provided by the ``Exportable`` mix-in class. If a model exte
    ...
 
    mymodel = MyExportableModel.from_pretrained(model_name="MyModelName")
+   model.eval()
+   model.to('cuda')  # or to('cpu') if you don't have GPU
    
    # exporting pre-trained model to ONNX file for deployment.	
    mymodel.export('mymodel.onnx', [options])
@@ -22,7 +24,7 @@ Export interface is provided by the ``Exportable`` mix-in class. If a model exte
 
 How to Use Model Export
 -----------------------
-The following arguments are for ``Exportable.export()``. In most cases, you should only supply the name of the output file and use all defaults:
+The following arguments are for :meth:`~nemo.core.classes.exportable.Exportable.export`. In most cases, you should only supply the name of the output file and use all defaults:
 
 .. code-block:: Python
 
@@ -30,30 +32,29 @@ The following arguments are for ``Exportable.export()``. In most cases, you shou
         self,
         output: str,
         input_example=None,
-        output_example=None,
         verbose=False,
-        export_params=True,
         do_constant_folding=True,
-        keep_initializers_as_inputs=False,
-        onnx_opset_version: int = 13,
-        try_script: bool = False,
-        set_eval: bool = True,
-        check_trace: bool = False,
-        use_dynamic_axes: bool = True,
+        onnx_opset_version=None,
+        check_trace: Union[bool, List[torch.Tensor]] = False,
         dynamic_axes=None,
         check_tolerance=0.01,
+        export_modules_as_functions=False,
+        keep_initializers_as_inputs=None,
     ):
 
-The ``output``, ``input_example``, ``output_example``, ``verbose``, ``export_params``, ``do_constant_folding``, ``keep_initializers_as_inputs``, ``onnx_opset_version``, ``set_eval`` options have the same semantics as in Pytorch ``onnx.export()`` and ``jit.trace()`` functions and are passed through. For more information about Pytorch's``onnx.export()``, refer to the `torch.onnx functions documentation
-<https://pytorch.org/docs/stable/onnx.html#functions>`_.
+The ``output``, ``input_example``, ``verbose``, ``do_constant_folding``, ``onnx_opset_version`` options have the same semantics as in Pytorch ``onnx.export()`` and ``jit.trace()`` functions and are passed through. For more information about Pytorch's``onnx.export()``, refer to the `torch.onnx functions documentation
+<https://pytorch.org/docs/stable/onnx.html#functions>`_. Note that if ``input_example`` is None, ``Exportable.input_example()`` is called.
 
-The file extension of the ``output`` parameter determines export format: ``.onnx->ONNX``, ``.pt`` or ``.ts`` -> ``TorchScript``. If ``input_example`` is None, ``Exportable.input_example()`` is called.
+The file extension of the ``output`` parameter determines export format:
 
-**TorchScript-specific**: If ``try_script`` is ``True``, ``export()`` tries ``jit.script()`` before ``jit.trace()``.
-The ``check_trace`` arg is passed through to ``jit.trace()``.
+* ``.onnx->ONNX``
+* ``.pt`` or ``.ts`` -> ``TorchScript``.
+
+**TorchScript-specific**: By default, the module will undergo ``jit.trace()``. You may require to explicitly pass some modules under ``jit.script()`` so that they are correctly traced.The ``check_trace`` arg is passed through to ``jit.trace()``.
+
 **ONNX-specific**: If ``use_dynamic_axes`` is True, ``onnx.export()`` is called with dynamic axes. If ``dynamic_axes`` is ``None``, they are inferred from the model's ``input_types`` definition (batch dimension is dynamic, and so is duration etc).
 
-If ``check_trace`` is ``True``, the resulting ONNX also runs on ``input_example`` and the results compared to ``output_example`` using the ``check_tolerance`` argument. Note the higher tolerance default.
+If ``check_trace`` is ``True``, the resulting ONNX also runs on ``input_example`` and the results compared to the exported model's output, using the ``check_tolerance`` argument. Note the higher tolerance default.
 
 
 How to Make Model Exportable
@@ -176,6 +177,37 @@ Another common requirement for models that are being exported is to run certain 
     # call base method for common set of modifications
 	Exportable._prepare_for_export(self, **kwargs)
 
+Some models that require control flow, need to be exported in multiple parts. Typical examples are RNNT nets.
+To facilitate that, the hooks below are provided. To export, for example, 'encoder' and 'decoder' subnets of the model, overload list_export_subnets to return ['encoder', 'decoder'].
+
+.. code-block:: Python
+
+    def get_export_subnet(self, subnet=None):
+        """
+        Returns Exportable subnet model/module to export 
+        """
+
+
+    def list_export_subnets(self):
+        """
+        Returns default set of subnet names exported for this model
+        First goes the one receiving input (input_example)
+        """
+
+Some nertworks may be exported differently according to user-settable options (like ragged batch support for TTS or cache support for ASR). To facilitate that - `set_export_config()` method is provided by Exportable to set key/value pairs to predefined model.export_config dictionary, to be used during the export:
+
+.. code-block:: Python	
+    def set_export_config(self, args):
+        """
+        Sets/updates export_config dictionary
+        """
+Also, if an action hook on setting config is desired, this method may be overloaded by `Exportable` descendants to include one.
+An example can be found in ``<NeMo_git_root>/nemo/collections/asr/models/rnnt_models.py``.
+
+Here is example on now `set_export_config()` call is being tied to command line arguments in ``<NeMo_git_root>/scripts/export.py`` :
+
+.. code-block:: Python
+    python scripts/export.py  hybrid_conformer.nemo hybrid_conformer.onnx --export-config decoder_type=ctc
 
 Exportable Model Code
 ~~~~~~~~~~~~~~~~~~~~~

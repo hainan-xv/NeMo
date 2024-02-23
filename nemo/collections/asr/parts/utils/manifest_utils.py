@@ -16,7 +16,8 @@ import json
 import os
 from collections import Counter
 from collections import OrderedDict as od
-from typing import Dict, List
+from pathlib import Path
+from typing import Dict, List, Union
 
 import librosa
 import numpy as np
@@ -30,6 +31,103 @@ from nemo.collections.asr.parts.utils.speaker_utils import (
     write_rttm2manifest,
 )
 from nemo.utils.data_utils import DataStoreObject
+
+
+def get_rounded_str_float(num: float, output_precision: int, min_precision=1, max_precision=3) -> str:
+    """
+    Get a string of a float number with rounded precision.
+
+    Args:
+        num (float): float number to round
+        output_precision (int): precision of the output floating point number
+        min_precision (int, optional): Minimum precision of the output floating point number. Defaults to 1.
+        max_precision (int, optional): Maximum precision of the output floating point number. Defaults to 3.
+
+    Returns:
+        (str): Return a string of a float number with rounded precision.
+    """
+    output_precision = min(max_precision, max(min_precision, output_precision))
+    return f"{num:.{output_precision}f}"
+
+
+def get_ctm_line(
+    source: str,
+    channel: int,
+    start_time: float,
+    duration: float,
+    token: str,
+    conf: float,
+    type_of_token: str,
+    speaker: str,
+    NA_token: str = 'NA',
+    UNK: str = 'unknown',
+    default_channel: str = '1',
+    output_precision: int = 2,
+) -> str:
+    """
+    Get a line in Conversation Time Mark (CTM) format. Following CTM format appeared in `Rich Transcription Meeting Eval Plan: RT09` document.
+    
+    CTM Format: 
+        <SOURCE><SP><CHANNEL><SP><BEG-TIME><SP><DURATION><SP><TOKEN><SP><CONF><SP><TYPE><SP><SPEAKER><NEWLINE>
+    
+    Reference: 
+        https://web.archive.org/web/20170119114252/http://www.itl.nist.gov/iad/mig/tests/rt/2009/docs/rt09-meeting-eval-plan-v2.pdf
+
+    Args:
+        source (str): <SOURCE> is name of the source file, session name or utterance ID
+        channel (int): <CHANNEL> is channel number defaults to 1
+        start_time (float): <BEG_TIME> is the begin time of the word, which we refer to as `start_time` in NeMo.
+        duration (float): <DURATION> is duration of the word
+        token (str): <TOKEN> Token or word for the current entry
+        conf (float): <CONF> is a floating point number between 0 (no confidence) and 1 (certainty). A value of “NA” is used (in CTM format data) 
+                      when no confidence is computed and in the reference data. 
+        type_of_token (str): <TYPE> is the token type. The legal values of <TYPE> are “lex”, “frag”, “fp”, “un-lex”, “for-lex”, “non-lex”, “misc”, or “noscore”
+        speaker (str): <SPEAKER> is a string identifier for the speaker who uttered the token. This should be “null” for non-speech tokens and “unknown” when
+                       the speaker has not been determined. 
+        NA_token (str, optional): A token for  . Defaults to '<NA>'.
+        output_precision (int, optional): The precision of the output floating point number. Defaults to 3.
+
+    Returns:
+        str: Return a line in CTM format filled with the given information.
+    """
+    VALID_TOKEN_TYPES = ["lex", "frag", "fp", "un-lex", "for-lex", "non-lex", "misc", "noscore"]
+
+    if type(start_time) == str and start_time.replace('.', '', 1).isdigit():
+        start_time = float(start_time)
+    elif type(start_time) != float:
+        raise ValueError(f"`start_time` must be a float or str containing float, but got {type(start_time)}")
+
+    if type(duration) == str and duration.replace('.', '', 1).isdigit():
+        duration = float(duration)
+    elif type(duration) != float:
+        raise ValueError(f"`duration` must be a float or str containing float, but got {type(duration)}")
+
+    if type(conf) == str and conf.replace('.', '', 1).isdigit():
+        conf = float(conf)
+    elif conf is None:
+        conf = NA_token
+    elif type(conf) != float:
+        raise ValueError(f"`conf` must be a float or str containing float, but got {type(conf)}")
+
+    if channel is not None and type(channel) != int:
+        channel = str(channel)
+    if conf is not None and type(conf) == float and not (0 <= conf <= 1):
+        raise ValueError(f"`conf` must be between 0 and 1, but got {conf}")
+    if type_of_token is not None and type(type_of_token) != str:
+        raise ValueError(f"`type` must be a string, but got {type(type_of_token)} type {type_of_token}")
+    if type_of_token is not None and type_of_token not in VALID_TOKEN_TYPES:
+        raise ValueError(f"`type` must be one of {VALID_TOKEN_TYPES}, but got {type_of_token} type {type_of_token}")
+    if speaker is not None and type(speaker) != str:
+        raise ValueError(f"`speaker` must be a string, but got {type(speaker)}")
+
+    channel = default_channel if channel is None else channel
+    conf = NA_token if conf is None else conf
+    speaker = NA_token if speaker is None else speaker
+    type_of_token = UNK if type_of_token is None else type_of_token
+    start_time = get_rounded_str_float(start_time, output_precision)
+    duration = get_rounded_str_float(duration, output_precision)
+    conf = get_rounded_str_float(conf, output_precision) if conf != NA_token else conf
+    return f"{source} {channel} {start_time} {duration} {token} {conf} {type_of_token} {speaker}\n"
 
 
 def rreplace(s: str, old: str, new: str) -> str:
@@ -175,7 +273,8 @@ def read_file(pathlist: str) -> List[str]:
     Returns:
         sorted(pathlist) (list): List of lines
     """
-    pathlist = open(pathlist, 'r').readlines()
+    with open(pathlist, 'r') as f:
+        pathlist = f.readlines()
     return sorted(pathlist)
 
 
@@ -331,7 +430,8 @@ def create_manifest(
             uem = uem.strip()
 
         if text is not None:
-            text = open(text.strip()).readlines()[0].strip()
+            with open(text.strip()) as f:
+                text = f.readlines()[0].strip()
         else:
             text = "-"
 
@@ -360,16 +460,16 @@ def create_manifest(
     write_file(manifest_filepath, lines, range(len(lines)))
 
 
-def read_manifest(manifest: str) -> List[dict]:
+def read_manifest(manifest: Union[Path, str]) -> List[dict]:
     """
     Read manifest file
 
     Args:
-        manifest (str): Path to manifest file
+        manifest (str or Path): Path to manifest file
     Returns:
         data (list): List of JSON items
     """
-    manifest = DataStoreObject(manifest)
+    manifest = DataStoreObject(str(manifest))
 
     data = []
     try:
@@ -383,17 +483,18 @@ def read_manifest(manifest: str) -> List[dict]:
     return data
 
 
-def write_manifest(output_path: str, target_manifest: List[dict]):
+def write_manifest(output_path: Union[Path, str], target_manifest: List[dict], ensure_ascii: bool = True):
     """
     Write to manifest file
 
     Args:
-        output_path (str): Path to output manifest file
+        output_path (str or Path): Path to output manifest file
         target_manifest (list): List of manifest file entries
+        ensure_ascii (bool): default is True, meaning the output is guaranteed to have all incoming non-ASCII characters escaped. If ensure_ascii is false, these characters will be output as-is.
     """
-    with open(output_path, "w") as outfile:
+    with open(output_path, "w", encoding="utf-8") as outfile:
         for tgt in target_manifest:
-            json.dump(tgt, outfile)
+            json.dump(tgt, outfile, ensure_ascii=ensure_ascii)
             outfile.write('\n')
 
 

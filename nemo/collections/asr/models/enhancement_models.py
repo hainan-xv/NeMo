@@ -30,12 +30,10 @@ from nemo.collections.asr.parts.utils.audio_utils import ChannelSelectorType
 from nemo.core.classes.common import PretrainedModelInfo, typecheck
 from nemo.core.neural_types import AudioSignal, LengthsType, NeuralType
 from nemo.utils import logging
-from nemo.utils.decorators import experimental
 
 __all__ = ['EncMaskDecAudioToAudioModel']
 
 
-@experimental
 class EncMaskDecAudioToAudioModel(AudioToAudioModel):
     """Class for encoder-mask-decoder audio processing models.
 
@@ -62,12 +60,24 @@ class EncMaskDecAudioToAudioModel(AudioToAudioModel):
         self.mask_processor = EncMaskDecAudioToAudioModel.from_config_dict(self._cfg.mask_processor)
         self.decoder = EncMaskDecAudioToAudioModel.from_config_dict(self._cfg.decoder)
 
+        if 'mixture_consistency' in self._cfg:
+            logging.debug('Using mixture consistency')
+            self.mixture_consistency = EncMaskDecAudioToAudioModel.from_config_dict(self._cfg.mixture_consistency)
+        else:
+            logging.debug('Mixture consistency not used')
+            self.mixture_consistency = None
+
         # Future enhancement:
         # If subclasses need to modify the config before calling super()
         # Check ASRBPE* classes do with their mixin
 
-        # Setup loss
-        self.loss = EncMaskDecAudioToAudioModel.from_config_dict(self._cfg.loss)
+        # Setup augmentation
+        if hasattr(self.cfg, 'channel_augment') and self.cfg.channel_augment is not None:
+            logging.debug('Using channel augmentation')
+            self.channel_augmentation = EncMaskDecAudioToAudioModel.from_config_dict(self.cfg.channel_augment)
+        else:
+            logging.debug('Channel augmentation not used')
+            self.channel_augmentation = None
 
         # Setup optional Optimization flags
         self.setup_optimization_flags()
@@ -92,7 +102,8 @@ class EncMaskDecAudioToAudioModel(AudioToAudioModel):
             output_dir: 
             batch_size: (int) batch size to use during inference.
                 Bigger will result in better throughput performance but would use more memory.
-            channel_selector (int | Iterable[int] | str): select a single channel or a subset of channels from multi-channel audio. If set to `'average'`, it performs averaging across channels. Disabled if set to `None`. Defaults to `None`.
+            num_workers: Number of workers for the dataloader
+            input_channel_selector (int | Iterable[int] | str): select a single channel or a subset of channels from multi-channel audio. If set to `'average'`, it performs averaging across channels. Disabled if set to `None`. Defaults to `None`.
 
         Returns:
         """
@@ -124,7 +135,7 @@ class EncMaskDecAudioToAudioModel(AudioToAudioModel):
                 temporary_manifest_filepath = os.path.join(tmpdir, 'manifest.json')
                 with open(temporary_manifest_filepath, 'w', encoding='utf-8') as fp:
                     for audio_file in paths2audio_files:
-                        entry = {'input_filepath': audio_file, 'duration': librosa.get_duration(filename=audio_file)}
+                        entry = {'input_filepath': audio_file, 'duration': librosa.get_duration(path=audio_file)}
                         fp.write(json.dumps(entry) + '\n')
 
                 config = {
@@ -133,7 +144,6 @@ class EncMaskDecAudioToAudioModel(AudioToAudioModel):
                     'input_channel_selector': input_channel_selector,
                     'batch_size': min(batch_size, len(paths2audio_files)),
                     'num_workers': num_workers,
-                    'channel_selector': input_channel_selector,
                 }
 
                 # Create output dir if necessary
@@ -208,8 +218,12 @@ class EncMaskDecAudioToAudioModel(AudioToAudioModel):
 
         if hasattr(dataset, 'collate_fn'):
             collate_fn = dataset.collate_fn
-        else:
+        elif hasattr(dataset.datasets[0], 'collate_fn'):
+            # support datasets that are lists of entries
             collate_fn = dataset.datasets[0].collate_fn
+        else:
+            # support datasets that are lists of lists
+            collate_fn = dataset.datasets[0].datasets[0].collate_fn
 
         return torch.utils.data.DataLoader(
             dataset=dataset,
@@ -317,7 +331,7 @@ class EncMaskDecAudioToAudioModel(AudioToAudioModel):
             "input_signal": NeuralType(
                 ('B', 'C', 'T'), AudioSignal(freq=self.sample_rate)
             ),  # multi-channel format, channel dimension can be 1 for single-channel audio
-            "input_length": NeuralType(tuple('B'), LengthsType()),
+            "input_length": NeuralType(tuple('B'), LengthsType(), optional=True),
         }
 
     @property
@@ -326,7 +340,7 @@ class EncMaskDecAudioToAudioModel(AudioToAudioModel):
             "output_signal": NeuralType(
                 ('B', 'C', 'T'), AudioSignal(freq=self.sample_rate)
             ),  # multi-channel format, channel dimension can be 1 for single-channel audio
-            "output_length": NeuralType(tuple('B'), LengthsType()),
+            "output_length": NeuralType(tuple('B'), LengthsType(), optional=True),
         }
 
     def match_batch_length(self, input: torch.Tensor, batch_length: int):
@@ -347,7 +361,7 @@ class EncMaskDecAudioToAudioModel(AudioToAudioModel):
         return torch.nn.functional.pad(input, pad, 'constant', 0)
 
     @typecheck()
-    def forward(self, input_signal, input_length):
+    def forward(self, input_signal, input_length=None):
         """
         Forward pass of the model.
 
@@ -371,6 +385,10 @@ class EncMaskDecAudioToAudioModel(AudioToAudioModel):
         # Mask-based processor in the encoded domain
         processed, processed_length = self.mask_processor(input=encoded, input_length=encoded_length, mask=mask)
 
+        # Mixture consistency
+        if self.mixture_consistency is not None:
+            processed = self.mixture_consistency(mixture=encoded, estimate=processed)
+
         # Decoder
         processed, processed_length = self.decoder(input=processed, input_length=processed_length)
 
@@ -389,17 +407,23 @@ class EncMaskDecAudioToAudioModel(AudioToAudioModel):
         if target_signal.ndim == 2:
             target_signal = target_signal.unsqueeze(1)
 
+        # Apply channel augmentation
+        if self.training and self.channel_augmentation is not None:
+            input_signal = self.channel_augmentation(input=input_signal)
+
+        # Process input
         processed_signal, _ = self.forward(input_signal=input_signal, input_length=input_length)
 
-        loss_value = self.loss(estimate=processed_signal, target=target_signal, input_length=input_length)
+        # Calculate the loss
+        loss = self.loss(estimate=processed_signal, target=target_signal, input_length=input_length)
 
-        tensorboard_logs = {
-            'train_loss': loss_value,
-            'learning_rate': self._optimizer.param_groups[0]['lr'],
-            'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
-        }
+        # Logs
+        self.log('train_loss', loss)
+        self.log('learning_rate', self._optimizer.param_groups[0]['lr'])
+        self.log('global_step', torch.tensor(self.trainer.global_step, dtype=torch.float32))
 
-        return {'loss': loss_value, 'log': tensorboard_logs}
+        # Return loss
+        return loss
 
     def evaluation_step(self, batch, batch_idx, dataloader_idx: int = 0, tag: str = 'val'):
         input_signal, input_length, target_signal, target_length = batch
@@ -411,15 +435,23 @@ class EncMaskDecAudioToAudioModel(AudioToAudioModel):
         if target_signal.ndim == 2:
             target_signal = target_signal.unsqueeze(1)
 
+        # Process input
         processed_signal, _ = self.forward(input_signal=input_signal, input_length=input_length)
 
-        loss_value = self.loss(estimate=processed_signal, target=target_signal, input_length=input_length)
+        # Calculate the loss
+        loss = self.loss(estimate=processed_signal, target=target_signal, input_length=input_length)
 
+        # Update metrics
+        if hasattr(self, 'metrics') and tag in self.metrics:
+            # Update metrics for this (tag, dataloader_idx)
+            for name, metric in self.metrics[tag][dataloader_idx].items():
+                metric.update(preds=processed_signal, target=target_signal, input_length=input_length)
+
+        # Log global step
         self.log('global_step', torch.tensor(self.trainer.global_step, dtype=torch.float32))
 
-        return {
-            f'{tag}_loss': loss_value,
-        }
+        # Return loss
+        return {f'{tag}_loss': loss}
 
     @classmethod
     def list_available_models(cls) -> Optional[PretrainedModelInfo]:

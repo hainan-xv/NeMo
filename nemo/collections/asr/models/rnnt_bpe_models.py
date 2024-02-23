@@ -14,7 +14,6 @@
 
 import copy
 import os
-from math import isclose
 from typing import Dict, List, Optional, Union
 
 import torch
@@ -22,11 +21,14 @@ from omegaconf import DictConfig, ListConfig, OmegaConf, open_dict
 from pytorch_lightning import Trainer
 
 from nemo.collections.asr.data import audio_to_text_dataset
+from nemo.collections.asr.data.audio_to_text_dali import AudioToBPEDALIDataset
+from nemo.collections.asr.data.audio_to_text_lhotse import LhotseSpeechToTextBpeDataset
 from nemo.collections.asr.losses.rnnt import RNNTLoss
-from nemo.collections.asr.metrics.rnnt_wer_bpe import RNNTBPEWER, RNNTBPEDecoding, RNNTBPEDecodingConfig
+from nemo.collections.asr.metrics import BLEU
 from nemo.collections.asr.models.rnnt_models import EncDecRNNTModel
 from nemo.collections.asr.parts.mixins import ASRBPEMixin
-from nemo.collections.asr.parts.preprocessing.perturb import process_augmentations
+from nemo.collections.asr.parts.submodules.rnnt_decoding import RNNTBPEDecoding, RNNTBPEDecodingConfig
+from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
 from nemo.core.classes.common import PretrainedModelInfo
 from nemo.utils import logging, model_utils
 
@@ -247,6 +249,34 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
         )
         results.append(model)
 
+        model = PretrainedModelInfo(
+            pretrained_model_name="stt_en_fastconformer_transducer_large",
+            description="For details about this model, please visit https://ngc.nvidia.com/catalog/models/nvidia:nemo:stt_en_fastconformer_transducer_large",
+            location="https://api.ngc.nvidia.com/v2/models/nvidia/nemo/stt_en_fastconformer_transducer_large/versions/1.0.0/files/stt_en_fastconformer_transducer_large.nemo",
+        )
+        results.append(model)
+
+        model = PretrainedModelInfo(
+            pretrained_model_name="stt_en_fastconformer_transducer_large_ls",
+            description="For details about this model, please visit https://ngc.nvidia.com/catalog/models/nvidia:nemo:stt_en_fastconformer_transducer_large_ls",
+            location="https://api.ngc.nvidia.com/v2/models/nvidia/nemo/stt_en_fastconformer_transducer_large_ls/versions/1.0.0/files/stt_en_fastconformer_transducer_large_ls.nemo",
+        )
+        results.append(model)
+
+        model = PretrainedModelInfo(
+            pretrained_model_name="stt_en_fastconformer_transducer_xlarge",
+            description="For details about this model, please visit https://ngc.nvidia.com/catalog/models/nvidia:nemo:stt_en_fastconformer_transducer_xlarge",
+            location="https://api.ngc.nvidia.com/v2/models/nvidia/nemo/stt_en_fastconformer_transducer_xlarge/versions/1.20.1/files/stt_en_fastconformer_transducer_xlarge.nemo",
+        )
+        results.append(model)
+
+        model = PretrainedModelInfo(
+            pretrained_model_name="stt_en_fastconformer_transducer_xxlarge",
+            description="For details about this model, please visit https://ngc.nvidia.com/catalog/models/nvidia:nemo:stt_en_fastconformer_transducer_xxlarge",
+            location="https://api.ngc.nvidia.com/v2/models/nvidia/nemo/stt_en_fastconformer_transducer_xxlarge/versions/1.20.1/files/stt_en_fastconformer_transducer_xxlarge.nemo",
+        )
+        results.append(model)
+
         return results
 
     def __init__(self, cfg: DictConfig, trainer: Trainer = None):
@@ -289,10 +319,10 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
         )
 
         # Setup wer object
-        self.wer = RNNTBPEWER(
+        self.bleu = BLEU(
             decoding=self.decoding,
             batch_dim_index=0,
-            use_cer=self._cfg.get('use_cer', False),
+#            use_cer=self._cfg.get('use_cer', False),
             log_prediction=self._cfg.get('log_prediction', True),
             dist_sync_on_step=True,
         )
@@ -300,7 +330,7 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
         # Setup fused Joint step if flag is set
         if self.joint.fuse_loss_wer:
             self.joint.set_loss(self.loss)
-            self.joint.set_wer(self.wer)
+            self.joint.set_wer(self.bleu)
 
     def change_vocabulary(
         self,
@@ -385,11 +415,11 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
             decoding_cfg=decoding_cfg, decoder=self.decoder, joint=self.joint, tokenizer=self.tokenizer,
         )
 
-        self.wer = RNNTBPEWER(
+        self.bleu = BLEU(
             decoding=self.decoding,
-            batch_dim_index=self.wer.batch_dim_index,
-            use_cer=self.wer.use_cer,
-            log_prediction=self.wer.log_prediction,
+            batch_dim_index=self.bleu.batch_dim_index,
+#            use_cer=self.bleu.use_cer,
+            log_prediction=self.bleu.log_prediction,
             dist_sync_on_step=True,
         )
 
@@ -398,7 +428,7 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
             self.decoding.joint_fused_batch_size is not None and self.decoding.joint_fused_batch_size > 0
         ):
             self.joint.set_loss(self.loss)
-            self.joint.set_wer(self.wer)
+            self.joint.set_wer(self.bleu)
 
         # Update config
         with open_dict(self.cfg.joint):
@@ -430,15 +460,22 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
         decoding_cls = OmegaConf.create(OmegaConf.to_container(decoding_cls))
         decoding_cfg = OmegaConf.merge(decoding_cls, decoding_cfg)
 
+        loss_name, loss_kwargs = self.extract_rnnt_loss_cfg(self.cfg.get("loss", None))
+
+        if loss_name == 'tdt':
+            decoding_cfg.durations = loss_kwargs.durations
+        elif loss_name == 'multiblank_rnnt':
+            decoding_cfg.big_blank_durations = loss_kwargs.big_blank_durations
+
         self.decoding = RNNTBPEDecoding(
             decoding_cfg=decoding_cfg, decoder=self.decoder, joint=self.joint, tokenizer=self.tokenizer,
         )
 
-        self.wer = RNNTBPEWER(
+        self.bleu = BLEU(
             decoding=self.decoding,
-            batch_dim_index=self.wer.batch_dim_index,
-            use_cer=self.wer.use_cer,
-            log_prediction=self.wer.log_prediction,
+            batch_dim_index=self.bleu.batch_dim_index,
+#            use_cer=self.bleu.use_cer,
+            log_prediction=self.bleu.log_prediction,
             dist_sync_on_step=True,
         )
 
@@ -447,7 +484,9 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
             self.decoding.joint_fused_batch_size is not None and self.decoding.joint_fused_batch_size > 0
         ):
             self.joint.set_loss(self.loss)
-            self.joint.set_wer(self.wer)
+            self.joint.set_wer(self.bleu)
+
+        self.joint.temperature = decoding_cfg.get('temperature', 1.0)
 
         # Update config
         with open_dict(self.cfg.decoding):
@@ -456,85 +495,42 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
         logging.info(f"Changed decoding strategy to \n{OmegaConf.to_yaml(self.cfg.decoding)}")
 
     def _setup_dataloader_from_config(self, config: Optional[Dict]):
-        if 'augmentor' in config:
-            augmentor = process_augmentations(config['augmentor'])
-        else:
-            augmentor = None
+        if config.get("use_lhotse"):
+            return get_lhotse_dataloader_from_config(
+                config,
+                global_rank=self.global_rank,
+                world_size=self.world_size,
+                dataset=LhotseSpeechToTextBpeDataset(tokenizer=self.tokenizer,),
+            )
+
+        dataset = audio_to_text_dataset.get_audio_to_text_bpe_dataset_from_config(
+            config=config,
+            local_rank=self.local_rank,
+            global_rank=self.global_rank,
+            world_size=self.world_size,
+            tokenizer=self.tokenizer,
+            preprocessor_cfg=self.cfg.get("preprocessor", None),
+        )
+
+        if dataset is None:
+            return None
+
+        if isinstance(dataset, AudioToBPEDALIDataset):
+            # DALI Dataset implements dataloader interface
+            return dataset
 
         shuffle = config['shuffle']
-
-        is_concat = config.get('is_concat', False)
-        if is_concat:
-            if 'concat_sampling' in config and config['concat_sampling'] is None:
-                logging.warning(
-                    f"Concat dataset requires `contact_sampling` but it was not provided. Config: {config}"
-                )
-                return None
-
-            if not 'concat_probabilities' in config:
-                logging.warning(
-                    f"Concat dataset requires `contact_probabilities` list but it was not provided. Config: {config}"
-                )
-                return None
-            else:
-                if not isclose(sum(config['concat_probabilities']), 1, abs_tol=1e-6):
-                    logging.warning(f"`contact_probabilities` need to sum to 1. Config: {config}")
-                    return None
-
-        # Instantiate tarred dataset loader or normal dataset loader
-        if config.get('is_tarred', False):
-            if ('tarred_audio_filepaths' in config and config['tarred_audio_filepaths'] is None) or (
-                'manifest_filepath' in config and config['manifest_filepath'] is None
-            ):
-                logging.warning(
-                    "Could not load dataset as `manifest_filepath` was None or "
-                    f"`tarred_audio_filepaths` is None. Provided config : {config}"
-                )
-                return None
-
-            shuffle_n = config.get('shuffle_n', 4 * config['batch_size']) if shuffle else 0
-
-            if is_concat:
-                dataset = audio_to_text_dataset.get_concat_tarred_dataset(
-                    config=config,
-                    tokenizer=self.tokenizer,
-                    shuffle_n=shuffle_n,
-                    global_rank=self.global_rank,
-                    world_size=self.world_size,
-                    augmentor=augmentor,
-                )
-            else:
-                dataset = audio_to_text_dataset.get_tarred_dataset(
-                    config=config,
-                    tokenizer=self.tokenizer,
-                    shuffle_n=shuffle_n,
-                    global_rank=self.global_rank,
-                    world_size=self.world_size,
-                    augmentor=augmentor,
-                )
+        if isinstance(dataset, torch.utils.data.IterableDataset):
             shuffle = False
-        else:
-            if 'manifest_filepath' in config and config['manifest_filepath'] is None:
-                logging.warning(f"Could not load dataset as `manifest_filepath` was None. Provided config : {config}")
-                return None
-
-            if is_concat:
-                dataset = audio_to_text_dataset.get_concat_bpe_dataset(
-                    config=config,
-                    tokenizer=self.tokenizer,
-                    global_rank=self.global_rank,
-                    world_size=self.world_size,
-                    augmentor=augmentor,
-                )
-            else:
-                dataset = audio_to_text_dataset.get_bpe_dataset(
-                    config=config, tokenizer=self.tokenizer, augmentor=augmentor
-                )
 
         if hasattr(dataset, 'collate_fn'):
             collate_fn = dataset.collate_fn
-        else:
+        elif hasattr(dataset.datasets[0], 'collate_fn'):
+            # support datasets that are lists of entries
             collate_fn = dataset.datasets[0].collate_fn
+        else:
+            # support datasets that are lists of lists
+            collate_fn = dataset.datasets[0].datasets[0].collate_fn
 
         return torch.utils.data.DataLoader(
             dataset=dataset,
@@ -579,6 +575,9 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
             'channel_selector': config.get('channel_selector', None),
             'use_start_end_token': self.cfg.validation_ds.get('use_start_end_token', False),
         }
+
+        if config.get("augmentor"):
+            dl_config['augmentor'] = config.get("augmentor")
 
         temporary_datalayer = self._setup_dataloader_from_config(config=DictConfig(dl_config))
         return temporary_datalayer

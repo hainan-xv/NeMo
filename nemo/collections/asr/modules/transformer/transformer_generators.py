@@ -188,7 +188,7 @@ class GreedySequenceGenerator:
             param.requires_grad = False
         self.decoder.eval()
         for param in self.log_softmax.parameters():
-            param.require_grad = False
+            param.requires_grad = False
         self.log_softmax.eval()
 
     def unfreeze(self) -> None:
@@ -201,7 +201,7 @@ class GreedySequenceGenerator:
             param.requires_grad = True
         self.decoder.train()
         for param in self.log_softmax.parameters():
-            param.require_grad = True
+            param.requires_grad = True
         self.log_softmax.train()
 
     @contextmanager
@@ -301,7 +301,7 @@ class BeamSearchSequenceGenerator(GreedySequenceGenerator):
         scores, prefixes = scores.view(-1, 1), prefixes.view(-1, 1)
 
         # repeat init target prefixes and cached memory states beam_size times
-        prefixes = torch.cat((tgt.repeat(1, self.beam_size).view(-1, 1), prefixes), dim=1)
+        prefixes = torch.cat((tgt.repeat(1, self.beam_size).view(-1, tgt.shape[1]), prefixes), dim=1)
         for j in range(len(decoder_mems_list)):
             decoder_mems_list[j] = decoder_mems_list[j].repeat(self.beam_size, 1, 1)
 
@@ -701,10 +701,10 @@ class EnsembleBeamSearchSequenceGenerator:
                 param.requires_grad = False
             self.decoders[model_num].eval()
             for param in self.log_softmaxes[model_num].parameters():
-                param.require_grad = False
+                param.requires_grad = False
             self.log_softmaxes[model_num].eval()
             for param in self.encoders[model_num].parameters():
-                param.require_grad = False
+                param.requires_grad = False
             self.encoders[model_num].eval()
 
     def unfreeze(self) -> None:
@@ -718,10 +718,10 @@ class EnsembleBeamSearchSequenceGenerator:
                 param.requires_grad = True
             self.decoders[model_num].train()
             for param in self.log_softmaxes[model_num].parameters():
-                param.require_grad = True
+                param.requires_grad = True
             self.log_softmaxes[model_num].train()
             for param in self.encoders[model_num].parameters():
-                param.require_grad = True
+                param.requires_grad = True
             self.encoders[model_num].train()
 
     @contextmanager

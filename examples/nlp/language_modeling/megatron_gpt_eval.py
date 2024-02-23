@@ -12,8 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
+import datetime
 import os
 import threading
+from functools import partial
 
 import torch
 from omegaconf import OmegaConf, open_dict
@@ -22,21 +25,22 @@ from torch.utils.data import DataLoader, Dataset
 
 from nemo.collections.nlp.models.language_modeling.megatron_gpt_model import MegatronGPTModel
 from nemo.collections.nlp.modules.common.megatron.megatron_init import fake_initialize_model_parallel
-from nemo.collections.nlp.modules.common.megatron_web_server import get_demo
 from nemo.collections.nlp.modules.common.text_generation_server import MegatronServer
 from nemo.collections.nlp.modules.common.text_generation_utils import generate
 from nemo.collections.nlp.modules.common.transformer.text_generation import LengthParam, SamplingParam
-from nemo.collections.nlp.parts.nlp_overrides import NLPDDPStrategy, NLPSaveRestoreConnector
+from nemo.collections.nlp.parts.nlp_overrides import CustomProgressBar, NLPDDPStrategy, NLPSaveRestoreConnector
 from nemo.core.config import hydra_runner
 from nemo.utils.app_state import AppState
 from nemo.utils.model_utils import inject_model_parallel_rank
 
 try:
-    from apex.transformer import parallel_state
+    from megatron.core import parallel_state
 
-    HAVE_APEX = True
+    HAVE_MEGATRON_CORE = True
+
 except (ImportError, ModuleNotFoundError):
-    HAVE_APEX = False
+
+    HAVE_MEGATRON_CORE = False
 
 """
 This is the script to run GPT text generation.
@@ -50,8 +54,8 @@ Usage:
             inference.add_BOS=True \
             trainer.devices=1 \
             trainer.num_nodes=1 \
-            tensor_model_parallel_size=1 \
-            pipeline_model_parallel_size=1 \
+            tensor_model_parallel_size=-1 \
+            pipeline_model_parallel_size=-1 \
             prompts=[prompt1,prompt2]
 
     b. run greedy inference from a PTL checkpoint file:
@@ -63,8 +67,8 @@ Usage:
             inference.add_BOS=True \
             trainer.devices=1 \
             trainer.num_nodes=1 \
-            tensor_model_parallel_size=1 \
-            pipeline_model_parallel_size=1 \
+            tensor_model_parallel_size=-1 \
+            pipeline_model_parallel_size=-1 \
             prompts=[prompt1,prompt2]
 
     c. run top_p inference from a nemo file:
@@ -77,8 +81,8 @@ Usage:
             inference.add_BOS=True \
             trainer.devices=1 \
             trainer.num_nodes=1 \
-            tensor_model_parallel_size=1 \
-            pipeline_model_parallel_size=1 \
+            tensor_model_parallel_size=-1 \
+            pipeline_model_parallel_size=-1 \
             prompts=[prompt1,prompt2]
 
     d. If you don't need to generate tokens and need model to compute logprobs:
@@ -87,8 +91,8 @@ Usage:
             inference.compute_logprob=True \
             trainer.devices=1 \
             trainer.num_nodes=1 \
-            tensor_model_parallel_size=1 \
-            pipeline_model_parallel_size=1 \
+            tensor_model_parallel_size=-1 \
+            pipeline_model_parallel_size=-1 \
             prompts=[text to get logprob]
 
     e. Launch the inference server
@@ -96,8 +100,8 @@ Usage:
             gpt_model_file=PATH_TO_MODEL \
             trainer.devices=1 \
             trainer.num_nodes=1 \
-            tensor_model_parallel_size=1 \
-            pipeline_model_parallel_size=1 \
+            tensor_model_parallel_size=-1 \
+            pipeline_model_parallel_size=-1 \
             server=True
         
         To send a request to the server, here is one example code:
@@ -151,11 +155,48 @@ class RequestDataSet(Dataset):
         return self.sentences[idx]
 
 
+def remove_padded_prompts(response, nb_paddings):
+    result = {}
+    for k, v in response.items():
+        if v != None and (type(v) is list or type(v) is torch.Tensor):
+            v = v[:-nb_paddings]
+        result[k] = v
+    return result
+
+
 @hydra_runner(config_path="conf", config_name="megatron_gpt_inference")
 def main(cfg) -> None:
 
     # trainer required for restoring model parallel models
-    trainer = Trainer(strategy=NLPDDPStrategy(), **cfg.trainer)
+    trainer = Trainer(
+        strategy=NLPDDPStrategy(timeout=datetime.timedelta(seconds=18000)),
+        **cfg.trainer,
+        callbacks=[CustomProgressBar()],
+    )
+
+    if cfg.gpt_model_file is not None:
+        if (
+            cfg.tensor_model_parallel_size < 0
+            or cfg.pipeline_model_parallel_size < 0
+            or cfg.get('pipeline_model_parallel_split_rank', -1) < 0
+        ):
+            save_restore_connector = NLPSaveRestoreConnector()
+            if os.path.isdir(cfg.gpt_model_file):
+                save_restore_connector.model_extracted_dir = cfg.gpt_model_file
+            model_config = MegatronGPTModel.restore_from(
+                restore_path=cfg.gpt_model_file,
+                trainer=trainer,
+                return_config=True,
+                save_restore_connector=save_restore_connector,
+            )
+
+            # with dist checkpointing we don't need to set this
+            if not model_config.get('mcore_gpt', False):
+                with open_dict(cfg):
+                    cfg.tensor_model_parallel_size = model_config.get('tensor_model_parallel_size', 1)
+                    cfg.pipeline_model_parallel_size = model_config.get('pipeline_model_parallel_size', 1)
+                    cfg.pipeline_model_parallel_split_rank = model_config.get('pipeline_model_parallel_split_rank', 0)
+
     assert (
         cfg.trainer.devices * cfg.trainer.num_nodes
         == cfg.tensor_model_parallel_size * cfg.pipeline_model_parallel_size
@@ -177,11 +218,22 @@ def main(cfg) -> None:
             pretrained_cfg.sequence_parallel = False
             pretrained_cfg.activations_checkpoint_granularity = None
             pretrained_cfg.activations_checkpoint_method = None
+            pretrained_cfg.precision = trainer.precision
+            pretrained_cfg["use_flash_attention"] = cfg.inference.get("use_flash_attention", False)
+            if pretrained_cfg.get('mcore_gpt', False):
+                # with dist checkpointing we can use the model parallel config specified by the user
+                pretrained_cfg.tensor_model_parallel_size = cfg.tensor_model_parallel_size
+                pretrained_cfg.pipeline_model_parallel_size = cfg.pipeline_model_parallel_size
+            if trainer.precision == "16":
+                pretrained_cfg.megatron_amp_O2 = False
+            elif trainer.precision in ['bf16', 'bf16-mixed'] and cfg.get('megatron_amp_O2', False):
+                pretrained_cfg.megatron_amp_O2 = True
         model = MegatronGPTModel.restore_from(
             restore_path=cfg.gpt_model_file,
             trainer=trainer,
             override_config_path=pretrained_cfg,
             save_restore_connector=save_restore_connector,
+            map_location=f'cuda:{trainer.local_rank}',  # map_location is needed for converted models
         )
     elif cfg.checkpoint_dir:
         app_state = AppState()
@@ -203,7 +255,11 @@ def main(cfg) -> None:
                 pipeline_model_parallel_size_=cfg.pipeline_model_parallel_size,
                 pipeline_model_parallel_split_rank_=cfg.pipeline_model_parallel_split_rank,
             )
-        checkpoint_path = inject_model_parallel_rank(os.path.join(cfg.checkpoint_dir, cfg.checkpoint_name))
+        checkpoint_path = os.path.join(cfg.checkpoint_dir, cfg.checkpoint_name)
+        # checkpoint_path is a dir in case of distributed checkpointing
+        if not os.path.isdir(checkpoint_path):
+            # legacy checkpoint needs model parallel rank injection
+            checkpoint_path = inject_model_parallel_rank(os.path.join(cfg.checkpoint_dir, cfg.checkpoint_name))
         model = MegatronGPTModel.load_from_checkpoint(checkpoint_path, hparams_file=cfg.hparams_file, trainer=trainer)
     else:
         raise ValueError("need at least a nemo file or checkpoint dir")
@@ -230,33 +286,67 @@ def main(cfg) -> None:
         "add_BOS": cfg.inference.add_BOS,
         "all_probs": cfg.inference.all_probs,
         "compute_logprob": cfg.inference.compute_logprob,
+        "end_strings": cfg.inference.end_strings,
     }
+
+    fp8_enabled = hasattr(model.cfg, "fp8") and (model.cfg.fp8 == True)
+    if fp8_enabled:
+        nb_paddings = 0
+        while len(cfg.prompts) % 8 != 0:
+            cfg.prompts.append("")
+            nb_paddings += 1
 
     # First method of running text generation, call model.generate method
     response = model.generate(
         inputs=OmegaConf.to_container(cfg.prompts), length_params=length_params, sampling_params=sampling_params
     )
 
+    if fp8_enabled:
+        response = remove_padded_prompts(response, nb_paddings)
     print("***************************")
     print(response)
     print("***************************")
 
-    # Second method of running text generation, call trainer.predict
+    # Second method of running text generation, call trainer.predict [recommended]
+    bs = 8 if fp8_enabled else 2
     ds = RequestDataSet(OmegaConf.to_container(cfg.prompts))
-    request_dl = DataLoader(dataset=ds, batch_size=2)
+    request_dl = DataLoader(dataset=ds, batch_size=bs)
     config = OmegaConf.to_container(cfg.inference)
     model.set_inference_config(config)
     response = trainer.predict(model, request_dl)
 
+    if fp8_enabled:
+        response[-1] = remove_padded_prompts(response[-1], nb_paddings)
     print("***************************")
     print(response)
     print("***************************")
 
     # Third method of running text generation, use inference server
     if cfg.server:
+        from nemo.collections.nlp.modules.common.megatron_web_server import get_chatbot_demo, get_demo
+
         if parallel_state.is_pipeline_first_stage() and parallel_state.get_tensor_model_parallel_rank() == 0:
             if cfg.web_server:
-                thread = threading.Thread(target=get_demo, daemon=True, args=(cfg.share, cfg.username, cfg.password))
+                if cfg.chat:
+                    defaults = {
+                        'user': cfg.chatbot_config.user,
+                        'assistant': cfg.chatbot_config.assistant,
+                        'system': cfg.chatbot_config.system,
+                    }
+                    web_ui = partial(
+                        get_chatbot_demo,
+                        defaults=defaults,
+                        value=cfg.chatbot_config.value,
+                        attributes=cfg.chatbot_config.attributes,
+                    )
+                else:
+                    web_ui = get_demo
+                loop = asyncio.new_event_loop()
+                thread = threading.Thread(
+                    target=web_ui,
+                    daemon=True,
+                    args=(cfg.share, cfg.username, cfg.password, cfg.port, cfg.web_port, loop),
+                )
                 thread.start()
             server = MegatronServer(model.cuda())
             server.run("0.0.0.0", port=cfg.port)

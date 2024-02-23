@@ -817,7 +817,7 @@ def create_label_ids(unique_labels: Set[str], pad_label: str) -> Dict[str, int]:
 
 def load_label_ids(file_path: Union[str, os.PathLike]) -> Dict[str, int]:
     ids = {}
-    with open(file_path) as f:
+    with open(file_path, encoding='utf_8') as f:
         for i, line in enumerate(f):
             ids[line.strip()] = i
     return ids
@@ -833,7 +833,7 @@ def save_label_ids(label_ids: Dict[str, int], file_path: Path) -> None:
         file_path: path to a file where labels will be saved
     """
     file_path.parent.mkdir(parents=True, exist_ok=True)
-    with file_path.open('w') as out:
+    with file_path.open('w', encoding='utf_8', newline='\n') as out:
         labels, _ = zip(*sorted(label_ids.items(), key=lambda x: x[1]))
         out.write('\n'.join(labels))
 
@@ -1384,11 +1384,11 @@ class BertPunctuationCapitalizationDataset(Dataset):
     def _read_dataset(
         text_file: Path, labels_file: Path, num_samples: int, audio_file: Optional[Path] = None
     ) -> Union[Tuple[Any, Any, Any, Set[Any], Set[Any], Any], Tuple[Any, Any, Any, Set[Any], Set[Any]]]:
-        with open(text_file, 'r') as f:
+        with open(text_file, 'r', encoding='utf_8') as f:
             text_lines = f.readlines()
         punct_unique_labels, capit_unique_labels = set(), set()
         punct_labels_lines, capit_labels_lines = [], []
-        with labels_file.open() as f:
+        with labels_file.open(encoding='utf_8') as f:
             for i, line in enumerate(f):
                 pairs = line.split()
                 if not all([len(p) == 2 for p in pairs]):
@@ -1647,7 +1647,7 @@ class BertPunctuationCapitalizationDataset(Dataset):
               - ``'input_mask'``: a boolean numpy array;
               - ``'loss_mask'``: a boolean numpy array.
             If ``waveforms`` is not ``None``, then a batch also contain items
-              - ``features``: a ``np.float`` numpy array.
+              - ``features``: a ``np.float64`` numpy array.
               - ``features_length`` a ``np.int32`` numpy array.
             If ``audio_filepaths`` is not ``None``, then a natch also contain items
               - ``audio_filepaths`` a list of strings.
@@ -1677,7 +1677,7 @@ class BertPunctuationCapitalizationDataset(Dataset):
                 "capit_labels": item[3].astype(np.int64),
             }
             if self.use_audio and self.preload_audios:
-                batch['features'] = item[4].astype(np.float)
+                batch['features'] = item[4].astype(np.float64)
                 batch['features_length'] = item[5]
             elif self.use_audio and not self.preload_audios:
                 batch['audio_filepaths'] = item[6]
@@ -1730,7 +1730,7 @@ class BertPunctuationCapitalizationDataset(Dataset):
               - ``'input_mask'``: a boolean numpy array;
               - ``'loss_mask'``: a boolean numpy array.
             If ``waveforms`` is not ``None``, then a batch also contain items
-              - ``features``: a ``np.float`` numpy array.
+              - ``features``: a ``np.float64`` numpy array.
               - ``features_length`` a ``np.int32`` numpy array.
             If ``audio_filepaths`` is not ``None``, then a natch also contain items
               - ``audio_filepaths`` a list of strings.
@@ -1785,7 +1785,7 @@ class BertPunctuationCapitalizationDataset(Dataset):
             if self.use_audio and self.preload_audios:
                 batch['features'] = pad(
                     waveforms[start : start + size], max(audio_lengths[start : start + size]), 0.0
-                ).astype(np.float)
+                ).astype(np.float64)
                 batch['features_length'] = audio_lengths[start : start + size]
             elif self.use_audio and not self.preload_audios:
                 batch['audio_filepaths'] = audio_filepaths[start : start + size]
@@ -1993,8 +1993,8 @@ class BertPunctuationCapitalizationDataset(Dataset):
                 computed for corresponding token. See more in description of constructor parameters
                 ``ignore_start_end``, ``ignore_extra_tokens`` (if ``self.add_masks_and_segment_ids_to_batch`` is
                 ``False``, then these items is missing).
-              - ``'features'`` (:obj:`numpy.ndarray`) :obj:`np.float` array of waveforms of audio if ``self.preload_audio`` is set to ``True`` else empty.
-              - ``'features_length'`` (:obj:`numpy.ndarray`) :obj:`np.long` array of number of samples per audio.
+              - ``'features'`` (:obj:`numpy.ndarray`) :obj:`np.float64` array of waveforms of audio if ``self.preload_audio`` is set to ``True`` else empty.
+              - ``'features_length'`` (:obj:`numpy.ndarray`) :obj:`np.longlong` array of number of samples per audio.
               - ``'audio_filepaths'`` (:obj:`List`) :obj:`str` contains paths of audio files if ``self.preload_audio`` set to ``False``
         """
         return self.batches[idx]

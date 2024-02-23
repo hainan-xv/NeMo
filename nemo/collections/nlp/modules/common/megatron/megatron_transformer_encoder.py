@@ -13,7 +13,6 @@
 # limitations under the License.
 
 """Transformer based language model."""
-
 from nemo.collections.nlp.modules.common.megatron.layer_type import LayerType
 from nemo.collections.nlp.modules.common.megatron.megatron_encoder_module import MegatronEncoderModule
 from nemo.collections.nlp.modules.common.megatron.module import MegatronModule
@@ -35,6 +34,17 @@ except (ImportError, ModuleNotFoundError):
     AttnMaskType = ApexGuardDefaults()
     ModelType = ApexGuardDefaults()
 
+try:
+    from megatron.core import ModelParallelConfig
+
+    HAVE_MEGATRON_CORE = True
+
+except (ImportError, ModuleNotFoundError):
+
+    ModelParallelConfig = ApexGuardDefaults
+
+    HAVE_MEGATRON_CORE = False
+
 __all__ = ["MegatronTransformerEncoderModule"]
 
 
@@ -43,6 +53,7 @@ class MegatronTransformerEncoderModule(MegatronModule, Exportable, MegatronEncod
 
     def __init__(
         self,
+        config: ModelParallelConfig,
         init_method,
         output_layer_init_method,
         hidden_size,
@@ -53,7 +64,6 @@ class MegatronTransformerEncoderModule(MegatronModule, Exportable, MegatronEncod
         kv_channels=None,
         pre_process=True,
         post_process=True,
-        use_cpu_initialization=False,
         encoder_attn_mask_type=AttnMaskType.padding,
         hidden_dropout=0.1,
         attention_dropout=0.1,
@@ -81,8 +91,10 @@ class MegatronTransformerEncoderModule(MegatronModule, Exportable, MegatronEncod
         num_moe_experts=1,
         moe_frequency=1,
         moe_dropout=0.0,
+        position_embedding_type='learned_absolute',
+        use_flash_attention=False,
     ):
-        super(MegatronTransformerEncoderModule, self).__init__()
+        super(MegatronTransformerEncoderModule, self).__init__(config=config)
 
         self.pre_process = pre_process
         self.post_process = post_process
@@ -95,6 +107,7 @@ class MegatronTransformerEncoderModule(MegatronModule, Exportable, MegatronEncod
         self.parent_model_type = parent_model_type
         self.normalization = normalization
         self.transformer_block_type = transformer_block_type
+        self.use_flash_attention = use_flash_attention
 
         if kv_channels is None:
 
@@ -105,6 +118,7 @@ class MegatronTransformerEncoderModule(MegatronModule, Exportable, MegatronEncod
 
         # Transformer.
         self.model = ParallelTransformer(
+            config=config,
             layer_type=LayerType.encoder,
             init_method=self.init_method,
             output_layer_init_method=self.output_layer_init_method,
@@ -126,7 +140,6 @@ class MegatronTransformerEncoderModule(MegatronModule, Exportable, MegatronEncod
             hidden_dropout=hidden_dropout,
             attention_dropout=attention_dropout,
             ffn_dropout=ffn_dropout,
-            use_cpu_initialization=use_cpu_initialization,
             bias_activation_fusion=bias_activation_fusion,
             bias_dropout_add_fusion=bias_dropout_add_fusion,
             masked_softmax_fusion=masked_softmax_fusion,
@@ -139,12 +152,13 @@ class MegatronTransformerEncoderModule(MegatronModule, Exportable, MegatronEncod
             transformer_block_type=transformer_block_type,
             headscale=headscale,
             model_type=parent_model_type,
-            gradient_accumulation_fusion=False,  # TODO: This has to be False for enc-dec models for now.
             megatron_legacy=megatron_legacy,
             normalize_attention_scores=normalize_attention_scores,
             num_moe_experts=num_moe_experts,
             moe_frequency=moe_frequency,
             moe_dropout=moe_dropout,
+            position_embedding_type=position_embedding_type,
+            use_flash_attention=use_flash_attention,
         )
         self._model_key = 'model'
 
@@ -161,14 +175,19 @@ class MegatronTransformerEncoderModule(MegatronModule, Exportable, MegatronEncod
         enc_self_attention_relative_position_bias=None,
     ):
         # convert to Megatron mask
-        enc_attn_mask_3d = build_attention_mask_3d(
-            source_mask=enc_attn_mask, target_mask=enc_attn_mask, attn_mask_type=self.model_attn_mask_type,
-        )
+        if self.use_flash_attention:
+            enc_attn_mask_3d = enc_attn_mask < 0.5
+        else:
+            enc_attn_mask_3d = attn_mask_postprocess(
+                build_attention_mask_3d(
+                    source_mask=enc_attn_mask, target_mask=enc_attn_mask, attn_mask_type=self.model_attn_mask_type,
+                )
+            )
 
         # transformer encoder
         enc_output = self.model(
             enc_input,
-            attn_mask_postprocess(enc_attn_mask_3d),
+            enc_attn_mask_3d,
             layer_past=layer_past,
             get_key_value=get_key_value,
             self_attention_relative_position_bias=enc_self_attention_relative_position_bias,

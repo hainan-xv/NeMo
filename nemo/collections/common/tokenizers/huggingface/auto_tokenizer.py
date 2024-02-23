@@ -82,6 +82,7 @@ class AutoTokenizer(TokenizerSpec):
                 f'Unable to instantiate HuggingFace AUTOTOKENIZER for {pretrained_model_name}. Exception: {e}'
             )
 
+        self.original_vocab_size = len(self.tokenizer)
         special_tokens_dict = {}
 
         # # setting special tokens, by default the default model's special tokens will be preserved
@@ -148,6 +149,7 @@ class AutoTokenizer(TokenizerSpec):
                 f'see NLP_Tokenizers.ipynb for more details.'
             )
         self.add_special_tokens(special_tokens_dict)
+        self.space_sensitive = self.text_to_tokens('x y') != self.text_to_tokens('x') + self.text_to_tokens('y')
 
     @property
     def vocab_size(self):

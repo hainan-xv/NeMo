@@ -82,6 +82,7 @@ class TranslationDataset(Dataset):
         use_cache: bool = False,
         reverse_lang_direction: bool = False,
         prepend_id: int = None,
+        add_bos_eos_to_encoder: bool = True,
     ):
         self.dataset_src = dataset_src
         self.dataset_tgt = dataset_tgt
@@ -96,6 +97,7 @@ class TranslationDataset(Dataset):
         self.max_seq_length_ratio = max_seq_length_ratio
         self.reverse_lang_direction = reverse_lang_direction
         self.prepend_id = prepend_id
+        self.add_bos_eos_to_encoder = add_bos_eos_to_encoder
 
         # deprecation warnings for cache_ids, use_cache, and cache_data_per_node
         if self.cache_ids is True or self.use_cache is True or self.cache_data_per_node is True:
@@ -110,6 +112,8 @@ class TranslationDataset(Dataset):
             cache_ids=self.cache_ids,
             cache_data_per_node=self.cache_data_per_node,
             use_cache=self.use_cache,
+            add_bos_eos=self.add_bos_eos_to_encoder,
+            remove_trailing_newline=True,
         )
         tgt_ids = dataset_to_ids(
             self.dataset_tgt,
@@ -117,6 +121,7 @@ class TranslationDataset(Dataset):
             cache_ids=self.cache_ids,
             cache_data_per_node=self.cache_data_per_node,
             use_cache=self.use_cache,
+            remove_trailing_newline=True,
         )
         if self.clean:
             src_ids, tgt_ids = self.clean_src_and_target(
@@ -159,8 +164,8 @@ class TranslationDataset(Dataset):
         for batch_idx, b in enumerate(batch_indices):
             src_len = max([len(src_ids[i]) for i in b])
             tgt_len = max([len(tgt_ids[i]) for i in b])
-            src_ids_ = self.src_pad_id * np.ones((len(b), src_len), dtype=np.int)
-            tgt_ids_ = self.tgt_pad_id * np.ones((len(b), tgt_len), dtype=np.int)
+            src_ids_ = self.src_pad_id * np.ones((len(b), src_len), dtype=np.int64)
+            tgt_ids_ = self.tgt_pad_id * np.ones((len(b), tgt_len), dtype=np.int64)
             for i, sentence_idx in enumerate(b):
                 src_ids_[i][: len(src_ids[sentence_idx])] = src_ids[sentence_idx]
                 tgt_ids_[i][: len(tgt_ids[sentence_idx])] = tgt_ids[sentence_idx]

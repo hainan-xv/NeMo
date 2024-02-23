@@ -26,6 +26,17 @@ If there is a local ``.nemo`` checkpoint that you'd like to load, use the :code:
 
 Where the model base class is the ASR model class of the original checkpoint, or the general ``ASRModel`` class.
 
+
+Hybrid ASR-TTS Models Checkpoints
+---------------------------------
+
+:ref:`Hybrid ASR-TTS model <Hybrid-ASR-TTS_model>` is a transparent wrapper for the ASR model, text-to-mel-spectrogram generator, and optional enhancer.
+The model is saved as a solid ``.nemo`` checkpoint containing all these parts.
+Due to transparency, the ASR model can be extracted after training/finetuning separately by using the ``asr_model`` attribute (NeMo submodel)
+:code:`hybrid_model.asr_model.save_to(<asr_checkpoint_path>.nemo)` or by using a wrapper
+made for convenience purpose :code:`hybrid_model.save_asr_model_to(<asr_checkpoint_path>.nemo)`
+
+
 NGC Pretrained Checkpoints
 --------------------------
 
@@ -66,10 +77,66 @@ To perform inference and transcribe a sample of speech after loading the model, 
 
 .. code-block:: python
 
-    model.transcribe(paths2audio_files=[list of audio files], batch_size=BATCH_SIZE, logprobs=False)
+    model.transcribe(audio=[list of audio files], batch_size=BATCH_SIZE)
 
-Setting the argument ``logprobs`` to ``True`` returns the log probabilities instead of transcriptions. For more information, see `nemo.collections.asr.modules <./api.html#modules>`__.
-The audio files should be 16KHz mono-channel wav files.
+``audio`` can be a string path to a file, a list of string paths to multiple files, a numpy or PyTorch tensor that is an audio file loaded via ``soundfile`` or some other library or even a list of such tensors. This expanded support for inputs to transcription should help users to easily integrate NeMo into their pipelines.
+
+-----
+
+You can do inference on a numpy array that represents an audio signal as follows. Note that it is your responsibility to process the audio to be monochannel and 16KHz sample rate before passing it to the model.
+
+.. code-block:: python
+
+    import torch
+    import soundfile as sf
+
+    from nemo.collections.asr.models import ASRModel
+    model = ASRModel.from_pretrained(<Model Name>)
+    model.eval()
+
+    # Load audio files
+    audio_file = os.path.join(test_data_dir, "asr", "train", "an4", "wav", "an46-mmap-b.wav")
+    audio, sr = sf.read(audio_file, dtype='float32')
+
+    audio_file_2 = os.path.join(test_data_dir, "asr", "train", "an4", "wav", "an104-mrcb-b.wav")
+    audio_2, sr = sf.read(audio_file_2, dtype='float32')
+
+    # Mix one numpy array audio segment with torch audio tensor
+    audio_2 = torch.from_numpy(audio_2)
+
+    # Numpy array + torch tensor mixed tensor input (for batched inference)
+    outputs = model.transcribe([audio, audio_2], batch_size=2)
+
+-----
+
+In order to obtain alignments from CTC or RNNT models (previously called ``logprobs``), you can use the following code:
+
+.. code-block:: python
+
+    hyps = model.transcribe(audio=[list of audio files], batch_size=BATCH_SIZE, return_hypotheses=True)
+    logprobs = hyps[0].alignments  # or hyps[0][0].alignments for RNNT
+
+-----
+
+Often times, we want to transcribe a large number of files at once (maybe from a manifest for example). In this case, using ``transcribe()`` directly may be incorrect because it will delay the return of the result until every single sample in the input is processed. One work around is to call transcribe() multiple times, each time using a small subset of the data. This workflow is now supported via a :meth:`~nemo.collections.asr.parts.mixins.transcription.TranscriptionMixin.transcribe_generator`.
+
+.. code-block:: python
+
+    import nemo.collections.asr as nemo_asr
+    model = nemo_asr.models.ASRModel.from_pretrained(<Model Name>)
+
+    config = model.get_transcribe_config()
+    config.batch_size = 32
+    generator = model.transcribe_generator(audio, config)
+
+    for processed_outputs in generator:
+        # process a batch of 32 results (or less if last batch does not contain 32 elements)
+        ....
+
+
+-----
+
+For more information, see `nemo.collections.asr.modules <./api.html#modules>`__. For more information on the general ``Transcription API``, please take a look at :class:`~nemo.collections.asr.parts.mixins.transcription.TranscriptionMixin`. The audio files should be 16KHz mono-channel wav files.
 
 Inference on long audio
 ^^^^^^^^^^^^^^^^^^^^^^
@@ -81,8 +148,10 @@ There are two main ways of performing inference on long audio files in NeMo:
 The first way is to use buffered inference, where the audio is divided into chunks to run on, and the output is merged afterwards.
 The relevant scripts for this are contained in `this folder <https://github.com/NVIDIA/NeMo/blob/stable/examples/asr/asr_chunked_inference>`_.
 
-The second way, specifically for models with the Conformer encoder, is to convert to local attention, which changes the costs to be linear.
-This can be done even for models trained with full attention, though may result in lower WER in some cases. You can switch to local attention when running the
+The second way, specifically for models with the Conformer/Fast Conformer encoder, is to use local attention, which changes the costs to be linear.
+You can train Fast Conformer models with Longformer-style (https://arxiv.org/abs/2004.05150) local+global attention using one of the following configs: CTC config at
+``<NeMo_git_root>/examples/asr/conf/fastconformer/fast-conformer-long_ctc_bpe.yaml`` and transducer config at ``<NeMo_git_root>/examples/asr/conf/fastconformer/fast-conformer-long_transducer_bpe.yaml``.
+You can also convert any model trained with full context attention to local, though this may result in lower WER in some cases. You can switch to local attention when running the
 `transcribe <https://github.com/NVIDIA/NeMo/blob/stable/examples/asr/transcribe_speech.py>`_ or `evaluation <https://github.com/NVIDIA/NeMo/blob/stable/examples/asr/transcribe_speech.py>`_
 scripts in the following way:
 
@@ -91,7 +160,7 @@ scripts in the following way:
     python speech_to_text_eval.py \
         (...other parameters...)  \
         ++model_change.conformer.self_attention_model="rel_pos_local_attn" \
-        ++model_change.conformer.att_context_size=[64, 64]
+        ++model_change.conformer.att_context_size=[128, 128]
 
 Alternatively, you can change the attention model after loading a checkpoint:
 
@@ -100,8 +169,35 @@ Alternatively, you can change the attention model after loading a checkpoint:
     asr_model = ASRModel.from_pretrained('stt_en_conformer_ctc_large')
     asr_model.change_attention_model(
         self_attention_model="rel_pos_local_attn",
-        att_context_size=[64, 64]
+        att_context_size=[128, 128]
     )
+
+Sometimes, the downsampling module at the earliest stage of the model can take more memory than the actual forward pass since it directly operates on the audio sequence which may not be able to fit in memory for very long audio files. In order to reduce the memory consumption of the subsampling module, you can ask the model to perform auto-chunking of the input sequence and process it piece by piece, taking more time but avoiding an OutOfMemoryError.
+
+.. code-block:: python
+
+    asr_model = ASRModel.from_pretrained('stt_en_fastconformer_ctc_large')
+    # Speedup conv subsampling factor to speed up the subsampling module.
+    asr_model.change_subsampling_conv_chunking_factor(1)  # 1 = auto select
+
+.. note::
+
+    Only certain models which use depthwise separable convolutions in the downsampling layer support this operation. Please try it out on your model and see if it is supported.
+
+
+Inference on Apple M-Series GPU
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+To perform inference on Apple Mac M-Series GPU (``mps`` PyTorch device), use PyTorch 2.0 or higher (see :ref:`mac-installation` section). Environment variable ``PYTORCH_ENABLE_MPS_FALLBACK=1`` should be set, since not all operations in PyTorch are currently implemented on ``mps`` device.
+
+If ``allow_mps=true`` flag is passed to ``speech_to_text_eval.py``, the ``mps`` device will be selected automatically.
+
+.. code-block:: python
+
+    PYTORCH_ENABLE_MPS_FALLBACK=1 python speech_to_text_eval.py \
+      (...other parameters...)  \
+      allow_mps=true
+
 
 Fine-tuning on Different Datasets
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -128,6 +224,9 @@ Language Models for ASR
    :header-rows: 1
 
 |
+
+
+.. _asr-checkpoint-list-by-language:
 
 Speech Recognition (Languages)
 ------------------------------
@@ -251,3 +350,42 @@ Kinyarwanda
    :widths: 40, 10, 50
    :header-rows: 1
 
+-----------------------------
+
+Belarusian
+^^^^^^^^^^^
+.. csv-table::
+   :file: data/benchmark_by.csv
+   :align: left
+   :widths: 40, 10, 50
+   :header-rows: 1
+
+-----------------------------
+
+Ukrainian
+^^^^^^^^^^^
+.. csv-table::
+   :file: data/benchmark_ua.csv
+   :align: left
+   :widths: 40, 10, 50
+   :header-rows: 1
+
+-----------------------------
+
+Multilingual
+^^^^^^^^^^^
+.. csv-table::
+   :file: data/benchmark_multilingual.csv
+   :align: left
+   :widths: 40, 10, 50
+   :header-rows: 1
+
+-----------------------------
+
+Code-Switching
+^^^^^^^^^^^
+.. csv-table::
+   :file: data/benchmark_code_switching.csv
+   :align: left
+   :widths: 40, 10, 50
+   :header-rows: 1

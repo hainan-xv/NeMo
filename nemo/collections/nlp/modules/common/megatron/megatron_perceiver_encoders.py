@@ -26,8 +26,8 @@ from nemo.collections.nlp.modules.common.megatron.utils import (
 )
 
 try:
-    from apex.transformer.enums import AttnMaskType, ModelType
     from apex.normalization import MixedFusedRMSNorm
+    from apex.transformer.enums import AttnMaskType, ModelType
 
     HAVE_APEX = True
 except (ImportError, ModuleNotFoundError):
@@ -35,6 +35,18 @@ except (ImportError, ModuleNotFoundError):
     # fake missing classes with None attributes
     AttnMaskType = ApexGuardDefaults()
     ModelType = ApexGuardDefaults()
+
+try:
+    from megatron.core import ModelParallelConfig
+
+    HAVE_MEGATRON_CORE = True
+
+except (ImportError, ModuleNotFoundError):
+
+    ModelParallelConfig = ApexGuardDefaults
+
+    HAVE_MEGATRON_CORE = False
+
 
 __all__ = ["MegatronPerceiverEncoderModule"]
 
@@ -45,6 +57,7 @@ class MegatronPerceiverEncoderModule(MegatronModule):
 
     def __init__(
         self,
+        config: ModelParallelConfig,
         init_method,
         output_layer_init_method,
         hidden_size,
@@ -55,7 +68,6 @@ class MegatronPerceiverEncoderModule(MegatronModule):
         kv_channels=None,
         pre_process=True,
         post_process=True,
-        use_cpu_initialization=False,
         encoder_attn_mask_type=AttnMaskType.padding,
         hidden_dropout=0.1,
         attention_dropout=0.1,
@@ -64,6 +76,7 @@ class MegatronPerceiverEncoderModule(MegatronModule):
         fp32_residual_connection=False,
         activations_checkpoint_method=None,
         activations_checkpoint_num_layers=1,
+        activations_checkpoint_granularity=None,
         layernorm_epsilon=1e-5,
         bias_activation_fusion=True,
         bias_dropout_add_fusion=True,
@@ -82,8 +95,9 @@ class MegatronPerceiverEncoderModule(MegatronModule):
         normalize_attention_scores=True,
         megatron_legacy=False,
     ):
-        super(MegatronPerceiverEncoderModule, self).__init__()
+        super(MegatronPerceiverEncoderModule, self).__init__(config=config)
 
+        self.config = config
         self.pre_process = pre_process
         self.post_process = post_process
         self.hidden_size = hidden_size
@@ -105,6 +119,7 @@ class MegatronPerceiverEncoderModule(MegatronModule):
         self.fp32_residual_connection = fp32_residual_connection
         self.activations_checkpoint_method = activations_checkpoint_method
         self.activations_checkpoint_num_layers = activations_checkpoint_num_layers
+        self.activations_checkpoint_granularity = activations_checkpoint_granularity
         self.layernorm_epsilon = layernorm_epsilon
         self.bias_activation_fusion = bias_activation_fusion
         self.bias_dropout_add_fusion = bias_dropout_add_fusion
@@ -117,7 +132,6 @@ class MegatronPerceiverEncoderModule(MegatronModule):
         self.headscale = headscale
         self.hidden_dropout = hidden_dropout
         self.attention_dropout = attention_dropout
-        self.use_cpu_initialization = use_cpu_initialization
         self.normalization = normalization
         self.parent_model_type = parent_model_type
         self.transformer_block_type = transformer_block_type
@@ -144,6 +158,7 @@ class MegatronPerceiverEncoderModule(MegatronModule):
 
     def _build_cross_attn_layer(self):
         return ParallelTransformer(
+            config=self.config,
             layer_type=LayerType.decoder,
             init_method=self.init_method,
             output_layer_init_method=self.output_layer_init_method,
@@ -160,11 +175,11 @@ class MegatronPerceiverEncoderModule(MegatronModule):
             fp32_residual_connection=self.fp32_residual_connection,
             activations_checkpoint_method=self.activations_checkpoint_method,
             activations_checkpoint_num_layers=self.activations_checkpoint_num_layers,
+            activations_checkpoint_granularity=self.activations_checkpoint_granularity,
             layernorm_epsilon=self.layernorm_epsilon,
             hidden_dropout=self.hidden_dropout,
             attention_dropout=self.attention_dropout,
             ffn_dropout=self.ffn_dropout,
-            use_cpu_initialization=self.use_cpu_initialization,
             bias_activation_fusion=self.bias_activation_fusion,
             bias_dropout_add_fusion=self.bias_dropout_add_fusion,
             masked_softmax_fusion=self.masked_softmax_fusion,
@@ -183,6 +198,7 @@ class MegatronPerceiverEncoderModule(MegatronModule):
 
     def _build_self_attn_layer(self):
         return ParallelTransformer(
+            config=self.config,
             layer_type=LayerType.encoder,
             init_method=self.init_method,
             output_layer_init_method=self.output_layer_init_method,
@@ -199,11 +215,11 @@ class MegatronPerceiverEncoderModule(MegatronModule):
             fp32_residual_connection=self.fp32_residual_connection,
             activations_checkpoint_method=self.activations_checkpoint_method,
             activations_checkpoint_num_layers=self.activations_checkpoint_num_layers,
+            activations_checkpoint_granularity=self.activations_checkpoint_granularity,
             layernorm_epsilon=self.layernorm_epsilon,
             hidden_dropout=self.hidden_dropout,
             attention_dropout=self.attention_dropout,
             ffn_dropout=self.ffn_dropout,
-            use_cpu_initialization=self.use_cpu_initialization,
             bias_activation_fusion=self.bias_activation_fusion,
             bias_dropout_add_fusion=self.bias_dropout_add_fusion,
             masked_softmax_fusion=self.masked_softmax_fusion,

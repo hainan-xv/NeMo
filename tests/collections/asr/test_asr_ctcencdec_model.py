@@ -19,8 +19,8 @@ from omegaconf import DictConfig, OmegaConf, open_dict
 
 import nemo.collections.asr as nemo_asr
 from nemo.collections.asr.data import audio_to_text
-from nemo.collections.asr.metrics.wer import CTCDecoding, CTCDecodingConfig
 from nemo.collections.asr.models import EncDecCTCModel, configs
+from nemo.collections.asr.parts.submodules.ctc_decoding import CTCDecoding, CTCDecodingConfig
 from nemo.utils.config_utils import assert_dataclass_signature_match, update_model_config
 
 
@@ -266,6 +266,7 @@ class TestEncDecCTCModel:
             'pin_memory',
             'drop_last',
             'tarred_shard_strategy',
+            'shard_manifests',
             'shuffle_n',
             'use_start_end_token',
             'use_start_end_token',

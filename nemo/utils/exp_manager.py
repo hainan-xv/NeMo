@@ -14,17 +14,15 @@
 
 import glob
 import os
-import re
 import subprocess
 import sys
 import time
 import warnings
-from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
 from shutil import copy, move
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Collection, Dict, List, Optional, Tuple, Union
 
 import pytorch_lightning
 import torch
@@ -32,22 +30,24 @@ from hydra.core.hydra_config import HydraConfig
 from hydra.utils import get_original_cwd
 from omegaconf import DictConfig, OmegaConf, open_dict
 from pytorch_lightning.callbacks import Callback, ModelCheckpoint
+from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from pytorch_lightning.callbacks.timer import Interval, Timer
-from pytorch_lightning.loggers import MLFlowLogger, TensorBoardLogger, WandbLogger
-from pytorch_lightning.loops import TrainingEpochLoop
+from pytorch_lightning.loggers import MLFlowLogger, NeptuneLogger, TensorBoardLogger, WandbLogger
+from pytorch_lightning.loops import _TrainingEpochLoop
 from pytorch_lightning.strategies.ddp import DDPStrategy
-from pytorch_lightning.utilities import rank_zero_info
 
 from nemo.collections.common.callbacks import EMA
 from nemo.constants import NEMO_ENV_VARNAME_TESTING, NEMO_ENV_VARNAME_VERSION
 from nemo.utils import logging, timers
 from nemo.utils.app_state import AppState
-from nemo.utils.dllogger import DLLogger
+from nemo.utils.callbacks import NeMoModelCheckpoint, PreemptionCallback
 from nemo.utils.env_var_parsing import get_envbool
 from nemo.utils.exceptions import NeMoBaseException
 from nemo.utils.get_rank import is_global_rank_zero
 from nemo.utils.lightning_logger_patch import add_filehandlers_to_pl_logger
-from nemo.utils.model_utils import inject_model_parallel_rank, uninject_model_parallel_rank
+from nemo.utils.loggers import ClearMLLogger, ClearMLParams, DLLogger, DLLoggerParams, MLFlowParams
+from nemo.utils.mcore_logger import add_handlers_to_mcore_logger
+from nemo.utils.model_utils import uninject_model_parallel_rank
 
 
 class NotFoundError(NeMoBaseException):
@@ -70,6 +70,21 @@ class CheckpointMisconfigurationError(NeMoBaseException):
 
 
 @dataclass
+class EarlyStoppingParams:
+    monitor: str = "val_loss"  # The metric that early stopping should consider.
+    mode: str = "min"  # inform early stopping whether to look for increase or decrease in monitor.
+    min_delta: float = 0.001  # smallest change to consider as improvement.
+    patience: int = 10  # how many (continuous) validation cycles to wait with no improvement and stopping training.
+    verbose: bool = True
+    strict: bool = True
+    check_finite: bool = True
+    stopping_threshold: Optional[float] = None
+    divergence_threshold: Optional[float] = None
+    check_on_train_epoch_end: Optional[bool] = None
+    log_rank_zero_only: bool = False
+
+
+@dataclass
 class CallbackParams:
     filepath: Optional[str] = None  # Deprecated
     dirpath: Optional[str] = None  # If None, exp_manager will attempt to handle the filepath
@@ -80,35 +95,17 @@ class CallbackParams:
     save_top_k: Optional[int] = 3
     save_weights_only: Optional[bool] = False
     mode: Optional[str] = "min"
+    auto_insert_metric_name: bool = True
     every_n_epochs: Optional[int] = 1
+    every_n_train_steps: Optional[int] = None
+    train_time_interval: Optional[str] = None
     prefix: Optional[str] = None  # If None, exp_manager will attempt to handle the filepath
     postfix: str = ".nemo"
     save_best_model: bool = False
     always_save_nemo: bool = False
     save_nemo_on_train_end: Optional[bool] = True  # Whether to automatically save .nemo file durin on_train_end hook
     model_parallel_size: Optional[int] = None  # tensor parallel size * pipeline parallel size
-
-
-@dataclass
-class MLFlowParams:
-    # name of experiment, if none, defaults to the globally set experiment name
-    experiment_name: Optional[str] = None
-    # no run_name because it's set by version
-    # local or remote tracking seerver. If tracking_uri is not set, it defaults to save_dir
-    tracking_uri: Optional[str] = None
-    tags: Optional[Dict[str, Any]] = None
-    save_dir: Optional[str] = "./mlruns"
-    prefix: str = ""
-    artifact_location: Optional[str] = None
-    # provide run_id if resuming a previously started run
-    run_id: Optional[str] = None
-
-
-@dataclass
-class DLLoggerParams:
-    verbose: Optional[bool] = False
-    stdout: Optional[bool] = False
-    json_file: Optional[str] = "./dllogger.json"
+    save_on_train_epoch_end: Optional[bool] = False  # Save after training, not after validation
 
 
 @dataclass
@@ -131,6 +128,9 @@ class EMAParams:
 
 @dataclass
 class ExpManagerConfig:
+    """Experiment Manager config for validation of passed arguments.
+    """
+
     # Log dir creation parameters
     explicit_log_dir: Optional[str] = None
     exp_dir: Optional[str] = None
@@ -140,31 +140,43 @@ class ExpManagerConfig:
     resume_if_exists: Optional[bool] = False
     resume_past_end: Optional[bool] = False
     resume_ignore_no_checkpoint: Optional[bool] = False
+    resume_from_checkpoint: Optional[str] = None
     # Logging parameters
     create_tensorboard_logger: Optional[bool] = True
     summary_writer_kwargs: Optional[Dict[Any, Any]] = None
     create_wandb_logger: Optional[bool] = False
     wandb_logger_kwargs: Optional[Dict[Any, Any]] = None
     create_mlflow_logger: Optional[bool] = False
-    mlflow_logger_kwargs: Optional[MLFlowParams] = MLFlowParams()
+    mlflow_logger_kwargs: Optional[MLFlowParams] = field(default_factory=lambda: MLFlowParams())
     create_dllogger_logger: Optional[bool] = False
-    dllogger_logger_kwargs: Optional[DLLoggerParams] = DLLoggerParams()
+    dllogger_logger_kwargs: Optional[DLLoggerParams] = field(default_factory=lambda: DLLoggerParams())
+    create_clearml_logger: Optional[bool] = False
+    clearml_logger_kwargs: Optional[ClearMLParams] = field(default_factory=lambda: ClearMLParams())
+    create_neptune_logger: Optional[bool] = False
+    neptune_logger_kwargs: Optional[Dict[Any, Any]] = None
     # Checkpointing parameters
     create_checkpoint_callback: Optional[bool] = True
-    checkpoint_callback_params: Optional[CallbackParams] = CallbackParams()
+    checkpoint_callback_params: Optional[CallbackParams] = field(default_factory=lambda: CallbackParams())
+    create_early_stopping_callback: Optional[bool] = False
+    early_stopping_callback_params: Optional[EarlyStoppingParams] = field(
+        default_factory=lambda: EarlyStoppingParams()
+    )
+    create_preemption_callback: Optional[bool] = True
     # Additional exp_manager arguments
     files_to_copy: Optional[List[str]] = None
     # logs timing of train/val/test steps
     log_step_timing: Optional[bool] = True
-    step_timing_kwargs: Optional[StepTimingParams] = StepTimingParams()
+    step_timing_kwargs: Optional[StepTimingParams] = field(default_factory=lambda: StepTimingParams())
     # Configures creation of log files for different ranks
     log_local_rank_0_only: Optional[bool] = False
     log_global_rank_0_only: Optional[bool] = False
     # disable initial validation when resuming from a checkpoint saved during validation
     disable_validation_on_resume: Optional[bool] = True
-    ema: Optional[EMAParams] = EMAParams()
+    ema: Optional[EMAParams] = field(default_factory=lambda: EMAParams())
     # Wall clock time limit
     max_time_per_run: Optional[str] = None
+    # time to sleep non 0 ranks during initialization
+    seconds_to_sleep: float = 5
 
 
 class TimingCallback(Callback):
@@ -180,11 +192,26 @@ class TimingCallback(Callback):
         if self.timer.buffer_size <= 0:
             self.timer.reset(name)
 
+        if self.timer.is_active(name):
+            logging.warning(
+                f"Timer `{name}` was not correctly stopped, suggesting a "
+                "possible issue. The timer will be reset for now."
+            )
+            self.timer.reset(name)
+
         self.timer.start(name)
 
     def _on_batch_end(self, name, pl_module):
         self.timer.stop(name)
-        pl_module.log(name, self.timer[name], on_step=True, on_epoch=False)
+        # Set the `batch_size=1` as WAR for `dataloader_iter`, which is not used for any metric
+        pl_module.log(
+            name + ' in s',
+            self.timer[name],
+            on_step=True,
+            on_epoch=False,
+            batch_size=1,
+            prog_bar=(name == "train_step_timing"),
+        )
 
     def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
         self._on_batch_start("train_step_timing")
@@ -192,16 +219,16 @@ class TimingCallback(Callback):
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         self._on_batch_end("train_step_timing", pl_module)
 
-    def on_validation_batch_start(self, trainer, pl_module, batch, batch_idx, dataloader_idx):
+    def on_validation_batch_start(self, trainer, pl_module, batch, batch_idx, dataloader_idx=0):
         self._on_batch_start("validation_step_timing")
 
-    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx):
+    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
         self._on_batch_end("validation_step_timing", pl_module)
 
-    def on_test_batch_start(self, trainer, pl_module, batch, batch_idx, dataloader_idx):
+    def on_test_batch_start(self, trainer, pl_module, batch, batch_idx, dataloader_idx=0):
         self._on_batch_start("test_step_timing")
 
-    def on_test_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx):
+    def on_test_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
         self._on_batch_end("test_step_timing", pl_module)
 
     def on_before_backward(self, trainer, pl_module, loss):
@@ -219,7 +246,8 @@ def exp_manager(trainer: 'pytorch_lightning.Trainer', cfg: Optional[Union[DictCo
     directory. exp_manager also allows for explicit folder creation via explicit_log_dir.
 
     The version can be a datetime string or an integer. Datestime version can be disabled if use_datetime_version is set
-     to False. It optionally creates TensorBoardLogger, WandBLogger, DLLogger, MLFlowLogger, ModelCheckpoint objects from pytorch lightning.
+    to False. It optionally creates TensorBoardLogger, WandBLogger, DLLogger, MLFlowLogger, ClearMLLogger,
+    ModelCheckpoint objects from pytorch lightning.
     It copies sys.argv, and git information if available to the logging directory. It creates a log file for each
     process to log their output into.
 
@@ -242,7 +270,7 @@ def exp_manager(trainer: 'pytorch_lightning.Trainer', cfg: Optional[Union[DictCo
                 lightning's TensorboardLogger system of using version_{int}.
             - use_datetime_version (bool): Whether to use a datetime string for version. Defaults to True.
             - resume_if_exists (bool): Whether this experiment is resuming from a previous run. If True, it sets
-                trainer._checkpoint_connector.resume_from_checkpoint_fit_path so that the trainer should auto-resume. exp_manager will move files
+                trainer._checkpoint_connector._ckpt_path so that the trainer should auto-resume. exp_manager will move files
                 under log_dir to log_dir/run_{int}. Defaults to False. From v1.0.0, when resume_if_exists is True,
                 we would not create version folders to make it easier to find the log folder for next runs.
             - resume_past_end (bool): exp_manager errors out if resume_if_exists is True and a checkpoint matching
@@ -251,6 +279,8 @@ def exp_manager(trainer: 'pytorch_lightning.Trainer', cfg: Optional[Union[DictCo
             - resume_ignore_no_checkpoint (bool): exp_manager errors out if resume_if_exists is True and no checkpoint
                 could be found. This behaviour can be disabled, in which case exp_manager will print a message and
                 continue without restoring, by setting resume_ignore_no_checkpoint to True. Defaults to False.
+            - resume_from_checkpoint (str): Can be used to specify a path to a specific checkpoint file to load from. This will
+                override any checkpoint found when resume_if_exists is True. Defaults to None.
             - create_tensorboard_logger (bool): Whether to create a tensorboard logger and attach it to the pytorch
                 lightning trainer. Defaults to True.
             - summary_writer_kwargs (dict): A dictionary of kwargs that can be passed to lightning's TensorboardLogger
@@ -266,10 +296,17 @@ def exp_manager(trainer: 'pytorch_lightning.Trainer', cfg: Optional[Union[DictCo
             - create_dllogger_logger (bool): Whether to create an DLLogger logger and attach it to the pytorch lightning
                 training. Defaults to False
             - dllogger_logger_kwargs (dict): optional parameters for the DLLogger logger
+            - create_clearml_logger (bool): Whether to create an ClearML logger and attach it to the pytorch lightning
+                training. Defaults to False
+            - clearml_logger_kwargs (dict): optional parameters for the ClearML logger
             - create_checkpoint_callback (bool): Whether to create a ModelCheckpoint callback and attach it to the
                 pytorch lightning trainer. The ModelCheckpoint saves the top 3 models with the best "val_loss", the most
                 recent checkpoint under ``*last.ckpt``, and the final checkpoint after training completes under ``*end.ckpt``.
                 Defaults to True.
+            - create_early_stopping_callback (bool): Flag to decide if early stopping should be used to stop training. Default is False.
+             See EarlyStoppingParams dataclass above.
+            - create_preemption_callback (bool): Flag to decide whether to enable preemption callback to save checkpoints and exit training
+             immediately upon preemption. Default is True.
             - files_to_copy (list): A list of files to copy to the experiment logging directory. Defaults to None which
                 copies no files.
             - log_local_rank_0_only (bool): Whether to only create log files for local rank 0. Defaults to False.
@@ -278,6 +315,7 @@ def exp_manager(trainer: 'pytorch_lightning.Trainer', cfg: Optional[Union[DictCo
                 Set this to True if you are using DDP with many GPUs and do not want many log files in your exp dir.
             - max_time (str): The maximum wall clock time *per run*. This is intended to be used on clusters where you want 
                 a checkpoint to be saved after this specified time and be able to resume from that checkpoint. Defaults to None.
+            - seconds_to_sleep (float): seconds to sleep non rank 0 processes for. Used to give enough time for rank 0 to initialize
 
     returns:
         log_dir (Path): The final logging directory where logging files are saved. Usually the concatenation of
@@ -317,18 +355,15 @@ def exp_manager(trainer: 'pytorch_lightning.Trainer', cfg: Optional[Union[DictCo
         resume_if_exists=cfg.resume_if_exists,
     )
 
-    if cfg.resume_if_exists:
-        # Check for existing checkpoints in `dirpath` if it's specified, use <log_dir>/checkpoints otherwise
-        if cfg.checkpoint_callback_params.dirpath:
-            check_resume(
-                trainer,
-                log_dir,
-                cfg.resume_past_end,
-                cfg.resume_ignore_no_checkpoint,
-                cfg.checkpoint_callback_params.dirpath,
-            )
-        else:
-            check_resume(trainer, log_dir, cfg.resume_past_end, cfg.resume_ignore_no_checkpoint)
+    check_resume(
+        trainer,
+        log_dir,
+        cfg.resume_if_exists,
+        cfg.resume_past_end,
+        cfg.resume_ignore_no_checkpoint,
+        cfg.checkpoint_callback_params.dirpath,
+        cfg.resume_from_checkpoint,
+    )
 
     checkpoint_name = name
     # If name returned from get_log_dir is "", use cfg.name for checkpointing
@@ -388,12 +423,16 @@ def exp_manager(trainer: 'pytorch_lightning.Trainer', cfg: Optional[Union[DictCo
         or cfg.create_wandb_logger
         or cfg.create_mlflow_logger
         or cfg.create_dllogger_logger
+        or cfg.create_clearml_logger
+        or cfg.create_neptune_logger
     ):
         configure_loggers(
             trainer,
             exp_dir,
+            log_dir,
             cfg.name,
             cfg.version,
+            cfg.checkpoint_callback_params,
             cfg.create_tensorboard_logger,
             cfg.summary_writer_kwargs,
             cfg.create_wandb_logger,
@@ -402,6 +441,10 @@ def exp_manager(trainer: 'pytorch_lightning.Trainer', cfg: Optional[Union[DictCo
             cfg.mlflow_logger_kwargs,
             cfg.create_dllogger_logger,
             cfg.dllogger_logger_kwargs,
+            cfg.create_clearml_logger,
+            cfg.clearml_logger_kwargs,
+            cfg.create_neptune_logger,
+            cfg.neptune_logger_kwargs,
         )
 
     # add loggers timing callbacks
@@ -418,15 +461,23 @@ def exp_manager(trainer: 'pytorch_lightning.Trainer', cfg: Optional[Union[DictCo
         )
         trainer.callbacks.append(ema_callback)
 
+    if cfg.create_early_stopping_callback:
+        early_stop_callback = EarlyStopping(**cfg.early_stopping_callback_params)
+        trainer.callbacks.append(early_stop_callback)
+
     if cfg.create_checkpoint_callback:
         configure_checkpointing(
-            trainer, log_dir, checkpoint_name, cfg.resume_if_exists, cfg.checkpoint_callback_params
+            trainer,
+            log_dir,
+            checkpoint_name,
+            cfg.resume_if_exists,
+            cfg.checkpoint_callback_params,
+            cfg.create_preemption_callback,
         )
 
     if cfg.disable_validation_on_resume:
         # extend training loop to skip initial validation when resuming from checkpoint
         configure_no_restart_validation_training_loop(trainer)
-
     # Setup a stateless timer for use on clusters.
     if cfg.max_time_per_run is not None:
         found_ptl_timer = False
@@ -468,6 +519,13 @@ def exp_manager(trainer: 'pytorch_lightning.Trainer', cfg: Optional[Union[DictCo
         # Add lightning file logging to global_rank zero
         add_filehandlers_to_pl_logger(log_dir / 'lightning_logs.txt', log_dir / 'nemo_error_log.txt')
 
+    elif trainer.num_nodes * trainer.num_devices > 1:
+        # sleep other ranks so rank 0 can finish
+        # doing the initialization such as moving files
+        time.sleep(cfg.seconds_to_sleep)
+
+    add_handlers_to_mcore_logger()
+
     return log_dir
 
 
@@ -506,15 +564,29 @@ def error_checks(trainer: 'pytorch_lightning.Trainer', cfg: Optional[Union[DictC
         )
 
 
+def _filter_out_unfinished_checkpoints(checkpoint_paths: Collection[Union[Path, str]]) -> Collection[Union[Path, str]]:
+    res = []
+    for chkpt_path in checkpoint_paths:
+        if NeMoModelCheckpoint.is_checkpoint_unfinished(chkpt_path):
+            logging.warning(
+                f'Checkpoint {chkpt_path} has the unfinished marker set - skipped while looking for the last one.'
+            )
+        else:
+            res.append(chkpt_path)
+    return res
+
+
 def check_resume(
     trainer: 'pytorch_lightning.Trainer',
     log_dir: str,
+    resume_if_exists: bool = False,
     resume_past_end: bool = False,
     resume_ignore_no_checkpoint: bool = False,
     dirpath: str = None,
+    resume_from_checkpoint: str = None,
 ):
     """Checks that resume=True was used correctly with the arguments pass to exp_manager. Sets
-    trainer._checkpoint_connector.resume_from_checkpoint_fit_path as necessary.
+    trainer._checkpoint_connector._ckpt_path as necessary.
 
     Returns:
         log_dir (Path): The log_dir
@@ -530,56 +602,68 @@ def check_resume(
     if not log_dir:
         raise ValueError(f"Resuming requires the log_dir {log_dir} to be passed to exp_manager")
 
-    # Use <log_dir>/checkpoints/ unless `dirpath` is set
-    checkpoint_dir = Path(dirpath) if dirpath else Path(Path(log_dir) / "checkpoints")
-
     checkpoint = None
-    end_checkpoints = list(checkpoint_dir.rglob("*end.ckpt"))
-    last_checkpoints = list(checkpoint_dir.rglob("*last.ckpt"))
-    if not checkpoint_dir.exists():
-        if resume_ignore_no_checkpoint:
-            logging.warning(
-                f"There was no checkpoint folder at checkpoint_dir :{checkpoint_dir}. Training from scratch."
-            )
-            return
-        else:
-            raise NotFoundError(f"There was no checkpoint folder at checkpoint_dir :{checkpoint_dir}. Cannot resume.")
-    elif len(end_checkpoints) > 0:
-        if resume_past_end:
-            if len(end_checkpoints) > 1:
-                if 'mp_rank' in str(end_checkpoints[0]):
-                    checkpoint = end_checkpoints[0]
-                else:
-                    raise ValueError(f"Multiple checkpoints {end_checkpoints} that matches *end.ckpt.")
-            logging.info(f"Resuming from {end_checkpoints[0]}")
-        else:
-            raise ValueError(
-                f"Found {end_checkpoints[0]} indicating that the last training run has already completed."
-            )
-    elif not len(last_checkpoints) > 0:
-        if resume_ignore_no_checkpoint:
-            logging.warning(f"There were no checkpoints found in {checkpoint_dir}. Training from scratch.")
-            return
-        else:
-            raise NotFoundError(f"There were no checkpoints found in {checkpoint_dir}. Cannot resume.")
-    elif len(last_checkpoints) > 1:
-        if 'mp_rank' in str(last_checkpoints[0]) or 'tp_rank' in str(last_checkpoints[0]):
-            checkpoint = last_checkpoints[0]
-            checkpoint = uninject_model_parallel_rank(checkpoint)
-        else:
-            raise ValueError(f"Multiple checkpoints {last_checkpoints} that matches *last.ckpt.")
-    else:
-        logging.info(f"Resuming from {last_checkpoints[0]}")
-        checkpoint = last_checkpoints[0]
+    if resume_from_checkpoint:
+        checkpoint = resume_from_checkpoint
+    if resume_if_exists:
+        # Use <log_dir>/checkpoints/ unless `dirpath` is set
+        checkpoint_dir = Path(dirpath) if dirpath else Path(Path(log_dir) / "checkpoints")
 
-    trainer._checkpoint_connector.resume_from_checkpoint_fit_path = str(checkpoint)
+        # when using distributed checkpointing, checkpoint_dir is a directory of directories
+        # we check for this here
+        dist_checkpoints = [d for d in list(checkpoint_dir.glob("*")) if d.is_dir()]
+        end_dist_checkpoints = [d for d in dist_checkpoints if d.match("*end")]
+        last_dist_checkpoints = [d for d in dist_checkpoints if d.match("*last")]
+
+        end_checkpoints = end_dist_checkpoints if end_dist_checkpoints else list(checkpoint_dir.rglob("*end.ckpt"))
+        end_checkpoints = _filter_out_unfinished_checkpoints(end_checkpoints)
+        last_checkpoints = last_dist_checkpoints if last_dist_checkpoints else list(checkpoint_dir.rglob("*last.ckpt"))
+        last_checkpoints = _filter_out_unfinished_checkpoints(last_checkpoints)
+
+        if not checkpoint_dir.exists() or (not len(end_checkpoints) > 0 and not len(last_checkpoints) > 0):
+            if resume_ignore_no_checkpoint:
+                warn = f"There were no checkpoints found in checkpoint_dir or no checkpoint folder at checkpoint_dir :{checkpoint_dir}. "
+                if checkpoint is None:
+                    warn += "Training from scratch."
+                elif checkpoint == resume_from_checkpoint:
+                    warn += f"Training from {resume_from_checkpoint}."
+                logging.warning(warn)
+            else:
+                raise NotFoundError(
+                    f"There were no checkpoints found in checkpoint_dir or no checkpoint folder at checkpoint_dir :{checkpoint_dir}. Cannot resume."
+                )
+        elif len(end_checkpoints) > 0:
+            if resume_past_end:
+                if len(end_checkpoints) > 1:
+                    if 'mp_rank' in str(end_checkpoints[0]):
+                        checkpoint = end_checkpoints[0]
+                    else:
+                        raise ValueError(f"Multiple checkpoints {end_checkpoints} that matches *end.ckpt.")
+            else:
+                raise ValueError(
+                    f"Found {end_checkpoints[0]} indicating that the last training run has already completed."
+                )
+        elif len(last_checkpoints) > 1:
+            if any([s for s in ['mp_rank', 'tp_rank', 'fsdp_shard'] if s in str(last_checkpoints[0])]):
+                checkpoint = last_checkpoints[0]
+                checkpoint = uninject_model_parallel_rank(checkpoint)
+            else:
+                raise ValueError(f"Multiple checkpoints {last_checkpoints} that matches *last.ckpt.")
+        else:
+            checkpoint = last_checkpoints[0]
+
+    # PTL 2.0 supports ckpt_path instead of resume_from_checkpoint as the trainer flag
+    if checkpoint is not None:
+        trainer.ckpt_path = str(checkpoint)
+        logging.info(f'Resuming training from checkpoint: {trainer.ckpt_path}')
 
     if is_global_rank_zero():
         # Check to see if any files exist that need to be moved
         files_to_move = []
-        for child in Path(log_dir).iterdir():
-            if child.is_file():
-                files_to_move.append(child)
+        if Path(log_dir).exists():
+            for child in Path(log_dir).iterdir():
+                if child.is_file():
+                    files_to_move.append(child)
 
         if len(files_to_move) > 0:
             # Move old files to a new folder
@@ -736,8 +820,10 @@ def get_git_diff():
 def configure_loggers(
     trainer: 'pytorch_lightning.Trainer',
     exp_dir: [Path, str],
+    log_dir: [Path, str],
     name: str,
     version: str,
+    checkpoint_callback_params: dict,
     create_tensorboard_logger: bool,
     summary_writer_kwargs: dict,
     create_wandb_logger: bool,
@@ -746,9 +832,13 @@ def configure_loggers(
     mlflow_kwargs: dict,
     create_dllogger_logger: bool,
     dllogger_kwargs: dict,
+    create_clearml_logger: bool,
+    clearml_kwargs: dict,
+    create_neptune_logger: bool,
+    neptune_kwargs: dict,
 ):
     """
-    Creates TensorboardLogger and/or WandBLogger / MLFlowLogger / DLlogger and attach them to trainer.
+    Creates TensorboardLogger and/or WandBLogger / MLFlowLogger / DLlogger / ClearMLLogger and attach them to trainer.
     Raises ValueError if summary_writer_kwargs or wandb_kwargs are misconfigured.
     """
     # Potentially create tensorboard logger and/or WandBLogger / MLFlowLogger / DLLogger
@@ -792,210 +882,41 @@ def configure_loggers(
         logger_list.append(dllogger_logger)
         logging.info("DLLogger has been set up")
 
+    if create_clearml_logger:
+        clearml_logger = ClearMLLogger(
+            clearml_cfg=clearml_kwargs,
+            log_dir=log_dir,
+            prefix=name,
+            save_best_model=checkpoint_callback_params.save_best_model,
+        )
+
+        logger_list.append(clearml_logger)
+        logging.info("ClearMLLogger has been set up")
+
+    if create_neptune_logger:
+        if neptune_kwargs is None:
+            neptune_kwargs = {}
+        if "name" not in neptune_kwargs and "project" not in neptune_kwargs:
+            raise ValueError("name and project are required for neptune_logger")
+        if "api_key" not in neptune_kwargs and not os.getenv("NEPTUNE_API_TOKEN", None):
+            raise ValueError(
+                "either api_key should be set in neptune_kwargs or NEPTUNE_API_TOKEN should be set in environment variable for neptune_logger"
+            )
+        neptune_logger = NeptuneLogger(**neptune_kwargs)
+
+        logger_list.append(neptune_logger)
+        logging.info("NeptuneLogger has been set up")
+
     trainer._logger_connector.configure_logger(logger_list)
 
 
-class NeMoModelCheckpoint(ModelCheckpoint):
-    """ Light wrapper around Lightning's ModelCheckpoint to force a saved checkpoint on train_end
-    """
-
-    def __init__(
-        self,
-        always_save_nemo: bool = False,
-        save_nemo_on_train_end: bool = True,
-        save_best_model: bool = False,
-        postfix: str = ".nemo",
-        n_resume: bool = False,
-        model_parallel_size: int = None,
-        **kwargs,
-    ):
-        # Parse and store "extended" parameters: save_best model and postfix.
-        self.always_save_nemo = always_save_nemo
-        self.save_nemo_on_train_end = save_nemo_on_train_end
-        self.save_best_model = save_best_model
-        if self.save_best_model and not self.save_nemo_on_train_end:
-            logging.warning(
-                (
-                    "Found save_best_model is True and save_nemo_on_train_end is False. "
-                    "Set save_nemo_on_train_end to True to automatically save the best model."
-                )
-            )
-        self.postfix = postfix
-        self.previous_best_path = ""
-        self.model_parallel_size = model_parallel_size
-
-        # `prefix` is deprecated
-        if 'prefix' in kwargs:
-            self.prefix = kwargs.pop('prefix')
-        else:
-            self.prefix = ""
-
-        # Call the parent class constructor with the remaining kwargs.
-        super().__init__(**kwargs)
-
-        if self.save_top_k != -1 and n_resume:
-            logging.debug("Checking previous runs")
-            self.nemo_topk_check_previous_run()
-
-    def nemo_topk_check_previous_run(self):
-        try:
-            self.best_k_models
-            self.kth_best_model_path
-            self.best_model_score
-            self.best_model_path
-        except AttributeError:
-            raise AttributeError("Lightning's ModelCheckpoint was updated. NeMoModelCheckpoint will need an update.")
-        self.best_k_models = {}
-        self.kth_best_model_path = ""
-        self.best_model_score = None
-        self.best_model_path = ""
-
-        checkpoints = list(Path(self.dirpath).rglob("*.ckpt"))
-        for checkpoint in checkpoints:
-            if 'mp_rank' in str(checkpoint) or 'tp_rank' in str(checkpoint):
-                checkpoint = uninject_model_parallel_rank(checkpoint)
-            checkpoint = str(checkpoint)
-            if checkpoint[-10:] == '-last.ckpt':
-                continue
-            index = checkpoint.find(self.monitor) + len(self.monitor) + 1  # Find monitor in str + 1 for '='
-            if index != -1:
-                match = re.search('[A-z]', checkpoint[index:])
-                if match:
-                    value = checkpoint[index : index + match.start() - 1]  # -1 due to separator hypen
-                    self.best_k_models[checkpoint] = float(value)
-        if len(self.best_k_models) < 1:
-            return  # No saved checkpoints yet
-
-        _reverse = False if self.mode == "min" else True
-
-        best_k_models = sorted(self.best_k_models, key=self.best_k_models.get, reverse=_reverse)
-
-        ### This section should be ok as rank zero will delete all excess checkpoints, since all other ranks are
-        ### instantiated after rank zero. models_to_delete should be 0 for all other ranks.
-        if self.model_parallel_size is not None:
-            models_to_delete = len(best_k_models) - self.model_parallel_size * self.save_top_k
-        else:
-            models_to_delete = len(best_k_models) - self.save_top_k
-        logging.debug(f'Number of models to delete: {models_to_delete}')
-        for _ in range(models_to_delete):
-            model = best_k_models.pop(-1)
-            self.best_k_models.pop(model)
-            self._del_model_without_trainer(model)
-            logging.debug(f"Removed checkpoint: {model}")
-
-        self.kth_best_model_path = best_k_models[-1]
-        self.best_model_path = best_k_models[0]
-        self.best_model_score = self.best_k_models[self.best_model_path]
-
-    def on_save_checkpoint(self, trainer, pl_module, checkpoint):
-        # output = None
-        output = super().on_save_checkpoint(trainer, pl_module, checkpoint)
-        if not self.always_save_nemo:
-            return output
-        else:
-            # Load the best model and then re-save it
-            app_state = AppState()
-            if app_state.model_parallel_size is not None and app_state.model_parallel_size > 1:
-                raise ValueError(f'always_save_nemo is not implemented for model parallel models.')
-            # since we are creating tarfile artifacts we need to update .nemo path
-            app_state.model_restore_path = os.path.abspath(
-                os.path.expanduser(os.path.join(self.dirpath, self.prefix + self.postfix))
-            )
-            if self.save_best_model:
-                if not os.path.exists(self.best_model_path):
-                    return output
-
-                if self.best_model_path == self.previous_best_path:
-                    return output
-
-                self.previous_model_path = self.best_model_path
-                old_state_dict = deepcopy(pl_module.state_dict())
-                checkpoint = torch.load(self.best_model_path, map_location='cpu')
-                if 'state_dict' in checkpoint:
-                    checkpoint = checkpoint['state_dict']
-                # get a new instanace of the model
-                pl_module.load_state_dict(checkpoint, strict=True)
-                pl_module.save_to(save_path=app_state.model_restore_path)
-                pl_module.load_state_dict(old_state_dict, strict=True)
-            else:
-                pl_module.save_to(save_path=app_state.model_restore_path)
-            return output
-
-    def on_train_end(self, trainer, pl_module):
-        if trainer.fast_dev_run:
-            return None
-
-        # check if we need to save a last checkpoint manually as validation isn't always run based on the interval
-        if self.save_last and trainer.val_check_interval != 0:
-            should_save_last_checkpoint = False
-            if isinstance(trainer.val_check_interval, float) and trainer.val_check_interval % trainer.global_step != 0:
-                should_save_last_checkpoint = True
-            if isinstance(trainer.val_check_interval, int) and trainer.global_step % trainer.val_check_interval != 0:
-                should_save_last_checkpoint = True
-            if should_save_last_checkpoint:
-                monitor_candidates = self._monitor_candidates(trainer)
-                super()._save_last_checkpoint(trainer, monitor_candidates)
-        # Call parent on_train_end() to save the -last checkpoint
-        super().on_train_end(trainer, pl_module)
-
-        # Load the best model and then re-save it
-        if self.save_best_model:
-            # wait for all processes
-            trainer.strategy.barrier("SaveBestCheckpointConnector.resume_end")
-            if self.best_model_path == "":
-                logging.warning(
-                    f"{self} was told to save the best checkpoint at the end of training, but no saved checkpoints "
-                    "were found. Saving latest model instead."
-                )
-            else:
-                self.best_model_path = trainer.strategy.broadcast(self.best_model_path)
-                trainer._checkpoint_connector.restore(self.best_model_path)
-
-        if self.save_nemo_on_train_end:
-            pl_module.save_to(save_path=os.path.join(self.dirpath, self.prefix + self.postfix))
-
-    def _del_model_without_trainer(self, filepath: str) -> None:
-        app_state = AppState()
-        if app_state.model_parallel_size is not None and app_state.model_parallel_size > 1:
-            # filepath needs to be updated to include mp_rank
-            filepath = inject_model_parallel_rank(filepath)
-
-        # each model parallel rank needs to remove its model
-        if is_global_rank_zero() or (app_state.model_parallel_size is not None and app_state.data_parallel_rank == 0):
-            try:
-                self._fs.rm(filepath)
-                logging.info(f"Removed checkpoint: {filepath}")
-            except:
-                logging.info(f"Tried to remove checkpoint: {filepath} but failed.")
-
-    def _ema_callback(self, trainer: 'pytorch_lightning.Trainer') -> Optional[EMA]:
-        ema_callback = None
-        for callback in trainer.callbacks:
-            if isinstance(callback, EMA):
-                ema_callback = callback
-        return ema_callback
-
-    def _save_checkpoint(self, trainer: 'pytorch_lightning.Trainer', filepath: str) -> None:
-        ema_callback = self._ema_callback(trainer)
-        if ema_callback is not None:
-            with ema_callback.save_original_optimizer_state(trainer):
-                super()._save_checkpoint(trainer, filepath)
-
-            # save EMA copy of the model as well.
-            with ema_callback.save_ema_model(trainer):
-                filepath = self._ema_format_filepath(filepath)
-                if self.verbose:
-                    rank_zero_info(f"Saving EMA weights to separate checkpoint {filepath}")
-                super()._save_checkpoint(trainer, filepath)
-        else:
-            super()._save_checkpoint(trainer, filepath)
-
-    def _ema_format_filepath(self, filepath: str) -> str:
-        return filepath.replace(self.FILE_EXTENSION, f'-EMA{self.FILE_EXTENSION}')
-
-
 def configure_checkpointing(
-    trainer: 'pytorch_lightning.Trainer', log_dir: Path, name: str, resume: bool, params: 'DictConfig',
+    trainer: 'pytorch_lightning.Trainer',
+    log_dir: Path,
+    name: str,
+    resume: bool,
+    params: 'DictConfig',
+    create_preemption_callback: bool,
 ):
     """ Adds ModelCheckpoint to trainer. Raises CheckpointMisconfigurationError if trainer already has a ModelCheckpoint
     callback
@@ -1041,7 +962,7 @@ def configure_checkpointing(
                 f"). It is very likely this run will fail with ModelCheckpoint(monitor='{params.monitor}') not found "
                 "in the returned metrics. Please ensure that validation is run within trainer.max_epochs."
             )
-        elif trainer.max_steps is not None:
+        elif trainer.max_steps is not None and trainer.max_steps != -1:
             logging.warning(
                 "The checkpoint callback was told to monitor a validation value and trainer's max_steps was set to "
                 f"{trainer.max_steps}. Please ensure that max_steps will run for at least "
@@ -1049,10 +970,19 @@ def configure_checkpointing(
             )
 
     checkpoint_callback = NeMoModelCheckpoint(n_resume=resume, **params)
-    checkpoint_callback.last_model_path = trainer._checkpoint_connector.resume_from_checkpoint_fit_path or ""
+    checkpoint_callback.last_model_path = trainer.ckpt_path or ""
     if 'mp_rank' in checkpoint_callback.last_model_path or 'tp_rank' in checkpoint_callback.last_model_path:
         checkpoint_callback.last_model_path = uninject_model_parallel_rank(checkpoint_callback.last_model_path)
     trainer.callbacks.append(checkpoint_callback)
+    if create_preemption_callback:
+        # Check if cuda is avialable as preemption is supported only on GPUs
+        if torch.cuda.is_available():
+            ## By default PreemptionCallback handles SIGTERM. To handle other signals pass the signal in the call as below:
+            ## PreemptionCallback(checkpoint_callback, signal.SIGCHLD)
+            preemption_callback = PreemptionCallback(checkpoint_callback)
+            trainer.callbacks.append(preemption_callback)
+        else:
+            logging.info("Preemption is supported only on GPUs, disabling preemption")
 
 
 def check_slurm(trainer):
@@ -1075,17 +1005,29 @@ class StatelessTimer(Timer):
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
         return
 
+    def _check_time_remaining(self, trainer: "pl.Trainer") -> None:
+        super()._check_time_remaining(trainer)
+        if trainer.should_stop:
+            checkpoint_callback: Optional[NeMoModelCheckpoint] = trainer.checkpoint_callback
+            if checkpoint_callback:
+                monitor_candidates = checkpoint_callback._monitor_candidates(trainer)
+                checkpoint_callback._save_last_checkpoint(trainer, monitor_candidates)
+            # Throw this exception to signal to Lightning to terminate gracefully.
+            from pytorch_lightning.utilities.exceptions import _TunerExitException
+
+            raise _TunerExitException()
+
 
 def configure_no_restart_validation_training_loop(trainer: pytorch_lightning.Trainer) -> None:
-    if type(trainer.fit_loop.epoch_loop) != TrainingEpochLoop:
+    if type(trainer.fit_loop.epoch_loop) != _TrainingEpochLoop:
         warnings.warn("Detected custom epoch loop. Skipping no validation on restart support.", UserWarning)
         return
-    loop = SkipResumeTrainingValidationLoop(trainer.min_steps, trainer.max_steps)
-    loop.trainer = trainer
+    ## Pass trainer object to avoid trainer getting overwritten as None
+    loop = SkipResumeTrainingValidationLoop(trainer, trainer.min_steps, trainer.max_steps)
     trainer.fit_loop.epoch_loop = loop
 
 
-class SkipResumeTrainingValidationLoop(TrainingEpochLoop):
+class SkipResumeTrainingValidationLoop(_TrainingEpochLoop):
     """
     Extend the PTL Epoch loop to skip validating when resuming.
     This happens when resuming a checkpoint that has already run validation, but loading restores

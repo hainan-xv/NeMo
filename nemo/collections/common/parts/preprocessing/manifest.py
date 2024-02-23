@@ -14,12 +14,13 @@
 
 import json
 import os
+import re
 from os.path import expanduser
-from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Union
 
 from nemo.utils import logging
 from nemo.utils.data_utils import DataStoreObject, datastore_path_to_local_path, is_datastore_path
+from nemo.utils.nemo_logging import LogMode
 
 
 class ManifestBase:
@@ -92,16 +93,26 @@ def __parse_item(line: str, manifest_file: str) -> Dict[str, Any]:
         item['audio_file'] = item.pop('audio_filename')
     elif 'audio_filepath' in item:
         item['audio_file'] = item.pop('audio_filepath')
-    elif 'audio_file' not in item:
+
+    # Video File
+    if 'video_filename' in item:
+        item['video_file'] = item.pop('video_filename')
+    elif 'video_filepath' in item:
+        item['video_file'] = item.pop('video_filepath')
+
+    if 'video_file' not in item and 'audio_file' not in item:
         raise ValueError(
-            f"Manifest file {manifest_file} has invalid json line structure: {line} without proper audio file key."
+            f"Manifest file {manifest_file} has invalid json line structure: {line} without proper audio/video file key."
         )
 
-    # If the audio path is a relative path and does not exist,
+    # If the audio/video path is a relative path and does not exist,
     # try to attach the parent directory of manifest to the audio path.
     # Revert to the original path if the new path still doesn't exist.
     # Assume that the audio path is like "wavs/xxxxxx.wav".
-    item['audio_file'] = get_full_path(audio_file=item['audio_file'], manifest_file=manifest_file)
+    if 'audio_file' in item:
+        item['audio_file'] = get_full_path(audio_file=item['audio_file'], manifest_file=manifest_file)
+    if 'video_file' in item:
+        item['video_file'] = get_full_path(audio_file=item['video_file'], manifest_file=manifest_file)
 
     # Duration.
     if 'duration' not in item:
@@ -145,7 +156,8 @@ def __parse_item(line: str, manifest_file: str) -> Dict[str, Any]:
         item['feature_file'] = get_full_path(audio_file=item['feature_file'], manifest_file=manifest_file)
 
     item = dict(
-        audio_file=item['audio_file'],
+        audio_file=item.get('audio_file', None),
+        video_file=item.get('video_file', None),
         duration=item['duration'],
         text=item['text'],
         rttm_file=item['rttm_file'],
@@ -159,7 +171,25 @@ def __parse_item(line: str, manifest_file: str) -> Dict[str, Any]:
     return item
 
 
-def get_full_path(audio_file: str, manifest_file: str, audio_file_len_limit: int = 255) -> str:
+def is_tarred_dataset(audio_file: str, manifest_file: Optional[str] = None) -> bool:
+    if "/" in audio_file or manifest_file is None:
+        # audio files in a tarred dataset don't have `/` in their paths
+        return False
+    if os.path.basename(manifest_file) == "tarred_audio_manifest.json":
+        # the manifest file is a tarred manifest
+        return True
+    if "/sharded_manifests/" in manifest_file and re.match(r'^manifest_(\d+)\.json$', os.path.basename(manifest_file)):
+        # the manifest file is a sharded manifest
+        return True
+    return False
+
+
+def get_full_path(
+    audio_file: Union[str, List[str]],
+    manifest_file: Optional[str] = None,
+    data_dir: Optional[str] = None,
+    audio_file_len_limit: int = 255,
+) -> Union[str, List[str]]:
     """Get full path to audio_file.
 
     If the audio_file is a relative path and does not exist,
@@ -169,35 +199,65 @@ def get_full_path(audio_file: str, manifest_file: str, audio_file_len_limit: int
 
     Args:
         audio_file: path to an audio file, either absolute or assumed relative
-                    to the manifest directory
+                    to the manifest directory or data directory.
+                    Alternatively, a list of paths may be provided.
         manifest_file: path to a manifest file
+        data_dir: path to a directory containing data, use only if a manifest file is not provided
         audio_file_len_limit: limit for length of audio_file when using relative paths
 
     Returns:
-        Full path to audio_file.
+        Full path to audio_file or a list of paths.
     """
-    audio_file = Path(audio_file)
+    if isinstance(audio_file, list):
+        # If input is a list, return a list of full paths
+        return [
+            get_full_path(
+                audio_file=a_file,
+                manifest_file=manifest_file,
+                data_dir=data_dir,
+                audio_file_len_limit=audio_file_len_limit,
+            )
+            for a_file in audio_file
+        ]
+    elif isinstance(audio_file, str):
+        # If input is a string, get the corresponding full path
+        if is_tarred_dataset(audio_file=audio_file, manifest_file=manifest_file):
+            logging.warning(
+                f"Manifest file `{manifest_file}` seems to be part of a tarred dataset, skip checking for relative paths. If this is not intended, please avoid having `/sharded_manifests/` and `tarred_audio_manifest.json` in manifest_filepath.",
+                mode=LogMode.ONCE,
+            )
+            return audio_file
+        if (
+            (len(audio_file) < audio_file_len_limit)
+            and not os.path.isabs(audio_file)
+            and not os.path.isfile(audio_file)
+        ):
+            # If audio_file is not available and the path is not absolute, the full path is assumed
+            # to be relative to the manifest file parent directory or data directory.
+            if manifest_file is None and data_dir is None:
+                raise ValueError(f'Use either manifest_file or data_dir to specify the data directory.')
+            elif manifest_file is not None and data_dir is not None:
+                raise ValueError(
+                    f'Parameters manifest_file and data_dir cannot be used simultaneously. Currently manifest_file is {manifest_file} and data_dir is {data_dir}.'
+                )
 
-    if is_datastore_path(manifest_file):
-        # WORKAROUND: pathlib does not support URIs, so use os.path
-        manifest_dir = os.path.dirname(manifest_file)
-    else:
-        manifest_dir = Path(manifest_file).parent.as_posix()
+            # resolve the data directory
+            if data_dir is None:
+                data_dir = os.path.dirname(manifest_file)
 
-    if (len(str(audio_file)) < audio_file_len_limit) and not audio_file.is_file() and not audio_file.is_absolute():
-        # assume audio_file path is relative to manifest_dir
-        audio_file_path = os.path.join(manifest_dir, audio_file.as_posix())
+            # assume audio_file path is relative to data_dir
+            audio_file_path = os.path.join(data_dir, audio_file)
 
-        if is_datastore_path(audio_file_path):
-            # If audio was originally on an object store, use locally-cached path
-            audio_file_path = datastore_path_to_local_path(audio_file_path)
+            if is_datastore_path(audio_file_path):
+                # If audio was originally on an object store, use locally-cached path
+                audio_file_path = datastore_path_to_local_path(audio_file_path)
 
-        audio_file_path = Path(audio_file_path)
-
-        if audio_file_path.is_file():
-            audio_file = str(audio_file_path.absolute())
+            if os.path.isfile(audio_file_path):
+                audio_file = os.path.abspath(audio_file_path)
+            else:
+                audio_file = expanduser(audio_file)
         else:
             audio_file = expanduser(audio_file)
+        return audio_file
     else:
-        audio_file = expanduser(audio_file)
-    return audio_file
+        raise ValueError(f'Unexpected audio_file type {type(audio_file)}, audio_file {audio_file}.')

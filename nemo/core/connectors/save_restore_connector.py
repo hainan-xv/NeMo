@@ -12,19 +12,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations  # necessary for lazy types evaluation
 
 import os
 import shutil
 import tarfile
 import tempfile
 import uuid
-from typing import Optional, Union
+from typing import Optional, Set, Union
 
 import torch
 from omegaconf import DictConfig, OmegaConf
 from omegaconf.omegaconf import open_dict
 from pytorch_lightning.trainer.trainer import Trainer
 
+from nemo.core import classes as nemo_classes  # to avoid circular import do not import ModelPT directly
 from nemo.utils import logging, model_utils
 from nemo.utils.app_state import AppState
 from nemo.utils.get_rank import is_global_rank_zero
@@ -36,19 +38,24 @@ class SaveRestoreConnector:
         self._model_config_yaml = "model_config.yaml"
         self._model_weights_ckpt = "model_weights.ckpt"
         self._model_extracted_dir = None
+        self._pack_nemo_file = True
 
-    def save_to(self, model, save_path: str):
+    def save_to(self, model: "nemo_classes.ModelPT", save_path: str):
         """
         Saves model instance (weights and configuration) into .nemo file.
         You can use "restore_from" method to fully restore instance from .nemo file.
 
         .nemo file is an archive (tar.gz) with the following:
             model_config.yaml - model configuration in .yaml format. You can deserialize this into cfg argument for model's constructor
-            model_wights.chpt - model checkpoint
+            model_wights.ckpt - model checkpoint
 
         Args:
             model: ModelPT object to be saved.
             save_path: Path to .nemo file where model instance should be saved
+
+        Returns:
+            str: Path to .nemo file where model instance was saved (same as save_path argument) or None if not rank 0
+                The path can be a directory if the flag `pack_nemo_file` is set to False.
         """
 
         if is_global_rank_zero():
@@ -56,12 +63,23 @@ class SaveRestoreConnector:
                 config_yaml = os.path.join(tmpdir, self.model_config_yaml)
                 model_weights = os.path.join(tmpdir, self.model_weights_ckpt)
                 model.to_config_file(path2yaml_file=config_yaml)
-                if hasattr(model, 'artifacts') and model.artifacts is not None:
+                # update subconfigs, if there are child model, since child model can change its config
+                self._update_subconfigs(model, path2yaml_file=config_yaml)
+                if model.has_native_or_submodules_artifacts():
                     self._handle_artifacts(model, nemo_file_folder=tmpdir)
                     # We should not update self._cfg here - the model can still be in use
                     self._update_artifact_paths(model, path2yaml_file=config_yaml)
                 self._save_state_dict_to_disk(model.state_dict(), model_weights)
-                self._make_nemo_file_from_folder(filename=save_path, source_dir=tmpdir)
+
+                # Check if we are packing the folder into a nemo file
+                if self.pack_nemo_file:
+                    self._make_nemo_file_from_folder(filename=save_path, source_dir=tmpdir)
+                else:
+                    # Get the folder path from the save_path and move all values inside the tmpdir to the folder
+                    folder_path = os.path.dirname(save_path)
+
+                    for file in os.listdir(tmpdir):
+                        shutil.move(os.path.join(tmpdir, file), folder_path)
         else:
             return
 
@@ -122,12 +140,14 @@ class SaveRestoreConnector:
 
                 else:
                     # Extract the nemo file into the temporary directory
-                    self._unpack_nemo_file(path2file=restore_path, out_folder=tmpdir)
+                    self._unpack_nemo_file(
+                        path2file=restore_path, out_folder=tmpdir, extract_config_only=return_config is True
+                    )
 
                 # Change current working directory to
                 os.chdir(tmpdir)
                 if override_config_path is None:
-                    config_yaml = os.path.join(tmpdir, self.model_config_yaml)
+                    config_yaml = self.model_config_yaml
                 else:
                     # can be str path or OmegaConf / DictConfig object
                     config_yaml = override_config_path
@@ -235,7 +255,7 @@ class SaveRestoreConnector:
         loaded_params = self.load_config_and_state_dict(
             calling_cls, restore_path, override_config_path, map_location, strict, return_config, trainer,
         )
-        if not isinstance(loaded_params, tuple):
+        if not isinstance(loaded_params, tuple) or return_config is True:
             return loaded_params
         conf, instance, state_dict = loaded_params
         state_dict = self.modify_state_dict(conf, state_dict)
@@ -385,6 +405,9 @@ class SaveRestoreConnector:
                 )
             else:
                 # artifact is optional and we simply return None
+                logging.warning(
+                    f"src path does not exist or it is not a path in nemo file. src value I got was: {src}. Absolute: {os.path.abspath(src)}"
+                )
                 return None
 
         assert os.path.exists(return_path)
@@ -400,40 +423,74 @@ class SaveRestoreConnector:
     def _handle_artifacts(self, model, nemo_file_folder):
         tarfile_artifacts = []
         app_state = AppState()
-        for conf_path, artiitem in model.artifacts.items():
-            if artiitem.path_type == model_utils.ArtifactPathType.LOCAL_PATH:
-                if not os.path.exists(artiitem.path):
-                    raise FileNotFoundError(f"Artifact {conf_path} not found at location: {artiitem.path}")
 
-                # Generate new uniq artifact name and copy it to nemo_file_folder
-                # Note uuid.uuid4().hex is guaranteed to be 32 character long
-                artifact_base_name = os.path.basename(artiitem.path)
-                artifact_uniq_name = f"{uuid.uuid4().hex}_{artifact_base_name}"
-                shutil.copy2(artiitem.path, os.path.join(nemo_file_folder, artifact_uniq_name))
+        # aggregate artifacts from self and all children recursively
+        artifacts_containers = []
+        for _, config_path, module in model.named_nemo_modules():
+            if module.has_artifacts():  # NeMo model with artifacts
+                artifacts_containers.append((config_path, module.artifacts))
 
-                # Update artifacts registry
-                artiitem.hashed_path = "nemo:" + artifact_uniq_name
-                model.artifacts[conf_path] = artiitem
+        if len(artifacts_containers) > 0 and (not hasattr(model, "artifacts") or model.artifacts is None):
+            # model has no artifacts, but submodules have some
+            model.artifacts = dict()
+        for config_path, artifacts in artifacts_containers:
+            for subconf_path, artiitem in artifacts.items():
+                conf_path = f"{config_path}.{subconf_path}" if config_path else f"{subconf_path}"
+                if artiitem.path_type == model_utils.ArtifactPathType.LOCAL_PATH:
+                    if not os.path.exists(artiitem.path):
+                        raise FileNotFoundError(f"Artifact {conf_path} not found at location: {artiitem.path}")
 
-            elif artiitem.path_type == model_utils.ArtifactPathType.TAR_PATH:
-                # process all tarfile artifacts in one go, so preserve key-value pair
-                tarfile_artifacts.append((conf_path, artiitem))
+                    # Generate new uniq artifact name and copy it to nemo_file_folder
+                    # Note uuid.uuid4().hex is guaranteed to be 32 character long
+                    artifact_base_name = os.path.basename(artiitem.path)
+                    artifact_uniq_name = f"{uuid.uuid4().hex}_{artifact_base_name}"
+                    shutil.copy2(artiitem.path, os.path.join(nemo_file_folder, artifact_uniq_name))
 
-            else:
-                raise ValueError(f"Directly referencing artifacts from other nemo files isn't supported yet")
+                    # Update artifacts registry
+                    artiitem.hashed_path = "nemo:" + artifact_uniq_name
+                    model.artifacts[conf_path] = artiitem
+
+                elif artiitem.path_type == model_utils.ArtifactPathType.TAR_PATH:
+                    # process all tarfile artifacts in one go, so preserve key-value pair
+                    tarfile_artifacts.append((conf_path, artiitem))
+                    if subconf_path:  # artifact from submodule
+                        model.artifacts[conf_path] = artiitem
+
+                else:
+                    raise ValueError(f"Directly referencing artifacts from other nemo files isn't supported yet")
 
         # Process current tarfile artifacts by unpacking the previous tarfile and extract the artifacts
         # that are currently required.
+        # artifacts can be native (from the model itself) and from submodules
+        restoration_paths: Set[str] = set()  # model + submodules restoration paths, handle only unique paths
         model_metadata = app_state.get_model_metadata_from_guid(model.model_guid)
-        if len(tarfile_artifacts) > 0 and model_metadata.restoration_path is not None:
+        if model_metadata.restoration_path is not None:
+            restoration_paths.add(model_metadata.restoration_path)
+        # aggregate restoration paths for all submodules recursively
+        for module in model.modules():
+            if isinstance(module, nemo_classes.ModelPT):  # if NeMo model
+                submodule_restoration_path = app_state.get_model_metadata_from_guid(module.model_guid).restoration_path
+                if submodule_restoration_path is not None:
+                    restoration_paths.add(submodule_restoration_path)
+        if len(tarfile_artifacts) > 0 and len(restoration_paths) == 0:
+            # TODO: see cases when this can occur, and if we can fix them
+            logging.warning("Model contains registered artifacts, but no restoration paths found")
+        if len(tarfile_artifacts) > 0 and len(restoration_paths) > 0:
             # Need to step into nemo archive to extract file
             # Get path where the command is executed - the artifacts will be "retrieved" there
             # (original .nemo behavior)
             cwd = os.getcwd()
-            try:
-                # Step into the nemo archive to try and find the file
-                with tempfile.TemporaryDirectory() as archive_dir:
-                    self._unpack_nemo_file(path2file=model_metadata.restoration_path, out_folder=archive_dir)
+            # Step into the nemo archive to try and find the file
+            # TemporaryDirectory context must always be outer to try-catch chdir otherwise it crashes on Windows
+            with tempfile.TemporaryDirectory() as archive_dir:
+                try:
+                    # unpack all restorations paths (nemo checkpoints)
+                    # in nemo checkpoints all resources contain hash in name, so there should be no collisions
+                    for path in restoration_paths:
+                        if self.model_extracted_dir:
+                            shutil.copytree(src=path, dst=archive_dir, dirs_exist_ok=True)
+                        else:
+                            self._unpack_nemo_file(path2file=path, out_folder=archive_dir)
                     os.chdir(archive_dir)
                     for conf_path, artiitem in tarfile_artifacts:
                         # Get basename and copy it to nemo_file_folder
@@ -450,12 +507,31 @@ class SaveRestoreConnector:
                         new_artiitem.path = "nemo:" + artifact_uniq_name
                         new_artiitem.path_type = model_utils.ArtifactPathType.TAR_PATH
                         model.artifacts[conf_path] = new_artiitem
-            finally:
-                # change back working directory
-                os.chdir(cwd)
+                finally:
+                    # change back working directory
+                    os.chdir(cwd)
+
+    @staticmethod
+    def _update_subconfigs(model: "nemo_classes.ModelPT", path2yaml_file):
+        """
+        Update subconfigs of the model if ModelPT has submodules
+        Should be called before updating artifacts paths
+        """
+        if not model.has_nemo_submodules():
+            # no submodules => nothing to update
+            return
+        conf = OmegaConf.load(path2yaml_file)
+        # update subconfigs for all children recoursively
+        # parent configs updated before children
+        for _, conf_path, submodule in model.named_nemo_modules():
+            if not conf_path:  # self
+                continue
+            OmegaConf.update(conf, conf_path, submodule.cfg)
+        with open(path2yaml_file, 'w', encoding='utf-8') as fout:
+            OmegaConf.save(config=conf, f=fout, resolve=True)
 
     def _update_artifact_paths(self, model, path2yaml_file):
-        if model.artifacts is not None and len(model.artifacts) > 0:
+        if hasattr(model, "artifacts") and model.artifacts is not None and len(model.artifacts) > 0:
             conf = OmegaConf.load(path2yaml_file)
             for conf_path, item in model.artifacts.items():
                 if item.hashed_path is None:
@@ -478,7 +554,7 @@ class SaveRestoreConnector:
             tar.add(source_dir, arcname=".")
 
     @staticmethod
-    def _unpack_nemo_file(path2file: str, out_folder: str) -> str:
+    def _unpack_nemo_file(path2file: str, out_folder: str, extract_config_only: bool = False) -> str:
         if not os.path.exists(path2file):
             raise FileNotFoundError(f"{path2file} does not exist")
 
@@ -492,7 +568,11 @@ class SaveRestoreConnector:
             # can be older checkpoint => try compressed tar
             tar_header = "r:gz"
         tar = tarfile.open(path2file, tar_header)
-        tar.extractall(path=out_folder)
+        if not extract_config_only:
+            tar.extractall(path=out_folder)
+        else:
+            members = [x for x in tar.getmembers() if ".yaml" in x.name]
+            tar.extractall(path=out_folder, members=members)
         tar.close()
         return out_folder
 
@@ -502,7 +582,7 @@ class SaveRestoreConnector:
 
     @staticmethod
     def _load_state_dict_from_disk(model_weights, map_location=None):
-        return torch.load(model_weights, map_location=map_location)
+        return torch.load(model_weights, map_location='cpu')
 
     @property
     def model_config_yaml(self) -> str:
@@ -527,3 +607,11 @@ class SaveRestoreConnector:
     @model_extracted_dir.setter
     def model_extracted_dir(self, path: Optional[str]):
         self._model_extracted_dir = path
+
+    @property
+    def pack_nemo_file(self) -> bool:
+        return self._pack_nemo_file
+
+    @pack_nemo_file.setter
+    def pack_nemo_file(self, save_nemo_file: bool):
+        self._pack_nemo_file = save_nemo_file

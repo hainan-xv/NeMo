@@ -35,6 +35,16 @@ Model Classes
     :members: setup_training_data, setup_optimization, setup_validation_data, setup_test_data, register_artifact
 
 
+.. autoclass:: nemo.collections.asr.models.hybrid_asr_tts_models.ASRWithTTSModel
+    :show-inheritance:
+    :members: from_asr_config, from_pretrained_models, save_asr_model_to, setup_training_data
+
+.. _confidence-ensembles-api:
+
+.. autoclass:: nemo.collections.asr.models.confidence_ensembles.ConfidenceEnsembleModel
+    :show-inheritance:
+    :members: transcribe
+
 Modules
 -------
 
@@ -113,6 +123,18 @@ Mixins
     :show-inheritance:
     :members:
 
+.. autoclass:: nemo.collections.asr.parts.mixins.transcription.TranscriptionMixin
+    :show-inheritance:
+    :members:
+
+.. autoclass:: nemo.collections.asr.parts.mixins.transcription.TranscribeConfig
+    :show-inheritance:
+    :members:
+
+.. autoclass:: nemo.collections.asr.parts.mixins.interctc_mixin.InterCTCMixin
+    :show-inheritance:
+    :members:
+
 Datasets
 --------
 
@@ -126,6 +148,19 @@ Character Encoding Datasets
 .. autoclass:: nemo.collections.asr.data.audio_to_text.TarredAudioToCharDataset
     :show-inheritance:
     :members:
+
+
+Text-to-Text Datasets for Hybrid ASR-TTS models
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. autoclass:: nemo.collections.asr.data.text_to_text.TextToTextDataset
+    :show-inheritance:
+    :members:
+
+.. autoclass:: nemo.collections.asr.data.text_to_text.TextToTextIterableDataset
+    :show-inheritance:
+    :members:
+
 
 Subword Encoding Datasets
 ~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -202,11 +237,11 @@ Miscellaneous Classes
 CTC Decoding
 ~~~~~~~~~~~~
 
-.. autoclass:: nemo.collections.asr.metrics.wer.CTCDecoding
+.. autoclass:: nemo.collections.asr.parts.submodules.ctc_decoding.CTCDecoding
     :show-inheritance:
     :members:
 
-.. autoclass:: nemo.collections.asr.metrics.wer_bpe.CTCBPEDecoding
+.. autoclass:: nemo.collections.asr.parts.submodules.ctc_decoding.CTCBPEDecoding
     :show-inheritance:
     :members:
 
@@ -221,11 +256,11 @@ CTC Decoding
 RNNT Decoding
 ~~~~~~~~~~~~~
 
-.. autoclass:: nemo.collections.asr.metrics.rnnt_wer.RNNTDecoding
+.. autoclass:: nemo.collections.asr.parts.submodules.rnnt_decoding.RNNTDecoding
     :show-inheritance:
     :members:
 
-.. autoclass:: nemo.collections.asr.metrics.rnnt_wer_bpe.RNNTBPEDecoding
+.. autoclass:: nemo.collections.asr.parts.submodules.rnnt_decoding.RNNTBPEDecoding
     :show-inheritance:
     :members:
 

@@ -15,17 +15,149 @@
 from abc import ABC, abstractmethod
 from typing import List, Union
 
+import hydra
 import torch
+from omegaconf import DictConfig, OmegaConf
+from pytorch_lightning import Trainer
 
+from nemo.collections.asr.metrics.audio import AudioMetricWrapper
 from nemo.core.classes import ModelPT
 from nemo.utils import logging, model_utils
-from nemo.utils.decorators import experimental
 
 __all__ = ['AudioToAudioModel']
 
 
-@experimental
 class AudioToAudioModel(ModelPT, ABC):
+    def __init__(self, cfg: DictConfig, trainer: Trainer = None):
+        super().__init__(cfg=cfg, trainer=trainer)
+
+        self._setup_loss()
+
+    def _setup_loss(self):
+        """Setup loss for this model.
+        """
+        self.loss = AudioToAudioModel.from_config_dict(self._cfg.loss)
+
+    def _get_num_dataloaders(self, tag: str = 'val'):
+        if tag == 'val':
+            num_dataloaders = len(self._validation_dl) if isinstance(self._validation_dl, List) else 1
+        elif tag == 'test':
+            num_dataloaders = len(self._test_dl) if isinstance(self._test_dl, List) else 1
+        else:
+            raise ValueError(f'Unexpected tag {tag}.')
+
+        return num_dataloaders
+
+    def _setup_metrics(self, tag: str = 'val'):
+        """Setup metrics for this model for all available dataloaders.
+
+        When using multiple DataLoaders, it is recommended to initialize separate modular
+        metric instances for each DataLoader and use them separately.
+
+        Reference:
+            - https://torchmetrics.readthedocs.io/en/stable/pages/lightning.html#common-pitfalls
+        """
+        # Number of currently configured dataloaders
+        num_dataloaders = self._get_num_dataloaders(tag)
+        logging.debug('Found %d dataloaders for %s', num_dataloaders, tag)
+
+        if hasattr(self, 'metrics'):
+            if tag in self.metrics and len(self.metrics[tag]) == num_dataloaders:
+                # Exact number of metrics have already been configured, nothing else to do
+                logging.debug('Found %d metrics for tag %s, not necesary to initialize again', num_dataloaders, tag)
+                return
+
+        if self.cfg.get('metrics') is None:
+            # Metrics are not available in the configuration, nothing to do
+            logging.debug('No metrics configured in model.metrics')
+            return
+
+        if (metrics_cfg := self.cfg['metrics'].get(tag)) is None:
+            # Metrics configuration is not available in the configuration, nothing to do
+            logging.debug('No metrics configured for %s in model.metrics', tag)
+            return
+
+        if 'loss' in metrics_cfg:
+            raise ValueError(
+                f'Loss is automatically included in the metrics, it should not be specified in model.metrics.{tag}.'
+            )
+
+        # Initialize metrics
+        if not hasattr(self, 'metrics'):
+            self.metrics = torch.nn.ModuleDict()
+
+        # Setup metrics for each dataloader
+        self.metrics[tag] = torch.nn.ModuleList()
+        for dataloader_idx in range(num_dataloaders):
+            metrics_dataloader_idx = {}
+            for name, cfg in metrics_cfg.items():
+                logging.debug('Initialize %s for dataloader_idx %s', name, dataloader_idx)
+                cfg_dict = OmegaConf.to_container(cfg)
+                cfg_channel = cfg_dict.pop('channel', None)
+                cfg_batch_averaging = cfg_dict.pop('metric_using_batch_averaging', None)
+                metrics_dataloader_idx[name] = AudioMetricWrapper(
+                    metric=hydra.utils.instantiate(cfg_dict),
+                    channel=cfg_channel,
+                    metric_using_batch_averaging=cfg_batch_averaging,
+                )
+
+            metrics_dataloader_idx = torch.nn.ModuleDict(metrics_dataloader_idx)
+            self.metrics[tag].append(metrics_dataloader_idx.to(self.device))
+
+            logging.info(
+                'Setup metrics for %s, dataloader %d: %s', tag, dataloader_idx, ', '.join(metrics_dataloader_idx)
+            )
+
+    @abstractmethod
+    def evaluation_step(self, batch, batch_idx, dataloader_idx: int = 0, tag: str = 'val'):
+        pass
+
+    def on_validation_start(self):
+        self._setup_metrics('val')
+        return super().on_validation_start()
+
+    def on_test_start(self):
+        self._setup_metrics('test')
+        return super().on_test_start()
+
+    def validation_step(self, batch, batch_idx, dataloader_idx: int = 0):
+        output_dict = self.evaluation_step(batch, batch_idx, dataloader_idx, 'val')
+        if isinstance(self.trainer.val_dataloaders, (list, tuple)) and len(self.trainer.val_dataloaders) > 1:
+            self.validation_step_outputs[dataloader_idx].append(output_dict)
+        else:
+            self.validation_step_outputs.append(output_dict)
+        return output_dict
+
+    def test_step(self, batch, batch_idx, dataloader_idx=0):
+        output_dict = self.evaluation_step(batch, batch_idx, dataloader_idx, 'test')
+        if isinstance(self.trainer.test_dataloaders, (list, tuple)) and len(self.trainer.test_dataloaders) > 1:
+            self.test_step_outputs[dataloader_idx].append(output_dict)
+        else:
+            self.test_step_outputs.append(output_dict)
+        return output_dict
+
+    def multi_evaluation_epoch_end(self, outputs, dataloader_idx: int = 0, tag: str = 'val'):
+        # Handle loss
+        loss_mean = torch.stack([x[f'{tag}_loss'] for x in outputs]).mean()
+        tensorboard_logs = {f'{tag}_loss': loss_mean}
+
+        # Handle metrics for this tag and dataloader_idx
+        if hasattr(self, 'metrics') and tag in self.metrics:
+            for name, metric in self.metrics[tag][dataloader_idx].items():
+                # Compute & reset the metric
+                value = metric.compute()
+                metric.reset()
+                # Store for logs
+                tensorboard_logs[f'{tag}_{name}'] = value
+
+        return {f'{tag}_loss': loss_mean, 'log': tensorboard_logs}
+
+    def multi_validation_epoch_end(self, outputs, dataloader_idx: int = 0):
+        return self.multi_evaluation_epoch_end(outputs, dataloader_idx, 'val')
+
+    def multi_test_epoch_end(self, outputs, dataloader_idx: int = 0):
+        return self.multi_evaluation_epoch_end(outputs, dataloader_idx, 'test')
+
     @abstractmethod
     def process(
         self, paths2audio_files: List[str], output_dir: str, batch_size: int = 4
@@ -43,27 +175,6 @@ class AudioToAudioModel(ModelPT, ABC):
             Paths to processed audio signals.
         """
         pass
-
-    @abstractmethod
-    def evaluation_step(self, batch, batch_idx, dataloader_idx: int = 0, tag: str = 'val'):
-        pass
-
-    def validation_step(self, batch, batch_idx, dataloader_idx: int = 0):
-        return self.evaluation_step(batch, batch_idx, dataloader_idx, 'val')
-
-    def test_step(self, batch, batch_idx, dataloader_idx=0):
-        return self.evaluation_step(batch, batch_idx, dataloader_idx, 'test')
-
-    def multi_evaluation_epoch_end(self, outputs, dataloader_idx: int = 0, tag: str = 'val'):
-        loss_mean = torch.stack([x[f'{tag}_loss'] for x in outputs]).mean()
-        tensorboard_logs = {f'{tag}_loss': loss_mean}
-        return {f'{tag}_loss': loss_mean, 'log': tensorboard_logs}
-
-    def multi_validation_epoch_end(self, outputs, dataloader_idx: int = 0):
-        return self.multi_evaluation_epoch_end(outputs, dataloader_idx, 'val')
-
-    def multi_test_epoch_end(self, outputs, dataloader_idx: int = 0):
-        return self.multi_evaluation_epoch_end(outputs, dataloader_idx, 'test')
 
     @classmethod
     def list_available_models(cls) -> 'List[PretrainedModelInfo]':

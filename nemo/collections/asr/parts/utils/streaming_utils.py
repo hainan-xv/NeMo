@@ -14,18 +14,20 @@
 
 import copy
 import os
+from typing import Optional
 
 import numpy as np
 import torch
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 
+from nemo.collections.asr.data.audio_to_text_lhotse_prompted import canary_prompt
 from nemo.collections.asr.models.ctc_bpe_models import EncDecCTCModelBPE
 from nemo.collections.asr.parts.mixins.streaming import StreamingEncoder
 from nemo.collections.asr.parts.preprocessing.features import normalize_batch
 from nemo.collections.asr.parts.utils.audio_utils import get_samples
 from nemo.core.classes import IterableDataset
-from nemo.core.neural_types import LengthsType, NeuralType
+from nemo.core.neural_types import LengthsType, MelSpectrogramType, NeuralType
 
 # Minimum number of tokens required to assign a LCS merge step, otherwise ignore and
 # select all i-1 and ith buffer tokens to merge.
@@ -700,6 +702,7 @@ class FrameBatchASR:
         )
 
         self.asr_model = asr_model
+        self.decoder = getattr(asr_model, "decoder", None)
 
         self.batch_size = batch_size
         self.all_logits = []
@@ -707,7 +710,9 @@ class FrameBatchASR:
 
         self.unmerged = []
 
-        if hasattr(asr_model.decoder, "vocabulary"):
+        if self.decoder is None:
+            self.blank_id = len(asr_model.tokenizer.vocabulary)
+        elif hasattr(asr_model.decoder, "vocabulary"):
             self.blank_id = len(asr_model.decoder.vocabulary)
         else:
             self.blank_id = len(asr_model.joint.vocabulary)
@@ -716,6 +721,7 @@ class FrameBatchASR:
         self.frame_buffers = []
         self.reset()
         cfg = copy.deepcopy(asr_model._cfg)
+        self.cfg = cfg
         self.frame_len = frame_len
         OmegaConf.set_struct(cfg.preprocessor, False)
 
@@ -725,6 +731,7 @@ class FrameBatchASR:
         cfg.preprocessor.normalize = "None"
         self.raw_preprocessor = EncDecCTCModelBPE.from_config_dict(cfg.preprocessor)
         self.raw_preprocessor.to(asr_model.device)
+        self.preprocessor = self.raw_preprocessor
 
     def reset(self):
         """
@@ -750,41 +757,60 @@ class FrameBatchASR:
         self.frame_bufferer.set_frame_reader(frame_reader)
 
     @torch.no_grad()
-    def infer_logits(self):
+    def infer_logits(self, keep_logits=False):
         frame_buffers = self.frame_bufferer.get_buffers_batch()
 
         while len(frame_buffers) > 0:
             self.frame_buffers += frame_buffers[:]
             self.data_layer.set_signal(frame_buffers[:])
-            self._get_batch_preds()
+            self._get_batch_preds(keep_logits)
             frame_buffers = self.frame_bufferer.get_buffers_batch()
 
     @torch.no_grad()
-    def _get_batch_preds(self):
+    def _get_batch_preds(self, keep_logits=False):
         device = self.asr_model.device
         for batch in iter(self.data_loader):
 
             feat_signal, feat_signal_len = batch
             feat_signal, feat_signal_len = feat_signal.to(device), feat_signal_len.to(device)
-            log_probs, encoded_len, predictions = self.asr_model(
-                processed_signal=feat_signal, processed_signal_length=feat_signal_len
-            )
+            forward_outs = self.asr_model(processed_signal=feat_signal, processed_signal_length=feat_signal_len)
+
+            if len(forward_outs) == 2:  # hybrid ctc rnnt model
+                encoded, encoded_len = forward_outs
+                log_probs = self.asr_model.ctc_decoder(encoder_output=encoded)
+                predictions = log_probs.argmax(dim=-1, keepdim=False)
+            else:
+                log_probs, encoded_len, predictions = forward_outs
+
             preds = torch.unbind(predictions)
             for pred in preds:
                 self.all_preds.append(pred.cpu().numpy())
-            del log_probs
+            if keep_logits:
+                log_probs = torch.unbind(log_probs)
+                for log_prob in log_probs:
+                    self.all_logits.append(log_prob.cpu())
+            else:
+                del log_probs
             del encoded_len
             del predictions
 
-    def transcribe(
-        self, tokens_per_chunk: int, delay: int,
-    ):
-        self.infer_logits()
+    def transcribe(self, tokens_per_chunk: int, delay: int, keep_logits: bool = False):
+        self.infer_logits(keep_logits)
         self.unmerged = []
         for pred in self.all_preds:
             decoded = pred.tolist()
             self.unmerged += decoded[len(decoded) - 1 - delay : len(decoded) - 1 - delay + tokens_per_chunk]
-        return self.greedy_merge(self.unmerged)
+        hypothesis = self.greedy_merge(self.unmerged)
+        if not keep_logits:
+            return hypothesis
+
+        all_logits = []
+        for log_prob in self.all_logits:
+            T = log_prob.shape[0]
+            log_prob = log_prob[T - 1 - delay : T - 1 - delay + tokens_per_chunk, :]
+            all_logits.append(log_prob)
+        all_logits = torch.concat(all_logits, 0)
+        return hypothesis, all_logits
 
     def greedy_merge(self, preds):
         decoded_prediction = []
@@ -1301,17 +1327,19 @@ class CacheAwareStreamingAudioBuffer:
     It can be used to simulate streaming audio or audios.
     """
 
-    def __init__(self, model, online_normalization=None):
+    def __init__(self, model, online_normalization=None, pad_and_drop_preencoded=False):
         '''
         Args:
             model: An ASR model.
             online_normalization (bool): whether to perform online normalization per chunk or normalize the whole audio before chunking
+            pad_and_drop_preencoded (bool): if true pad first audio chunk and always drop preencoded
         '''
         self.model = model
         self.buffer = None
         self.buffer_idx = 0
         self.streams_length = None
         self.step = 0
+        self.pad_and_drop_preencoded = pad_and_drop_preencoded
 
         self.online_normalization = online_normalization
         if not isinstance(model.encoder, StreamingEncoder):
@@ -1337,7 +1365,10 @@ class CacheAwareStreamingAudioBuffer:
                 return
 
             if self.buffer_idx == 0 and isinstance(self.streaming_cfg.chunk_size, list):
-                chunk_size = self.streaming_cfg.chunk_size[0]
+                if self.pad_and_drop_preencoded:
+                    chunk_size = self.streaming_cfg.chunk_size[1]
+                else:
+                    chunk_size = self.streaming_cfg.chunk_size[0]
             else:
                 chunk_size = (
                     self.streaming_cfg.chunk_size[1]
@@ -1346,7 +1377,10 @@ class CacheAwareStreamingAudioBuffer:
                 )
 
             if self.buffer_idx == 0 and isinstance(self.streaming_cfg.shift_size, list):
-                shift_size = self.streaming_cfg.shift_size[0]
+                if self.pad_and_drop_preencoded:
+                    shift_size = self.streaming_cfg.shift_size[1]
+                else:
+                    shift_size = self.streaming_cfg.shift_size[0]
             else:
                 shift_size = (
                     self.streaming_cfg.shift_size[1]
@@ -1371,8 +1405,12 @@ class CacheAwareStreamingAudioBuffer:
             # if there is not enough frames to be used as the pre-encoding cache, zeros would be added
             zeros_pads = None
             if self.buffer_idx == 0 and isinstance(self.streaming_cfg.pre_encode_cache_size, list):
+                if self.pad_and_drop_preencoded:
+                    cache_pre_encode_num_frames = self.streaming_cfg.pre_encode_cache_size[1]
+                else:
+                    cache_pre_encode_num_frames = self.streaming_cfg.pre_encode_cache_size[0]
                 cache_pre_encode = torch.zeros(
-                    (audio_chunk.size(0), self.input_features, self.streaming_cfg.pre_encode_cache_size[0]),
+                    (audio_chunk.size(0), self.input_features, cache_pre_encode_num_frames),
                     device=audio_chunk.device,
                     dtype=audio_chunk.dtype,
                 )
@@ -1520,3 +1558,59 @@ class CacheAwareStreamingAudioBuffer:
                 normalize_type=self.model_normalize_type,
             )
         return processed_signal, self.streams_length
+
+
+class FrameBatchMultiTaskAED(FrameBatchASR):
+    def get_input_tokens(self, sample: dict):
+        if self.asr_model.prompt_format == "canary":
+            missing_keys = [k for k in ("source_lang", "target_lang", "taskname", "pnc") if k not in sample]
+            if missing_keys:
+                raise RuntimeError(
+                    f"We found sample that is missing the following keys: {missing_keys}"
+                    f"Please ensure that every utterance in the input manifests contains these keys. Sample: {sample}"
+                )
+            tokens = canary_prompt(
+                tokenizer=self.asr_model.tokenizer,
+                text="none",
+                language=sample['target_lang'],
+                source_language=sample['source_lang'],
+                target_language=sample['target_lang'],
+                taskname=sample['taskname'],
+                pnc=sample['pnc'],
+            )
+        else:
+            raise ValueError(f"Unknown prompt format: {self.asr_model.prompt_format}")
+        return torch.tensor(tokens, dtype=torch.long, device=self.asr_model.device).unsqueeze(0)  # [1, T]
+
+    def read_audio_file(self, audio_filepath: str, delay, model_stride_in_secs, meta_data):
+        self.input_tokens = self.get_input_tokens(meta_data)
+        super().read_audio_file(audio_filepath, delay, model_stride_in_secs)
+
+    @torch.no_grad()
+    def _get_batch_preds(self, keep_logits=False):
+        device = self.asr_model.device
+        for batch in iter(self.data_loader):
+            feat_signal, feat_signal_len = batch
+            feat_signal, feat_signal_len = feat_signal.to(device), feat_signal_len.to(device)
+            tokens = self.input_tokens.to(device).repeat(feat_signal.size(0), 1)
+            tokens_len = torch.tensor([tokens.size(1)] * tokens.size(0), device=device).long()
+
+            batch_input = (feat_signal, feat_signal_len, tokens, tokens_len)
+            predictions = self.asr_model.predict_step(batch_input, has_processed_signal=True)
+            self.all_preds.extend(predictions)
+            del predictions
+
+    def transcribe(
+        self, tokens_per_chunk: Optional[int] = None, delay: Optional[int] = None, keep_logits: bool = False
+    ):
+        """
+        unsued params are for keeping the same signature as the parent class
+        """
+        self.infer_logits(keep_logits)
+
+        hypothesis = " ".join(self.all_preds)
+        if not keep_logits:
+            return hypothesis
+
+        print("keep_logits=True is not supported for MultiTaskAEDFrameBatchInfer. Returning empty logits.")
+        return hypothesis, []

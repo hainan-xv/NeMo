@@ -23,13 +23,11 @@ from nemo.collections.nlp.modules.common.megatron.module import MegatronModule
 from nemo.collections.nlp.modules.common.megatron.mup.layer import MuReadout
 from nemo.collections.nlp.modules.common.megatron.utils import (
     ApexGuardDefaults,
-    build_position_ids,
     init_method_normal,
     scaled_init_method_normal,
 )
 
 try:
-    from apex.transformer import tensor_parallel
     from apex.transformer.enums import ModelType
 
     HAVE_APEX = True
@@ -38,6 +36,17 @@ except (ImportError, ModuleNotFoundError):
     # fake missing classes with None attributes
     AttnMaskType = ApexGuardDefaults()
     ModelType = ApexGuardDefaults()
+
+try:
+    from megatron.core import ModelParallelConfig, tensor_parallel
+
+    HAVE_MEGATRON_CORE = True
+
+except (ImportError, ModuleNotFoundError):
+
+    ModelParallelConfig = ApexGuardDefaults
+
+    HAVE_MEGATRON_CORE = True
 
 
 __all__ = ["MegatronRetrievalTokenLevelEncoderDecoderModule"]
@@ -48,6 +57,7 @@ class MegatronRetrievalTokenLevelEncoderDecoderModule(MegatronModule):
 
     def __init__(
         self,
+        config: ModelParallelConfig,
         vocab_size,
         hidden_size,
         max_position_embeddings,
@@ -61,7 +71,7 @@ class MegatronRetrievalTokenLevelEncoderDecoderModule(MegatronModule):
         post_process=True,
         init_method_std=0.02,
         fp16_cross_entropy=False,
-        use_cpu_initialization=False,
+        megatron_amp_O2=False,
         hidden_dropout=0.1,
         attention_dropout=0.1,
         precision=16,
@@ -92,9 +102,15 @@ class MegatronRetrievalTokenLevelEncoderDecoderModule(MegatronModule):
         tokenizer=None,  # tokenizer
         normalize_attention_scores=True,
         activations_checkpoint_granularity=None,
+        megatron_lm_compatible=False,
+        version=1,
     ):
         super(MegatronRetrievalTokenLevelEncoderDecoderModule, self).__init__()
-
+        if megatron_lm_compatible:
+            assert (
+                apply_query_key_layer_scaling
+            ), "megatron lm compatible model has to set apply_query_key_layer_scaling"
+            assert add_position_embedding, "megatron lm compatible model has to set add_position_embedding"
         self.parallel_output = parallel_output
         self.pre_process = pre_process
         self.post_process = post_process
@@ -107,6 +123,7 @@ class MegatronRetrievalTokenLevelEncoderDecoderModule(MegatronModule):
         self.eod_id = tokenizer.eos_id
         self.transformer_block_type = transformer_block_type
         self.num_chunked_cross_attention = len(dec_cross_attention)
+        self.megatron_lm_compatible = megatron_lm_compatible
 
         if kv_channels is None:
             assert (
@@ -116,12 +133,12 @@ class MegatronRetrievalTokenLevelEncoderDecoderModule(MegatronModule):
 
         if pre_process:
             self.encoder_embedding = Embedding(
+                config=config,
                 hidden_size=hidden_size,
                 vocab_size=vocab_size,
                 max_sequence_length=max_position_embeddings,
                 init_method=init_method_normal(init_method_std),
                 num_tokentypes=num_tokentypes,
-                use_cpu_initialization=use_cpu_initialization,
                 embedding_dropout_prob=hidden_dropout,
                 position_embedding_type='learned_absolute' if add_position_embedding else '',
                 transpose_batch_sequence=False,
@@ -144,6 +161,7 @@ class MegatronRetrievalTokenLevelEncoderDecoderModule(MegatronModule):
                     enc_layer_types.append(LayerType.encoder)
 
             self.encoder = get_encoder_model(
+                config=config,
                 arch="retro",
                 hidden_size=hidden_size,
                 ffn_hidden_size=ffn_hidden_size,
@@ -154,9 +172,10 @@ class MegatronRetrievalTokenLevelEncoderDecoderModule(MegatronModule):
                 init_method=encoder_init,
                 scaled_init_method=encoder_scaled_init,
                 pre_process=pre_process,
-                post_process=post_process,
+                post_process=False
+                if megatron_lm_compatible
+                else post_process,  # megatron lm model has no final layer_norm
                 init_method_std=init_method_std,
-                use_cpu_initialization=use_cpu_initialization,
                 hidden_dropout=hidden_dropout,
                 attention_dropout=attention_dropout,
                 precision=precision,
@@ -182,6 +201,8 @@ class MegatronRetrievalTokenLevelEncoderDecoderModule(MegatronModule):
                 chunk_size=chunk_size,
                 layer_number_offset=0,
                 normalize_attention_scores=normalize_attention_scores,
+                turn_off_rop=megatron_lm_compatible,
+                version=version,
             )
             self._encoder_key = "encoder"
 
@@ -206,6 +227,7 @@ class MegatronRetrievalTokenLevelEncoderDecoderModule(MegatronModule):
 
             # it is used to process the inputs for encoder to use as context (H in the paper)
             self.pre_decoder = get_decoder_model(
+                config=config,
                 arch="retro",
                 hidden_size=hidden_size,
                 ffn_hidden_size=ffn_hidden_size,
@@ -218,7 +240,6 @@ class MegatronRetrievalTokenLevelEncoderDecoderModule(MegatronModule):
                 pre_process=pre_process,
                 post_process=False,  # no need for post process
                 init_method_std=init_method_std,
-                use_cpu_initialization=use_cpu_initialization,
                 hidden_dropout=hidden_dropout,
                 attention_dropout=attention_dropout,
                 precision=precision,
@@ -244,10 +265,13 @@ class MegatronRetrievalTokenLevelEncoderDecoderModule(MegatronModule):
                 chunk_size=chunk_size,
                 layer_number_offset=0,
                 normalize_attention_scores=normalize_attention_scores,
+                turn_off_rop=megatron_lm_compatible,
+                version=version,
             )
 
             # it is where the chunked cross attention happens
             self.post_decoder = get_decoder_model(
+                config=config,
                 arch="retro",
                 hidden_size=hidden_size,
                 ffn_hidden_size=ffn_hidden_size,
@@ -260,7 +284,6 @@ class MegatronRetrievalTokenLevelEncoderDecoderModule(MegatronModule):
                 pre_process=False,  # directly take the pre_decoder output, skip preprocess
                 post_process=post_process,
                 init_method_std=init_method_std,
-                use_cpu_initialization=use_cpu_initialization,
                 hidden_dropout=hidden_dropout,
                 attention_dropout=attention_dropout,
                 precision=precision,
@@ -286,6 +309,8 @@ class MegatronRetrievalTokenLevelEncoderDecoderModule(MegatronModule):
                 chunk_size=chunk_size,
                 layer_number_offset=pre_decoder_num_layers + 1,
                 normalize_attention_scores=normalize_attention_scores,
+                turn_off_rop=megatron_lm_compatible,
+                version=version,
             )
             self._pre_decoder_key = "pre_decoder"
             self._post_decoder_key = "post_decoder"
@@ -320,20 +345,22 @@ class MegatronRetrievalTokenLevelEncoderDecoderModule(MegatronModule):
         set_inference_key_value_memory=False,
         inference_max_sequence_len=None,
         neighbors=None,
+        position_ids=None,
     ):
         """
         Return value is per token / per dimension (i.e., non collapsed loss value)
         """
         eod_positions = None
         retrieved_emb = None
-        if input_ids is not None and self.eod_id is not None:
+        if input_ids is not None and self.eod_id is not None and not self.megatron_lm_compatible:
+            # do not reset attention for megatron lm compatible model
             eod_positions = torch.where(input_ids == self.eod_id)
 
         if input_emb is None:
             if self.pre_process and self.add_encoder:
                 # encoder embeddings
                 if self.add_abs_position_embedding:
-                    input_position_ids = build_position_ids(input_ids)
+                    input_position_ids = position_ids
                 else:
                     input_position_ids = None
                 input_emb = self.encoder_embedding(input_ids, input_position_ids, token_type_ids=token_type_ids)

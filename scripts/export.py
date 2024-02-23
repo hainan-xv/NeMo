@@ -30,8 +30,10 @@ import argparse
 import sys
 
 import torch
+from omegaconf import OmegaConf
 from pytorch_lightning import Trainer
 
+import nemo
 from nemo.core import ModelPT
 from nemo.core.classes import Exportable
 from nemo.core.config.pytorch_lightning import TrainerConfig
@@ -60,6 +62,16 @@ def get_args(argv):
         "--cache_support", action="store_true", help="enables caching inputs for the models support it."
     )
     parser.add_argument("--device", default="cuda", help="Device to export for")
+    parser.add_argument("--check-tolerance", type=float, default=0.01, help="tolerance for verification")
+    parser.add_argument(
+        "--export-config",
+        metavar="KEY=VALUE",
+        nargs='+',
+        help="Set a number of key-value pairs to model.export_config dictionary "
+        "(do not put spaces before or after the = sign). "
+        "Note that values are always treated as strings.",
+    )
+
     args = parser.parse_args(argv)
     return args
 
@@ -92,7 +104,8 @@ def nemo_export(argv):
         logger=False,
         enable_checkpointing=False,
     )
-    trainer = Trainer(cfg_trainer)
+    cfg_trainer = OmegaConf.to_container(OmegaConf.create(cfg_trainer))
+    trainer = Trainer(**cfg_trainer)
 
     logging.info("Restoring NeMo model from '{}'".format(nemo_in))
     try:
@@ -128,9 +141,18 @@ def nemo_export(argv):
         in_args["max_dim"] = args.max_dim
         max_dim = args.max_dim
 
-    if args.cache_support and hasattr(model, "encoder") and hasattr(model.encoder, "export_cache_support"):
-        model.encoder.export_cache_support = True
-        logging.info("Caching support is enabled.")
+    if args.cache_support:
+        model.set_export_config({"cache_support": "True"})
+
+    if args.export_config:
+        kv = {}
+        for key_value in args.export_config:
+            lst = key_value.split("=")
+            if len(lst) != 2:
+                raise Exception("Use correct format for --export_config: k=v")
+            k, v = lst
+            kv[k] = v
+        model.set_export_config(kv)
 
     autocast = nullcontext
     if args.autocast:
@@ -153,8 +175,9 @@ def nemo_export(argv):
                 out,
                 input_example=input_example,
                 check_trace=check_trace,
+                check_tolerance=args.check_tolerance,
                 onnx_opset_version=args.onnx_opset,
-                verbose=args.verbose,
+                verbose=bool(args.verbose),
             )
 
     except Exception as e:

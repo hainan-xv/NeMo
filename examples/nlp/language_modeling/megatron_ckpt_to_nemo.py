@@ -24,21 +24,30 @@ Conversion script to convert PTL checkpoints into nemo checkpoint.
      --pipeline_model_parallel_size <pipeline_model_parallel_size>
 """
 
+import dis
 import os
 from argparse import ArgumentParser
 
 import torch
-from apex.transformer import parallel_state
-from lightning_lite.plugins.environments import TorchElasticEnvironment
+from genericpath import isdir
+from megatron.core import parallel_state
+from omegaconf import OmegaConf, open_dict
+from pytorch_lightning.plugins.environments import TorchElasticEnvironment
 from pytorch_lightning.trainer.trainer import Trainer
 
 from nemo.collections.nlp.models.language_modeling.megatron_bart_model import MegatronBARTModel
 from nemo.collections.nlp.models.language_modeling.megatron_bert_model import MegatronBertModel
 from nemo.collections.nlp.models.language_modeling.megatron_gpt_model import MegatronGPTModel
+from nemo.collections.nlp.models.language_modeling.megatron_gpt_sft_model import MegatronGPTSFTModel
 from nemo.collections.nlp.models.language_modeling.megatron_retrieval_model import MegatronRetrievalModel
 from nemo.collections.nlp.models.language_modeling.megatron_t5_model import MegatronT5Model
 from nemo.collections.nlp.models.machine_translation.megatron_nmt_model import MegatronNMTModel
-from nemo.collections.nlp.parts.nlp_overrides import NLPSaveRestoreConnector
+from nemo.collections.nlp.parts.nlp_overrides import (
+    GradScaler,
+    NLPDDPStrategy,
+    NLPSaveRestoreConnector,
+    PipelineMixedPrecisionPlugin,
+)
 from nemo.utils import AppState, logging
 from nemo.utils.distributed import initialize_distributed
 from nemo.utils.model_utils import inject_model_parallel_rank
@@ -80,10 +89,22 @@ def get_args():
         help="If pipeline parallel size > 1, this is the rank at which the encoder ends and the decoder begins.",
     )
     parser.add_argument(
-        "--model_type", type=str, required=True, default="gpt", choices=["gpt", "t5", "bert", "nmt", "bart", "retro"]
+        "--model_type",
+        type=str,
+        required=True,
+        default="gpt",
+        choices=["gpt", "sft", "t5", "bert", "nmt", "bart", "retro"],
     )
     parser.add_argument("--local_rank", type=int, required=False, default=os.getenv('LOCAL_RANK', -1))
     parser.add_argument("--bcp", action="store_true", help="Whether on BCP platform")
+    parser.add_argument(
+        "--precision",
+        type=str,
+        required=False,
+        default='16-mixed',
+        choices=['32-true', '16-mixed', 'bf16-mixed'],
+        help="Precision value for the trainer that matches with precision of the ckpt",
+    )
 
     args = parser.parse_args()
     return args
@@ -94,12 +115,34 @@ def convert(local_rank, rank, world_size, args):
     app_state = AppState()
     app_state.data_parallel_rank = 0
     num_nodes = world_size // args.gpus_per_node
+    plugins = []
+    strategy = "auto"
     if args.bcp:
-        trainer = Trainer(
-            devices=args.gpus_per_node, num_nodes=num_nodes, accelerator='gpu', plugins=[TorchElasticEnvironment()]
+        plugins.append(TorchElasticEnvironment())
+    if args.model_type == 'gpt':
+        strategy = NLPDDPStrategy()
+
+    cfg = {
+        'trainer': {
+            'devices': args.gpus_per_node,
+            'num_nodes': num_nodes,
+            'accelerator': 'gpu',
+            'precision': args.precision,
+        },
+        'model': {'native_amp_init_scale': 2 ** 32, 'native_amp_growth_interval': 1000, 'hysteresis': 2},
+    }
+    cfg = OmegaConf.create(cfg)
+
+    scaler = None
+    # If FP16 create a GradScaler as the build_model_parallel_config of MegatronBaseModel expects it
+    if cfg.trainer.precision == '16-mixed':
+        scaler = GradScaler(
+            init_scale=cfg.model.get('native_amp_init_scale', 2 ** 32),
+            growth_interval=cfg.model.get('native_amp_growth_interval', 1000),
+            hysteresis=cfg.model.get('hysteresis', 2),
         )
-    else:
-        trainer = Trainer(devices=args.gpus_per_node, num_nodes=num_nodes, accelerator='gpu')
+    plugins.append(PipelineMixedPrecisionPlugin(precision=cfg.trainer.precision, device='cuda', scaler=scaler))
+    trainer = Trainer(plugins=plugins, strategy=strategy, **cfg.trainer)
 
     app_state.pipeline_model_parallel_size = args.pipeline_model_parallel_size
     app_state.tensor_model_parallel_size = args.tensor_model_parallel_size
@@ -121,16 +164,21 @@ def convert(local_rank, rank, world_size, args):
     app_state.model_parallel_size = app_state.tensor_model_parallel_size * app_state.pipeline_model_parallel_size
 
     parallel_state.initialize_model_parallel(
-        tensor_model_parallel_size_=app_state.tensor_model_parallel_size,
-        pipeline_model_parallel_size_=app_state.pipeline_model_parallel_size,
-        pipeline_model_parallel_split_rank_=app_state.pipeline_model_parallel_split_rank,
+        tensor_model_parallel_size=app_state.tensor_model_parallel_size,
+        pipeline_model_parallel_size=app_state.pipeline_model_parallel_size,
+        pipeline_model_parallel_split_rank=app_state.pipeline_model_parallel_split_rank,
     )
 
     app_state.pipeline_model_parallel_rank = parallel_state.get_pipeline_model_parallel_rank()
     app_state.tensor_model_parallel_rank = parallel_state.get_tensor_model_parallel_rank()
 
-    # inject model parallel rank
-    checkpoint_path = inject_model_parallel_rank(os.path.join(args.checkpoint_folder, args.checkpoint_name))
+    # check for distributed checkpoint
+    dist_ckpt_dir = os.path.join(args.checkpoint_folder, args.checkpoint_name)
+    if os.path.isdir(dist_ckpt_dir):
+        checkpoint_path = dist_ckpt_dir
+    else:
+        # legacy checkpoint needs model parallel injection
+        checkpoint_path = inject_model_parallel_rank(os.path.join(args.checkpoint_folder, args.checkpoint_name))
 
     logging.info(
         f'rank: {rank}, local_rank: {local_rank}, is loading checkpoint: {checkpoint_path} for tp_rank: {app_state.tensor_model_parallel_rank} and pp_rank: {app_state.pipeline_model_parallel_rank}'
@@ -138,6 +186,15 @@ def convert(local_rank, rank, world_size, args):
 
     if args.model_type == 'gpt':
         model = MegatronGPTModel.load_from_checkpoint(checkpoint_path, hparams_file=args.hparams_file, trainer=trainer)
+    elif args.model_type == 'sft':
+        model = MegatronGPTSFTModel.load_from_checkpoint(
+            checkpoint_path, hparams_file=args.hparams_file, trainer=trainer
+        )
+        # we force the target for the loaded model to have the correct target
+        # because the hparams.yaml sometimes contains MegatronGPTModel as the target.
+        with open_dict(model.cfg):
+            model.cfg.target = f"{MegatronGPTSFTModel.__module__}.{MegatronGPTSFTModel.__name__}"
+
     elif args.model_type == 'bert':
         model = MegatronBertModel.load_from_checkpoint(
             checkpoint_path, hparams_file=args.hparams_file, trainer=trainer

@@ -56,6 +56,23 @@ Base Connector classes
     :members:
     :member-order: bysource
 
+
+Base Mixin Classes
+------------------
+
+.. autoclass:: nemo.core.classes.mixins.access_mixins.AccessMixin
+    :show-inheritance:
+    :members:
+    :member-order: bysource
+
+-----
+
+.. autoclass:: nemo.core.classes.mixins.hf_io_mixin.HuggingFaceFileIO
+    :show-inheritance:
+    :members:
+    :member-order: bysource
+
+
 Neural Type checking
 --------------------
 
@@ -102,3 +119,18 @@ Experiment manager
     :show-inheritance:
     :members:
     :member-order: bysource
+
+.. autoclass:: nemo.utils.exp_manager.ExpManagerConfig
+    :show-inheritance:
+    :members:
+    :member-order: bysource
+
+
+Exportable
+----------
+
+.. autoclass:: nemo.core.classes.exportable.Exportable
+    :show-inheritance:
+    :members:
+    :member-order: bysource
+

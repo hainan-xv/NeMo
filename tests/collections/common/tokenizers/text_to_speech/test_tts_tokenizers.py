@@ -13,14 +13,16 @@
 # limitations under the License.
 
 import pytest
-from nemo_text_processing.g2p.modules import IPAG2P
 
 from nemo.collections.common.tokenizers.text_to_speech.tts_tokenizers import (
     EnglishCharsTokenizer,
+    FrenchCharsTokenizer,
     GermanCharsTokenizer,
     IPATokenizer,
+    ItalianCharsTokenizer,
     SpanishCharsTokenizer,
 )
+from nemo.collections.tts.g2p.models.i18n_ipa import IpaG2p
 
 
 class TestTTSTokenizers:
@@ -32,6 +34,15 @@ class TestTTSTokenizers:
     PHONEME_DICT_ES = {
         "BUENOS": ["bwˈenos"],
         "DÍAS": ["dˈias"],
+    }
+    PHONEME_DICT_IT = {
+        "CIAO": ["tʃˈao"],
+        "MONDO": ["mˈondo"],
+    }
+    PHONEME_DICT_FR = {
+        "BONJOUR": ["bɔ̃ʒˈuʁ"],
+        "LE": ["lˈə-"],
+        "MONDE": ["mˈɔ̃d"],
     }
 
     @staticmethod
@@ -81,9 +92,21 @@ class TestTTSTokenizers:
     @pytest.mark.unit
     def test_german_chars_tokenizer(self):
         input_text = "Was ist dein Lieblingsgetränk?"
-        expected_output = "was ist dein lieblingsgetränk?"
+        expected_output = "Was ist dein Lieblingsgetränk?"
 
         tokenizer = GermanCharsTokenizer()
+        chars, tokens = self._parse_text(tokenizer, input_text)
+
+        assert chars == expected_output
+        assert len(tokens) == len(input_text)
+
+    @pytest.mark.run_only_on('CPU')
+    @pytest.mark.unit
+    def test_italian_chars_tokenizer(self):
+        input_text = "Ciao mondo!"
+        expected_output = "ciao mondo!"
+
+        tokenizer = ItalianCharsTokenizer()
         chars, tokens = self._parse_text(tokenizer, input_text)
 
         assert chars == expected_output
@@ -103,11 +126,23 @@ class TestTTSTokenizers:
 
     @pytest.mark.run_only_on('CPU')
     @pytest.mark.unit
+    def test_french_chars_tokenizer(self):
+        input_text = "Bon après-midi !"
+        expected_output = "bon après-midi !"
+
+        tokenizer = FrenchCharsTokenizer()
+        chars, tokens = self._parse_text(tokenizer, input_text)
+
+        assert chars == expected_output
+        assert len(tokens) == len(input_text)
+
+    @pytest.mark.run_only_on('CPU')
+    @pytest.mark.unit
     def test_ipa_tokenizer(self):
         input_text = "Hello world!"
         expected_output = " həˈɫoʊ ˈwɝɫd! "
 
-        g2p = IPAG2P(phoneme_dict=self.PHONEME_DICT_EN)
+        g2p = IpaG2p(phoneme_dict=self.PHONEME_DICT_EN)
 
         tokenizer = IPATokenizer(g2p=g2p, locale=None, pad_with_space=True)
         chars, tokens = self._parse_text(tokenizer, input_text)
@@ -117,7 +152,7 @@ class TestTTSTokenizers:
     @pytest.mark.run_only_on('CPU')
     @pytest.mark.unit
     def test_ipa_tokenizer_unsupported_locale(self):
-        g2p = IPAG2P(phoneme_dict=self.PHONEME_DICT_EN)
+        g2p = IpaG2p(phoneme_dict=self.PHONEME_DICT_EN)
         with pytest.raises(ValueError, match="Unsupported locale"):
             IPATokenizer(g2p=g2p, locale="asdf")
 
@@ -127,8 +162,20 @@ class TestTTSTokenizers:
         input_text = "Hallo welt"
         expected_output = "hˈaloː vˈɛlt"
 
-        g2p = IPAG2P(phoneme_dict=self.PHONEME_DICT_DE, locale="de-DE")
+        g2p = IpaG2p(phoneme_dict=self.PHONEME_DICT_DE, locale="de-DE")
         tokenizer = IPATokenizer(g2p=g2p, locale="de-DE")
+        chars, tokens = self._parse_text(tokenizer, input_text)
+
+        assert chars == expected_output
+
+    @pytest.mark.run_only_on('CPU')
+    @pytest.mark.unit
+    def test_ipa_tokenizer_it_it(self):
+        input_text = "Ciao mondo"
+        expected_output = "tʃˈao mˈondo"
+
+        g2p = IpaG2p(phoneme_dict=self.PHONEME_DICT_IT, locale="it-IT")
+        tokenizer = IPATokenizer(g2p=g2p, locale="it-IT")
         chars, tokens = self._parse_text(tokenizer, input_text)
 
         assert chars == expected_output
@@ -138,7 +185,7 @@ class TestTTSTokenizers:
     def test_ipa_tokenizer_en_us(self):
         input_text = "Hello café."
         expected_output = "həˈɫoʊ kəˈfeɪ."
-        g2p = IPAG2P(phoneme_dict=self.PHONEME_DICT_EN)
+        g2p = IpaG2p(phoneme_dict=self.PHONEME_DICT_EN)
 
         tokenizer = IPATokenizer(g2p=g2p, locale="en-US")
         tokenizer.tokens.extend("CAFE")
@@ -152,8 +199,56 @@ class TestTTSTokenizers:
         input_text = "¡Buenos días!"
         expected_output = "¡bwˈenos dˈias!"
 
-        g2p = IPAG2P(phoneme_dict=self.PHONEME_DICT_ES, locale="es-ES")
+        g2p = IpaG2p(phoneme_dict=self.PHONEME_DICT_ES, locale="es-ES")
         tokenizer = IPATokenizer(g2p=g2p, locale="es-ES")
         chars, tokens = self._parse_text(tokenizer, input_text)
 
+        assert chars == expected_output
+
+    @pytest.mark.run_only_on('CPU')
+    @pytest.mark.unit
+    def test_ipa_tokenizer_fr_fr(self):
+        input_text = "Bonjour le monde"
+        expected_output = "bɔ̃ʒˈuʁ lˈə- mˈɔ̃d"
+
+        g2p = IpaG2p(phoneme_dict=self.PHONEME_DICT_FR, locale="fr-FR")
+        tokenizer = IPATokenizer(g2p=g2p, locale="fr-FR")
+        chars, tokens = self._parse_text(tokenizer, input_text)
+
+        assert chars == expected_output
+
+    @pytest.mark.run_only_on('CPU')
+    @pytest.mark.unit
+    def test_ipa_tokenizer_fixed_vocab(self):
+        phoneme_dict = self.PHONEME_DICT_EN
+        phoneme_dict["WOUND"] = ["ˈwaʊnd", "ˈwund"]
+        g2p = IpaG2p(phoneme_dict=phoneme_dict)
+
+        assert "WOUND" in g2p.phoneme_dict
+
+        # fmt: off
+        symbol_vocab = {
+            'H', 'E', 'L', 'L', 'O',
+            'W', 'O', 'R', 'L', 'D',
+            'C', 'A', 'F', 'E',
+            'W', 'O', 'U', 'N', 'D',
+            'h', 'ə', 'ˈ', 'ɫ', 'o', 'ʊ',
+            'ˈ', 'w', 'ɝ', 'ɫ', 'd',
+            'k', 'ə', 'ˈ', 'f', 'e', 'ɪ',
+            'ˈ', 'w', 'a', 'ʊ', 'n', 'd',
+            'ˈ', 'w', 'u', 'n', 'd',
+        }
+        # fmt: on
+        fixed_vocab = symbol_vocab - {'ʊ', 'F'}
+        tokenizer = IPATokenizer(g2p=g2p, locale="en-US", fixed_vocab=fixed_vocab)
+
+        # Make sure phoneme_dict has been updated properly
+        assert "HELLO" not in tokenizer.g2p.phoneme_dict
+        assert "WORLD" in tokenizer.g2p.phoneme_dict
+        assert "CAFE" not in tokenizer.g2p.phoneme_dict
+        assert len(tokenizer.g2p.phoneme_dict["WOUND"]) == 1
+        assert tokenizer.g2p.phoneme_dict["WOUND"][0] == list("ˈwund")
+
+        chars, tokens = self._parse_text(tokenizer, "Hello, wound")
+        expected_output = "HELLO, ˈwund"
         assert chars == expected_output

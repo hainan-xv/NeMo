@@ -45,7 +45,6 @@ class CausalConv2D(nn.Conv2d):
             raise ValueError("Argument padding should be set to None for CausalConv2D.")
         self._left_padding = kernel_size - 1
         self._right_padding = stride - 1
-        self._cache_id = None
 
         padding = 0
         super(CausalConv2D, self).__init__(
@@ -68,15 +67,6 @@ class CausalConv2D(nn.Conv2d):
         x = F.pad(x, pad=(self._left_padding, self._right_padding, self._left_padding, self._right_padding))
         x = super().forward(x)
         return x
-
-
-@torch.jit.script
-def keep_in_cache_next(cache: torch.Tensor, cache_next: torch.Tensor, cache_keep_size: torch.Tensor, cache_id: int):
-    # Current ONNX does not support a Tensor with a dimension of zero
-    # Needed to use Torch script to skip this part when this case happens
-    if cache_keep_size < cache_next.size(-1):
-        cache_next[cache_id, :, :, :-cache_keep_size] = cache[cache_id, :, :, cache_keep_size:]
-    return cache_next
 
 
 class CausalConv1D(nn.Conv1d):
@@ -122,7 +112,6 @@ class CausalConv1D(nn.Conv1d):
                 raise ValueError(f"Invalid padding param: {padding}!")
 
         self._max_cache_len = self._left_padding
-        self._cache_id = None
 
         super(CausalConv1D, self).__init__(
             in_channels=in_channels,
@@ -138,27 +127,24 @@ class CausalConv1D(nn.Conv1d):
             dtype=dtype,
         )
 
-    def update_cache(self, x, cache=None, cache_next=None):
+    def update_cache(self, x, cache=None):
         if cache is None:
-            x = F.pad(x, pad=(self._left_padding, self._right_padding))
+            new_x = F.pad(x, pad=(self._left_padding, self._right_padding))
+            next_cache = cache
         else:
-            input_x = x
-            needed_cache = cache[self._cache_id, :, :, -self._max_cache_len :]
-            x = F.pad(x, pad=(0, self._right_padding))
-            x = torch.cat((needed_cache, x), dim=-1)
+            new_x = F.pad(x, pad=(0, self._right_padding))
+            new_x = torch.cat([cache, new_x], dim=-1)
+            if self.cache_drop_size > 0:
+                next_cache = new_x[:, :, : -self.cache_drop_size]
+            else:
+                next_cache = new_x
+            next_cache = next_cache[:, :, -cache.size(-1) :]
+        return new_x, next_cache
 
-        if cache_next is not None:
-            input_x_kept = input_x[:, :, : input_x.size(-1) - self.cache_drop_size]
-
-            cache_keep_size = torch.tensor(input_x.size(-1) - self.cache_drop_size, dtype=torch.int64)
-            cache_keep_size = cache_keep_size.clip(min=1, max=cache_next.size(-1))
-            keep_in_cache_next(
-                cache=cache, cache_next=cache_next, cache_keep_size=cache_keep_size, cache_id=self._cache_id
-            )
-            cache_next[self._cache_id, :, :, -cache_keep_size:] = input_x_kept[:, :, -cache_keep_size:]
-        return x
-
-    def forward(self, x, cache=None, cache_next=None):
-        x = self.update_cache(x, cache=cache, cache_next=cache_next)
+    def forward(self, x, cache=None):
+        x, cache = self.update_cache(x, cache=cache)
         x = super().forward(x)
-        return x
+        if cache is None:
+            return x
+        else:
+            return x, cache

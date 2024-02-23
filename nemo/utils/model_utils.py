@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import copy
+import importlib
 import os
 from dataclasses import dataclass, is_dataclass
 from enum import Enum
@@ -53,10 +54,10 @@ class ArtifactPathType(Enum):
     TAR_PATH = 1
 
 
-@dataclass(init=False)
+@dataclass
 class ArtifactItem:
-    path: str
-    path_type: ArtifactPathType
+    path: str = ""
+    path_type: ArtifactPathType = ArtifactPathType.LOCAL_PATH
     hashed_path: Optional[str] = None
 
 
@@ -256,7 +257,7 @@ def resolve_validation_dataloaders(model: 'ModelPT'):
 
     ds_key = resolve_dataset_name_from_cfg(cfg.validation_ds)
 
-    if ds_key is None:
+    if ds_key is None or val_dl_idx < 0:
         logging.debug(
             "Could not resolve file path from provided config - {}. "
             "Disabling support for multi-dataloaders.".format(cfg.validation_ds)
@@ -270,12 +271,21 @@ def resolve_validation_dataloaders(model: 'ModelPT'):
     if isinstance(ds_values, (list, tuple, ListConfig)):
 
         for ds_value in ds_values:
-            cfg.validation_ds[ds_key] = ds_value
+            if isinstance(ds_value, (dict, DictConfig)):
+                # this is a nested dataset
+                cfg.validation_ds = ds_value
+            else:
+                cfg.validation_ds[ds_key] = ds_value
+
             model.setup_validation_data(cfg.validation_ds)
             dataloaders.append(model._validation_dl)
 
         model._validation_dl = dataloaders
-        model._validation_names = [parse_dataset_as_name(ds) for ds in ds_values]
+        if len(ds_values) > 0 and isinstance(ds_values[0], (dict, DictConfig)):
+            # using the name of each of the nested dataset
+            model._validation_names = [ds.name for ds in ds_values]
+        else:
+            model._validation_names = [parse_dataset_as_name(ds) for ds in ds_values]
         unique_names_check(name_list=model._validation_names)
         return
 
@@ -340,12 +350,21 @@ def resolve_test_dataloaders(model: 'ModelPT'):
     if isinstance(ds_values, (list, tuple, ListConfig)):
 
         for ds_value in ds_values:
-            cfg.test_ds[ds_key] = ds_value
+            if isinstance(ds_value, (dict, DictConfig)):
+                # this is a nested dataset
+                cfg.test_ds = ds_value
+            else:
+                cfg.test_ds[ds_key] = ds_value
+
             model.setup_test_data(cfg.test_ds)
             dataloaders.append(model._test_dl)
 
         model._test_dl = dataloaders
-        model._test_names = [parse_dataset_as_name(ds) for ds in ds_values]
+        if len(ds_values) > 0 and isinstance(ds_values[0], (dict, DictConfig)):
+            # using the name of each of the nested dataset
+            model._test_names = [ds.name for ds in ds_values]
+        else:
+            model._test_names = [parse_dataset_as_name(ds) for ds in ds_values]
 
         unique_names_check(name_list=model._test_names)
         return
@@ -536,7 +555,7 @@ def check_lib_version(lib_name: str, checked_version: str, operator) -> Tuple[Op
         if '.' in lib_name:
             mod = import_class_by_path(lib_name)
         else:
-            mod = __import__(lib_name)
+            mod = importlib.import_module(lib_name)
 
         if hasattr(mod, '__version__'):
             lib_ver = version.Version(mod.__version__)
@@ -557,7 +576,7 @@ def check_lib_version(lib_name: str, checked_version: str, operator) -> Tuple[Op
                 f"Could not check version compatibility."
             )
             return False, msg
-    except (ImportError, ModuleNotFoundError):
+    except (AttributeError, ImportError, ModuleNotFoundError):
         pass
 
     msg = f"Lib {lib_name} has not been installed. Please use pip or conda to install this package."
@@ -566,7 +585,7 @@ def check_lib_version(lib_name: str, checked_version: str, operator) -> Tuple[Op
 
 def uninject_model_parallel_rank(filepath):
     filepath = str(filepath)
-    if 'mp_rank' in filepath or 'tp_rank' in filepath:
+    if any([s for s in ['mp_rank', 'tp_rank', 'fsdp_shard'] if s in filepath]):
         dirname = os.path.dirname(os.path.dirname(filepath))
         basename = os.path.basename(filepath)
         filepath = os.path.join(dirname, basename)
@@ -575,7 +594,7 @@ def uninject_model_parallel_rank(filepath):
         return filepath
 
 
-def inject_model_parallel_rank(filepath):
+def inject_model_parallel_rank(filepath, fsdp_sharded_ckpt=False):
     """
     Injects tensor/pipeline model parallel ranks into the filepath.
     Does nothing if not using model parallelism.
@@ -584,14 +603,36 @@ def inject_model_parallel_rank(filepath):
     filepath = uninject_model_parallel_rank(filepath)
 
     app_state = AppState()
+    dirname = os.path.dirname(filepath)
+    basename = os.path.basename(filepath)
     if app_state.model_parallel_size is not None and app_state.model_parallel_size > 1:
-        # filepath needs to be updated to include mp_rank
-        dirname = os.path.dirname(filepath)
-        basename = os.path.basename(filepath)
+        fsdp_shard = f'_fsdp_shard_{app_state.data_parallel_rank:05d}' if fsdp_sharded_ckpt else ''
         if app_state.pipeline_model_parallel_size is None or app_state.pipeline_model_parallel_size == 1:
-            filepath = f'{dirname}/mp_rank_{app_state.tensor_model_parallel_rank:02d}/{basename}'
+            filepath = f'{dirname}/mp_rank_{app_state.tensor_model_parallel_rank:02d}{fsdp_shard}/{basename}'
         else:
             filepath = f'{dirname}/tp_rank_{app_state.tensor_model_parallel_rank:02d}_pp_rank_{app_state.pipeline_model_parallel_rank:03d}/{basename}'
         return filepath
     else:
+        fsdp_shard = f'/fsdp_shard_{app_state.data_parallel_rank:05d}' if fsdp_sharded_ckpt else ''
+        return f'{dirname}{fsdp_shard}/{basename}'
+
+
+def ckpt_to_dir(filepath: Union[str, Path]) -> Path:
+    """ PTL considers checkpoints as .ckpt files.
+        This method removes the extension and returns a path
+        to be used as a directory for distributed checkpoints
+    """
+
+    filepath = Path(filepath)
+
+    # if it is already a distributed checkpoint, then return
+    if filepath.suffix != ".ckpt" and filepath.is_dir():
         return filepath
+
+    # adding this assert because we will later remove directories based on the return value of this method
+    assert filepath.suffix == ".ckpt", f'filepath: {filepath} must have .ckpt extension'
+
+    # create a new path whose name is the original filepath without the .ckpt extension
+    checkpoint_dir = filepath.with_name(filepath.stem)
+
+    return checkpoint_dir
