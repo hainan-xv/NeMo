@@ -686,9 +686,10 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 )
                 bleu = self.bleu.compute(return_all_metrics=False)['bleu']
                 self.bleu.reset()
-                tensorboard_logs.update({'training_batch_wer': bleu})
+                tensorboard_logs.update({'training_batch_bleu': bleu})
 
         else:
+            assert(0)
             # If experimental fused Joint-Loss-WER is used
             if (sample_id + 1) % log_every_n_steps == 0:
                 compute_wer = True
