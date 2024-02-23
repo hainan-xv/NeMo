@@ -606,14 +606,26 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin):
         return test_logs
 
     def multi_validation_epoch_end(self, outputs, dataloader_idx: int = 0):
+        super_return = super(self).multi_validation_epoch_end(outputs, dataloader_idx)
         if self.compute_eval_loss:
             val_loss_mean = torch.stack([x['val_loss'] for x in outputs]).mean()
             val_loss_log = {'val_loss': val_loss_mean}
         else:
             val_loss_log = {}
-        wer_num = torch.stack([x['val_wer_num'] for x in outputs]).sum()
-        wer_denom = torch.stack([x['val_wer_denom'] for x in outputs]).sum()
-        tensorboard_logs = {**val_loss_log, 'val_wer': wer_num.float() / wer_denom}
+
+#        wer_num = torch.stack([x['val_wer_num'] for x in outputs]).sum()
+#        wer_denom = torch.stack([x['val_wer_denom'] for x in outputs]).sum()
+#        tensorboard_logs = {**val_loss_log, 'val_wer': wer_num.float() / wer_denom}
+
+        if "val_bleu_num" in outputs[0]:
+            bleu_pred_len = torch.stack([x[f"val_bleu_pred_len"] for x in outputs]).sum()
+            bleu_target_len = torch.stack([x[f"val_bleu_target_len"] for x in outputs]).sum()
+            bleu_num = torch.stack([x[f"val_bleu_num"] for x in outputs]).sum(dim=0)
+            bleu_denom = torch.stack([x[f"val_bleu_denom"] for x in outputs]).sum(dim=0)
+            val_bleu = {"val_bleu": self.bleu._compute_bleu(bleu_pred_len, bleu_target_len, bleu_num, bleu_denom)}
+
+            tensorboard_logs.update(val_bleu)
+
         if self.ctc_loss_weight > 0:
             ctc_wer_num = torch.stack([x['val_wer_num_ctc'] for x in outputs]).sum()
             ctc_wer_denom = torch.stack([x['val_wer_denom_ctc'] for x in outputs]).sum()
