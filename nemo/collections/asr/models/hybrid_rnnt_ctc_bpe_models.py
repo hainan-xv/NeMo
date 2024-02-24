@@ -51,7 +51,10 @@ class EncDecHybridRNNTCTCBPEModel(EncDecHybridRNNTCTCModel, ASRBPEMixin):
             cfg = OmegaConf.create(cfg)
 
         # Setup the tokenizer
-        self._setup_tokenizer(cfg.tokenizer, cfg.inter_tokenizer)
+        if 'inter_tokenizer' in cfg:
+            self._setup_tokenizer(cfg.tokenizer, cfg.inter_tokenizer)
+        else:
+            self._setup_tokenizer(cfg.tokenizer, cfg.tokenizer)
 
         # Initialize a dummy vocabulary
         if hasattr(self.tokenizer.tokenizer, 'vocab') and callable(self.tokenizer.tokenizer.vocab):
@@ -144,6 +147,8 @@ class EncDecHybridRNNTCTCBPEModel(EncDecHybridRNNTCTCModel, ASRBPEMixin):
                 dataset=LhotseSpeechToTextBpeDataset(tokenizer=self.tokenizer,),
             )
 
+        print("self.inter_tokenizer", self.inter_tokenizer)
+        print("self.tokenizer", self.tokenizer)
         dataset = audio_to_text_dataset.get_audio_to_text_bpe_dataset_from_config(
             config=config,
             local_rank=self.local_rank,

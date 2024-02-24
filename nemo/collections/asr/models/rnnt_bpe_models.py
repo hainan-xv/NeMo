@@ -292,7 +292,7 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
             cfg = OmegaConf.create(cfg)
 
         # Setup the tokenizer
-        self._setup_tokenizer(cfg.tokenizer)
+        self._setup_tokenizer(cfg.tokenizer, cfg.tokenizer)
 
         # Initialize a dummy vocabulary
 #        vocabulary = self.tokenizer.tokenizer.get_vocab()

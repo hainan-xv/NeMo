@@ -884,6 +884,7 @@ class _TarredAudioToTextDataset(IterableDataset):
         audio_tar_filepaths: Union[str, List[str]],
         manifest_filepath: str,
         parser: Callable,
+        inter_parser: Callable,
         sample_rate: int,
         int_values: bool = False,
         augmentor: Optional['nemo.collections.asr.parts.perturb.AudioAugmentor'] = None,
@@ -894,6 +895,9 @@ class _TarredAudioToTextDataset(IterableDataset):
         bos_id: Optional[int] = None,
         eos_id: Optional[int] = None,
         pad_id: int = 0,
+        inter_bos_id: Optional[int] = None,
+        inter_eos_id: Optional[int] = None,
+        inter_pad_id: int = 0,
         shard_strategy: str = "scatter",
         shard_manifests: bool = False,
         global_rank: int = 0,
@@ -917,12 +921,16 @@ class _TarredAudioToTextDataset(IterableDataset):
         self.manifest_processor = ASRManifestProcessor(
             manifest_filepath=manifest_filepath,
             parser=parser,
+            inter_parser=inter_parser,
             max_duration=max_duration,
             min_duration=min_duration,
             max_utts=0,
             bos_id=bos_id,
             eos_id=eos_id,
             pad_id=pad_id,
+            inter_bos_id=inter_bos_id,
+            inter_eos_id=inter_eos_id,
+            inter_pad_id=inter_pad_id,
             index_by_file_id=True,  # Must set this so the manifest lines can be indexed by file ID
         )
 
@@ -933,6 +941,9 @@ class _TarredAudioToTextDataset(IterableDataset):
         self.eos_id = eos_id
         self.bos_id = bos_id
         self.pad_id = pad_id
+        self.inter_eos_id = inter_eos_id
+        self.inter_bos_id = inter_bos_id
+        self.inter_pad_id = inter_pad_id
         self.return_sample_id = return_sample_id
 
         audio_tar_filepaths = expand_sharded_filepaths(
@@ -1339,6 +1350,7 @@ class TarredAudioToBPEDataset(_TarredAudioToTextDataset):
         audio_tar_filepaths: Union[str, List[str]],
         manifest_filepath: str,
         tokenizer: 'nemo.collections.common.tokenizers.TokenizerSpec',
+        inter_tokenizer: 'nemo.collections.common.tokenizers.TokenizerSpec',
         sample_rate: int,
         int_values: bool = False,
         augmentor: Optional['nemo.collections.asr.parts.perturb.AudioAugmentor'] = None,
@@ -1368,6 +1380,21 @@ class TarredAudioToBPEDataset(_TarredAudioToTextDataset):
         else:
             pad_id = 0
 
+        if use_start_end_token and hasattr(inter_tokenizer, "bos_id") and inter_tokenizer.bos_id > 0:
+            inter_bos_id = inter_tokenizer.bos_id
+        else:
+            inter_bos_id = None
+
+        if use_start_end_token and hasattr(inter_tokenizer, "eos_id") and inter_tokenizer.eos_id > 0:
+            inter_eos_id = inter_tokenizer.eos_id
+        else:
+            inter_eos_id = None
+
+        if hasattr(inter_tokenizer, "pad_id") and inter_tokenizer.pad_id > 0:
+            inter_pad_id = inter_tokenizer.pad_id
+        else:
+            inter_pad_id = 0
+
         class TokenizerWrapper:
             def __init__(self, tokenizer):
                 if isinstance(tokenizer, tokenizers.aggregate_tokenizer.AggregateTokenizer):
@@ -1390,6 +1417,7 @@ class TarredAudioToBPEDataset(_TarredAudioToTextDataset):
             audio_tar_filepaths=audio_tar_filepaths,
             manifest_filepath=manifest_filepath,
             parser=TokenizerWrapper(tokenizer),
+            inter_parser=TokenizerWrapper(inter_tokenizer),
             sample_rate=sample_rate,
             int_values=int_values,
             augmentor=augmentor,
@@ -1400,6 +1428,9 @@ class TarredAudioToBPEDataset(_TarredAudioToTextDataset):
             bos_id=bos_id,
             eos_id=eos_id,
             pad_id=pad_id,
+            inter_bos_id=inter_bos_id,
+            inter_eos_id=inter_eos_id,
+            inter_pad_id=inter_pad_id,
             shard_strategy=shard_strategy,
             shard_manifests=shard_manifests,
             global_rank=global_rank,
