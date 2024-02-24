@@ -51,10 +51,13 @@ class EncDecHybridRNNTCTCBPEModel(EncDecHybridRNNTCTCModel, ASRBPEMixin):
             cfg = OmegaConf.create(cfg)
 
         # Setup the tokenizer
-        self._setup_tokenizer(cfg.tokenizer)
+        self._setup_tokenizer(cfg.tokenizer, cfg.inter_tokenizer)
 
         # Initialize a dummy vocabulary
-        vocabulary = self.tokenizer.tokenizer.get_vocab()
+        if hasattr(self.tokenizer.tokenizer, 'vocab') and callable(self.tokenizer.tokenizer.vocab):
+            vocabulary = self.tokenizer.tokenizer.vocab()
+        else:
+            vocabulary = self.tokenizer.tokenizer.get_vocab()
 
         # Set the new vocabulary
         with open_dict(cfg):
@@ -75,8 +78,9 @@ class EncDecHybridRNNTCTCBPEModel(EncDecHybridRNNTCTCModel, ASRBPEMixin):
                 "The config need to have a section for the CTC decoder named as aux_ctc for Hybrid models."
             )
 
+#        print('vcab is', vocabulary)
         with open_dict(cfg):
-            if self.tokenizer_type == "agg":
+            if self.tokenizer_type == "agg" or self.tokenizer_type == 'yttm':
                 cfg.aux_ctc.decoder.vocabulary = ListConfig(vocabulary)
             else:
                 cfg.aux_ctc.decoder.vocabulary = ListConfig(list(vocabulary.keys()))
@@ -146,6 +150,7 @@ class EncDecHybridRNNTCTCBPEModel(EncDecHybridRNNTCTCModel, ASRBPEMixin):
             global_rank=self.global_rank,
             world_size=self.world_size,
             tokenizer=self.tokenizer,
+            inter_tokenizer=self.inter_tokenizer,
             preprocessor_cfg=self.cfg.get("preprocessor", None),
         )
 
@@ -269,7 +274,7 @@ class EncDecHybridRNNTCTCBPEModel(EncDecHybridRNNTCTCModel, ASRBPEMixin):
             tokenizer_cfg = OmegaConf.create({'dir': new_tokenizer_dir, 'type': new_tokenizer_type})
 
         # Setup the tokenizer
-        self._setup_tokenizer(tokenizer_cfg)
+        self._setup_tokenizer(tokenizer_cfg, inter_tokenizer_cfg)
 
         # Initialize a dummy vocabulary
         vocabulary = self.tokenizer.tokenizer.get_vocab()

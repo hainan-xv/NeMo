@@ -210,7 +210,7 @@ def get_concat_bpe_dataset(
 
 
 def get_bpe_dataset(
-    config: dict, tokenizer: 'TokenizerSpec', augmentor: Optional['AudioAugmentor'] = None
+    config: dict, tokenizer: 'TokenizerSpec', inter_tokenizer: 'TokenizerSpec', augmentor: Optional['AudioAugmentor'] = None
 ) -> audio_to_text.AudioToBPEDataset:
     """
     Instantiates a Byte Pair Encoding / Word Piece Encoding based AudioToBPEDataset.
@@ -226,6 +226,7 @@ def get_bpe_dataset(
     dataset = audio_to_text.AudioToBPEDataset(
         manifest_filepath=config['manifest_filepath'],
         tokenizer=tokenizer,
+        inter_tokenizer=inter_tokenizer,
         sample_rate=config['sample_rate'],
         int_values=config.get('int_values', False),
         augmentor=augmentor,
@@ -711,6 +712,7 @@ def get_audio_to_text_bpe_dataset_from_config(
     global_rank: int,
     world_size: int,
     tokenizer,
+    inter_tokenizer,
     preprocessor_cfg: Optional[DictConfig] = None,
 ):
     """
@@ -838,7 +840,7 @@ def get_audio_to_text_bpe_dataset_from_config(
                 augmentor=augmentor,
             )
         else:
-            dataset = get_bpe_dataset(config=config, tokenizer=tokenizer, augmentor=augmentor)
+            dataset = get_bpe_dataset(config=config, tokenizer=tokenizer, inter_tokenizer=inter_tokenizer, augmentor=augmentor)
     return dataset
 
 

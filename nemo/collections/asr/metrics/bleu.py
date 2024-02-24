@@ -22,9 +22,14 @@ from nemo.collections.asr.parts.submodules.ctc_decoding import AbstractCTCDecodi
 from nemo.collections.asr.parts.submodules.multitask_decoding import AbstractMultiTaskDecoding
 from nemo.collections.asr.parts.submodules.rnnt_decoding import AbstractRNNTDecoding
 from nemo.utils import logging
+import re
 
 __all__ = ['BLEU']
 
+def add_space(s):
+    s = re.sub(r'([\u4e00-\u9fff])', ' \\1 ', s)
+    s = ' '.join(s.split())
+    return s
 
 def move_dimension_to_the_front(tensor, dim_index):
     all_dims = list(range(tensor.ndim))
@@ -168,6 +173,13 @@ class BLEU(SacreBLEUScore):
             if self.has_spl_tokens:
                 hypotheses = [self.decoding.strip_special_tokens(hyp) for hyp in hypotheses]
                 references = [self.decoding.strip_special_tokens(ref) for ref in references]
+
+#        print("before h, r", hypotheses[0], references[0])
+        hypotheses = [add_space(s) for s in hypotheses]
+        references = [add_space(s) for s in references]
+#        print("after  h, r", hypotheses[0], references[0])
+#        print("")
+
 
         if self.log_prediction:
             logging.info(f"\n")

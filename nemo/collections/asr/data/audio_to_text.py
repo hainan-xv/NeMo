@@ -689,6 +689,7 @@ class AudioToBPEDataset(_AudioTextDataset):
         self,
         manifest_filepath: str,
         tokenizer: 'nemo.collections.common.tokenizers.TokenizerSpec',
+        inter_tokenizer: 'nemo.collections.common.tokenizers.TokenizerSpec',
         sample_rate: int,
         int_values: bool = False,
         augmentor: 'nemo.collections.asr.parts.perturb.AudioAugmentor' = None,

@@ -1096,6 +1096,10 @@ class CTCBPEDecoding(AbstractCTCDecoding):
 
     def __init__(self, decoding_cfg, tokenizer: TokenizerSpec):
         blank_id = tokenizer.tokenizer.vocab_size
+
+        if callable(blank_id):
+            blank_id = blank_id()
+
         self.tokenizer = tokenizer
 
         super().__init__(decoding_cfg=decoding_cfg, blank_id=blank_id)
