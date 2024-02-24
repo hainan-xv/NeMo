@@ -198,37 +198,6 @@ class ASRBPEMixin(ABC):
 
         elif self.tokenizer_type == 'wpe':
             assert(0) # not implemented
-            # This is a WPE Tokenizer
-            # If path from previous registration exists, remove it
-            if 'vocab_path' in self.tokenizer_cfg:
-                vocab_path = self.tokenizer_cfg.get('vocab_path')
-            else:
-                vocab_path = os.path.join(self.tokenizer_dir, 'vocab.txt')
-            vocab_path = self.register_artifact('tokenizer.vocab_path', vocab_path)
-            self.vocab_path = vocab_path
-
-            # If path from previous registration exists, remove it
-            if 'vocab_path' in self.tokenizer_cfg:
-                self.tokenizer_cfg.pop('vocab_path')
-
-            if 'special_tokens' in self.tokenizer_cfg:
-                special_tokens = self.tokenizer_cfg['special_tokens']
-
-                if special_tokens is not None:
-                    raise ValueError("`special_tokens` are no longer supported for SentencePiece based tokenizers.")
-
-            self.tokenizer = tokenizers.AutoTokenizer(
-                pretrained_model_name='bert-base-cased',
-                vocab_file=self.vocab_path,
-                mask_token=self.hf_tokenizer_kwargs.get('mask_token', None),
-                bos_token=self.hf_tokenizer_kwargs.get('bos_token', None),
-                eos_token=self.hf_tokenizer_kwargs.get('eos_token', None),
-                pad_token=self.hf_tokenizer_kwargs.get('pad_token', None),
-                sep_token=self.hf_tokenizer_kwargs.get('sep_token', None),
-                cls_token=self.hf_tokenizer_kwargs.get('cls_token', None),
-                unk_token=self.hf_tokenizer_kwargs.get('unk_token', None),
-                use_fast=self.hf_tokenizer_kwargs.get('use_fast', False),
-            )
         elif self.inter_tokenizer_type == 'yttm':
             # This is a BPE Tokenizer
             if 'model_path' in self.inter_tokenizer_cfg:

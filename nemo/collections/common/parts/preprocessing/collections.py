@@ -109,6 +109,7 @@ class AudioText(_Collection):
         token_labels: List[Optional[int]],
         langs: List[Optional[str]],
         parser: parsers.CharParser,
+        inter_parser: parsers.CharParser,
         min_duration: Optional[float] = None,
         max_duration: Optional[float] = None,
         max_number: Optional[int] = None,
@@ -166,7 +167,7 @@ class AudioText(_Collection):
                 text_tokens = token_labels
             else:
                 if text != '':
-                    if hasattr(parser, "is_aggregate") and parser.is_aggregate and isinstance(text, str):
+                    if hasattr(inter_parser, "is_aggregate") and inter_parser.is_aggregate and isinstance(text, str):
                         if lang is not None:
                             text_tokens = parser(text, lang)
                         # for future use if want to add language bypass to audio_to_text classes
@@ -175,7 +176,7 @@ class AudioText(_Collection):
                         else:
                             raise ValueError("lang required in manifest when using aggregate tokenizers")
                     else:
-                        text_tokens = parser(text)
+                        text_tokens = inter_parser(text)
                 else:
                     text_tokens = []
 
