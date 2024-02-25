@@ -132,7 +132,8 @@ def __parse_item(line: str, manifest_file: str) -> Dict[str, Any]:
         item['text'] = ""
 
     if 'translated_text' not in item:
-        assert(0)
+        item['translated_text'] = item['text']
+#        assert(0)
 
     # Optional RTTM file
     if 'rttm_file' in item:

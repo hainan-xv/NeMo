@@ -14,7 +14,7 @@
 
 import contextlib
 import os
-from dataclasses import dataclass, is_dataclass
+from dataclasses import dataclass, is_dataclass, field
 from typing import List, Optional, Union
 
 import pytorch_lightning as pl
@@ -105,7 +105,7 @@ python transcribe_speech.py \
 class ModelChangeConfig:
 
     # Sub-config for changes specific to the Conformer Encoder
-    conformer: ConformerChangeConfig = ConformerChangeConfig()
+    conformer: ConformerChangeConfig = field(default_factory=lambda: ConformerChangeConfig())
 
 
 @dataclass
@@ -150,13 +150,13 @@ class TranscriptionConfig:
     overwrite_transcripts: bool = True
 
     # Decoding strategy for CTC models
-    ctc_decoding: CTCDecodingConfig = CTCDecodingConfig()
+    ctc_decoding: CTCDecodingConfig = field(default_factory=lambda: CTCDecodingConfig())
 
     # Decoding strategy for RNNT models
-    rnnt_decoding: RNNTDecodingConfig = RNNTDecodingConfig(fused_batch_size=-1)
+    rnnt_decoding: RNNTDecodingConfig = field(default_factory=lambda: RNNTDecodingConfig(fused_batch_size=-1))
 
     # Decoding strategy for AED models
-    multitask_decoding: MultiTaskDecodingConfig = MultiTaskDecodingConfig()
+    multitask_decoding: MultiTaskDecodingConfig = field(default_factory=lambda: MultiTaskDecodingConfig())
 
     # decoder type: ctc or rnnt, can be used to switch between CTC and RNNT decoder for Hybrid RNNT/CTC models
     decoder_type: Optional[str] = None
@@ -164,7 +164,7 @@ class TranscriptionConfig:
     att_context_size: Optional[list] = None
 
     # Use this for model-specific changes before transcription
-    model_change: ModelChangeConfig = ModelChangeConfig()
+    model_change: ModelChangeConfig = field(default_factory=lambda: ModelChangeConfig())
 
     # Config for word / character error rate calculation
     calculate_wer: bool = True
