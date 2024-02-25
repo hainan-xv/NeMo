@@ -20,6 +20,7 @@ import torch
 from omegaconf import DictConfig, ListConfig, OmegaConf, open_dict
 from pytorch_lightning import Trainer
 
+from nemo.collections.asr.models.rnnt_models import EncDecRNNTModel
 from nemo.collections.asr.data import audio_to_text_dataset
 from nemo.collections.asr.data.audio_to_text_dali import AudioToBPEDALIDataset
 from nemo.collections.asr.data.audio_to_text_lhotse import LhotseSpeechToTextBpeDataset
@@ -30,6 +31,7 @@ from nemo.collections.asr.models.hybrid_rnnt_ctc_models import EncDecHybridRNNTC
 from nemo.collections.asr.parts.mixins import ASRBPEMixin
 from nemo.collections.asr.parts.submodules.ctc_decoding import CTCBPEDecoding, CTCBPEDecodingConfig
 from nemo.collections.asr.parts.submodules.rnnt_decoding import RNNTBPEDecoding, RNNTBPEDecodingConfig
+from nemo.collections.asr.parts.submodules.rnnt_decoding import RNNTDecoding, RNNTDecodingConfig
 from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
 from nemo.core.classes.common import PretrainedModelInfo
 from nemo.utils import logging, model_utils
@@ -62,6 +64,11 @@ class EncDecHybridRNNTCTCBPEModel(EncDecHybridRNNTCTCModel, ASRBPEMixin):
         else:
             vocabulary = self.tokenizer.tokenizer.get_vocab()
 
+        if hasattr(self.inter_tokenizer.tokenizer, 'vocab') and callable(self.inter_tokenizer.tokenizer.vocab):
+            inter_vocabulary = self.inter_tokenizer.tokenizer.vocab()
+        else:
+            inter_vocabulary = self.inter_tokenizer.tokenizer.get_vocab()
+
         # Set the new vocabulary
         with open_dict(cfg):
             cfg.labels = ListConfig(list(vocabulary))
@@ -81,7 +88,6 @@ class EncDecHybridRNNTCTCBPEModel(EncDecHybridRNNTCTCModel, ASRBPEMixin):
                 "The config need to have a section for the CTC decoder named as aux_ctc for Hybrid models."
             )
 
-#        print('vcab is', vocabulary)
         with open_dict(cfg):
             if self.tokenizer_type == "agg" or self.tokenizer_type == 'yttm':
                 cfg.aux_ctc.decoder.vocabulary = ListConfig(vocabulary)
@@ -97,6 +103,21 @@ class EncDecHybridRNNTCTCBPEModel(EncDecHybridRNNTCTCModel, ASRBPEMixin):
             cfg.aux_ctc.decoder["num_classes"] = len(vocabulary)
 
         super().__init__(cfg=cfg, trainer=trainer)
+
+#        print("HERE self.cfg.joint is", self.cfg.joint)
+
+        self.cfg.decoder['vocab_size'] = len(inter_vocabulary)
+
+        self.cfg.joint.num_classes = len(inter_vocabulary)
+        self.cfg.joint.vocabulary = ListConfig(list(inter_vocabulary))
+
+        self.inter_decoder = EncDecRNNTModel.from_config_dict(self.cfg.decoder)
+        self.inter_joint = EncDecRNNTModel.from_config_dict(self.cfg.joint)
+
+        self.ctc_decoding = RNNTBPEDecoding(
+            decoding_cfg=self.cfg.decoding, decoder=self.inter_decoder, joint=self.inter_joint, tokenizer=self.inter_tokenizer,
+            )
+#        print('init self.inter_decoder is', self.cfg.decoder)
 
         # Setup decoding object
         self.decoding = RNNTBPEDecoding(
@@ -124,7 +145,9 @@ class EncDecHybridRNNTCTCBPEModel(EncDecHybridRNNTCTCModel, ASRBPEMixin):
             ctc_decoding_cfg = OmegaConf.structured(CTCBPEDecodingConfig)
             with open_dict(self.cfg.aux_ctc):
                 self.cfg.aux_ctc.decoding = ctc_decoding_cfg
-        self.ctc_decoding = CTCBPEDecoding(self.cfg.aux_ctc.decoding, tokenizer=self.inter_tokenizer)
+        self.ctc_decoding = RNNTBPEDecoding(
+            decoding_cfg=self.cfg.decoding, decoder=self.inter_decoder, joint=self.inter_joint, tokenizer=self.inter_tokenizer,
+        )
 
         # Setup CTC WER
         self.ctc_wer = WER(
@@ -147,8 +170,8 @@ class EncDecHybridRNNTCTCBPEModel(EncDecHybridRNNTCTCModel, ASRBPEMixin):
                 dataset=LhotseSpeechToTextBpeDataset(tokenizer=self.tokenizer,),
             )
 
-        print("self.inter_tokenizer", self.inter_tokenizer)
-        print("self.tokenizer", self.tokenizer)
+#        print("self.inter_tokenizer", self.inter_tokenizer)
+#        print("self.tokenizer", self.tokenizer)
         dataset = audio_to_text_dataset.get_audio_to_text_bpe_dataset_from_config(
             config=config,
             local_rank=self.local_rank,
@@ -255,6 +278,7 @@ class EncDecHybridRNNTCTCBPEModel(EncDecHybridRNNTCTCModel, ASRBPEMixin):
         Returns: None
 
         """
+        assert(0)
         if isinstance(new_tokenizer_dir, DictConfig):
             if new_tokenizer_type == 'agg':
                 new_tokenizer_cfg = new_tokenizer_dir
