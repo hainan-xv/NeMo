@@ -16,6 +16,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from nemo.core.classes.mixins import AccessMixin
+from nemo.utils import logging
 
 
 class InterCTCMixin:
@@ -61,7 +62,15 @@ class InterCTCMixin:
 
         # setting up config for AccessMixin that will be checked in encoders to
         # log the layers we need
-        AccessMixin.update_access_cfg({'interctc': {'capture_layers': apply_at_layers}})
+        AccessMixin.update_access_cfg(
+            {'interctc': {'capture_layers': apply_at_layers}}, guid=getattr(self, "model_guid", None)
+        )
+        if hasattr(self, "propagate_model_guid"):
+            self.propagate_model_guid()
+        else:
+            logging.warning(
+                f"Not able to propagate model_guid to the submodules. Make sure to call self.propagate_model_guid() in ModelPT class."
+            )
 
     def setup_interctc(self, decoder_name, loss_name, wer_name):
         """Sets up all interctc-specific parameters and checks config consistency.
@@ -197,17 +206,13 @@ class InterCTCMixin:
                 raise RuntimeError(
                     "Make sure encoder.forward is called exactly one time before interCTC loss is computed."
                 )
-#            print("layer_outputs here", layer_outputs[0].shape)
             captured_tensors.append(
-                [layer_outputs[0], layer_lengths[0]]
+                (self.get_interctc_param('decoder')(encoder_output=layer_outputs[0]), layer_lengths[0])
             )
         return captured_tensors
 
     def add_interctc_losses(
         self,
-        inter_decoder,
-        inter_target_length,
-        inter_states,
         loss_value: torch.Tensor,
         transcript: torch.Tensor,
         transcript_len: torch.Tensor,
@@ -241,14 +246,13 @@ class InterCTCMixin:
         Returns:
             tuple[Optional[torch.Tensor], Dict]: tuple of new loss tensor and dictionary with logged metrics.
         """
-        if not self.is_interctc_enabled() or not AccessMixin.is_access_enabled():
+        if not self.is_interctc_enabled() or not AccessMixin.is_access_enabled(getattr(self, "model_guid", None)):
             return loss_value, {}
         metrics = {}
         if compute_loss:
             metrics[f"{log_prefix}final_loss"] = loss_value
         else:
             loss_value = None
-
         captured_tensors = self.get_captured_interctc_tensors()
 
         if compute_loss:
@@ -259,38 +263,32 @@ class InterCTCMixin:
             captured_tensors,
             self.get_interctc_param('intermediate_loss_weights'),
         ):
-#            inter_decoder, inter_target_length, inter_states
-            joint = self.inter_joint(encoder_outputs=intermediate_result[0], decoder_outputs=inter_decoder)
-#            print("interjoined", joint.shape)
             if compute_loss:
-#                print('self.loss is', self.loss)
-#                print('transcript is', transcript.shape)
-#                print(
-                inter_loss_value = self.loss(
-                    log_probs=joint,
+                inter_loss_value = self.get_interctc_param('loss')(
+                    log_probs=intermediate_result[0],
                     targets=transcript,
-                    input_lengths=intermediate_result[1],
                     target_lengths=transcript_len,
+                    input_lengths=intermediate_result[1],
                 )
                 metrics[f"{log_prefix}inter_ctc_loss_l{layer_idx}"] = inter_loss_value.detach()
                 loss_value += inter_loss_value * loss_weight
-#            if compute_wer:
-#                self.get_interctc_param('wer').update(
-#                    predictions=intermediate_result[0],
-#                    targets=transcript,
-#                    targets_lengths=transcript_len,
-#                    predictions_lengths=intermediate_result[1],
-#                )
-#                wer, wer_num, wer_denom = self.get_interctc_param('wer').compute()
-#                self.get_interctc_param('wer').reset()
-#                metrics.update({f'{log_prefix}inter_wer_l{layer_idx}': wer})
-#                if log_wer_num_denom:
-#                    metrics.update(
-#                        {
-#                            f'{log_prefix}inter_wer_num_l{layer_idx}': wer_num,
-#                            f'{log_prefix}inter_wer_denom_l{layer_idx}': wer_denom,
-#                        }
-#                    )
+            if compute_wer:
+                self.get_interctc_param('wer').update(
+                    predictions=intermediate_result[0],
+                    targets=transcript,
+                    targets_lengths=transcript_len,
+                    predictions_lengths=intermediate_result[1],
+                )
+                wer, wer_num, wer_denom = self.get_interctc_param('wer').compute()
+                self.get_interctc_param('wer').reset()
+                metrics.update({f'{log_prefix}inter_wer_l{layer_idx}': wer})
+                if log_wer_num_denom:
+                    metrics.update(
+                        {
+                            f'{log_prefix}inter_wer_num_l{layer_idx}': wer_num,
+                            f'{log_prefix}inter_wer_denom_l{layer_idx}': wer_denom,
+                        }
+                    )
 
         # return total loss and dictionary of metrics
         return loss_value, metrics

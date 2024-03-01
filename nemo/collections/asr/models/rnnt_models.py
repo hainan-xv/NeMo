@@ -834,15 +834,6 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
     def multi_validation_epoch_end(self, outputs, dataloader_idx: int = 0):
         return super().multi_validation_epoch_end(outputs, dataloader_idx)
-#        if self.compute_eval_loss:
-#            val_loss_mean = torch.stack([x['val_loss'] for x in outputs]).mean()
-#            val_loss_log = {'val_loss': val_loss_mean}
-#        else:
-#            val_loss_log = {}
-#        wer_num = torch.stack([x['val_wer_num'] for x in outputs]).sum()
-#        wer_denom = torch.stack([x['val_wer_denom'] for x in outputs]).sum()
-#        tensorboard_logs = {**val_loss_log, 'val_wer': wer_num.float() / wer_denom}
-#        return {**val_loss_log, 'log': tensorboard_logs}
 
     def multi_test_epoch_end(self, outputs, dataloader_idx: int = 0):
         if self.compute_eval_loss:

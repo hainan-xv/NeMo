@@ -104,21 +104,33 @@ class EncDecHybridRNNTCTCBPEModel(EncDecHybridRNNTCTCModel, ASRBPEMixin):
 
         super().__init__(cfg=cfg, trainer=trainer)
 
-#        print("HERE self.cfg.joint is", self.cfg.joint)
-
-        self.cfg.decoder['vocab_size'] = len(inter_vocabulary)
-
-        self.cfg.joint.num_classes = len(inter_vocabulary)
-        self.cfg.joint.vocabulary = ListConfig(list(inter_vocabulary))
-
-        self.inter_decoder = EncDecRNNTModel.from_config_dict(self.cfg.decoder)
-        self.inter_joint = EncDecRNNTModel.from_config_dict(self.cfg.joint)
-
-        self.ctc_decoding = RNNTBPEDecoding(
-            decoding_cfg=self.cfg.decoding, decoder=self.inter_decoder, joint=self.inter_joint, tokenizer=self.inter_tokenizer,
-            )
-#        print('init self.inter_decoder is', self.cfg.decoder)
-
+#        old_len = self.cfg.decoder['vocab_size']
+#        old_n_classes, old_vocab = self.cfg.joint.num_classes, self.cfg.joint.vocabulary
+#        assert old_len == old_n_classes
+#
+#        self.cfg.decoder['vocab_size'] = len(inter_vocabulary)
+#        self.cfg.joint.num_classes = len(inter_vocabulary)
+#        self.cfg.joint.vocabulary = ListConfig(list(inter_vocabulary))
+#
+#        self.ctc_decoder = EncDecRNNTModel.from_config_dict(self.cfg.decoder)
+#        self.inter_rnnt_decoder = EncDecRNNTModel.from_config_dict(self.cfg.decoder)
+##        self.inter_joint = EncDecRNNTModel.from_config_dict(self.cfg.joint)
+##
+#        if self.cfg.inter_ctc
+#        self.inter_ctc_decoding = CTCBPEDecoding(
+#            decoding_cfg=self.cfg.decoding, decoder=self.inter_decoder, tokenizer=self.inter_tokenizer,
+#            )
+#        self.inter_ctc_decoding = CTCBPEDecoding(
+#            decoding_cfg=self.cfg.decoding, decoder=self.inter_decoder, tokenizer=self.inter_tokenizer,
+#            )
+#
+##        self.inter_rnnt_decoding = RNNTBPEDecoding(   # can't have it here since it needs joint
+##            decoding_cfg=self.cfg.decoding, decoder=self.inter_decoder, joint=self.inter_joint, tokenizer=self.inter_tokenizer,
+##            )
+#
+#        self.cfg.joint.num_classes, self.cfg.joint.vocabulary = old_n_classes, old_vocab
+#        self.cfg.decoder['vocab_size'] = old_len
+#
         # Setup decoding object
         self.decoding = RNNTBPEDecoding(
             decoding_cfg=self.cfg.decoding, decoder=self.decoder, joint=self.joint, tokenizer=self.tokenizer,
@@ -136,8 +148,6 @@ class EncDecHybridRNNTCTCBPEModel(EncDecHybridRNNTCTCModel, ASRBPEMixin):
         # Setup fused Joint step if flag is set
         if self.joint.fuse_loss_wer:
             assert(0)
-            self.joint.set_loss(self.loss)
-            self.joint.set_wer(self.bleu)
 
         # Setup CTC decoding
         ctc_decoding_cfg = self.cfg.aux_ctc.get('decoding', None)
@@ -145,9 +155,7 @@ class EncDecHybridRNNTCTCBPEModel(EncDecHybridRNNTCTCModel, ASRBPEMixin):
             ctc_decoding_cfg = OmegaConf.structured(CTCBPEDecodingConfig)
             with open_dict(self.cfg.aux_ctc):
                 self.cfg.aux_ctc.decoding = ctc_decoding_cfg
-        self.ctc_decoding = RNNTBPEDecoding(
-            decoding_cfg=self.cfg.decoding, decoder=self.inter_decoder, joint=self.inter_joint, tokenizer=self.inter_tokenizer,
-        )
+        self.ctc_decoding = CTCBPEDecoding(self.cfg.aux_ctc.decoding, tokenizer=self.tokenizer)
 
         # Setup CTC WER
         self.ctc_wer = WER(
@@ -170,8 +178,6 @@ class EncDecHybridRNNTCTCBPEModel(EncDecHybridRNNTCTCModel, ASRBPEMixin):
                 dataset=LhotseSpeechToTextBpeDataset(tokenizer=self.tokenizer,),
             )
 
-#        print("self.inter_tokenizer", self.inter_tokenizer)
-#        print("self.tokenizer", self.tokenizer)
         dataset = audio_to_text_dataset.get_audio_to_text_bpe_dataset_from_config(
             config=config,
             local_rank=self.local_rank,
@@ -354,8 +360,6 @@ class EncDecHybridRNNTCTCBPEModel(EncDecHybridRNNTCTCModel, ASRBPEMixin):
             self.decoding.joint_fused_batch_size is not None and self.decoding.joint_fused_batch_size > 0
         ):
             assert(0)
-            self.joint.set_loss(self.loss)
-            self.joint.set_wer(self.bleu)
 
         # Update config
         with open_dict(self.cfg.joint):
@@ -461,8 +465,6 @@ class EncDecHybridRNNTCTCBPEModel(EncDecHybridRNNTCTCModel, ASRBPEMixin):
                 self.decoding.joint_fused_batch_size is not None and self.decoding.joint_fused_batch_size > 0
             ):
                 assert(0)
-                self.joint.set_loss(self.loss)
-                self.joint.set_wer(self.bleu)
 
             self.joint.temperature = decoding_cfg.get('temperature', 1.0)
 
