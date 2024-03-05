@@ -93,6 +93,7 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin, Inte
 
         # setting up interCTC loss (from InterCTCMixin)
         self.setup_interctc(decoder_name='ctc_decoder', loss_name='ctc_loss', wer_name='ctc_wer')
+        self.setup_interrnnt(decoder_name='rnnt_decoder', loss_name='tdt', wer_name='rnnt_wer')
 
     @torch.no_grad()
     def transcribe(
