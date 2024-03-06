@@ -26,6 +26,7 @@ from nemo.collections.asr.modules.conformer_encoder import ConformerChangeConfig
 from nemo.collections.asr.parts.utils.transcribe_utils import compute_output_filename, prepare_audio_data, setup_model
 from nemo.core.config import hydra_runner
 from nemo.utils import logging
+from dataclasses import field
 
 """
 Translate audio file on a single CPU/GPU. Useful for translations of moderate amounts of audio data.
@@ -67,7 +68,7 @@ python translate_speech.py \
 class ModelChangeConfig:
 
     # Sub-config for changes specific to the Conformer Encoder
-    conformer: ConformerChangeConfig = ConformerChangeConfig()
+    conformer: ConformerChangeConfig = field(default_factory=lambda: ConformerChangeConfig())
 
 
 @dataclass
@@ -186,8 +187,8 @@ def main(cfg: TranslationConfig) -> Union[TranslationConfig, List[str]]:
     # translate audio
     with autocast():
         with torch.no_grad():
-            translations = asr_model.translate(
-                paths2audio_files=filepaths, batch_size=cfg.batch_size, return_hypotheses=return_hypotheses,
+            translations = asr_model.transcribe(
+                audio=filepaths, batch_size=cfg.batch_size, return_hypotheses=return_hypotheses,
             )
 
     logging.info(f"Finished translating {len(filepaths)} files !")

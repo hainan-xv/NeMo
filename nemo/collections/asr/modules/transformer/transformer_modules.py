@@ -100,7 +100,7 @@ class TransformerEmbedding(nn.Module):
         self,
         vocab_size,
         hidden_size,
-        feature_map,
+        feature_map='',
         max_sequence_length=512,
         num_token_types=2,
         embedding_dropout=0.0,
@@ -113,9 +113,14 @@ class TransformerEmbedding(nn.Module):
         self.token_embedding = nn.Embedding(vocab_size, hidden_size, padding_idx=0)
 
         self.feature_map = []
-        self.read_feature_map(feature_map)
+        if feature_map != '' and feature_map is not None:
+            self.read_feature_map(feature_map)
 
-        self.feature_embedding = nn.Embedding(self.n_extra_features, hidden_size, padding_idx=0)
+            self.feature_embedding = nn.Embedding(self.n_extra_features, hidden_size, padding_idx=0)
+        else:
+            self.feature_embedding = None
+            self.n_extra_features = None
+            self.feature_map = None
 
         if learn_positional_encodings:
             self.position_embedding = nn.Embedding(max_sequence_length, hidden_size)
@@ -135,7 +140,6 @@ class TransformerEmbedding(nn.Module):
             self.n_extra_features = max(self.n_extra_features, l[-1] + 1)
             self.feature_map.append(l)
         self.feature_map = torch.Tensor(self.feature_map).long() #, dtype=torch.long)
-        print('self.feature_map is', self.feature_map)
 
     def forward(self, input_ids, token_type_ids=None, start_pos=0):
         seq_length = input_ids.size(1)
@@ -152,17 +156,13 @@ class TransformerEmbedding(nn.Module):
 
         token_embeddings = self.token_embedding(input_ids)
 
-        if input_ids.device != self.feature_map.device:
-            self.feature_map = self.feature_map.to(input_ids.device)
+        if self.feature_map is not None:
+            if input_ids.device != self.feature_map.device:
+                self.feature_map = self.feature_map.to(input_ids.device)
 
-#        print('self.feature_map', self.feature_map.shape)
-#        print('input_ids', input_ids.shape)
-        token_features = self.feature_map[input_ids]
-        feature_embs = torch.sum(self.feature_embedding(token_features), dim=-2)
-#        print('feature_embs', feature_embs.shape)
-#        assert(0)
-#        print('token_features', token_features.shape)
-        token_embeddings += feature_embs
+            token_features = self.feature_map[input_ids]
+            feature_embs = torch.sum(self.feature_embedding(token_features), dim=-2)
+            token_embeddings += feature_embs
 
         position_embeddings = self.position_embedding(position_ids)
         embeddings = token_embeddings + position_embeddings
