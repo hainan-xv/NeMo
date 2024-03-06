@@ -115,6 +115,7 @@ def get_nemo_transformer(
     else:
         model = TransformerDecoderNM(
             vocab_size=cfg.get('vocab_size'),
+            feature_map=cfg.get('feature_map'),
             hidden_size=cfg.get('hidden_size'),
             num_layers=cfg.get('num_layers'),
             inner_size=cfg.get('inner_size'),

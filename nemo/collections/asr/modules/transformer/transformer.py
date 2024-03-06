@@ -158,6 +158,7 @@ class TransformerDecoderNM(DecoderModule, Exportable):
     def __init__(
         self,
         vocab_size: int,
+        feature_map: list,
         hidden_size: int,
         num_layers: int,
         inner_size: int,
@@ -186,6 +187,7 @@ class TransformerDecoderNM(DecoderModule, Exportable):
         self._embedding = TransformerEmbedding(
             vocab_size=self.vocab_size,
             hidden_size=self.hidden_size,
+            feature_map=feature_map,
             max_sequence_length=max_sequence_length,
             num_token_types=num_token_types,
             embedding_dropout=embedding_dropout,

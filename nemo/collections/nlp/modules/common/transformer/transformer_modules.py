@@ -80,7 +80,7 @@ class FixedPositionalEncoding(nn.Module):
         return embeddings
 
 
-class FactoredTransformerEmbedding(nn.Module):
+class TransformerEmbedding(nn.Module):
     """
     Embedding from token and position embeddings.
     Optionally add token_type embedding (e.g. type of the sentence in BERT).
@@ -112,6 +112,16 @@ class FactoredTransformerEmbedding(nn.Module):
         self.max_sequence_length = max_sequence_length
         self.learn_positional_encodings = learn_positional_encodings
         self.token_embedding = nn.Embedding(vocab_size, hidden_size, padding_idx=padding_idx)
+        self.token_to_featuers = token_to_features
+        self.num_features = len(token_to_features)
+        self.feature_dims = []
+        for feature_map in token_to_features:
+            max_id = max(feature_map)
+            self.feature_dims.append(max_id)
+
+        total_extra_dims = sum(self.feature_dims)
+        self.feature_embedding = nn.Embedding(total_extra_dims, hidden_size, padding_idx=padding_idx)
+
         if learn_positional_encodings:
             self.position_embedding = nn.Embedding(max_sequence_length, hidden_size)
         else:
@@ -148,7 +158,7 @@ class FactoredTransformerEmbedding(nn.Module):
         return embeddings
 
 
-class TransformerEmbedding(nn.Module):
+class OldTransformerEmbedding(nn.Module):
     """
     Embedding from token and position embeddings.
     Optionally add token_type embedding (e.g. type of the sentence in BERT).

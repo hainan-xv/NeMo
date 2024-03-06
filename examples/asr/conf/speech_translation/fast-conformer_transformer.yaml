@@ -10,10 +10,10 @@
 name: "FastConformer-Transformer-BPE-st"
 
 # Initialize model encoder with pre-trained ASR FastConformer encoder for faster convergence and improved accuracy
-init_from_nemo_model:
-  model0:
-    path: ???
-    include: ["preprocessor", "encoder"]
+#init_from_nemo_model:
+#  model0:
+#    path: ???
+#    include: ["preprocessor", "encoder"]
 
 model:
   sample_rate: 16000
