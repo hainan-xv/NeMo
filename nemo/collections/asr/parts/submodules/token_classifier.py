@@ -15,7 +15,7 @@
 from dataclasses import dataclass
 from typing import Dict, Optional
 
-from torch import nn as nn
+from torch import nn as nn, Tensor as Tensor
 
 from nemo.collections.asr.parts.submodules.classifier import Classifier
 from nemo.collections.common.parts import MultiLayerPerceptron
@@ -55,6 +55,7 @@ class TokenClassifier(Classifier):
         self,
         hidden_size: int,
         num_classes: int,
+        feature_map: Tensor,
         num_layers: int = 1,
         activation: str = 'relu',
         log_softmax: bool = True,
@@ -77,7 +78,7 @@ class TokenClassifier(Classifier):
         super().__init__(hidden_size=hidden_size, dropout=dropout)
         self.log_softmax = log_softmax
         self.mlp = MultiLayerPerceptron(
-            hidden_size, num_classes, num_layers=num_layers, activation=activation, log_softmax=log_softmax
+            hidden_size, num_classes, feature_map=feature_map, num_layers=num_layers, activation=activation, log_softmax=log_softmax
         )
         self.post_init(use_transformer_init=use_transformer_init)
 

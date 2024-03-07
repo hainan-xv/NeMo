@@ -123,17 +123,22 @@ class EncDecTransfModelBPE(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRTran
             raise ValueError(f"Currently only 'nemo' library is supported for Transformer decoder. Got {library}")
         model_name = transf_decoder_cfg_dict.pop('model_name', None)
         pretrained = transf_decoder_cfg_dict.pop('pretrained', False)
+        input_feature_map = self.read_feature_map(transf_decoder_cfg_dict.pop('input_feature_map', None))
         self.transf_decoder = get_nemo_transformer(
             model_name=model_name,
+            feature_map=input_feature_map,
             pretrained=pretrained,
             config_dict=transf_decoder_cfg_dict,
             encoder=False,
             pre_ln_final_layer_norm=transf_decoder_cfg_dict.get("pre_ln_final_layer_norm", False),
         )
 
+        output_feature_map = self.read_feature_map(transf_decoder_cfg_dict.pop('output_feature_map', None))
+
         self.log_softmax = TokenClassifier(
             hidden_size=self.transf_decoder.hidden_size,
             num_classes=vocab_size,
+            feature_map=output_feature_map,
             activation=self.cfg.head.activation,
             log_softmax=self.cfg.head.log_softmax,
             dropout=self.cfg.head.dropout,
@@ -170,6 +175,20 @@ class EncDecTransfModelBPE(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRTran
             self.spec_augmentation = None
 
         self.val_loss = GlobalAverageLossMetric(dist_sync_on_step=False, take_avg_loss=True)
+
+    def read_feature_map(self, feature_map):
+        if feature_map is None:
+            return None
+        ret = []
+        n_extra_features = 0
+        for line in open(feature_map):
+            splitted = line.split()
+            word_id = int(splitted[0])
+            l = [int(i) for i in splitted[1:]]
+            n_extra_features = max(n_extra_features, l[-1] + 1)
+            ret.append(l)
+        ret = torch.LongTensor(ret) #, dtype=torch.long)
+        return ret
 
     @torch.no_grad()
     def transcribe(
@@ -480,9 +499,12 @@ class EncDecTransfModelBPE(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRTran
         self.val_loss(loss=transf_loss, num_measurements=transf_log_probs.shape[0] * transf_log_probs.shape[1])
 
         output_dict = {f'{eval_mode}_loss': transf_loss, 'translations': translations, 'ground_truths': ground_truths}
+#        print('translations:', translations)
+#        print('ground_truths:', ground_truths)
 
         self.validation_step_outputs.append(output_dict)
 
+#        print("output_dict is", output_dict)
         return output_dict
 
     def test_step(self, batch, batch_idx, dataloader_idx=0):

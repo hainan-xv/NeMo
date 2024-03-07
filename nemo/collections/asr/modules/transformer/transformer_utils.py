@@ -20,11 +20,14 @@ from omegaconf.dictconfig import DictConfig
 from nemo.collections.asr.modules.transformer.transformer import TransformerDecoderNM, TransformerEncoderNM
 from nemo.collections.asr.modules.transformer.transformer_bottleneck import TransformerBottleneckEncoderNM
 
+from torch import Tensor
+
 __all__ = ['get_nemo_transformer']
 
 
 def get_nemo_transformer(
     model_name: Optional[str] = None,
+    feature_map: Tensor = None,
     pretrained: bool = False,
     config_dict: Optional[Union[dict, DictConfig]] = None,
     encoder: bool = True,
@@ -115,7 +118,7 @@ def get_nemo_transformer(
     else:
         model = TransformerDecoderNM(
             vocab_size=cfg.get('vocab_size'),
-            feature_map=cfg.get('feature_map'),
+            feature_map=feature_map,
             hidden_size=cfg.get('hidden_size'),
             num_layers=cfg.get('num_layers'),
             inner_size=cfg.get('inner_size'),

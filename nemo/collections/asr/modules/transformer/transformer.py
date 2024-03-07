@@ -158,7 +158,7 @@ class TransformerDecoderNM(DecoderModule, Exportable):
     def __init__(
         self,
         vocab_size: int,
-        feature_map: list,
+        feature_map: torch.Tensor,
         hidden_size: int,
         num_layers: int,
         inner_size: int,

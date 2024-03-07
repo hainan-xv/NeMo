@@ -31,6 +31,7 @@ class MultiLayerPerceptron(torch.nn.Module):
         self,
         hidden_size: int,
         num_classes: int,
+        feature_map: torch.Tensor,
         num_layers: int = 2,
         activation: str = 'relu',
         log_softmax: bool = True,
@@ -43,19 +44,38 @@ class MultiLayerPerceptron(torch.nn.Module):
             setattr(self, f'layer{self.layers + 1}', getattr(torch, activation))
             self.layers += 2
         layer = torch.nn.Linear(hidden_size, num_classes)
+        if feature_map != None:
+            self.feature_map = feature_map
+            n_features = torch.max(self.feature_map).item() + 1
+            self.feature_emb = torch.nn.Linear(hidden_size, n_features)
+        else:
+            self.feature_map = None
+            self.feature_emb = None
         setattr(self, f'layer{self.layers}', layer)
         self.layers += 1
         self.log_softmax = log_softmax
 
     @property
     def last_linear_layer(self):
-        return getattr(self, f'layer{self.layers - 1}')
+        last_emb = getattr(self, f'layer{self.layers - 1}')
+        if self.feature_emb == None:
+            return last_emb
+
+        assert(0)
+        feature_emb = self.feature_emb(self.feature_map)
+        return last_emb + feature_emb
 
     def forward(self, hidden_states):
         output_states = hidden_states[:]
-        for i in range(self.layers):
+        for i in range(self.layers - 1):
             output_states = getattr(self, f'layer{i}')(output_states)
+        i = self.layers - 1
 
+        output_states_1 = getattr(self, f'layer{i}')(output_states)
+        output_states_2 = self.feature_emb(output_states)
+        output_states = torch.sum(output_states_2[:,:,self.feature_map], dim=-1)
+        output_states += output_states_1
+        del output_states_1, output_states_2
         if self.log_softmax:
             output_states = torch.log_softmax(output_states, dim=-1)
         return output_states

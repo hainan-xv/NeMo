@@ -100,7 +100,7 @@ class TransformerEmbedding(nn.Module):
         self,
         vocab_size,
         hidden_size,
-        feature_map='',
+        feature_map,
         max_sequence_length=512,
         num_token_types=2,
         embedding_dropout=0.0,
@@ -112,10 +112,9 @@ class TransformerEmbedding(nn.Module):
         self.learn_positional_encodings = learn_positional_encodings
         self.token_embedding = nn.Embedding(vocab_size, hidden_size, padding_idx=0)
 
-        self.feature_map = []
-        if feature_map != '' and feature_map is not None:
-            self.read_feature_map(feature_map)
-
+        if feature_map is not None:
+            self.feature_map = feature_map
+            self.n_extra_features = torch.max(feature_map).item() + 1
             self.feature_embedding = nn.Embedding(self.n_extra_features, hidden_size, padding_idx=0)
         else:
             self.feature_embedding = None
