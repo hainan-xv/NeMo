@@ -50,14 +50,12 @@ class ClassificationInferConfig:
 
     _internal: InternalTranscribeConfig = field(default_factory=lambda: InternalTranscribeConfig())
 
-
 @dataclass
 class RegressionInferConfig:
     batch_size: int = 4
     logprobs: bool = True
 
     _internal: InternalTranscribeConfig = field(default_factory=lambda: InternalTranscribeConfig())
-
 
 class _EncDecBaseModel(ASRModel, ExportableEncDecModel, TranscriptionMixin):
     """Encoder decoder Classification models."""
