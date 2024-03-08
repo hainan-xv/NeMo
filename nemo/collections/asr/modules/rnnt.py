@@ -1240,10 +1240,25 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         """Implement this method to return a set of input names disabled for export"""
         return set(["encoder_lengths", "transcripts", "transcript_lengths", "compute_wer"])
 
+    def read_feature_map(self, feature_map):
+        if feature_map is None or feature_map == '':
+            return None
+        ret = []
+        n_extra_features = 0
+        for line in open(feature_map):
+            splitted = line.split()
+            word_id = int(splitted[0])
+            l = [int(i) for i in splitted[1:]]
+            n_extra_features = max(n_extra_features, l[-1] + 1)
+            ret.append(l)
+        ret = torch.LongTensor(ret) #, dtype=torch.long)
+        return ret
+
     def __init__(
         self,
         jointnet: Dict[str, Any],
         num_classes: int,
+        feature_map: str = '',
         num_extra_outputs: int = 0,
         vocabulary: Optional[List] = None,
         log_softmax: Optional[bool] = None,
@@ -1255,6 +1270,7 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         super().__init__()
 
         self.vocabulary = vocabulary
+        self.feature_map = self.read_feature_map(feature_map)
 
         self._vocab_size = num_classes
         self._num_extra_outputs = num_extra_outputs
@@ -1301,6 +1317,14 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
             activation=self.activation,
             dropout=dropout,
         )
+
+        if self.feature_map is not None:
+            n_features = torch.max(self.feature_map).item() + 1
+            self.feature_emb = torch.nn.Linear(self.joint_hidden, n_features)
+            self.token_emb = torch.nn.Linear(self.joint_hidden, self._num_classes)
+        else:
+            self.feature_emb = None
+
 
         # Flag needed for RNNT export support
         self._rnnt_export = False
@@ -1516,7 +1540,20 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         if self.is_adapter_available():
             inp = self.forward_enabled_adapters(inp)
 
-        res = self.joint_net(inp)  # [B, T, U, V + 1]
+        if self.feature_emb is not None:
+            tmp = self.joint_net(inp)  # [B, T, U, V + 1]
+            res = self.token_emb(tmp)
+
+            feature_res = torch.sum(self.feature_emb(tmp)[:,:,:,self.feature_map], dim=-1)
+            nwords = self.feature_map.shape[0]
+            res[:,:,:,:nwords] += feature_res
+
+            del feature_res, tmp
+        else:
+            res = self.joint_net(inp)  # [B, T, U, V + 1]
+
+#        print("res", res.shape)
+#        print("feature_res", feature_res.shape)
 
         del inp
 
@@ -1566,11 +1603,19 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         elif activation == 'tanh':
             activation = torch.nn.Tanh()
 
-        layers = (
-            [activation]
-            + ([torch.nn.Dropout(p=dropout)] if dropout else [])
+        if self.feature_map != None:
+            layers = (
+                [activation]
+                + ([torch.nn.Dropout(p=dropout)] if dropout else [])
+#            + [torch.nn.Linear(joint_n_hidden, num_classes)]
+            )
+        else:
+            layers = (
+                [activation]
+                + ([torch.nn.Dropout(p=dropout)] if dropout else [])
             + [torch.nn.Linear(joint_n_hidden, num_classes)]
-        )
+            )
+
         return pred, enc, torch.nn.Sequential(*layers)
 
     # Adapter method overrides
