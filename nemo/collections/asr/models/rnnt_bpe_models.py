@@ -285,42 +285,49 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
         cfg = model_utils.maybe_update_config_version(cfg)
 
         # Tokenizer is necessary for this model
-        if 'tokenizer' not in cfg:
+        if 'asr_tokenizer' not in cfg:
             raise ValueError("`cfg` must have `tokenizer` config to create a tokenizer !")
 
         if not isinstance(cfg, DictConfig):
             cfg = OmegaConf.create(cfg)
 
         # Setup the tokenizer
-        self._setup_tokenizer(cfg.tokenizer, cfg.tokenizer)
+        self._setup_tokenizer(cfg.asr_tokenizer, cfg.st_tokenizer)
 
         # Initialize a dummy vocabulary
 #        vocabulary = self.tokenizer.tokenizer.get_vocab()
 #        print("self.tokenizer.tokenizer is", self.tokenizer.tokenizer)
-        if hasattr(self.tokenizer.tokenizer, 'vocab') and callable(self.tokenizer.tokenizer.vocab):
-            vocabulary = self.tokenizer.tokenizer.vocab()
+        if hasattr(self.asr_tokenizer.tokenizer, 'vocab') and callable(self.asr_tokenizer.tokenizer.vocab):
+            asr_vocabulary = self.asr_tokenizer.tokenizer.vocab()
         else:
-            vocabulary = self.tokenizer.tokenizer.get_vocab()
+            asr_vocabulary = self.asr_tokenizer.tokenizer.get_vocab()
+
+        if hasattr(self.st_tokenizer.tokenizer, 'vocab') and callable(self.st_tokenizer.tokenizer.vocab):
+            st_vocabulary = self.st_tokenizer.tokenizer.vocab()
+        else:
+            st_vocabulary = self.st_tokenizer.tokenizer.get_vocab()
             
 
         # Set the new vocabulary
         with open_dict(cfg):
-            cfg.labels = ListConfig(list(vocabulary))
+            cfg.asr_labels = ListConfig(list(asr_vocabulary))
+            cfg.st_labels = ListConfig(list(st_vocabulary))
 
         with open_dict(cfg.decoder):
-            cfg.decoder.vocab_size = len(vocabulary)
+            cfg.decoder.vocab_size = len(asr_vocabulary)
 
         with open_dict(cfg.joint):
-            cfg.joint.num_classes = len(vocabulary)
-            cfg.joint.vocabulary = ListConfig(list(vocabulary))
+            cfg.joint.num_classes = len(asr_vocabulary)
+            cfg.joint.vocabulary = ListConfig(list(asr_vocabulary))
             cfg.joint.jointnet.encoder_hidden = cfg.model_defaults.enc_hidden
             cfg.joint.jointnet.pred_hidden = cfg.model_defaults.pred_hidden
 
         super().__init__(cfg=cfg, trainer=trainer)
 
+        self.cfg.decoding = self.set_decoding_type_according_to_loss(self.cfg.decoding)
         # Setup decoding object
         self.decoding = RNNTBPEDecoding(
-            decoding_cfg=self.cfg.decoding, decoder=self.decoder, joint=self.joint, tokenizer=self.tokenizer,
+            decoding_cfg=self.cfg.decoding, decoder=self.decoder, joint=self.joint, tokenizer=self.asr_tokenizer,
         )
 
         # Setup wer object
@@ -415,6 +422,7 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
         decoding_cls = OmegaConf.structured(RNNTBPEDecodingConfig)
         decoding_cls = OmegaConf.create(OmegaConf.to_container(decoding_cls))
         decoding_cfg = OmegaConf.merge(decoding_cls, decoding_cfg)
+        decoding_cfg = self.set_decoding_type_according_to_loss(decoding_cfg)
 
         self.decoding = RNNTBPEDecoding(
             decoding_cfg=decoding_cfg, decoder=self.decoder, joint=self.joint, tokenizer=self.tokenizer,
@@ -464,13 +472,7 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
         decoding_cls = OmegaConf.structured(RNNTBPEDecodingConfig)
         decoding_cls = OmegaConf.create(OmegaConf.to_container(decoding_cls))
         decoding_cfg = OmegaConf.merge(decoding_cls, decoding_cfg)
-
-        loss_name, loss_kwargs = self.extract_rnnt_loss_cfg(self.cfg.get("loss", None))
-
-        if loss_name == 'tdt':
-            decoding_cfg.durations = loss_kwargs.durations
-        elif loss_name == 'multiblank_rnnt':
-            decoding_cfg.big_blank_durations = loss_kwargs.big_blank_durations
+        decoding_cfg = self.set_decoding_type_according_to_loss(decoding_cfg)
 
         self.decoding = RNNTBPEDecoding(
             decoding_cfg=decoding_cfg, decoder=self.decoder, joint=self.joint, tokenizer=self.tokenizer,
@@ -513,7 +515,8 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
             local_rank=self.local_rank,
             global_rank=self.global_rank,
             world_size=self.world_size,
-            tokenizer=self.tokenizer,
+            st_tokenizer=self.st_tokenizer,
+            asr_tokenizer=self.asr_tokenizer,
             preprocessor_cfg=self.cfg.get("preprocessor", None),
         )
 

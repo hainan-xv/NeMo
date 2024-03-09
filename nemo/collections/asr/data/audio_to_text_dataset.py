@@ -210,7 +210,7 @@ def get_concat_bpe_dataset(
 
 
 def get_bpe_dataset(
-    config: dict, tokenizer: 'TokenizerSpec', inter_tokenizer: 'TokenizerSpec', augmentor: Optional['AudioAugmentor'] = None
+    config: dict, st_tokenizer: 'TokenizerSpec', asr_tokenizer: 'TokenizerSpec', augmentor: Optional['AudioAugmentor'] = None
 ) -> audio_to_text.AudioToBPEDataset:
     """
     Instantiates a Byte Pair Encoding / Word Piece Encoding based AudioToBPEDataset.
@@ -225,8 +225,8 @@ def get_bpe_dataset(
     """
     dataset = audio_to_text.AudioToBPEDataset(
         manifest_filepath=config['manifest_filepath'],
-        tokenizer=tokenizer,
-        inter_tokenizer=inter_tokenizer,
+        st_tokenizer=st_tokenizer,
+        asr_tokenizer=asr_tokenizer,
         sample_rate=config['sample_rate'],
         int_values=config.get('int_values', False),
         augmentor=augmentor,
@@ -304,8 +304,8 @@ def get_tarred_dataset(
     shuffle_n: int,
     global_rank: int,
     world_size: int,
-    tokenizer: Optional['TokenizerSpec'] = None,
-    inter_tokenizer: Optional['TokenizerSpec'] = None,
+    st_tokenizer: Optional['TokenizerSpec'] = None,
+    asr_tokenizer: Optional['TokenizerSpec'] = None,
     augmentor: Optional['AudioAugmentor'] = None,
 ) -> Union[audio_to_text.TarredAudioToBPEDataset, audio_to_text.TarredAudioToCharDataset]:
     """
@@ -381,8 +381,8 @@ def get_tarred_dataset(
             dataset = audio_to_text.TarredAudioToBPEDataset(
                 audio_tar_filepaths=tarred_audio_filepath,
                 manifest_filepath=manifest_filepath,
-                tokenizer=tokenizer,
-                inter_tokenizer=inter_tokenizer,
+                st_tokenizer=st_tokenizer,
+                asr_tokenizer=asr_tokenizer,
                 sample_rate=config['sample_rate'],
                 int_values=config.get('int_values', False),
                 augmentor=augmentor,
@@ -713,8 +713,8 @@ def get_audio_to_text_bpe_dataset_from_config(
     local_rank: int,
     global_rank: int,
     world_size: int,
-    tokenizer,
-    inter_tokenizer,
+    st_tokenizer,
+    asr_tokenizer,
     preprocessor_cfg: Optional[DictConfig] = None,
 ):
     """
@@ -737,7 +737,7 @@ def get_audio_to_text_bpe_dataset_from_config(
 
     if 'hf_data_cfg' in config:
         return get_hf_audio_to_text_bpe_dataset(
-            config=config, global_rank=global_rank, world_size=world_size, tokenizer=tokenizer, inter_tokenizer=inter_tokenizer, augmentor=augmentor
+            config=config, global_rank=global_rank, world_size=world_size, st_tokenizer=st_tokenizer, asr_tokenizer=asr_tokenizer, augmentor=augmentor
         )
 
     is_concat = config.get('is_concat', False)
@@ -814,8 +814,8 @@ def get_audio_to_text_bpe_dataset_from_config(
         if is_concat:
             dataset = get_concat_tarred_dataset(
                 config=config,
-                tokenizer=tokenizer,
-                inter_tokenizer=inter_tokenizer,
+                st_tokenizer=st_tokenizer,
+                asr_tokenizer=asr_tokenizer,
                 shuffle_n=shuffle_n,
                 global_rank=global_rank,
                 world_size=world_size,
@@ -824,8 +824,8 @@ def get_audio_to_text_bpe_dataset_from_config(
         else:
             dataset = get_tarred_dataset(
                 config=config,
-                tokenizer=tokenizer,
-                inter_tokenizer=inter_tokenizer,
+                st_tokenizer=st_tokenizer,
+                asr_tokenizer=asr_tokenizer,
                 shuffle_n=shuffle_n,
                 global_rank=global_rank,
                 world_size=world_size,
@@ -844,7 +844,7 @@ def get_audio_to_text_bpe_dataset_from_config(
                 augmentor=augmentor,
             )
         else:
-            dataset = get_bpe_dataset(config=config, tokenizer=tokenizer, inter_tokenizer=inter_tokenizer, augmentor=augmentor)
+            dataset = get_bpe_dataset(config=config, st_tokenizer=st_tokenizer, asr_tokenizer=asr_tokenizer, augmentor=augmentor)
     return dataset
 
 

@@ -108,8 +108,8 @@ class AudioText(_Collection):
         orig_sampling_rates: List[Optional[int]],
         token_labels: List[Optional[int]],
         langs: List[Optional[str]],
-        parser: parsers.CharParser,
-        inter_parser: parsers.CharParser,
+        st_parser: parsers.CharParser,
+        asr_parser: parsers.CharParser,
         min_duration: Optional[float] = None,
         max_duration: Optional[float] = None,
         max_number: Optional[int] = None,
@@ -167,30 +167,30 @@ class AudioText(_Collection):
                 text_tokens = token_labels
             else:
                 if text != '':
-                    if hasattr(inter_parser, "is_aggregate") and inter_parser.is_aggregate and isinstance(text, str):
+                    if hasattr(asr_parser, "is_aggregate") and asr_parser.is_aggregate and isinstance(text, str):
                         if lang is not None:
-                            text_tokens = parser(text, lang)
+                            text_tokens = asr_parser(text, lang)
                         # for future use if want to add language bypass to audio_to_text classes
                         # elif hasattr(parser, "lang") and parser.lang is not None:
                         #    text_tokens = parser(text, parser.lang)
                         else:
                             raise ValueError("lang required in manifest when using aggregate tokenizers")
                     else:
-                        text_tokens = inter_parser(text)
+                        text_tokens = asr_parser(text)
                 else:
                     text_tokens = []
 
                 if translated_text != '':
-                    if hasattr(parser, "is_aggregate") and parser.is_aggregate and isinstance(translated_text, str):
+                    if hasattr(st_parser, "is_aggregate") and st_parser.is_aggregate and isinstance(translated_text, str):
                         if lang is not None:
-                            translated_text_tokens = parser(translated_text, lang)
+                            translated_text_tokens = st_parser(translated_text, lang)
                         # for future use if want to add language bypass to audio_to_text classes
                         # elif hasattr(parser, "lang") and parser.lang is not None:
                         #    text_tokens = parser(text, parser.lang)
                         else:
                             raise ValueError("lang required in manifest when using aggregate tokenizers")
                     else:
-                        translated_text_tokens = parser(translated_text)
+                        translated_text_tokens = st_parser(translated_text)
                 else:
                     translated_text_tokens = []
 

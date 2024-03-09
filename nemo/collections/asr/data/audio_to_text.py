@@ -50,7 +50,7 @@ __all__ = [
 ]
 
 
-def _speech_collate_fn(batch, pad_id):
+def _speech_collate_fn(batch, asr_pad_id, st_pad_id):
     """collate batch of audio sig, audio len, tokens, tokens len
     Args:
         batch (Optional[FloatTensor], Optional[LongTensor], LongTensor,
@@ -91,12 +91,12 @@ def _speech_collate_fn(batch, pad_id):
 
         if tokens_i_len < max_tokens_len:
             pad = (0, max_tokens_len - tokens_i_len)
-            tokens_i = torch.nn.functional.pad(tokens_i, pad, value=pad_id)
+            tokens_i = torch.nn.functional.pad(tokens_i, pad, value=asr_pad_id)
         tokens.append(tokens_i)
 
         if tokens_j_len < max_tokens_len2:
             pad = (0, max_tokens_len2 - tokens_j_len)
-            tokens_j = torch.nn.functional.pad(tokens_j, pad, value=pad_id)
+            tokens_j = torch.nn.functional.pad(tokens_j, pad, value=st_pad_id)
 
         tokens2.append(tokens_j)
 
@@ -138,67 +138,69 @@ class ASRManifestProcessor:
     def __init__(
         self,
         manifest_filepath: str,
-        parser: Union[str, Callable],
-        inter_parser: Union[str, Callable],
+        st_parser: Union[str, Callable],
+        asr_parser: Union[str, Callable],
         max_duration: Optional[float] = None,
         min_duration: Optional[float] = None,
         max_utts: int = 0,
-        bos_id: Optional[int] = None,
-        eos_id: Optional[int] = None,
-        pad_id: int = 0,
-        inter_bos_id: Optional[int] = None,
-        inter_eos_id: Optional[int] = None,
-        inter_pad_id: int = 0,
+        st_bos_id: Optional[int] = None,
+        st_eos_id: Optional[int] = None,
+        st_pad_id: int = 0,
+        asr_bos_id: Optional[int] = None,
+        asr_eos_id: Optional[int] = None,
+        asr_pad_id: int = 0,
         index_by_file_id: bool = False,
     ):
-        self.parser = parser
+        self.st_parser = st_parser
+        self.asr_parser = asr_parser
 
         self.collection = collections.ASRAudioText(
             manifests_files=manifest_filepath,
-            parser=parser,
-            inter_parser=inter_parser,
+            st_parser=st_parser,
+            asr_parser=asr_parser,
             min_duration=min_duration,
             max_duration=max_duration,
             max_number=max_utts,
             index_by_file_id=index_by_file_id,
         )
 
-        self.eos_id = eos_id
-        self.bos_id = bos_id
-        self.pad_id = pad_id
-        self.inter_eos_id = inter_eos_id
-        self.inter_bos_id = inter_bos_id
-        self.inter_pad_id = inter_pad_id
+        self.st_eos_id = st_eos_id
+        self.st_bos_id = st_bos_id
+        self.st_pad_id = st_pad_id
+        self.asr_eos_id = asr_eos_id
+        self.asr_bos_id = asr_bos_id
+        self.asr_pad_id = asr_pad_id
 
     def process_text_by_id(self, index: int) -> Tuple[List[int], int]:
+        assert(0)
         sample = self.collection[index]
         return self.process_text_by_sample(sample)
 
     def process_text_by_file_id(self, file_id: str) -> Tuple[List[int], int]:
         manifest_idx = self.collection.mapping[file_id][0]
         sample = self.collection[manifest_idx]
-        return self.process_text_by_sample(sample), self.process_translated_text_by_sample(sample)
+        return self.process_asr_text_by_sample(sample), self.process_st_text_by_sample(sample)
 
-    def process_text_by_sample(self, sample: collections.ASRAudioText.OUTPUT_TYPE) -> Tuple[List[int], int]:
+    def process_asr_text_by_sample(self, sample: collections.ASRAudioText.OUTPUT_TYPE) -> Tuple[List[int], int]:
         t, tl = sample.text_tokens, len(sample.text_tokens)
 
-        if self.inter_bos_id is not None:
-            t = [self.inter_bos_id] + t
+        if self.asr_bos_id is not None:
+            t = [self.asr_bos_id] + t
             tl += 1
-        if self.inter_eos_id is not None:
-            t = t + [self.inter_eos_id]
+        if self.asr_eos_id is not None:
+            t = t + [self.asr_eos_id]
             tl += 1
 
         return t, tl
 
-    def process_translated_text_by_sample(self, sample: collections.ASRAudioText.OUTPUT_TYPE) -> Tuple[List[int], int]:
+    def process_st_text_by_sample(self, sample: collections.ASRAudioText.OUTPUT_TYPE) -> Tuple[List[int], int]:
         t, tl = sample.translated_text_tokens, len(sample.translated_text_tokens)
 
-        if self.bos_id is not None:
-            t = [self.bos_id] + t
+        if self.st_bos_id is not None:
+            t = [self.st_bos_id] + t
             tl += 1
-        if self.eos_id is not None:
-            t = t + [self.eos_id]
+        if self.st_eos_id is not None:
+            t = t + [self.st_eos_id]
             tl += 1
 
         return t, tl
@@ -463,8 +465,8 @@ class _AudioTextDataset(Dataset):
     def __init__(
         self,
         manifest_filepath: str,
-        parser: Union[str, Callable],
-        inter_parser: Union[str, Callable],
+        st_parser: Union[str, Callable],
+        asr_parser: Union[str, Callable],
         sample_rate: int,
         int_values: bool = False,
         augmentor: 'nemo.collections.asr.parts.perturb.AudioAugmentor' = None,
@@ -472,12 +474,12 @@ class _AudioTextDataset(Dataset):
         min_duration: Optional[int] = None,
         max_utts: int = 0,
         trim: bool = False,
-        bos_id: Optional[int] = None,
-        eos_id: Optional[int] = None,
-        pad_id: int = 0,
-        inter_bos_id: Optional[int] = None,
-        inter_eos_id: Optional[int] = None,
-        inter_pad_id: int = 0,
+        st_bos_id: Optional[int] = None,
+        st_eos_id: Optional[int] = None,
+        st_pad_id: int = 0,
+        asr_bos_id: Optional[int] = None,
+        asr_eos_id: Optional[int] = None,
+        asr_pad_id: int = 0,
         return_sample_id: bool = False,
         channel_selector: Optional[ChannelSelectorType] = None,
     ):
@@ -489,17 +491,17 @@ class _AudioTextDataset(Dataset):
 
         self.manifest_processor = ASRManifestProcessor(
             manifest_filepath=manifest_filepath,
-            parser=parser,
-            inter_parser=inter_parser,
+            st_parser=st_parser,
+            asr_parser=asr_parser,
             max_duration=max_duration,
             min_duration=min_duration,
             max_utts=max_utts,
-            bos_id=bos_id,
-            eos_id=eos_id,
-            pad_id=pad_id,
-            inter_bos_id=inter_bos_id,
-            inter_eos_id=inter_eos_id,
-            inter_pad_id=inter_pad_id,
+            st_bos_id=st_bos_id,
+            st_eos_id=st_eos_id,
+            st_pad_id=st_pad_id,
+            asr_bos_id=asr_bos_id,
+            asr_eos_id=asr_eos_id,
+            asr_pad_id=asr_pad_id,
         )
         self.featurizer = WaveformFeaturizer(sample_rate=sample_rate, int_values=int_values, augmentor=augmentor)
         self.trim = trim
@@ -526,8 +528,8 @@ class _AudioTextDataset(Dataset):
         )
         f, fl = features, torch.tensor(features.shape[0]).long()
 
-        t, tl = self.manifest_processor.process_text_by_sample(sample=sample)
-        t2, tl2 = self.manifest_processor.process_translated_text_by_sample(sample=sample)
+        t, tl = self.manifest_processor.process_asr_text_by_sample(sample=sample)
+        t2, tl2 = self.manifest_processor.process_st_text_by_sample(sample=sample)
 
         if self.return_sample_id:
             output = (
@@ -555,7 +557,7 @@ class _AudioTextDataset(Dataset):
         return len(self.manifest_processor.collection)
 
     def _collate_fn(self, batch):
-        return _speech_collate_fn(batch, pad_id=self.manifest_processor.pad_id)
+        return _speech_collate_fn(batch, asr_pad_id=self.manifest_processor.asr_pad_id, st_pad_id=self.manifest_processor.st_pad_id)
 
 
 class AudioToCharDataset(_AudioTextDataset):
@@ -704,8 +706,8 @@ class AudioToBPEDataset(_AudioTextDataset):
     def __init__(
         self,
         manifest_filepath: str,
-        tokenizer: 'nemo.collections.common.tokenizers.TokenizerSpec',
-        inter_tokenizer: 'nemo.collections.common.tokenizers.TokenizerSpec',
+        st_tokenizer: 'nemo.collections.common.tokenizers.TokenizerSpec',
+        asr_tokenizer: 'nemo.collections.common.tokenizers.TokenizerSpec',
         sample_rate: int,
         int_values: bool = False,
         augmentor: 'nemo.collections.asr.parts.perturb.AudioAugmentor' = None,
@@ -717,35 +719,35 @@ class AudioToBPEDataset(_AudioTextDataset):
         return_sample_id: bool = False,
         channel_selector: Optional[ChannelSelectorType] = None,
     ):
-        if use_start_end_token and hasattr(tokenizer, "bos_id") and tokenizer.bos_id > 0:
-            bos_id = tokenizer.bos_id
+        if use_start_end_token and hasattr(st_tokenizer, "bos_id") and st_tokenizer.bos_id > 0:
+            st_bos_id = st_tokenizer.bos_id
         else:
-            bos_id = None
+            st_bos_id = None
 
-        if use_start_end_token and hasattr(tokenizer, "eos_id") and tokenizer.eos_id > 0:
-            eos_id = tokenizer.eos_id
+        if use_start_end_token and hasattr(st_tokenizer, "eos_id") and st_tokenizer.eos_id > 0:
+            st_eos_id = st_tokenizer.eos_id
         else:
-            eos_id = None
+            st_eos_id = None
 
-        if hasattr(tokenizer, "pad_id") and tokenizer.pad_id > 0:
-            pad_id = tokenizer.pad_id
+        if hasattr(st_tokenizer, "pad_id") and st_tokenizer.pad_id > 0:
+            st_pad_id = st_tokenizer.pad_id
         else:
-            pad_id = 0
+            st_pad_id = 0
 
-        if use_start_end_token and hasattr(inter_tokenizer, "bos_id") and inter_tokenizer.bos_id > 0:
-            inter_bos_id = inter_tokenizer.bos_id
+        if use_start_end_token and hasattr(asr_tokenizer, "bos_id") and asr_tokenizer.bos_id > 0:
+            asr_bos_id = asr_tokenizer.bos_id
         else:
-            inter_bos_id = None
+            asr_bos_id = None
 
-        if use_start_end_token and hasattr(inter_tokenizer, "eos_id") and inter_tokenizer.eos_id > 0:
-            inter_eos_id = inter_tokenizer.eos_id
+        if use_start_end_token and hasattr(asr_tokenizer, "eos_id") and asr_tokenizer.eos_id > 0:
+            asr_eos_id = asr_tokenizer.eos_id
         else:
-            inter_eos_id = None
+            asr_eos_id = None
 
-        if hasattr(inter_tokenizer, "pad_id") and inter_tokenizer.pad_id > 0:
-            inter_pad_id = inter_tokenizer.pad_id
+        if hasattr(asr_tokenizer, "pad_id") and asr_tokenizer.pad_id > 0:
+            asr_pad_id = asr_tokenizer.pad_id
         else:
-            inter_pad_id = 0
+            asr_pad_id = 0
 
         class TokenizerWrapper:
             def __init__(self, tokenizer):
@@ -767,20 +769,20 @@ class AudioToBPEDataset(_AudioTextDataset):
 
         super().__init__(
             manifest_filepath=manifest_filepath,
-            parser=TokenizerWrapper(tokenizer),
-            inter_parser=TokenizerWrapper(inter_tokenizer),
+            st_parser=TokenizerWrapper(st_tokenizer),
+            asr_parser=TokenizerWrapper(asr_tokenizer),
             sample_rate=sample_rate,
             int_values=int_values,
             augmentor=augmentor,
             max_duration=max_duration,
             min_duration=min_duration,
             max_utts=max_utts,
-            bos_id=bos_id,
-            eos_id=eos_id,
-            pad_id=pad_id,
-            inter_bos_id=inter_bos_id,
-            inter_eos_id=inter_eos_id,
-            inter_pad_id=inter_pad_id,
+            st_bos_id=st_bos_id,
+            st_eos_id=st_eos_id,
+            st_pad_id=st_pad_id,
+            asr_bos_id=asr_bos_id,
+            asr_eos_id=asr_eos_id,
+            asr_pad_id=asr_pad_id,
             trim=trim,
             return_sample_id=return_sample_id,
             channel_selector=channel_selector,
@@ -883,8 +885,8 @@ class _TarredAudioToTextDataset(IterableDataset):
         self,
         audio_tar_filepaths: Union[str, List[str]],
         manifest_filepath: str,
-        parser: Callable,
-        inter_parser: Callable,
+        st_parser: Callable,
+        asr_parser: Callable,
         sample_rate: int,
         int_values: bool = False,
         augmentor: Optional['nemo.collections.asr.parts.perturb.AudioAugmentor'] = None,
@@ -892,12 +894,12 @@ class _TarredAudioToTextDataset(IterableDataset):
         min_duration: Optional[float] = None,
         max_duration: Optional[float] = None,
         trim: bool = False,
-        bos_id: Optional[int] = None,
-        eos_id: Optional[int] = None,
-        pad_id: int = 0,
-        inter_bos_id: Optional[int] = None,
-        inter_eos_id: Optional[int] = None,
-        inter_pad_id: int = 0,
+        st_bos_id: Optional[int] = None,
+        st_eos_id: Optional[int] = None,
+        st_pad_id: int = 0,
+        asr_bos_id: Optional[int] = None,
+        asr_eos_id: Optional[int] = None,
+        asr_pad_id: int = 0,
         shard_strategy: str = "scatter",
         shard_manifests: bool = False,
         global_rank: int = 0,
@@ -920,17 +922,17 @@ class _TarredAudioToTextDataset(IterableDataset):
 
         self.manifest_processor = ASRManifestProcessor(
             manifest_filepath=manifest_filepath,
-            parser=parser,
-            inter_parser=inter_parser,
+            st_parser=st_parser,
+            asr_parser=asr_parser,
             max_duration=max_duration,
             min_duration=min_duration,
             max_utts=0,
-            bos_id=bos_id,
-            eos_id=eos_id,
-            pad_id=pad_id,
-            inter_bos_id=inter_bos_id,
-            inter_eos_id=inter_eos_id,
-            inter_pad_id=inter_pad_id,
+            st_bos_id=st_bos_id,
+            st_eos_id=st_eos_id,
+            st_pad_id=st_pad_id,
+            asr_bos_id=asr_bos_id,
+            asr_eos_id=asr_eos_id,
+            asr_pad_id=asr_pad_id,
             index_by_file_id=True,  # Must set this so the manifest lines can be indexed by file ID
         )
 
@@ -938,12 +940,12 @@ class _TarredAudioToTextDataset(IterableDataset):
 
         self.featurizer = WaveformFeaturizer(sample_rate=sample_rate, int_values=int_values, augmentor=augmentor)
         self.trim = trim
-        self.eos_id = eos_id
-        self.bos_id = bos_id
-        self.pad_id = pad_id
-        self.inter_eos_id = inter_eos_id
-        self.inter_bos_id = inter_bos_id
-        self.inter_pad_id = inter_pad_id
+        self.st_eos_id = st_eos_id
+        self.st_bos_id = st_bos_id
+        self.st_pad_id = st_pad_id
+        self.asr_eos_id = asr_eos_id
+        self.asr_bos_id = asr_bos_id
+        self.asr_pad_id = asr_pad_id
         self.return_sample_id = return_sample_id
 
         audio_tar_filepaths = expand_sharded_filepaths(
@@ -1065,20 +1067,23 @@ class _TarredAudioToTextDataset(IterableDataset):
 
         t2, tl2 = manifest_entry.translated_text_tokens, len(manifest_entry.translated_text_tokens)
 
-        self.manifest_processor.process_text_by_sample(sample=manifest_entry)
-        self.manifest_processor.process_translated_text_by_sample(sample=manifest_entry)
+        self.manifest_processor.process_asr_text_by_sample(sample=manifest_entry)
+        self.manifest_processor.process_st_text_by_sample(sample=manifest_entry)
 
-        if self.bos_id is not None:
-            t = [self.bos_id] + t
+        if self.asr_bos_id is not None:
+            t = [self.asr_bos_id] + t
             tl += 1
 
-            t2 = [self.bos_id] + t2
+        if self.st_bos_id is not None:
+            t2 = [self.st_bos_id] + t2
             tl2 += 1
 
-        if self.eos_id is not None:
-            t = t + [self.eos_id]
+        if self.asr_eos_id is not None:
+            t = t + [self.asr_eos_id]
             tl += 1
-            t2 = t2 + [self.eos_id]
+
+        if self.st_eos_id is not None:
+            t2 = t2 + [self.st_eos_id]
             tl2 += 1
 
         if self.return_sample_id:
@@ -1349,8 +1354,8 @@ class TarredAudioToBPEDataset(_TarredAudioToTextDataset):
         self,
         audio_tar_filepaths: Union[str, List[str]],
         manifest_filepath: str,
-        tokenizer: 'nemo.collections.common.tokenizers.TokenizerSpec',
-        inter_tokenizer: 'nemo.collections.common.tokenizers.TokenizerSpec',
+        st_tokenizer: 'nemo.collections.common.tokenizers.TokenizerSpec',
+        asr_tokenizer: 'nemo.collections.common.tokenizers.TokenizerSpec',
         sample_rate: int,
         int_values: bool = False,
         augmentor: Optional['nemo.collections.asr.parts.perturb.AudioAugmentor'] = None,
@@ -1365,35 +1370,35 @@ class TarredAudioToBPEDataset(_TarredAudioToTextDataset):
         world_size: int = 0,
         return_sample_id: bool = False,
     ):
-        if use_start_end_token and hasattr(tokenizer, "bos_id") and tokenizer.bos_id > 0:
-            bos_id = tokenizer.bos_id
+        if use_start_end_token and hasattr(st_tokenizer, "bos_id") and st_tokenizer.bos_id > 0:
+            st_bos_id = st_tokenizer.bos_id
         else:
-            bos_id = None
+            st_bos_id = None
 
-        if use_start_end_token and hasattr(tokenizer, "eos_id") and tokenizer.eos_id > 0:
-            eos_id = tokenizer.eos_id
+        if use_start_end_token and hasattr(st_tokenizer, "eos_id") and st_tokenizer.eos_id > 0:
+            st_eos_id = st_tokenizer.eos_id
         else:
-            eos_id = None
+            st_eos_id = None
 
-        if hasattr(tokenizer, "pad_id") and tokenizer.pad_id > 0:
-            pad_id = tokenizer.pad_id
+        if hasattr(st_tokenizer, "pad_id") and st_tokenizer.pad_id > 0:
+            st_pad_id = st_tokenizer.pad_id
         else:
-            pad_id = 0
+            st_pad_id = 0
 
-        if use_start_end_token and hasattr(inter_tokenizer, "bos_id") and inter_tokenizer.bos_id > 0:
-            inter_bos_id = inter_tokenizer.bos_id
+        if use_start_end_token and hasattr(asr_tokenizer, "bos_id") and asr_tokenizer.bos_id > 0:
+            asr_bos_id = asr_tokenizer.bos_id
         else:
-            inter_bos_id = None
+            asr_bos_id = None
 
-        if use_start_end_token and hasattr(inter_tokenizer, "eos_id") and inter_tokenizer.eos_id > 0:
-            inter_eos_id = inter_tokenizer.eos_id
+        if use_start_end_token and hasattr(asr_tokenizer, "eos_id") and asr_tokenizer.eos_id > 0:
+            asr_eos_id = asr_tokenizer.eos_id
         else:
-            inter_eos_id = None
+            asr_eos_id = None
 
-        if hasattr(inter_tokenizer, "pad_id") and inter_tokenizer.pad_id > 0:
-            inter_pad_id = inter_tokenizer.pad_id
+        if hasattr(asr_tokenizer, "pad_id") and asr_tokenizer.pad_id > 0:
+            asr_pad_id = asr_tokenizer.pad_id
         else:
-            inter_pad_id = 0
+            asr_pad_id = 0
 
         class TokenizerWrapper:
             def __init__(self, tokenizer):
@@ -1416,8 +1421,8 @@ class TarredAudioToBPEDataset(_TarredAudioToTextDataset):
         super().__init__(
             audio_tar_filepaths=audio_tar_filepaths,
             manifest_filepath=manifest_filepath,
-            parser=TokenizerWrapper(tokenizer),
-            inter_parser=TokenizerWrapper(inter_tokenizer),
+            st_parser=TokenizerWrapper(st_tokenizer),
+            asr_parser=TokenizerWrapper(asr_tokenizer),
             sample_rate=sample_rate,
             int_values=int_values,
             augmentor=augmentor,
@@ -1425,12 +1430,12 @@ class TarredAudioToBPEDataset(_TarredAudioToTextDataset):
             min_duration=min_duration,
             max_duration=max_duration,
             trim=trim,
-            bos_id=bos_id,
-            eos_id=eos_id,
-            pad_id=pad_id,
-            inter_bos_id=inter_bos_id,
-            inter_eos_id=inter_eos_id,
-            inter_pad_id=inter_pad_id,
+            st_bos_id=st_bos_id,
+            st_eos_id=st_eos_id,
+            st_pad_id=st_pad_id,
+            asr_bos_id=asr_bos_id,
+            asr_eos_id=asr_eos_id,
+            asr_pad_id=asr_pad_id,
             shard_strategy=shard_strategy,
             shard_manifests=shard_manifests,
             global_rank=global_rank,
