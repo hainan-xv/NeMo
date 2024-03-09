@@ -20,18 +20,16 @@ import torch
 from omegaconf import DictConfig, ListConfig, OmegaConf, open_dict
 from pytorch_lightning import Trainer
 
-from nemo.collections.asr.models.rnnt_models import EncDecRNNTModel
 from nemo.collections.asr.data import audio_to_text_dataset
 from nemo.collections.asr.data.audio_to_text_dali import AudioToBPEDALIDataset
 from nemo.collections.asr.data.audio_to_text_lhotse import LhotseSpeechToTextBpeDataset
 from nemo.collections.asr.losses.ctc import CTCLoss
 from nemo.collections.asr.losses.rnnt import RNNTLoss
-from nemo.collections.asr.metrics import WER, BLEU
+from nemo.collections.asr.metrics.wer import WER
 from nemo.collections.asr.models.hybrid_rnnt_ctc_models import EncDecHybridRNNTCTCModel
 from nemo.collections.asr.parts.mixins import ASRBPEMixin
 from nemo.collections.asr.parts.submodules.ctc_decoding import CTCBPEDecoding, CTCBPEDecodingConfig
 from nemo.collections.asr.parts.submodules.rnnt_decoding import RNNTBPEDecoding, RNNTBPEDecodingConfig
-from nemo.collections.asr.parts.submodules.rnnt_decoding import RNNTDecoding, RNNTDecodingConfig
 from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
 from nemo.core.classes.common import PretrainedModelInfo
 from nemo.utils import logging, model_utils
@@ -53,21 +51,10 @@ class EncDecHybridRNNTCTCBPEModel(EncDecHybridRNNTCTCModel, ASRBPEMixin):
             cfg = OmegaConf.create(cfg)
 
         # Setup the tokenizer
-        if 'inter_tokenizer' in cfg:
-            self._setup_tokenizer(cfg.tokenizer, cfg.inter_tokenizer)
-        else:
-            self._setup_tokenizer(cfg.tokenizer, cfg.tokenizer)
+        self._setup_tokenizer(cfg.tokenizer)
 
         # Initialize a dummy vocabulary
-        if hasattr(self.tokenizer.tokenizer, 'vocab') and callable(self.tokenizer.tokenizer.vocab):
-            vocabulary = self.tokenizer.tokenizer.vocab()
-        else:
-            vocabulary = self.tokenizer.tokenizer.get_vocab()
-
-        if hasattr(self.inter_tokenizer.tokenizer, 'vocab') and callable(self.inter_tokenizer.tokenizer.vocab):
-            inter_vocabulary = self.inter_tokenizer.tokenizer.vocab()
-        else:
-            inter_vocabulary = self.inter_tokenizer.tokenizer.get_vocab()
+        vocabulary = self.tokenizer.tokenizer.get_vocab()
 
         # Set the new vocabulary
         with open_dict(cfg):
@@ -89,7 +76,7 @@ class EncDecHybridRNNTCTCBPEModel(EncDecHybridRNNTCTCModel, ASRBPEMixin):
             )
 
         with open_dict(cfg):
-            if self.tokenizer_type == "agg" or self.tokenizer_type == 'yttm':
+            if self.tokenizer_type == "agg":
                 cfg.aux_ctc.decoder.vocabulary = ListConfig(vocabulary)
             else:
                 cfg.aux_ctc.decoder.vocabulary = ListConfig(list(vocabulary.keys()))
@@ -104,50 +91,25 @@ class EncDecHybridRNNTCTCBPEModel(EncDecHybridRNNTCTCModel, ASRBPEMixin):
 
         super().__init__(cfg=cfg, trainer=trainer)
 
-#        old_len = self.cfg.decoder['vocab_size']
-#        old_n_classes, old_vocab = self.cfg.joint.num_classes, self.cfg.joint.vocabulary
-#        assert old_len == old_n_classes
-#
-#        self.cfg.decoder['vocab_size'] = len(inter_vocabulary)
-#        self.cfg.joint.num_classes = len(inter_vocabulary)
-#        self.cfg.joint.vocabulary = ListConfig(list(inter_vocabulary))
-#
-#        self.ctc_decoder = EncDecRNNTModel.from_config_dict(self.cfg.decoder)
-#        self.inter_rnnt_decoder = EncDecRNNTModel.from_config_dict(self.cfg.decoder)
-##        self.inter_joint = EncDecRNNTModel.from_config_dict(self.cfg.joint)
-##
-#        if self.cfg.inter_ctc
-#        self.inter_ctc_decoding = CTCBPEDecoding(
-#            decoding_cfg=self.cfg.decoding, decoder=self.inter_decoder, tokenizer=self.inter_tokenizer,
-#            )
-#        self.inter_ctc_decoding = CTCBPEDecoding(
-#            decoding_cfg=self.cfg.decoding, decoder=self.inter_decoder, tokenizer=self.inter_tokenizer,
-#            )
-#
-##        self.inter_rnnt_decoding = RNNTBPEDecoding(   # can't have it here since it needs joint
-##            decoding_cfg=self.cfg.decoding, decoder=self.inter_decoder, joint=self.inter_joint, tokenizer=self.inter_tokenizer,
-##            )
-#
-#        self.cfg.joint.num_classes, self.cfg.joint.vocabulary = old_n_classes, old_vocab
-#        self.cfg.decoder['vocab_size'] = old_len
-#
+        self.cfg.decoding = self.set_decoding_type_according_to_loss(self.cfg.decoding)
         # Setup decoding object
         self.decoding = RNNTBPEDecoding(
             decoding_cfg=self.cfg.decoding, decoder=self.decoder, joint=self.joint, tokenizer=self.tokenizer,
         )
 
         # Setup wer object
-        self.bleu = BLEU(
+        self.wer = WER(
             decoding=self.decoding,
             batch_dim_index=0,
-#            use_cer=self.cfg.get('use_cer', False),
+            use_cer=self.cfg.get('use_cer', False),
             log_prediction=self.cfg.get('log_prediction', True),
             dist_sync_on_step=True,
         )
 
         # Setup fused Joint step if flag is set
         if self.joint.fuse_loss_wer:
-            assert(0)
+            self.joint.set_loss(self.loss)
+            self.joint.set_wer(self.wer)
 
         # Setup CTC decoding
         ctc_decoding_cfg = self.cfg.aux_ctc.get('decoding', None)
@@ -184,7 +146,6 @@ class EncDecHybridRNNTCTCBPEModel(EncDecHybridRNNTCTCModel, ASRBPEMixin):
             global_rank=self.global_rank,
             world_size=self.world_size,
             tokenizer=self.tokenizer,
-            inter_tokenizer=self.inter_tokenizer,
             preprocessor_cfg=self.cfg.get("preprocessor", None),
         )
 
@@ -284,7 +245,6 @@ class EncDecHybridRNNTCTCBPEModel(EncDecHybridRNNTCTCModel, ASRBPEMixin):
         Returns: None
 
         """
-        assert(0)
         if isinstance(new_tokenizer_dir, DictConfig):
             if new_tokenizer_type == 'agg':
                 new_tokenizer_cfg = new_tokenizer_dir
@@ -309,7 +269,7 @@ class EncDecHybridRNNTCTCBPEModel(EncDecHybridRNNTCTCModel, ASRBPEMixin):
             tokenizer_cfg = OmegaConf.create({'dir': new_tokenizer_dir, 'type': new_tokenizer_type})
 
         # Setup the tokenizer
-        self._setup_tokenizer(tokenizer_cfg, inter_tokenizer_cfg)
+        self._setup_tokenizer(tokenizer_cfg)
 
         # Initialize a dummy vocabulary
         vocabulary = self.tokenizer.tokenizer.get_vocab()
@@ -342,16 +302,17 @@ class EncDecHybridRNNTCTCBPEModel(EncDecHybridRNNTCTCModel, ASRBPEMixin):
         decoding_cls = OmegaConf.structured(RNNTBPEDecodingConfig)
         decoding_cls = OmegaConf.create(OmegaConf.to_container(decoding_cls))
         decoding_cfg = OmegaConf.merge(decoding_cls, decoding_cfg)
+        decoding_cfg = self.set_decoding_type_according_to_loss(decoding_cfg)
 
         self.decoding = RNNTBPEDecoding(
             decoding_cfg=decoding_cfg, decoder=self.decoder, joint=self.joint, tokenizer=self.tokenizer,
         )
 
-        self.bleu = BLEU(
+        self.wer = WER(
             decoding=self.decoding,
-            batch_dim_index=self.bleu.batch_dim_index,
-#            use_cer=self.bleu.use_cer,
-            log_prediction=self.bleu.log_prediction,
+            batch_dim_index=self.wer.batch_dim_index,
+            use_cer=self.wer.use_cer,
+            log_prediction=self.wer.log_prediction,
             dist_sync_on_step=True,
         )
 
@@ -359,7 +320,8 @@ class EncDecHybridRNNTCTCBPEModel(EncDecHybridRNNTCTCModel, ASRBPEMixin):
         if self.joint.fuse_loss_wer or (
             self.decoding.joint_fused_batch_size is not None and self.decoding.joint_fused_batch_size > 0
         ):
-            assert(0)
+            self.joint.set_loss(self.loss)
+            self.joint.set_wer(self.wer)
 
         # Update config
         with open_dict(self.cfg.joint):
@@ -447,16 +409,17 @@ class EncDecHybridRNNTCTCBPEModel(EncDecHybridRNNTCTCModel, ASRBPEMixin):
             decoding_cls = OmegaConf.structured(RNNTBPEDecodingConfig)
             decoding_cls = OmegaConf.create(OmegaConf.to_container(decoding_cls))
             decoding_cfg = OmegaConf.merge(decoding_cls, decoding_cfg)
+            decoding_cfg = self.set_decoding_type_according_to_loss(decoding_cfg)
 
             self.decoding = RNNTBPEDecoding(
                 decoding_cfg=decoding_cfg, decoder=self.decoder, joint=self.joint, tokenizer=self.tokenizer,
             )
 
-            self.bleu = BLEU(
+            self.wer = WER(
                 decoding=self.decoding,
-                batch_dim_index=self.bleu.batch_dim_index,
-#                use_cer=self.bleu.use_cer,
-                log_prediction=self.bleu.log_prediction,
+                batch_dim_index=self.wer.batch_dim_index,
+                use_cer=self.wer.use_cer,
+                log_prediction=self.wer.log_prediction,
                 dist_sync_on_step=True,
             )
 
@@ -464,7 +427,8 @@ class EncDecHybridRNNTCTCBPEModel(EncDecHybridRNNTCTCModel, ASRBPEMixin):
             if self.joint.fuse_loss_wer or (
                 self.decoding.joint_fused_batch_size is not None and self.decoding.joint_fused_batch_size > 0
             ):
-                assert(0)
+                self.joint.set_loss(self.loss)
+                self.joint.set_wer(self.wer)
 
             self.joint.temperature = decoding_cfg.get('temperature', 1.0)
 
