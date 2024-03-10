@@ -28,7 +28,7 @@ from nemo.collections.asr.data import audio_to_text_dataset
 from nemo.collections.asr.data.audio_to_text_dali import AudioToCharDALIDataset, DALIOutputs
 from nemo.collections.asr.data.audio_to_text_lhotse import LhotseSpeechToTextBpeDataset
 from nemo.collections.asr.losses.rnnt import RNNTLoss, resolve_rnnt_default_loss_name
-from nemo.collections.asr.metrics import BLEU
+from nemo.collections.asr.metrics import BLEU, WER
 from nemo.collections.asr.models.asr_model import ASRModel, ExportableEncDecModel
 from nemo.collections.asr.modules.rnnt import RNNTDecoderJoint
 from nemo.collections.asr.parts.mixins import (
@@ -62,6 +62,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         # Initialize components
         self.preprocessor = EncDecRNNTModel.from_config_dict(self.cfg.preprocessor)
         self.encoder = EncDecRNNTModel.from_config_dict(self.cfg.encoder)
+        self.st_encoder = EncDecRNNTModel.from_config_dict(self.cfg.st_encoder)
 
         # Update config values required by components dynamically
         with open_dict(self.cfg.decoder):
@@ -76,16 +77,34 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         self.decoder = EncDecRNNTModel.from_config_dict(self.cfg.decoder)
         self.joint = EncDecRNNTModel.from_config_dict(self.cfg.joint)
 
+        with open_dict(self.cfg.decoder):
+            self.cfg.decoder.vocab_size = len(self.cfg.st_labels)
+        with open_dict(self.cfg.joint):
+            self.cfg.joint.num_classes = len(self.cfg.st_labels)
+            self.cfg.joint.vocabulary = self.cfg.st_labels
+
+        self.st_decoder = EncDecRNNTModel.from_config_dict(self.cfg.decoder)
+        self.st_joint = EncDecRNNTModel.from_config_dict(self.cfg.joint)
+
         # Setup RNNT Loss
         loss_name, loss_kwargs = self.extract_rnnt_loss_cfg(self.cfg.get("loss", None))
 
-        num_classes = self.joint.num_classes_with_blank - 1  # for standard RNNT and multi-blank
+        asr_num_classes = self.joint.num_classes_with_blank - 1  # for standard RNNT and multi-blank
+        st_num_classes = self.st_joint.num_classes_with_blank - 1  # for standard RNNT and multi-blank
 
         if loss_name == 'tdt':
-            num_classes = num_classes - self.joint.num_extra_outputs
+            asr_num_classes = asr_num_classes - self.joint.num_extra_outputs
+            st_num_classes = st_num_classes - self.joint.num_extra_outputs
 
-        self.loss = RNNTLoss(
-            num_classes=num_classes,
+        self.asr_loss = RNNTLoss(
+            num_classes=asr_num_classes,
+            loss_name=loss_name,
+            loss_kwargs=loss_kwargs,
+            reduction=self.cfg.get("rnnt_reduction", "mean_batch"),
+        )
+
+        self.st_loss = RNNTLoss(
+            num_classes=st_num_classes,
             loss_name=loss_name,
             loss_kwargs=loss_kwargs,
             reduction=self.cfg.get("rnnt_reduction", "mean_batch"),
@@ -101,11 +120,20 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         self.decoding = RNNTDecoding(
             decoding_cfg=self.cfg.decoding, decoder=self.decoder, joint=self.joint, vocabulary=self.joint.vocabulary,
         )
+        self.st_decoding = RNNTDecoding(
+            decoding_cfg=self.cfg.decoding, decoder=self.st_decoder, joint=self.st_joint, vocabulary=self.st_joint.vocabulary,
+        )
         # Setup WER calculation
-        self.bleu = BLEU(
+        self.wer = WER(
             decoding=self.decoding,
             batch_dim_index=0,
-#            use_cer=self._cfg.get('use_cer', False),
+            use_cer=self._cfg.get('use_cer', False),
+            log_prediction=self._cfg.get('log_prediction', True),
+            dist_sync_on_step=True,
+        )
+        self.bleu = BLEU(
+            decoding=self.st_decoding,
+            batch_dim_index=0,
             log_prediction=self._cfg.get('log_prediction', True),
             dist_sync_on_step=True,
         )
@@ -120,8 +148,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         if self.joint.fuse_loss_wer or (
             self.decoding.joint_fused_batch_size is not None and self.decoding.joint_fused_batch_size > 0
         ):
-            self.joint.set_loss(self.loss)
-            self.joint.set_wer(self.bleu)
+            assert(0)
 
         # Setup optimization normalization (if provided in config)
         self.setup_optim_normalization()
@@ -300,6 +327,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         Returns: None
 
         """
+        assert(0)
         if self.joint.vocabulary == new_vocabulary:
             logging.warning(f"Old {self.joint.vocabulary} and new {new_vocabulary} match. Not changing anything.")
         else:
@@ -319,10 +347,13 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             del self.decoder
             self.decoder = EncDecRNNTModel.from_config_dict(new_decoder_config)
 
-            del self.loss
+            del self.asr_loss
             loss_name, loss_kwargs = self.extract_rnnt_loss_cfg(self.cfg.get('loss', None))
-            self.loss = RNNTLoss(
+            self.asr_loss = RNNTLoss(
                 num_classes=self.joint.num_classes_with_blank - 1, loss_name=loss_name, loss_kwargs=loss_kwargs
+            )
+            self.st_loss = RNNTLoss(
+                num_classes=self.st_joint.num_classes_with_blank - 1, loss_name=loss_name, loss_kwargs=loss_kwargs
             )
 
             if decoding_cfg is None:
@@ -351,8 +382,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             if self.joint.fuse_loss_wer or (
                 self.decoding.joint_fused_batch_size is not None and self.decoding.joint_fused_batch_size > 0
             ):
-                self.joint.set_loss(self.loss)
-                self.joint.set_wer(self.bleu)
+                assert(0)
 
             # Update config
             with open_dict(self.cfg.joint):
@@ -380,43 +410,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             decoding_cfg: A config for the decoder, which is optional. If the decoding type
                 needs to be changed (from say Greedy to Beam decoding etc), the config can be passed here.
         """
-        if decoding_cfg is None:
-            # Assume same decoding config as before
-            logging.info("No `decoding_cfg` passed when changing decoding strategy, using internal config")
-            decoding_cfg = self.cfg.decoding
-
-        # Assert the decoding config with all hyper parameters
-        decoding_cls = OmegaConf.structured(RNNTDecodingConfig)
-        decoding_cls = OmegaConf.create(OmegaConf.to_container(decoding_cls))
-        decoding_cfg = OmegaConf.merge(decoding_cls, decoding_cfg)
-        decoding_cfg = self.set_decoding_type_according_to_loss(decoding_cfg)
-
-        self.decoding = RNNTDecoding(
-            decoding_cfg=decoding_cfg, decoder=self.decoder, joint=self.joint, vocabulary=self.joint.vocabulary,
-        )
-
-        self.bleu = BLEU(
-            decoding=self.decoding,
-            batch_dim_index=self.bleu.batch_dim_index,
-#            use_cer=self.bleu.use_cer,
-            log_prediction=self.bleu.log_prediction,
-            dist_sync_on_step=True,
-        )
-
-        # Setup fused Joint step
-        if self.joint.fuse_loss_wer or (
-            self.decoding.joint_fused_batch_size is not None and self.decoding.joint_fused_batch_size > 0
-        ):
-            self.joint.set_loss(self.loss)
-            self.joint.set_wer(self.bleu)
-
-        self.joint.temperature = decoding_cfg.get('temperature', 1.0)
-
-        # Update config
-        with open_dict(self.cfg.decoding):
-            self.cfg.decoding = decoding_cfg
-
-        logging.info(f"Changed decoding strategy to \n{OmegaConf.to_yaml(self.cfg.decoding)}")
+        assert(0)
 
     def _setup_dataloader_from_config(self, config: Optional[Dict]):
         # Automatically inject args from model config to dataloader config
@@ -587,6 +581,8 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         return {
             "outputs": NeuralType(('B', 'D', 'T'), AcousticEncodedRepresentation()),
             "encoded_lengths": NeuralType(tuple('B'), LengthsType()),
+            "st_outputs": NeuralType(('B', 'D', 'T'), AcousticEncodedRepresentation()),
+            "st_encoded_lengths": NeuralType(tuple('B'), LengthsType()),
         }
 
     @typecheck()
@@ -639,7 +635,9 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
 
         encoded, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
-        return encoded, encoded_len
+        st_encoded, st_encoded_len = self.st_encoder(audio_signal=encoded, length=encoded_len)
+
+        return encoded, encoded_len, st_encoded, st_encoded_len
 
     # PTL-specific methods
     def training_step(self, batch, batch_nb):
@@ -647,17 +645,18 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         if AccessMixin.is_access_enabled(self.model_guid):
             AccessMixin.reset_registry(self)
 
-        signal, signal_len, asr_transcript, asr_transcript_len, st_transcript, st_transcript_le = batch
+        signal, signal_len, asr_transcript, asr_transcript_len, st_transcript, st_transcript_len = batch
 
         # forward() only performs encoder forward
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
             encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
         else:
-            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
+            encoded, encoded_len, st_encoded, st_encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
         del signal
 
         # During training, loss must be computed, so decoder forward is necessary
         decoder, target_length, states = self.decoder(targets=asr_transcript, target_length=asr_transcript_len)
+        st_decoder, st_target_length, st_states = self.st_decoder(targets=st_transcript, target_length=st_transcript_len)
 
         if hasattr(self, '_trainer') and self._trainer is not None:
             log_every_n_steps = self._trainer.log_every_n_steps
@@ -670,9 +669,16 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         if not self.joint.fuse_loss_wer:
             # Compute full joint and loss
             joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder)
-            loss_value = self.loss(
+            asr_loss_value = self.asr_loss(
                 log_probs=joint, targets=asr_transcript, input_lengths=encoded_len, target_lengths=target_length
             )
+
+            st_joint = self.st_joint(encoder_outputs=st_encoded, decoder_outputs=st_decoder)
+            st_loss_value = self.st_loss(
+                log_probs=st_joint, targets=st_transcript, input_lengths=st_encoded_len, target_lengths=st_target_length
+            )
+
+            loss_value = asr_loss_value + st_loss_value
 
             # Add auxiliary losses, if registered
             loss_value = self.add_auxiliary_losses(loss_value)
@@ -683,6 +689,8 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
             tensorboard_logs = {
                 'train_loss': loss_value,
+                'asr_train_loss': asr_loss_value,
+                'st_train_loss': st_loss_value,
                 'learning_rate': self._optimizer.param_groups[0]['lr'],
                 'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
             }
@@ -696,7 +704,15 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 )
                 bleu = self.bleu.compute(return_all_metrics=False)['bleu']
                 self.bleu.reset()
-                tensorboard_logs.update({'training_batch_bleu': bleu})
+                self.wer.update(
+                    predictions=encoded,
+                    predictions_lengths=encoded_len,
+                    targets=transcript,
+                    targets_lengths=transcript_len,
+                )
+                _, scores, words = self.wer.compute()
+                self.wer.reset()
+                tensorboard_logs.update({'training_batch_st_bleu': bleu, 'training_batch_asr_wer': scores.float() / words})
 
         else:
             assert(0)
@@ -711,30 +727,31 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         return {'loss': loss_value}
 
     def predict_step(self, batch, batch_idx, dataloader_idx=0):
-        signal, signal_len, transcript, transcript_len, sample_id = batch
-
-        # forward() only performs encoder forward
-        if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
-            encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
-        else:
-            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
-        del signal
-
-        best_hyp_text, all_hyp_text = self.decoding.rnnt_decoder_predictions_tensor(
-            encoder_output=encoded, encoded_lengths=encoded_len, return_hypotheses=False
-        )
-
-        sample_id = sample_id.cpu().detach().numpy()
-        return list(zip(sample_id, best_hyp_text))
+        assert(0)
+#        signal, signal_len, transcript, transcript_len, sample_id = batch
+#
+#        # forward() only performs encoder forward
+#        if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
+#            encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
+#        else:
+#            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
+#        del signal
+#
+#        best_hyp_text, all_hyp_text = self.decoding.rnnt_decoder_predictions_tensor(
+#            encoder_output=encoded, encoded_lengths=encoded_len, return_hypotheses=False
+#        )
+#
+#        sample_id = sample_id.cpu().detach().numpy()
+#        return list(zip(sample_id, best_hyp_text))
 
     def validation_pass(self, batch, batch_idx, dataloader_idx=0):
-        signal, signal_len, asr_transcript, asr_transcript_len, st_transcript, st_transcript_le = batch
+        signal, signal_len, asr_transcript, asr_transcript_len, st_transcript, st_transcript_len = batch
 
         # forward() only performs encoder forward
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
             encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
         else:
-            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
+            encoded, encoded_len, st_encoded, st_encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
         del signal
 
         tensorboard_logs = {}
@@ -745,17 +762,41 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 decoder, target_length, states = self.decoder(targets=asr_transcript, target_length=asr_transcript_len)
                 joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder)
 
-                loss_value = self.loss(
+                asr_loss_value = self.asr_loss(
                     log_probs=joint, targets=transcript, input_lengths=encoded_len, target_lengths=target_length
                 )
 
-                tensorboard_logs['val_loss'] = loss_value
+                st_decoder, st_target_length, st_states = self.st_decoder(targets=st_transcript, target_length=st_transcript_len)
+                st_joint = self.st_joint(encoder_outputs=st_encoded, decoder_outputs=st_decoder)
 
-            self.bleu.update(
+                st_loss_value = self.st_loss(
+                    log_probs=st_joint, targets=st_transcript, input_lengths=st_encoded_len, target_lengths=st_target_length
+                )
+
+                loss_value = st_loss_value + asr_loss_value
+
+                tensorboard_logs['val_loss'] = loss_value
+                tensorboard_logs['st_val_loss'] = st_loss_value
+                tensorboard_logs['asr_val_loss'] = asr_loss_value
+
+            self.wer.update(
                 predictions=encoded,
                 predictions_lengths=encoded_len,
                 targets=asr_transcript,
                 targets_lengths=asr_transcript_len,
+            )
+            wer, wer_num, wer_denom = self.wer.compute()
+            self.wer.reset()
+
+            tensorboard_logs['val_wer_num'] = wer_num
+            tensorboard_logs['val_wer_denom'] = wer_denom
+            tensorboard_logs['val_wer'] = wer
+
+            self.bleu.update(
+                predictions=st_encoded,
+                predictions_lengths=st_encoded_len,
+                targets=st_transcript,
+                targets_lengths=st_transcript_len,
             )
             bleu_returns = self.bleu.compute(prefix='val_')
             self.bleu.reset()

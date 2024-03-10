@@ -24,7 +24,7 @@ from nemo.collections.asr.data import audio_to_text_dataset
 from nemo.collections.asr.data.audio_to_text_dali import AudioToBPEDALIDataset
 from nemo.collections.asr.data.audio_to_text_lhotse import LhotseSpeechToTextBpeDataset
 from nemo.collections.asr.losses.rnnt import RNNTLoss
-from nemo.collections.asr.metrics import BLEU
+from nemo.collections.asr.metrics import BLEU, WER
 from nemo.collections.asr.models.rnnt_models import EncDecRNNTModel
 from nemo.collections.asr.parts.mixins import ASRBPEMixin
 from nemo.collections.asr.parts.submodules.rnnt_decoding import RNNTBPEDecoding, RNNTBPEDecodingConfig
@@ -326,23 +326,34 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
 
         self.cfg.decoding = self.set_decoding_type_according_to_loss(self.cfg.decoding)
         # Setup decoding object
-        self.decoding = RNNTBPEDecoding(
+        self.asr_decoding = RNNTBPEDecoding(
             decoding_cfg=self.cfg.decoding, decoder=self.decoder, joint=self.joint, tokenizer=self.asr_tokenizer,
+        )
+
+        self.st_decoding = RNNTBPEDecoding(
+            decoding_cfg=self.cfg.decoding, decoder=self.st_decoder, joint=self.st_joint, tokenizer=self.st_tokenizer,
         )
 
         # Setup wer object
         self.bleu = BLEU(
-            decoding=self.decoding,
+            decoding=self.st_decoding,
             batch_dim_index=0,
 #            use_cer=self._cfg.get('use_cer', False),
             log_prediction=self._cfg.get('log_prediction', True),
             dist_sync_on_step=True,
         )
 
+        self.wer = WER(
+            decoding=self.asr_decoding,
+            batch_dim_index=0,
+            use_cer=self._cfg.get('use_cer', False),
+            log_prediction=self._cfg.get('log_prediction', True),
+            dist_sync_on_step=True,
+        )
+
         # Setup fused Joint step if flag is set
         if self.joint.fuse_loss_wer:
-            self.joint.set_loss(self.loss)
-            self.joint.set_wer(self.bleu)
+            assert(0)
 
     def change_vocabulary(
         self,
@@ -365,6 +376,7 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
         Returns: None
 
         """
+        assert(0)
         if isinstance(new_tokenizer_dir, DictConfig):
             if new_tokenizer_type == 'agg':
                 new_tokenizer_cfg = new_tokenizer_dir
@@ -431,7 +443,6 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
         self.bleu = BLEU(
             decoding=self.decoding,
             batch_dim_index=self.bleu.batch_dim_index,
-#            use_cer=self.bleu.use_cer,
             log_prediction=self.bleu.log_prediction,
             dist_sync_on_step=True,
         )
@@ -463,6 +474,7 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
             decoding_cfg: A config for the decoder, which is optional. If the decoding type
                 needs to be changed (from say Greedy to Beam decoding etc), the config can be passed here.
         """
+        assert(0)
         if decoding_cfg is None:
             # Assume same decoding config as before
             logging.info("No `decoding_cfg` passed when changing decoding strategy, using internal config")

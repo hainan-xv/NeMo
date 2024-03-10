@@ -190,18 +190,18 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
 
         return all_input_example
 
-    @property
-    def input_types(self):
-        """Returns definitions of module input ports."""
-        return OrderedDict(
-            {
-                "audio_signal": NeuralType(('B', 'D', 'T'), SpectrogramType()),
-                "length": NeuralType(tuple('B'), LengthsType()),
-                "cache_last_channel": NeuralType(('D', 'B', 'T', 'D'), ChannelType(), optional=True),
-                "cache_last_time": NeuralType(('D', 'B', 'D', 'T'), ChannelType(), optional=True),
-                "cache_last_channel_len": NeuralType(tuple('B'), LengthsType(), optional=True),
-            }
-        )
+#    @property
+#    def input_types(self):
+#        """Returns definitions of module input ports."""
+#        return OrderedDict(
+#            {
+#                "audio_signal": NeuralType(('B', 'D', 'T'), SpectrogramType()),
+#                "length": NeuralType(tuple('B'), LengthsType()),
+#                "cache_last_channel": NeuralType(('D', 'B', 'T', 'D'), ChannelType(), optional=True),
+#                "cache_last_time": NeuralType(('D', 'B', 'D', 'T'), ChannelType(), optional=True),
+#                "cache_last_channel_len": NeuralType(tuple('B'), LengthsType(), optional=True),
+#            }
+#        )
 
     @property
     def input_types_for_export(self):
