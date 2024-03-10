@@ -285,14 +285,19 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
         cfg = model_utils.maybe_update_config_version(cfg)
 
         # Tokenizer is necessary for this model
-        if 'asr_tokenizer' not in cfg:
+        if 'asr_tokenizer' not in cfg 'tokenizer' not in cfg:
             raise ValueError("`cfg` must have `tokenizer` config to create a tokenizer !")
 
         if not isinstance(cfg, DictConfig):
             cfg = OmegaConf.create(cfg)
 
         # Setup the tokenizer
-        self._setup_tokenizer(cfg.asr_tokenizer, cfg.st_tokenizer)
+        if 'asr_tokenizer' in cfg:
+            self._setup_tokenizer(cfg.asr_tokenizer, cfg.st_tokenizer)
+        elif 'tokenizer' in cfg:
+            self._setup_tokenizer(cfg.tokenizer, cfg.tokenizer)
+        else:
+            assert(0)
 
         # Initialize a dummy vocabulary
 #        vocabulary = self.tokenizer.tokenizer.get_vocab()

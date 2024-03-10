@@ -133,6 +133,8 @@ RUN pip install flash-attn
 # install numba for latest containers
 RUN pip install numba>=0.57.1
 
+RUN pip install youtokentome
+
 # copy nemo source into a scratch image
 FROM scratch as nemo-src
 COPY . .
