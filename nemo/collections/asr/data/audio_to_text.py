@@ -1460,7 +1460,7 @@ class BucketingDataset(IterableDataset):
         super().__init__()
 
     def _collate_fn(self, batch):
-        return _speech_collate_fn(batch[0], self.wrapped_dataset.pad_id)
+        return _speech_collate_fn(batch[0], self.wrapped_dataset.asr_pad_id, self.wrapped_dataset.st_pad_id)
 
     def __iter__(self):
         return BucketingIterator(

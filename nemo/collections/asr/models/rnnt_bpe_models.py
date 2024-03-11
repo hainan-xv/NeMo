@@ -285,7 +285,7 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
         cfg = model_utils.maybe_update_config_version(cfg)
 
         # Tokenizer is necessary for this model
-        if 'asr_tokenizer' not in cfg 'tokenizer' not in cfg:
+        if 'asr_tokenizer' not in cfg and 'tokenizer' not in cfg:
             raise ValueError("`cfg` must have `tokenizer` config to create a tokenizer !")
 
         if not isinstance(cfg, DictConfig):
@@ -299,9 +299,6 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
         else:
             assert(0)
 
-        # Initialize a dummy vocabulary
-#        vocabulary = self.tokenizer.tokenizer.get_vocab()
-#        print("self.tokenizer.tokenizer is", self.tokenizer.tokenizer)
         if hasattr(self.asr_tokenizer.tokenizer, 'vocab') and callable(self.asr_tokenizer.tokenizer.vocab):
             asr_vocabulary = self.asr_tokenizer.tokenizer.vocab()
         else:
@@ -311,7 +308,6 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
             st_vocabulary = self.st_tokenizer.tokenizer.vocab()
         else:
             st_vocabulary = self.st_tokenizer.tokenizer.get_vocab()
-            
 
         # Set the new vocabulary
         with open_dict(cfg):
@@ -334,19 +330,19 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
         self.asr_decoding = RNNTBPEDecoding(
             decoding_cfg=self.cfg.decoding, decoder=self.decoder, joint=self.joint, tokenizer=self.asr_tokenizer,
         )
+        if self.st_encoder != None:
 
-        self.st_decoding = RNNTBPEDecoding(
-            decoding_cfg=self.cfg.decoding, decoder=self.st_decoder, joint=self.st_joint, tokenizer=self.st_tokenizer,
-        )
+            self.st_decoding = RNNTBPEDecoding(
+                decoding_cfg=self.cfg.decoding, decoder=self.st_decoder, joint=self.st_joint, tokenizer=self.st_tokenizer,
+            )
 
-        # Setup wer object
-        self.bleu = BLEU(
-            decoding=self.st_decoding,
-            batch_dim_index=0,
-#            use_cer=self._cfg.get('use_cer', False),
-            log_prediction=self._cfg.get('log_prediction', True),
-            dist_sync_on_step=True,
-        )
+            # Setup wer object
+            self.bleu = BLEU(
+                decoding=self.st_decoding,
+                batch_dim_index=0,
+                log_prediction=self._cfg.get('log_prediction', True),
+                dist_sync_on_step=True,
+            )
 
         self.wer = WER(
             decoding=self.asr_decoding,
@@ -358,7 +354,7 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
 
         # Setup fused Joint step if flag is set
         if self.joint.fuse_loss_wer:
-            assert(0)
+            pass
 
     def change_vocabulary(
         self,
