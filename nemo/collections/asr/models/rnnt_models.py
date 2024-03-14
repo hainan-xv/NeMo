@@ -80,6 +80,10 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         self.decoder = EncDecRNNTModel.from_config_dict(self.cfg.decoder)
         self.joint = EncDecRNNTModel.from_config_dict(self.cfg.joint)
 
+        self.asr_weight = 1.0
+        if 'asr_weight' in self.cfg:
+            self.asr_weight = self.cfg.asr_weight
+
         # Setup RNNT Loss
         loss_name, loss_kwargs = self.extract_rnnt_loss_cfg(self.cfg.get("loss", None))
 
@@ -691,7 +695,8 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 log_probs=st_joint, targets=st_transcript, input_lengths=st_encoded_len, target_lengths=st_target_length
             )
 
-            loss_value = asr_loss_value + st_loss_value
+#            print('asr weight', self.asr_weight)
+            loss_value = asr_loss_value * self.asr_weight + st_loss_value
 
             # Add auxiliary losses, if registered
             loss_value = self.add_auxiliary_losses(loss_value)
@@ -786,24 +791,25 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                     log_probs=st_joint, targets=st_transcript, input_lengths=st_encoded_len, target_lengths=st_target_length
                 )
 
-                loss_value = st_loss_value + asr_loss_value
+                loss_value = st_loss_value + self.asr_weight * asr_loss_value
 
                 tensorboard_logs['val_loss'] = loss_value
                 tensorboard_logs['st_val_loss'] = st_loss_value
                 tensorboard_logs['asr_val_loss'] = asr_loss_value
 
-            self.wer.update(
-                predictions=encoded,
-                predictions_lengths=encoded_len,
-                targets=asr_transcript,
-                targets_lengths=asr_transcript_len,
-            )
-            wer, wer_num, wer_denom = self.wer.compute()
-            self.wer.reset()
+            if self.asr_weight != 0.0:
+                self.wer.update(
+                    predictions=encoded,
+                    predictions_lengths=encoded_len,
+                    targets=asr_transcript,
+                    targets_lengths=asr_transcript_len,
+                )
+                wer, wer_num, wer_denom = self.wer.compute()
+                self.wer.reset()
 
-            tensorboard_logs['val_wer_num'] = wer_num
-            tensorboard_logs['val_wer_denom'] = wer_denom
-            tensorboard_logs['val_wer'] = wer
+                tensorboard_logs['val_wer_num'] = wer_num
+                tensorboard_logs['val_wer_denom'] = wer_denom
+                tensorboard_logs['val_wer'] = wer
 
             self.bleu.update(
                 predictions=st_encoded,

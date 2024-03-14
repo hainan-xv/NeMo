@@ -293,7 +293,7 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
 
         # Setup the tokenizer
         if 'asr_tokenizer' in cfg:
-            self._setup_tokenizer(cfg.asr_tokenizer, cfg.st_tokenizer)
+            self._setup_tokenizer(cfg.st_tokenizer, cfg.asr_tokenizer)
         elif 'tokenizer' in cfg:
             self._setup_tokenizer(cfg.tokenizer, cfg.tokenizer)
         else:
