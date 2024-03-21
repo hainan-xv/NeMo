@@ -475,7 +475,6 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
             decoding_cfg: A config for the decoder, which is optional. If the decoding type
                 needs to be changed (from say Greedy to Beam decoding etc), the config can be passed here.
         """
-        assert(0)
         if decoding_cfg is None:
             # Assume same decoding config as before
             logging.info("No `decoding_cfg` passed when changing decoding strategy, using internal config")
@@ -487,12 +486,12 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
         decoding_cfg = OmegaConf.merge(decoding_cls, decoding_cfg)
         decoding_cfg = self.set_decoding_type_according_to_loss(decoding_cfg)
 
-        self.decoding = RNNTBPEDecoding(
-            decoding_cfg=decoding_cfg, decoder=self.decoder, joint=self.joint, tokenizer=self.tokenizer,
+        self.st_decoding = RNNTBPEDecoding(
+            decoding_cfg=decoding_cfg, decoder=self.st_decoder, joint=self.st_joint, tokenizer=self.st_tokenizer,
         )
 
         self.bleu = BLEU(
-            decoding=self.decoding,
+            decoding=self.st_decoding,
             batch_dim_index=self.bleu.batch_dim_index,
 #            use_cer=self.bleu.use_cer,
             log_prediction=self.bleu.log_prediction,
@@ -500,13 +499,12 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
         )
 
         # Setup fused Joint step
-        if self.joint.fuse_loss_wer or (
-            self.decoding.joint_fused_batch_size is not None and self.decoding.joint_fused_batch_size > 0
+        if self.st_joint.fuse_loss_wer or (
+            self.st_decoding.joint_fused_batch_size is not None and self.st_decoding.joint_fused_batch_size > 0
         ):
-            self.joint.set_loss(self.loss)
-            self.joint.set_wer(self.bleu)
+            assert(0)
 
-        self.joint.temperature = decoding_cfg.get('temperature', 1.0)
+        self.st_joint.temperature = decoding_cfg.get('temperature', 1.0)
 
         # Update config
         with open_dict(self.cfg.decoding):

@@ -863,17 +863,18 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
     """ Transcription related methods """
 
     def _transcribe_forward(self, batch: Any, trcfg: TranscribeConfig):
-        encoded, encoded_len = self.forward(input_signal=batch[0], input_signal_length=batch[1])
-        output = dict(encoded=encoded, encoded_len=encoded_len)
+        encoded, encoded_len, st_encoded, st_encoded_len = self.forward(input_signal=batch[0], input_signal_length=batch[1])
+        output = dict(encoded=encoded, encoded_len=encoded_len, st_encoded=st_encoded, st_encoded_len=st_encoded_len)
+        output = dict(st_encoded=st_encoded, st_encoded_len=st_encoded_len)
         return output
 
     def _transcribe_output_processing(
         self, outputs, trcfg: TranscribeConfig
     ) -> Tuple[List['Hypothesis'], List['Hypothesis']]:
-        encoded = outputs.pop('encoded')
-        encoded_len = outputs.pop('encoded_len')
+        encoded = outputs.pop('st_encoded')
+        encoded_len = outputs.pop('st_encoded_len')
 
-        best_hyp, all_hyp = self.decoding.rnnt_decoder_predictions_tensor(
+        best_hyp, all_hyp = self.st_decoding.rnnt_decoder_predictions_tensor(
             encoded,
             encoded_len,
             return_hypotheses=trcfg.return_hypotheses,
