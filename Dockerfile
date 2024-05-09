@@ -129,6 +129,9 @@ ENV LHOTSE_REQUIRE_TORCHAUDIO=0
 COPY requirements .
 RUN for f in $(ls requirements*.txt); do pip3 install --disable-pip-version-check --no-cache-dir -r $f; done
 
+# TODO(hainan)
+#RUN pip install group_norm_cuda
+
 # install flash attention
 RUN pip install flash-attn
 # install numba for latest containers
