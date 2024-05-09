@@ -22,6 +22,7 @@ from torchmetrics import Metric
 from nemo.collections.asr.parts.submodules.ctc_decoding import AbstractCTCDecoding
 from nemo.collections.asr.parts.submodules.multitask_decoding import AbstractMultiTaskDecoding
 from nemo.collections.asr.parts.submodules.rnnt_decoding import AbstractRNNTDecoding
+from nemo.collections.asr.parts.submodules.nar_tdt_decoding import AbstractNARTDTDecoding
 from nemo.utils import logging
 
 __all__ = ['word_error_rate', 'word_error_rate_detail', 'WER']
@@ -266,6 +267,10 @@ class WER(Metric):
         self.has_spl_tokens = False
         self.decode = None
         if isinstance(self.decoding, AbstractRNNTDecoding):
+            self.decode = lambda predictions, predictions_lengths, predictions_mask, input_ids, targets: self.decoding.rnnt_decoder_predictions_tensor(
+                encoder_output=predictions, encoded_lengths=predictions_lengths
+            )
+        elif isinstance(self.decoding, AbstractNARTDTDecoding):
             self.decode = lambda predictions, predictions_lengths, predictions_mask, input_ids, targets: self.decoding.rnnt_decoder_predictions_tensor(
                 encoder_output=predictions, encoded_lengths=predictions_lengths
             )

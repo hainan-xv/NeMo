@@ -26,16 +26,17 @@ from nemo.collections.asr.data.audio_to_text_dali import AudioToBPEDALIDataset
 from nemo.collections.asr.data.audio_to_text_lhotse import LhotseSpeechToTextBpeDataset
 from nemo.collections.asr.losses.rnnt import RNNTLoss
 from nemo.collections.asr.metrics.wer import WER
-from nemo.collections.asr.models.rnnt_bpe_models import EncDecRNNTBPEModel
+from nemo.collections.asr.models.nar_tdt_models import EncDecNARTDTModel 
 from nemo.collections.asr.parts.mixins import ASRBPEMixin
-from nemo.collections.asr.parts.submodules.rnnt_decoding import RNNTBPEDecoding, RNNTBPEDecodingConfig
+#from nemo.collections.asr.parts.submodules.rnnt_decoding import RNNTBPEDecoding, RNNTBPEDecodingConfig
+from nemo.collections.asr.parts.submodules.nar_tdt_decoding import NARTDTBPEDecoding, NARTDTBPEDecodingConfig
 from nemo.collections.asr.parts.utils.asr_batching import get_semi_sorted_batch_sampler
 from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
 from nemo.core.classes.common import PretrainedModelInfo
 from nemo.utils import logging, model_utils
 
 
-class EncDecNARTDTBPEModel(EncDecRNNTBPEModel, ASRBPEMixin):
+class EncDecNARTDTBPEModel(EncDecNARTDTModel, ASRBPEMixin):
     """Base class for encoder-only NARTDT models with subword tokenization."""
 
     @classmethod

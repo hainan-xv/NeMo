@@ -20,6 +20,82 @@ from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
 from nemo.core import NeuralModule
 
 
+class AbstractNARTDTJoint(NeuralModule, ABC):
+    """
+    An abstract RNNT Joint framework, which can possibly integrate with GreedyRNNTInfer and BeamRNNTInfer classes.
+    Represents the abstract RNNT Joint network, which accepts the acoustic model and prediction network
+    embeddings in order to compute the joint of the two prior to decoding the output sequence.
+    """
+
+    @abstractmethod
+    def joint_after_projection(self, f: torch.Tensor) -> Any:
+        """
+        Compute the joint step of the network after the projection step.
+        Args:
+            f: Output of the Encoder model after projection. A torch.Tensor of shape [B, T, H]
+            g: Output of the Decoder model (Prediction Network) after projection. A torch.Tensor of shape [B, U, H]
+
+        Returns:
+            Logits / log softmaxed tensor of shape (B, T, U, V + 1).
+            Arbitrary return type, preferably torch.Tensor, but not limited to (e.g., see HatJoint)
+        """
+        raise NotImplementedError()
+
+    @abstractmethod
+    def project_encoder(self, encoder_output: torch.Tensor) -> torch.Tensor:
+        """
+        Project the encoder output to the joint hidden dimension.
+
+        Args:
+            encoder_output: A torch.Tensor of shape [B, T, D]
+
+        Returns:
+            A torch.Tensor of shape [B, T, H]
+        """
+        raise NotImplementedError()
+
+
+    def joint(self, f: torch.Tensor) -> torch.Tensor:
+        """
+        Compute the joint step of the network.
+
+        Here,
+        B = Batch size
+        T = Acoustic model timesteps
+        U = Target sequence length
+        H1, H2 = Hidden dimensions of the Encoder / Decoder respectively
+        H = Hidden dimension of the Joint hidden step.
+        V = Vocabulary size of the Decoder (excluding the RNNT blank token).
+
+        NOTE:
+            The implementation of this model is slightly modified from the original paper.
+            The original paper proposes the following steps :
+            (enc, dec) -> Expand + Concat + Sum [B, T, U, H1+H2] -> Forward through joint hidden [B, T, U, H] -- *1
+            *1 -> Forward through joint final [B, T, U, V + 1].
+
+            We instead split the joint hidden into joint_hidden_enc and joint_hidden_dec and act as follows:
+            enc -> Forward through joint_hidden_enc -> Expand [B, T, 1, H] -- *1
+            dec -> Forward through joint_hidden_dec -> Expand [B, 1, U, H] -- *2
+            (*1, *2) -> Sum [B, T, U, H] -> Forward through joint final [B, T, U, V + 1].
+
+        Args:
+            f: Output of the Encoder model. A torch.Tensor of shape [B, T, H1]
+            g: Output of the Decoder model. A torch.Tensor of shape [B, U, H2]
+
+        Returns:
+            Logits / log softmaxed tensor of shape (B, T, U, V + 1).
+        """
+        return self.joint_after_projection(self.project_encoder(f))
+
+    @property
+    def num_classes_with_blank(self):
+        raise NotImplementedError()
+
+    @property
+    def num_extra_outputs(self):
+        raise NotImplementedError()
+
+
 class AbstractRNNTJoint(NeuralModule, ABC):
     """
     An abstract RNNT Joint framework, which can possibly integrate with GreedyRNNTInfer and BeamRNNTInfer classes.

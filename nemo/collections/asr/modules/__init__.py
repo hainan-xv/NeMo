@@ -48,6 +48,7 @@ from nemo.collections.asr.modules.rnnt import (
     RNNTDecoder,
     RNNTDecoderJointSSL,
     RNNTJoint,
+    NARTDTJoint,
     SampledRNNTJoint,
     StatelessTransducerDecoder,
 )
