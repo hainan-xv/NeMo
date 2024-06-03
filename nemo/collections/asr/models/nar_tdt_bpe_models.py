@@ -216,7 +216,7 @@ class EncDecNARTDTBPEModel(EncDecNARTDTModel, ASRBPEMixin):
             decoding_cfg = self.cfg.decoding
 
         # Assert the decoding config with all hyper parameters
-        decoding_cls = OmegaConf.structured(RNNTBPEDecodingConfig)
+        decoding_cls = OmegaConf.structured(NARTDTBPEDecodingConfig)
         decoding_cls = OmegaConf.create(OmegaConf.to_container(decoding_cls))
         decoding_cfg = OmegaConf.merge(decoding_cls, decoding_cfg)
         decoding_cfg = self.set_decoding_type_according_to_loss(decoding_cfg)
