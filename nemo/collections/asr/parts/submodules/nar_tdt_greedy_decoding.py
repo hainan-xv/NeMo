@@ -333,9 +333,11 @@ class GreedyNARTDTInfer(_GreedyNARTDTInfer):
         # Preserve decoder and joint training state
         joint_training_state = self.joint.training
 
+        encoder_output = encoder_output.transpose(1, 2)  # (B, T, D)
+        encoder_output = self._joint_step(encoder_output, log_normalize=False)
+
         with torch.inference_mode():
             # Apply optional preprocessing
-            encoder_output = encoder_output.transpose(1, 2)  # (B, T, D)
 
             self.joint.eval()
 
@@ -343,7 +345,7 @@ class GreedyNARTDTInfer(_GreedyNARTDTInfer):
             # Process each sequence independently
             with self.joint.as_frozen():
                 for batch_idx in range(encoder_output.size(0)):
-                    inseq = encoder_output[batch_idx, :, :].unsqueeze(1)  # [T, 1, D]
+                    inseq = encoder_output[batch_idx, :, :, :].unsqueeze(1)  # [T, 1, D]
                     logitlen = encoded_lengths[batch_idx]
 
                     partial_hypothesis = partial_hypotheses[batch_idx] if partial_hypotheses is not None else None
@@ -359,11 +361,8 @@ class GreedyNARTDTInfer(_GreedyNARTDTInfer):
 
     @torch.no_grad()
     def _greedy_decode(
-        self, x: torch.Tensor, out_len: torch.Tensor, partial_hypotheses: Optional[rnnt_utils.Hypothesis] = None
+        self, logits: torch.Tensor, out_len: torch.Tensor, partial_hypotheses: Optional[rnnt_utils.Hypothesis] = None
     ):
-        # x: [T, 1, D]
-        # out_len: [seq_len]
-
         # Initialize blank state and empty label set in Hypothesis
         hypothesis = rnnt_utils.Hypothesis(score=0.0, y_sequence=[], dec_state=None, timestep=[], last_token=None)
 
@@ -382,103 +381,23 @@ class GreedyNARTDTInfer(_GreedyNARTDTInfer):
         if self.preserve_frame_confidence:
             hypothesis.frame_confidence = [[]]
 
+        logp = logits[:, 0, 0, : -len(self.durations)]
+
+        duration_logp = logits[:, 0, 0, -len(self.durations) :]
+
+        v, k = torch.max(logp, dim=-1)
+        k = k.tolist()
+
+        d_v, d_k = torch.max(duration_logp, dim=-1)
+        d_k = d_k.tolist()
+
         time_idx = 0
         while time_idx < out_len:
-            # Extract encoder embedding at timestep t
-            # f = x[time_idx, :, :].unsqueeze(0)  # [1, 1, D]
-            f = x.narrow(dim=0, start=time_idx, length=1)
-
-            # Setup exit flags and counter
-            not_blank = True
-            symbols_added = 0
-
-            need_loop = True
-            # While blank is not predicted, or we dont run out of max symbols per timestep
-            while need_loop and (self.max_symbols is None or symbols_added < self.max_symbols):
-                # In the first timestep, we initialize the network with RNNT Blank
-                # In later timesteps, we provide previous predicted label as input.
-                if hypothesis.last_token is None and hypothesis.dec_state is None:
-                    last_label = self._SOS
-                else:
-                    last_label = label_collate([[hypothesis.last_token]])
-
-                # If preserving per-frame confidence, log_normalize must be true
-                logits = self._joint_step(f, log_normalize=False)
-                logp = logits[0, 0, 0, : -len(self.durations)]
-                if self.preserve_frame_confidence:
-                    logp = torch.log_softmax(logp, -1)
-
-                duration_logp = torch.log_softmax(logits[0, 0, 0, -len(self.durations) :], dim=-1)
-
-                # torch.max(0) op doesnt exist for FP 16.
-                if logp.dtype != torch.float32:
-                    logp = logp.float()
-
-                # get index k, of max prob
-                v, k = logp.max(0)
-                k = k.item()  # K is the label at timestep t_s in inner loop, s >= 0.
-
-                d_v, d_k = duration_logp.max(0)
-                d_k = d_k.item()
-
-                skip = self.durations[d_k]
-
-                if self.preserve_alignments:
-                    # insert logprobs into last timestep
-                    hypothesis.alignments[-1].append((logp.to('cpu'), torch.tensor(k, dtype=torch.int32)))
-
-                if self.preserve_frame_confidence:
-                    # insert confidence into last timestep
-                    hypothesis.frame_confidence[-1].append(
-                        (self._get_confidence_tensor(logp), self._get_confidence_tensor(duration_logp))
-                        if self.include_duration_confidence
-                        else self._get_confidence_tensor(logp)
-                    )
-
-                del logp
-
-                # If blank token is predicted, exit inner loop, move onto next timestep t
-                if k == self._blank_index:
-                    not_blank = False
-                else:
-                    # Append token to label set, update RNN state.
-                    hypothesis.y_sequence.append(k)
-                    hypothesis.score += float(v)
-                    hypothesis.timestep.append(time_idx)
-                    hypothesis.dec_state = None
-                    hypothesis.last_token = k
-
-                # Increment token counter.
-                symbols_added += 1
-                time_idx += skip
-                need_loop = skip == 0
-
-            # this rarely happens, but we manually increment the `skip` number
-            # if blank is emitted and duration=0 is predicted. This prevents possible
-            # infinite loops.
-            if skip == 0:
-                skip = 1
-
-            if self.preserve_alignments:
-                # convert Ti-th logits into a torch array
-                hypothesis.alignments.append([])  # blank buffer for next timestep
-
-            if self.preserve_frame_confidence:
-                hypothesis.frame_confidence.append([])  # blank buffer for next timestep
-
-            if symbols_added == self.max_symbols:
-                time_idx += 1
-
-        # Remove trailing empty list of Alignments
-        if self.preserve_alignments:
-            if len(hypothesis.alignments[-1]) == 0:
-                del hypothesis.alignments[-1]
-
-        # Remove trailing empty list of per-frame confidence
-        if self.preserve_frame_confidence:
-            if len(hypothesis.frame_confidence[-1]) == 0:
-                del hypothesis.frame_confidence[-1]
-
+            token_idx = k[time_idx]
+            if token_idx != self._blank_index:
+                hypothesis.y_sequence.append(token_idx)
+            skip = self.durations[d_k[time_idx]]
+            time_idx += skip
 
         return hypothesis
 
