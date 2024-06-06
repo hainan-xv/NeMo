@@ -82,7 +82,7 @@ class _GreedyNARTDTInfer(Typing, ConfidenceMethodMixin):
     Provides a common abstraction for sample level and batch level greedy decoding.
 
     Args:
-        joint_model: rnnt_utils.AbstractRNNTJoint implementation.
+        decoder_model: rnnt_utils.AbstractRNNTJoint implementation.
         blank_index: int index of the blank token. Can be 0 or len(vocabulary).
         max_symbols_per_step: Optional int. The maximum number of symbols that can be added
             to a sequence in a single time step; if set to None then there is
@@ -154,7 +154,7 @@ class _GreedyNARTDTInfer(Typing, ConfidenceMethodMixin):
 
     def __init__(
         self,
-        joint_model: rnnt_abstract.AbstractRNNTJoint,
+        decoder_model,
         blank_index: int,
         max_symbols_per_step: Optional[int] = None,
         preserve_alignments: bool = False,
@@ -162,7 +162,7 @@ class _GreedyNARTDTInfer(Typing, ConfidenceMethodMixin):
         confidence_method_cfg: Optional[DictConfig] = None,
     ):
         super().__init__()
-        self.joint = joint_model
+        self.decoder = decoder_model
 
         self._blank_index = blank_index
         self._SOS = blank_index  # Start of single index
@@ -179,7 +179,7 @@ class _GreedyNARTDTInfer(Typing, ConfidenceMethodMixin):
     def __call__(self, *args, **kwargs):
         return self.forward(*args, **kwargs)
 
-    def _joint_step(self, enc, log_normalize: Optional[bool] = None):
+    def _decoder_step(self, enc, log_normalize: Optional[bool] = None):
         """
         Common joint step based on AbstractRNNTJoint implementation.
 
@@ -192,7 +192,7 @@ class _GreedyNARTDTInfer(Typing, ConfidenceMethodMixin):
              logits of shape (B, T=1, U=1, V + 1)
         """
         with torch.no_grad():
-            logits = self.joint.joint(enc)
+            logits = self.decoder(enc)
 
             if log_normalize is None:
                 if not logits.is_cuda:  # Use log softmax only if on CPU
@@ -202,32 +202,6 @@ class _GreedyNARTDTInfer(Typing, ConfidenceMethodMixin):
                     logits = logits.log_softmax(dim=len(logits.shape) - 1)
 
         return logits
-
-    def _joint_step_after_projection(self, enc, log_normalize: Optional[bool] = None) -> torch.Tensor:
-        """
-        Common joint step based on AbstractRNNTJoint implementation.
-
-        Args:
-            enc: Output of the Encoder model after projection. A torch.Tensor of shape [B, 1, H]
-            pred: Output of the Decoder model after projection. A torch.Tensor of shape [B, 1, H]
-            log_normalize: Whether to log normalize or not. None will log normalize only for CPU.
-
-        Returns:
-             logits of shape (B, T=1, U=1, V + 1)
-        """
-        with torch.no_grad():
-            logits = self.joint.joint_after_projection(enc)
-
-            if log_normalize is None:
-                if not logits.is_cuda:  # Use log softmax only if on CPU
-                    logits = logits.log_softmax(dim=len(logits.shape) - 1)
-            else:
-                if log_normalize:
-                    logits = logits.log_softmax(dim=len(logits.shape) - 1)
-
-        return logits
-
-
 
 
 class GreedyNARTDTInfer(_GreedyNARTDTInfer):
@@ -236,7 +210,7 @@ class GreedyNARTDTInfer(_GreedyNARTDTInfer):
     Sequence level greedy decoding, performed auto-regressively.
 
     Args:
-        joint_model: rnnt_utils.AbstractRNNTJoint implementation.
+        decoder_model: rnnt_utils.AbstractRNNTJoint implementation.
         blank_index: int index of the blank token. Must be len(vocabulary) for TDT models.
         durations: a list containing durations for TDT.
         max_symbols_per_step: Optional int. The maximum number of symbols that can be added
@@ -294,7 +268,7 @@ class GreedyNARTDTInfer(_GreedyNARTDTInfer):
 
     def __init__(
         self,
-        joint_model: rnnt_abstract.AbstractRNNTJoint,
+        decoder_model,
         blank_index: int,
         durations: list,
         max_symbols_per_step: Optional[int] = None,
@@ -304,7 +278,7 @@ class GreedyNARTDTInfer(_GreedyNARTDTInfer):
         confidence_method_cfg: Optional[DictConfig] = None,
     ):
         super().__init__(
-            joint_model=joint_model,
+            decoder_model=decoder_model,
             blank_index=blank_index,
             max_symbols_per_step=max_symbols_per_step,
             preserve_alignments=preserve_alignments,
@@ -331,10 +305,10 @@ class GreedyNARTDTInfer(_GreedyNARTDTInfer):
             packed list containing batch number of sentences (Hypotheses).
         """
         # Preserve decoder and joint training state
-        joint_training_state = self.joint.training
+        decoder_training_state = self.decoder.training
 
         encoder_output = encoder_output.transpose(1, 2)  # (B, T, D)
-        encoder_output = self._joint_step(encoder_output, log_normalize=False)
+        encoder_output = self._decoder_step(encoder_output, log_normalize=False)
 
         with torch.inference_mode():
             # Apply optional preprocessing

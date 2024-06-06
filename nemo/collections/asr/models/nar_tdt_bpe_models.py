@@ -69,22 +69,33 @@ class EncDecNARTDTBPEModel(EncDecNARTDTModel, ASRBPEMixin):
         # Initialize a dummy vocabulary
         vocabulary = self.tokenizer.tokenizer.get_vocab()
 
-        # Set the new vocabulary
         with open_dict(cfg):
-            cfg.labels = ListConfig(list(vocabulary))
+            # sidestepping the potential overlapping tokens issue in aggregate tokenizers
+            if self.tokenizer_type == "agg":
+                cfg.decoder.vocabulary = ListConfig(vocabulary)
+            else:
+                cfg.decoder.vocabulary = ListConfig(list(vocabulary.keys()))
 
-        with open_dict(cfg.joint):
-            cfg.joint.num_classes = len(vocabulary)
-            cfg.joint.vocabulary = ListConfig(list(vocabulary))
-            cfg.joint.jointnet.encoder_hidden = cfg.model_defaults.enc_hidden
-            cfg.joint.jointnet.pred_hidden = cfg.model_defaults.pred_hidden
+        # Override number of classes if placeholder provided
+        num_classes = cfg.decoder["num_classes"]
+
+        print("HHERE num_classes", num_classes)
+
+        if num_classes < 1:
+            logging.info(
+                "\nReplacing placeholder number of classes ({}) with actual number of classes - {}".format(
+                    num_classes, len(vocabulary)
+                )
+            )
+            cfg.decoder["num_classes"] = len(vocabulary) + cfg.model_defaults.num_tdt_durations
+            print("HHERE num_classes", cfg.decoder["num_classes"])
 
         super().__init__(cfg=cfg, trainer=trainer)
 
         self.cfg.decoding = self.set_decoding_type_according_to_loss(self.cfg.decoding)
         # Setup decoding object
         self.decoding = NARTDTBPEDecoding(
-            decoding_cfg=self.cfg.decoding, joint=self.joint, tokenizer=self.tokenizer,
+            decoding_cfg=self.cfg.decoding, decoder=self.decoder, tokenizer=self.tokenizer,
         )
 
         # Setup wer object
@@ -95,11 +106,6 @@ class EncDecNARTDTBPEModel(EncDecNARTDTModel, ASRBPEMixin):
             log_prediction=self._cfg.get('log_prediction', True),
             dist_sync_on_step=True,
         )
-
-        # Setup fused Joint step if flag is set
-        if self.joint.fuse_loss_wer:
-            self.joint.set_loss(self.loss)
-            self.joint.set_wer(self.wer)
 
     def change_vocabulary(
         self,
@@ -151,19 +157,19 @@ class EncDecNARTDTBPEModel(EncDecNARTDTModel, ASRBPEMixin):
         # Initialize a dummy vocabulary
         vocabulary = self.tokenizer.tokenizer.get_vocab()
 
-        joint_config = self.joint.to_config_dict()
-        new_joint_config = copy.deepcopy(joint_config)
+        decoder_config = self.decoder.to_config_dict()
+        new_decoder_config = copy.deepcopy(decoder_config)
         if self.tokenizer_type == "agg":
-            new_joint_config["vocabulary"] = ListConfig(vocabulary)
+            new_decoder_config["vocabulary"] = ListConfig(vocabulary)
         else:
-            new_joint_config["vocabulary"] = ListConfig(list(vocabulary.keys()))
+            new_decoder_config["vocabulary"] = ListConfig(list(vocabulary.keys()))
 
-        new_joint_config['num_classes'] = len(vocabulary)
-        del self.joint
-        self.joint = EncDecRNNTBPEModel.from_config_dict(new_joint_config)
+        new_decoder_config['num_classes'] = len(vocabulary)
+        del self.decoder
+        self.decoder = EncDecRNNTBPEModel.from_config_dict(new_decoder_config)
 
         del self.loss
-        self.loss = RNNTLoss(num_classes=self.joint.num_classes_with_blank - 1)
+        self.loss = RNNTLoss(num_classes=self.decoder.num_classes_with_blank - 1)
 
         if decoding_cfg is None:
             # Assume same decoding config as before
@@ -176,7 +182,7 @@ class EncDecNARTDTBPEModel(EncDecNARTDTModel, ASRBPEMixin):
         decoding_cfg = self.set_decoding_type_according_to_loss(decoding_cfg)
 
         self.decoding = NARTDTBPEDecoding(
-            decoding_cfg=decoding_cfg, joint=self.joint, tokenizer=self.tokenizer,
+            decoding_cfg=decoding_cfg, decoder=self.decoder, tokenizer=self.tokenizer,
         )
 
         self.wer = WER(
@@ -187,16 +193,9 @@ class EncDecNARTDTBPEModel(EncDecNARTDTModel, ASRBPEMixin):
             dist_sync_on_step=True,
         )
 
-        # Setup fused Joint step
-        if self.joint.fuse_loss_wer or (
-            self.decoding.joint_fused_batch_size is not None and self.decoding.joint_fused_batch_size > 0
-        ):
-            self.joint.set_loss(self.loss)
-            self.joint.set_wer(self.wer)
-
         # Update config
-        with open_dict(self.cfg.joint):
-            self.cfg.joint = new_joint_config
+        with open_dict(self.cfg.decoder):
+            self.cfg.decoder = new_decoder_config
 
         with open_dict(self.cfg.decoding):
             self.cfg.decoding = decoding_cfg
@@ -222,7 +221,7 @@ class EncDecNARTDTBPEModel(EncDecNARTDTModel, ASRBPEMixin):
         decoding_cfg = self.set_decoding_type_according_to_loss(decoding_cfg)
 
         self.decoding = NARTDTBPEDecoding(
-            decoding_cfg=decoding_cfg, joint=self.joint, tokenizer=self.tokenizer,
+            decoding_cfg=decoding_cfg, decoder=self.decoder, tokenizer=self.tokenizer,
         )
 
         self.wer = WER(
@@ -233,14 +232,8 @@ class EncDecNARTDTBPEModel(EncDecNARTDTModel, ASRBPEMixin):
             dist_sync_on_step=True,
         )
 
-        # Setup fused Joint step
-        if self.joint.fuse_loss_wer or (
-            self.decoding.joint_fused_batch_size is not None and self.decoding.joint_fused_batch_size > 0
-        ):
-            self.joint.set_loss(self.loss)
-            self.joint.set_wer(self.wer)
 
-        self.joint.temperature = decoding_cfg.get('temperature', 1.0)
+        self.decoder.temperature = decoding_cfg.get('temperature', 1.0)
 
         # Update config
         with open_dict(self.cfg.decoding):

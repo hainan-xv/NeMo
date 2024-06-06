@@ -186,14 +186,14 @@ class AbstractNARTDTDecoding(ConfidenceMixin):
                     thereby reducing speed but potentially improving accuracy). This is a hyper parameter to be experimentally
                     tuned on a validation set.
 
-                softmax_temperature: Scales the logits of the joint prior to computing log_softmax.
+                softmax_temperature: Scales the logits of the decoder prior to computing log_softmax.
 
         decoder: The Decoder/Prediction network module.
         joint: The Joint network module.
         blank_id: The id of the RNNT blank token.
     """
 
-    def __init__(self, decoding_cfg, joint, blank_id: int):
+    def __init__(self, decoding_cfg, decoder, blank_id: int):
         super(AbstractNARTDTDecoding, self).__init__()
 
         # Convert dataclass to config object
@@ -202,34 +202,22 @@ class AbstractNARTDTDecoding(ConfidenceMixin):
 
         self.cfg = decoding_cfg
         self.blank_id = blank_id
-        self.num_extra_outputs = joint.num_extra_outputs
-        self.big_blank_durations = self.cfg.get("big_blank_durations", None)
         self.durations = self.cfg.get("durations", None)
+        self.num_extra_outputs = len(self.durations)
+        print("HERE self.num_extra_outputs,", self.num_extra_outputs)
         self.compute_hypothesis_token_set = self.cfg.get("compute_hypothesis_token_set", False)
         self.compute_langs = decoding_cfg.get('compute_langs', False)
         self.preserve_alignments = self.cfg.get('preserve_alignments', None)
-        self.joint_fused_batch_size = self.cfg.get('fused_batch_size', None)
+#        self.joint_fused_batch_size = self.cfg.get('fused_batch_size', None)
         self.compute_timestamps = self.cfg.get('compute_timestamps', None)
         self.word_seperator = self.cfg.get('word_seperator', ' ')
 
         self._is_tdt = self.durations is not None and self.durations != []  # this means it's a TDT model.
-        if self._is_tdt:
-            if blank_id == 0:
-                raise ValueError("blank_id must equal len(non_blank_vocabs) for TDT models")
-            if self.big_blank_durations is not None and self.big_blank_durations != []:
-                raise ValueError("duration and big_blank_durations can't both be not None")
-            if self.cfg.strategy not in ['greedy', 'greedy_batch']:
-                raise ValueError("currently only greedy and greedy_batch inference is supported for TDT models")
+        if blank_id == 0:
+            raise ValueError("blank_id must equal len(non_blank_vocabs) for TDT models")
+        if self.cfg.strategy not in ['greedy', 'greedy_batch']:
+            raise ValueError("currently only greedy and greedy_batch inference is supported for TDT models")
 
-        if (
-            self.big_blank_durations is not None and self.big_blank_durations != []
-        ):  # this means it's a multi-blank model.
-            if blank_id == 0:
-                raise ValueError("blank_id must equal len(vocabs) for multi-blank RNN-T models")
-            if self.cfg.strategy not in ['greedy', 'greedy_batch']:
-                raise ValueError(
-                    "currently only greedy and greedy_batch inference is supported for multi-blank models"
-                )
 
         possible_strategies = ['greedy', 'greedy_batch', 'beam', 'tsd', 'alsd', 'maes']
         if self.cfg.strategy not in possible_strategies:
@@ -273,147 +261,34 @@ class AbstractNARTDTDecoding(ConfidenceMixin):
             raise NotImplementedError(f"Confidence calculation is not supported for strategy `{self.cfg.strategy}`")
 
         if self.cfg.strategy == 'greedy':
-            if self.big_blank_durations is None or self.big_blank_durations == []:
-                if not self._is_tdt:
-                    self.decoding = rnnt_greedy_decoding.GreedyNARTDTInfer(
-                        joint_model=joint,
-                        blank_index=self.blank_id,
-                        max_symbols_per_step=(
-                            self.cfg.greedy.get('max_symbols', None)
-                            or self.cfg.greedy.get('max_symbols_per_step', None)
-                        ),
-                        preserve_alignments=self.preserve_alignments,
-                        preserve_frame_confidence=self.preserve_frame_confidence,
-                        confidence_method_cfg=self.confidence_method_cfg,
-                    )
-                else:
-                    self.decoding = nar_tdt_greedy_decoding.GreedyNARTDTInfer(
-                        joint_model=joint,
-                        blank_index=self.blank_id,
-                        durations=self.durations,
-                        max_symbols_per_step=(
-                            self.cfg.greedy.get('max_symbols', None)
-                            or self.cfg.greedy.get('max_symbols_per_step', None)
-                        ),
-                        preserve_alignments=self.preserve_alignments,
-                        preserve_frame_confidence=self.preserve_frame_confidence,
-                        include_duration_confidence=self.tdt_include_duration_confidence,
-                        confidence_method_cfg=self.confidence_method_cfg,
-                    )
-            else:
-                self.decoding = rnnt_greedy_decoding.GreedyMultiblankRNNTInfer(
-                    joint_model=joint,
-                    blank_index=self.blank_id,
-                    big_blank_durations=self.big_blank_durations,
-                    max_symbols_per_step=(
-                        self.cfg.greedy.get('max_symbols', None) or self.cfg.greedy.get('max_symbols_per_step', None)
-                    ),
-                    preserve_alignments=self.preserve_alignments,
-                    preserve_frame_confidence=self.preserve_frame_confidence,
-                    confidence_method_cfg=self.confidence_method_cfg,
-                )
+            self.decoding = nar_tdt_greedy_decoding.GreedyNARTDTInfer(
+                decoder_model=decoder,
+                blank_index=self.blank_id,
+                durations=self.durations,
+                max_symbols_per_step=(
+                    self.cfg.greedy.get('max_symbols', None)
+                    or self.cfg.greedy.get('max_symbols_per_step', None)
+                ),
+                preserve_alignments=self.preserve_alignments,
+                preserve_frame_confidence=self.preserve_frame_confidence,
+                include_duration_confidence=self.tdt_include_duration_confidence,
+                confidence_method_cfg=self.confidence_method_cfg,
+            )
 
         elif self.cfg.strategy == 'greedy_batch':
-            if self.big_blank_durations is None or self.big_blank_durations == []:
-                if not self._is_tdt:
-                    self.decoding = rnnt_greedy_decoding.GreedyBatchedRNNTInfer(
-                        joint_model=joint,
-                        blank_index=self.blank_id,
-                        max_symbols_per_step=(
-                            self.cfg.greedy.get('max_symbols', None)
-                            or self.cfg.greedy.get('max_symbols_per_step', None)
-                        ),
-                        preserve_alignments=self.preserve_alignments,
-                        preserve_frame_confidence=self.preserve_frame_confidence,
-                        confidence_method_cfg=self.confidence_method_cfg,
-                        loop_labels=self.cfg.greedy.get('loop_labels', True),
-                        use_cuda_graph_decoder=self.cfg.greedy.get('use_cuda_graph_decoder', True),
-                    )
-                else:
-                    self.decoding = rnnt_greedy_decoding.GreedyBatchedTDTInfer(
-                        joint_model=joint,
-                        blank_index=self.blank_id,
-                        durations=self.durations,
-                        max_symbols_per_step=(
-                            self.cfg.greedy.get('max_symbols', None)
-                            or self.cfg.greedy.get('max_symbols_per_step', None)
-                        ),
-                        preserve_alignments=self.preserve_alignments,
-                        preserve_frame_confidence=self.preserve_frame_confidence,
-                        include_duration_confidence=self.tdt_include_duration_confidence,
-                        confidence_method_cfg=self.confidence_method_cfg,
-                        use_cuda_graph_decoder=self.cfg.greedy.get('use_cuda_graph_decoder', True),
-                    )
-
-            else:
-                self.decoding = rnnt_greedy_decoding.GreedyBatchedMultiblankRNNTInfer(
-                    joint_model=joint,
-                    blank_index=self.blank_id,
-                    big_blank_durations=self.big_blank_durations,
-                    max_symbols_per_step=(
-                        self.cfg.greedy.get('max_symbols', None) or self.cfg.greedy.get('max_symbols_per_step', None)
-                    ),
-                    preserve_alignments=self.preserve_alignments,
-                    preserve_frame_confidence=self.preserve_frame_confidence,
-                    confidence_method_cfg=self.confidence_method_cfg,
-                )
-
-        elif self.cfg.strategy == 'beam':
-
-            self.decoding = rnnt_beam_decoding.BeamRNNTInfer(
+            self.decoding = rnnt_greedy_decoding.GreedyBatchedTDTInfer(
                 joint_model=joint,
-                beam_size=self.cfg.beam.beam_size,
-                return_best_hypothesis=decoding_cfg.beam.get('return_best_hypothesis', True),
-                search_type='default',
-                score_norm=self.cfg.beam.get('score_norm', True),
-                softmax_temperature=self.cfg.beam.get('softmax_temperature', 1.0),
+                blank_index=self.blank_id,
+                durations=self.durations,
+                max_symbols_per_step=(
+                    self.cfg.greedy.get('max_symbols', None)
+                    or self.cfg.greedy.get('max_symbols_per_step', None)
+                ),
                 preserve_alignments=self.preserve_alignments,
-            )
-
-        elif self.cfg.strategy == 'tsd':
-
-            self.decoding = rnnt_beam_decoding.BeamRNNTInfer(
-                joint_model=joint,
-                beam_size=self.cfg.beam.beam_size,
-                return_best_hypothesis=decoding_cfg.beam.get('return_best_hypothesis', True),
-                search_type='tsd',
-                score_norm=self.cfg.beam.get('score_norm', True),
-                tsd_max_sym_exp_per_step=self.cfg.beam.get('tsd_max_sym_exp', 10),
-                softmax_temperature=self.cfg.beam.get('softmax_temperature', 1.0),
-                preserve_alignments=self.preserve_alignments,
-            )
-
-        elif self.cfg.strategy == 'alsd':
-
-            self.decoding = rnnt_beam_decoding.BeamRNNTInfer(
-                joint_model=joint,
-                beam_size=self.cfg.beam.beam_size,
-                return_best_hypothesis=decoding_cfg.beam.get('return_best_hypothesis', True),
-                search_type='alsd',
-                score_norm=self.cfg.beam.get('score_norm', True),
-                alsd_max_target_len=self.cfg.beam.get('alsd_max_target_len', 2),
-                softmax_temperature=self.cfg.beam.get('softmax_temperature', 1.0),
-                preserve_alignments=self.preserve_alignments,
-            )
-
-        elif self.cfg.strategy == 'maes':
-
-            self.decoding = rnnt_beam_decoding.BeamRNNTInfer(
-                joint_model=joint,
-                beam_size=self.cfg.beam.beam_size,
-                return_best_hypothesis=decoding_cfg.beam.get('return_best_hypothesis', True),
-                search_type='maes',
-                score_norm=self.cfg.beam.get('score_norm', True),
-                maes_num_steps=self.cfg.beam.get('maes_num_steps', 2),
-                maes_prefix_alpha=self.cfg.beam.get('maes_prefix_alpha', 1),
-                maes_expansion_gamma=self.cfg.beam.get('maes_expansion_gamma', 2.3),
-                maes_expansion_beta=self.cfg.beam.get('maes_expansion_beta', 2.0),
-                softmax_temperature=self.cfg.beam.get('softmax_temperature', 1.0),
-                preserve_alignments=self.preserve_alignments,
-                ngram_lm_model=self.cfg.beam.get('ngram_lm_model', None),
-                ngram_lm_alpha=self.cfg.beam.get('ngram_lm_alpha', 0.0),
-                hat_subtract_ilm=self.cfg.beam.get('hat_subtract_ilm', False),
-                hat_ilm_weight=self.cfg.beam.get('hat_ilm_weight', 0.0),
+                preserve_frame_confidence=self.preserve_frame_confidence,
+                include_duration_confidence=self.tdt_include_duration_confidence,
+                confidence_method_cfg=self.confidence_method_cfg,
+                use_cuda_graph_decoder=self.cfg.greedy.get('use_cuda_graph_decoder', True),
             )
 
         else:
@@ -423,8 +298,6 @@ class AbstractNARTDTDecoding(ConfidenceMixin):
                 f"but was provided {self.cfg.strategy}"
             )
 
-        # Update the joint fused batch size or disable it entirely if needed.
-        self.update_joint_fused_batch_size()
 
     def rnnt_decoder_predictions_tensor(
         self,
@@ -693,32 +566,6 @@ class AbstractNARTDTDecoding(ConfidenceMixin):
             A list of decoded LIDS.
         """
         raise NotImplementedError()
-
-    def update_joint_fused_batch_size(self):
-        if self.joint_fused_batch_size is None:
-            # do nothing and let the Joint itself handle setting up of the fused batch
-            return
-
-        if not hasattr(self.decoding.joint, 'set_fused_batch_size'):
-            logging.warning(
-                "The joint module does not have `set_fused_batch_size(int)` as a setter function.\n"
-                "Ignoring update of joint fused batch size."
-            )
-            return
-
-        if not hasattr(self.decoding.joint, 'set_fuse_loss_wer'):
-            logging.warning(
-                "The joint module does not have `set_fuse_loss_wer(bool, RNNTLoss, RNNTWER)` "
-                "as a setter function.\n"
-                "Ignoring update of joint fused batch size."
-            )
-            return
-
-        if self.joint_fused_batch_size > 0:
-            self.decoding.joint.set_fused_batch_size(self.joint_fused_batch_size)
-        else:
-            logging.info("Joint fused batch size <= 0; Will temporarily disable fused batch step in the Joint.")
-            self.decoding.joint.set_fuse_loss_wer(False)
 
     def compute_rnnt_timestamps(self, hypothesis: Hypothesis, timestamp_type: str = "all"):
         assert timestamp_type in ['char', 'word', 'all']
@@ -1165,18 +1012,16 @@ class NARTDTDecoding(AbstractNARTDTDecoding):
     """
 
     def __init__(
-        self, decoding_cfg, joint, vocabulary,
+        self, decoding_cfg, decoder, vocabulary, blank_id,
     ):
         # we need to ensure blank is the last token in the vocab for the case of RNNT and Multi-blank RNNT.
-        blank_id = len(vocabulary) + joint.num_extra_outputs
-
-        if hasattr(decoding_cfg, 'model_type') and decoding_cfg.model_type == 'tdt':
-            blank_id = len(vocabulary)
+        print("HERE", len(vocabulary))
+        print("HERE blank", blank_id)
 
         self.labels_map = dict([(i, vocabulary[i]) for i in range(len(vocabulary))])
 
         super(NARTDTDecoding, self).__init__(
-            decoding_cfg=decoding_cfg, joint=joint, blank_id=blank_id,
+            decoding_cfg=decoding_cfg, decoder=decoder, blank_id=blank_id,
         )
 
         if isinstance(self.decoding, rnnt_beam_decoding.BeamRNNTInfer):
@@ -1430,17 +1275,14 @@ class NARTDTBPEDecoding(AbstractNARTDTDecoding):
         tokenizer: The tokenizer which will be used for decoding.
     """
 
-    def __init__(self, decoding_cfg, joint, tokenizer: TokenizerSpec):
+    def __init__(self, decoding_cfg, decoder, tokenizer: TokenizerSpec):
         blank_id = tokenizer.tokenizer.vocab_size  # RNNT or TDT models.
 
-        # multi-blank RNNTs
-        if hasattr(decoding_cfg, 'model_type') and decoding_cfg.model_type == 'multiblank':
-            blank_id = tokenizer.tokenizer.vocab_size + joint.num_extra_outputs
 
         self.tokenizer = tokenizer
 
         super(NARTDTBPEDecoding, self).__init__(
-            decoding_cfg=decoding_cfg, joint=joint, blank_id=blank_id
+            decoding_cfg=decoding_cfg, decoder=decoder, blank_id=blank_id
         )
 
         if isinstance(self.decoding, rnnt_beam_decoding.BeamRNNTInfer):

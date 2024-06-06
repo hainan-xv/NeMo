@@ -65,24 +65,36 @@ class EncDecNARTDTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTran
         self.preprocessor = EncDecNARTDTModel.from_config_dict(self.cfg.preprocessor)
         self.encoder = EncDecNARTDTModel.from_config_dict(self.cfg.encoder)
 
+        with open_dict(self._cfg):
+            if "feat_in" not in self.cfg.decoder or (
+                not self.cfg.decoder.feat_in and hasattr(self.encoder, '_feat_out')
+            ):
+                self.cfg.decoder.feat_in = self.encoder._feat_out
+            if "feat_in" not in self.cfg.decoder or not self.cfg.decoder.feat_in:
+                raise ValueError("param feat_in of the decoder's config is not set!")
 
-        with open_dict(self.cfg.joint):
-            self.cfg.joint.num_classes = len(self.cfg.labels)
-            self.cfg.joint.vocabulary = self.cfg.labels
-            self.cfg.joint.jointnet.encoder_hidden = self.cfg.model_defaults.enc_hidden
-            self.cfg.joint.jointnet.pred_hidden = self.cfg.model_defaults.pred_hidden
+#            self.cfg.decoder.num_classes = len(self.cfg.labels)
+#            self.cfg.decoder.vocabulary = self.cfg.labels
 
-        self.joint = EncDecNARTDTModel.from_config_dict(self.cfg.joint)
+            if self.cfg.decoder.num_classes < 1 and self.cfg.decoder.vocabulary is not None:
+                logging.info(
+                    "\nReplacing placeholder number of classes ({}) with actual number of classes - {}".format(
+                        self.cfg.decoder.num_classes, len(self.cfg.decoder.vocabulary)
+                    )
+                )
+                cfg.decoder["num_classes"] = len(self.cfg.decoder.vocabulary) + self.cfg.model_defaults.num_tdt_durations
+
+
+        self.decoder = EncDecNARTDTModel.from_config_dict(self.cfg.decoder)
 
         # Setup RNNT Loss
         loss_name, loss_kwargs = self.extract_rnnt_loss_cfg(self.cfg.get("loss", None))
 
-        num_classes = self.joint.num_classes_with_blank - 1  # for standard RNNT and multi-blank
+        num_classes = self.decoder.num_classes_with_blank - 1  # for standard RNNT and multi-blank
 
-        if loss_name == 'tdt':
-            num_classes = num_classes - self.joint.num_extra_outputs
-        else:
-            assert(False)
+        num_classes = num_classes - self.cfg.model_defaults.num_tdt_durations
+
+        print("HERE num_classes", num_classes, self.cfg.decoder.num_classes)
 
         self.loss = RNNTLoss(
             num_classes=num_classes,
@@ -99,7 +111,7 @@ class EncDecNARTDTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTran
         self.cfg.decoding = self.set_decoding_type_according_to_loss(self.cfg.decoding)
         # Setup decoding objects
         self.decoding = NARTDTDecoding(
-            decoding_cfg=self.cfg.decoding, joint=self.joint, vocabulary=self.joint.vocabulary,
+            decoding_cfg=self.cfg.decoding, decoder=self.decoder, vocabulary=self.decoder.vocabulary, blank_id=num_classes + 1,
         )
         # Setup WER calculation
         self.wer = WER(
@@ -115,13 +127,6 @@ class EncDecNARTDTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTran
             self.compute_eval_loss = self.cfg.compute_eval_loss
         else:
             self.compute_eval_loss = True
-
-        # Setup fused Joint step if flag is set
-        if self.joint.fuse_loss_wer or (
-            self.decoding.joint_fused_batch_size is not None and self.decoding.joint_fused_batch_size > 0
-        ):
-            self.joint.set_loss(self.loss)
-            self.joint.set_wer(self.wer)
 
         # Setup optimization normalization (if provided in config)
         self.setup_optim_normalization()

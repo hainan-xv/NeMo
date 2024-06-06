@@ -428,11 +428,12 @@ class ConvASRDecoder(NeuralModule, Exportable, adapter_mixins.AdapterModuleMixin
             logging.info(f"num_classes of ConvASRDecoder is set to the size of the vocabulary: {num_classes}.")
 
         if vocabulary is not None:
-            if num_classes != len(vocabulary):
-                raise ValueError(
-                    f"If vocabulary is specified, it's length should be equal to the num_classes. Instead got: num_classes={num_classes} and len(vocabulary)={len(vocabulary)}"
-                )
+#            if num_classes != len(vocabulary):
+#                raise ValueError(
+#                    f"If vocabulary is specified, it's length should be equal to the num_classes. Instead got: num_classes={num_classes} and len(vocabulary)={len(vocabulary)}"
+#                )
             self.__vocabulary = vocabulary
+
         self._feat_in = feat_in
         # Add 1 for blank char
         self._num_classes = num_classes + 1
