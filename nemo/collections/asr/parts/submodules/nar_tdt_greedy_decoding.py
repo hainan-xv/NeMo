@@ -334,7 +334,6 @@ class GreedyNARTDTInfer(_GreedyNARTDTInfer):
         joint_training_state = self.joint.training
 
         encoder_output = encoder_output.transpose(1, 2)  # (B, T, D)
-        assert(False)
         encoder_output = self._joint_step(encoder_output, log_normalize=False)
 
         with torch.inference_mode():
