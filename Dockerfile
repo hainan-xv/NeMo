@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:experimental
+## syntax=docker/dockerfile:experimental
 
 # Copyright (c) 2019, NVIDIA CORPORATION. All rights reserved.
 #
@@ -76,13 +76,13 @@ RUN git clone https://github.com/NVIDIA/apex.git && \
   git checkout f058162b215791b15507bb542f22ccfde49c872d && \
   pip install -v --no-build-isolation --disable-pip-version-check --no-cache-dir --config-settings "--build-option=--cpp_ext --cuda_ext --fast_layer_norm --distributed_adam --deprecated_fused_adam" ./
 
-# Transformer Engine 1.2.0
-RUN git clone https://github.com/NVIDIA/TransformerEngine.git && \
-  cd TransformerEngine && \
-  git fetch origin da30634a6c9ccdbb6c587b6c93b1860e4b038204 && \
-  git checkout FETCH_HEAD && \
-  git submodule init && git submodule update && \
-  NVTE_FRAMEWORK=pytorch NVTE_WITH_USERBUFFERS=1 MPI_HOME=/usr/local/mpi pip install .
+## Transformer Engine 1.2.0
+#RUN git clone https://github.com/NVIDIA/TransformerEngine.git && \
+#  cd TransformerEngine && \
+#  git fetch origin da30634a6c9ccdbb6c587b6c93b1860e4b038204 && \
+#  git checkout FETCH_HEAD && \
+#  git submodule init && git submodule update && \
+#  NVTE_FRAMEWORK=pytorch NVTE_WITH_USERBUFFERS=1 MPI_HOME=/usr/local/mpi pip install .
 
 WORKDIR /tmp/
 
@@ -133,7 +133,7 @@ RUN for f in $(ls requirements*.txt); do pip3 install --disable-pip-version-chec
 #RUN pip install group_norm_cuda
 
 # install flash attention
-RUN pip install flash-attn
+##RUN pip install flash-attn
 # install numba for latest containers
 RUN pip install numba>=0.57.1
 
