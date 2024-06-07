@@ -402,13 +402,7 @@ class AbstractNARTDTDecoding(ConfidenceMixin):
 
             # RNN-T sample level is already preprocessed by implicit RNNT decoding
             # Simply remove any blank and possibly big blank tokens
-            if self.big_blank_durations is not None and self.big_blank_durations != []:  # multi-blank RNNT
-                num_extra_outputs = len(self.big_blank_durations)
-                prediction = [p for p in prediction if p < self.blank_id - num_extra_outputs]
-            elif self._is_tdt:  # TDT model.
-                prediction = [p for p in prediction if p < self.blank_id]
-            else:  # standard RNN-T
-                prediction = [p for p in prediction if p != self.blank_id]
+            prediction = [p for p in prediction if p < self.blank_id]
 
             # De-tokenize the integer tokens; if not computing timestamps
             if self.compute_timestamps is True:

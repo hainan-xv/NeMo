@@ -192,7 +192,7 @@ class _GreedyNARTDTInfer(Typing, ConfidenceMethodMixin):
              logits of shape (B, T=1, U=1, V + 1)
         """
         with torch.no_grad():
-            logits = self.decoder(enc)
+            logits = self.decoder(encoder_output=enc.transpose(1, 2))
 
             if log_normalize is None:
                 if not logits.is_cuda:  # Use log softmax only if on CPU
@@ -313,13 +313,13 @@ class GreedyNARTDTInfer(_GreedyNARTDTInfer):
         with torch.inference_mode():
             # Apply optional preprocessing
 
-            self.joint.eval()
+            self.decoder.eval()
 
             hypotheses = []
             # Process each sequence independently
-            with self.joint.as_frozen():
+            with self.decoder.as_frozen():
                 for batch_idx in range(encoder_output.size(0)):
-                    inseq = encoder_output[batch_idx, :, :, :].unsqueeze(1)  # [T, 1, D]
+                    inseq = encoder_output[batch_idx, :, :].unsqueeze(1)  # [T, 1, D]
                     logitlen = encoded_lengths[batch_idx]
 
                     partial_hypothesis = partial_hypotheses[batch_idx] if partial_hypotheses is not None else None
@@ -329,7 +329,7 @@ class GreedyNARTDTInfer(_GreedyNARTDTInfer):
             # Pack results into Hypotheses
             packed_result = pack_hypotheses(hypotheses, encoded_lengths)
 
-        self.joint.train(joint_training_state)
+        self.decoder.train(decoder_training_state)
 
         return (packed_result,)
 
@@ -355,9 +355,11 @@ class GreedyNARTDTInfer(_GreedyNARTDTInfer):
         if self.preserve_frame_confidence:
             hypothesis.frame_confidence = [[]]
 
-        logp = logits[:, 0, 0, : -len(self.durations)]
+        print("HERE logits", logits.shape)
+        logp = logits[:, 0, : -len(self.durations)]
+        print("HERE logp", logp.shape)
 
-        duration_logp = logits[:, 0, 0, -len(self.durations) :]
+        duration_logp = logits[:, 0, -len(self.durations) :]
 
         v, k = torch.max(logp, dim=-1)
         k = k.tolist()

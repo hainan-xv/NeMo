@@ -64,11 +64,11 @@ RUN apt-get update && \
 WORKDIR /workspace/
 # Install megatron core, this can be removed once 0.3 pip package is released
 # We leave it here in case we need to work off of a specific commit in main
-RUN git clone https://github.com/NVIDIA/Megatron-LM.git && \
-  cd Megatron-LM && \
-  git checkout 36e9b6bf3d8034b10c9bbd9fc357c2df2bd1515c && \
-  git cherry-pick -n e69187bc3679ea5841030a165d587bb48b56ee77 && \
-  pip install .
+#RUN git clone https://github.com/NVIDIA/Megatron-LM.git && \
+#  cd Megatron-LM && \
+#  git checkout 36e9b6bf3d8034b10c9bbd9fc357c2df2bd1515c && \
+#  git cherry-pick -n e69187bc3679ea5841030a165d587bb48b56ee77 && \
+#  pip install .
 
 # Performance optimizations for distributed optimizer: https://github.com/NVIDIA/apex/pull/1771
 RUN git clone https://github.com/NVIDIA/apex.git && \

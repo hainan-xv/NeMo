@@ -94,8 +94,6 @@ class EncDecNARTDTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTran
 
         num_classes = num_classes - self.cfg.model_defaults.num_tdt_durations
 
-        print("HERE num_classes", num_classes, self.cfg.decoder.num_classes)
-
         self.loss = RNNTLoss(
             num_classes=num_classes,
             loss_name=loss_name,
@@ -674,73 +672,45 @@ class EncDecNARTDTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTran
             sample_id = batch_nb
 
         # If experimental fused Joint-Loss-WER is not used
-        if not self.joint.fuse_loss_wer:
-            # Compute full joint and loss
-            joint = self.joint(encoder_outputs=encoded)
+        # Compute full joint and loss
+        
+        logprob = self.decoder(encoder_output=encoded)
+        B, T, V = logprob.shape
+        logprob = torch.reshape(logprob, [B, T, 1, V])
 
-            max_len = transcript_len.max().item() + 1
+        max_len = transcript_len.max().item() + 1
 
-            joint = joint.repeat(1, 1, max_len, 1)
+        logprob = logprob.repeat(1, 1, max_len, 1)
 
-            loss_value = self.loss(
-                log_probs=joint, targets=transcript, input_lengths=encoded_len, target_lengths=transcript_len
+
+        loss_value = self.loss(
+            log_probs=logprob, targets=transcript, input_lengths=encoded_len, target_lengths=transcript_len
+        )
+
+        # Add auxiliary losses, if registered
+        loss_value = self.add_auxiliary_losses(loss_value)
+
+        # Reset access registry
+        if AccessMixin.is_access_enabled(self.model_guid):
+            AccessMixin.reset_registry(self)
+
+        tensorboard_logs = {
+            'train_loss': loss_value,
+            'learning_rate': self._optimizer.param_groups[0]['lr'],
+            'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
+        }
+
+        if (sample_id + 1) % log_every_n_steps == 0:
+            self.wer.update(
+                predictions=encoded,
+                predictions_lengths=encoded_len,
+                targets=transcript,
+                targets_lengths=transcript_len,
             )
+            _, scores, words = self.wer.compute()
+            self.wer.reset()
+            tensorboard_logs.update({'training_batch_wer': scores.float() / words})
 
-            # Add auxiliary losses, if registered
-            loss_value = self.add_auxiliary_losses(loss_value)
-
-            # Reset access registry
-            if AccessMixin.is_access_enabled(self.model_guid):
-                AccessMixin.reset_registry(self)
-
-            tensorboard_logs = {
-                'train_loss': loss_value,
-                'learning_rate': self._optimizer.param_groups[0]['lr'],
-                'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
-            }
-
-            if (sample_id + 1) % log_every_n_steps == 0:
-                self.wer.update(
-                    predictions=encoded,
-                    predictions_lengths=encoded_len,
-                    targets=transcript,
-                    targets_lengths=transcript_len,
-                )
-                _, scores, words = self.wer.compute()
-                self.wer.reset()
-                tensorboard_logs.update({'training_batch_wer': scores.float() / words})
-
-        else:
-            # If experimental fused Joint-Loss-WER is used
-            if (sample_id + 1) % log_every_n_steps == 0:
-                compute_wer = True
-            else:
-                compute_wer = False
-
-            # Fused joint step
-            loss_value, wer, _, _ = self.joint(
-                encoder_outputs=encoded,
-                encoder_lengths=encoded_len,
-                transcripts=transcript,
-                transcript_lengths=transcript_len,
-                compute_wer=compute_wer,
-            )
-
-            # Add auxiliary losses, if registered
-            loss_value = self.add_auxiliary_losses(loss_value)
-
-            # Reset access registry
-            if AccessMixin.is_access_enabled(self.model_guid):
-                AccessMixin.reset_registry(self)
-
-            tensorboard_logs = {
-                'train_loss': loss_value,
-                'learning_rate': self._optimizer.param_groups[0]['lr'],
-                'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
-            }
-
-            if compute_wer:
-                tensorboard_logs.update({'training_batch_wer': wer})
 
         # Log items
         self.log_dict(tensorboard_logs)
@@ -781,54 +751,27 @@ class EncDecNARTDTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTran
         tensorboard_logs = {}
 
         # If experimental fused Joint-Loss-WER is not used
-        if not self.joint.fuse_loss_wer:
-            if self.compute_eval_loss:
-                joint = self.joint(encoder_outputs=encoded)
+        if self.compute_eval_loss:
+            decoded = self.decoder(encoder_outputs=encoded)
 
-                loss_value = self.loss(
-                    log_probs=joint, targets=transcript, input_lengths=encoded_len, target_lengths=target_length
-                )
-
-                tensorboard_logs['val_loss'] = loss_value
-
-            self.wer.update(
-                predictions=encoded,
-                predictions_lengths=encoded_len,
-                targets=transcript,
-                targets_lengths=transcript_len,
-            )
-            wer, wer_num, wer_denom = self.wer.compute()
-            self.wer.reset()
-
-            tensorboard_logs['val_wer_num'] = wer_num
-            tensorboard_logs['val_wer_denom'] = wer_denom
-            tensorboard_logs['val_wer'] = wer
-
-        else:
-            # If experimental fused Joint-Loss-WER is used
-            compute_wer = True
-
-            if self.compute_eval_loss:
-                pass
-            else:
-                decoded = None
-                target_len = transcript_len
-
-            # Fused joint step
-            loss_value, wer, wer_num, wer_denom = self.joint(
-                encoder_outputs=encoded,
-                encoder_lengths=encoded_len,
-                transcripts=transcript,
-                transcript_lengths=target_len,
-                compute_wer=compute_wer,
+            loss_value = self.loss(
+                log_probs=decoded, targets=transcript, input_lengths=encoded_len, target_lengths=target_length
             )
 
-            if loss_value is not None:
-                tensorboard_logs['val_loss'] = loss_value
+            tensorboard_logs['val_loss'] = loss_value
 
-            tensorboard_logs['val_wer_num'] = wer_num
-            tensorboard_logs['val_wer_denom'] = wer_denom
-            tensorboard_logs['val_wer'] = wer
+        self.wer.update(
+            predictions=encoded,
+            predictions_lengths=encoded_len,
+            targets=transcript,
+            targets_lengths=transcript_len,
+        )
+        wer, wer_num, wer_denom = self.wer.compute()
+        self.wer.reset()
+
+        tensorboard_logs['val_wer_num'] = wer_num
+        tensorboard_logs['val_wer_denom'] = wer_denom
+        tensorboard_logs['val_wer'] = wer
 
         self.log('global_step', torch.tensor(self.trainer.global_step, dtype=torch.float32))
 
