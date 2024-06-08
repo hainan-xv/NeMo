@@ -355,9 +355,7 @@ class GreedyNARTDTInfer(_GreedyNARTDTInfer):
         if self.preserve_frame_confidence:
             hypothesis.frame_confidence = [[]]
 
-        print("HERE logits", logits.shape)
         logp = logits[:, 0, : -len(self.durations)]
-        print("HERE logp", logp.shape)
 
         duration_logp = logits[:, 0, -len(self.durations) :]
 

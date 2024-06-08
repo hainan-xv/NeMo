@@ -79,8 +79,6 @@ class EncDecNARTDTBPEModel(EncDecNARTDTModel, ASRBPEMixin):
         # Override number of classes if placeholder provided
         num_classes = cfg.decoder["num_classes"]
 
-        print("HHERE num_classes", num_classes)
-
         if num_classes < 1:
             logging.info(
                 "\nReplacing placeholder number of classes ({}) with actual number of classes - {}".format(
@@ -88,7 +86,6 @@ class EncDecNARTDTBPEModel(EncDecNARTDTModel, ASRBPEMixin):
                 )
             )
             cfg.decoder["num_classes"] = len(vocabulary) + cfg.model_defaults.num_tdt_durations
-            print("HHERE num_classes", cfg.decoder["num_classes"])
 
         super().__init__(cfg=cfg, trainer=trainer)
 
@@ -166,6 +163,7 @@ class EncDecNARTDTBPEModel(EncDecNARTDTModel, ASRBPEMixin):
 
         new_decoder_config['num_classes'] = len(vocabulary)
         del self.decoder
+
         self.decoder = EncDecRNNTBPEModel.from_config_dict(new_decoder_config)
 
         del self.loss

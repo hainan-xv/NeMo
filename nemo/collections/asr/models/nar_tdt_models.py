@@ -73,9 +73,6 @@ class EncDecNARTDTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTran
             if "feat_in" not in self.cfg.decoder or not self.cfg.decoder.feat_in:
                 raise ValueError("param feat_in of the decoder's config is not set!")
 
-#            self.cfg.decoder.num_classes = len(self.cfg.labels)
-#            self.cfg.decoder.vocabulary = self.cfg.labels
-
             if self.cfg.decoder.num_classes < 1 and self.cfg.decoder.vocabulary is not None:
                 logging.info(
                     "\nReplacing placeholder number of classes ({}) with actual number of classes - {}".format(
@@ -90,9 +87,7 @@ class EncDecNARTDTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTran
         # Setup RNNT Loss
         loss_name, loss_kwargs = self.extract_rnnt_loss_cfg(self.cfg.get("loss", None))
 
-        num_classes = self.decoder.num_classes_with_blank - 1  # for standard RNNT and multi-blank
-
-        num_classes = num_classes - self.cfg.model_defaults.num_tdt_durations
+        num_classes = self.decoder.num_classes_with_blank - 1 - self.cfg.model_defaults.num_tdt_durations
 
         self.loss = RNNTLoss(
             num_classes=num_classes,
@@ -109,7 +104,7 @@ class EncDecNARTDTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTran
         self.cfg.decoding = self.set_decoding_type_according_to_loss(self.cfg.decoding)
         # Setup decoding objects
         self.decoding = NARTDTDecoding(
-            decoding_cfg=self.cfg.decoding, decoder=self.decoder, vocabulary=self.decoder.vocabulary, blank_id=num_classes + 1,
+            decoding_cfg=self.cfg.decoding, decoder=self.decoder, vocabulary=self.decoder.vocabulary, blank_id=num_classes,
         )
         # Setup WER calculation
         self.wer = WER(
@@ -394,13 +389,6 @@ class EncDecNARTDTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTran
             dist_sync_on_step=True,
         )
 
-        # Setup fused Joint step
-        if self.joint.fuse_loss_wer or (
-            self.decoding.joint_fused_batch_size is not None and self.decoding.joint_fused_batch_size > 0
-        ):
-            self.joint.set_loss(self.loss)
-            self.joint.set_wer(self.wer)
-
         self.joint.temperature = decoding_cfg.get('temperature', 1.0)
 
         # Update config
@@ -681,7 +669,6 @@ class EncDecNARTDTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTran
         max_len = transcript_len.max().item() + 1
 
         logprob = logprob.repeat(1, 1, max_len, 1)
-
 
         loss_value = self.loss(
             log_probs=logprob, targets=transcript, input_lengths=encoded_len, target_lengths=transcript_len

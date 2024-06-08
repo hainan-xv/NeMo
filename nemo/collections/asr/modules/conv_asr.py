@@ -428,10 +428,6 @@ class ConvASRDecoder(NeuralModule, Exportable, adapter_mixins.AdapterModuleMixin
             logging.info(f"num_classes of ConvASRDecoder is set to the size of the vocabulary: {num_classes}.")
 
         if vocabulary is not None:
-#            if num_classes != len(vocabulary):
-#                raise ValueError(
-#                    f"If vocabulary is specified, it's length should be equal to the num_classes. Instead got: num_classes={num_classes} and len(vocabulary)={len(vocabulary)}"
-#                )
             self.__vocabulary = vocabulary
 
         self._feat_in = feat_in
@@ -450,7 +446,7 @@ class ConvASRDecoder(NeuralModule, Exportable, adapter_mixins.AdapterModuleMixin
         self.temperature = 1.0
 
     @typecheck()
-    def forward(self, encoder_output):
+    def forward(self, encoder_output, normalize=True):
         # Adapter module forward step
         if self.is_adapter_available():
             encoder_output = encoder_output.transpose(1, 2)  # [B, T, C]
@@ -458,10 +454,16 @@ class ConvASRDecoder(NeuralModule, Exportable, adapter_mixins.AdapterModuleMixin
             encoder_output = encoder_output.transpose(1, 2)  # [B, C, T]
 
         if self.temperature != 1.0:
-            return torch.nn.functional.log_softmax(
-                self.decoder_layers(encoder_output).transpose(1, 2) / self.temperature, dim=-1
-            )
-        return torch.nn.functional.log_softmax(self.decoder_layers(encoder_output).transpose(1, 2), dim=-1)
+            if normalize:
+                return torch.nn.functional.log_softmax(
+                    self.decoder_layers(encoder_output).transpose(1, 2) / self.temperature, dim=-1
+                )
+            else:
+                return self.decoder_layers(encoder_output).transpose(1, 2) / self.temperature
+        if normalize:
+            return torch.nn.functional.log_softmax(self.decoder_layers(encoder_output).transpose(1, 2), dim=-1)
+        else:
+            return self.decoder_layers(encoder_output).transpose(1, 2)
 
     def input_example(self, max_batch=1, max_dim=256):
         """
