@@ -1352,7 +1352,7 @@ class NARTDTJoint(rnnt_abstract.AbstractNARTDTJoint, Exportable, AdapterModuleMi
         # Optional arguments
         dropout = jointnet.get('dropout', 0.0)
 
-        self.enc, self.joint_net = self._joint_net_modules(
+        self.joint_net = self._joint_net_modules(
             num_classes=self._num_classes,  # add 1 for blank symbol
             pred_n_hidden=self.pred_hidden,
             enc_n_hidden=self.encoder_hidden,
@@ -1519,7 +1519,7 @@ class NARTDTJoint(rnnt_abstract.AbstractNARTDTJoint, Exportable, AdapterModuleMi
         Returns:
             A torch.Tensor of shape [B, T, H]
         """
-        return self.enc(encoder_output)
+        return encoder_output
 
     def project_prednet(self, prednet_output: torch.Tensor) -> torch.Tensor:
         """
@@ -1607,26 +1607,28 @@ class NARTDTJoint(rnnt_abstract.AbstractNARTDTJoint, Exportable, AdapterModuleMi
             activation: Activation of the joint. Can be one of [relu, tanh, sigmoid]
             dropout: Dropout value to apply to joint.
         """
-        enc = torch.nn.Linear(enc_n_hidden, joint_n_hidden)
+#        enc = torch.nn.Linear(enc_n_hidden, joint_n_hidden)
 
-        if activation not in ['relu', 'sigmoid', 'tanh']:
-            raise ValueError("Unsupported activation for joint step - please pass one of " "[relu, sigmoid, tanh]")
+#        if activation not in ['relu', 'sigmoid', 'tanh']:
+#            raise ValueError("Unsupported activation for joint step - please pass one of " "[relu, sigmoid, tanh]")
+#
+#        activation = activation.lower()
+#
+#        if activation == 'relu':
+#            activation = torch.nn.ReLU(inplace=True)
+#        elif activation == 'sigmoid':
+#            activation = torch.nn.Sigmoid()
+#        elif activation == 'tanh':
+#            activation = torch.nn.Tanh()
 
-        activation = activation.lower()
+#        layers = (
+#            [activation]
+#            + ([torch.nn.Dropout(p=dropout)] if dropout else [])
+#            + [torch.nn.Linear(joint_n_hidden, num_classes)]
+#        )
 
-        if activation == 'relu':
-            activation = torch.nn.ReLU(inplace=True)
-        elif activation == 'sigmoid':
-            activation = torch.nn.Sigmoid()
-        elif activation == 'tanh':
-            activation = torch.nn.Tanh()
-
-        layers = (
-            [activation]
-            + ([torch.nn.Dropout(p=dropout)] if dropout else [])
-            + [torch.nn.Linear(joint_n_hidden, num_classes)]
-        )
-        return enc, torch.nn.Sequential(*layers)
+        project = torch.nn.Linear(self.encoder_hidden, num_classes)
+        return project
 
     # Adapter method overrides
     def add_adapter(self, name: str, cfg: DictConfig):
