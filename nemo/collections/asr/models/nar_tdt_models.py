@@ -29,6 +29,7 @@ from nemo.collections.asr.data.audio_to_text import _AudioTextDataset
 from nemo.collections.asr.data.audio_to_text_dali import AudioToCharDALIDataset, DALIOutputs
 from nemo.collections.asr.data.audio_to_text_lhotse import LhotseSpeechToTextBpeDataset
 from nemo.collections.asr.losses.rnnt import RNNTLoss, resolve_rnnt_default_loss_name
+from nemo.collections.asr.losses.ctc import CTCLoss
 from nemo.collections.asr.metrics.wer import WER
 from nemo.collections.asr.models.asr_model import ASRModel, ExportableEncDecModel
 from nemo.collections.asr.modules.rnnt import RNNTDecoderJoint
@@ -76,19 +77,21 @@ class EncDecNARTDTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTran
 
         # Setup RNNT Loss
         loss_name, loss_kwargs = self.extract_rnnt_loss_cfg(self.cfg.get("loss", None))
+        assert loss_name == 'tdt'
 
-        num_classes = self.joint.num_classes_with_blank - 1  # for standard RNNT and multi-blank
+        num_classes = self.joint.num_classes_with_blank - 1 - self.joint.num_extra_outputs
 
-        if loss_name == 'tdt':
-            num_classes = num_classes - self.joint.num_extra_outputs
-        else:
-            assert(False)
-
-        self.loss = RNNTLoss(
+        self.tdt_loss = RNNTLoss(
             num_classes=num_classes,
             loss_name=loss_name,
             loss_kwargs=loss_kwargs,
-            reduction=self.cfg.get("rnnt_reduction", "mean_batch"),
+            reduction="mean_volume",
+        )
+
+        self.ctc_loss = CTCLoss(
+            num_classes=num_classes,
+            zero_infinity=True,
+            reduction="mean_volume",
         )
 
         if hasattr(self.cfg, 'spec_augment') and self._cfg.spec_augment is not None:
@@ -115,13 +118,6 @@ class EncDecNARTDTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTran
             self.compute_eval_loss = self.cfg.compute_eval_loss
         else:
             self.compute_eval_loss = True
-
-        # Setup fused Joint step if flag is set
-        if self.joint.fuse_loss_wer or (
-            self.decoding.joint_fused_batch_size is not None and self.decoding.joint_fused_batch_size > 0
-        ):
-            self.joint.set_loss(self.loss)
-            self.joint.set_wer(self.wer)
 
         # Setup optimization normalization (if provided in config)
         self.setup_optim_normalization()
@@ -310,10 +306,16 @@ class EncDecNARTDTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTran
             del self.joint
             self.joint = EncDecRNNTModel.from_config_dict(new_joint_config)
 
-            del self.loss
+            del self.tdt_loss, self.ctc_loss
             loss_name, loss_kwargs = self.extract_rnnt_loss_cfg(self.cfg.get('loss', None))
-            self.loss = RNNTLoss(
-                num_classes=self.joint.num_classes_with_blank - 1, loss_name=loss_name, loss_kwargs=loss_kwargs
+            self.tdt_loss = RNNTLoss(
+                num_classes=self.joint.num_classes_with_blank - 1, loss_name=loss_name, loss_kwargs=loss_kwargs, reduction='mean_volume'
+            )
+
+            self.ctc_loss = CTCLoss(
+                num_classes=self.decoder.num_classes_with_blank - 1,
+                zero_infinity=True,
+                reduction='mean_volume',
             )
 
             if decoding_cfg is None:
@@ -338,12 +340,6 @@ class EncDecNARTDTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTran
                 dist_sync_on_step=True,
             )
 
-            # Setup fused Joint step
-            if self.joint.fuse_loss_wer or (
-                self.decoding.joint_fused_batch_size is not None and self.decoding.joint_fused_batch_size > 0
-            ):
-                self.joint.set_loss(self.loss)
-                self.joint.set_wer(self.wer)
 
             # Update config
             with open_dict(self.cfg.joint):
@@ -391,12 +387,6 @@ class EncDecNARTDTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTran
             dist_sync_on_step=True,
         )
 
-        # Setup fused Joint step
-        if self.joint.fuse_loss_wer or (
-            self.decoding.joint_fused_batch_size is not None and self.decoding.joint_fused_batch_size > 0
-        ):
-            self.joint.set_loss(self.loss)
-            self.joint.set_wer(self.wer)
 
         self.joint.temperature = decoding_cfg.get('temperature', 1.0)
 
@@ -669,73 +659,56 @@ class EncDecNARTDTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTran
             sample_id = batch_nb
 
         # If experimental fused Joint-Loss-WER is not used
-        if not self.joint.fuse_loss_wer:
-            # Compute full joint and loss
-            joint = self.joint(encoder_outputs=encoded)
+        # Compute full joint and loss
+        joint = self.joint(encoder_outputs=encoded)
+        B, T, _, V = joint.shape
+        ctc_in = torch.reshape(joint, [B, T, V])[:,:,:-self.joint.num_extra_outputs]
+        ctc_in = torch.nn.functional.log_softmax(ctc_in, dim=-1)
 
-            max_len = transcript_len.max().item() + 1
+        ctc_loss_value = self.ctc_loss(
+            log_probs=ctc_in, targets=transcript, input_lengths=encoded_len, target_lengths=transcript_len
+        )
 
-            joint = joint.repeat(1, 1, max_len, 1)
+        max_len = transcript_len.max().item() + 1
+        new_joint = torch.cat(torch.reshape(ctc_in, [B, T, 1, V]), joint[:,:,:,-self.joint.num_extra_outputs:]], dim=-1)
+#        new_joint = torch.cat([joint[:,:,:,:-self.joint.num_extra_outputs].detach(), joint[:,:,:,-self.joint.num_extra_outputs:]], dim=-1)
+#        print("HERE old", joint.shape)
+#        print("HERE new", new_joint.shape)
 
-            loss_value = self.loss(
-                log_probs=joint, targets=transcript, input_lengths=encoded_len, target_lengths=transcript_len
+        new_joint = new_joint.repeat(1, 1, max_len, 1)
+
+        tdt_loss_value = self.tdt_loss(
+            log_probs=new_joint, targets=transcript, input_lengths=encoded_len, target_lengths=transcript_len
+        )
+
+        loss_value = ctc_loss_value + tdt_loss_value
+
+        # Add auxiliary losses, if registered
+        loss_value = self.add_auxiliary_losses(loss_value)
+
+        # Reset access registry
+        if AccessMixin.is_access_enabled(self.model_guid):
+            AccessMixin.reset_registry(self)
+
+        tensorboard_logs = {
+            'train_loss': loss_value,
+            'ctc_loss': ctc_loss_value,
+            'tdt_loss': tdt_loss_value,
+            'learning_rate': self._optimizer.param_groups[0]['lr'],
+            'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
+        }
+
+        if (sample_id + 1) % log_every_n_steps == 0:
+            self.wer.update(
+                predictions=encoded,
+                predictions_lengths=encoded_len,
+                targets=transcript,
+                targets_lengths=transcript_len,
             )
+            _, scores, words = self.wer.compute()
+            self.wer.reset()
+            tensorboard_logs.update({'training_batch_wer': scores.float() / words})
 
-            # Add auxiliary losses, if registered
-            loss_value = self.add_auxiliary_losses(loss_value)
-
-            # Reset access registry
-            if AccessMixin.is_access_enabled(self.model_guid):
-                AccessMixin.reset_registry(self)
-
-            tensorboard_logs = {
-                'train_loss': loss_value,
-                'learning_rate': self._optimizer.param_groups[0]['lr'],
-                'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
-            }
-
-            if (sample_id + 1) % log_every_n_steps == 0:
-                self.wer.update(
-                    predictions=encoded,
-                    predictions_lengths=encoded_len,
-                    targets=transcript,
-                    targets_lengths=transcript_len,
-                )
-                _, scores, words = self.wer.compute()
-                self.wer.reset()
-                tensorboard_logs.update({'training_batch_wer': scores.float() / words})
-
-        else:
-            # If experimental fused Joint-Loss-WER is used
-            if (sample_id + 1) % log_every_n_steps == 0:
-                compute_wer = True
-            else:
-                compute_wer = False
-
-            # Fused joint step
-            loss_value, wer, _, _ = self.joint(
-                encoder_outputs=encoded,
-                encoder_lengths=encoded_len,
-                transcripts=transcript,
-                transcript_lengths=transcript_len,
-                compute_wer=compute_wer,
-            )
-
-            # Add auxiliary losses, if registered
-            loss_value = self.add_auxiliary_losses(loss_value)
-
-            # Reset access registry
-            if AccessMixin.is_access_enabled(self.model_guid):
-                AccessMixin.reset_registry(self)
-
-            tensorboard_logs = {
-                'train_loss': loss_value,
-                'learning_rate': self._optimizer.param_groups[0]['lr'],
-                'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
-            }
-
-            if compute_wer:
-                tensorboard_logs.update({'training_batch_wer': wer})
 
         # Log items
         self.log_dict(tensorboard_logs)
@@ -776,54 +749,36 @@ class EncDecNARTDTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTran
         tensorboard_logs = {}
 
         # If experimental fused Joint-Loss-WER is not used
-        if not self.joint.fuse_loss_wer:
-            if self.compute_eval_loss:
-                joint = self.joint(encoder_outputs=encoded)
+        if self.compute_eval_loss:
+            joint = self.joint(encoder_outputs=encoded)
 
-                loss_value = self.loss(
-                    log_probs=joint, targets=transcript, input_lengths=encoded_len, target_lengths=target_length
-                )
-
-                tensorboard_logs['val_loss'] = loss_value
-
-            self.wer.update(
-                predictions=encoded,
-                predictions_lengths=encoded_len,
-                targets=transcript,
-                targets_lengths=transcript_len,
-            )
-            wer, wer_num, wer_denom = self.wer.compute()
-            self.wer.reset()
-
-            tensorboard_logs['val_wer_num'] = wer_num
-            tensorboard_logs['val_wer_denom'] = wer_denom
-            tensorboard_logs['val_wer'] = wer
-
-        else:
-            # If experimental fused Joint-Loss-WER is used
-            compute_wer = True
-
-            if self.compute_eval_loss:
-                pass
-            else:
-                decoded = None
-                target_len = transcript_len
-
-            # Fused joint step
-            loss_value, wer, wer_num, wer_denom = self.joint(
-                encoder_outputs=encoded,
-                encoder_lengths=encoded_len,
-                transcripts=transcript,
-                transcript_lengths=target_len,
-                compute_wer=compute_wer,
+            tdt_loss_value = self.tdt_loss(
+                log_probs=joint, targets=transcript, input_lengths=encoded_len, target_lengths=target_length
             )
 
-            if loss_value is not None:
-                tensorboard_logs['val_loss'] = loss_value
+            ctc_loss_value = self.ctc_loss(
+                log_probs=joint, targets=transcript, input_lengths=encoded_len, target_lengths=target_length
+            )
 
-            tensorboard_logs['val_wer_num'] = wer_num
-            tensorboard_logs['val_wer_denom'] = wer_denom
-            tensorboard_logs['val_wer'] = wer
+            loss_value = tdt_loss_value + ctc_loss_value
+
+            tensorboard_logs['val_loss'] = loss_value
+            tensorboard_logs['val_ctc_loss'] = ctc_loss_value
+            tensorboard_logs['val_tdt_loss'] = tdt_loss_value
+
+        self.wer.update(
+            predictions=encoded,
+            predictions_lengths=encoded_len,
+            targets=transcript,
+            targets_lengths=transcript_len,
+        )
+        wer, wer_num, wer_denom = self.wer.compute()
+        self.wer.reset()
+
+        tensorboard_logs['val_wer_num'] = wer_num
+        tensorboard_logs['val_wer_denom'] = wer_denom
+        tensorboard_logs['val_wer'] = wer
+
 
         self.log('global_step', torch.tensor(self.trainer.global_step, dtype=torch.float32))
 
