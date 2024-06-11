@@ -671,7 +671,7 @@ class EncDecNARTDTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTran
         # If experimental fused Joint-Loss-WER is not used
         if not self.joint.fuse_loss_wer:
             # Compute full joint and loss
-            joint = self.joint(encoder_outputs=encoded)
+            joint = self.joint(encoder_outputs=encoded, encoder_lengths=encoded_len)
 
             max_len = transcript_len.max().item() + 1
 

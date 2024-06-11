@@ -26,7 +26,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from typing import Any, Dict, List, Optional, Tuple, Union
+from torch.nn import LayerNorm
 
 import torch
 from omegaconf import DictConfig, OmegaConf
@@ -50,6 +52,10 @@ from nemo.core.neural_types import (
     SpectrogramType,
 )
 from nemo.utils import logging
+from nemo.collections.asr.parts.submodules.multi_head_attention import (
+    RelPositionMultiHeadAttentionLongformer,
+    LocalAttRelPositionalEncoding,
+)
 
 
 class StatelessTransducerDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable):
@@ -1361,6 +1367,39 @@ class NARTDTJoint(rnnt_abstract.AbstractNARTDTJoint, Exportable, AdapterModuleMi
             dropout=dropout,
         )
 
+        att_context = [8,0]
+
+        self.pos_enc = LocalAttRelPositionalEncoding(
+            att_context_size=att_context,
+            d_model=self.encoder_hidden,
+            dropout_rate=0.1,
+            max_len=5000,
+            xscale=math.sqrt(self.encoder_hidden),
+            dropout_rate_emb=0.1,
+        )
+
+
+        self.self_attn = RelPositionMultiHeadAttentionLongformer(
+            n_head=4,
+            n_feat=self.encoder_hidden,
+            dropout_rate=0.1,
+            pos_bias_u=None,
+            pos_bias_v=None,
+            max_cache_len=att_context,
+            att_context_size=att_context,
+            global_tokens=0,
+            global_tokens_spacing=1,
+            global_attn_separate=False,
+            use_bias=True,
+        )
+
+        self.max_audio_length = 5000
+        device = next(self.parameters()).device
+        dtype = next(self.parameters()).dtype
+        self.pos_enc.extend_pe(self.max_audio_length, device, dtype)
+        self.norm_out = LayerNorm(self.encoder_hidden)
+
+
         # Flag needed for RNNT export support
         self._rnnt_export = False
 
@@ -1377,8 +1416,17 @@ class NARTDTJoint(rnnt_abstract.AbstractNARTDTJoint, Exportable, AdapterModuleMi
         compute_wer: bool = False,
     ) -> Union[torch.Tensor, List[Optional[torch.Tensor]]]:
         # encoder = (B, D, T)
-        encoder_outputs = encoder_outputs.transpose(1, 2)  # (B, T, D)
+        _, pos_emb = self.pos_enc(x=encoder_outputs, cache_len=0)
 
+
+        encoder_outputs = encoder_outputs.transpose(1, 2)  # (B, T, D)
+        max_audio_length = encoder_outputs.size(1)
+        pad_mask = torch.arange(0, max_audio_length, device=encoder_outputs.device).expand(
+            encoder_lengths.size(0), -1
+        ) < encoder_lengths.unsqueeze(-1)
+        encoder_outputs = self.self_attn(query=encoder_outputs, key=encoder_outputs, value=encoder_outputs, pad_mask=pad_mask, pos_emb=pos_emb, cache=None)
+
+        encoder_outputs = self.norm_out(encoder_outputs)
         if not self._fuse_loss_wer:
             out = self.joint(encoder_outputs)  # [B, T, U, V + 1]
             return out
