@@ -1424,7 +1424,7 @@ class NARTDTJoint(rnnt_abstract.AbstractNARTDTJoint, Exportable, AdapterModuleMi
         pad_mask = torch.arange(0, max_audio_length, device=encoder_outputs.device).expand(
             encoder_lengths.size(0), -1
         ) < encoder_lengths.unsqueeze(-1)
-        encoder_outputs = self.self_attn(query=encoder_outputs, key=encoder_outputs, value=encoder_outputs, pad_mask=pad_mask, pos_emb=pos_emb, cache=None)
+        encoder_outputs = encoder_outputs + self.self_attn(query=encoder_outputs, key=encoder_outputs, value=encoder_outputs, pad_mask=pad_mask, pos_emb=pos_emb, cache=None)
 
         encoder_outputs = self.norm_out(encoder_outputs)
         if not self._fuse_loss_wer:
