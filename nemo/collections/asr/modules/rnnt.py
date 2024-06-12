@@ -1365,7 +1365,7 @@ class NARTDTJoint(rnnt_abstract.AbstractNARTDTJoint, Exportable, AdapterModuleMi
         )
 
         self.conv = ConformerConvolution(
-            d_model=self.encoder_hidden,
+            d_model=self.joint_hidden,
             kernel_size=9,
             norm_type='batch_norm',
             conv_context_size=[8, 0],
@@ -1897,6 +1897,15 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
             dropout=dropout,
         )
 
+#        self.conv = ConformerConvolution(
+#            d_model=self.joint_hidden,
+#            kernel_size=num_extra_outputs + 1,
+#            norm_type='batch_norm',
+#            conv_context_size=[num_extra_outputs, 0],
+#            use_bias=True,
+#        )
+#        self.norm_out = LayerNorm(self.joint_hidden)
+
         # Flag needed for RNNT export support
         self._rnnt_export = False
 
@@ -1920,140 +1929,16 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         if decoder_outputs is not None:
             decoder_outputs = decoder_outputs.transpose(1, 2)  # (B, U, D)
 
-        if not self._fuse_loss_wer:
-            if decoder_outputs is None:
-                raise ValueError(
-                    "decoder_outputs passed is None, and `fuse_loss_wer` is not set. "
-                    "decoder_outputs can only be None for fused step!"
-                )
+        assert not self._fuse_loss_wer
+        if decoder_outputs is None:
+            raise ValueError(
+                "decoder_outputs passed is None, and `fuse_loss_wer` is not set. "
+                "decoder_outputs can only be None for fused step!"
+            )
 
-            out = self.joint(encoder_outputs, decoder_outputs)  # [B, T, U, V + 1]
-            return out
+        out = self.joint(encoder_outputs, decoder_outputs)  # [B, T, U, V + 1]
+        return out
 
-        else:
-            # At least the loss module must be supplied during fused joint
-            if self._loss is None or self._wer is None:
-                raise ValueError("`fuse_loss_wer` flag is set, but `loss` and `wer` modules were not provided! ")
-
-            # If fused joint step is required, fused batch size is required as well
-            if self._fused_batch_size is None:
-                raise ValueError("If `fuse_loss_wer` is set, then `fused_batch_size` cannot be None!")
-
-            # When using fused joint step, both encoder and transcript lengths must be provided
-            if (encoder_lengths is None) or (transcript_lengths is None):
-                raise ValueError(
-                    "`fuse_loss_wer` is set, therefore encoder and target lengths " "must be provided as well!"
-                )
-
-            losses = []
-            wers, wer_nums, wer_denoms = [], [], []
-            target_lengths = []
-            batch_size = int(encoder_outputs.size(0))  # actual batch size
-
-            # Iterate over batch using fused_batch_size steps
-            for batch_idx in range(0, batch_size, self._fused_batch_size):
-                begin = batch_idx
-                end = min(begin + self._fused_batch_size, batch_size)
-
-                # Extract the sub batch inputs
-                # sub_enc = encoder_outputs[begin:end, ...]
-                # sub_transcripts = transcripts[begin:end, ...]
-                sub_enc = encoder_outputs.narrow(dim=0, start=begin, length=int(end - begin))
-                sub_transcripts = transcripts.narrow(dim=0, start=begin, length=int(end - begin))
-
-                sub_enc_lens = encoder_lengths[begin:end]
-                sub_transcript_lens = transcript_lengths[begin:end]
-
-                # Sub transcripts does not need the full padding of the entire batch
-                # Therefore reduce the decoder time steps to match
-                max_sub_enc_length = sub_enc_lens.max()
-                max_sub_transcript_length = sub_transcript_lens.max()
-
-                if decoder_outputs is not None:
-                    # Reduce encoder length to preserve computation
-                    # Encoder: [sub-batch, T, D] -> [sub-batch, T', D]; T' < T
-                    if sub_enc.shape[1] != max_sub_enc_length:
-                        sub_enc = sub_enc.narrow(dim=1, start=0, length=int(max_sub_enc_length))
-
-                    # sub_dec = decoder_outputs[begin:end, ...]  # [sub-batch, U, D]
-                    sub_dec = decoder_outputs.narrow(dim=0, start=begin, length=int(end - begin))  # [sub-batch, U, D]
-
-                    # Reduce decoder length to preserve computation
-                    # Decoder: [sub-batch, U, D] -> [sub-batch, U', D]; U' < U
-                    if sub_dec.shape[1] != max_sub_transcript_length + 1:
-                        sub_dec = sub_dec.narrow(dim=1, start=0, length=int(max_sub_transcript_length + 1))
-
-                    # Perform joint => [sub-batch, T', U', V + 1]
-                    sub_joint = self.joint(sub_enc, sub_dec)
-
-                    del sub_dec
-
-                    # Reduce transcript length to correct alignment
-                    # Transcript: [sub-batch, L] -> [sub-batch, L']; L' <= L
-                    if sub_transcripts.shape[1] != max_sub_transcript_length:
-                        sub_transcripts = sub_transcripts.narrow(dim=1, start=0, length=int(max_sub_transcript_length))
-
-                    # Compute sub batch loss
-                    # preserve loss reduction type
-                    loss_reduction = self.loss.reduction
-
-                    # override loss reduction to sum
-                    self.loss.reduction = None
-
-                    # compute and preserve loss
-                    loss_batch = self.loss(
-                        log_probs=sub_joint,
-                        targets=sub_transcripts,
-                        input_lengths=sub_enc_lens,
-                        target_lengths=sub_transcript_lens,
-                    )
-                    losses.append(loss_batch)
-                    target_lengths.append(sub_transcript_lens)
-
-                    # reset loss reduction type
-                    self.loss.reduction = loss_reduction
-
-                else:
-                    losses = None
-
-                # Update WER for sub batch
-                if compute_wer:
-                    sub_enc = sub_enc.transpose(1, 2)  # [B, T, D] -> [B, D, T]
-                    sub_enc = sub_enc.detach()
-                    sub_transcripts = sub_transcripts.detach()
-
-                    # Update WER on each process without syncing
-                    self.wer.update(
-                        predictions=sub_enc,
-                        predictions_lengths=sub_enc_lens,
-                        targets=sub_transcripts,
-                        targets_lengths=sub_transcript_lens,
-                    )
-                    # Sync and all_reduce on all processes, compute global WER
-                    wer, wer_num, wer_denom = self.wer.compute()
-                    self.wer.reset()
-
-                    wers.append(wer)
-                    wer_nums.append(wer_num)
-                    wer_denoms.append(wer_denom)
-
-                del sub_enc, sub_transcripts, sub_enc_lens, sub_transcript_lens
-
-            # Reduce over sub batches
-            if losses is not None:
-                losses = self.loss.reduce(losses, target_lengths)
-
-            # Collect sub batch wer results
-            if compute_wer:
-                wer = sum(wers) / len(wers)
-                wer_num = sum(wer_nums)
-                wer_denom = sum(wer_denoms)
-            else:
-                wer = None
-                wer_num = None
-                wer_denom = None
-
-            return losses, wer, wer_num, wer_denom
 
     def project_encoder(self, encoder_output: torch.Tensor) -> torch.Tensor:
         """
@@ -2109,15 +1994,64 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         Returns:
             Logits / log softmaxed tensor of shape (B, T, U, V + 1).
         """
-        f = f.unsqueeze(dim=2)  # (B, T, 1, H)
-        g = g.unsqueeze(dim=1)  # (B, 1, U, H)
-        inp = f + g  # [B, T, U, H]
 
-        del f, g
+        if self.training:
 
-        # Forward adapter modules on joint hidden
-        if self.is_adapter_available():
-            inp = self.forward_enabled_adapters(inp)
+#            f1 = f[:,0:8,:]
+#            f2 = f[:,0:9,:]
+#
+#            f1_conv = self.conv(f1)
+#            f2_conv = self.conv(f2)
+#
+#            print("HERE DIFF", f1_conv.shape)
+#            print("HERE DIFF", f2_conv[:,0:8,:] - f1_conv)
+
+            g = g.unsqueeze(dim=1)  # (B, 1, U, H)
+
+            r = random.uniform(0, 1)
+            T = f.size(1)
+
+#            pad_mask = None
+#            assert f_len is not None
+#            pad_mask = torch.arange(0, T, device=f.device).expand(
+#                f_len.size(0), -1
+#            ) < f_len.unsqueeze(-1)
+
+#            inp_enc_mimic = self.conv(f).unsqueeze(dim=2) + g * 0
+#            inp_enc_mimic = self.norm_out(inp_enc_mimic)
+
+            f = f.unsqueeze(dim=2)  # (B, T, 1, H)
+            if r < 0.5:
+                g = g * 0
+            inp = f + g  # [B, T, U, H]
+
+#            inp_enc_only = f + g * 0  # [B, T, U, H]
+#
+#            if r < 0:
+#                inp = inp_enc_mimic * 0 + inp_enc_dec * 0 + inp_enc_only * 0
+#            elif r < 0.5:
+#                inp = inp_enc_mimic * 0 + inp_enc_dec + inp_enc_only * 0
+#            else:
+#                inp = inp_enc_mimic * 0 + inp_enc_dec * 0 + inp_enc_only
+
+            del f, g
+
+            # Forward adapter modules on joint hidden
+            if self.is_adapter_available():
+                inp = self.forward_enabled_adapters(inp)
+        else:
+            g = g.unsqueeze(dim=1)  # (B, 1, U, H)
+
+            f = f.unsqueeze(dim=2)  # (B, T, 1, H)
+            inp = f + g * 0  # [B, T, U, H]
+
+
+            del f, g
+
+            # Forward adapter modules on joint hidden
+            if self.is_adapter_available():
+                inp = self.forward_enabled_adapters(inp)
+            
 
         res = self.joint_net(inp)  # [B, T, U, V + 1]
 

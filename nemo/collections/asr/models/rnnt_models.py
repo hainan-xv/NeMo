@@ -727,6 +727,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 tensorboard_logs.update({'training_batch_wer': scores.float() / words})
 
         else:
+            assert(0)
             # If experimental fused Joint-Loss-WER is used
             if (sample_id + 1) % log_every_n_steps == 0:
                 compute_wer = True
@@ -737,7 +738,6 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             loss_value, wer, _, _ = self.joint(
                 encoder_outputs=encoded,
                 decoder_outputs=decoder,
-                encoder_lengths=encoded_len,
                 transcripts=transcript,
                 transcript_lengths=transcript_len,
                 compute_wer=compute_wer,
