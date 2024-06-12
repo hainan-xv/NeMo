@@ -194,6 +194,7 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
             residual = pack_ip['x']
 
         x = self.norm_conv(residual)
+
         x = self.conv(x, pad_mask=pad_mask, cache=cache_last_time)
         if cache_last_time is not None:
             (x, cache_last_time) = x
