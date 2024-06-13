@@ -497,9 +497,9 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
 
         return (encoded, encoded_len, cache_last_channel_next, cache_last_time_next, cache_last_channel_next_len)
 
-    @typecheck()
+#    @typecheck()
     def forward(
-        self, audio_signal, length, cache_last_channel=None, cache_last_time=None, cache_last_channel_len=None
+        self, audio_signal, length, cache_last_channel=None, cache_last_time=None, cache_last_channel_len=None, r=-1.0
     ):
         return self.forward_internal(
             audio_signal,
@@ -507,10 +507,11 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             cache_last_channel=cache_last_channel,
             cache_last_time=cache_last_time,
             cache_last_channel_len=cache_last_channel_len,
+            r=r,
         )
 
     def forward_internal(
-        self, audio_signal, length, cache_last_channel=None, cache_last_time=None, cache_last_channel_len=None
+        self, audio_signal, length, cache_last_channel=None, cache_last_time=None, cache_last_channel_len=None, r=-1.0,
     ):
         self.update_max_seq_length(seq_length=audio_signal.size(2), device=audio_signal.device)
 
@@ -573,6 +574,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             cache_last_time_next = []
             cache_last_channel_next = []
 
+        early_return = None
         for lth, (drop_prob, layer) in enumerate(zip(self.layer_drop_probs, self.layers)):
             original_signal = audio_signal
             if cache_last_channel is not None:
@@ -635,6 +637,13 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                         name=f'interctc/layer_output_{lth}', tensor=torch.transpose(lth_audio_signal, 1, 2)
                     )
                     self.register_accessible_tensor(name=f'interctc/layer_length_{lth}', tensor=length)
+
+            if lth == self.n_layers - 2:
+                if r > 0 and r < 0.5:
+                    early_return = audio_signal
+
+        if early_return is not None:
+            audio_signal = audio_signal * 0.0 + early_return
 
         if self.out_proj is not None:
             audio_signal = self.out_proj(audio_signal)

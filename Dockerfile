@@ -73,7 +73,7 @@ RUN git clone https://github.com/NVIDIA/Megatron-LM.git && \
 # Performance optimizations for distributed optimizer: https://github.com/NVIDIA/apex/pull/1771
 RUN git clone https://github.com/NVIDIA/apex.git && \
   cd apex && \
-  git checkout f058162b215791b15507bb542f22ccfde49c872d && \
+  git checkout f058162b215791b15507bb542f22ccfde49c872d && echo HAHA && \
   pip install -v --no-build-isolation --disable-pip-version-check --no-cache-dir --config-settings "--build-option=--cpp_ext --cuda_ext --fast_layer_norm --distributed_adam --deprecated_fused_adam" ./
 
 ## Transformer Engine 1.2.0

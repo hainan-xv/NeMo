@@ -1911,8 +1911,9 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
 
         # to change, requires running ``model.temperature = T`` explicitly
         self.temperature = 1.0
+        self.r = -1.0
 
-    @typecheck()
+#    @typecheck()
     def forward(
         self,
         encoder_outputs: torch.Tensor,
@@ -1921,11 +1922,12 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         transcripts: Optional[torch.Tensor] = None,
         transcript_lengths: Optional[torch.Tensor] = None,
         compute_wer: bool = False,
+        r: float = -1.0,
     ) -> Union[torch.Tensor, List[Optional[torch.Tensor]]]:
         # encoder = (B, D, T)
         # decoder = (B, D, U) if passed, else None
         encoder_outputs = encoder_outputs.transpose(1, 2)  # (B, T, D)
-
+        self.r = r
         if decoder_outputs is not None:
             decoder_outputs = decoder_outputs.transpose(1, 2)  # (B, U, D)
 
@@ -1997,32 +1999,15 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
 
         if self.training:
 
-#            f1 = f[:,0:8,:]
-#            f2 = f[:,0:9,:]
-#
-#            f1_conv = self.conv(f1)
-#            f2_conv = self.conv(f2)
-#
-#            print("HERE DIFF", f1_conv.shape)
-#            print("HERE DIFF", f2_conv[:,0:8,:] - f1_conv)
-
             g = g.unsqueeze(dim=1)  # (B, 1, U, H)
 
-            r = random.uniform(0, 1)
+            r2 = random.uniform(0, 1)
             T = f.size(1)
 
-#            pad_mask = None
-#            assert f_len is not None
-#            pad_mask = torch.arange(0, T, device=f.device).expand(
-#                f_len.size(0), -1
-#            ) < f_len.unsqueeze(-1)
-
-#            inp_enc_mimic = self.conv(f).unsqueeze(dim=2) + g * 0
-#            inp_enc_mimic = self.norm_out(inp_enc_mimic)
-
             f = f.unsqueeze(dim=2)  # (B, T, 1, H)
-            if r < 0.5:
+            if r2 < 0.5:
                 g = g * 0
+
             inp = f + g  # [B, T, U, H]
 
 #            inp_enc_only = f + g * 0  # [B, T, U, H]
