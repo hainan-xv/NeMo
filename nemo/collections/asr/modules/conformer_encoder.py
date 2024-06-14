@@ -576,6 +576,10 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
 
         early_return = None
         for lth, (drop_prob, layer) in enumerate(zip(self.layer_drop_probs, self.layers)):
+            if lth == self.n_layers - 1:
+                with torch.no_grad():
+                    audio_signal = audio_signal * 1.0
+
             original_signal = audio_signal
             if cache_last_channel is not None:
                 cache_last_channel_cur = cache_last_channel[lth]
@@ -639,11 +643,14 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                     self.register_accessible_tensor(name=f'interctc/layer_length_{lth}', tensor=length)
 
             if lth == self.n_layers - 2:
+                if r < 0:
+                    assert not self.training
                 if r > 0 and r < 0.5:
                     early_return = audio_signal
 
+
         if early_return is not None:
-            audio_signal = audio_signal * 0.0 + early_return
+            audio_signal = early_return + audio_signal * 0.0
 
         if self.out_proj is not None:
             audio_signal = self.out_proj(audio_signal)

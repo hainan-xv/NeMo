@@ -2005,19 +2005,10 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
             T = f.size(1)
 
             f = f.unsqueeze(dim=2)  # (B, T, 1, H)
-            if r2 < 0.5:
+            if r2 < 1.0:
                 g = g * 0
 
             inp = f + g  # [B, T, U, H]
-
-#            inp_enc_only = f + g * 0  # [B, T, U, H]
-#
-#            if r < 0:
-#                inp = inp_enc_mimic * 0 + inp_enc_dec * 0 + inp_enc_only * 0
-#            elif r < 0.5:
-#                inp = inp_enc_mimic * 0 + inp_enc_dec + inp_enc_only * 0
-#            else:
-#                inp = inp_enc_mimic * 0 + inp_enc_dec * 0 + inp_enc_only
 
             del f, g
 

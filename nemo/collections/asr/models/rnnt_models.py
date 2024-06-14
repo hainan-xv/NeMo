@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from nemo.collections.asr.losses.ctc import CTCLoss
 import random
 import copy
 import os
@@ -80,17 +81,24 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
         # Setup RNNT Loss
         loss_name, loss_kwargs = self.extract_rnnt_loss_cfg(self.cfg.get("loss", None))
+        assert loss_name == 'tdt'
 
-        num_classes = self.joint.num_classes_with_blank - 1  # for standard RNNT and multi-blank
 
-        if loss_name == 'tdt':
-            num_classes = num_classes - self.joint.num_extra_outputs
+        num_classes = self.joint.num_classes_with_blank - 1 - self.joint.num_extra_outputs
 
-        self.loss = RNNTLoss(
+        self.ctc_dec = torch.nn.Linear(self.cfg.encoder.d_model, num_classes + 1)
+
+        self.tdt_loss = RNNTLoss(
             num_classes=num_classes,
             loss_name=loss_name,
             loss_kwargs=loss_kwargs,
-            reduction=self.cfg.get("rnnt_reduction", "mean_batch"),
+            reduction="mean_volume",
+        )
+
+        self.ctc_loss = CTCLoss(
+            num_classes=num_classes,
+            zero_infinity=True,
+            reduction="mean_volume",
         )
 
         if hasattr(self.cfg, 'spec_augment') and self._cfg.spec_augment is not None:
@@ -701,67 +709,52 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         # If experimental fused Joint-Loss-WER is not used
         if not self.joint.fuse_loss_wer:
             # Compute full joint and loss
-            joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder, r=r)
-            loss_value = self.loss(
-                log_probs=joint, targets=transcript, input_lengths=encoded_len, target_lengths=target_length
-            )
-
-            # Add auxiliary losses, if registered
-            loss_value = self.add_auxiliary_losses(loss_value)
-
-            # Reset access registry
-            if AccessMixin.is_access_enabled(self.model_guid):
-                AccessMixin.reset_registry(self)
-
-            tensorboard_logs = {
-                'train_loss': loss_value,
-                'learning_rate': self._optimizer.param_groups[0]['lr'],
-                'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
-            }
-
-            if (sample_id + 1) % log_every_n_steps == 0:
-                self.wer.update(
-                    predictions=encoded,
-                    predictions_lengths=encoded_len,
-                    targets=transcript,
-                    targets_lengths=transcript_len,
+            if r > 0.5:
+                joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder, r=r)
+                loss_value = self.tdt_loss(
+                    log_probs=joint, targets=transcript, input_lengths=encoded_len, target_lengths=target_length
                 )
-                _, scores, words = self.wer.compute()
-                self.wer.reset()
-                tensorboard_logs.update({'training_batch_wer': scores.float() / words})
+
+                # Add auxiliary losses, if registered
+                loss_value = self.add_auxiliary_losses(loss_value)
+
+                # Reset access registry
+                if AccessMixin.is_access_enabled(self.model_guid):
+                    AccessMixin.reset_registry(self)
+
+                tensorboard_logs = {
+                    'train_loss': loss_value,
+                    'learning_rate': self._optimizer.param_groups[0]['lr'],
+                    'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
+                }
+
+                if (sample_id + 1) % log_every_n_steps == 0:
+                    self.wer.update(
+                        predictions=encoded,
+                        predictions_lengths=encoded_len,
+                        targets=transcript,
+                        targets_lengths=transcript_len,
+                    )
+                    _, scores, words = self.wer.compute()
+                    self.wer.reset()
+                    tensorboard_logs.update({'training_batch_wer': scores.float() / words})
+            else:
+                # result of early return
+                encoded = encoded.transpose(1,2)
+                ctc_out = torch.nn.functional.log_softmax(self.ctc_dec(encoded), dim=-1)
+                loss_value = self.ctc_loss(
+                    log_probs=ctc_out, targets=transcript, input_lengths=encoded_len, target_lengths=transcript_len
+                )
+                tensorboard_logs = {
+                    'ctc_loss': loss_value,
+                    'learning_rate': self._optimizer.param_groups[0]['lr'],
+                    'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
+                }
+
+
 
         else:
             assert(0)
-            # If experimental fused Joint-Loss-WER is used
-            if (sample_id + 1) % log_every_n_steps == 0:
-                compute_wer = True
-            else:
-                compute_wer = False
-
-            # Fused joint step
-            loss_value, wer, _, _ = self.joint(
-                encoder_outputs=encoded,
-                decoder_outputs=decoder,
-                transcripts=transcript,
-                transcript_lengths=transcript_len,
-                compute_wer=compute_wer,
-            )
-
-            # Add auxiliary losses, if registered
-            loss_value = self.add_auxiliary_losses(loss_value)
-
-            # Reset access registry
-            if AccessMixin.is_access_enabled(self.model_guid):
-                AccessMixin.reset_registry(self)
-
-            tensorboard_logs = {
-                'train_loss': loss_value,
-                'learning_rate': self._optimizer.param_groups[0]['lr'],
-                'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
-            }
-
-            if compute_wer:
-                tensorboard_logs.update({'training_batch_wer': wer})
 
         # Log items
         self.log_dict(tensorboard_logs)
