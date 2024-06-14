@@ -81,21 +81,30 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
         # Setup RNNT Loss
         loss_name, loss_kwargs = self.extract_rnnt_loss_cfg(self.cfg.get("loss", None))
-        print("HERE WEIRD", self.cfg.get("loss", None))
-        print("HERE LOSS", loss_name)
+#        print("HERE WEIRD", self.cfg.get("loss", None))
+#        print("HERE LOSS", loss_name)
 #        assert loss_name == 'tdt'
 
 
         num_classes = self.joint.num_classes_with_blank - 1 - self.joint.num_extra_outputs
 
-        self.ctc_dec = torch.nn.Linear(self.cfg.encoder.d_model, num_classes + 1)
+        self.ctc_dec = None
+        if loss_name == 'tdt':
+            self.ctc_dec = torch.nn.Linear(self.cfg.encoder.d_model, num_classes + 1)
 
-        self.tdt_loss = RNNTLoss(
-            num_classes=num_classes,
-            loss_name=loss_name,
-            loss_kwargs=loss_kwargs,
-            reduction="mean_volume",
-        )
+            self.tdt_loss = RNNTLoss(
+                num_classes=num_classes,
+                loss_name=loss_name,
+                loss_kwargs=loss_kwargs,
+                reduction="mean_volume",
+            )
+        else:
+            self.loss = RNNTLoss(
+                num_classes=num_classes,
+                loss_name=loss_name,
+                loss_kwargs=loss_kwargs,
+                reduction="mean_volume",
+            )
 
         self.ctc_loss = CTCLoss(
             num_classes=num_classes,
