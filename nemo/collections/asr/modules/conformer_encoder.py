@@ -577,8 +577,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         early_return = None
         for lth, (drop_prob, layer) in enumerate(zip(self.layer_drop_probs, self.layers)):
             if lth == self.n_layers - 1:
-                with torch.no_grad():
-                    audio_signal = audio_signal * 1.0
+                audio_signal = audio_signal.detach()
 
             original_signal = audio_signal
             if cache_last_channel is not None:
@@ -643,10 +642,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                     self.register_accessible_tensor(name=f'interctc/layer_length_{lth}', tensor=length)
 
             if lth == self.n_layers - 2:
-                if r < 0:
-                    assert not self.training
-                if r > 0 and r < 0.5:
-                    early_return = audio_signal
+                early_return = audio_signal
 
 
         if early_return is not None:
@@ -673,7 +669,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                 torch.clamp(cache_last_channel_len + cache_keep_size, max=cache_len),
             )
         else:
-            return audio_signal, length
+            return audio_signal, early_return, length
 
     def update_max_seq_length(self, seq_length: int, device):
         # Find global max audio length across all nodes
