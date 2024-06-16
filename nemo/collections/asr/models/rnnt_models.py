@@ -81,34 +81,14 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
         # Setup RNNT Loss
         loss_name, loss_kwargs = self.extract_rnnt_loss_cfg(self.cfg.get("loss", None))
-#        print("HERE WEIRD", self.cfg.get("loss", None))
-#        print("HERE LOSS", loss_name)
-#        assert loss_name == 'tdt'
 
 
         num_classes = self.joint.num_classes_with_blank - 1 - self.joint.num_extra_outputs
 
-        self.ctc_dec = None
-        if loss_name == 'tdt':
-            self.ctc_dec = torch.nn.Linear(self.cfg.encoder.d_model, num_classes + 1)
-
-            self.tdt_loss = RNNTLoss(
-                num_classes=num_classes,
-                loss_name=loss_name,
-                loss_kwargs=loss_kwargs,
-                reduction="mean_volume",
-            )
-        else:
-            self.loss = RNNTLoss(
-                num_classes=num_classes,
-                loss_name=loss_name,
-                loss_kwargs=loss_kwargs,
-                reduction="mean_volume",
-            )
-
-        self.ctc_loss = CTCLoss(
+        self.loss = RNNTLoss(
             num_classes=num_classes,
-            zero_infinity=True,
+            loss_name=loss_name,
+            loss_kwargs=loss_kwargs,
             reduction="mean_volume",
         )
 
@@ -638,7 +618,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
 #    @typecheck()
     def forward(
-        self, input_signal=None, input_signal_length=None, processed_signal=None, processed_signal_length=None, r=-1.0,
+        self, input_signal=None, input_signal_length=None, processed_signal=None, processed_signal_length=None
     ):
         """
         Forward pass of the model. Note that for RNNT Models, the forward pass of the model is a 3 step process,
@@ -686,13 +666,11 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         if self.spec_augmentation is not None and self.training:
             processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
 
-        encoded, ctc_layer, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length, r=r)
-        return encoded, ctc_layer, encoded_len
+        encoded, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
+        return encoded, encoded_len
 
     # PTL-specific methods
     def training_step(self, batch, batch_nb):
-
-        r = random.uniform(0, 1)
 
         # Reset access registry
         if AccessMixin.is_access_enabled(self.model_guid):
@@ -702,9 +680,9 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
         # forward() only performs encoder forward
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
-            encoded, ctc_layer, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len, r=r)
+            encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
         else:
-            encoded, ctc_layer, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len, r=r)
+            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
         del signal
 
         # During training, loss must be computed, so decoder forward is necessary
@@ -720,28 +698,17 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         # If experimental fused Joint-Loss-WER is not used
         if not self.joint.fuse_loss_wer:
             # Compute full joint and loss
-            joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder, r=r)
-            tdt_loss_value = self.tdt_loss(
+            joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder)
+            loss_value = self.loss(
                 log_probs=joint, targets=transcript, input_lengths=encoded_len, target_lengths=target_length
             )
 
             # Add auxiliary losses, if registered
-            tdt_loss_value = self.add_auxiliary_losses(tdt_loss_value)
+            loss_value = self.add_auxiliary_losses(loss_value)
 
             # result of early return
-#            ctc_layer = ctc_layer.transpose(1,2)
-#            print("HERE ctc_layer", ctc_layer.shape)
-#            print("HERE self.ctc_dec", self.ctc_dec)
-            ctc_out = torch.nn.functional.log_softmax(self.ctc_dec(ctc_layer), dim=-1)
-            ctc_loss_value = self.ctc_loss(
-                log_probs=ctc_out, targets=transcript, input_lengths=encoded_len, target_lengths=transcript_len
-            )
-
-            loss_value = tdt_loss_value + ctc_loss_value
             tensorboard_logs = {
                 'train_loss': loss_value,
-                'tdt_loss': tdt_loss_value,
-                'ctc_loss': ctc_loss_value,
                 'learning_rate': self._optimizer.param_groups[0]['lr'],
                 'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
             }
@@ -799,9 +766,9 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
         # forward() only performs encoder forward
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
-            encoded, _, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
+            encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
         else:
-            encoded, _, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
+            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
         del signal
 
         tensorboard_logs = {}
