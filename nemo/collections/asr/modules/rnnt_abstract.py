@@ -173,7 +173,10 @@ class AbstractRNNTJoint(NeuralModule, ABC):
         Returns:
             Logits / log softmaxed tensor of shape (B, T, U, V + 1).
         """
-        return self.joint_after_projection(self.project_encoder(f), self.project_prednet(g))
+        if g is not None:
+            return self.joint_after_projection(self.project_encoder(f), self.project_prednet(g))
+        else:
+            return self.joint_after_projection(self.project_encoder(f), None)
 
     @property
     def num_classes_with_blank(self):

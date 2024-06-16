@@ -1391,11 +1391,6 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
             decoder_outputs = decoder_outputs.transpose(1, 2)  # (B, U, D)
 
         assert not self._fuse_loss_wer
-        if decoder_outputs is None:
-            raise ValueError(
-                "decoder_outputs passed is None, and `fuse_loss_wer` is not set. "
-                "decoder_outputs can only be None for fused step!"
-            )
 
         out = self.joint(encoder_outputs, decoder_outputs)  # [B, T, U, V + 1]
         return out
@@ -1475,12 +1470,12 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
             if self.is_adapter_available():
                 inp = self.forward_enabled_adapters(inp)
         else:
-            g = g.unsqueeze(dim=1)  # (B, 1, U, H)
+#            g = g.unsqueeze(dim=1)  # (B, 1, U, H)
 
-            f = f.unsqueeze(dim=2)  # (B, T, 1, H)
-            inp = f + g * 0  # [B, T, U, H]
+            inp = f.unsqueeze(dim=2)  # (B, T, 1, H)
+#            inp = f + g * 0  # [B, T, U, H]
 
-            del f, g
+#            del f, g
 
             # Forward adapter modules on joint hidden
             if self.is_adapter_available():
