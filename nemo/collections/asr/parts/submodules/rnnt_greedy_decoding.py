@@ -2513,6 +2513,8 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
 
         # Initialize blank state and empty label set in Hypothesis
         hypothesis = rnnt_utils.Hypothesis(score=0.0, y_sequence=[], dec_state=None, timestep=[], last_token=None)
+#        if True:
+#            return hypothesis
 
         if partial_hypotheses is not None:
             hypothesis.last_token = partial_hypotheses.last_token
@@ -2533,20 +2535,23 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
             hypothesis.frame_confidence = [[]]
 
         logits = self.joint.joint(x, None)
-        v_t, k_t = logits[:,:,:,:-len(self.durations)].max(-1) #.view([-1]).tolist()
-        v_d, k_d = logits[:,:,:,-len(self.durations):].max(-1) #.view([-1]).tolist()         
-        k_t = k_t.view([-1]).tolist()
-        k_d = k_d.view([-1]).tolist()
+        logits = logits.view([-1, logits.shape[-1]])
+        v_t, k_t = logits[:,:-len(self.durations)].max(-1)
+        v_d, k_d = logits[:,-len(self.durations):].max(-1)
+        k_t = k_t.tolist()
+        k_d = k_d.tolist()
+
+#        return hypothesis
 
         time_idx = 0
+        out_len = out_len.item()
         while time_idx < out_len:
             k = k_t[time_idx]
             skip = k_d[time_idx] + 1
-            if k == self._blank_index:
-                not_blank = False
-            else:
+            if k != self._blank_index:
                 # Append token to label set, update RNN state.
                 hypothesis.y_sequence.append(k)
+
             time_idx += skip
 
         # Unpack the hidden states
