@@ -1473,7 +1473,8 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
 #            g = g.unsqueeze(dim=1)  # (B, 1, U, H)
 
             inp = f.unsqueeze(dim=2)  # (B, T, 1, H)
-#            inp = f + g * 0  # [B, T, U, H]
+            if g is not None:
+                inp = f + g
 
 #            del f, g
 

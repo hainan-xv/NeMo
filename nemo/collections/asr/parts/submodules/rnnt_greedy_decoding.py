@@ -2537,21 +2537,22 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
             skip = k_d[time_idx] + 1
             if k != self._blank_index:
                 # Append token to label set, update RNN state.
-#                hypothesis.y_sequence.append(k)
                 token_sequence.append(k)
                 token_time_stamps.append(time_idx)
 
             time_idx += skip
 
-        if True and len(token_sequence) > 1:
+        if False and len(token_sequence) > 1:
             token_sequence = [self._blank_index] + token_sequence[:-1]
             out_len = len(token_sequence)
             token_sequence_tensor = torch.LongTensor(token_sequence).to(x.device)
             token_time_stamps_tensor = torch.LongTensor(token_time_stamps).to(x.device)
 
-            decoder_embs = self.decoder.prediction.embeds[0](token_sequence_tensor)
+            decoder_embs = self.decoder.prediction.embeds[0](token_sequence_tensor)  # [T, D]
 
-            x = x[token_time_stamps_tensor,:,:]
+            decoder_embs = torch.reshape(decoder_embs, [out_len, 1, -1]) # [T, 1, D]
+
+            x = x[token_time_stamps_tensor,:,:] # [T, 1, D]
 
             logits = self.joint.joint(x, decoder_embs)
             logits = logits.view([-1, logits.shape[-1]])
