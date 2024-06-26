@@ -2513,19 +2513,8 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
 
         # Initialize blank state and empty label set in Hypothesis
         hypothesis = rnnt_utils.Hypothesis(score=0.0, y_sequence=[], dec_state=None, timestep=[], last_token=None)
-#        if True:
-#            return hypothesis
-
-        if partial_hypotheses is not None:
-            hypothesis.last_token = partial_hypotheses.last_token
-            hypothesis.y_sequence = (
-                partial_hypotheses.y_sequence.cpu().tolist()
-                if isinstance(partial_hypotheses.y_sequence, torch.Tensor)
-                else partial_hypotheses.y_sequence
-            )
-            if partial_hypotheses.dec_state is not None:
-                hypothesis.dec_state = self.decoder.batch_concat_states([partial_hypotheses.dec_state])
-                hypothesis.dec_state = _states_to_device(hypothesis.dec_state, x.device)
+        token_sequence = []
+        token_time_stamps = []
 
         if self.preserve_alignments:
             # Alignments is a 2-dimensional dangling list representing T x U
@@ -2541,8 +2530,6 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
         k_t = k_t.tolist()
         k_d = k_d.tolist()
 
-#        return hypothesis
-
         time_idx = 0
         out_len = out_len.item()
         while time_idx < out_len:
@@ -2550,12 +2537,30 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
             skip = k_d[time_idx] + 1
             if k != self._blank_index:
                 # Append token to label set, update RNN state.
-                hypothesis.y_sequence.append(k)
+#                hypothesis.y_sequence.append(k)
+                token_sequence.append(k)
+                token_time_stamps.append(time_idx)
 
             time_idx += skip
 
+        if True and len(token_sequence) > 1:
+            token_sequence = [self._blank_index] + token_sequence[:-1]
+            out_len = len(token_sequence)
+            token_sequence_tensor = torch.LongTensor(token_sequence).to(x.device)
+            token_time_stamps_tensor = torch.LongTensor(token_time_stamps).to(x.device)
+
+            decoder_embs = self.decoder.prediction.embeds[0](token_sequence_tensor)
+
+            x = x[token_time_stamps_tensor,:,:]
+
+            logits = self.joint.joint(x, decoder_embs)
+            logits = logits.view([-1, logits.shape[-1]])
+            v_t, k_t = logits[:,:-len(self.durations)].max(-1)
+            token_sequence = k_t.tolist()
+
         # Unpack the hidden states
         hypothesis.dec_state = self.decoder.batch_select_state(hypothesis.dec_state, 0)
+        hypothesis.y_sequence = token_sequence
 
         return hypothesis
 
