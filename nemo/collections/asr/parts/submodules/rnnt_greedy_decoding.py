@@ -2542,9 +2542,9 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
 
             time_idx += skip
 
-        if False and len(token_sequence) > 1:
-            token_sequence = [self._blank_index] + token_sequence[:-1]
+        if True and len(token_sequence) > 1:
             out_len = len(token_sequence)
+            token_sequence = [self._blank_index] + token_sequence[:-1]
             token_sequence_tensor = torch.LongTensor(token_sequence).to(x.device)
             token_time_stamps_tensor = torch.LongTensor(token_time_stamps).to(x.device)
 
@@ -2558,6 +2558,18 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
             logits = logits.view([-1, logits.shape[-1]])
             v_t, k_t = logits[:,:-len(self.durations)].max(-1)
             token_sequence = k_t.tolist()
+            for i in range(5):
+                token_sequence = [self._blank_index] + token_sequence[:-1]
+                token_sequence_tensor = torch.LongTensor(token_sequence).to(x.device)
+
+                decoder_embs = self.decoder.prediction.embeds[0](token_sequence_tensor)  # [T, D]
+
+                decoder_embs = torch.reshape(decoder_embs, [out_len, 1, -1]) # [T, 1, D]
+
+                logits = self.joint.joint(x, decoder_embs)
+                logits = logits.view([-1, logits.shape[-1]])
+                v_t, k_t = logits[:,:-len(self.durations)].max(-1)
+                token_sequence = k_t.tolist()
 
         # Unpack the hidden states
         hypothesis.dec_state = self.decoder.batch_select_state(hypothesis.dec_state, 0)
