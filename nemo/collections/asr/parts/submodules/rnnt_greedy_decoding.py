@@ -2551,7 +2551,7 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
             token_sequence_tensor = torch.reshape(token_sequence_tensor, [1, -1])
 
 #            decoder_embs = self.decoder.prediction.embeds[0](token_sequence_tensor)  # [T, D]
-            decoder_embs, _ = self.decoder.prediction(token_sequence_tensor)  # [T, D]
+            decoder_embs = self.decoder.prediction.fast_inference_run(token_sequence_tensor)  # [T, D]
 
             decoder_embs = torch.reshape(decoder_embs, [out_len, 1, -1]) # [T, 1, D]
 
@@ -2561,13 +2561,13 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
             logits = logits.view([-1, logits.shape[-1]])
             v_t, k_t = logits[:,:-len(self.durations)].max(-1)
             token_sequence = k_t.tolist()
-            for i in range(5):
+            for i in range(2):
                 token_sequence = [self._blank_index] + token_sequence[:-1]
                 token_sequence_tensor = torch.LongTensor(token_sequence).to(x.device)
                 token_sequence_tensor = torch.reshape(token_sequence_tensor, [1, -1])
 
 #                decoder_embs = self.decoder.prediction.embeds[0](token_sequence_tensor)  # [T, D]
-                decoder_embs, _ = self.decoder.prediction(token_sequence_tensor)  # [T, D]
+                decoder_embs = self.decoder.prediction.fast_inference_run(token_sequence_tensor)  # [T, D]
 
                 decoder_embs = torch.reshape(decoder_embs, [out_len, 1, -1]) # [T, 1, D]
 
