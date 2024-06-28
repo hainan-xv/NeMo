@@ -79,9 +79,12 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         self.decoder = EncDecRNNTModel.from_config_dict(self.cfg.decoder)
         self.joint = EncDecRNNTModel.from_config_dict(self.cfg.joint)
 
+        if self.cfg.model_defaults.get("bi_directional", None) is not None:
+            self.decoder2 = EncDecRNNTModel.from_config_dict(self.cfg.decoder)
+            self.joint2 = EncDecRNNTModel.from_config_dict(self.cfg.joint)
+
         # Setup RNNT Loss
         loss_name, loss_kwargs = self.extract_rnnt_loss_cfg(self.cfg.get("loss", None))
-
 
         num_classes = self.joint.num_classes_with_blank - 1 - self.joint.num_extra_outputs
 
@@ -678,6 +681,16 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
         signal, signal_len, transcript, transcript_len = batch
 
+#        transcript_list = transcript.tolist()
+        transcript_len_list = transcript_len.tolist()
+        signal_len_list = signal_len.tolist()
+        transcript2 = transcript
+#        print("HERE transcript is", transcript)
+        for i in range(len(transcript_len_list)):
+            transcript2[i,:transcript_len_list[i]] = torch.flip(transcript2[i,:transcript_len_list[i]], dims=(-1,))
+
+#        print("HERE transcript2 is", transcript2)
+
         # forward() only performs encoder forward
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
             encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
@@ -685,8 +698,15 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
         del signal
 
+#        print("HERE encoded shape", encoded.shape)
+        encoded2 = encoded
+#        print("HERE transcript is", transcript)
+        for i in range(len(signal_len_list)):
+            encoded2[i,:,:signal_len_list[i]] = torch.flip(encoded2[i,:,:signal_len_list[i]], dims=(-1,))
+
         # During training, loss must be computed, so decoder forward is necessary
         decoder, target_length, states = self.decoder(targets=transcript, target_length=transcript_len)
+        decoder2, target_length2, states2 = self.decoder2(targets=transcript2, target_length=transcript_len)
 
         if hasattr(self, '_trainer') and self._trainer is not None:
             log_every_n_steps = self._trainer.log_every_n_steps
@@ -699,16 +719,24 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         if not self.joint.fuse_loss_wer:
             # Compute full joint and loss
             joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder)
-            loss_value = self.loss(
+            joint2 = self.joint2(encoder_outputs=encoded, decoder_outputs=decoder2)
+            loss_value1 = self.loss(
                 log_probs=joint, targets=transcript, input_lengths=encoded_len, target_lengths=target_length
+            )
+            loss_value2 = self.loss(
+                log_probs=joint2, targets=transcript2, input_lengths=encoded_len, target_lengths=target_length
             )
 
             # Add auxiliary losses, if registered
-            loss_value = self.add_auxiliary_losses(loss_value)
+#            loss_value = self.add_auxiliary_losses(loss_value)
+
+            loss_value = loss_value1 + loss_value2
 
             # result of early return
             tensorboard_logs = {
                 'train_loss': loss_value,
+                'train_loss1': loss_value1,
+                'train_loss2': loss_value2,
                 'learning_rate': self._optimizer.param_groups[0]['lr'],
                 'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
             }
