@@ -157,7 +157,9 @@ class _GreedyRNNTInfer(Typing, ConfidenceMethodMixin):
     def __init__(
         self,
         decoder_model: rnnt_abstract.AbstractRNNTDecoder,
+        decoder_model2: rnnt_abstract.AbstractRNNTDecoder,
         joint_model: rnnt_abstract.AbstractRNNTJoint,
+        joint_model2: rnnt_abstract.AbstractRNNTJoint,
         blank_index: int,
         max_symbols_per_step: Optional[int] = None,
         preserve_alignments: bool = False,
@@ -167,6 +169,8 @@ class _GreedyRNNTInfer(Typing, ConfidenceMethodMixin):
         super().__init__()
         self.decoder = decoder_model
         self.joint = joint_model
+        self.decoder2 = decoder_model2
+        self.joint2 = joint_model2
 
         self._blank_index = blank_index
         self._SOS = blank_index  # Start of single index
@@ -379,7 +383,9 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
             encoder_output = encoder_output.transpose(1, 2)  # (B, T, D)
 
             self.decoder.eval()
+            self.decoder2.eval()
             self.joint.eval()
+            self.joint2.eval()
 
             hypotheses = []
             # Process each sequence independently
@@ -2437,7 +2443,9 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
     def __init__(
         self,
         decoder_model: rnnt_abstract.AbstractRNNTDecoder,
+        decoder_model2: rnnt_abstract.AbstractRNNTDecoder,
         joint_model: rnnt_abstract.AbstractRNNTJoint,
+        joint_model2: rnnt_abstract.AbstractRNNTJoint,
         blank_index: int,
         durations: list,
         max_symbols_per_step: Optional[int] = None,
@@ -2448,7 +2456,9 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
     ):
         super().__init__(
             decoder_model=decoder_model,
+            decoder_model2=decoder_model2,
             joint_model=joint_model,
+            joint_model2=joint_model2,
             blank_index=blank_index,
             max_symbols_per_step=max_symbols_per_step,
             preserve_alignments=preserve_alignments,
@@ -2483,11 +2493,13 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
             encoder_output = encoder_output.transpose(1, 2)  # (B, T, D)
 
             self.decoder.eval()
+            self.decoder2.eval()
             self.joint.eval()
+            self.joint2.eval()
 
             hypotheses = []
             # Process each sequence independently
-            with self.decoder.as_frozen(), self.joint.as_frozen():
+            with self.decoder.as_frozen(), self.joint.as_frozen(),  self.joint2.as_frozen():
                 for batch_idx in range(encoder_output.size(0)):
                     inseq = encoder_output[batch_idx, :, :].unsqueeze(1)  # [T, 1, D]
                     logitlen = encoded_lengths[batch_idx]
@@ -2500,7 +2512,9 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
             packed_result = pack_hypotheses(hypotheses, encoded_lengths)
 
         self.decoder.train(decoder_training_state)
+        self.decoder2.train(decoder_training_state)
         self.joint.train(joint_training_state)
+        self.joint2.train(joint_training_state)
 
         return (packed_result,)
 
@@ -2523,7 +2537,12 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
         if self.preserve_frame_confidence:
             hypothesis.frame_confidence = [[]]
 
-        logits = self.joint.joint(x, None)
+        out_len = out_len.item()
+
+#        print("HERE x shape", x.shape)
+
+        x = torch.flip(x[:out_len,:,:], dims=(0,))
+        logits = self.joint2.joint(x, None)
         logits = logits.view([-1, logits.shape[-1]])
         v_t, k_t = logits[:,:-len(self.durations)].max(-1)
         v_d, k_d = logits[:,-len(self.durations):].max(-1)
@@ -2531,7 +2550,6 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
         k_d = k_d.tolist()
 
         time_idx = 0
-        out_len = out_len.item()
         while time_idx < out_len:
             k = k_t[time_idx]
             skip = k_d[time_idx] + 1
@@ -2541,8 +2559,9 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
                 token_time_stamps.append(time_idx)
 
             time_idx += skip
+        token_sequence = token_sequence[::-1]
 
-        if True and len(token_sequence) > 1:
+        if False and len(token_sequence) > 1:
             out_len = len(token_sequence)
             token_sequence = [self._blank_index] + token_sequence[:-1]
             token_sequence_tensor = torch.LongTensor(token_sequence).to(x.device)
@@ -2561,7 +2580,7 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
             logits = logits.view([-1, logits.shape[-1]])
             v_t, k_t = logits[:,:-len(self.durations)].max(-1)
             token_sequence = k_t.tolist()
-            for i in range(2):
+            for i in range(0):
                 token_sequence = [self._blank_index] + token_sequence[:-1]
                 token_sequence_tensor = torch.LongTensor(token_sequence).to(x.device)
                 token_sequence_tensor = torch.reshape(token_sequence_tensor, [1, -1])
@@ -2575,6 +2594,24 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
                 logits = logits.view([-1, logits.shape[-1]])
                 v_t, k_t = logits[:,:-len(self.durations)].max(-1)
                 token_sequence = k_t.tolist()
+
+
+            x_flip = torch.flip(x, dims=(0,))
+            for i in range(1):
+                token_sequence = token_sequence[::-1]
+                token_sequence = [self._blank_index] + token_sequence[:-1]
+                token_sequence_tensor = torch.LongTensor(token_sequence).to(x.device)
+                token_sequence_tensor = torch.reshape(token_sequence_tensor, [1, -1])
+
+#                decoder_embs = self.decoder.prediction.embeds[0](token_sequence_tensor)  # [T, D]
+                decoder_embs = self.decoder2.prediction.fast_inference_run(token_sequence_tensor)  # [T, D]
+
+                decoder_embs = torch.reshape(decoder_embs, [out_len, 1, -1]) # [T, 1, D]
+
+                logits = self.joint2.joint(x_flip, decoder_embs)
+                logits = logits.view([-1, logits.shape[-1]])
+                v_t, k_t = logits[:,:-len(self.durations)].max(-1)
+                token_sequence = k_t.tolist()[::-1]
 
         # Unpack the hidden states
         hypothesis.dec_state = self.decoder.batch_select_state(hypothesis.dec_state, 0)

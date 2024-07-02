@@ -317,7 +317,7 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
         self.cfg.decoding = self.set_decoding_type_according_to_loss(self.cfg.decoding)
         # Setup decoding object
         self.decoding = RNNTBPEDecoding(
-            decoding_cfg=self.cfg.decoding, decoder=self.decoder, joint=self.joint, tokenizer=self.tokenizer,
+            decoding_cfg=self.cfg.decoding, decoder=self.decoder, decoder2=self.decoder2, joint=self.joint, joint2=self.joint2, tokenizer=self.tokenizer,
         )
 
         # Setup wer object
@@ -395,6 +395,8 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
         del self.joint
         self.joint = EncDecRNNTBPEModel.from_config_dict(new_joint_config)
 
+        assert(0)
+
         decoder_config = self.decoder.to_config_dict()
         new_decoder_config = copy.deepcopy(decoder_config)
         new_decoder_config.vocab_size = len(vocabulary)
@@ -465,7 +467,7 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
         decoding_cfg = self.set_decoding_type_according_to_loss(decoding_cfg)
 
         self.decoding = RNNTBPEDecoding(
-            decoding_cfg=decoding_cfg, decoder=self.decoder, joint=self.joint, tokenizer=self.tokenizer,
+            decoding_cfg=decoding_cfg, decoder=self.decoder, decoder2=self.decoder2, joint=self.joint, joint2=self.joint2, tokenizer=self.tokenizer,
         )
 
         self.wer = WER(

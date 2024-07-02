@@ -80,7 +80,10 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         self.decoder = EncDecRNNTModel.from_config_dict(self.cfg.decoder)
         self.joint = EncDecRNNTModel.from_config_dict(self.cfg.joint)
 
+        self.decoder2 = None
+        self.joint2 = None
         if self.cfg.model_defaults.get("bi_directional", None) is not None:
+            print("HERE making decoder2")
             self.decoder2 = EncDecRNNTModel.from_config_dict(self.cfg.decoder)
             self.joint2 = EncDecRNNTModel.from_config_dict(self.cfg.joint)
 
@@ -106,7 +109,9 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         self.decoding = RNNTDecoding(
             decoding_cfg=self.cfg.decoding,
             decoder=self.decoder,
+            decoder2=self.decoder2,
             joint=self.joint,
+            joint2=self.joint2,
             vocabulary=self.joint.vocabulary,
         )
         # Setup WER calculation
@@ -309,6 +314,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         Returns: None
 
         """
+        assert(0)
         if self.joint.vocabulary == new_vocabulary:
             logging.warning(f"Old {self.joint.vocabulary} and new {new_vocabulary} match. Not changing anything.")
         else:
@@ -680,19 +686,22 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         if AccessMixin.is_access_enabled(self.model_guid):
             AccessMixin.reset_registry(self)
 
-        signal, signal_len, transcript, transcript_len = batch
+        signal, signal_len, transcript1, transcript_len = batch
 
         transcript_len_list = transcript_len.tolist()
         signal_len_list = signal_len.tolist()
 
-
         r = random.uniform(0.0, 1.0)
         run_backward = True if r > 0.5 else False
 
-        if run_backward:
-            transcript2 = transcript
-            for i in range(len(transcript_len_list)):
-                transcript2[i,:transcript_len_list[i]] = torch.flip(transcript2[i,:transcript_len_list[i]], dims=(-1,))
+#        print("HERE len is", len(transcript_len_list))
+#        if self.old_weight is not None:
+#            print("HERE diff is", torch.max(self.encoder.layers[-1].feed_forward1.linear1.weight - self.old_weight))
+#        self.old_weight = self.encoder.layers[-1].feed_forward1.linear1.weight
+
+        transcript2 = transcript1 * 1
+        for i in range(len(transcript_len_list)):
+            transcript2[i,:transcript_len_list[i]] = torch.flip(transcript2[i,:transcript_len_list[i]], dims=(-1,))
 
         # forward() only performs encoder forward
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
@@ -702,19 +711,26 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         del signal
 
         if run_backward:
-            encoded2 = encoded
+            encoded2 = encoded * 1.0
             for i in range(len(signal_len_list)):
-                encoded2[i,:,:signal_len_list[i]] = torch.flip(encoded2[i,:,:signal_len_list[i]], dims=(-1,))
+                encoded2[i,:,:encoded_len[i]] = torch.flip(encoded2[i,:,:encoded_len[i]], dims=(-1,))
+            encoded = encoded * 0.0 + encoded2
 
         # During training, loss must be computed, so decoder forward is necessary
+        decoder1, target_length, states1 = self.decoder(targets=transcript1, target_length=transcript_len)
+        decoder2, target_length2, states2 = self.decoder2(targets=transcript2, target_length=transcript_len)
+
+#        print("HERE transcript1", transcript1)
+#        print("HERE transcript2", transcript2)
+#        print("HERE target_length", target_length)
+#        print("HERE target_length2", target_length2)
+
         if run_backward:
-            decoder2, target_length2, states2 = self.decoder2(targets=transcript2, target_length=transcript_len)
-            dummy, _, _ = self.decoder(targets=transcript2, target_length=transcript_len)
-            decoder2 = decoder2 + dummy * 0
+            transcript = transcript2 + transcript1 * 0
+            decoder = decoder2 + decoder1 * 0
         else:
-            decoder, target_length, states = self.decoder(targets=transcript, target_length=transcript_len)
-            dummy, _, _ = self.decoder2(targets=transcript, target_length=transcript_len)
-            decoder = decoder + dummy * 0
+            transcript = transcript1 + transcript2 * 0
+            decoder = decoder1 + decoder2 * 0
 
         if hasattr(self, '_trainer') and self._trainer is not None:
             log_every_n_steps = self._trainer.log_every_n_steps
@@ -724,66 +740,49 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             sample_id = batch_nb
 
         # If experimental fused Joint-Loss-WER is not used
-        if not self.joint.fuse_loss_wer:
-            # Compute full joint and loss
+        assert not self.joint.fuse_loss_wer
+        # Compute full joint and loss
 
-            loss_value2 = 0
-            if run_backward:
-                joint2 = self.joint2(encoder_outputs=encoded2, decoder_outputs=decoder2)
-                dummy = self.joint(encoder_outputs=encoded, decoder_outputs=decoder2)
-                joint2 = joint2 + dummy * 0
-                loss_value2 = self.loss(
-                    log_probs=joint2, targets=transcript2, input_lengths=encoded_len, target_lengths=target_length2
-                )
-                loss_value = loss_value2
-                tensorboard_logs = {
-                    'train_loss': loss_value,
-                    'train_loss2': loss_value2,
-                    'learning_rate': self._optimizer.param_groups[0]['lr'],
-                    'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
-                }
-            else:
-                joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder)
-                dummy = self.joint2(encoder_outputs=encoded, decoder_outputs=decoder)
-                joint = joint + dummy * 0
-                loss_value1 = self.loss(
-                    log_probs=joint, targets=transcript, input_lengths=encoded_len, target_lengths=target_length
-                )
-                loss_value = loss_value1
-                tensorboard_logs = {
-                    'train_loss': loss_value,
-                    'train_loss1': loss_value1,
-                    'learning_rate': self._optimizer.param_groups[0]['lr'],
-                    'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
-                }
+        joint1 = self.joint(encoder_outputs=encoded, decoder_outputs=decoder)
+        joint2 = self.joint2(encoder_outputs=encoded, decoder_outputs=decoder)
 
-            # Add auxiliary losses, if registered
-#            loss_value = self.add_auxiliary_losses(loss_value)
-
-
-            # result of early return
-
-            # Reset access registry
-            if AccessMixin.is_access_enabled(self.model_guid):
-                AccessMixin.reset_registry(self)
-
-
-            if (sample_id + 1) % log_every_n_steps == 0:
-                self.wer.update(
-                    predictions=encoded,
-                    predictions_lengths=encoded_len,
-                    targets=transcript,
-                    targets_lengths=transcript_len,
-                )
-                _, scores, words = self.wer.compute()
-                self.wer.reset()
-                tensorboard_logs.update({'training_batch_wer': scores.float() / words})
-
-
-
-
+        if run_backward:
+            joint = joint1 * 0 + joint2
+            loss_name = 'train_loss_backward'
         else:
-            assert(0)
+            joint = joint2 * 0 + joint1
+            loss_name = 'train_loss_forward'
+
+        loss_value = self.loss(
+            log_probs=joint, targets=transcript, input_lengths=encoded_len, target_lengths=target_length
+        )
+        tensorboard_logs = {
+            'train_loss': loss_value,
+            loss_name: loss_value,
+            'learning_rate': self._optimizer.param_groups[0]['lr'],
+            'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
+        }
+
+        # Add auxiliary losses, if registered
+        loss_value = self.add_auxiliary_losses(loss_value)
+
+
+        # result of early return
+
+        # Reset access registry
+        if AccessMixin.is_access_enabled(self.model_guid):
+            AccessMixin.reset_registry(self)
+
+        if (sample_id + 1) % log_every_n_steps == 0:
+            self.wer.update(
+                predictions=encoded,
+                predictions_lengths=encoded_len,
+                targets=transcript,
+                targets_lengths=transcript_len,
+            )
+            _, scores, words = self.wer.compute()
+            self.wer.reset()
+            tensorboard_logs.update({'training_batch_wer': scores.float() / words})
 
         # Log items
         self.log_dict(tensorboard_logs)
