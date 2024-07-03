@@ -2519,7 +2519,7 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
         return (packed_result,)
 
     @torch.no_grad()
-    def _greedy_decode(
+    def _greedy_decode_backward(
         self, x: torch.Tensor, out_len: torch.Tensor, partial_hypotheses: Optional[rnnt_utils.Hypothesis] = None
     ):
         # x: [T, 1, D]
@@ -2538,8 +2538,6 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
             hypothesis.frame_confidence = [[]]
 
         out_len = out_len.item()
-
-#        print("HERE x shape", x.shape)
 
         x = torch.flip(x[:out_len,:,:], dims=(0,))
         logits = self.joint2.joint(x, None)
@@ -2569,7 +2567,6 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
 
             token_sequence_tensor = torch.reshape(token_sequence_tensor, [1, -1])
 
-#            decoder_embs = self.decoder.prediction.embeds[0](token_sequence_tensor)  # [T, D]
             decoder_embs = self.decoder.prediction.fast_inference_run(token_sequence_tensor)  # [T, D]
 
             decoder_embs = torch.reshape(decoder_embs, [out_len, 1, -1]) # [T, 1, D]
@@ -2585,7 +2582,6 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
                 token_sequence_tensor = torch.LongTensor(token_sequence).to(x.device)
                 token_sequence_tensor = torch.reshape(token_sequence_tensor, [1, -1])
 
-#                decoder_embs = self.decoder.prediction.embeds[0](token_sequence_tensor)  # [T, D]
                 decoder_embs = self.decoder.prediction.fast_inference_run(token_sequence_tensor)  # [T, D]
 
                 decoder_embs = torch.reshape(decoder_embs, [out_len, 1, -1]) # [T, 1, D]
@@ -2603,9 +2599,86 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
                 token_sequence_tensor = torch.LongTensor(token_sequence).to(x.device)
                 token_sequence_tensor = torch.reshape(token_sequence_tensor, [1, -1])
 
-#                decoder_embs = self.decoder.prediction.embeds[0](token_sequence_tensor)  # [T, D]
                 decoder_embs = self.decoder2.prediction.fast_inference_run(token_sequence_tensor)  # [T, D]
 
+                decoder_embs = torch.reshape(decoder_embs, [out_len, 1, -1]) # [T, 1, D]
+
+                logits = self.joint2.joint(x_flip, decoder_embs)
+                logits = logits.view([-1, logits.shape[-1]])
+                v_t, k_t = logits[:,:-len(self.durations)].max(-1)
+                token_sequence = k_t.tolist()[::-1]
+
+        # Unpack the hidden states
+        hypothesis.dec_state = self.decoder.batch_select_state(hypothesis.dec_state, 0)
+        hypothesis.y_sequence = token_sequence
+
+        return hypothesis
+
+    @torch.no_grad()
+    def _greedy_decode(
+        self, x: torch.Tensor, out_len: torch.Tensor, partial_hypotheses: Optional[rnnt_utils.Hypothesis] = None
+    ):
+        # x: [T, 1, D]
+        # out_len: [seq_len]
+
+        # Initialize blank state and empty label set in Hypothesis
+        hypothesis = rnnt_utils.Hypothesis(score=0.0, y_sequence=[], dec_state=None, timestep=[], last_token=None)
+        token_sequence = []
+        token_time_stamps = []
+
+        if self.preserve_alignments:
+            # Alignments is a 2-dimensional dangling list representing T x U
+            hypothesis.alignments = [[]]
+
+        if self.preserve_frame_confidence:
+            hypothesis.frame_confidence = [[]]
+
+        out_len = out_len.item()
+
+        logits = self.joint.joint(x, None)
+        logits = logits.view([-1, logits.shape[-1]])
+        v_t, k_t = logits[:,:-len(self.durations)].max(-1)
+        v_d, k_d = logits[:,-len(self.durations):].max(-1)
+        k_t = k_t.tolist()
+        k_d = k_d.tolist()
+
+        time_idx = 0
+        while time_idx < out_len:
+            k = k_t[time_idx]
+            skip = k_d[time_idx] + 1
+            if k != self._blank_index:
+                # Append token to label set, update RNN state.
+                token_sequence.append(k)
+                token_time_stamps.append(time_idx)
+
+            time_idx += skip
+
+        if True and len(token_sequence) > 1:
+            out_len = len(token_sequence)
+            token_time_stamps_tensor = torch.LongTensor(token_time_stamps).to(x.device)
+            x = x[token_time_stamps_tensor,:,:] # [T, 1, D]
+
+            for i in range(1):
+                history = [self._blank_index] + token_sequence[:-1]
+                history_tensor = torch.LongTensor(history).to(x.device)
+                history_tensor = torch.reshape(history_tensor, [1, -1])
+
+                decoder_embs = self.decoder.prediction.fast_inference_run(history_tensor)  # [T, D]
+                decoder_embs = torch.reshape(decoder_embs, [out_len, 1, -1]) # [T, 1, D]
+
+                logits = self.joint.joint(x, decoder_embs)
+                logits = logits.view([-1, logits.shape[-1]])
+                v_t, k_t = logits[:,:-len(self.durations)].max(-1)
+                token_sequence = k_t.tolist()
+
+            x_flip = torch.flip(x, dims=(0,))
+            for i in range(0):
+                token_sequence_reversed = token_sequence[::-1]
+                history = [self._blank_index] + token_sequence_reversed[:-1]
+                history_tensor = torch.LongTensor(history).to(x.device)
+                history_tensor = torch.reshape(history_tensor, [1, -1])
+
+                decoder_embs = self.decoder2.prediction.fast_inference_run(history_tensor)  # [T, D]
                 decoder_embs = torch.reshape(decoder_embs, [out_len, 1, -1]) # [T, 1, D]
 
                 logits = self.joint2.joint(x_flip, decoder_embs)
