@@ -691,14 +691,6 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         transcript_len_list = transcript_len.tolist()
         signal_len_list = signal_len.tolist()
 
-        r = random.uniform(0.0, 1.0)
-        run_backward = True if r > 0.5 else False
-
-#        print("HERE len is", len(transcript_len_list))
-#        if self.old_weight is not None:
-#            print("HERE diff is", torch.max(self.encoder.layers[-1].feed_forward1.linear1.weight - self.old_weight))
-#        self.old_weight = self.encoder.layers[-1].feed_forward1.linear1.weight
-
         transcript2 = transcript1 * 1
         for i in range(len(transcript_len_list)):
             transcript2[i,:transcript_len_list[i]] = torch.flip(transcript2[i,:transcript_len_list[i]], dims=(-1,))
@@ -710,27 +702,13 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
         del signal
 
-        if run_backward:
-            encoded2 = encoded * 1.0
-            for i in range(len(signal_len_list)):
-                encoded2[i,:,:encoded_len[i]] = torch.flip(encoded2[i,:,:encoded_len[i]], dims=(-1,))
-            encoded = encoded * 0.0 + encoded2
+        encoded2 = encoded * 1.0
+        for i in range(len(signal_len_list)):
+            encoded2[i,:,:encoded_len[i]] = torch.flip(encoded2[i,:,:encoded_len[i]], dims=(-1,))
 
         # During training, loss must be computed, so decoder forward is necessary
         decoder1, target_length, states1 = self.decoder(targets=transcript1, target_length=transcript_len)
         decoder2, target_length2, states2 = self.decoder2(targets=transcript2, target_length=transcript_len)
-
-#        print("HERE transcript1", transcript1)
-#        print("HERE transcript2", transcript2)
-#        print("HERE target_length", target_length)
-#        print("HERE target_length2", target_length2)
-
-        if run_backward:
-            transcript = transcript2 + transcript1 * 0
-            decoder = decoder2 + decoder1 * 0
-        else:
-            transcript = transcript1 + transcript2 * 0
-            decoder = decoder1 + decoder2 * 0
 
         if hasattr(self, '_trainer') and self._trainer is not None:
             log_every_n_steps = self._trainer.log_every_n_steps
@@ -743,22 +721,24 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         assert not self.joint.fuse_loss_wer
         # Compute full joint and loss
 
-        joint1 = self.joint(encoder_outputs=encoded, decoder_outputs=decoder)
-        joint2 = self.joint2(encoder_outputs=encoded, decoder_outputs=decoder)
+        joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder1)
+        joint2 = self.joint2(encoder_outputs=encoded2, decoder_outputs=decoder2)
+        joint2 = torch.flip(joint2, dims=(1,))
+        B, T, U, _ = joint1.shape
 
-        if run_backward:
-            joint = joint1 * 0 + joint2
-            loss_name = 'train_loss_backward'
-        else:
-            joint = joint2 * 0 + joint1
-            loss_name = 'train_loss_forward'
+        rand = torch.rand([B, T - 1, U, 1]).to(joint1.device)
+        rand = torch.gt(rand, 0.5)
+
+        rand2 = torch.rand([B, T - 1, U, 1]).to(joint1.device)
+        rand2 = torch.gt(rand2, 0.5)
+
+        joint[:,:-1,:,:] = joint1[:,:-1,:,:] * rand + joint2[:,1:,:,:] * rand2
 
         loss_value = self.loss(
-            log_probs=joint, targets=transcript, input_lengths=encoded_len, target_lengths=target_length
+            log_probs=joint, targets=transcript1, input_lengths=encoded_len, target_lengths=target_length
         )
         tensorboard_logs = {
             'train_loss': loss_value,
-            loss_name: loss_value,
             'learning_rate': self._optimizer.param_groups[0]['lr'],
             'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
         }
@@ -777,7 +757,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             self.wer.update(
                 predictions=encoded,
                 predictions_lengths=encoded_len,
-                targets=transcript,
+                targets=transcript1,
                 targets_lengths=transcript_len,
             )
             _, scores, words = self.wer.compute()

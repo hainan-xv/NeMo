@@ -2672,26 +2672,22 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
                 v_t, k_t = logits[:,:-len(self.durations)].max(-1)
                 token_sequence = k_t.tolist()
 
-            x_flip = torch.flip(x, dims=(0,))
-            for i in range(1):
+                x_flip = torch.flip(x, dims=(0,))
+
                 token_sequence_reversed = token_sequence[::-1]
-                history = [self._blank_index] + token_sequence_reversed[:-1]
-                history_tensor = torch.LongTensor(history).to(x.device)
-                history_tensor = torch.reshape(history_tensor, [1, -1])
+                backward_history = [self._blank_index] + token_sequence_reversed[:-1]
+                backward_history_tensor = torch.LongTensor(backward_history).to(x.device)
+                backward_history_tensor = torch.reshape(backward_history_tensor, [1, -1])
 
-                decoder_embs = self.decoder2.prediction.fast_inference_run(history_tensor)  # [T, D]
-                decoder_embs = torch.reshape(decoder_embs, [out_len, 1, -1]) # [T, 1, D]
+                backward_decoder_embs = self.decoder2.prediction.fast_inference_run(backward_history_tensor)  # [T, D]
+                backward_decoder_embs = torch.reshape(backward_decoder_embs, [out_len, 1, -1]) # [T, 1, D]
 
-                logits = self.joint2.joint(x_flip, decoder_embs)
+                logits = self.joint2.joint(x_flip, backward_decoder_embs)
                 logits = logits.view([-1, logits.shape[-1]])
 
                 backward_logits = torch.flip(logits[:,:-len(self.durations)], dims=(0,))
-                v_t, k_t = (forward_logits + backward_logits).max(-1)
+                v_t, k_t = (forward_logits * 1 + backward_logits * 0).max(-1)
                 token_sequence = k_t.tolist()
-
-
-#                v_t, k_t = logits[:,:-len(self.durations)].max(-1)
-#                token_sequence = k_t.tolist()[::-1]
 
         # Unpack the hidden states
         hypothesis.dec_state = self.decoder.batch_select_state(hypothesis.dec_state, 0)
