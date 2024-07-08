@@ -724,15 +724,15 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder1)
         joint2 = self.joint2(encoder_outputs=encoded2, decoder_outputs=decoder2)
         joint2 = torch.flip(joint2, dims=(1,))
-        B, T, U, _ = joint1.shape
+        B, T, U, _ = joint.shape
 
-        rand = torch.rand([B, T - 1, U, 1]).to(joint1.device)
-        rand = torch.gt(rand, 0.5)
+#        rand = torch.rand([B, T - 1, U, 1]).to(joint.device)
+#        rand = torch.gt(rand, 0.5)
 
-        rand2 = torch.rand([B, T - 1, U, 1]).to(joint1.device)
+        rand2 = torch.rand([B, T - 1, U, 1]).to(joint.device)
         rand2 = torch.gt(rand2, 0.5)
 
-        joint[:,:-1,:,:] = joint1[:,:-1,:,:] * rand + joint2[:,1:,:,:] * rand2
+        joint[:,:-1,:,:] = joint[:,:-1,:,:] + joint2[:,1:,:,:] * rand2
 
         loss_value = self.loss(
             log_probs=joint, targets=transcript1, input_lengths=encoded_len, target_lengths=target_length
