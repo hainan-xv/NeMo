@@ -203,6 +203,16 @@ class RelPositionMultiHeadAttention(MultiHeadAttention):
         x = x[:, :, 1:].view(b, h, qlen, pos_len)  # (b, h, t1, t2)
         return x
 
+    def create_power2_mask(self, seq_length):
+        mask = torch.zeros(seq_length, seq_length, dtype=torch.bool, device=self.pos_bias_u.device)
+        for i in range(seq_length):
+            for j in range(seq_length):
+                distance = abs(i - j)
+                if distance == 0 or (distance & (distance - 1) == 0):  # Check if distance is a power of 2
+                    mask[i, j] = True
+        return mask
+
+
     def forward(self, query, key, value, mask, pos_emb, cache=None):
         """Compute 'Scaled Dot Product Attention' with rel. positional encoding.
         Args:
@@ -250,6 +260,11 @@ class RelPositionMultiHeadAttention(MultiHeadAttention):
             matrix_bd = matrix_bd[:, :, :, : matrix_ac.size(-1)]
 
             scores = (matrix_ac + matrix_bd) / self.s_d_k  # (batch, head, time1, time2)
+
+            # Apply power-of-2 distance mask
+            power2_mask = self.create_power2_mask(scores.size(-1))
+            power2_mask = power2_mask.unsqueeze(0).unsqueeze(0)  # Add batch and head dimensions
+            scores = scores.masked_fill(~power2_mask, float('-inf'))
 
             out = self.forward_attention(v, scores, mask)
 
