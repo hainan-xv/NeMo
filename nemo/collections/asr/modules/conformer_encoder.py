@@ -556,6 +556,8 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
 
         audio_signal, pos_emb = self.pos_enc(x=audio_signal, cache_len=cache_len)
 
+        print("pos_emb", pos_emb.shape)
+
         # Create the self-attention and padding masks
         pad_mask, att_mask = self._create_masks(
             att_context_size=cur_att_context_size,
@@ -679,7 +681,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         """
         self.max_audio_length = max_audio_length
         device = next(self.parameters()).device
-        self.pos_enc.extend_pe(max_audio_length, device)
+        self.pos_enc.extend_pe(24, device)
 
     def _create_masks(self, att_context_size, padding_length, max_audio_length, offset, device):
         if self.self_attention_model != "rel_pos_local_attn":
