@@ -204,6 +204,7 @@ class RelPositionMultiHeadAttention(MultiHeadAttention):
         return x
 
     def create_power2_indices(self, seq_length):
+        print("HERE seq_length", seq_length)
         indices = []
         valid_mask = []
         legit_distances = [0]
@@ -214,6 +215,8 @@ class RelPositionMultiHeadAttention(MultiHeadAttention):
 
         reversed_dists = legit_distances[::-1]
         legit_distances = [-i for i in reversed_dists] + legit_distances[1:]
+
+        print("HERE legit_distances", legit_distances)
 
         for i in range(seq_length):
             for idx, j in enumerate(legit_distances):
@@ -239,28 +242,31 @@ class RelPositionMultiHeadAttention(MultiHeadAttention):
 
         with avoid_float16_autocast_context():
             q, k, v = self.forward_qkv(query, key, value)
+            print("HERE", q.shape, k.shape, v.shape, pos_emb.shape)
             q = q.transpose(1, 2)  # (batch, time2, head, d_k)
             k = k.transpose(1, 2)  # (batch, time2, head, d_k)
-
-            heads = k.shape[2]
-            
-            # pos_emb: (batch, E, d_model)
-            E = pos_emb.shape[1]   # number of relative positions needed
-            p = self.linear_pos(pos_emb).view(B, -1, self.h, self.d_k)  # (batch, E, head, d)
-
-            q_with_bias_u = q + self.pos_bias_u  # (batch, t, head, d_k)
-            q_with_bias_v = q + self.pos_bias_v  # (batch, t, head, d_k)
 
             # Get indices for power-of-2 distances
             # indices reference 't' axis (0, 1, 2, 4, ...)
             # indices2 references the pos_emb (0,1,2,3,4,...)
             # att_mask is false when this_position + position_distance is out of bound
             indices, att_mask = self.create_power2_indices(q.size(1))
+            E = att_mask.shape[0] / q.size(1)
+            print("FIRST E", E)
+            heads = k.shape[2]
+            
+            # pos_emb: (1, E, d_model)
+            E = pos_emb.shape[1]   # number of relative positions needed
+            p = self.linear_pos(pos_emb).view(1, E, self.h, self.d_k)  # (batch, E, head, d)
+
+            q_with_bias_u = q + self.pos_bias_u  # (batch, t, head, d_k)
+            q_with_bias_v = q + self.pos_bias_v  # (batch, t, head, d_k)
 
             q_indices, k_indices, log_indices = indices[:, 0], indices[:, 1], indices[:, 2]
 
             # Compute attention scores only for power-of-2 distances
             q_selected = q_with_bias_u[:, q_indices, :, :]   # (batch, t * E, head, d_k)
+            print("HERE q_indices", q_indices.shape, "HERE q_selected", q_selected.shape, "E", E)
             d_k = q_selected.shape[-1]
             q_selected = q_selected.transpose(1, 2)
             q_selected = torch.reshape(q_selected, [B, heads, T, E, d_k])
@@ -285,7 +291,7 @@ class RelPositionMultiHeadAttention(MultiHeadAttention):
 
             # p shape: [batch, E, head, d]
             p = p.transpose(1, 2) # [B, head, E, d]
-            p = torch.reshape(p, [B, heads, 1, E, d_k])
+            p = torch.reshape(p, [1, heads, 1, E, d_k])
 
             matrix_bd = torch.sum(q_v_selected * p, dim=-1)  # [B, head, T, E]
 
@@ -1039,7 +1045,7 @@ class RelPositionalEncoding(PositionalEncoding):
 
     def extend_pe(self, length, device):
         """Reset and extend the positional encodings if needed."""
-        needed_size = 2 * length - 1
+        needed_size = 2 * length + 1
         if hasattr(self, 'pe') and self.pe.size(1) >= needed_size:
             return
         # positions would be from negative numbers to positive
@@ -1047,16 +1053,14 @@ class RelPositionalEncoding(PositionalEncoding):
         positions = []
         for i in range(-length, length + 1):
             if i < 0:
-                positions.append(2 ** (-i))
+                positions.append(2 ** (1 - i))
             elif i == 0:
                 positions.append(0)
             else:
-                positions.append(2 ** i)
+                positions.append(2 ** (i - 1))
 
-        positions = torch.tensor(positions, dtype=torch.float32, device=device)
+        positions = torch.tensor(positions, dtype=torch.long, device=device)
         positions = positions.unsqueeze(1)
-
-        print("HERE positions is", positions.shape)
         
         self.create_pe(positions=positions)
 
@@ -1076,19 +1080,21 @@ class RelPositionalEncoding(PositionalEncoding):
         # center_pos would be the index of position 0
         # negative positions would be used for right and positive for left tokens
         # for input of length L, 2*L-1 positions are needed, positions from (L-1) to -(L-1)
-        input_len = int(math.log2(x.size(1))) + 2
+#        input_len = int(math.log2(x.size(1))) + 1
+#
+#        print("x size", x.shape)
+#        print("HERE input_len", input_len)
+#
+#
+#        print("HERE self.pe", self.pe.shape)
+#        center_pos = self.pe.size(1) // 2
+#        print("HERE center_pos", center_pos)
+#        start_pos = center_pos - input_len
+#        end_pos = center_pos + input_len - 1
+#        print("start_pos:end_pos", start_pos, end_pos)
+#        pos_emb = self.pe[:, start_pos:end_pos]
 
-        print("x size", x.shape)
-        print("HERE input_len", input_len)
-
-
-        print("HERE self.pe", self.pe.shape)
-        center_pos = self.pe.size(1) // 2 + 1
-        print("HERE center_pos", center_pos)
-        start_pos = center_pos - input_len
-        end_pos = center_pos + input_len - 1
-        print("start_pos:end_pos", start_pos, end_pos)
-        pos_emb = self.pe[:, start_pos:end_pos]
+        pos_emb = self.pe
         if self.dropout_emb:
             pos_emb = self.dropout_emb(pos_emb)
         return self.dropout(x), pos_emb
