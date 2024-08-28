@@ -64,6 +64,7 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
         self,
         d_model,
         d_ff,
+        supported_positions,
         self_attention_model='rel_pos',
         global_tokens=0,
         global_tokens_spacing=1,
@@ -112,6 +113,7 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
                 pos_bias_v=pos_bias_v,
                 max_cache_len=MHA_max_cache_len,
                 use_bias=use_bias,
+                supported_positions=supported_positions,
             )
         elif self_attention_model == 'rel_pos_local_attn':
             self.self_attn = RelPositionMultiHeadAttentionLongformer(

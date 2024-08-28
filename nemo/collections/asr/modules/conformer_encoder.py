@@ -263,6 +263,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         feat_in,
         n_layers,
         d_model,
+        supported_positions,
         feat_out=-1,
         causal_downsampling=False,
         subsampling='striding',
@@ -370,6 +371,8 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
 
         self._feat_out = d_model
 
+        self.supported_positions = supported_positions
+
         # Biases for relative positional encoding
         if not untie_biases and self_attention_model == "rel_pos":
             d_head = d_model // n_heads
@@ -390,6 +393,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                 max_len=pos_emb_max_len,
                 xscale=self.xscale,
                 dropout_rate_emb=dropout_emb,
+                supported_positions=self.supported_positions,
             )
         elif self_attention_model == 'rel_pos_local_attn':
             if max(att_context_size) <= 0:
@@ -416,6 +420,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             layer = ConformerLayer(
                 d_model=d_model,
                 d_ff=d_ff,
+                supported_positions=self.supported_positions,
                 self_attention_model=self_attention_model,
                 global_tokens=global_tokens,
                 global_tokens_spacing=global_tokens_spacing,
@@ -555,8 +560,6 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             offset = None
 
         audio_signal, pos_emb = self.pos_enc(x=audio_signal, cache_len=cache_len)
-
-        print("pos_emb", pos_emb.shape)
 
         # Create the self-attention and padding masks
         pad_mask, att_mask = self._create_masks(

@@ -166,7 +166,7 @@ class RelPositionMultiHeadAttention(MultiHeadAttention):
         use_bias (bool): whether to apply bias in linear and conv layers of MultiHeadAttention
     """
 
-    def __init__(self, n_head, n_feat, dropout_rate, pos_bias_u, pos_bias_v, max_cache_len=0, use_bias=True):
+    def __init__(self, n_head, n_feat, dropout_rate, pos_bias_u, pos_bias_v, supported_positions, max_cache_len=0, use_bias=True):
         """Construct an RelPositionMultiHeadedAttention object."""
         super().__init__(
             n_head=n_head,
@@ -189,6 +189,7 @@ class RelPositionMultiHeadAttention(MultiHeadAttention):
         else:
             self.pos_bias_u = pos_bias_u
             self.pos_bias_v = pos_bias_v
+        self.supported_positions = supported_positions
 
     def rel_shift(self, x):
         """Compute relative positional encoding.
@@ -203,20 +204,11 @@ class RelPositionMultiHeadAttention(MultiHeadAttention):
         x = x[:, :, 1:].view(b, h, qlen, pos_len)  # (b, h, t1, t2)
         return x
 
-    def create_power2_indices(self, seq_length):
-        print("HERE seq_length", seq_length)
+    def create_attention_indices(self, seq_length):
         indices = []
         valid_mask = []
-        legit_distances = [0]
-        dist = 1
-        while dist < seq_length:
-            legit_distances.append(dist)
-            dist = dist * 2
 
-        reversed_dists = legit_distances[::-1]
-        legit_distances = [-i for i in reversed_dists] + legit_distances[1:]
-
-        print("HERE legit_distances", legit_distances)
+        legit_distances = self.supported_positions
 
         for i in range(seq_length):
             for idx, j in enumerate(legit_distances):
@@ -242,17 +234,15 @@ class RelPositionMultiHeadAttention(MultiHeadAttention):
 
         with avoid_float16_autocast_context():
             q, k, v = self.forward_qkv(query, key, value)
-            print("HERE", q.shape, k.shape, v.shape, pos_emb.shape)
             q = q.transpose(1, 2)  # (batch, time2, head, d_k)
             k = k.transpose(1, 2)  # (batch, time2, head, d_k)
 
             # Get indices for power-of-2 distances
-            # indices reference 't' axis (0, 1, 2, 4, ...)
-            # indices2 references the pos_emb (0,1,2,3,4,...)
+            # indices..[0] reference 't' axis (0, 1, 2, 4, 8, ...)
+            # indices..[1] references the pos_emb (0,1,2,3,4,...)
             # att_mask is false when this_position + position_distance is out of bound
-            indices, att_mask = self.create_power2_indices(q.size(1))
-            E = att_mask.shape[0] / q.size(1)
-            print("FIRST E", E)
+            indices, att_mask = self.create_attention_indices(q.size(1))
+            assert att_mask.shape[0] == q.size(1)
             heads = k.shape[2]
             
             # pos_emb: (1, E, d_model)
@@ -266,24 +256,15 @@ class RelPositionMultiHeadAttention(MultiHeadAttention):
 
             # Compute attention scores only for power-of-2 distances
             q_selected = q_with_bias_u[:, q_indices, :, :]   # (batch, t * E, head, d_k)
-            print("HERE q_indices", q_indices.shape, "HERE q_selected", q_selected.shape, "E", E)
             d_k = q_selected.shape[-1]
             q_selected = q_selected.transpose(1, 2)
             q_selected = torch.reshape(q_selected, [B, heads, T, E, d_k])
-
 
             k_selected = k[:, k_indices, :, :]     # (batch, t * E, head, d_k)
             k_selected = k_selected.transpose(1, 2)
             k_selected = torch.reshape(k_selected, [B, heads, T, E, d_k])
 
             matrix_ac = torch.sum(q_selected * k_selected, dim=-1)  # (batch, head, T, E)
-#            print("HERE matrix_ac", matrix_ac.shape)
-
-            # Handle relative positional encoding
-            # p: batch, time, head, dimension
-#            print("HERE q_with_bias_v", q_with_bias_v.shape)
-#            p_selected = p[:, :, k_indices, :]
-#            p_selected = torch.reshape(p_selected, [B, E, T, E, -1])
 
             q_v_selected = q_with_bias_v[:, q_indices, :, :] # (batch, t * E, head, d)
             q_v_selected = q_v_selected.transpose(1, 2) # (batch, head, t*E, d)
@@ -297,7 +278,6 @@ class RelPositionMultiHeadAttention(MultiHeadAttention):
 
             scores = (matrix_ac + matrix_bd) / self.s_d_k  # (batch, head, t, E)
 
-#        print("k_indices is", torch.reshape(k_indices, [T, E]))
         out = self.forward_hop_attention(v, scores, mask, att_mask, torch.reshape(k_indices, [T, E]))
 
         if cache is None:
@@ -315,11 +295,6 @@ class RelPositionMultiHeadAttention(MultiHeadAttention):
             value (torch.Tensor): transformed `value` (batch, time2, d_model) weighted by the attention scores
         """
         B = value.size(0)
-#        print("HERE")
-#        print("value", value.shape)  # b, head, t, d
-#        print("score", scores.shape) # b, head, t, E
-#        print("mask ", mask.shape)
-#        print("attmask", att_mask.shape)  # t, E
 
         selected_value = value[:,:,k_indices,:]  # [batch, head, t, E, d]
 
@@ -330,12 +305,9 @@ class RelPositionMultiHeadAttention(MultiHeadAttention):
         else:
             attn = torch.softmax(scores, dim=-1)
 
-#        if mask is not None:
-#            mask = mask.unsqueeze(1)  # (batch, 1, time1, time2)
-#            scores = scores.masked_fill(mask, -10000.0)
-#            attn = torch.softmax(scores, dim=-1).masked_fill(mask, 0.0)  # (batch, head, time1, time2)
-#        else:
-#            attn = torch.softmax(scores, dim=-1)  # (batch, head, time1, time2)
+        if self.training and att_mask.shape[2] < 10:
+            print("HERE mask", mask)
+            assert(False)
 
         p_attn = self.dropout(attn)  # [b, head, t, E]
         p_attn = p_attn.unsqueeze(-1) #  [b, head, t, E, 1]
@@ -1043,25 +1015,19 @@ class RelPositionalEncoding(PositionalEncoding):
         dropout_rate_emb (float): dropout rate for the positional embeddings
     """
 
+    def __init__(self, d_model, dropout_rate, max_len, xscale, dropout_rate_emb, supported_positions):
+        super().__init__(d_model, dropout_rate, max_len, xscale, dropout_rate_emb)
+        self.supported_positions = supported_positions
+
     def extend_pe(self, length, device):
         """Reset and extend the positional encodings if needed."""
-        needed_size = 2 * length + 1
-        if hasattr(self, 'pe') and self.pe.size(1) >= needed_size:
-            return
         # positions would be from negative numbers to positive
         # positive positions would be used for left positions and negative for right positions
-        positions = []
-        for i in range(-length, length + 1):
-            if i < 0:
-                positions.append(2 ** (1 - i))
-            elif i == 0:
-                positions.append(0)
-            else:
-                positions.append(2 ** (i - 1))
+        positions = self.supported_positions
 
         positions = torch.tensor(positions, dtype=torch.long, device=device)
         positions = positions.unsqueeze(1)
-        
+
         self.create_pe(positions=positions)
 
     def forward(self, x, cache_len=0):
@@ -1076,23 +1042,6 @@ class RelPositionalEncoding(PositionalEncoding):
 
         if self.xscale:
             x = x * self.xscale
-
-        # center_pos would be the index of position 0
-        # negative positions would be used for right and positive for left tokens
-        # for input of length L, 2*L-1 positions are needed, positions from (L-1) to -(L-1)
-#        input_len = int(math.log2(x.size(1))) + 1
-#
-#        print("x size", x.shape)
-#        print("HERE input_len", input_len)
-#
-#
-#        print("HERE self.pe", self.pe.shape)
-#        center_pos = self.pe.size(1) // 2
-#        print("HERE center_pos", center_pos)
-#        start_pos = center_pos - input_len
-#        end_pos = center_pos + input_len - 1
-#        print("start_pos:end_pos", start_pos, end_pos)
-#        pos_emb = self.pe[:, start_pos:end_pos]
 
         pos_emb = self.pe
         if self.dropout_emb:
