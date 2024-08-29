@@ -484,6 +484,26 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                 rets[4],
             )
 
+    def create_attention_indices(self, seq_length, device):
+        indices = []
+        valid_mask = []
+
+        legit_distances = self.supported_positions
+
+        for i in range(seq_length):
+            for idx, j in enumerate(legit_distances):
+                valid = i + j >= 0 and i + j < seq_length
+                if valid:
+                    valid_mask.append(True)
+                    indices.append((i, i + j, idx))
+                else:
+                    valid_mask.append(False)
+                    indices.append((i, 0, 0))  # will be masked out anyway
+
+        ret = torch.tensor(indices, device=device)
+        mask = torch.tensor(valid_mask, device=device)
+        return ret, torch.reshape(mask, [seq_length, -1])
+
     def streaming_post_process(self, rets, keep_all_outputs=True):
         if len(rets) == 2:
             return rets[0], rets[1], None, None, None
@@ -570,6 +590,8 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             device=audio_signal.device,
         )
 
+        extra_indices, extra_att_mask = self.create_attention_indices(max_audio_length, att_mask.device)
+
         if cache_last_channel is not None:
             pad_mask = pad_mask[:, cache_len:]
             if att_mask is not None:
@@ -591,6 +613,8 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                 att_mask=att_mask,
                 pos_emb=pos_emb,
                 pad_mask=pad_mask,
+                extra_indices=extra_indices,
+                extra_att_mask=extra_att_mask,
                 cache_last_channel=cache_last_channel_cur,
                 cache_last_time=cache_last_time_cur,
             )
@@ -626,6 +650,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                     offset=offset,
                     device=audio_signal.device,
                 )
+                extra_indices, extra_att_mask = self.create_attention_indices(max_audio_length, pad_mask.device)
 
             # saving tensors if required for interctc loss
             if self.is_access_enabled(getattr(self, "model_guid", None)):

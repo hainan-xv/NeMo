@@ -204,27 +204,27 @@ class RelPositionMultiHeadAttention(MultiHeadAttention):
         x = x[:, :, 1:].view(b, h, qlen, pos_len)  # (b, h, t1, t2)
         return x
 
-    def create_attention_indices(self, seq_length):
-        indices = []
-        valid_mask = []
+#    def create_attention_indices(self, seq_length):
+#        indices = []
+#        valid_mask = []
+#
+#        legit_distances = self.supported_positions
+#
+#        for i in range(seq_length):
+#            for idx, j in enumerate(legit_distances):
+#                valid = i + j >= 0 and i + j < seq_length
+#                if valid:
+#                    valid_mask.append(True)
+#                    indices.append((i, i + j, idx))
+#                else:
+#                    valid_mask.append(False)
+#                    indices.append((i, 0, 0))  # will be masked out anyway
+#
+#        ret = torch.tensor(indices, device=self.pos_bias_u.device)
+#        mask = torch.tensor(valid_mask, device=self.pos_bias_u.device)
+#        return ret, torch.reshape(mask, [seq_length, -1])
 
-        legit_distances = self.supported_positions
-
-        for i in range(seq_length):
-            for idx, j in enumerate(legit_distances):
-                valid = i + j >= 0 and i + j < seq_length
-                if valid:
-                    valid_mask.append(True)
-                    indices.append((i, i + j, idx))
-                else:
-                    valid_mask.append(False)
-                    indices.append((i, 0, 0))  # will be masked out anyway
-
-        ret = torch.tensor(indices, device=self.pos_bias_u.device)
-        mask = torch.tensor(valid_mask, device=self.pos_bias_u.device)
-        return ret, torch.reshape(mask, [seq_length, -1])
-
-    def forward(self, query, key, value, mask, pos_emb, cache=None):
+    def forward(self, query, key, value, mask, pos_emb, indices, att_mask, cache=None):
         key, value, query, cache = self.update_cache(key=key, value=value, query=query, cache=cache)
 
         B, T, _ = query.shape
@@ -241,7 +241,7 @@ class RelPositionMultiHeadAttention(MultiHeadAttention):
             # indices..[0] reference 't' axis (0, 1, 2, 4, 8, ...)
             # indices..[1] references the pos_emb (0,1,2,3,4,...)
             # att_mask is false when this_position + position_distance is out of bound
-            indices, att_mask = self.create_attention_indices(q.size(1))
+#            indices, att_mask = self.create_attention_indices(q.size(1))
             assert att_mask.shape[0] == q.size(1)
             heads = k.shape[2]
             
@@ -304,10 +304,6 @@ class RelPositionMultiHeadAttention(MultiHeadAttention):
             attn = torch.softmax(scores, dim=-1).masked_fill(att_mask, 0.0)
         else:
             attn = torch.softmax(scores, dim=-1)
-
-        if self.training and att_mask.shape[2] < 10:
-            print("HERE mask", mask)
-            assert(False)
 
         p_attn = self.dropout(attn)  # [b, head, t, E]
         p_attn = p_attn.unsqueeze(-1) #  [b, head, t, E, 1]
