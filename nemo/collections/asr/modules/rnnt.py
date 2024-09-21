@@ -694,14 +694,8 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
     def fast_inference_run(self, y: torch.Tensor):
         # state maintenance is unnecessary during training forward call
         # to get state, use .predict() method.
-        if self._rnnt_export:
-            add_sos = False
-        else:
-            add_sos = True
 
-        g, states = self.predict(y, state=None, add_sos=add_sos)  # (B, U, D)
-
-        g = g[:,1:,:]
+        g, states = self.predict(y, state=None, add_sos=False)  # (B, U, D)
 
         return g
 

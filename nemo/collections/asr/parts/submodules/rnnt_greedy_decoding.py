@@ -2511,7 +2511,7 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
     def _greedy_decode(
         self, x: torch.Tensor, out_len: torch.Tensor, partial_hypotheses: Optional[rnnt_utils.Hypothesis] = None
     ):
-#        self.decoding_type = 'nar-0'
+#        self.decoding_type = 'nar-2'
         if self.decoding_type == 'original' or self.decoding_type == None:
             return self._greedy_decode_original(x, out_len, partial_hypotheses)
         else:
