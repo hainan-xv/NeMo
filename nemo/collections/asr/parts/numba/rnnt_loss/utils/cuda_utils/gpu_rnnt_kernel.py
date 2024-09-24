@@ -947,6 +947,7 @@ def compute_tdt_alphas_kernel(
     # Initilize alpha[b, t=0, u=0] for all b in B
     if u == 0:
         alphas[offset] = 0
+        print('alpha', b, 0, u, alphas[offset])
 
     # sync until all alphas are initialized
     cuda.syncthreads()
@@ -979,6 +980,7 @@ def compute_tdt_alphas_kernel(
                     else:
                         break  # since durations are in ascending order, when we encounter a duration that is too large, then
                         # there is no need to check larger durations after that.
+                print('alpha', b, t, u, alphas[offset + t * maxU + u])
 
         elif u < U:
             # when t == 0, we only consider the non-blank emission.
@@ -996,6 +998,8 @@ def compute_tdt_alphas_kernel(
                     )
                 else:
                     alphas[offset + u] = -INF
+
+                print('alpha', b, t, u, alphas[offset + t * maxU + u])
 
             # now we have t != 0 and u != 0, and we need to consider both non-blank and blank emissions.
             elif t > 0 and t < T:
@@ -1037,6 +1041,7 @@ def compute_tdt_alphas_kernel(
 
                 # combining blank and non-blank emissions.
                 alphas[offset + t * maxU + u] = rnnt_helper.log_sum_exp(emit, no_emit)
+                print('alpha', b, t, u, alphas[offset + t * maxU + u])
 
         # sync across all B=b and U=u
         cuda.syncthreads()
@@ -1071,6 +1076,7 @@ def compute_tdt_alphas_kernel(
                 break
 
         llForward[b] = loglike
+#        print("total_forward b t u", loglike)
 
 
 @cuda.jit()
@@ -1188,6 +1194,7 @@ def compute_tdt_betas_kernel(
                             )  # log prob of duration (durations[i])
                             - sigma,  # for logit undernormalization. Basically every time sigma shows up is because of logit undernormalization.
                         )
+                print("beta", b, t, u, betas[offset + t * maxU + u])
 
         elif u < U - 1:
             if t == T - 1:
@@ -1201,6 +1208,7 @@ def compute_tdt_betas_kernel(
                     )
                 else:
                     betas[offset + (T - 1) * maxU + u] = -INF
+                print("beta", b, t, u, betas[offset + t * maxU + u])
 
             elif t >= 0 and t < T - 1:
                 # now we need to consider both blank andnon-blanks. Similar to alphas, we first compute them separately with no_emit and emit.
@@ -1230,6 +1238,7 @@ def compute_tdt_betas_kernel(
 
                 # combining all blank emissions and all non-blank emissions.
                 betas[offset + t * maxU + u] = rnnt_helper.log_sum_exp(emit, no_emit)
+                print("beta", b, t, u, betas[offset + t * maxU + u])
 
         # sync across all B=b and U=u
         cuda.syncthreads()
@@ -1237,6 +1246,7 @@ def compute_tdt_betas_kernel(
     # After final sync, betas[b, 0, 0] gives log-likelihood of backward pass, same with conventional Transducers.
     if u == 0:
         llBackward[b] = betas[offset]
+#        print("total_backward b t u", betas[offset])
 
 
 @cuda.jit()

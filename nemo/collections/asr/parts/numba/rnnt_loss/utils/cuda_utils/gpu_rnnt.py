@@ -641,6 +641,7 @@ class GPUTDT(GPURNNT):
                 self.num_durations,
             )
 
+        print("compute_tdt_betas_kernel alpha", alphas)
         if training:
             # Compute betas
             if r < self.omega:
@@ -658,6 +659,7 @@ class GPUTDT(GPURNNT):
                     self.alphabet_size_,
                     self.blank_,
                 )
+                print("compute_tdt_betas_kernel betas", betas)
 
                 # Compute gradient
                 grad_blocks_per_grid = self.minibatch_ * self.maxT_ * self.maxU_
@@ -699,6 +701,8 @@ class GPUTDT(GPURNNT):
                     durations,
                     self.num_durations,
                 )
+
+                exit(-1)
 
                 # Compute gradient
                 grad_blocks_per_grid = self.minibatch_ * self.maxT_ * self.maxU_

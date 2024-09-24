@@ -2523,98 +2523,6 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
                 return self._greedy_decode_nar_t(x, out_len, partial_hypotheses, b)
 
 
-    @torch.no_grad()
-    def _greedy_decode_nar_t(
-        self, x: torch.Tensor, out_len: torch.Tensor, partial_hypotheses: Optional[rnnt_utils.Hypothesis] = None, loop_count = 0,
-    ):
-        # x: [T, 1, D]
-        # out_len: [seq_len]
-
-        # Initialize blank state and empty label set in Hypothesis
-        hypothesis = rnnt_utils.Hypothesis(score=0.0, y_sequence=[], dec_state=None, timestep=[], last_token=None)
-
-        if partial_hypotheses is not None:
-            assert False
-
-        if self.preserve_alignments:
-            # Alignments is a 2-dimensional dangling list representing T x U
-            hypothesis.alignments = [[]]
-
-        if self.preserve_frame_confidence:
-            hypothesis.frame_confidence = [[]]
-
-        logits = self.joint.nar_joint(x)
-        logits = logits.view([-1, logits.shape[-1]])
-        logits[:,:-len(self.durations)] = torch.nn.functional.softmax(logits[:,:-len(self.durations)], dim=-1)
-        logits[:,-len(self.durations):] = torch.nn.functional.softmax(logits[:,-len(self.durations):], dim=-1)
-        v_t, k_t = logits[:,:-len(self.durations)].max(-1)
-        v_d, k_d = logits[:,-len(self.durations):].max(-1)
-        k_t = k_t.tolist()
-        k_d = k_d.tolist()
-
-        useful_logits = []
-        time_idx = 0
-        out_len = out_len.item()
-        non_blank_indices = []
-        indices_to_last_non_blank = []
-        all_timestamps = []
-        all_output = []
-#        upgrade_timestamp = []  # True if the previous prediction is not a blank, and therefore we can
-        output = []
-
-        while time_idx < out_len:
-            k = k_t[time_idx]
-            skip = k_d[time_idx] + 1
-            all_timestamps.append(time_idx)
-            all_output.append(k)
-            indices_to_last_non_blank.append(len(output))
-
-            if k != self._blank_index:
-                # Append token to label set, update RNN state.
-                output.append(k)
-                non_blank_indices.append(len(all_timestamps) - 1)
-
-            time_idx += skip
-
-
-        for t in range(loop_count):
-            timestamp_tensor = torch.LongTensor(all_timestamps).to(x.device)
-            token_sequence = [[self._blank_index] + output]
-            token_sequence_tensor = torch.LongTensor(token_sequence).to(x.device)
-
-            decoded = self.decoder.fast_inference_run(token_sequence_tensor)
-
-            useful_frames = x[timestamp_tensor,::]
-
-            decoded = decoded.view([decoded.shape[1], 1, -1]) # [T, 1, D]
-            decoded_extended = decoded[indices_to_last_non_blank,:,:]
-
-            logits = self.joint.joint(useful_frames, decoded_extended)
-            logits = logits.view([-1, logits.shape[-1]])
-            v_t, k_t = logits[:,:-len(self.durations)].max(-1)
-
-            v_d, k_d = logits[:,-len(self.durations):].max(-1)
-
-            all_output = k_t.tolist()
-            output = k_t[non_blank_indices].tolist()
-
-            all_durations = k_d.tolist()
-            new_all_timestamps = [all_timestamps[0]]
-            for i in range(1, len(all_timestamps)):
-                if all_output[i - 1] != self._blank_index:
-                    new_all_timestamps.append(all_timestamps[i - 1] + all_durations[i] + 1)
-                else:
-                    new_all_timestamps.append(all_timestamps[i])
-
-            print("all_timestamps:     ", all_timestamps)
-            print("new_all_timestamps: ", new_all_timestamps)
-            print("all_output:         ", all_output)
-
-            all_timestamps = new_all_timestamps
-
-        hypothesis.y_sequence = output
-
-        return hypothesis
 
     @torch.no_grad()
     def _greedy_decode_nar(
@@ -2646,8 +2554,19 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
 
         logits = self.joint.nar_joint(x)
         logits = logits.view([-1, logits.shape[-1]])
-#        logits[:,:-len(self.durations)] = torch.nn.functional.softmax(logits[:,:-len(self.durations)], dim=-1)
-#        logits[:,-len(self.durations):] = torch.nn.functional.softmax(logits[:,-len(self.durations):], dim=-1)
+        logits[:,:-len(self.durations)] = torch.nn.functional.log_softmax(logits[:,:-len(self.durations)], dim=-1)
+        logits[:,-len(self.durations):] = torch.nn.functional.log_softmax(logits[:,-len(self.durations):], dim=-1)
+
+        probs = torch.exp(logits[:,:-len(self.durations)])
+        log_probs = logits[:,:-len(self.durations)]
+        token_entropy = -torch.sum(probs * log_probs, dim=-1)
+
+        probs = torch.exp(logits[:,-len(self.durations):])
+        log_probs = logits[:,-len(self.durations):]
+        duration_entropy = -torch.sum(probs * log_probs, dim=-1)
+
+#        print("TWO ENTROPY", token_entropy, duration_entropy)
+
         v_t, k_t = logits[:,:-len(self.durations)].max(-1)
         v_d, k_d = logits[:,-len(self.durations):].max(-1)  # get rid of 0 duration
         k_t = k_t.tolist()
@@ -2659,6 +2578,7 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
         while time_idx < out_len:
             k = k_t[time_idx]
             skip = self.durations[k_d[time_idx]]
+            print("TWO ENTROPY", duration_entropy[time_idx].item(), token_entropy[time_idx].item())
 #            print("SKIP IS", skip)
             if skip == 0:
                 skip += 1
@@ -2688,6 +2608,20 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
             logits = self.joint.joint(useful_frames, decoder_embs)
             logits = logits.view([-1, logits.shape[-1]])
             v_t, k_t = logits[:,:-len(self.durations)].max(-1)
+
+            logits[:,:-len(self.durations)] = torch.log_softmax(logits[:,:-len(self.durations)], dim=-1)
+            probs = torch.exp(logits[:,:-len(self.durations)])
+            log_probs = logits[:,:-len(self.durations)]
+            token_entropy = -torch.sum(probs * log_probs, dim=-1)
+
+            logits[:,-len(self.durations):] = torch.log_softmax(logits[:,-len(self.durations):], dim=-1)
+            probs = torch.exp(logits[:,-len(self.durations):])
+            log_probs = logits[:,-len(self.durations):]
+            duration_entropy = -torch.sum(probs * log_probs, dim=-1)
+        
+            for time_idx in range(logits.shape[0]):
+                print(str(t) + "th ENTROPY", duration_entropy[time_idx].item(), token_entropy[time_idx].item())
+
             token_sequence = k_t.tolist()
             hypothesis.y_sequence = token_sequence
 
@@ -2746,11 +2680,23 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
                 # If preserving per-frame confidence, log_normalize must be true
                 logits = self._joint_step(f, g, log_normalize=False)
                 logp = logits[0, 0, 0, : -len(self.durations)]
+
+                logp = torch.log_softmax(logp, dim=-1)
                 if self.preserve_frame_confidence:
                     logp = torch.log_softmax(logp, -1)
 
                 duration_logp = torch.log_softmax(logits[0, 0, 0, -len(self.durations) :], dim=-1)
                 del g
+
+                probs = torch.exp(logp)
+                log_probs = logp
+                token_entropy = -torch.sum(probs * log_probs, dim=-1)
+
+                probs = torch.exp(duration_logp)
+                log_probs = duration_logp
+                duration_entropy = -torch.sum(probs * log_probs, dim=-1)
+
+                print("TWO ENTROPY", duration_entropy.item(), token_entropy.item())
 
                 # torch.max(0) op doesnt exist for FP 16.
                 if logp.dtype != torch.float32:
