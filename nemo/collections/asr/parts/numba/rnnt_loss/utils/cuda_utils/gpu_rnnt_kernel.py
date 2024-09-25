@@ -947,7 +947,7 @@ def compute_tdt_alphas_kernel(
     # Initilize alpha[b, t=0, u=0] for all b in B
     if u == 0:
         alphas[offset] = 0
-        print('alpha', b, 0, u, alphas[offset])
+        print('\nalpha', b, 0, u, alphas[offset])
 
     # sync until all alphas are initialized
     cuda.syncthreads()
@@ -1152,6 +1152,7 @@ def compute_tdt_betas_kernel(
                 - sigma
                 + logp_duration(duration_acts, maxT, maxU, num_durations, b, T - 1, U - 1, 1)
             )
+        print("beta", b, T - 1, U - 1, betas[offset + (T - 1) * maxU + U - 1])
 
     # sync until all betas are initialized
     cuda.syncthreads()

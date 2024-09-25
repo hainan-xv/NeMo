@@ -2571,6 +2571,7 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
         v_d, k_d = logits[:,-len(self.durations):].max(-1)  # get rid of 0 duration
         k_t = k_t.tolist()
         k_d = k_d.tolist()
+        print("NAR HYPS", k_t)                          
 
         useful_logits = []
         time_idx = 0

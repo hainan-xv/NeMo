@@ -211,6 +211,7 @@ class GreedyCTCInfer(Typing, ConfidenceMethodMixin):
             for ind in range(prediction_cpu_tensor.shape[0]):
                 out_len = decoder_lengths[ind] if decoder_lengths is not None else None
                 hypothesis = greedy_decode(prediction_cpu_tensor[ind], out_len)
+                print("CTC HYPS", hypothesis.y_sequence)
                 hypotheses.append(hypothesis)
 
             # Pack results into Hypotheses
