@@ -2511,7 +2511,8 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
     def _greedy_decode(
         self, x: torch.Tensor, out_len: torch.Tensor, partial_hypotheses: Optional[rnnt_utils.Hypothesis] = None
     ):
-#        self.decoding_type = 'nar-2'
+#        self.decoding_type = 'nar_2-0'
+#        self.decoding_type = 'nar-0'
         if self.decoding_type == 'original' or self.decoding_type == None:
             return self._greedy_decode_original(x, out_len, partial_hypotheses)
         else:
@@ -2521,98 +2522,78 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
                 return self._greedy_decode_nar(x, out_len, partial_hypotheses, b)
             elif a == 'nar_t':
                 return self._greedy_decode_nar_t(x, out_len, partial_hypotheses, b)
-
+            elif a == 'nar_2':
+                return self._greedy_decode_nar2(x, out_len, partial_hypotheses, b)
 
     @torch.no_grad()
-    def _greedy_decode_nar_t(
+    def _greedy_decode_nar2(
         self, x: torch.Tensor, out_len: torch.Tensor, partial_hypotheses: Optional[rnnt_utils.Hypothesis] = None, loop_count = 0,
     ):
         # x: [T, 1, D]
         # out_len: [seq_len]
 
+        U = x.shape[0]
+
         # Initialize blank state and empty label set in Hypothesis
         hypothesis = rnnt_utils.Hypothesis(score=0.0, y_sequence=[], dec_state=None, timestep=[], last_token=None)
 
-        if partial_hypotheses is not None:
-            assert False
-
-        if self.preserve_alignments:
-            # Alignments is a 2-dimensional dangling list representing T x U
-            hypothesis.alignments = [[]]
-
-        if self.preserve_frame_confidence:
-            hypothesis.frame_confidence = [[]]
-
         logits = self.joint.nar_joint(x)
         logits = logits.view([-1, logits.shape[-1]])
-        logits[:,:-len(self.durations)] = torch.nn.functional.softmax(logits[:,:-len(self.durations)], dim=-1)
-        logits[:,-len(self.durations):] = torch.nn.functional.softmax(logits[:,-len(self.durations):], dim=-1)
         v_t, k_t = logits[:,:-len(self.durations)].max(-1)
-        v_d, k_d = logits[:,-len(self.durations):].max(-1)
+        v_d, k_d = logits[:,-len(self.durations):].max(dim=-1)  # get rid of 0 duration
         k_t = k_t.tolist()
         k_d = k_d.tolist()
+        
+        e_probs, _ = logits[:,:-len(self.durations)].log_softmax(dim=-1).max(dim=-1)
+        e_matrix = [v.item() for v in e_probs] + [0.0]
 
+        t_probs = logits[:,-len(self.durations):].softmax(dim=-1)
+        t_matrix = [[0.0 for _ in range(U+1)] for _ in range(U+1)] # have end state
+
+        for t in range(U):
+            for idx, n in enumerate(self.durations):
+                target = t + n
+                if n == 0:
+                    target += 1
+                if target > U:
+                    target = U # send to final sentinel
+                # we add on in case multiple matches to state
+                t_matrix[t][target] += t_probs[t][idx].item()
+        # log conversion
+        for i in range(U+1):
+            for j in range(U+1):
+                t_matrix[i][j] = np.log(t_matrix[i][j])
+
+        states = [[-float("inf"), None] for _ in range(U+1)]
+        states[0][0] = e_matrix[0]
+
+        for t in range(1, U+1):
+            target_prob, target_backtrack = states[t]
+            e_prob = e_matrix[t]    
+            # Only need to consider up max durations back
+            start = max(t-max(self.durations), 0)
+            for s in range(start, t):
+                transition_prob = t_matrix[s][t]
+                source_prob, source_backtrack = states[s]
+                update = source_prob + transition_prob + e_prob
+                if update > target_prob:
+                    target_prob = update
+                    target_backtrack = s
+            states[t] = target_prob, target_backtrack
+
+        time_steps = []
         useful_logits = []
-        time_idx = 0
-        out_len = out_len.item()
-        non_blank_indices = []
-        indices_to_last_non_blank = []
-        all_timestamps = []
-        all_output = []
-#        upgrade_timestamp = []  # True if the previous prediction is not a blank, and therefore we can
-        output = []
-
-        while time_idx < out_len:
+        t = states[-1][-1]
+        while t is not None:
+            time_steps.append(t)
+            t = states[t][-1]
+        for time_idx in reversed(time_steps):
             k = k_t[time_idx]
-            skip = k_d[time_idx] + 1
-            all_timestamps.append(time_idx)
-            all_output.append(k)
-            indices_to_last_non_blank.append(len(output))
-
             if k != self._blank_index:
                 # Append token to label set, update RNN state.
-                output.append(k)
-                non_blank_indices.append(len(all_timestamps) - 1)
-
-            time_idx += skip
-
-
-        for t in range(loop_count):
-            timestamp_tensor = torch.LongTensor(all_timestamps).to(x.device)
-            token_sequence = [[self._blank_index] + output]
-            token_sequence_tensor = torch.LongTensor(token_sequence).to(x.device)
-
-            decoded = self.decoder.fast_inference_run(token_sequence_tensor)
-
-            useful_frames = x[timestamp_tensor,::]
-
-            decoded = decoded.view([decoded.shape[1], 1, -1]) # [T, 1, D]
-            decoded_extended = decoded[indices_to_last_non_blank,:,:]
-
-            logits = self.joint.joint(useful_frames, decoded_extended)
-            logits = logits.view([-1, logits.shape[-1]])
-            v_t, k_t = logits[:,:-len(self.durations)].max(-1)
-
-            v_d, k_d = logits[:,-len(self.durations):].max(-1)
-
-            all_output = k_t.tolist()
-            output = k_t[non_blank_indices].tolist()
-
-            all_durations = k_d.tolist()
-            new_all_timestamps = [all_timestamps[0]]
-            for i in range(1, len(all_timestamps)):
-                if all_output[i - 1] != self._blank_index:
-                    new_all_timestamps.append(all_timestamps[i - 1] + all_durations[i] + 1)
-                else:
-                    new_all_timestamps.append(all_timestamps[i])
-
-            print("all_timestamps:     ", all_timestamps)
-            print("new_all_timestamps: ", new_all_timestamps)
-            print("all_output:         ", all_output)
-
-            all_timestamps = new_all_timestamps
-
-        hypothesis.y_sequence = output
+                hypothesis.y_sequence.append(k)
+                hypothesis.timestep.append(time_idx)
+                useful_logits.append(logits[time_idx,:].log_softmax(0).max(0)[0])
 
         return hypothesis
 
@@ -2687,7 +2668,10 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
 
             logits = self.joint.joint(useful_frames, decoder_embs)
             logits = logits.view([-1, logits.shape[-1]])
-            v_t, k_t = logits[:,:-len(self.durations)].max(-1)
+            if t == loop_count - 1:
+                v_t, k_t = logits[:,:-len(self.durations)].max(-1)
+            else:
+                v_t, k_t = logits[:,:-len(self.durations) - 1].max(-1)
             token_sequence = k_t.tolist()
             hypothesis.y_sequence = token_sequence
 
