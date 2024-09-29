@@ -402,10 +402,18 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
 
     @torch.no_grad()
     def _greedy_decode(
-        self, x: torch.Tensor, out_len: torch.Tensor, partial_hypotheses: Optional[rnnt_utils.Hypothesis] = None
+        self, x: torch.Tensor, out_len: torch.Tensor, subsampling_factor: int = 8, partial_hypotheses: Optional[rnnt_utils.Hypothesis] = None
     ):
         # x: [T, 1, D]
         # out_len: [seq_len]
+
+        T, _, D = x.shape
+        if T % subsampling_factor != 0:
+            t_to_add = subsampling_factor - T % subsampling_factor
+            x = torch.cat([x, torch.zeros([t_to_add, 1, D]).to(x.device)], dim=0)
+  
+        x = torch.reshape(x, [-1, 1, subsampling_factor * D])
+        out_len = x.shape[0]
 
         # Initialize blank state and empty label set in Hypothesis
         hypothesis = rnnt_utils.Hypothesis(score=0.0, y_sequence=[], dec_state=None, timestep=[], last_token=None)

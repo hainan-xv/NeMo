@@ -1306,6 +1306,7 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         self,
         jointnet: Dict[str, Any],
         num_classes: int,
+        sub_sampling_factor: int = 8,
         num_extra_outputs: int = 0,
         vocabulary: Optional[List] = None,
         log_softmax: Optional[bool] = None,
@@ -1351,6 +1352,7 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         self.pred_hidden = jointnet['pred_hidden']
         self.joint_hidden = jointnet['joint_hidden']
         self.activation = jointnet['activation']
+        self.sub_sampling_factor = sub_sampling_factor
 
         # Optional arguments
         dropout = jointnet.get('dropout', 0.0)
@@ -1383,6 +1385,14 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         # encoder = (B, D, T)
         # decoder = (B, D, U) if passed, else None
         encoder_outputs = encoder_outputs.transpose(1, 2)  # (B, T, D)
+        B, T, D = encoder_outputs.shape
+        s = self.sub_sampling_factor
+        if T % s != 0:
+            t_to_add = s - T % s
+            encoder_outputs = torch.cat([encoder_outputs, torch.zeros([B, t_to_add, D]).to(encoder_outputs.device)], dim=1)
+            T = T + t_to_add
+
+        encoder_outputs = torch.reshape(encoder_outputs, [B, T // s, D * s])
 
         if decoder_outputs is not None:
             decoder_outputs = decoder_outputs.transpose(1, 2)  # (B, U, D)
@@ -1622,7 +1632,7 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
             dropout: Dropout value to apply to joint.
         """
         pred = torch.nn.Linear(pred_n_hidden, joint_n_hidden)
-        enc = torch.nn.Linear(enc_n_hidden, joint_n_hidden)
+        enc = torch.nn.Linear(enc_n_hidden * self.sub_sampling_factor, joint_n_hidden)
 
         if activation not in ['relu', 'sigmoid', 'tanh']:
             raise ValueError("Unsupported activation for joint step - please pass one of " "[relu, sigmoid, tanh]")
