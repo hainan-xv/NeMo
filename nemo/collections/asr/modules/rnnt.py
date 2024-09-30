@@ -1184,6 +1184,44 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
         return cfg
 
 
+class LocalMultiHeadAttention(torch.nn.Module):
+    def __init__(self, d_model, num_heads=4, dropout=0.1):
+        super().__init__()
+        self.num_heads = num_heads
+        self.d_model = d_model
+
+        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
+
+        self.d_k = d_model // num_heads
+
+        self.W_q = torch.nn.Linear(d_model, d_model)
+        self.W_k = torch.nn.Linear(d_model, d_model)
+        self.W_v = torch.nn.Linear(d_model, d_model)
+        self.W_o = torch.nn.Linear(d_model, d_model)
+
+        self.dropout = torch.nn.Dropout(dropout)
+
+    def forward(self, q, k, v, mask=None):
+        batch_size = q.size(0)
+
+        q = self.W_q(q).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
+        k = self.W_k(k).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
+        v = self.W_v(v).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
+
+        scores = torch.matmul(q, k.transpose(-2, -1)) / torch.sqrt(torch.tensor(self.d_k, dtype=torch.float32))
+
+        if mask is not None:
+            scores = scores.masked_fill(mask == 0, -1e9)
+
+        attn = torch.nn.functional.softmax(scores, dim=-1)
+        attn = self.dropout(attn)
+
+        context = torch.matmul(attn, v)
+        context = context.transpose(1, 2).contiguous().view(batch_size, -1, self.d_model)
+
+        output = self.W_o(context)
+        return output
+
 class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin):
     """A Recurrent Neural Network Transducer Joint Network (RNN-T Joint Network).
     An RNN-T Joint network, comprised of a feedforward model.
@@ -1306,7 +1344,7 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         self,
         jointnet: Dict[str, Any],
         num_classes: int,
-        sub_sampling_factor: int = 8,
+        subsampling_factor: int,
         num_extra_outputs: int = 0,
         vocabulary: Optional[List] = None,
         log_softmax: Optional[bool] = None,
@@ -1314,6 +1352,7 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         fuse_loss_wer: bool = False,
         fused_batch_size: Optional[int] = None,
         experimental_fuse_loss_wer: Any = None,
+        num_heads: int = 4,
     ):
         super().__init__()
 
@@ -1352,18 +1391,30 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         self.pred_hidden = jointnet['pred_hidden']
         self.joint_hidden = jointnet['joint_hidden']
         self.activation = jointnet['activation']
-        self.sub_sampling_factor = sub_sampling_factor
-
+        self.subsampling_factor = subsampling_factor 
         # Optional arguments
         dropout = jointnet.get('dropout', 0.0)
 
-        self.pred, self.enc, self.joint_net = self._joint_net_modules(
-            num_classes=self._num_classes,  # add 1 for blank symbol
-            pred_n_hidden=self.pred_hidden,
-            enc_n_hidden=self.encoder_hidden,
-            joint_n_hidden=self.joint_hidden,
-            activation=self.activation,
-            dropout=dropout,
+        self.local_attention = LocalMultiHeadAttention(
+            d_model=self.joint_hidden,
+            num_heads=num_heads,
+            dropout=dropout
+        )
+
+        # Modified joint network modules
+        self.pred = torch.nn.Linear(self.pred_hidden, self.joint_hidden)
+        self.enc = torch.nn.Linear(self.encoder_hidden, self.joint_hidden)
+
+        if self.activation == 'relu':
+            activation = torch.nn.ReLU()
+        elif self.activation == 'tanh':
+            activation = torch.nn.Tanh()
+        else:
+            raise ValueError(f"Unsupported activation: {self.activation}")
+
+        self.joint_net = torch.nn.Sequential(
+            activation,
+            torch.nn.Linear(self.joint_hidden, self._num_classes)
         )
 
         # Flag needed for RNNT export support
@@ -1385,14 +1436,15 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         # encoder = (B, D, T)
         # decoder = (B, D, U) if passed, else None
         encoder_outputs = encoder_outputs.transpose(1, 2)  # (B, T, D)
+
         B, T, D = encoder_outputs.shape
-        s = self.sub_sampling_factor
+        s = self.subsampling_factor
         if T % s != 0:
             t_to_add = s - T % s
             encoder_outputs = torch.cat([encoder_outputs, torch.zeros([B, t_to_add, D]).to(encoder_outputs.device)], dim=1)
             T = T + t_to_add
 
-        encoder_outputs = torch.reshape(encoder_outputs, [B, T // s, D * s])
+        encoder_outputs = encoder_outputs.view(B, T // self.subsampling_factor, self.subsampling_factor * D)
 
         if decoder_outputs is not None:
             decoder_outputs = decoder_outputs.transpose(1, 2)  # (B, U, D)
@@ -1542,6 +1594,8 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         Returns:
             A torch.Tensor of shape [B, T, H]
         """
+        B, T, D = encoder_output.shape
+        encoder_output = torch.reshape(encoder_output, [B, T, self.subsampling_factor, -1])
         return self.enc(encoder_output)
 
     def project_prednet(self, prednet_output: torch.Tensor) -> torch.Tensor:
@@ -1586,72 +1640,47 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         Returns:
             Logits / log softmaxed tensor of shape (B, T, U, V + 1).
         """
-        f = f.unsqueeze(dim=2)  # (B, T, 1, H)
-        g = g.unsqueeze(dim=1)  # (B, 1, U, H)
-        inp = f + g  # [B, T, U, H]
+        B, T, N, H = f.shape
+        _, U, _ = g.shape
 
-        del f, g
+        # Prepare decoder outputs for attention
+        g_expanded = g.unsqueeze(1).expand(-1, T, -1, -1)
+        g_reshaped = g_expanded.reshape(B * T, U, H)
+
+        # Apply local attention
+        f_reshaped = f.reshape(B * T, N, H)
+        attended_f = self.local_attention(
+            q=g_reshaped,
+            k=f_reshaped,
+            v=f_reshaped
+        )
+
+        # Reshape attended encoder outputs
+        attended_f = attended_f.view(B, T, U, H)
+
+        # Sum the attended encoder outputs and decoder outputs
+        joint = attended_f + g_expanded
 
         # Forward adapter modules on joint hidden
         if self.is_adapter_available():
-            inp = self.forward_enabled_adapters(inp)
+            joint = self.forward_enabled_adapters(joint)
 
-        res = self.joint_net(inp)  # [B, T, U, V + 1]
-
-        del inp
+        res = self.joint_net(joint)
 
         if self.preserve_memory:
             torch.cuda.empty_cache()
 
-        # If log_softmax is automatic
+        # Apply log_softmax if needed
         if self.log_softmax is None:
             if not res.is_cuda:  # Use log softmax only if on CPU
-                if self.temperature != 1.0:
-                    res = (res / self.temperature).log_softmax(dim=-1)
-                else:
-                    res = res.log_softmax(dim=-1)
-        else:
-            if self.log_softmax:
-                if self.temperature != 1.0:
-                    res = (res / self.temperature).log_softmax(dim=-1)
-                else:
-                    res = res.log_softmax(dim=-1)
+                res = res.log_softmax(dim=-1)
+        elif self.log_softmax:
+            res = res.log_softmax(dim=-1)
 
         return res
 
-    def _joint_net_modules(self, num_classes, pred_n_hidden, enc_n_hidden, joint_n_hidden, activation, dropout):
-        """
-        Prepare the trainable modules of the Joint Network
+        return res
 
-        Args:
-            num_classes: Number of output classes (vocab size) excluding the RNNT blank token.
-            pred_n_hidden: Hidden size of the prediction network.
-            enc_n_hidden: Hidden size of the encoder network.
-            joint_n_hidden: Hidden size of the joint network.
-            activation: Activation of the joint. Can be one of [relu, tanh, sigmoid]
-            dropout: Dropout value to apply to joint.
-        """
-        pred = torch.nn.Linear(pred_n_hidden, joint_n_hidden)
-        enc = torch.nn.Linear(enc_n_hidden * self.sub_sampling_factor, joint_n_hidden)
-
-        if activation not in ['relu', 'sigmoid', 'tanh']:
-            raise ValueError("Unsupported activation for joint step - please pass one of " "[relu, sigmoid, tanh]")
-
-        activation = activation.lower()
-
-        if activation == 'relu':
-            activation = torch.nn.ReLU(inplace=True)
-        elif activation == 'sigmoid':
-            activation = torch.nn.Sigmoid()
-        elif activation == 'tanh':
-            activation = torch.nn.Tanh()
-
-        layers = (
-            [activation]
-            + ([torch.nn.Dropout(p=dropout)] if dropout else [])
-            + [torch.nn.Linear(joint_n_hidden, num_classes)]
-        )
-        return pred, enc, torch.nn.Sequential(*layers)
 
     # Adapter method overrides
     def add_adapter(self, name: str, cfg: DictConfig):

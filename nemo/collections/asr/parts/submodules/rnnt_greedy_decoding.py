@@ -337,6 +337,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
         decoder_model: rnnt_abstract.AbstractRNNTDecoder,
         joint_model: rnnt_abstract.AbstractRNNTJoint,
         blank_index: int,
+        subsampling_factor: int,
         max_symbols_per_step: Optional[int] = None,
         preserve_alignments: bool = False,
         preserve_frame_confidence: bool = False,
@@ -351,6 +352,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
             preserve_frame_confidence=preserve_frame_confidence,
             confidence_method_cfg=confidence_method_cfg,
         )
+        self.subsampling_factor = subsampling_factor
 
     @typecheck()
     def forward(
@@ -402,17 +404,19 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
 
     @torch.no_grad()
     def _greedy_decode(
-        self, x: torch.Tensor, out_len: torch.Tensor, subsampling_factor: int = 8, partial_hypotheses: Optional[rnnt_utils.Hypothesis] = None
+        self, x: torch.Tensor, out_len: torch.Tensor, partial_hypotheses: Optional[rnnt_utils.Hypothesis] = None
     ):
         # x: [T, 1, D]
         # out_len: [seq_len]
 
+
         T, _, D = x.shape
-        if T % subsampling_factor != 0:
-            t_to_add = subsampling_factor - T % subsampling_factor
+        if T % self.subsampling_factor != 0:
+            t_to_add = self.subsampling_factor - T % self.subsampling_factor
             x = torch.cat([x, torch.zeros([t_to_add, 1, D]).to(x.device)], dim=0)
+        out_len = x.shape[0]
   
-        x = torch.reshape(x, [-1, 1, subsampling_factor * D])
+        x = torch.reshape(x, [-1, 1, self.subsampling_factor * D])
         out_len = x.shape[0]
 
         # Initialize blank state and empty label set in Hypothesis
@@ -441,6 +445,8 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
             # Extract encoder embedding at timestep t
             # f = x[time_idx, :, :].unsqueeze(0)  # [1, 1, D]
             f = x.narrow(dim=0, start=time_idx, length=1)
+
+
 
             # Setup exit flags and counter
             not_blank = True

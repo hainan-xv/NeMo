@@ -243,6 +243,7 @@ class AbstractRNNTDecoding(ConfidenceMixin):
             elif self.cfg.strategy in ['beam', 'tsd', 'alsd', 'maes']:
                 self.preserve_alignments = self.cfg.beam.get('preserve_alignments', False)
 
+        self.subsampling_factor = self.cfg.greedy.get('subsampling_factor', 1)
         # Update compute timestamps
         if self.compute_timestamps is None:
             if self.cfg.strategy in ['greedy', 'greedy_batch']:
@@ -279,6 +280,7 @@ class AbstractRNNTDecoding(ConfidenceMixin):
                         decoder_model=decoder,
                         joint_model=joint,
                         blank_index=self.blank_id,
+                        subsampling_factor=self.subsampling_factor,
                         max_symbols_per_step=(
                             self.cfg.greedy.get('max_symbols', None)
                             or self.cfg.greedy.get('max_symbols_per_step', None)
