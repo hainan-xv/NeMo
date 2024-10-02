@@ -338,6 +338,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
         joint_model: rnnt_abstract.AbstractRNNTJoint,
         blank_index: int,
         subsampling_factor: int,
+        window_size: int,
         max_symbols_per_step: Optional[int] = None,
         preserve_alignments: bool = False,
         preserve_frame_confidence: bool = False,
@@ -353,6 +354,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
             confidence_method_cfg=confidence_method_cfg,
         )
         self.subsampling_factor = subsampling_factor
+        self.window_size = window_size
 
     @typecheck()
     def forward(
@@ -409,14 +411,31 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
         # x: [T, 1, D]
         # out_len: [seq_len]
 
+        x = x.transpose(0, 1)
+        B, T, D = x.shape
+        s = self.subsampling_factor
+        w = self.window_size
 
-        T, _, D = x.shape
-        if T % self.subsampling_factor != 0:
-            t_to_add = self.subsampling_factor - T % self.subsampling_factor
-            x = torch.cat([x, torch.zeros([t_to_add, 1, D]).to(x.device)], dim=0)
-        out_len = x.shape[0]
-  
-        x = torch.reshape(x, [-1, 1, self.subsampling_factor * D])
+        # Calculate the number of windows, including partial windows at the end
+        num_windows = (T - 1) // s + 1
+        # Create indices for the start of each window
+        window_starts = torch.arange(0, num_windows * s, s)
+        
+        # Create indices for each element in the windows
+        window_indices = window_starts.unsqueeze(1) + torch.arange(w).unsqueeze(0)
+        
+        # Clip indices to ensure we don't go out of bounds
+        window_indices = torch.clamp(window_indices, 0, T - 1)
+
+        mask = window_indices < T
+
+        enc = torch.zeros(B, num_windows, w, D, device=x.device)
+        enc[..., mask, :] = x[:, window_indices[mask]]
+
+        B, T, N, D = enc.shape
+        x = torch.reshape(enc, [T, 1, -1])
+
+        print("HERE x is", x.shape)
         out_len = x.shape[0]
 
         # Initialize blank state and empty label set in Hypothesis
@@ -445,8 +464,6 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
             # Extract encoder embedding at timestep t
             # f = x[time_idx, :, :].unsqueeze(0)  # [1, 1, D]
             f = x.narrow(dim=0, start=time_idx, length=1)
-
-
 
             # Setup exit flags and counter
             not_blank = True

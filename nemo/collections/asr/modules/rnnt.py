@@ -1345,6 +1345,7 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         jointnet: Dict[str, Any],
         num_classes: int,
         subsampling_factor: int,
+        window_size: int,
         num_extra_outputs: int = 0,
         vocabulary: Optional[List] = None,
         log_softmax: Optional[bool] = None,
@@ -1392,6 +1393,7 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         self.joint_hidden = jointnet['joint_hidden']
         self.activation = jointnet['activation']
         self.subsampling_factor = subsampling_factor 
+        self.window_size = window_size
         # Optional arguments
         dropout = jointnet.get('dropout', 0.0)
 
@@ -1439,12 +1441,26 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
 
         B, T, D = encoder_outputs.shape
         s = self.subsampling_factor
-        if T % s != 0:
-            t_to_add = s - T % s
-            encoder_outputs = torch.cat([encoder_outputs, torch.zeros([B, t_to_add, D]).to(encoder_outputs.device)], dim=1)
-            T = T + t_to_add
+        w = self.window_size
 
-        encoder_outputs = encoder_outputs.view(B, T // self.subsampling_factor, self.subsampling_factor * D)
+
+        # Calculate the number of windows, including partial windows at the end
+        num_windows = (T - 1) // s + 1
+        # Create indices for the start of each window
+        window_starts = torch.arange(0, num_windows * s, s)
+        
+        # Create indices for each element in the windows
+        window_indices = window_starts.unsqueeze(1) + torch.arange(w).unsqueeze(0)
+        
+        # Clip indices to ensure we don't go out of bounds
+        window_indices = torch.clamp(window_indices, 0, T - 1)
+
+        mask = window_indices < T
+
+        enc = torch.zeros(B, num_windows, w, D, device=encoder_outputs.device)
+        enc[..., mask, :] = encoder_outputs[:, window_indices[mask]]
+        
+        enc = enc.view(B, num_windows, w * D)
 
         if decoder_outputs is not None:
             decoder_outputs = decoder_outputs.transpose(1, 2)  # (B, U, D)
@@ -1456,7 +1472,7 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
                     "decoder_outputs can only be None for fused step!"
                 )
 
-            out = self.joint(encoder_outputs, decoder_outputs)  # [B, T, U, V + 1]
+            out = self.joint(enc, decoder_outputs)  # [B, T, U, V + 1]
             return out
 
         else:
@@ -1595,7 +1611,7 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
             A torch.Tensor of shape [B, T, H]
         """
         B, T, D = encoder_output.shape
-        encoder_output = torch.reshape(encoder_output, [B, T, self.subsampling_factor, -1])
+        encoder_output = torch.reshape(encoder_output, [B, T, self.window_size, -1])
         return self.enc(encoder_output)
 
     def project_prednet(self, prednet_output: torch.Tensor) -> torch.Tensor:
