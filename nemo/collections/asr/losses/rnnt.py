@@ -348,7 +348,8 @@ class RNNTLoss(Loss):
         loss:
             NeuralType(None)
         """
-        return {"loss": NeuralType(elements_type=LossType())}
+        return {"loss": NeuralType(elements_type=LossType()),
+                "posterior": NeuralType(elements_type=LogprobsType())}
 
     def __init__(self, num_classes, reduction: str = 'mean_batch', loss_name: str = "default", loss_kwargs=None):
         """
@@ -473,6 +474,7 @@ class RNNTLoss(Loss):
         # of the log_probs tensor, therefore we increment the input_lengths by the difference.
         # This difference is generally small.
         if log_probs.shape[1] != max_logit_len:
+            print("HERE log_probs", log_probs.shape, max_logit_len)
             log_probs = log_probs.narrow(dim=1, start=0, length=max_logit_len).contiguous()
 
         # Reduce transcript length to correct alignment if additional padding was applied.
@@ -488,7 +490,7 @@ class RNNTLoss(Loss):
         self._loss.reduction = None
 
         # Compute RNNT loss
-        loss = self._loss(acts=log_probs, labels=targets, act_lens=input_lengths, label_lens=target_lengths)
+        loss, posteriors = self._loss(acts=log_probs, labels=targets, act_lens=input_lengths, label_lens=target_lengths)
 
         # Loss reduction can be dynamic, so reset it after call
         self._loss.reduction = loss_reduction
@@ -505,4 +507,4 @@ class RNNTLoss(Loss):
             target_lengths,
         )
 
-        return loss
+        return loss, posteriors.detach()

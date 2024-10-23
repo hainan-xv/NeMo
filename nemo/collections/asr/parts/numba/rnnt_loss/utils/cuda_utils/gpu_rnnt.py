@@ -564,6 +564,7 @@ class GPUTDT(GPURNNT):
         self,
         label_acts: torch.Tensor,
         duration_acts: torch.Tensor,
+        posteriors: torch.Tensor,
         label_grads: Optional[torch.Tensor],
         duration_grads: Optional[torch.Tensor],
         costs: torch.Tensor,
@@ -708,6 +709,7 @@ class GPUTDT(GPURNNT):
                     duration_grads,
                     label_acts,
                     duration_acts,
+                    posteriors,
                     denom,
                     self.sigma,
                     alphas,
@@ -746,6 +748,7 @@ class GPUTDT(GPURNNT):
         self,
         label_acts: torch.Tensor,
         duration_acts: torch.Tensor,
+        posteriors: torch.Tensor,
         label_grads: torch.Tensor,
         duration_grads: torch.Tensor,
         costs: torch.Tensor,
@@ -766,7 +769,7 @@ class GPUTDT(GPURNNT):
             return global_constants.RNNTStatus.RNNT_STATUS_INVALID_VALUE
 
         return self.compute_cost_and_score(
-            label_acts, duration_acts, label_grads, duration_grads, costs, pad_labels, label_lengths, input_lengths
+            label_acts, duration_acts, posteriors, label_grads, duration_grads, costs, pad_labels, label_lengths, input_lengths
         )
 
     def score_forward(

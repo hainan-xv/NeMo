@@ -143,9 +143,13 @@ class _TDTNumba(Function):
         minibatch_size = label_acts.size(0)
         costs = torch.zeros(minibatch_size, device=label_acts.device, dtype=label_acts.dtype)
 
+        B, T, U, _ = label_acts.shape
+        posteriors = torch.zeros_like(label_acts[:,:,:,0].view([-1])) # shape of [B, T, U]
+
         loss_func(
             label_acts,
             duration_acts,
+            posteriors=posteriors,
             labels=labels,
             input_lengths=act_lens,
             label_lengths=label_lens,
@@ -161,6 +165,8 @@ class _TDTNumba(Function):
             num_threads=0,
         )
 
+        posteriors = torch.reshape(posteriors, [B, T, U])
+
         if reduction in ['sum', 'mean']:
             costs = costs.sum().unsqueeze_(-1)
             if reduction == 'mean':
@@ -173,10 +179,10 @@ class _TDTNumba(Function):
         ctx.label_grads = label_grads
         ctx.duration_grads = duration_grads
 
-        return costs
+        return costs, posteriors
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(ctx, grad_output, tmp):
         if grad_output is not None and ctx.label_grads is not None:
             grad_output = grad_output.view(-1, 1, 1, 1).to(ctx.label_grads)
             return (

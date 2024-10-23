@@ -1220,6 +1220,7 @@ def compute_tdt_grad_kernel(
     duration_grads: torch.Tensor,
     acts: torch.Tensor,
     duration_acts: torch.Tensor,
+    posteriors: torch.Tensor,
     denom: torch.Tensor,
     sigma: float,
     alphas: torch.Tensor,
@@ -1294,6 +1295,9 @@ def compute_tdt_grad_kernel(
     # Look up gradient calculation from rnnt_numpy.compute_gradient()
 
     if t < T and u < U:
+        if idx == 0:
+            posteriors[col] = alphas[col] + betas[col] - logll[mb]
+
         logpk_blank = (
             denom[col] + acts[col * alphabet_size + blank_] - sigma
         )  # whenever sigma is used, it is for logit under-normalization.

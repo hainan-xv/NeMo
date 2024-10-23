@@ -684,6 +684,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
         del signal
 
+
         # During training, loss must be computed, so decoder forward is necessary
         decoder, target_length, states = self.decoder(targets=transcript, target_length=transcript_len)
 
@@ -698,9 +699,33 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         if not self.joint.fuse_loss_wer:
             # Compute full joint and loss
             joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder)
-            loss_value = self.loss(
+            joint2 = self.joint(encoder_outputs=encoded, decoder_outputs=decoder * 0)
+           
+            loss_value, posteriors = self.loss(
                 log_probs=joint, targets=transcript, input_lengths=encoded_len, target_lengths=target_length
             )
+
+            loss_value += self.loss(
+                log_probs=joint2, targets=transcript, input_lengths=encoded_len, target_lengths=target_length
+            )[0]
+
+#            diff = torch.nn.functinal.log_softmax(joint) - torch.nn.functinal.log_softmax(joint2)
+#            kl = torch.nn.functional.kl_div(torch.nn.functional.log_softmax(joint), torch.nn.functional.log_softmax(joint2), log_target=True, reduction='batchmean')
+#            print("KL is", kl)
+
+#            reg_term = (joint - joint2) * (joint - joint2)
+            kl = torch.nn.functional.kl_div(torch.nn.functional.log_softmax(joint), torch.nn.functional.log_softmax(joint2), log_target=True, reduction='none')
+
+            kl = torch.sum(kl, dim=-1) * posteriors
+
+            print("KL IS", kl.shape)
+            
+            reg = torch.sum(kl)
+            
+
+#            print("HERE reg_term is", reg_term.shape)
+
+#            loss_value += kl
 
             # Add auxiliary losses, if registered
             loss_value = self.add_auxiliary_losses(loss_value)

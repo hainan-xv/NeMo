@@ -239,6 +239,7 @@ def rnnt_loss_gpu(
 def tdt_loss_gpu(
     label_acts: torch.Tensor,
     duration_acts: torch.Tensor,
+    posteriors: torch.Tensor,
     labels: torch.Tensor,
     input_lengths: torch.Tensor,
     label_lengths: torch.Tensor,
@@ -348,6 +349,7 @@ def tdt_loss_gpu(
         status = wrapper.cost_and_grad(
             label_acts=label_acts.data,
             duration_acts=duration_acts.data,
+            posteriors=posteriors.data,
             label_grads=label_grads.data,
             duration_grads=duration_grads.data,
             costs=costs.data,
