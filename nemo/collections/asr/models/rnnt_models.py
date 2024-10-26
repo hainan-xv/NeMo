@@ -701,11 +701,11 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder)
             joint2 = self.joint(encoder_outputs=encoded, decoder_outputs=decoder * 0)
            
-            loss_value, posteriors = self.loss(
+            loss_value1, posteriors = self.loss(
                 log_probs=joint, targets=transcript, input_lengths=encoded_len, target_lengths=target_length
             )
 
-            loss_value += self.loss(
+            loss_value2 = self.loss(
                 log_probs=joint2, targets=transcript, input_lengths=encoded_len, target_lengths=target_length
             )[0]
 
@@ -716,16 +716,18 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 #            reg_term = (joint - joint2) * (joint - joint2)
             kl = torch.nn.functional.kl_div(torch.nn.functional.log_softmax(joint), torch.nn.functional.log_softmax(joint2), log_target=True, reduction='none')
 
+            posteriors = torch.exp(posteriors)
             kl = torch.sum(kl, dim=-1) * posteriors
+            print("POSTERIOR is", posteriors)
 
-            print("KL IS", kl.shape)
+#            print("KL IS", kl.shape)
             
             reg = torch.sum(kl)
             
 
 #            print("HERE reg_term is", reg_term.shape)
 
-#            loss_value += kl
+            loss_value = reg + loss_value1 + loss_value2
 
             # Add auxiliary losses, if registered
             loss_value = self.add_auxiliary_losses(loss_value)
@@ -736,6 +738,8 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
             tensorboard_logs = {
                 'train_loss': loss_value,
+                'train_loss1': loss_value1,
+                'train_loss2': loss_value2,
                 'learning_rate': self._optimizer.param_groups[0]['lr'],
                 'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
             }
