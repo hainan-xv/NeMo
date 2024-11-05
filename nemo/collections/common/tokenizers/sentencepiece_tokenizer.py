@@ -65,6 +65,7 @@ class SentencePieceTokenizer(TokenizerSpec, ChatTemplateMixin):
         self.space_sensitive = self.text_to_tokens('x y') != self.text_to_tokens('x') + self.text_to_tokens('y')
 
     def text_to_tokens(self, text):
+        text = text[::-1]
         if self.legacy:
             tokens = []
             idx = 0
@@ -90,19 +91,21 @@ class SentencePieceTokenizer(TokenizerSpec, ChatTemplateMixin):
                 idx = next_idx + len(next_token)
 
             tokens.extend(self.tokenizer.encode_as_pieces(text[idx:]))
-            return tokens
+            return tokens[::-1]
 
-        return self.tokenizer.encode_as_pieces(text)
+        return self.tokenizer.encode_as_pieces(text)[::-1]
 
     def text_to_ids(self, text, sample_alpha=None):
         if isinstance(text, str):
             return self._text_to_ids(text, sample_alpha)
         elif isinstance(text, list):
+            assert False # not implemented
             return self.apply_chat_template(text)
         else:
             raise ValueError(f"Expected either str or list input, but got {type(text)}")
 
     def _text_to_ids(self, text, sample_alpha=None):
+        text = text[::-1]
         if self.legacy:
             ids = []
             idx = 0
@@ -128,23 +131,25 @@ class SentencePieceTokenizer(TokenizerSpec, ChatTemplateMixin):
                 idx = next_idx + len(next_token)
 
             ids.extend(self.tokenizer.encode_as_ids(text[idx:]))
-            return ids
+            return ids[::-1]
 
         if sample_alpha is not None:
-            return self.tokenizer.encode_as_ids(text, enable_sampling=True, alpha=sample_alpha, nbest_size=-1)
+            return self.tokenizer.encode_as_ids(text, enable_sampling=True, alpha=sample_alpha, nbest_size=-1)[::-1]
         else:
-            return self.tokenizer.encode_as_ids(text)
+            return self.tokenizer.encode_as_ids(text)[::-1]
 
     def tokens_to_text(self, tokens):
         if isinstance(tokens, np.ndarray):
             tokens = tokens.tolist()
 
-        return self.tokenizer.decode_pieces(tokens)
+        tokens = tokens[::-1]
+        return self.tokenizer.decode_pieces(tokens)[::-1]
 
     def ids_to_text(self, ids):
         if isinstance(ids, (np.ndarray, torch.Tensor)):
             ids = ids.tolist()
 
+        ids = ids[::-1]
         if self.legacy:
             text = ""
             last_i = 0
@@ -156,9 +161,9 @@ class SentencePieceTokenizer(TokenizerSpec, ChatTemplateMixin):
                     last_i = i + 1
 
             text += self.tokenizer.decode_ids(ids[last_i:])
-            return text.strip()
+            return text.strip()[::-1]
 
-        return self.tokenizer.decode_ids(ids)
+        return self.tokenizer.decode_ids(ids)[::-1]
 
     def token_to_id(self, token):
         if self.legacy and token in self.special_token_to_id:
