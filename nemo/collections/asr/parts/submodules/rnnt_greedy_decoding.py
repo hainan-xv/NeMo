@@ -222,7 +222,7 @@ class _GreedyRNNTInfer(Typing, ConfidenceMethodMixin):
         # output: [B, 1, K]
         return self.decoder.predict(label, hidden, add_sos=add_sos, batch_size=batch_size)
 
-    def _joint_step(self, enc, pred, log_normalize: Optional[bool] = None):
+    def _joint_step(self, enc, pred, last_label, log_normalize: Optional[bool] = None):
         """
         Common joint step based on AbstractRNNTJoint implementation.
 
@@ -235,7 +235,7 @@ class _GreedyRNNTInfer(Typing, ConfidenceMethodMixin):
              logits of shape (B, T=1, U=1, V + 1)
         """
         with torch.no_grad():
-            logits = self.joint.joint(enc, pred)
+            logits = self.joint.joint(enc, pred, last_label)
 
             if log_normalize is None:
                 if not logits.is_cuda:  # Use log softmax only if on CPU
@@ -2546,13 +2546,17 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
                 # In later timesteps, we provide previous predicted label as input.
                 if hypothesis.last_token is None and hypothesis.dec_state is None:
                     last_label = self._SOS
+                    LL = 0
                 else:
                     last_label = label_collate([[hypothesis.last_token]])
+                    LL = last_label
+
+                LL = torch.LongTensor([[LL]]).to(f.device)
 
                 # Perform prediction network and joint network steps.
                 g, hidden_prime = self._pred_step(last_label, hypothesis.dec_state)
                 # If preserving per-frame confidence, log_normalize must be true
-                logits = self._joint_step(f, g, log_normalize=False)
+                logits = self._joint_step(f, g, LL, log_normalize=False)
                 logp = logits[0, 0, 0, : -len(self.durations)]
                 if self.preserve_frame_confidence:
                     logp = torch.log_softmax(logp, -1)

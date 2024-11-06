@@ -367,6 +367,7 @@ class GreedyBatchedRNNTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMeth
                 self.joint.joint_after_projection(
                     encoder_output_projected[batch_indices, safe_time_indices].unsqueeze(1),
                     decoder_output,
+                    labels.unsqueeze(1),
                 )
                 .squeeze(1)
                 .squeeze(1)
