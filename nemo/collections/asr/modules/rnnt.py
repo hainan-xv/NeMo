@@ -1351,6 +1351,27 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         # to change, requires running ``model.temperature = T`` explicitly
         self.temperature = 1.0
 
+    def state_dict(self, *args, **kwargs):
+        """Override state_dict to include custom_list"""
+        state_dict = super().state_dict(*args, **kwargs)
+        state_dict['is_special'] = self.is_special
+        state_dict['one_distribution'] = self.one_distribution 
+
+        return state_dict
+
+    def load_state_dict(self, state_dict, strict=True):
+        """Override load_state_dict to handle custom_list"""
+        is_special = state_dict.pop('is_special', None)
+        one_distribution = state_dict.pop('one_distribution', None)
+
+        super().load_state_dict(state_dict, strict)
+
+        if is_special is not None:
+            self.one_distribution = one_distribution
+            self.is_special = is_special
+
+
+
     def read_vocab_file(self, vocab_file):
         if vocab_file == '':
             return None
@@ -1610,7 +1631,9 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
 
         res = self.joint_net(inp)  # [B, T, U, V + 1]
 
-        res[:,:,:,-self._num_extra_outputs:] = res[:,:,:,-self._num_extra_outputs:] * trans_is_special + self.one_distribution * (1 - trans_is_special)
+        n = self._num_extra_outputs
+        res[:,:,:,-n:] = res[:,:,:,-n:] * trans_is_special + self.one_distribution * (1 - trans_is_special)
+        res[:,:,:,-n-1:-n] = res[:,:,:,-n-1:-n] * trans_is_special + (res[:,:,:,-n-1:-n] - 1000) * (1 - trans_is_special)
 
         del inp
 
