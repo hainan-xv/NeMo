@@ -1317,7 +1317,7 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
 
         if durations is not None and len(durations) > 0:
             self.one_distribution = [0.0 for i in range(len(durations))]
-            self.one_distribution[self.one_idx] = 10.0
+            self.one_distribution[self.one_idx] = 100.0
             self.one_distribution = torch.Tensor(self.one_distribution)
 
         if preserve_memory:
