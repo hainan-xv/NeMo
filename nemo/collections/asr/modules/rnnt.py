@@ -1316,8 +1316,9 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
             self.one_idx = 1
 
         if durations is not None and len(durations) > 0:
-            self.one_distribution = [0.0 for i in range(len(durations))]
-            self.one_distribution[self.one_idx] = 100.0
+            self.one_distribution = [-1000.0 for i in range(len(durations))]
+            for i in range(self.one_idx + 1):
+                self.one_distribution[i] = 0.0   # allowing duration 0 and 1
             self.one_distribution = torch.Tensor(self.one_distribution)
 
         if preserve_memory:
@@ -1631,8 +1632,11 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
 
         res = self.joint_net(inp)  # [B, T, U, V + 1]
 
-        n = self._num_extra_outputs
-        res[:,:,:,-n:] = res[:,:,:,-n:] * trans_is_special + self.one_distribution * (1 - trans_is_special)
+        n = self._num_extra_outputs  # same as num_durations
+        # if special, nothing changes; else, adding one_distribution which masks out >=2 durations
+        res[:,:,:,-n:] = res[:,:,:,-n:] * trans_is_special + (res[:,:,:,-n:] + self.one_distribution) * (1 - trans_is_special)
+
+        # -n-1 corresponds to the blank token probability, which doesn't change if special, but masked out if non-special - basically, not allowing blank to follow non-special tokens
         res[:,:,:,-n-1:-n] = res[:,:,:,-n-1:-n] * trans_is_special + (res[:,:,:,-n-1:-n] - 1000) * (1 - trans_is_special)
 
         del inp
