@@ -526,6 +526,7 @@ class GPUTDT(GPURNNT):
         clamp: float,
         num_threads: int,
         stream,
+        is_terminal,
     ):
         """
         Helper class to launch the CUDA Kernels to compute TDT Loss (https://arxiv.org/pdf/2211.03541).
@@ -559,6 +560,7 @@ class GPUTDT(GPURNNT):
         self.num_durations = num_durations
         self.sigma = sigma
         self.omega = omega
+        self.is_terminal = is_terminal
 
     def compute_cost_and_score(
         self,
@@ -639,6 +641,7 @@ class GPUTDT(GPURNNT):
                 self.blank_,
                 durations,
                 self.num_durations,
+                self.is_terminal,
             )
 
         if training:
@@ -698,6 +701,7 @@ class GPUTDT(GPURNNT):
                     self.blank_,
                     durations,
                     self.num_durations,
+                    self.is_terminal,
                 )
 
                 # Compute gradient
@@ -725,6 +729,7 @@ class GPUTDT(GPURNNT):
                     self.num_durations,
                     self.fastemit_lambda_,
                     self.clamp_,
+                    self.is_terminal,
                 )
 
         # // cost copy, negate (for log likelihood) and update with additional regularizers

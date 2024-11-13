@@ -1277,7 +1277,6 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         fused_batch_size: Optional[int] = None,
         experimental_fuse_loss_wer: Any = None,
         masking_prob: float = -1.0,
-        vocab_file: str = '',
     ):
         super().__init__()
 
@@ -1307,19 +1306,6 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         # Log softmax should be applied explicitly only for CPU
         self.log_softmax = log_softmax
         self.preserve_memory = preserve_memory
-
-        self.is_special_list = self.read_vocab_file(vocab_file)
-        self.is_special = None
-        self.one_idx = 0
-
-        if durations is not None and len(durations) > 0 and durations[0] == 0:
-            self.one_idx = 1
-
-        if durations is not None and len(durations) > 0:
-            self.one_distribution = [-1000.0 for i in range(len(durations))]
-            for i in range(self.one_idx + 1):
-                self.one_distribution[i] = 0.0   # allowing duration 0 and 1
-            self.one_distribution = torch.Tensor(self.one_distribution)
 
         if preserve_memory:
             logging.warning(
@@ -1352,38 +1338,6 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         # to change, requires running ``model.temperature = T`` explicitly
         self.temperature = 1.0
 
-#    def state_dict(self, *args, **kwargs):
-#        """Override state_dict to include custom_list"""
-#        state_dict = super().state_dict(*args, **kwargs)
-#        state_dict['is_special'] = self.is_special
-#        state_dict['one_distribution'] = self.one_distribution 
-#
-#        return state_dict
-#
-#    def load_state_dict(self, state_dict, strict=True):
-#        """Override load_state_dict to handle custom_list"""
-#        is_special = state_dict.pop('is_special', None)
-#        one_distribution = state_dict.pop('one_distribution', None)
-#
-#        super().load_state_dict(state_dict, strict)
-#
-#        if is_special is not None:
-#            self.one_distribution = one_distribution
-#            self.is_special = is_special
-
-
-
-    def read_vocab_file(self, vocab_file):
-        if vocab_file == '':
-            return None
-        ifile = open(vocab_file, 'r')
-        is_special_list = []
-        for line in ifile:
-            token, _ = line.split()
-            is_special = token[0] == '▁' or token[-1] == '>'
-            is_special_list.append(is_special)
-
-        return is_special_list
 
 
     @typecheck()
@@ -1604,18 +1558,6 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
 
         B, _, U, _ = g.shape
 
-        if self.is_special == None:
-            self.is_special = torch.LongTensor(self.is_special_list).to(f.device)
-            self.one_distribution = self.one_distribution.to(f.device)
-
-        trans_is_special = self.is_special[transcription]
-
-        if trans_is_special.shape[1] < U:
-            BOS = torch.ones([B, 1], dtype=torch.long).to(g.device)
-            trans_is_special = torch.cat([BOS, trans_is_special], dim=-1)
-
-        trans_is_special = torch.reshape(trans_is_special, [B, 1, U, 1])
-
         if self.training and self.masking_prob > 0:
             [B, _, U, _] = g.shape
             rand = torch.rand([B, 1, U, 1]).to(g.device)
@@ -1631,13 +1573,6 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
             inp = self.forward_enabled_adapters(inp)
 
         res = self.joint_net(inp)  # [B, T, U, V + 1]
-
-        n = self._num_extra_outputs  # same as num_durations
-        # if special, nothing changes; else, adding one_distribution which masks out >=2 durations
-        res[:,:,:,-n:] = res[:,:,:,-n:] * trans_is_special + (res[:,:,:,-n:] + self.one_distribution) * (1 - trans_is_special)
-
-        # -n-1 corresponds to the blank token probability, which doesn't change if special, but masked out if non-special - basically, not allowing blank to follow non-special tokens
-        res[:,:,:,-n-1:-n] = res[:,:,:,-n-1:-n] * trans_is_special + (res[:,:,:,-n-1:-n] - 1000) * (1 - trans_is_special)
 
         del inp
 

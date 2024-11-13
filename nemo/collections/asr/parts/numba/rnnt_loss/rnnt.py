@@ -252,6 +252,7 @@ def tdt_loss_gpu(
     num_threads: int,
     sigma: float,
     omega: float,
+    is_terminal: torch.Tensor,
 ):
     """
     Wrapper method for accessing GPU TDT loss (https://arxiv.org/abs/2304.06795).
@@ -303,8 +304,13 @@ def tdt_loss_gpu(
 
     tdt_workspace = torch.zeros(len(durations), device=label_acts.device, dtype=torch.long, requires_grad=False)
 
+    is_terminal_workspace = torch.zeros(len(is_terminal), device=label_acts.device, dtype=torch.long, requires_grad=False)
+
     for i in range(0, len(durations)):
         tdt_workspace[i] = durations[i]
+
+    for i in range(0, len(is_terminal)):
+        is_terminal_workspace[i] = is_terminal[i]
 
     ### VIEW TENSORS AS VECTORS FOR POINTER INDEXING ###
     label_acts, label_acts_shape = rnnt_helper.flatten_tensor(label_acts)
@@ -325,6 +331,7 @@ def tdt_loss_gpu(
         stream=stream,
         sigma=sigma,
         omega=omega,
+        is_terminal=is_terminal_workspace,
     )
 
     if label_grads is None:

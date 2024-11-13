@@ -903,6 +903,7 @@ def compute_tdt_alphas_kernel(
     blank_: int,
     durations: torch.Tensor,
     num_durations: int,
+    is_terminal: torch.Tensor,
 ):
     """
     Compute alpha (forward variable) probabilities over the transduction step.
@@ -956,7 +957,7 @@ def compute_tdt_alphas_kernel(
     for n in range(1, T + U - 1):
         t = n - u
 
-        if u == 0:
+        if u == 0:   # stay at BOS
             # when u == 0, we only consider blank emissions.
             if t > 0 and t < T:
                 alphas[offset + t * maxU + u] = -INF
@@ -1004,34 +1005,44 @@ def compute_tdt_alphas_kernel(
                     if durations[i] == 0:
                         continue
                     if t >= durations[i]:
-                        no_emit = rnnt_helper.log_sum_exp(
-                            no_emit,  # current score
-                            alphas[offset + (t - durations[i]) * maxU + u]  # alpha(t - duration, u)
-                            + logp(
-                                denom, acts, maxT, maxU, alphabet_size, b, t - durations[i], u, blank_
-                            )  # logp of blank emission
-                            - sigma  #  logit under-normalization
-                            + logp_duration(
-                                duration_acts, maxT, maxU, num_durations, b, t - durations[i], u, i
-                            ),  # logp of duration
-                        )
+                        if u > 0 and not is_terminal[labels[u - 1]]:  # previous token is not terminal means we're in between a word and no blanks allowed
+                            no_emit = no_emit
+                        else:
+                            no_emit = rnnt_helper.log_sum_exp(
+                                no_emit,  # current score
+                                alphas[offset + (t - durations[i]) * maxU + u]  # alpha(t - duration, u)
+                                + logp(
+                                    denom, acts, maxT, maxU, alphabet_size, b, t - durations[i], u, blank_
+                                )  # logp of blank emission
+                                - sigma  #  logit under-normalization
+                                + logp_duration(
+                                    duration_acts, maxT, maxU, num_durations, b, t - durations[i], u, i
+                                ),  # logp of duration
+                            )
+
+
                     else:
                         break  # we can exit the loop early here, same as the case for u == 0 above.
 
                 emit = -INF  # emit stores the score for non-blank emissions.
                 for i in range(num_durations):
                     if t >= durations[i]:
-                        emit = rnnt_helper.log_sum_exp(
-                            emit,  # current score
-                            alphas[offset + (t - durations[i]) * maxU + u - 1]  # alpha(t - duration, u - 1)
-                            + logp(
-                                denom, acts, maxT, maxU, alphabet_size, b, t - durations[i], u - 1, labels[u - 1]
-                            )  # logp of non-blank emission
-                            - sigma  #  logit under-normalization
-                            + logp_duration(
-                                duration_acts, maxT, maxU, num_durations, b, t - durations[i], u - 1, i
-                            ),  # logp of duration
-                        )
+                        if durations[i] > 1 and u > 0 and not is_terminal[labels[u - 1]]:
+                            emit = emit
+                        else:
+                            emit = rnnt_helper.log_sum_exp(
+                                emit,  # current score
+                                alphas[offset + (t - durations[i]) * maxU + u - 1]  # alpha(t - duration, u - 1)
+                                + logp(
+                                    denom, acts, maxT, maxU, alphabet_size, b, t - durations[i], u - 1, labels[u - 1]
+                                )  # logp of non-blank emission
+                                - sigma  #  logit under-normalization
+                                + logp_duration(
+                                    duration_acts, maxT, maxU, num_durations, b, t - durations[i], u - 1, i
+                                ),  # logp of duration
+                            )
+
+
                     else:
                         break  # we can exit the loop early here, same as the case for u == 0 above.
 
@@ -1091,6 +1102,7 @@ def compute_tdt_betas_kernel(
     blank_: int,
     durations: torch.Tensor,
     num_durations: int,
+    is_terminal: torch.Tensor,
 ):
     """
     Compute beta (backward variable) probabilities over the transduction step.
@@ -1211,24 +1223,30 @@ def compute_tdt_betas_kernel(
                     if durations[i] == 0:
                         continue
                     if t + durations[i] < T:
-                        no_emit = rnnt_helper.log_sum_exp(
-                            no_emit,
-                            betas[offset + (t + durations[i]) * maxU + u]
-                            + logp(denom, acts, maxT, maxU, alphabet_size, b, t, u, blank_)
-                            + logp_duration(duration_acts, maxT, maxU, num_durations, b, t, u, i)
-                            - sigma,
-                        )
+                        if u >= 0 and not is_terminal[labels[u]]:
+                            pass
+                        else:
+                            no_emit = rnnt_helper.log_sum_exp(
+                                no_emit,
+                                betas[offset + (t + durations[i]) * maxU + u]
+                                + logp(denom, acts, maxT, maxU, alphabet_size, b, t, u, blank_)
+                                + logp_duration(duration_acts, maxT, maxU, num_durations, b, t, u, i)
+                                - sigma,
+                            )
 
                 emit = -INF
                 for i in range(num_durations):
                     if t + durations[i] < T:
-                        emit = rnnt_helper.log_sum_exp(
-                            emit,
-                            betas[offset + (t + durations[i]) * maxU + u + 1]
-                            + logp(denom, acts, maxT, maxU, alphabet_size, b, t, u, labels[u])
-                            + logp_duration(duration_acts, maxT, maxU, num_durations, b, t, u, i)
-                            - sigma,
-                        )
+                        if durations[i] > 1 and not is_terminal[labels[u]]:
+                            pass
+                        else:
+                            emit = rnnt_helper.log_sum_exp(
+                                emit,
+                                betas[offset + (t + durations[i]) * maxU + u + 1]
+                                + logp(denom, acts, maxT, maxU, alphabet_size, b, t, u, labels[u])
+                                + logp_duration(duration_acts, maxT, maxU, num_durations, b, t, u, i)
+                                - sigma,
+                            )
 
                 # combining all blank emissions and all non-blank emissions.
                 betas[offset + t * maxU + u] = rnnt_helper.log_sum_exp(emit, no_emit)
@@ -1264,6 +1282,7 @@ def compute_tdt_grad_kernel(
     num_durations: int,
     fastemit_lambda: float,
     clamp: float,
+    is_terminal: torch.Tensor,
 ):
     """
     Compute gradients over the transduction step.
@@ -1327,12 +1346,18 @@ def compute_tdt_grad_kernel(
 
         if idx < num_durations:
             grad = 0.0
-            if t + durations[idx] < T and u < U - 1:  # for label
-                logpk_label = denom[col] + acts[col * alphabet_size + labels[u]] - sigma
-                grad -= math.exp(alphas[col] + betas[col + 1 + durations[idx] * maxU] + logpk_label - logll[mb])
+            if t + durations[idx] < T and u < U - 1:  # for labelA
+                if durations[idx] > 1 and not is_terminal[labels[u]]:
+                    pass
+                else:
+                    logpk_label = denom[col] + acts[col * alphabet_size + labels[u]] - sigma
+                    grad -= math.exp(alphas[col] + betas[col + 1 + durations[idx] * maxU] + logpk_label - logll[mb])
 
             if t + durations[idx] < T and durations[idx] > 0:  # for blank in the middle
-                grad -= math.exp(alphas[col] + betas[col + durations[idx] * maxU] + logpk_blank - logll[mb])
+                if u == 0 or not is_terminal[labels[u - 1]]:
+                    pass
+                else:
+                    grad -= math.exp(alphas[col] + betas[col + durations[idx] * maxU] + logpk_blank - logll[mb])
 
             if t + durations[idx] == T and u == U - 1 and durations[idx] > 0:  # for blank as the last symbol
                 grad -= math.exp(alphas[col] + logpk_blank - logll[mb])
@@ -1392,7 +1417,7 @@ def compute_tdt_grad_kernel(
 
             # grad of blank across t < T;
             # grad[b, t<T-1, u, v=blank] -= exp(alphas[b, t, u] + logpk - sigma + logp_duration - logll[b] + betas[b, t + duration, u]) for all non-zero durations
-            if idx == blank_:
+            if idx == blank_ and ( u == 0 or is_terminal[labels[u - 1]] ) :
                 for i in range(num_durations):
                     if durations[i] == 0:
                         continue
@@ -1414,15 +1439,18 @@ def compute_tdt_grad_kernel(
                 # multiplying (1.0 + fastemit_lambda) with result.
                 for i in range(num_durations):
                     if t + durations[i] < T:
-                        grad -= math.exp(
-                            math.log1p(fastemit_lambda)
-                            + alphas[col]
-                            + logpk
-                            - sigma
-                            - logll[mb]
-                            + betas[col + 1 + maxU * durations[i]]
-                            + duration_acts[col * num_durations + i]
-                        )
+                        if durations[i] > 1 and not is_terminal[idx]:
+                            pass
+                        else:
+                            grad -= math.exp(
+                                math.log1p(fastemit_lambda)
+                                + alphas[col]
+                                + logpk
+                                - sigma
+                                - logll[mb]
+                                + betas[col + 1 + maxU * durations[i]]
+                                + duration_acts[col * num_durations + i]
+                            )
 
             # update grads[b, t, u, v] = grad
             label_grads[col * alphabet_size + idx] = grad

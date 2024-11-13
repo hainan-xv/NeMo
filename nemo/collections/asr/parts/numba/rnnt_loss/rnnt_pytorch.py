@@ -111,6 +111,7 @@ class _TDTNumba(Function):
         clamp,
         sigma,
         omega,
+        is_terminal,
     ):
         """
         log_probs: Tensor of (batch x seqLength x labelLength x outputDim) containing output from network
@@ -159,6 +160,7 @@ class _TDTNumba(Function):
             sigma=sigma,
             omega=omega,
             num_threads=0,
+            is_terminal=is_terminal,
         )
 
         if reduction in ['sum', 'mean']:
@@ -182,6 +184,7 @@ class _TDTNumba(Function):
             return (
                 ctx.label_grads.mul_(grad_output),
                 ctx.duration_grads.mul_(grad_output),
+                None,
                 None,
                 None,
                 None,
@@ -532,6 +535,7 @@ class TDTLossNumba(Module):
     def __init__(
         self,
         blank,
+        is_terminal,
         durations=None,
         reduction='mean',
         fastemit_lambda: float = 0.0,
@@ -548,6 +552,7 @@ class TDTLossNumba(Module):
         self.loss = _TDTNumba.apply
         self.sigma = sigma
         self.omega = omega
+        self.is_terminal = is_terminal
 
     def forward(self, acts, labels, act_lens, label_lens):
         """
@@ -578,6 +583,7 @@ class TDTLossNumba(Module):
             self.clamp,
             self.sigma,
             self.omega,
+            self.is_terminal,
         )
 
 
