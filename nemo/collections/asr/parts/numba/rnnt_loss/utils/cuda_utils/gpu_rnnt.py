@@ -560,7 +560,8 @@ class GPUTDT(GPURNNT):
         self.num_durations = num_durations
         self.sigma = sigma
         self.omega = omega
-        self.is_terminal = is_terminal
+#        print("IS TERMINAL", is_terminal)
+        self.is_terminal = cuda.as_cuda_array(is_terminal)
 
     def compute_cost_and_score(
         self,

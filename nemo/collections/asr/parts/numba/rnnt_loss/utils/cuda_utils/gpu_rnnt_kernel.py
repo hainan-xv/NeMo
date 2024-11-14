@@ -1006,7 +1006,7 @@ def compute_tdt_alphas_kernel(
                         continue
                     if t >= durations[i]:
                         if u > 0 and not is_terminal[labels[u - 1]]:  # previous token is not terminal means we're in between a word and no blanks allowed
-                            no_emit = no_emit
+                            pass
                         else:
                             no_emit = rnnt_helper.log_sum_exp(
                                 no_emit,  # current score
@@ -1028,7 +1028,7 @@ def compute_tdt_alphas_kernel(
                 for i in range(num_durations):
                     if t >= durations[i]:
                         if durations[i] > 1 and u > 0 and not is_terminal[labels[u - 1]]:
-                            emit = emit
+                            pass
                         else:
                             emit = rnnt_helper.log_sum_exp(
                                 emit,  # current score
@@ -1354,7 +1354,7 @@ def compute_tdt_grad_kernel(
                     grad -= math.exp(alphas[col] + betas[col + 1 + durations[idx] * maxU] + logpk_label - logll[mb])
 
             if t + durations[idx] < T and durations[idx] > 0:  # for blank in the middle
-                if u == 0 or not is_terminal[labels[u - 1]]:
+                if u > 0 and not is_terminal[labels[u - 1]]):
                     pass
                 else:
                     grad -= math.exp(alphas[col] + betas[col + durations[idx] * maxU] + logpk_blank - logll[mb])
@@ -1389,15 +1389,18 @@ def compute_tdt_grad_kernel(
 
                 for i in range(num_durations):
                     if t + durations[i] < T:
-                        fastemit_grad += fastemit_lambda * math.exp(
-                            alphas[col]  # alphas(t, u)
-                            + (denom[col] + acts[col * alphabet_size + labels[u]])  # log prob of token emission
-                            + duration_acts[col * num_durations + i]  # duration log-prob
-                            + betas[col + 1 + durations[i] * maxU]  # betas(t, u+1)
-                            + logpk  # log Pr(k|t, u)
-                            - sigma  # for logit under-normalization
-                            - logll[mb]  # total log likelihood for normalization
-                        )
+                        if durations[i] > 1 and not is_terminal[labels[u]]:
+                            pass
+                        else:
+                            fastemit_grad += fastemit_lambda * math.exp(
+                                alphas[col]  # alphas(t, u)
+                                + (denom[col] + acts[col * alphabet_size + labels[u]])  # log prob of token emission
+                                + duration_acts[col * num_durations + i]  # duration log-prob
+                                + betas[col + 1 + durations[i] * maxU]  # betas(t, u+1)
+                                + logpk  # log Pr(k|t, u)
+                                - sigma  # for logit under-normalization
+                                - logll[mb]  # total log likelihood for normalization
+                            )
             else:
                 fastemit_grad = 0.0
 

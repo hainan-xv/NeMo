@@ -86,7 +86,7 @@ class RNNTLossConfig:
 
 def read_vocab_file(vocab_file):
     if vocab_file == '':
-        return None
+        return []
 
     ifile = open(vocab_file, 'r')
     is_terminal_list = []
@@ -312,7 +312,7 @@ def resolve_rnnt_loss(loss_name: str, blank_idx: int, loss_kwargs: dict = None) 
         durations = loss_kwargs.pop('durations', None)
         sigma = loss_kwargs.pop('sigma', 0.0)
         omega = loss_kwargs.pop('omega', 0.0)
-        vocab_file = loss_kwargs.pop('vocab_file', 0.0)
+        vocab_file = loss_kwargs.pop('vocab_file', '')
 
         is_terminal = read_vocab_file(vocab_file)
 
