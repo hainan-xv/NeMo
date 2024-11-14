@@ -1027,7 +1027,7 @@ def compute_tdt_alphas_kernel(
                 emit = -INF  # emit stores the score for non-blank emissions.
                 for i in range(num_durations):
                     if t >= durations[i]:
-                        if durations[i] > 1 and u > 0 and not is_terminal[labels[u - 1]]:
+                        if durations[i] > 1 and not is_terminal[labels[u - 1]]:
                             pass
                         else:
                             emit = rnnt_helper.log_sum_exp(
@@ -1041,7 +1041,6 @@ def compute_tdt_alphas_kernel(
                                     duration_acts, maxT, maxU, num_durations, b, t - durations[i], u - 1, i
                                 ),  # logp of duration
                             )
-
 
                     else:
                         break  # we can exit the loop early here, same as the case for u == 0 above.
@@ -1354,7 +1353,7 @@ def compute_tdt_grad_kernel(
                     grad -= math.exp(alphas[col] + betas[col + 1 + durations[idx] * maxU] + logpk_label - logll[mb])
 
             if t + durations[idx] < T and durations[idx] > 0:  # for blank in the middle
-                if u > 0 and not is_terminal[labels[u - 1]]):
+                if u > 0 and not is_terminal[labels[u - 1]]:
                     pass
                 else:
                     grad -= math.exp(alphas[col] + betas[col + durations[idx] * maxU] + logpk_blank - logll[mb])
@@ -1420,19 +1419,22 @@ def compute_tdt_grad_kernel(
 
             # grad of blank across t < T;
             # grad[b, t<T-1, u, v=blank] -= exp(alphas[b, t, u] + logpk - sigma + logp_duration - logll[b] + betas[b, t + duration, u]) for all non-zero durations
-            if idx == blank_ and ( u == 0 or is_terminal[labels[u - 1]] ) :
-                for i in range(num_durations):
-                    if durations[i] == 0:
-                        continue
-                    if t < T - durations[i]:
-                        grad -= math.exp(
-                            alphas[col]
-                            + logpk
-                            - sigma
-                            - logll[mb]
-                            + betas[col + maxU * durations[i]]
-                            + duration_acts[col * num_durations + i]
-                        )
+            if idx == blank_:
+                if u > 0 and not is_terminal[labels[u - 1]]:
+                    pass
+                else:
+                    for i in range(num_durations):
+                        if durations[i] == 0:
+                            continue
+                        if t < T - durations[i]:
+                            grad -= math.exp(
+                                alphas[col]
+                                + logpk
+                                - sigma
+                                - logll[mb]
+                                + betas[col + maxU * durations[i]]
+                                + duration_acts[col * num_durations + i]
+                            )
 
             # grad of correct token across u < U;
             # grad[b, t, u<U-1, v=label[u]] -= exp(alphas[b, t, u] + logpk - sigma + logp_duration - logll[b] + betas[b, t + duration, u + 1]) for all blank durations.
