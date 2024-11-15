@@ -143,13 +143,14 @@ class TDTLossPytorch(Loss):
         """
         return {"loss": NeuralType(elements_type=LossType())}
 
-    def __init__(self, blank: int, durations: List[int] = [], reduction: str = 'sum', sigma: float = 0.0):
+    def __init__(self, blank: int, durations: List[int] = [], reduction: str = 'sum', sigma: float = 0.0, is_terminal: List[int] = []):
         super().__init__()
         self.blank = blank
         self.durations = durations
         self.n_durations = len(durations)
         self.reduction = reduction
         self.sigma = sigma
+        self.is_terminal = is_terminal
 
     def forward(self, acts, labels, act_lens, label_lens):
         label_acts = acts[:, :, :, : -self.n_durations]
@@ -217,7 +218,10 @@ class TDTLossPytorch(Loss):
                                         + acts[b, t - l, u, self.blank]
                                         + duration_acts[b, t - l, u, n]
                                     )
-                                    log_alpha[b, t, u] = self.logsumexp(tmp, 1.0 * log_alpha[b, t, u])
+                                    if not self.is_terminal[labels[b, u - 1]]:
+                                        pass
+                                    else:
+                                        log_alpha[b, t, u] = self.logsumexp(tmp, 1.0 * log_alpha[b, t, u])
 
                                 # non-blank emissions.
                                 tmp = (
@@ -225,7 +229,10 @@ class TDTLossPytorch(Loss):
                                     + acts[b, t - l, u - 1, labels[b, u - 1]]
                                     + duration_acts[b, t - l, u - 1, n]
                                 )
-                                log_alpha[b, t, u] = self.logsumexp(tmp, 1.0 * log_alpha[b, t, u])
+                                if not self.is_terminal[labels[b, u - 1]] and l > 1:
+                                    pass
+                                else:
+                                    log_alpha[b, t, u] = self.logsumexp(tmp, 1.0 * log_alpha[b, t, u])
 
         log_probs = []
         for b in range(B):
@@ -239,6 +246,7 @@ class TDTLossPytorch(Loss):
                         + acts[b, act_lens[b] - l, label_lens[b], self.blank]
                         + duration_acts[b, act_lens[b] - l, label_lens[b], n]
                     )
+                    assert self.is_terminal[labels[b, label_lens[b] - 1]]
 
                     tt = self.logsumexp(bb, 1.0 * tt)
 

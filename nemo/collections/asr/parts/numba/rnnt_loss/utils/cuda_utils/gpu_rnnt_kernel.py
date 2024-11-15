@@ -1081,6 +1081,7 @@ def compute_tdt_alphas_kernel(
                 break
 
         llForward[b] = loglike
+#        print("FORWARD", llForward[b])
 
 
 @cuda.jit()
@@ -1222,7 +1223,7 @@ def compute_tdt_betas_kernel(
                     if durations[i] == 0:
                         continue
                     if t + durations[i] < T:
-                        if u >= 0 and not is_terminal[labels[u]]:
+                        if u > 0 and not is_terminal[labels[u - 1]]:
                             pass
                         else:
                             no_emit = rnnt_helper.log_sum_exp(
@@ -1256,6 +1257,7 @@ def compute_tdt_betas_kernel(
     # After final sync, betas[b, 0, 0] gives log-likelihood of backward pass, same with conventional Transducers.
     if u == 0:
         llBackward[b] = betas[offset]
+#        print("BACKWARD", betas[offset])
 
 
 @cuda.jit()
@@ -1353,13 +1355,17 @@ def compute_tdt_grad_kernel(
                     grad -= math.exp(alphas[col] + betas[col + 1 + durations[idx] * maxU] + logpk_label - logll[mb])
 
             if t + durations[idx] < T and durations[idx] > 0:  # for blank in the middle
+#                if not is_terminal[labels[u]]:
                 if u > 0 and not is_terminal[labels[u - 1]]:
                     pass
                 else:
                     grad -= math.exp(alphas[col] + betas[col + durations[idx] * maxU] + logpk_blank - logll[mb])
 
             if t + durations[idx] == T and u == U - 1 and durations[idx] > 0:  # for blank as the last symbol
-                grad -= math.exp(alphas[col] + logpk_blank - logll[mb])
+#                if not is_terminal[labels[u]]:
+#                    pass
+#                else:
+                    grad -= math.exp(alphas[col] + logpk_blank - logll[mb])
 
             grad = grad * math.exp(duration_acts[col * num_durations + idx])
             duration_grads[col * num_durations + idx] = grad
