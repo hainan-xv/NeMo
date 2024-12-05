@@ -2533,7 +2533,15 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
         while time_idx < out_len:
             # Extract encoder embedding at timestep t
             # f = x[time_idx, :, :].unsqueeze(0)  # [1, 1, D]
-            f = x.narrow(dim=0, start=time_idx, length=1)
+            num_durations = min(len(self.durations), out_len - time_idx + 1)  # +1 for 0 duration
+            length = num_durations - 1
+            f = x.narrow(dim=0, start=time_idx, length=length)  # say num_durations = 5, we only need to consider 4 into the future
+
+            _, _, D = f.shape  # length, 1, D
+            f = torch.reshape(f, [1, length, D])
+
+            if num_durations < len(self.durations):
+                f = torch.cat([f, torch.zeros([1, len(self.durations) - num_durations, D]).to(f.device)], dim=1)
 
             # Setup exit flags and counter
             not_blank = True
@@ -2553,11 +2561,14 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
                 g, hidden_prime = self._pred_step(last_label, hypothesis.dec_state)
                 # If preserving per-frame confidence, log_normalize must be true
                 logits = self._joint_step(f, g, log_normalize=False)
+#                print("HERE greedy logits is", logits.shape)
                 logp = logits[0, 0, 0, : -len(self.durations)]
+#                print("HERE logp logits is", logp.shape)
                 if self.preserve_frame_confidence:
                     logp = torch.log_softmax(logp, -1)
 
-                duration_logp = torch.log_softmax(logits[0, 0, 0, -len(self.durations) :], dim=-1)
+                duration_logp = torch.log_softmax(logits[0, 0, 0, -len(self.durations) : ], dim=-1)
+#                print("HERE greedy duration_logp", duration_logp.shape, length)
                 del g
 
                 # torch.max(0) op doesnt exist for FP 16.

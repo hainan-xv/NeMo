@@ -27,7 +27,7 @@
 # limitations under the License.
 
 from typing import Any, Dict, List, Optional, Tuple, Union
-
+import math
 import torch
 from omegaconf import DictConfig, OmegaConf
 
@@ -50,6 +50,8 @@ from nemo.core.neural_types import (
     SpectrogramType,
 )
 from nemo.utils import logging
+
+import torch.nn.functional as F
 
 
 class StatelessTransducerDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable):
@@ -1283,7 +1285,7 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
 
         self._vocab_size = num_classes
         self._num_extra_outputs = num_extra_outputs
-        self._num_classes = num_classes + 1 + num_extra_outputs  # 1 is for blank
+        self._num_classes = num_classes + 1 # + num_extra_outputs  # 1 is for blank
 
         self.masking_prob = masking_prob
         if self.masking_prob > 0.0:
@@ -1520,6 +1522,58 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         """
         return self.pred(prednet_output)
 
+    def compute_jump_probabilities(self, enc, joined, max_distance):
+        """
+        Compute probabilities of jumping d frames using vectorized operations.
+        
+        Args:
+            enc: Tensor of shape [B, T, 1, H] - encoded representations
+            joined: Tensor of shape [B, T, U, H] - joined representations
+            max_distance: int - maximum supported jump distance D
+        
+        Returns:
+            Tensor of shape [B, T, U, D] containing jump probabilities
+        """
+        B, T, U, H = joined.shape
+        assert enc.shape == (B, T, 1, H), f"Expected enc shape [B, T, 1, H], got {enc.shape}"
+        
+        # First, expand enc to match U dimension
+        enc_expanded = (1 * enc).expand(-1, -1, U, -1)  # Shape: [B, T, U, H]
+        
+        # Create a tensor of all possible shifted versions of enc
+        # We'll create a [B, T, U, D, H] tensor where each slice along D
+        # represents enc shifted by d positions
+        shifted_enc = torch.stack(
+            [
+                F.pad(enc_expanded[:, d:] * 1.0, (0, 0, 0, 0, 0, d))  # Pad at the end to maintain shape
+                for d in range(max_distance)
+            ],
+            dim=3
+        )  # Shape: [B, T, U, D, H]
+        
+        # Expand joined to match the D dimension
+        joined_expanded = (1 * joined).unsqueeze(3)  # Shape: [B, T, U, 1, H]
+        
+        # Compute dot products between shifted_enc and joined for all distances at once
+        # Use broadcasting for the computation
+        dots = torch.sum(shifted_enc * joined_expanded, dim=-1) / math.sqrt(H * 1.0)  # Shape: [B, T, U, D]
+        
+        # Create a mask for invalid positions (where t+d >= T)
+#        mask = torch.arange(T, device=enc.device).unsqueeze(1) + torch.arange(max_distance, device=enc.device)  # Shape: [T, D]
+##        print("HERE mask is", mask)
+#        mask = (mask < T + 1).unsqueeze(0).unsqueeze(2)  # Shape: [1, T, 1, D]
+        
+        # Apply mask and set invalid positions to large negative value
+#        dots = dots.masked_fill(~mask, -9999900.0)
+#        dots = dots.masked_fill(~mask, float('-inf'))
+        
+        # Apply softmax over the distance dimension
+#        probs = F.log_softmax(dots, dim=-1)
+        
+        return dots
+#        return probs
+
+
     def joint_after_projection(self, f: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
         """
         Compute the joint step of the network after projection.
@@ -1561,6 +1615,9 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
 
         inp = f + g  # [B, T, U, H]
 
+#        duration_logits = self.compute_jump_probabilities(f[:,:,:,:32], inp[:,:,:,:32], self._num_extra_outputs)
+        duration_logits = self.compute_jump_probabilities(f[:,:,:,:], inp[:,:,:,:], self._num_extra_outputs)
+
         del f, g
 
         # Forward adapter modules on joint hidden
@@ -1568,6 +1625,8 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
             inp = self.forward_enabled_adapters(inp)
 
         res = self.joint_net(inp)  # [B, T, U, V + 1]
+
+        res = torch.cat([res * 1.0, duration_logits * 1.0], dim=-1)
 
         del inp
 

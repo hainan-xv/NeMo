@@ -83,7 +83,8 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         num_classes = self.joint.num_classes_with_blank - 1  # for standard RNNT and multi-blank
 
         if loss_name == 'tdt':
-            num_classes = num_classes - self.joint.num_extra_outputs
+            num_classes = num_classes #- self.joint.num_extra_outputs
+            print("HERE num_classes", num_classes)
 
         self.loss = RNNTLoss(
             num_classes=num_classes,
