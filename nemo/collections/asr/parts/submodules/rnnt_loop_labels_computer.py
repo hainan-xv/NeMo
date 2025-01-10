@@ -336,6 +336,8 @@ class GreedyBatchedRNNTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMeth
         state = self.decoder.initialize_state(encoder_output_projected)
         # indices of elements in batch (constant)
         batch_indices = torch.arange(batch_size, dtype=torch.long, device=device)
+        expanded_batch_indices = batch_indices.unsqueeze(1).expand(-1, lookahead_n)
+        offsets = torch.arange(lookahead_n, device=encoder_output_projected.device)
         # last found labels - initially <SOS> (<blank>) symbol
         labels = torch.full_like(batch_indices, fill_value=self._SOS)
 
@@ -365,10 +367,8 @@ class GreedyBatchedRNNTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMeth
             # stage 2: get joint output, iteratively seeking for non-blank labels
             # blank label in `labels` tensor means "end of hypothesis" (for this index)
 
-            offsets = torch.arange(lookahead_n, device=encoder_output_projected.device)
             expanded_time_indices = safe_time_indices.unsqueeze(1) + offsets.unsqueeze(0)
             expanded_time_indices = torch.clamp(expanded_time_indices, min=0, max=max_time - 1)
-            expanded_batch_indices = batch_indices.unsqueeze(1).expand(-1, lookahead_n)
             selected_encoded = encoder_output_projected[expanded_batch_indices, expanded_time_indices]
 
             logits = (
@@ -415,22 +415,49 @@ class GreedyBatchedRNNTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMeth
             torch.less(time_indices, encoder_output_length, out=active_mask)
             torch.logical_and(active_mask, blank_mask, out=advance_mask)
 
+#            if advance_mask.any():
+#                print("HERE some blanks")
+#                print("HERE advance_mask", advance_mask)
+#            else:
+#                print("HERE great all non blanks")
+
             # inner loop: find next non-blank labels (if exist)
             while advance_mask.any():
                 # same as: time_indices_current_labels[advance_mask] = time_indices[advance_mask], but non-blocking
                 # store current time indices to use further for storing the results
                 torch.where(advance_mask, time_indices, time_indices_current_labels, out=time_indices_current_labels)
+#                print("HERE time_indices_current_labels", time_indices_current_labels)
+#                print("HERE bad batch_indices", batch_indices, safe_time_indices)
+
+                expanded_time_indices = safe_time_indices.unsqueeze(1) + offsets.unsqueeze(0)
+                expanded_time_indices = torch.clamp(expanded_time_indices, min=0, max=max_time - 1)
+                selected_encoded = encoder_output_projected[expanded_batch_indices, expanded_time_indices]
+                
+
                 logits = (
                     self.joint.joint_after_projection(
-                        encoder_output_projected[batch_indices, safe_time_indices].unsqueeze(1),
+                        selected_encoded,
                         decoder_output,
                     )
-                    .squeeze(1)
-                    .squeeze(1)
                 )
                 # get labels (greedy) and scores from current logits, replace labels/scores with new
                 # labels[advance_mask] are blank, and we are looking for non-blank labels
                 more_scores, more_labels = logits.max(-1)
+
+                more_labels = torch.reshape(more_labels, [-1, lookahead_n])
+                more_scores = torch.reshape(more_scores, [-1, lookahead_n])
+
+                mask = (more_labels != self._blank_index)
+                first_nonblank = mask.int().argmax(dim=1)
+                all_blank = ~mask.any(dim=1)
+                selected_idx = torch.where(all_blank, lookahead_n - 1, first_nonblank)
+
+                more_labels = more_labels[batch_indices, selected_idx]
+                more_scores = more_scores[batch_indices, selected_idx]
+
+                time_indices += selected_idx
+            
+
                 # same as: labels[advance_mask] = more_labels[advance_mask], but non-blocking
                 torch.where(advance_mask, more_labels, labels, out=labels)
                 # same as: scores[advance_mask] = more_scores[advance_mask], but non-blocking
