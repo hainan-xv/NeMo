@@ -727,6 +727,7 @@ class GreedyBatchedRNNTInfer(_GreedyRNNTInfer, WithOptionalCudaGraphs):
         confidence_method_cfg: Optional[DictConfig] = None,
         loop_labels: bool = True,
         use_cuda_graph_decoder: bool = True,
+        lookahead_n: int = 0,
     ):
         super().__init__(
             decoder_model=decoder_model,
@@ -738,6 +739,7 @@ class GreedyBatchedRNNTInfer(_GreedyRNNTInfer, WithOptionalCudaGraphs):
             confidence_method_cfg=confidence_method_cfg,
         )
 
+        self.lookahead_n = lookahead_n
         self.use_cuda_graph_decoder = use_cuda_graph_decoder
         self.loop_labels = loop_labels
 
@@ -747,7 +749,10 @@ class GreedyBatchedRNNTInfer(_GreedyRNNTInfer, WithOptionalCudaGraphs):
         if self.decoder.blank_as_pad:
             if self.loop_labels:
                 # Label-Looping algorithm (default, faster)
-                self._greedy_decode = self._greedy_decode_blank_as_pad_loop_labels
+                if lookahead_n > 1:
+                    self._greedy_decode = self._greedy_decode_blank_as_pad_loop_labels_lookahead
+                else:
+                    self._greedy_decode = self._greedy_decode_blank_as_pad_loop_labels
                 self._decoding_computer = GreedyBatchedRNNTLoopLabelsComputer(
                     decoder=self.decoder,
                     joint=self.joint,
@@ -867,6 +872,29 @@ class GreedyBatchedRNNTInfer(_GreedyRNNTInfer, WithOptionalCudaGraphs):
         self.joint.train(joint_training_state)
 
         return (packed_result,)
+
+    @torch.inference_mode()
+    def _greedy_decode_blank_as_pad_loop_labels_lookahead(
+        self,
+        x: torch.Tensor,
+        out_len: torch.Tensor,
+        device: torch.device,
+        partial_hypotheses: Optional[list[rnnt_utils.Hypothesis]] = None,
+    ) -> list[rnnt_utils.Hypothesis]:
+        """
+        Optimized batched greedy decoding.
+        The main idea: search for next labels for the whole batch (evaluating Joint)
+        and thus always evaluate prediction network with maximum possible batch size
+        """
+        if partial_hypotheses is not None:
+            raise NotImplementedError("`partial_hypotheses` support is not implemented")
+
+        batched_hyps, alignments, last_decoder_state = self._decoding_computer(x=x, out_len=out_len, lookahead_n=self.lookahead_n)
+        hyps = rnnt_utils.batched_hyps_to_hypotheses(batched_hyps, alignments, batch_size=x.shape[0])
+        for hyp, state in zip(hyps, self.decoder.batch_split_states(last_decoder_state)):
+            hyp.dec_state = state
+        return hyps
+
 
     @torch.inference_mode()
     def _greedy_decode_blank_as_pad_loop_labels(
