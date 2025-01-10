@@ -342,10 +342,8 @@ class GreedyBatchedRNNTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMeth
         # time indices
         time_indices = torch.zeros_like(batch_indices)
         safe_time_indices = torch.zeros_like(time_indices)  # time indices, guaranteed to be < out_len
-        safe_time_indices_list = safe_time_indices.tolist()
         time_indices_current_labels = torch.zeros_like(time_indices)
         last_timesteps = encoder_output_length - 1
-        last_timesteps_list = last_timesteps.tolist()
 
         # masks for utterances in batch
         active_mask: torch.Tensor = encoder_output_length > 0
@@ -367,7 +365,6 @@ class GreedyBatchedRNNTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMeth
             # stage 2: get joint output, iteratively seeking for non-blank labels
             # blank label in `labels` tensor means "end of hypothesis" (for this index)
 
-
             offsets = torch.arange(lookahead_n, device=encoder_output_projected.device)
             expanded_time_indices = safe_time_indices.unsqueeze(1) + offsets.unsqueeze(0)
             expanded_time_indices = torch.clamp(expanded_time_indices, min=0, max=max_time - 1)
@@ -382,27 +379,17 @@ class GreedyBatchedRNNTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMeth
             )
             scores, labels = logits.max(-1)
             labels = torch.reshape(labels, [-1, lookahead_n])
+            scores = torch.reshape(scores, [-1, lookahead_n])
 
-            selected_labels = []
-            labels_list = labels.tolist()
-            selected_idx = []
-            scores_list = [0] * scores.shape[0]
-            for i in range(len(labels_list)):
-                to_append = min(lookahead_n - 1, last_timesteps_list[i] - safe_time_indices_list[i])
-                for j in range(min(lookahead_n, last_timesteps_list[i] + 1 - safe_time_indices_list[i])):
-                    scores_list[i] += scores[i][j]
-                    if labels_list[i][j] != self._blank_index:
-                        to_append = j
-                        break
+            mask = (labels != self._blank_index)
+            first_nonblank = mask.int().argmax(dim=1)
+            all_blank = ~mask.any(dim=1)
+            selected_idx = torch.where(all_blank, lookahead_n - 1, first_nonblank)
 
-                selected_idx.append(to_append)
-                selected_labels.append(labels_list[i][to_append])
+            labels = labels[batch_indices, selected_idx]
+            scores = scores[batch_indices, selected_idx]
 
-            labels = torch.LongTensor(selected_labels).to(labels.device)
-            scores = torch.Tensor(scores_list).to(labels.device)
-
-            safe_time_indices += torch.LongTensor(selected_idx).to(safe_time_indices.device)
-            time_indices += torch.LongTensor(selected_idx).to(safe_time_indices.device)
+            time_indices += selected_idx
 
             # search for non-blank labels using joint, advancing time indices for blank labels
             # checking max_symbols is not needed, since we already forced advancing time indices for such cases
