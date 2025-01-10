@@ -374,22 +374,14 @@ class GreedyBatchedRNNTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMeth
             expanded_batch_indices = batch_indices.unsqueeze(1).expand(-1, lookahead_n)
             selected_encoded = encoder_output_projected[expanded_batch_indices, expanded_time_indices]
 
-#            print("HERE batch_indices", batch_indices)
-#            print("HERE safe_time_indices", time_indices)
-#            print("HERE size", selected_encoded.shape)
-
             logits = (
                 self.joint.joint_after_projection(
                     selected_encoded,
                     decoder_output,
                 )
-#                .squeeze(1)
-#                .squeeze(1)
             )
-#            print("HERE logits", logits.shape)
             scores, labels = logits.max(-1)
             labels = torch.reshape(labels, [-1, lookahead_n])
-#            print("HERE labels", labels.shape)
 
             selected_labels = []
             labels_list = labels.tolist()
@@ -406,18 +398,11 @@ class GreedyBatchedRNNTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMeth
                 selected_idx.append(to_append)
                 selected_labels.append(labels_list[i][to_append])
 
-#            print("HERE selected_idx", selected_idx)
-
             labels = torch.LongTensor(selected_labels).to(labels.device)
-#            print("HERE refined labels", labels)
             scores = torch.Tensor(scores_list).to(labels.device)
 
-#            print("HEREsafe_time_indices", safe_time_indices)
             safe_time_indices += torch.LongTensor(selected_idx).to(safe_time_indices.device)
             time_indices += torch.LongTensor(selected_idx).to(safe_time_indices.device)
-#            print("HERE new safe_time_indices", safe_time_indices)
-#            print("HERE scores labels are", scores, labels)
-                
 
             # search for non-blank labels using joint, advancing time indices for blank labels
             # checking max_symbols is not needed, since we already forced advancing time indices for such cases
