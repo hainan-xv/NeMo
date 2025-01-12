@@ -218,6 +218,7 @@ class BeamRNNTInfer(Typing):
         decoder_model: rnnt_abstract.AbstractRNNTDecoder,
         joint_model: rnnt_abstract.AbstractRNNTJoint,
         beam_size: int,
+        window_size: int,
         search_type: str = 'default',
         score_norm: bool = True,
         return_best_hypothesis: bool = True,
@@ -244,6 +245,7 @@ class BeamRNNTInfer(Typing):
         self.vocab_size = decoder_model.vocab_size
         self.search_type = search_type
         self.return_best_hypothesis = return_best_hypothesis
+        self.window_size = window_size
 
         if beam_size < 1:
             raise ValueError("Beam search size cannot be less than 1!")
@@ -835,6 +837,7 @@ class BeamRNNTInfer(Typing):
         Returns:
             nbest_hyps: N-best decoding results
         """
+
         # delay this import here instead of at the beginning to avoid circular imports.
         from nemo.collections.asr.modules.rnnt import RNNTDecoder, StatelessTransducerDecoder
 
@@ -1468,6 +1471,7 @@ class BeamRNNTInfer(Typing):
 @dataclass
 class BeamRNNTInferConfig:
     beam_size: int
+    window_size: int
     search_type: str = 'default'
     score_norm: bool = True
     return_best_hypothesis: bool = True

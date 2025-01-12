@@ -422,6 +422,7 @@ class AbstractRNNTDecoding(ConfidenceMixin):
                 score_norm=self.cfg.beam.get('score_norm', True),
                 alsd_max_target_len=self.cfg.beam.get('alsd_max_target_len', 2),
                 softmax_temperature=self.cfg.beam.get('softmax_temperature', 1.0),
+                window_size=self.cfg.beam.get('window_size', 1),
                 preserve_alignments=self.preserve_alignments,
             )
 
@@ -1802,7 +1803,7 @@ class RNNTDecodingConfig:
 
     # beam decoding config
     beam: rnnt_beam_decoding.BeamRNNTInferConfig = field(
-        default_factory=lambda: rnnt_beam_decoding.BeamRNNTInferConfig(beam_size=4)
+        default_factory=lambda: rnnt_beam_decoding.BeamRNNTInferConfig(beam_size=4, window_size=1)
     )
 
     # can be used to change temperature for decoding
