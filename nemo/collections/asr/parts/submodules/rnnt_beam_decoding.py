@@ -262,7 +262,10 @@ class BeamRNNTInfer(Typing):
         elif search_type == "tsd":
             self.search_algorithm = self.time_sync_decoding
         elif search_type == "alsd":
-            self.search_algorithm = self.align_length_sync_decoding
+            if self.window_size > 1:
+                self.search_algorithm = self.align_length_sync_decoding_window
+            else:
+                self.search_algorithm = self.align_length_sync_decoding
         elif search_type == "nsc":
             raise NotImplementedError("`nsc` (Constrained Beam Search) has not been implemented.")
             # self.search_algorithm = self.nsc_beam_search
@@ -824,6 +827,243 @@ class BeamRNNTInfer(Typing):
                     del h.alignments[-1]
 
         return self.sort_nbest(B)
+
+    def align_length_sync_decoding_window(
+        self, h: torch.Tensor, encoded_lengths: torch.Tensor, partial_hypotheses: Optional[Hypothesis] = None
+    ) -> List[Hypothesis]:
+        """Alignment-length synchronous beam search implementation.
+        Based on https://ieeexplore.ieee.org/document/9053040
+
+        Args:
+            h: Encoded speech features (1, T_max, D_enc)
+
+        Returns:
+            nbest_hyps: N-best decoding results
+        """
+
+        # delay this import here instead of at the beginning to avoid circular imports.
+        from nemo.collections.asr.modules.rnnt import RNNTDecoder, StatelessTransducerDecoder
+
+        if partial_hypotheses is not None:
+            raise NotImplementedError("`partial_hypotheses` support is not supported")
+
+        # Precompute some constants for blank position
+        ids = list(range(self.vocab_size + 1))
+        ids.remove(self.blank)
+
+        # Used when blank token is first vs last token
+        if self.blank == 0:
+            index_incr = 1
+        else:
+            index_incr = 0
+
+        # prepare the batched beam states
+        beam = min(self.beam_size, self.vocab_size)
+
+        h = h[0]  # [T, D]
+        h_length = int(encoded_lengths)
+        beam_state = self.decoder.initialize_state(
+            torch.zeros(beam, device=h.device, dtype=h.dtype)
+        )  # [L, B, H], [L, B, H] for LSTMS
+        beam_state = [self.decoder.batch_select_state(beam_state, 0)]
+
+        # compute u_max as either a specific static limit,
+        # or a multiple of current `h_length` dynamically.
+        if type(self.alsd_max_target_length) == float:
+            u_max = int(self.alsd_max_target_length * h_length)
+        else:
+            u_max = int(self.alsd_max_target_length)
+
+        # Initialize first hypothesis for the beam (blank)
+        B = [
+            Hypothesis(
+                y_sequence=[self.blank],
+                score=0.0,
+                dec_state=beam_state[0],
+                timestep=[-1],
+                length=0,
+            )
+        ]
+
+        # Initialize alignments
+        if self.preserve_alignments:
+            B[0].alignments = [[]]
+
+        final = []
+        cache = {}
+
+        # ALSD runs for T + U_max steps
+        for i in range(h_length + u_max):
+            # Update caches
+            A = []
+            B_ = []
+            h_states = []
+
+            # preserve the list of batch indices which are added into the list
+            # and those which are removed from the list
+            # This is necessary to perform state updates in the correct batch indices later
+            batch_ids = list(range(len(B)))  # initialize as a list of all batch ids
+            batch_removal_ids = []  # update with sample ids which are removed
+
+            for bid, hyp in enumerate(B):
+                u = len(hyp.y_sequence) - 1
+                t = i - u
+
+                if t > (h_length - 1):
+                    batch_removal_ids.append(bid)
+                    continue
+
+                B_.append(hyp)
+                h_states.append((t, h[t]))
+
+            if B_:
+                # Compute the subset of batch ids which were *not* removed from the list above
+                sub_batch_ids = None
+                if len(B_) != beam:
+                    sub_batch_ids = batch_ids
+                    for id in batch_removal_ids:
+                        # sub_batch_ids contains list of ids *that were not removed*
+                        sub_batch_ids.remove(id)
+
+                    # extract the states of the sub batch only.
+                    if isinstance(self.decoder, RNNTDecoder) or isinstance(self.decoder, StatelessTransducerDecoder):
+                        beam_state_ = (beam_state[sub_batch_id] for sub_batch_id in sub_batch_ids)
+                    else:
+                        raise NotImplementedError("Unknown decoder type.")
+
+                else:
+                    # If entire batch was used (none were removed), simply take all the states
+                    beam_state_ = beam_state
+
+                # Decode a batch/sub-batch of beam states and scores
+                beam_y, beam_state_ = self.decoder.batch_score_hypothesis(B_, cache)
+
+                # If only a subset of batch ids were updated (some were removed)
+                if sub_batch_ids is not None:
+                    # For each state in the RNN (2 for LSTM)
+                    # Update the current batch states with the sub-batch states (in the correct indices)
+                    # These indices are specified by sub_batch_ids, the ids of samples which were updated.
+                    if isinstance(self.decoder, RNNTDecoder) or isinstance(self.decoder, StatelessTransducerDecoder):
+                        # LSTM decoder, state is [layer x batch x hidden]
+                        index = 0
+                        for sub_batch_id in sub_batch_ids:
+                            beam_state[sub_batch_id] = beam_state_[index]
+                            index += 1
+                    else:
+                        raise NotImplementedError("Unknown decoder type.")
+                else:
+                    # If entire batch was updated, simply update all the states
+                    beam_state = beam_state_
+
+                # h_states = list of [t, h[t]]
+                # so h[1] here is a h[t] of shape [D]
+                # Simply stack all of the h[t] within the sub_batch/batch (T <= beam)
+                h_enc = torch.stack([h[1] for h in h_states])  # [T=beam, D]
+                h_enc = h_enc.unsqueeze(1)  # [B=beam, T=1, D]; batch over the beams
+
+                # Extract the log probabilities and the predicted tokens
+                beam_logp = torch.log_softmax(
+                    self.joint.joint(h_enc, torch.stack(beam_y)) / self.softmax_temperature, dim=-1
+                )  # [B=beam, 1, 1, V + 1]
+                beam_logp = beam_logp[:, 0, 0, :]  # [B=beam, V + 1]
+                beam_topk = beam_logp[:, ids].topk(beam, dim=-1)
+                print("HERE beam_topk", beam_topk)
+
+                for j, hyp in enumerate(B_):
+                    # For all updated samples in the batch, add it as the blank token
+                    # In this step, we dont add a token but simply update score
+                    new_hyp = Hypothesis(
+                        score=(hyp.score + float(beam_logp[j, self.blank])),
+                        y_sequence=hyp.y_sequence[:],
+                        dec_state=hyp.dec_state,
+                        lm_state=hyp.lm_state,
+                        timestep=hyp.timestep[:],
+                        length=i,
+                    )
+
+                    if self.preserve_alignments:
+                        new_hyp.alignments = copy.deepcopy(hyp.alignments)
+
+                        # Add the alignment of blank at this step
+                        new_hyp.alignments[-1].append(
+                            (beam_logp[j].clone().cpu(), torch.tensor(self.blank, dtype=torch.int32))
+                        )
+
+                    # Add blank prediction to A
+                    A.append(new_hyp)
+
+                    # If the prediction "timestep" t has reached the length of the input sequence
+                    # we can add it to the "finished" hypothesis list.
+                    if h_states[j][0] == (h_length - 1):
+                        final.append(new_hyp)
+
+                    # Here, we carefully select the indices of the states that we want to preserve
+                    # for the next token (non-blank) update.
+                    if sub_batch_ids is not None:
+                        h_states_idx = sub_batch_ids[j]
+                    else:
+                        h_states_idx = j
+
+                    # for each current hypothesis j
+                    # extract the top token score and top token id for the jth hypothesis
+                    for logp, k in zip(beam_topk[0][j], beam_topk[1][j] + index_incr):
+                        # create new hypothesis and store in A
+                        # Note: This loop does *not* include the blank token!
+                        new_hyp = Hypothesis(
+                            score=(hyp.score + float(logp)),
+                            y_sequence=(hyp.y_sequence[:] + [int(k)]),
+                            dec_state=beam_state[h_states_idx],
+                            lm_state=hyp.lm_state,
+                            timestep=hyp.timestep[:] + [i],
+                            length=i,
+                        )
+
+                        if self.preserve_alignments:
+                            new_hyp.alignments = copy.deepcopy(hyp.alignments)
+
+                            # Add the alignment of Uj for this beam candidate at this step
+                            new_hyp.alignments[-1].append(
+                                (beam_logp[j].clone().cpu(), torch.tensor(new_hyp.y_sequence[-1], dtype=torch.int32))
+                            )
+
+                        A.append(new_hyp)
+
+                # Prune and recombine same hypothesis
+                # This may cause next beam to be smaller than max beam size
+                # Therefore larger beam sizes may be required for better decoding.
+                B = sorted(A, key=lambda x: x.score, reverse=True)[:beam]
+                B = self.recombine_hypotheses(B)
+
+                if self.preserve_alignments:
+                    # convert Ti-th logits into a torch array
+                    for B_i in B:
+                        # Check if the last token emitted at last timestep was a blank
+                        # If so, move to next timestep
+                        logp, label = B_i.alignments[-1][-1]  # The last alignment of this step
+                        if int(label) == self.blank:
+                            B_i.alignments.append([])  # blank buffer for next timestep
+
+            # If B_ is empty list, then we may be able to early exit
+            elif len(batch_ids) == len(batch_removal_ids):
+                # break early
+                break
+
+        if final:
+            # Remove trailing empty list of alignments
+            if self.preserve_alignments:
+                for h in final:
+                    if len(h.alignments[-1]) == 0:
+                        del h.alignments[-1]
+
+            return self.sort_nbest(final)
+        else:
+            # Remove trailing empty list of alignments
+            if self.preserve_alignments:
+                for h in B:
+                    if len(h.alignments[-1]) == 0:
+                        del h.alignments[-1]
+
+            return B
 
     def align_length_sync_decoding(
         self, h: torch.Tensor, encoded_lengths: torch.Tensor, partial_hypotheses: Optional[Hypothesis] = None
