@@ -341,7 +341,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
         preserve_alignments: bool = False,
         preserve_frame_confidence: bool = False,
         confidence_method_cfg: Optional[DictConfig] = None,
-        lookahead_n: int = 0,
+        window_size: int = 0,
     ):
         super().__init__(
             decoder_model=decoder_model,
@@ -352,7 +352,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
             preserve_frame_confidence=preserve_frame_confidence,
             confidence_method_cfg=confidence_method_cfg,
         )
-        self.lookahead_n = lookahead_n
+        self.window_size = window_size
 
     @typecheck()
     def forward(
@@ -390,10 +390,10 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                 logitlen = encoded_lengths[batch_idx]
 
                 partial_hypothesis = partial_hypotheses[batch_idx] if partial_hypotheses is not None else None
-                if self.lookahead_n == 0:
+                if self.window_size == 0:
                     hypothesis = self._greedy_decode(inseq, logitlen, partial_hypotheses=partial_hypothesis)
                 else:
-                    hypothesis = self._greedy_decode_lookahead(inseq, logitlen, partial_hypotheses=partial_hypothesis, lookahead_n=self.lookahead_n)
+                    hypothesis = self._greedy_decode_lookahead(inseq, logitlen, partial_hypotheses=partial_hypothesis, window_size=self.window_size)
                 hypotheses.append(hypothesis)
 
             # Pack results into Hypotheses
@@ -406,7 +406,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
 
     @torch.no_grad()
     def _greedy_decode_lookahead(
-        self, x: torch.Tensor, out_len: torch.Tensor, lookahead_n: int, partial_hypotheses: Optional[rnnt_utils.Hypothesis] = None
+        self, x: torch.Tensor, out_len: torch.Tensor, window_size: int, partial_hypotheses: Optional[rnnt_utils.Hypothesis] = None
     ):
         # x: [T, 1, D]
         # out_len: [seq_len]
@@ -443,7 +443,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
             symbols_added = 0
             # While blank is not predicted, or we dont run out of max symbols per timestep
             while not_blank and (self.max_symbols is None or symbols_added < self.max_symbols):
-                n = lookahead_n
+                n = window_size
                 if time_idx + n > out_len:
                     n = out_len - time_idx
 
@@ -727,7 +727,7 @@ class GreedyBatchedRNNTInfer(_GreedyRNNTInfer, WithOptionalCudaGraphs):
         confidence_method_cfg: Optional[DictConfig] = None,
         loop_labels: bool = True,
         use_cuda_graph_decoder: bool = True,
-        lookahead_n: int = 0,
+        window_size: int = 0,
     ):
         super().__init__(
             decoder_model=decoder_model,
@@ -739,7 +739,7 @@ class GreedyBatchedRNNTInfer(_GreedyRNNTInfer, WithOptionalCudaGraphs):
             confidence_method_cfg=confidence_method_cfg,
         )
 
-        self.lookahead_n = lookahead_n
+        self.window_size = window_size
         self.use_cuda_graph_decoder = use_cuda_graph_decoder
         self.loop_labels = loop_labels
 
@@ -749,7 +749,7 @@ class GreedyBatchedRNNTInfer(_GreedyRNNTInfer, WithOptionalCudaGraphs):
         if self.decoder.blank_as_pad:
             if self.loop_labels:
                 # Label-Looping algorithm (default, faster)
-                if lookahead_n > 1:
+                if window_size > 1:
                     self._greedy_decode = self._greedy_decode_blank_as_pad_loop_labels_lookahead
                 else:
                     self._greedy_decode = self._greedy_decode_blank_as_pad_loop_labels
@@ -889,7 +889,7 @@ class GreedyBatchedRNNTInfer(_GreedyRNNTInfer, WithOptionalCudaGraphs):
         if partial_hypotheses is not None:
             raise NotImplementedError("`partial_hypotheses` support is not implemented")
 
-        batched_hyps, alignments, last_decoder_state = self._decoding_computer(x=x, out_len=out_len, lookahead_n=self.lookahead_n)
+        batched_hyps, alignments, last_decoder_state = self._decoding_computer(x=x, out_len=out_len, window_size=self.window_size)
         hyps = rnnt_utils.batched_hyps_to_hypotheses(batched_hyps, alignments, batch_size=x.shape[0])
         for hyp, state in zip(hyps, self.decoder.batch_split_states(last_decoder_state)):
             hyp.dec_state = state

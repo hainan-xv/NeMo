@@ -293,7 +293,7 @@ class GreedyBatchedRNNTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMeth
         self,
         encoder_output: torch.Tensor,
         encoder_output_length: torch.Tensor,
-        lookahead_n: int,
+        window_size: int,
     ) -> Tuple[rnnt_utils.BatchedHyps, Optional[rnnt_utils.BatchedAlignments], Any]:
         """
         Pure PyTorch implementation
@@ -336,8 +336,8 @@ class GreedyBatchedRNNTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMeth
         state = self.decoder.initialize_state(encoder_output_projected)
         # indices of elements in batch (constant)
         batch_indices = torch.arange(batch_size, dtype=torch.long, device=device)
-        expanded_batch_indices = batch_indices.unsqueeze(1).expand(-1, lookahead_n)
-        offsets = torch.arange(lookahead_n, device=encoder_output_projected.device)
+        expanded_batch_indices = batch_indices.unsqueeze(1).expand(-1, window_size)
+        offsets = torch.arange(window_size, device=encoder_output_projected.device)
         # last found labels - initially <SOS> (<blank>) symbol
         labels = torch.full_like(batch_indices, fill_value=self._SOS)
 
@@ -378,13 +378,13 @@ class GreedyBatchedRNNTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMeth
                 )
             )
             scores, labels = logits.max(-1)
-            labels = torch.reshape(labels, [-1, lookahead_n])
-            scores = torch.reshape(scores, [-1, lookahead_n])
+            labels = torch.reshape(labels, [-1, window_size])
+            scores = torch.reshape(scores, [-1, window_size])
 
             mask = (labels != self._blank_index)
             first_nonblank = mask.int().argmax(dim=1)
             all_blank = ~mask.any(dim=1)
-            selected_idx = torch.where(all_blank, lookahead_n - 1, first_nonblank)
+            selected_idx = torch.where(all_blank, window_size - 1, first_nonblank)
 
             labels = labels[batch_indices, selected_idx]
             scores = scores[batch_indices, selected_idx]
@@ -444,13 +444,13 @@ class GreedyBatchedRNNTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMeth
                 # labels[advance_mask] are blank, and we are looking for non-blank labels
                 more_scores, more_labels = logits.max(-1)
 
-                more_labels = torch.reshape(more_labels, [-1, lookahead_n])
-                more_scores = torch.reshape(more_scores, [-1, lookahead_n])
+                more_labels = torch.reshape(more_labels, [-1, window_size])
+                more_scores = torch.reshape(more_scores, [-1, window_size])
 
                 mask = (more_labels != self._blank_index)
                 first_nonblank = mask.int().argmax(dim=1)
                 all_blank = ~mask.any(dim=1)
-                selected_idx = torch.where(all_blank, lookahead_n - 1, first_nonblank)
+                selected_idx = torch.where(all_blank, window_size - 1, first_nonblank)
 
                 more_labels = more_labels[batch_indices, selected_idx]
                 more_scores = more_scores[batch_indices, selected_idx]
@@ -1138,10 +1138,10 @@ class GreedyBatchedRNNTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMeth
         self,
         x: torch.Tensor,
         out_len: torch.Tensor,
-        lookahead_n: int = 0,
+        window_size: int = 0,
     ) -> Tuple[rnnt_utils.BatchedHyps, Optional[rnnt_utils.BatchedAlignments], Any]:
-        if lookahead_n > 1:
-            return self.loop_labels_torch_lookahead(encoder_output=x, encoder_output_length=out_len, lookahead_n=lookahead_n)
+        if window_size > 1:
+            return self.loop_labels_torch_lookahead(encoder_output=x, encoder_output_length=out_len, window_size=window_size)
         if self.cuda_graphs_mode is not None and x.device.type == "cuda":
             return self.loop_labels_cuda_graphs(encoder_output=x, encoder_output_length=out_len)
 

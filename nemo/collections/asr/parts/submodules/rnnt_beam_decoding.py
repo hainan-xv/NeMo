@@ -894,6 +894,12 @@ class BeamRNNTInfer(Typing):
 
         # ALSD runs for T + U_max steps
         for i in range(h_length + u_max):
+
+            print("HERE B IS")
+            for idx, b in enumerate(B):
+                print("sequence:", idx, b.score, b.y_sequence)
+            print()
+
             # Update caches
             A = []
             B_ = []
@@ -967,7 +973,6 @@ class BeamRNNTInfer(Typing):
                 )  # [B=beam, 1, 1, V + 1]
                 beam_logp = beam_logp[:, 0, 0, :]  # [B=beam, V + 1]
                 beam_topk = beam_logp[:, ids].topk(beam, dim=-1)
-                print("HERE beam_topk", beam_topk)
 
                 for j, hyp in enumerate(B_):
                     # For all updated samples in the batch, add it as the blank token
