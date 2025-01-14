@@ -437,12 +437,8 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
         if self.preserve_frame_confidence:
             hypothesis.frame_confidence = [[]]
 
-        token_scores = []
-        logp_list = []
-        dec_state_list = []
         time_idx = 0
         # For timestep t in X_t
-        accumulated_score = 0.0
         while time_idx < out_len:
             # Extract encoder embedding at timestep t
             # f = x[time_idx, :, :].unsqueeze(0)  # [1, 1, D]
@@ -502,18 +498,13 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                 # If blank token is predicted, exit inner loop, move onto next timestep t
                 if k == self._blank_index:
                     not_blank = False
-                    accumulated_score += v
                 else:
                     # Append token to label set, update RNN state.
                     hypothesis.y_sequence.append(k)
-                    hypothesis.score += v + accumulated_score
+                    hypothesis.score += v
                     hypothesis.timestep.append(time_idx)
                     hypothesis.dec_state = hidden_prime
                     hypothesis.last_token = k
-                    token_scores.append(v + accumulated_score)
-                    logp_list.append(logp[jump,:])
-                    dec_state_list.append(hidden_prime)
-                    accumulated_score = 0.0
 
                 # Increment token counter.
                 symbols_added += 1
