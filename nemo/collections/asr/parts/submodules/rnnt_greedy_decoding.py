@@ -480,8 +480,6 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                 # get index k, of max prob
                 vs, ks = logp.max(-1)
 
-#                vs, ks = logp.topk(3, -1)
-
                 ks = ks.tolist()  # K is the label at timestep t_s in inner loop, s >= 0.
                 k = self._blank_index
                 vs = vs.tolist()
@@ -493,42 +491,21 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                         k = ks[jump]
                         break
 
-#                print("K is", k) 
-#                print("JUMP is", jump)
-
-#                if k != self._blank_index:
                 if k != self._blank_index:
                     blank_score = logp[:,self._blank_index:self._blank_index+1]
                     cumsum = torch.cumsum(blank_score, dim=0)
-#                    for ii in range(jump + 1, logp.shape[0]):
-#                        logp[ii,:] += logp[ii-1,self._blank_index]
                     weight = 0.5
                     logp[1:,:] += cumsum[:-1,:]
                     logp_sum = torch.logsumexp(logp[jump:,:] * weight, dim=0)
                     
-
                     _, kk = logp_sum.max(-1)
                     kk = kk.item()
                     if kk != self._blank_index and kk != k:
                         k = kk
-#                        jump += 1
-#                print("KK is", kk) 
-#                print()
-#
-#
-#                for j in range(0, len(ks)):
-#                    a = int(100 * math.exp(vs[j][0])) / 100
-#                    b = int(100 * math.exp(vs[j][1])) / 100
-#                    c = int(100 * math.exp(vs[j][2])) / 100
-#                    print("AT", time_idx + j, "selects", ks[j][0], a, ks[j][1], b, ks[j][2], c)
-#                    
-#                print()
-                    
 
                 if jump > 0:
                     time_idx += jump
                     symbols_added = 0
-
 
                 # If blank token is predicted, exit inner loop, move onto next timestep t
                 if k == self._blank_index:
