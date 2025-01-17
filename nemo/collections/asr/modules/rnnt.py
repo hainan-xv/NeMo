@@ -1328,6 +1328,7 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         fuse_loss_wer: bool = False,
         fused_batch_size: Optional[int] = None,
         experimental_fuse_loss_wer: Any = None,
+        masking_prob: float = 0.0,
     ):
         super().__init__()
 
