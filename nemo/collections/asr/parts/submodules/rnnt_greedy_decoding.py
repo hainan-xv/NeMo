@@ -478,7 +478,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                     logp = logp.float()
 
                 # get index k, of max prob
-                vs, ks = logp.max(-1)
+                vs, ks = logp.topk(3, -1)
 
                 ks = ks.tolist()  # K is the label at timestep t_s in inner loop, s >= 0.
                 k = self._blank_index
@@ -486,22 +486,33 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                 v = 0.0
                
                 for jump in range(len(ks)):
-                    v += vs[jump]
-                    if ks[jump] != self._blank_index:
-                        k = ks[jump]
+                    v += vs[jump][0]
+
+                    if ks[jump][0] != self._blank_index:
+                        k = ks[jump][0]
                         break
 
-                if k != self._blank_index:
-                    blank_score = logp[:,self._blank_index:self._blank_index+1]
-                    cumsum = torch.cumsum(blank_score, dim=0)
-                    weight = 0.5
-                    logp[1:,:] += cumsum[:-1,:]
-                    logp_sum = torch.logsumexp(logp[jump:,:] * weight, dim=0)
-                    
-                    _, kk = logp_sum.max(-1)
-                    kk = kk.item()
-                    if kk != self._blank_index and kk != k:
-                        k = kk
+                for j in range(len(ks)):
+                    those_scores = math.exp(vs[j][0]), math.exp(vs[j][1]), math.exp(vs[j][2])
+                    those_scores = [int(i * 10000) / 10000 for i in those_scores]
+                    to_add = ''
+                    if j == jump:
+                        to_add = '<---------'
+                    print("TOP 3", ks[j][0], ks[j][1], ks[j][2], those_scores, to_add)
+
+                print("TOP")
+
+#                if k != self._blank_index:
+#                    blank_score = logp[:,self._blank_index:self._blank_index+1]
+#                    cumsum = torch.cumsum(blank_score, dim=0)
+#                    weight = 0.5
+#                    logp[1:,:] += cumsum[:-1,:]
+#                    logp_sum = torch.logsumexp(logp[jump:,:] * weight, dim=0)
+#                    
+#                    _, kk = logp_sum.max(-1)
+#                    kk = kk.item()
+#                    if kk != self._blank_index and kk != k:
+#                        k = kk
 
                 if jump > 0:
                     time_idx += jump
