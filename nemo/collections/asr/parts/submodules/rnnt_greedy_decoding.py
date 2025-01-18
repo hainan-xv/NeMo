@@ -422,6 +422,8 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
         symbols_added_list = [0]
         finished_hyps = []
 
+        beam=1
+
         while len(finished_hyps) < beam:
 
             expanded_hyp_list = []
@@ -530,14 +532,36 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
 
             if len(expanded_hyp_list) == 0:
                 break
+
             expanded_hyp_list, expanded_time_idx_list, expanded_symbols_added_list =  zip(*sorted(zip(expanded_hyp_list, expanded_time_idx_list, expanded_symbols_added_list), key=lambda x:-x[0].score))
+            print("OLD SIZE", len(expanded_hyp_list))
+            expanded_hyp_list, expanded_time_idx_list, expanded_symbols_added_list = self.dedup_lists_by_field(expanded_hyp_list, expanded_time_idx_list, expanded_symbols_added_list, 'y_sequence')
+            print("new SIZE", len(expanded_hyp_list))
+
             hypothesis_list = expanded_hyp_list[:beam]
             time_idx_list = expanded_time_idx_list[:beam]
             symbols_added_list = expanded_symbols_added_list[:beam]
                 
-        
         hypothesis  =  sorted(finished_hyps, key=lambda x:-x.score)[0]
         return hypothesis
+
+    def dedup_lists_by_field(self, a_list, b_list, c_list, field_name):
+        seen = {}
+        unique_a = []
+        unique_b = []
+        unique_c = []
+
+        for i, (a_item, b_item, c_item) in enumerate(zip(a_list, b_list, c_list)):
+            field_value = getattr(a_item, field_name)
+            field_value = tuple(field_value)
+            if field_value not in seen:
+                seen[field_value] = i
+                unique_a.append(a_item)
+                unique_b.append(b_item)
+                unique_c.append(c_item)
+
+        return unique_a, unique_b, unique_c
+
 
     @torch.no_grad()
     def _greedy_decode_lookahead(
