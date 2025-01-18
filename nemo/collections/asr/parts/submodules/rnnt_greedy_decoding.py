@@ -417,37 +417,28 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
         # out_len: [seq_len]
 
         # Initialize blank state and empty label set in Hypothesis
-        hypothesis = rnnt_utils.Hypothesis(score=0.0, y_sequence=[], dec_state=None, timestep=[], last_token=None)
+        hypothesis_list = [rnnt_utils.Hypothesis(score=0.0, y_sequence=[], dec_state=None, timestep=[], last_token=None)]
+        time_idx_list = [0]
+        symbols_added_list = [0]
+        finished_hyps = []
 
-        if partial_hypotheses is not None:
-            hypothesis.last_token = partial_hypotheses.last_token
-            hypothesis.y_sequence = (
-                partial_hypotheses.y_sequence.cpu().tolist()
-                if isinstance(partial_hypotheses.y_sequence, torch.Tensor)
-                else partial_hypotheses.y_sequence
-            )
-            if partial_hypotheses.dec_state is not None:
-                hypothesis.dec_state = self.decoder.batch_concat_states([partial_hypotheses.dec_state])
-                hypothesis.dec_state = _states_to_device(hypothesis.dec_state, x.device)
+        while len(finished_hyps) < beam:
 
-        if self.preserve_alignments:
-            # Alignments is a 2-dimensional dangling list representing T x U
-            hypothesis.alignments = [[]]
+            expanded_hyp_list = []
+            expanded_time_idx_list = []
+            expanded_symbols_added_list = []
 
-        if self.preserve_frame_confidence:
-            hypothesis.frame_confidence = [[]]
+            print("HERE time_idx_list", time_idx_list)
+            print("HERE hyp_list", [i.y_sequence for i in hypothesis_list])
+            print("HERE score_list", [i.score for i in hypothesis_list])
+            print("HERE symbols_added_list", symbols_added_list)
 
-        time_idx = 0
-        # For timestep t in X_t
-        while time_idx < out_len:
-            # Extract encoder embedding at timestep t
-            # f = x[time_idx, :, :].unsqueeze(0)  # [1, 1, D]
+            for i in range(len(hypothesis_list)):
+                hypothesis = hypothesis_list[i]
+                time_idx = time_idx_list[i]
+                not_blank = True
+                symbols_added = symbols_added_list[i]
 
-            # Setup exit flags and counter
-            not_blank = True
-            symbols_added = 0
-            # While blank is not predicted, or we dont run out of max symbols per timestep
-            while not_blank and (self.max_symbols is None or symbols_added < self.max_symbols):
                 n = window_size
                 if time_idx + n > out_len:
                     n = out_len - time_idx
@@ -458,14 +449,12 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
 
                 # In the first timestep, we initialize the network with RNNT Blank
                 # In later timesteps, we provide previous predicted label as input.
-                if hypothesis.last_token is None and hypothesis.dec_state is None:
+                if hypothesis_list[i].last_token is None and hypothesis_list[i].dec_state is None:
                     last_label = self._SOS
                 else:
-                    last_label = label_collate([[hypothesis.last_token]])
+                    last_label = label_collate([[hypothesis_list[i].last_token]])
 
-                # Perform prediction network and joint network steps.
-                g, hidden_prime = self._pred_step(last_label, hypothesis.dec_state)
-                # If preserving per-frame confidence, log_normalize must be true
+                g, hidden_prime = self._pred_step(last_label, hypothesis_list[i].dec_state)
 
                 logp = self._joint_step(f, g, log_normalize=True)[
                     0, :, 0, :
@@ -478,7 +467,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                     logp = logp.float()
 
                 # get index k, of max prob
-                vs, ks = logp.topk(3, -1)
+                vs, ks = logp.max(-1)
 
                 ks = ks.tolist()  # K is the label at timestep t_s in inner loop, s >= 0.
                 k = self._blank_index
@@ -486,19 +475,11 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                 v = 0.0
                
                 for jump in range(len(ks)):
-                    v += vs[jump][0]
+                    v += vs[jump]
 
-                    if ks[jump][0] != self._blank_index:
-                        k = ks[jump][0]
+                    if ks[jump] != self._blank_index:
+                        k = ks[jump]
                         break
-
-                for j in range(len(ks)):
-                    those_scores = math.exp(vs[j][0]), math.exp(vs[j][1]), math.exp(vs[j][2])
-                    those_scores = [int(i * 10000) / 10000 for i in those_scores]
-                    to_add = ''
-                    if j == jump:
-                        to_add = '<---------'
-                    print("TOP 3", ks[j][0], ks[j][1], ks[j][2], those_scores, to_add)
 
                 if k != self._blank_index:
                     blank_score = logp[:,self._blank_index:self._blank_index+1]
@@ -507,50 +488,55 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                     logp[1:,:] += cumsum[:-1,:]
                     logp_sum = torch.logsumexp(logp[:,:] * weight, dim=0) 
                     logp_sum[-1] = -999.0
-                    vv, kk = logp_sum.topk(3, -1)
+                    vv, kk = logp_sum.topk(beam, -1)
                     kk = kk.tolist() 
 
-                    those_scores = math.exp(vv[0]), math.exp(vv[1]), math.exp(vv[2])
-                    those_scores = [int(i * 10000) / 10000 for i in those_scores]
-                    print("NEWTOP 3", kk[0], kk[1], kk[2], those_scores)
-
-                    kk=kk[0]
-
-#                    kk = kk.item()
-                    if kk != self._blank_index and kk != k:
-                        k = kk
-                        if jump > 0:
-                            jump -= 1
+                    if jump > 0:
+                        time_idx += jump
+                        symbols_added = 0
+                    else:
+                        symbols_added += 1
+                        if symbols_added >= 5:
+                            time_idx += 1
 
 
-                print("TOP")
+                    print("HERE adding time_id", time_idx)
+                    for j in range(len(kk)):
+                        new_k = kk[j]
+                        new_v = vv[j]
+                        expanded_hyp = copy.deepcopy(hypothesis)
+                        # If blank token is predicted, exit inner loop, move onto next timestep t
 
 
-                if jump == 0:
-                    jump = 1
-                if jump > 0:
-                    time_idx += jump
-                    symbols_added = 0
+                        expanded_hyp.y_sequence.append(new_k)
+                        expanded_hyp.score += new_v
+                        expanded_hyp.timestep.append(time_idx)
+                        expanded_hyp.dec_state = hidden_prime
+                        expanded_hyp.last_token = new_k
 
-                # If blank token is predicted, exit inner loop, move onto next timestep t
-                if k == self._blank_index:
-                    not_blank = False
+                        # Increment token counter.
+                        expanded_hyp_list.append(expanded_hyp)
+                        expanded_time_idx_list.append(time_idx)
+                        expanded_symbols_added_list.append(symbols_added)
                 else:
-                    # Append token to label set, update RNN state.
-                    hypothesis.y_sequence.append(k)
-                    hypothesis.score += v
-                    hypothesis.timestep.append(time_idx)
-                    hypothesis.dec_state = hidden_prime
-                    hypothesis.last_token = k
+                    time_idx += 1
+                    if time_idx < out_len.item():
+                        expanded_hyp = copy.deepcopy(hypothesis)
+                        expanded_hyp_list.append(expanded_hyp)
+                        expanded_time_idx_list.append(time_idx)
+                        expanded_symbols_added_list.append(0)
+                    else:
+                        finished_hyps.append(hypothesis)
 
-                # Increment token counter.
-                symbols_added += 1
-
-            time_idx += 1
-
-        # Unpack the hidden states
-        hypothesis.dec_state = self.decoder.batch_select_state(hypothesis.dec_state, 0)
+            if len(expanded_hyp_list) == 0:
+                break
+            expanded_hyp_list, expanded_time_idx_list, expanded_symbols_added_list =  zip(*sorted(zip(expanded_hyp_list, expanded_time_idx_list, expanded_symbols_added_list), key=lambda x:-x[0].score))
+            hypothesis_list = expanded_hyp_list[:beam]
+            time_idx_list = expanded_time_idx_list[:beam]
+            symbols_added_list = expanded_symbols_added_list[:beam]
+                
         
+        hypothesis  =  sorted(finished_hyps, key=lambda x:-x.score)[0]
         return hypothesis
 
     @torch.no_grad()
