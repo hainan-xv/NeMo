@@ -500,20 +500,34 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                         to_add = '<---------'
                     print("TOP 3", ks[j][0], ks[j][1], ks[j][2], those_scores, to_add)
 
+                if k != self._blank_index:
+                    blank_score = logp[:,self._blank_index:self._blank_index+1]
+                    cumsum = torch.cumsum(blank_score, dim=0)
+                    weight = 1.0
+                    logp[1:,:] += cumsum[:-1,:]
+                    logp_sum = torch.logsumexp(logp[:,:] * weight, dim=0) 
+                    logp_sum[-1] = -999.0
+                    vv, kk = logp_sum.topk(3, -1)
+                    kk = kk.tolist() 
+
+                    those_scores = math.exp(vv[0]), math.exp(vv[1]), math.exp(vv[2])
+                    those_scores = [int(i * 10000) / 10000 for i in those_scores]
+                    print("NEWTOP 3", kk[0], kk[1], kk[2], those_scores)
+
+                    kk=kk[0]
+
+#                    kk = kk.item()
+                    if kk != self._blank_index and kk != k:
+                        k = kk
+                        if jump > 0:
+                            jump -= 1
+
+
                 print("TOP")
 
-#                if k != self._blank_index:
-#                    blank_score = logp[:,self._blank_index:self._blank_index+1]
-#                    cumsum = torch.cumsum(blank_score, dim=0)
-#                    weight = 0.5
-#                    logp[1:,:] += cumsum[:-1,:]
-#                    logp_sum = torch.logsumexp(logp[jump:,:] * weight, dim=0)
-#                    
-#                    _, kk = logp_sum.max(-1)
-#                    kk = kk.item()
-#                    if kk != self._blank_index and kk != k:
-#                        k = kk
 
+                if jump == 0:
+                    jump = 1
                 if jump > 0:
                     time_idx += jump
                     symbols_added = 0
