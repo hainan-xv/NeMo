@@ -482,6 +482,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                     if ks[jump] != self._blank_index:
                         k = ks[jump]
                         break
+                print("PROB all blank is", math.exp(v))
 
                 if k != self._blank_index:
                     blank_score = logp[:,self._blank_index:self._blank_index+1]
@@ -507,9 +508,12 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                     for j in range(len(kk)):
                         new_k = kk[j]
                         new_v = vv[j]
+
+                        if j > 0 and new_v < math.log(0.1):
+                            break
+
                         expanded_hyp = copy.deepcopy(hypothesis)
                         # If blank token is predicted, exit inner loop, move onto next timestep t
-
 
                         expanded_hyp.y_sequence.append(new_k)
                         expanded_hyp.score += new_v
@@ -523,6 +527,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                         expanded_symbols_added_list.append(symbols_added)
                 else:
                     time_idx += 1
+                    hypothesis.score += v
                     if time_idx < out_len.item():
                         expanded_hyp = copy.deepcopy(hypothesis)
                         expanded_hyp_list.append(expanded_hyp)
