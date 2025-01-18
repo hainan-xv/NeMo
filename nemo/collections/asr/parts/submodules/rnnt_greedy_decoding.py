@@ -422,7 +422,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
         symbols_added_list = [0]
         finished_hyps = []
 
-        beam=1
+        beam = 2
 
         while len(finished_hyps) < beam:
 
@@ -430,10 +430,10 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
             expanded_time_idx_list = []
             expanded_symbols_added_list = []
 
-            print("HERE time_idx_list", time_idx_list)
-            print("HERE hyp_list", [i.y_sequence for i in hypothesis_list])
-            print("HERE score_list", [i.score for i in hypothesis_list])
-            print("HERE symbols_added_list", symbols_added_list)
+#            print("HERE time_idx_list", time_idx_list)
+#            print("HERE hyp_list", [i.y_sequence for i in hypothesis_list])
+#            print("HERE score_list", [i.score for i in hypothesis_list])
+#            print("HERE symbols_added_list", symbols_added_list)
 
             for i in range(len(hypothesis_list)):
                 hypothesis = hypothesis_list[i]
@@ -500,9 +500,10 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                         symbols_added += 1
                         if symbols_added >= 5:
                             time_idx += 1
+                        symbols_added = 0
 
 
-                    print("HERE adding time_id", time_idx)
+#                    print("HERE adding time_id", time_idx)
                     for j in range(len(kk)):
                         new_k = kk[j]
                         new_v = vv[j]
@@ -534,9 +535,9 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                 break
 
             expanded_hyp_list, expanded_time_idx_list, expanded_symbols_added_list =  zip(*sorted(zip(expanded_hyp_list, expanded_time_idx_list, expanded_symbols_added_list), key=lambda x:-x[0].score))
-            print("OLD SIZE", len(expanded_hyp_list))
+#            print("OLD SIZE", len(expanded_hyp_list))
             expanded_hyp_list, expanded_time_idx_list, expanded_symbols_added_list = self.dedup_lists_by_field(expanded_hyp_list, expanded_time_idx_list, expanded_symbols_added_list, 'y_sequence')
-            print("new SIZE", len(expanded_hyp_list))
+#            print("new SIZE", len(expanded_hyp_list))
 
             hypothesis_list = expanded_hyp_list[:beam]
             time_idx_list = expanded_time_idx_list[:beam]
