@@ -469,51 +469,62 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                     logp = logp.float()
 
                 # get index k, of max prob
-                vs, ks = logp.max(-1)
-
-                ks = ks.tolist()  # K is the label at timestep t_s in inner loop, s >= 0.
-                k = self._blank_index
-                vs = vs.tolist()
-                v = 0.0
+#                vs, ks = logp.max(-1)
+#
+#                ks = ks.tolist()  # K is the label at timestep t_s in inner loop, s >= 0.
+#                k = self._blank_index
+#                vs = vs.tolist()
+#                v = 0.0
                
-                for jump in range(len(ks)):
-                    v += vs[jump]
+#                for jump in range(len(ks)):
+#                    v += vs[jump]
+#
+#                    if ks[jump] != self._blank_index:
+#                        k = ks[jump]
+#                        break
 
-                    if ks[jump] != self._blank_index:
-                        k = ks[jump]
-                        break
-                print("PROB all blank is", math.exp(v))
+                blank_score = logp[:,self._blank_index:self._blank_index+1]
+                cumsum = torch.cumsum(blank_score, dim=0)
+                weight = 1.0
+                logp[1:,:-1] += cumsum[:-1,:]
+                logp_sum = torch.logsumexp(logp[:,:] * weight, dim=0) 
 
-                if k != self._blank_index:
-                    blank_score = logp[:,self._blank_index:self._blank_index+1]
-                    cumsum = torch.cumsum(blank_score, dim=0)
-                    weight = 1.0
-                    logp[1:,:] += cumsum[:-1,:]
-                    logp_sum = torch.logsumexp(logp[:,:] * weight, dim=0) 
-                    logp_sum[-1] = -999.0
-                    vv, kk = logp_sum.topk(beam, -1)
-                    kk = kk.tolist() 
+                logp_blank = cumsum[-1] #.item()
+                logp_sum[-1] = logp_blank
 
-                    if jump > 0:
-                        time_idx += jump
-                        symbols_added = 0
-                    else:
-                        symbols_added += 1
-                        if symbols_added >= 5:
-                            time_idx += 1
-                        symbols_added = 0
+#                print("SANITY", torch.sum(torch.exp(logp_sum)))
 
+                vv, kk = logp_sum.topk(beam, -1)
+                kk = kk.tolist()
+                vv = vv.tolist()
+#                if logp_blank > -1.0:
+#                    kk = kk + [self._blank_index]
+#                    vv = vv + [logp_blank]
 
-#                    print("HERE adding time_id", time_idx)
-                    for j in range(len(kk)):
-                        new_k = kk[j]
-                        new_v = vv[j]
+#                print("HERE", kk, vv)
 
-                        if j > 0 and new_v < math.log(0.1):
-                            break
+                for j in range(len(kk)):
+                    new_k = kk[j]
+                    new_v = vv[j]
 
+#                    if j > 0 and new_v < math.log(0.1):
+#                        break
+
+                    if new_k != self._blank_index:
                         expanded_hyp = copy.deepcopy(hypothesis)
                         # If blank token is predicted, exit inner loop, move onto next timestep t
+
+                        _, jump = logp[:,new_k].max(-1)
+                        jump = jump.item()
+                        jump = 1
+
+                        if jump > 0:
+                            time_idx += jump
+                            symbols_added = 0
+                        else:
+                            if symbols_added >= 5:
+                                time_idx += 1
+                            symbols_added = 0
 
                         expanded_hyp.y_sequence.append(new_k)
                         expanded_hyp.score += new_v
@@ -521,15 +532,21 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                         expanded_hyp.dec_state = hidden_prime
                         expanded_hyp.last_token = new_k
 
-                        # Increment token counter.
-                        expanded_hyp_list.append(expanded_hyp)
-                        expanded_time_idx_list.append(time_idx)
-                        expanded_symbols_added_list.append(symbols_added)
-                else:
-                    time_idx += 1
-                    hypothesis.score += v
-                    if time_idx < out_len.item():
+#                        # Increment token counter.
+#                        if time_idx < out_len.item():
+#                            expanded_hyp_list.append(expanded_hyp)
+#                            expanded_time_idx_list.append(time_idx)
+#                            expanded_symbols_added_list.append(symbols_added)
+#                        else:
+#                            finished_hyps.append(hypothesis)
+
+                    else:  # blank prediction
+                        time_idx += n
                         expanded_hyp = copy.deepcopy(hypothesis)
+                        expanded_hyp.score += new_v
+                        symbols_added = 0
+
+                    if time_idx < out_len.item():
                         expanded_hyp_list.append(expanded_hyp)
                         expanded_time_idx_list.append(time_idx)
                         expanded_symbols_added_list.append(0)
