@@ -427,7 +427,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
 
         dec_state = self.decoder.initialize_state(x)
 
-        while len(finished_hyps) < beam:
+        while len(finished_hyps) < beam * beam * beam:
 
             expanded_hyp_list = []
             expanded_time_idx_list = []
@@ -464,12 +464,9 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
 #
 #            #self.decoder.predict(label, hidden, add_sos=add_sos, batch_size=batch_size)
 
-
             for i in range(len(hypothesis_list)):
                 hypothesis = hypothesis_list[i]
                 time_idx = time_idx_list[i]
-#                print("HERE TIME", time_idx)
-                not_blank = True
                 symbols_added = symbols_added_list[i]
 
                 n = window_size
@@ -559,7 +556,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                         expanded_symbols_added_list.append(0)
                     else:
                         finished_hyps.append(hypothesis)
-#                        print('adding to finished', hypothesis.y_sequence, hypothesis.score, hypothesis.timestep)
+#                        print('Adding to finished', hypothesis.y_sequence, hypothesis.score, hypothesis.timestep)
 
             if len(expanded_hyp_list) == 0:
                 break
@@ -571,7 +568,6 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
             expanded_hyp_list, expanded_time_idx_list, expanded_symbols_added_list =  zip(*sorted(zip(expanded_hyp_list, expanded_time_idx_list, expanded_symbols_added_list), key=lambda x:-x[0].score))
             expanded_hyp_list, expanded_time_idx_list, expanded_symbols_added_list = self.dedup_lists_by_field(expanded_hyp_list, expanded_time_idx_list, expanded_symbols_added_list, 'y_sequence')
 
-#            print("ENTERING LOOP")
 #            print("HERE expanded_time_idx_list", expanded_time_idx_list)
 #            print("HERE expanded_hyps_list", [i.y_sequence for i in expanded_hyp_list])
 #            print("HERE expanded_score_list", [i.score for i in expanded_hyp_list])
@@ -586,6 +582,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
             symbols_added_list = expanded_symbols_added_list[:beam2]
                 
         hypothesis  =  sorted(finished_hyps, key=lambda x:-x.score)[0]
+        print("SCORE IS", hypothesis.score)
         return hypothesis
 
     def dedup_lists_by_field(self, a_list, b_list, c_list, field_name):
@@ -598,10 +595,14 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
             field_value = getattr(a_item, field_name)
             field_value = tuple(field_value)
             if field_value not in seen:
-                seen[field_value] = i
+                seen[field_value] = len(unique_a)
                 unique_a.append(a_item)
                 unique_b.append(b_item)
                 unique_c.append(c_item)
+#            else:
+#                print("MERGE for", field_value)
+#                print("MERGE", unique_a[seen[field_value]].score, a_list[i].score)
+#                unique_a[seen[field_value]].score = np.logaddexp(unique_a[seen[field_value]].score , a_list[i].score)
 
         return unique_a, unique_b, unique_c
 
