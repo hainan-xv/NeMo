@@ -344,6 +344,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
         preserve_frame_confidence: bool = False,
         confidence_method_cfg: Optional[DictConfig] = None,
         window_size: int = 0,
+        beam: int = 1,
     ):
         super().__init__(
             decoder_model=decoder_model,
@@ -355,6 +356,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
             confidence_method_cfg=confidence_method_cfg,
         )
         self.window_size = window_size
+        self.beam = beam
 
     @typecheck()
     def forward(
@@ -395,7 +397,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                 if self.window_size == 1:
                     hypothesis = self._greedy_decode(inseq, logitlen, partial_hypotheses=partial_hypothesis)
                 elif self.window_size < 0:
-                    hypothesis = self._greedy_decode_lookahead_beam(inseq, logitlen, partial_hypotheses=partial_hypothesis, window_size=-self.window_size, beam=2)
+                    hypothesis = self._greedy_decode_lookahead_beam(inseq, logitlen, partial_hypotheses=partial_hypothesis, window_size=-self.window_size, beam=self.beam)
                 else:
                     hypothesis = self._greedy_decode_lookahead(inseq, logitlen, partial_hypotheses=partial_hypothesis, window_size=self.window_size)
                 hypotheses.append(hypothesis)
@@ -423,7 +425,6 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
         last_label_list = [self._SOS]
         finished_hyps = []
 
-        beam = 2
         dec_state = self.decoder.initialize_state(x)
 
         while len(finished_hyps) < beam:
@@ -432,38 +433,42 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
             expanded_time_idx_list = []
             expanded_symbols_added_list = []
 
-            print("HERE time_idx_list", time_idx_list)
-            print("HERE hyp_list", [i.y_sequence for i in hypothesis_list])
-            print("HERE hyp_list", [i.timestep for i in hypothesis_list])
-            print()
+#            print("ENTERING LOOP")
+#            print("HERE time_idx_list", time_idx_list)
+#            print("HERE hyps_list", [i.y_sequence for i in hypothesis_list])
+#            print("HERE score_list", [i.score for i in hypothesis_list])
+#            print("HERE time_list", [i.timestep for i in hypothesis_list])
+#            print()
+
 #            print("HERE score_list", [i.score for i in hypothesis_list])
 #            print("HERE symbols_added_list", symbols_added_list)
 
-            time_idx_tensor = torch.LongTensor(time_idx_list).to(x.device)
-
-            offsets = torch.arange(window_size, device=x.device) 
-            time_indices_windowed = time_idx_tensor.unsqueeze(1) + offsets.unsqueeze(0)
-            time_indices_windowed = torch.clamp(time_indices_windowed, min=0, max=out_len.item()-1)
-
-            print("HERE time_indices_windowed", time_indices_windowed)
-
-            f = x[time_indices_windowed,0,:] # beam x window_size x D
-
-            print("HERE f", f.shape)
-
-            last_label_tensor = torch.LongTensor(last_label_list).to(x.device)
-
-
-            print("last_label_tensor", last_label_tensor)
-#            print("dec_state", dec_state.shape)
-#            g, hidden_prime = self._pred_step(last_label_tensor, dec_state)
-
-            #self.decoder.predict(label, hidden, add_sos=add_sos, batch_size=batch_size)
+#            time_idx_tensor = torch.LongTensor(time_idx_list).to(x.device)
+#
+#            offsets = torch.arange(window_size, device=x.device) 
+#            time_indices_windowed = time_idx_tensor.unsqueeze(1) + offsets.unsqueeze(0)
+#            time_indices_windowed = torch.clamp(time_indices_windowed, min=0, max=out_len.item()-1)
+#
+#            print("HERE time_indices_windowed", time_indices_windowed)
+#
+#            f = x[time_indices_windowed,0,:] # beam x window_size x D
+#
+#            print("HERE f", f.shape)
+#
+#            last_label_tensor = torch.LongTensor(last_label_list).to(x.device)
+#
+#
+#            print("last_label_tensor", last_label_tensor)
+##            print("dec_state", dec_state.shape)
+##            g, hidden_prime = self._pred_step(last_label_tensor, dec_state)
+#
+#            #self.decoder.predict(label, hidden, add_sos=add_sos, batch_size=batch_size)
 
 
             for i in range(len(hypothesis_list)):
                 hypothesis = hypothesis_list[i]
                 time_idx = time_idx_list[i]
+#                print("HERE TIME", time_idx)
                 not_blank = True
                 symbols_added = symbols_added_list[i]
 
@@ -507,30 +512,32 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                 kk = kk.tolist()
                 vv = vv.tolist()
 
+                best_score = vv[0]
+
                 for j in range(beam):
                     new_k = kk[j]
                     new_v = vv[j]
 
-#                    if j > 0 and new_v < math.log(0.1):
-#                        break
+                    if new_v < best_score - 4:
+                        break
 
                     if new_k != self._blank_index:
                         expanded_hyp = copy.deepcopy(hypothesis)
                         # If blank token is predicted, exit inner loop, move onto next timestep t
 
-                        print("NEW K", new_k)
-                        print("TO MAX", logp[:,new_k])
+#                        print("NEW K", new_k)
+#                        print("TO MAX", logp[:,new_k])
                         _, jump = logp[:,new_k].max(-1)
                         jump = jump.item()
-                        print("THEREFORE jump is", jump)
 
                         if jump > 0:
                             time_idx += jump
                             symbols_added = 0
                         else:
+                            time_idx += 1
                             if symbols_added >= 5:
-                                time_idx += 1
-                            symbols_added = 0
+                                symbols_added = 0
+#                        print("THEREFORE jump is", jump, symbols_added, time_idx)
 
                         expanded_hyp.y_sequence.append(new_k)
                         expanded_hyp.score += new_v
@@ -539,6 +546,8 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                         expanded_hyp.last_token = new_k
 
                     else:  # blank prediction
+#                        print("NEW K: blank")
+#                        print("jump is", n)
                         time_idx += n
                         expanded_hyp = copy.deepcopy(hypothesis)
                         expanded_hyp.score += new_v
@@ -550,12 +559,24 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                         expanded_symbols_added_list.append(0)
                     else:
                         finished_hyps.append(hypothesis)
+#                        print('adding to finished', hypothesis.y_sequence, hypothesis.score, hypothesis.timestep)
 
             if len(expanded_hyp_list) == 0:
                 break
 
+
+#            print()
+#            print()
+
             expanded_hyp_list, expanded_time_idx_list, expanded_symbols_added_list =  zip(*sorted(zip(expanded_hyp_list, expanded_time_idx_list, expanded_symbols_added_list), key=lambda x:-x[0].score))
             expanded_hyp_list, expanded_time_idx_list, expanded_symbols_added_list = self.dedup_lists_by_field(expanded_hyp_list, expanded_time_idx_list, expanded_symbols_added_list, 'y_sequence')
+
+#            print("ENTERING LOOP")
+#            print("HERE expanded_time_idx_list", expanded_time_idx_list)
+#            print("HERE expanded_hyps_list", [i.y_sequence for i in expanded_hyp_list])
+#            print("HERE expanded_score_list", [i.score for i in expanded_hyp_list])
+#            print("HERE expanded_time_list", [i.timestep for i in expanded_hyp_list])
+#            print()
 
             beam2 = beam
 #            print("HERE before reducing time_idx_list", expanded_time_idx_list)

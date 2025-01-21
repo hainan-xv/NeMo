@@ -302,7 +302,8 @@ class AbstractRNNTDecoding(ConfidenceMixin):
                         preserve_alignments=self.preserve_alignments,
                         preserve_frame_confidence=self.preserve_frame_confidence,
                         confidence_method_cfg=self.confidence_method_cfg,
-                        window_size=self.cfg.greedy.get('window_size', 0)
+                        window_size=self.cfg.greedy.get('window_size', 0),
+                        beam=self.cfg.greedy.get('beam', 0),
                     )
                 else:
                     self.decoding = rnnt_greedy_decoding.GreedyTDTInfer(
