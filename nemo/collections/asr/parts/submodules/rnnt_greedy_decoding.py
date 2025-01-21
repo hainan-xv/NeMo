@@ -420,9 +420,11 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
         hypothesis_list = [rnnt_utils.Hypothesis(score=0.0, y_sequence=[], dec_state=None, timestep=[], last_token=None)]
         time_idx_list = [0]
         symbols_added_list = [0]
+        last_label_list = [self._SOS]
         finished_hyps = []
 
         beam = 2
+        dec_state = self.decoder.initialize_state(x)
 
         while len(finished_hyps) < beam:
 
@@ -430,10 +432,34 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
             expanded_time_idx_list = []
             expanded_symbols_added_list = []
 
-#            print("HERE time_idx_list", time_idx_list)
-#            print("HERE hyp_list", [i.y_sequence for i in hypothesis_list])
+            print("HERE time_idx_list", time_idx_list)
+            print("HERE hyp_list", [i.y_sequence for i in hypothesis_list])
+            print("HERE hyp_list", [i.timestep for i in hypothesis_list])
+            print()
 #            print("HERE score_list", [i.score for i in hypothesis_list])
 #            print("HERE symbols_added_list", symbols_added_list)
+
+            time_idx_tensor = torch.LongTensor(time_idx_list).to(x.device)
+
+            offsets = torch.arange(window_size, device=x.device) 
+            time_indices_windowed = time_idx_tensor.unsqueeze(1) + offsets.unsqueeze(0)
+            time_indices_windowed = torch.clamp(time_indices_windowed, min=0, max=out_len.item()-1)
+
+            print("HERE time_indices_windowed", time_indices_windowed)
+
+            f = x[time_indices_windowed,0,:] # beam x window_size x D
+
+            print("HERE f", f.shape)
+
+            last_label_tensor = torch.LongTensor(last_label_list).to(x.device)
+
+
+            print("last_label_tensor", last_label_tensor)
+#            print("dec_state", dec_state.shape)
+#            g, hidden_prime = self._pred_step(last_label_tensor, dec_state)
+
+            #self.decoder.predict(label, hidden, add_sos=add_sos, batch_size=batch_size)
+
 
             for i in range(len(hypothesis_list)):
                 hypothesis = hypothesis_list[i]
@@ -468,21 +494,6 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                 if logp.dtype != torch.float32:
                     logp = logp.float()
 
-                # get index k, of max prob
-#                vs, ks = logp.max(-1)
-#
-#                ks = ks.tolist()  # K is the label at timestep t_s in inner loop, s >= 0.
-#                k = self._blank_index
-#                vs = vs.tolist()
-#                v = 0.0
-               
-#                for jump in range(len(ks)):
-#                    v += vs[jump]
-#
-#                    if ks[jump] != self._blank_index:
-#                        k = ks[jump]
-#                        break
-
                 blank_score = logp[:,self._blank_index:self._blank_index+1]
                 cumsum = torch.cumsum(blank_score, dim=0)
                 weight = 1.0
@@ -492,18 +503,11 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                 logp_blank = cumsum[-1] #.item()
                 logp_sum[-1] = logp_blank
 
-#                print("SANITY", torch.sum(torch.exp(logp_sum)))
-
                 vv, kk = logp_sum.topk(beam, -1)
                 kk = kk.tolist()
                 vv = vv.tolist()
-#                if logp_blank > -1.0:
-#                    kk = kk + [self._blank_index]
-#                    vv = vv + [logp_blank]
 
-#                print("HERE", kk, vv)
-
-                for j in range(len(kk)):
+                for j in range(beam):
                     new_k = kk[j]
                     new_v = vv[j]
 
@@ -514,9 +518,11 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                         expanded_hyp = copy.deepcopy(hypothesis)
                         # If blank token is predicted, exit inner loop, move onto next timestep t
 
+                        print("NEW K", new_k)
+                        print("TO MAX", logp[:,new_k])
                         _, jump = logp[:,new_k].max(-1)
                         jump = jump.item()
-                        jump = 1
+                        print("THEREFORE jump is", jump)
 
                         if jump > 0:
                             time_idx += jump
@@ -531,14 +537,6 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                         expanded_hyp.timestep.append(time_idx)
                         expanded_hyp.dec_state = hidden_prime
                         expanded_hyp.last_token = new_k
-
-#                        # Increment token counter.
-#                        if time_idx < out_len.item():
-#                            expanded_hyp_list.append(expanded_hyp)
-#                            expanded_time_idx_list.append(time_idx)
-#                            expanded_symbols_added_list.append(symbols_added)
-#                        else:
-#                            finished_hyps.append(hypothesis)
 
                     else:  # blank prediction
                         time_idx += n
@@ -557,13 +555,14 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                 break
 
             expanded_hyp_list, expanded_time_idx_list, expanded_symbols_added_list =  zip(*sorted(zip(expanded_hyp_list, expanded_time_idx_list, expanded_symbols_added_list), key=lambda x:-x[0].score))
-#            print("OLD SIZE", len(expanded_hyp_list))
             expanded_hyp_list, expanded_time_idx_list, expanded_symbols_added_list = self.dedup_lists_by_field(expanded_hyp_list, expanded_time_idx_list, expanded_symbols_added_list, 'y_sequence')
-#            print("new SIZE", len(expanded_hyp_list))
 
-            hypothesis_list = expanded_hyp_list[:beam]
-            time_idx_list = expanded_time_idx_list[:beam]
-            symbols_added_list = expanded_symbols_added_list[:beam]
+            beam2 = beam
+#            print("HERE before reducing time_idx_list", expanded_time_idx_list)
+            hypothesis_list = expanded_hyp_list[:beam2]
+            time_idx_list = expanded_time_idx_list[:beam2]
+#            print("HERE after  reducing time_idx_list", time_idx_list)
+            symbols_added_list = expanded_symbols_added_list[:beam2]
                 
         hypothesis  =  sorted(finished_hyps, key=lambda x:-x.score)[0]
         return hypothesis
