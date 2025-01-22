@@ -424,10 +424,9 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
         hypothesis = rnnt_utils.Hypothesis(score=0.0, y_sequence=[], dec_state=None, timestep=[], last_token=None)
         time_idx = 0
         symbols_added = 0
-
         out_len = out_len.item()
 
-        while time_idx < out_len: #* beam * beam:
+        while time_idx < out_len:
             n = window_size
             if time_idx + n > out_len:
                 n = out_len - time_idx
@@ -443,12 +442,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                 last_label = label_collate([[hypothesis.last_token]])
 
             g, hidden_prime = self._pred_step(last_label, hypothesis.dec_state)
-
-            logp = self._joint_step(f, g, log_normalize=True)[
-                0, :, 0, :
-            ]
-
-            del g
+            logp = self._joint_step(f, g, log_normalize=True)[0, :, 0, :]
 
             # torch.max(0) op doesnt exist for FP 16.
             if logp.dtype != torch.float32:
