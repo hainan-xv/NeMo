@@ -422,69 +422,37 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
         hypothesis_list = [rnnt_utils.Hypothesis(score=0.0, y_sequence=[], dec_state=None, timestep=[], last_token=None)]
         time_idx_list = [0]
         symbols_added_list = [0]
-        last_label_list = [self._SOS]
         finished_hyps = []
 
-        dec_state = self.decoder.initialize_state(x)
+        out_len = out_len.item()
 
-        while len(finished_hyps) < beam * beam * beam:
-
+        while len(finished_hyps) < beam: #* beam * beam:
             expanded_hyp_list = []
             expanded_time_idx_list = []
             expanded_symbols_added_list = []
-
-#            print("ENTERING LOOP")
-#            print("HERE time_idx_list", time_idx_list)
-#            print("HERE hyps_list", [i.y_sequence for i in hypothesis_list])
-#            print("HERE score_list", [i.score for i in hypothesis_list])
-#            print("HERE time_list", [i.timestep for i in hypothesis_list])
-#            print()
-
-#            print("HERE score_list", [i.score for i in hypothesis_list])
-#            print("HERE symbols_added_list", symbols_added_list)
-
-#            time_idx_tensor = torch.LongTensor(time_idx_list).to(x.device)
-#
-#            offsets = torch.arange(window_size, device=x.device) 
-#            time_indices_windowed = time_idx_tensor.unsqueeze(1) + offsets.unsqueeze(0)
-#            time_indices_windowed = torch.clamp(time_indices_windowed, min=0, max=out_len.item()-1)
-#
-#            print("HERE time_indices_windowed", time_indices_windowed)
-#
-#            f = x[time_indices_windowed,0,:] # beam x window_size x D
-#
-#            print("HERE f", f.shape)
-#
-#            last_label_tensor = torch.LongTensor(last_label_list).to(x.device)
-#
-#
-#            print("last_label_tensor", last_label_tensor)
-##            print("dec_state", dec_state.shape)
-##            g, hidden_prime = self._pred_step(last_label_tensor, dec_state)
-#
-#            #self.decoder.predict(label, hidden, add_sos=add_sos, batch_size=batch_size)
 
             for i in range(len(hypothesis_list)):
                 hypothesis = hypothesis_list[i]
                 time_idx = time_idx_list[i]
                 symbols_added = symbols_added_list[i]
 
+                print("hyp score:", hypothesis.score, 'time', time_idx, 'text',  hypothesis.y_sequence)
+
                 n = window_size
                 if time_idx + n > out_len:
                     n = out_len - time_idx
 
                 f = x.narrow(dim=0, start=time_idx, length=n)
-                _, _, D = f.shape
-                f = torch.reshape(f, [1, n, D])
+                f = torch.reshape(f, [1, n, -1])
 
                 # In the first timestep, we initialize the network with RNNT Blank
                 # In later timesteps, we provide previous predicted label as input.
-                if hypothesis_list[i].last_token is None and hypothesis_list[i].dec_state is None:
+                if hypothesis.last_token is None and hypothesis.dec_state is None:
                     last_label = self._SOS
                 else:
                     last_label = label_collate([[hypothesis_list[i].last_token]])
 
-                g, hidden_prime = self._pred_step(last_label, hypothesis_list[i].dec_state)
+                g, hidden_prime = self._pred_step(last_label, hypothesis.dec_state)
 
                 logp = self._joint_step(f, g, log_normalize=True)[
                     0, :, 0, :
@@ -498,11 +466,10 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
 
                 blank_score = logp[:,self._blank_index:self._blank_index+1]
                 cumsum = torch.cumsum(blank_score, dim=0)
-                weight = 1.0
                 logp[1:,:-1] += cumsum[:-1,:]
-                logp_sum = torch.logsumexp(logp[:,:] * weight, dim=0) 
+                logp_sum = torch.logsumexp(logp[:,:], dim=0) 
 
-                logp_blank = cumsum[-1] #.item()
+                logp_blank = cumsum[-1]
                 logp_sum[-1] = logp_blank
 
                 vv, kk = logp_sum.topk(beam, -1)
@@ -515,70 +482,60 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                     new_k = kk[j]
                     new_v = vv[j]
 
-                    if new_v < best_score - 4:
-                        break
+
+                    this_time_idx = time_idx
+                    this_symbols_added = symbols_added
+
+#                    if new_v < best_score - 4:
+#                        break
+
+                    print("adding score", new_v, 'text', new_k, 'at time', time_idx, 'based on', hypothesis.y_sequence, 'with', hypothesis.score)
 
                     if new_k != self._blank_index:
                         expanded_hyp = copy.deepcopy(hypothesis)
-                        # If blank token is predicted, exit inner loop, move onto next timestep t
 
-#                        print("NEW K", new_k)
-#                        print("TO MAX", logp[:,new_k])
                         _, jump = logp[:,new_k].max(-1)
                         jump = jump.item()
 
-                        if jump > 0:
-                            time_idx += jump
-                            symbols_added = 0
-                        else:
-                            time_idx += 1
-                            if symbols_added >= 5:
-                                symbols_added = 0
-#                        print("THEREFORE jump is", jump, symbols_added, time_idx)
-
                         expanded_hyp.y_sequence.append(new_k)
                         expanded_hyp.score += new_v
-                        expanded_hyp.timestep.append(time_idx)
+                        expanded_hyp.timestep.append(this_time_idx + jump)
                         expanded_hyp.dec_state = hidden_prime
                         expanded_hyp.last_token = new_k
 
+                        if jump > 0:
+                            this_time_idx += jump
+                            this_symbols_added = 0
+                        else:
+                            this_symbols_added += 1
+                            if this_symbols_added >= 5:
+                                this_symbols_added = 0
+                                this_time_idx += 1
+
                     else:  # blank prediction
-#                        print("NEW K: blank")
-#                        print("jump is", n)
-                        time_idx += n
+                        this_time_idx += n
                         expanded_hyp = copy.deepcopy(hypothesis)
                         expanded_hyp.score += new_v
-                        symbols_added = 0
+                        this_symbols_added = 0
 
-                    if time_idx < out_len.item():
+                    print('adding result', expanded_hyp.score)
+
+                    if this_time_idx < out_len:
                         expanded_hyp_list.append(expanded_hyp)
-                        expanded_time_idx_list.append(time_idx)
-                        expanded_symbols_added_list.append(0)
+                        expanded_time_idx_list.append(this_time_idx)
+                        expanded_symbols_added_list.append(this_symbols_added)
                     else:
                         finished_hyps.append(hypothesis)
-#                        print('Adding to finished', hypothesis.y_sequence, hypothesis.score, hypothesis.timestep)
 
             if len(expanded_hyp_list) == 0:
                 break
 
-
-#            print()
-#            print()
-
             expanded_hyp_list, expanded_time_idx_list, expanded_symbols_added_list =  zip(*sorted(zip(expanded_hyp_list, expanded_time_idx_list, expanded_symbols_added_list), key=lambda x:-x[0].score))
             expanded_hyp_list, expanded_time_idx_list, expanded_symbols_added_list = self.dedup_lists_by_field(expanded_hyp_list, expanded_time_idx_list, expanded_symbols_added_list, 'y_sequence')
 
-#            print("HERE expanded_time_idx_list", expanded_time_idx_list)
-#            print("HERE expanded_hyps_list", [i.y_sequence for i in expanded_hyp_list])
-#            print("HERE expanded_score_list", [i.score for i in expanded_hyp_list])
-#            print("HERE expanded_time_list", [i.timestep for i in expanded_hyp_list])
-#            print()
-
             beam2 = beam
-#            print("HERE before reducing time_idx_list", expanded_time_idx_list)
             hypothesis_list = expanded_hyp_list[:beam2]
             time_idx_list = expanded_time_idx_list[:beam2]
-#            print("HERE after  reducing time_idx_list", time_idx_list)
             symbols_added_list = expanded_symbols_added_list[:beam2]
                 
         hypothesis  =  sorted(finished_hyps, key=lambda x:-x.score)[0]
@@ -599,10 +556,22 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                 unique_a.append(a_item)
                 unique_b.append(b_item)
                 unique_c.append(c_item)
-#            else:
+            else:
 #                print("MERGE for", field_value)
-#                print("MERGE", unique_a[seen[field_value]].score, a_list[i].score)
-#                unique_a[seen[field_value]].score = np.logaddexp(unique_a[seen[field_value]].score , a_list[i].score)
+#                old_value = unique_a[seen[field_value]].score
+#                unique_a[seen[field_value]].score = np.logaddexp(unique_a[seen[field_value]].score , a_item.score)
+#                print("MERGE", old_value, a_item.score, "to", unique_a[seen[field_value]].score)
+
+#                if unique_a[seen[field_value]].score < a_item.score:
+#                    unique_a[seen[field_value]] = a_item
+#                    unique_b[seen[field_value]] = b_item
+#                    unique_c[seen[field_value]] = c_item
+
+                unique_a[seen[field_value]].score = max(unique_a[seen[field_value]].score , a_item.score)
+
+                if b_item > b_list[seen[field_value]]:
+                    unique_b[seen[field_value]] = b_item
+                    unique_c[seen[field_value]] = c_item
 
         return unique_a, unique_b, unique_c
 
@@ -613,6 +582,8 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
     ):
         # x: [T, 1, D]
         # out_len: [seq_len]
+
+        out_len = out_len.item()
 
         # Initialize blank state and empty label set in Hypothesis
         hypothesis = rnnt_utils.Hypothesis(score=0.0, y_sequence=[], dec_state=None, timestep=[], last_token=None)
