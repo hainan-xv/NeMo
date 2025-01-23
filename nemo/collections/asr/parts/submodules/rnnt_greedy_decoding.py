@@ -402,7 +402,8 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                 if self.window_size == 1:
                     hypothesis = self._greedy_decode(inseq, logitlen, partial_hypotheses=partial_hypothesis)
                 elif self.window_size < 0 and self.beam == 1:
-                    hypothesis = self._greedy_decode_lookahead_sum(inseq, logitlen, partial_hypotheses=partial_hypothesis, window_size=-self.window_size)
+#                    hypothesis = self._greedy_decode_lookahead_sum(inseq, logitlen, partial_hypotheses=partial_hypothesis, window_size=-self.window_size)
+                    hypothesis = self._greedy_decode_lookahead_beam(inseq, logitlen, partial_hypotheses=partial_hypothesis, window_size=-self.window_size, beam=self.beam)
                 elif self.window_size < 0 and self.beam > 1:
                     hypothesis = self._greedy_decode_lookahead_beam(inseq, logitlen, partial_hypotheses=partial_hypothesis, window_size=-self.window_size, beam=self.beam)
                 else:
@@ -521,8 +522,14 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
         V = self._blank_index
 
         tmp = 0
-        while len(finished_hyps) < beam: #* beam * beam:
+#        while len(finished_hyps) < beam * beam * beam and len(hypothesis_list) > 0: #* beam * beam:
+        while len(hypothesis_list) > 0: #* beam * beam:
+            print("finished_hyps", len(finished_hyps))
             print("times in loop", tmp)
+            print(time_idx_list)
+            print([x.y_sequence for x in hypothesis_list])
+            print([x.score for x in hypothesis_list])
+            print()
             tmp += 1
             expanded_hyps = []
             expanded_times = []
@@ -578,9 +585,9 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                         expanded_symbols.append(symbols_added)
                     else:
                         finished_hyps.append(hypothesis)
-                    beam -= 1
+                    loops -= 1
 
-                for j in range(beam):
+                for j in range(loops):
                     jump, k = kk[j] // V, kk[j] % V
                     v = vv[j]
 
@@ -602,9 +609,12 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                             this_symbols_added = 0
                             this_time_idx += 1
 
-                    expanded_hyps.append(expanded_hyp)
-                    expanded_times.append(this_time_idx)
-                    expanded_symbols.append(this_symbols_added)
+                    if this_time_idx < out_len:
+                        expanded_hyps.append(expanded_hyp)
+                        expanded_times.append(this_time_idx)
+                        expanded_symbols.append(this_symbols_added)
+                    else:
+                        finished_hyps.append(hypothesis)
 
 
             if len(expanded_hyps) == 0:
