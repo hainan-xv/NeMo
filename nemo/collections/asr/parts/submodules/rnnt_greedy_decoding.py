@@ -46,6 +46,11 @@ from nemo.core.classes import Typing, typecheck
 from nemo.core.neural_types import AcousticEncodedRepresentation, HypothesisType, LengthsType, NeuralType
 from nemo.utils import logging
 
+def cumulative_logsumexp(tensor):
+    max_vals = torch.cummax(tensor, dim=0)[0]
+    exp_vals = torch.exp(tensor - max_vals)
+    cum_sum = torch.cumsum(exp_vals, dim=0)
+    return torch.log(cum_sum) + max_vals
 
 def pack_hypotheses(
     hypotheses: List[rnnt_utils.Hypothesis],
@@ -448,24 +453,35 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
             if logp.dtype != torch.float32:
                 logp = logp.float()
 
-            blank_score = logp[:,self._blank_index:self._blank_index+1]
-            cumsum = torch.cumsum(blank_score, dim=0)
-            logp[1:,:-1] += cumsum[:-1,:]
-            logp_sum = torch.logsumexp(logp[:,:], dim=0) 
+            # logp: [T, V]
 
-            logp_blank = cumsum[-1]
-            logp_sum[-1] = logp_blank
+            # get index k, of max prob
+            v, ks = logp.max(-1)
+            ks = ks.tolist()  # K is the label at timestep t_s in inner loop, s >= 0.
+            kk = self._blank_index
 
-            vv, kk = logp_sum.max(-1)
-            kk = kk.item()
-            vv = vv.item()
+            for jump in range(len(ks)):
+                if ks[jump] != self._blank_index:
+                    kk = ks[jump]
+                    break
+
 
             if kk != self._blank_index:
-                _, jump = logp[:,kk].max(-1)
-                jump = jump.item()
+                blank_score = logp[:,self._blank_index:self._blank_index+1] # [T, 1]
+                cumsum = torch.cumsum(blank_score, dim=0) # [T, 1]
+                cum_logp = logp[:,:-1] * 1.0
+                cum_logp[1:,] += cumsum[:-1,:]
+                logp_sum = torch.logsumexp(cum_logp[:,:], dim=0) 
+
+                vv,  kk = logp_sum.max(-1)
+                kk = kk.item()
+                vv = vv.item()
+
+#                _, jump = logp[:,kk].max(-1)
+#                jump = jump.item()
 
                 hypothesis.y_sequence.append(kk)
-                hypothesis.score += vv
+                hypothesis.score += v[jump]
                 hypothesis.timestep.append(time_idx + jump)
                 hypothesis.dec_state = hidden_prime
                 hypothesis.last_token = kk
@@ -481,7 +497,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
 
             else:  # blank prediction
                 time_idx += n
-                hypothesis.score += vv
+                hypothesis.score += v[jump]
                 symbols_added = 0
                 
         return hypothesis
@@ -502,18 +518,20 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
         finished_hyps = []
 
         out_len = out_len.item()
+        V = self._blank_index
 
+        tmp = 0
         while len(finished_hyps) < beam: #* beam * beam:
-            expanded_hyp_list = []
-            expanded_time_idx_list = []
-            expanded_symbols_added_list = []
+            print("times in loop", tmp)
+            tmp += 1
+            expanded_hyps = []
+            expanded_times = []
+            expanded_symbols = []
 
             for i in range(len(hypothesis_list)):
                 hypothesis = hypothesis_list[i]
                 time_idx = time_idx_list[i]
                 symbols_added = symbols_added_list[i]
-
-#                print("hyp score:", hypothesis.score, 'time', time_idx, 'text',  hypothesis.y_sequence)
 
                 n = window_size
                 if time_idx + n > out_len:
@@ -530,13 +548,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                     last_label = label_collate([[hypothesis_list[i].last_token]])
 
                 g, hidden_prime = self._pred_step(last_label, hypothesis.dec_state)
-
-                logp = self._joint_step(f, g, log_normalize=True)[
-                    0, :, 0, :
-                ]
-
-                del g
-
+                logp = self._joint_step(f, g, log_normalize=True)[0, :, 0, :]
                 # torch.max(0) op doesnt exist for FP 16.
                 if logp.dtype != torch.float32:
                     logp = logp.float()
@@ -544,113 +556,116 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                 blank_score = logp[:,self._blank_index:self._blank_index+1]
                 cumsum = torch.cumsum(blank_score, dim=0)
                 logp[1:,:-1] += cumsum[:-1,:]
-                logp_sum = torch.logsumexp(logp[:,:], dim=0) 
 
                 logp_blank = cumsum[-1]
-                logp_sum[-1] = logp_blank
 
-                vv, kk = logp_sum.topk(beam, -1)
+                vv, kk = logp[:,:-1].flatten().topk(beam, -1)
                 kk = kk.tolist()
                 vv = vv.tolist()
 
-                best_score = vv[0]
+                loops = beam
+
+                if logp_blank > vv[-1]:
+                    # now blank prediction
+                    time_idx += n
+                    expanded_hyp = hypothesis
+                    expanded_hyp.score += v
+                    symbols_added = 0
+
+                    if time_idx < out_len:
+                        expanded_hyps.append(expanded_hyp)
+                        expanded_times.append(time_idx)
+                        expanded_symbols.append(symbols_added)
+                    else:
+                        finished_hyps.append(hypothesis)
+                    beam -= 1
 
                 for j in range(beam):
-                    new_k = kk[j]
-                    new_v = vv[j]
-
+                    jump, k = kk[j] // V, kk[j] % V
+                    v = vv[j]
 
                     this_time_idx = time_idx
                     this_symbols_added = symbols_added
+                    expanded_hyp = copy.deepcopy(hypothesis)
+                    expanded_hyp.y_sequence.append(k)
+                    expanded_hyp.score += v
+                    expanded_hyp.timestep.append(this_time_idx + jump)
+                    expanded_hyp.dec_state = hidden_prime
+                    expanded_hyp.last_token = k
 
-#                    if new_v < best_score - 4:
-#                        break
-
-#                    print("adding score", new_v, 'text', new_k, 'at time', time_idx, 'based on', hypothesis.y_sequence, 'with', hypothesis.score)
-
-                    if new_k != self._blank_index:
-                        expanded_hyp = copy.deepcopy(hypothesis)
-
-                        _, jump = logp[:,new_k].max(-1)
-                        jump = jump.item()
-
-                        expanded_hyp.y_sequence.append(new_k)
-                        expanded_hyp.score += new_v
-                        expanded_hyp.timestep.append(this_time_idx + jump)
-                        expanded_hyp.dec_state = hidden_prime
-                        expanded_hyp.last_token = new_k
-
-                        if jump > 0:
-                            this_time_idx += jump
-                            this_symbols_added = 0
-                        else:
-                            this_symbols_added += 1
-                            if this_symbols_added >= 5:
-                                this_symbols_added = 0
-                                this_time_idx += 1
-
-                    else:  # blank prediction
-                        this_time_idx += n
-                        expanded_hyp = copy.deepcopy(hypothesis)
-                        expanded_hyp.score += new_v
+                    if jump > 0:
+                        this_time_idx += jump
                         this_symbols_added = 0
-
-#                    print('adding result', expanded_hyp.score)
-
-                    if this_time_idx < out_len:
-                        expanded_hyp_list.append(expanded_hyp)
-                        expanded_time_idx_list.append(this_time_idx)
-                        expanded_symbols_added_list.append(this_symbols_added)
                     else:
-                        finished_hyps.append(hypothesis)
+                        this_symbols_added += 1
+                        if this_symbols_added >= 5:
+                            this_symbols_added = 0
+                            this_time_idx += 1
 
-            if len(expanded_hyp_list) == 0:
+                    expanded_hyps.append(expanded_hyp)
+                    expanded_times.append(this_time_idx)
+                    expanded_symbols.append(this_symbols_added)
+
+
+            if len(expanded_hyps) == 0:
                 break
 
-            expanded_hyp_list, expanded_time_idx_list, expanded_symbols_added_list =  zip(*sorted(zip(expanded_hyp_list, expanded_time_idx_list, expanded_symbols_added_list), key=lambda x:-x[0].score))
-            expanded_hyp_list, expanded_time_idx_list, expanded_symbols_added_list = self.dedup_lists_by_field(expanded_hyp_list, expanded_time_idx_list, expanded_symbols_added_list, 'y_sequence')
+            expanded_hyps, expanded_times, expanded_symbols =  zip(*sorted(zip(expanded_hyps, expanded_times, expanded_symbols), key=lambda x:-x[0].score))
+            expanded_hyps, expanded_times, expanded_symbols = self.dedup_lists_by_field(expanded_hyps, expanded_times, expanded_symbols)
+            expanded_hyps, expanded_times, expanded_symbols = self.prune(beam, expanded_hyps, expanded_times, expanded_symbols)
 
-            beam2 = beam
-            hypothesis_list = expanded_hyp_list[:beam2]
-            time_idx_list = expanded_time_idx_list[:beam2]
-            symbols_added_list = expanded_symbols_added_list[:beam2]
+            hypothesis_list, time_idx_list, symbols_added_list = expanded_hyps, expanded_times, expanded_symbols
                 
         hypothesis  =  sorted(finished_hyps, key=lambda x:-x.score)[0]
-#        print("SCORE IS", hypothesis.score)
         return hypothesis
 
-    def dedup_lists_by_field(self, a_list, b_list, c_list, field_name):
-        seen = {}
-        unique_a = []
-        unique_b = []
-        unique_c = []
-
-        for i, (a_item, b_item, c_item) in enumerate(zip(a_list, b_list, c_list)):
-            field_value = getattr(a_item, field_name)
-            field_value = tuple(field_value)
-            if field_value not in seen:
-                seen[field_value] = len(unique_a)
-                unique_a.append(a_item)
-                unique_b.append(b_item)
-                unique_c.append(c_item)
+    def prune(self, beam, hyps, times, symbols):
+        time_to_scores = {}
+        for i, (hyp, time, symbol) in enumerate(zip(hyps, times, symbols)):
+            if time in time_to_scores:
+                time_to_scores[time].append(hyp.score)
             else:
-#                print("MERGE for", field_value)
-#                old_value = unique_a[seen[field_value]].score
-#                unique_a[seen[field_value]].score = np.logaddexp(unique_a[seen[field_value]].score , a_item.score)
-#                print("MERGE", old_value, a_item.score, "to", unique_a[seen[field_value]].score)
+                time_to_scores[time] = [hyp.score]
 
-#                if unique_a[seen[field_value]].score < a_item.score:
-#                    unique_a[seen[field_value]] = a_item
-#                    unique_b[seen[field_value]] = b_item
-#                    unique_c[seen[field_value]] = c_item
+        for key, value in time_to_scores.items():
+            time_to_scores[key].sort()
 
-                unique_a[seen[field_value]].score = max(unique_a[seen[field_value]].score , a_item.score)
+        pruned_hyps, pruned_times, pruned_symbols = [], [], []
+        for i, (hyp, time, symbol) in enumerate(zip(hyps, times, symbols)):
+            if len(time_to_scores[time]) < beam:
+                pruned_hyps.append(hyp)
+                pruned_times.append(time)
+                pruned_symbols.append(symbol)
 
-                if b_item > b_list[seen[field_value]]:
-                    unique_b[seen[field_value]] = b_item
-                    unique_c[seen[field_value]] = c_item
+            elif hyp.score >= time_to_scores[time][-beam]:
+                pruned_hyps.append(hyp)
+                pruned_times.append(time)
+                pruned_symbols.append(symbol)
 
-        return unique_a, unique_b, unique_c
+        return pruned_hyps, pruned_times, pruned_symbols
+
+    def dedup_lists_by_field(self, hyps, times, symbols):
+        seen = {}
+        unique_hyps = []
+        unique_times = []
+        unique_symbols = []
+
+        for i, (hyp, time, symbol) in enumerate(zip(hyps, times, symbols)):
+            key = [time] + hyp.y_sequence
+            key = tuple(key)
+            if key not in seen:
+                seen[key] = len(unique_hyps)
+                unique_hyps.append(hyp)
+                unique_times.append(time)
+                unique_symbols.append(symbol)
+            else:
+#                unique_hyps[seen[key]].score = max(unique_hyps[seen[key]].score , hyp.score)
+                unique_hyps[seen[key]].score = np.logaddexp(unique_hyps[seen[key]].score , hyp.score)
+
+                if symbol > symbols[seen[key]]:
+                    unique_symbols[seen[key]] = symbol
+
+        return unique_hyps, unique_times, unique_symbols
 
 
     @torch.no_grad()
