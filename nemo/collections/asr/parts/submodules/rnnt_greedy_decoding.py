@@ -557,9 +557,10 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
 
                 blank_score = logp[:,self._blank_index:self._blank_index+1]
                 cumsum = torch.cumsum(blank_score, dim=0)
+                print("cumsum is", cumsum.shape)
                 logp[1:,:-1] += cumsum[:-1,:]
 
-                logp_blank = cumsum[-1].item()
+                logp_blank = cumsum[-1, 0].item()
 
                 vv, kk = logp[:,:-1].flatten().topk(beam, -1)
                 kk = kk.tolist()
@@ -618,8 +619,12 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
             expanded_hyps, expanded_times, expanded_symbols =  zip(*sorted(zip(expanded_hyps, expanded_times, expanded_symbols), key=lambda x:-x[0].score))
 
             hypothesis_list, time_idx_list, symbols_added_list = expanded_hyps, expanded_times, expanded_symbols
-                
-        hypothesis  =  sorted(finished_hyps, key=lambda x:-x.score)[0]
+               
+        finished_hyps = sorted(finished_hyps, key=lambda x:-x.score)
+        print("HERE finished_hyps")
+        print([(x.score, x.y_sequence) for x in finished_hyps])
+        hypothesis  =  finished_hyps[0]
+        print("BEST SCORE", hypothesis.score)
         return hypothesis
 
     def prune(self, beam, hyps, times, symbols):
