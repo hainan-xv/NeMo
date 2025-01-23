@@ -504,7 +504,6 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
         return hypothesis
 
 
-
     @torch.no_grad()
     def _greedy_decode_lookahead_beam(
         self, x: torch.Tensor, out_len: torch.Tensor, window_size: int, beam: int, partial_hypotheses: Optional[rnnt_utils.Hypothesis] = None
@@ -521,16 +520,12 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
         out_len = out_len.item()
         V = self._blank_index
 
-        tmp = 0
-#        while len(finished_hyps) < beam * beam * beam and len(hypothesis_list) > 0: #* beam * beam:
-        while len(hypothesis_list) > 0: #* beam * beam:
+        while len(finished_hyps) < beam * beam * beam and len(hypothesis_list) > 0: #* beam * beam:
+#        while len(hypothesis_list) > 0: #* beam * beam:
             print("finished_hyps", len(finished_hyps))
-            print("times in loop", tmp)
             print(time_idx_list)
-            print([x.y_sequence for x in hypothesis_list])
-            print([x.score for x in hypothesis_list])
+            print([(x.score, x.y_sequence) for x in hypothesis_list])
             print()
-            tmp += 1
             expanded_hyps = []
             expanded_times = []
             expanded_symbols = []
@@ -564,7 +559,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                 cumsum = torch.cumsum(blank_score, dim=0)
                 logp[1:,:-1] += cumsum[:-1,:]
 
-                logp_blank = cumsum[-1]
+                logp_blank = cumsum[-1].item()
 
                 vv, kk = logp[:,:-1].flatten().topk(beam, -1)
                 kk = kk.tolist()
@@ -574,15 +569,14 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
 
                 if logp_blank > vv[-1]:
                     # now blank prediction
-                    time_idx += n
-                    expanded_hyp = hypothesis
-                    expanded_hyp.score += v
-                    symbols_added = 0
+                    this_time_idx = time_idx + n
+                    expanded_hyp = copy.deepcopy(hypothesis)
+                    expanded_hyp.score += logp_blank
 
-                    if time_idx < out_len:
+                    if this_time_idx < out_len:
                         expanded_hyps.append(expanded_hyp)
-                        expanded_times.append(time_idx)
-                        expanded_symbols.append(symbols_added)
+                        expanded_times.append(this_time_idx)
+                        expanded_symbols.append(0)
                     else:
                         finished_hyps.append(hypothesis)
                     loops -= 1
@@ -591,17 +585,16 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                     jump, k = kk[j] // V, kk[j] % V
                     v = vv[j]
 
-                    this_time_idx = time_idx
+                    this_time_idx = time_idx + jump
                     this_symbols_added = symbols_added
                     expanded_hyp = copy.deepcopy(hypothesis)
                     expanded_hyp.y_sequence.append(k)
                     expanded_hyp.score += v
-                    expanded_hyp.timestep.append(this_time_idx + jump)
+                    expanded_hyp.timestep.append(this_time_idx)
                     expanded_hyp.dec_state = hidden_prime
                     expanded_hyp.last_token = k
 
                     if jump > 0:
-                        this_time_idx += jump
                         this_symbols_added = 0
                     else:
                         this_symbols_added += 1
@@ -620,9 +613,9 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
             if len(expanded_hyps) == 0:
                 break
 
-            expanded_hyps, expanded_times, expanded_symbols =  zip(*sorted(zip(expanded_hyps, expanded_times, expanded_symbols), key=lambda x:-x[0].score))
             expanded_hyps, expanded_times, expanded_symbols = self.dedup_lists_by_field(expanded_hyps, expanded_times, expanded_symbols)
             expanded_hyps, expanded_times, expanded_symbols = self.prune(beam, expanded_hyps, expanded_times, expanded_symbols)
+            expanded_hyps, expanded_times, expanded_symbols =  zip(*sorted(zip(expanded_hyps, expanded_times, expanded_symbols), key=lambda x:-x[0].score))
 
             hypothesis_list, time_idx_list, symbols_added_list = expanded_hyps, expanded_times, expanded_symbols
                 
@@ -674,6 +667,8 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
 
                 if symbol > symbols[seen[key]]:
                     unique_symbols[seen[key]] = symbol
+
+                assert unique_times[seen[key]] == time
 
         return unique_hyps, unique_times, unique_symbols
 
