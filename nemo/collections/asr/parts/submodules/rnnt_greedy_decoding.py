@@ -420,91 +420,6 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
 
 
     @torch.no_grad()
-    def _greedy_decode_lookahead_sum(
-        self, x: torch.Tensor, out_len: torch.Tensor, window_size: int, partial_hypotheses: Optional[rnnt_utils.Hypothesis] = None
-    ):
-        # x: [T, 1, D]
-        # out_len: [seq_len]
-
-        # Initialize blank state and empty label set in Hypothesis
-        hypothesis = rnnt_utils.Hypothesis(score=0.0, y_sequence=[], dec_state=None, timestep=[], last_token=None)
-        time_idx = 0
-        symbols_added = 0
-        out_len = out_len.item()
-
-        while time_idx < out_len:
-            n = window_size
-            if time_idx + n > out_len:
-                n = out_len - time_idx
-
-            f = x.narrow(dim=0, start=time_idx, length=n)
-            f = torch.reshape(f, [1, n, -1])
-
-            # In the first timestep, we initialize the network with RNNT Blank
-            # In later timesteps, we provide previous predicted label as input.
-            if hypothesis.last_token is None and hypothesis.dec_state is None:
-                last_label = self._SOS
-            else:
-                last_label = label_collate([[hypothesis.last_token]])
-
-            g, hidden_prime = self._pred_step(last_label, hypothesis.dec_state)
-            logp = self._joint_step(f, g, log_normalize=True)[0, :, 0, :]
-
-            # torch.max(0) op doesnt exist for FP 16.
-            if logp.dtype != torch.float32:
-                logp = logp.float()
-
-            # logp: [T, V]
-
-            # get index k, of max prob
-            v, ks = logp.max(-1)
-            ks = ks.tolist()  # K is the label at timestep t_s in inner loop, s >= 0.
-            kk = self._blank_index
-
-            for jump in range(len(ks)):
-                if ks[jump] != self._blank_index:
-                    kk = ks[jump]
-                    break
-
-
-            if kk != self._blank_index:
-                blank_score = logp[:,self._blank_index:self._blank_index+1] # [T, 1]
-                cumsum = torch.cumsum(blank_score, dim=0) # [T, 1]
-                cum_logp = logp[:,:-1] * 1.0
-                cum_logp[1:,] += cumsum[:-1,:]
-                logp_sum = torch.logsumexp(cum_logp[:,:], dim=0) 
-
-                vv,  kk = logp_sum.max(-1)
-                kk = kk.item()
-                vv = vv.item()
-
-#                _, jump = logp[:,kk].max(-1)
-#                jump = jump.item()
-
-                hypothesis.y_sequence.append(kk)
-                hypothesis.score += v[jump]
-                hypothesis.timestep.append(time_idx + jump)
-                hypothesis.dec_state = hidden_prime
-                hypothesis.last_token = kk
-
-                if jump > 0:
-                    time_idx += jump
-                    symbols_added = 0
-                else:
-                    symbols_added += 1
-                    if symbols_added >= 5:
-                        symbols_added = 0
-                        time_idx += 1
-
-            else:  # blank prediction
-                time_idx += n
-                hypothesis.score += v[jump]
-                symbols_added = 0
-                
-        return hypothesis
-
-
-    @torch.no_grad()
     def _greedy_decode_lookahead_beam(
         self, x: torch.Tensor, out_len: torch.Tensor, window_size: int, beam: int, partial_hypotheses: Optional[rnnt_utils.Hypothesis] = None
     ):
@@ -665,7 +580,8 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                 unique_times.append(time)
                 unique_symbols.append(symbol)
             else:
-                unique_hyps[seen[key]].score = np.logaddexp(unique_hyps[seen[key]].score , hyp.score)
+                unique_hyps[seen[key]].score = max(unique_hyps[seen[key]].score , hyp.score)
+#                unique_hyps[seen[key]].score = np.logaddexp(unique_hyps[seen[key]].score , hyp.score)
 
                 if symbol > symbols[seen[key]]:
                     unique_symbols[seen[key]] = symbol

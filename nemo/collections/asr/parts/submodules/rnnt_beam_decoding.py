@@ -895,11 +895,6 @@ class BeamRNNTInfer(Typing):
         # ALSD runs for T + U_max steps
         for i in range(h_length + u_max):
 
-            print("HERE B IS")
-            for idx, b in enumerate(B):
-                print("sequence:", idx, b.score, b.y_sequence)
-            print()
-
             # Update caches
             A = []
             B_ = []
