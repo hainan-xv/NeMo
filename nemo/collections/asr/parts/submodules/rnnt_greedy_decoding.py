@@ -26,6 +26,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from heapq import nlargest
+
 import copy
 import math
 from dataclasses import dataclass, field
@@ -484,6 +486,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                         expanded_symbols.append(0)
                     else:
                         finished_hyps.append(hypothesis)
+                        finished_hyp_best_score = max(finished_hyp_best_score, hypothesis.score)
                     loops -= 1
 
                 for j in range(loops):
@@ -522,6 +525,9 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                             finished_hyp_best_score = max(finished_hyp_best_score, hypothesis.score)
 
             finished_hyps, _, _ = self.dedup_lists_by_field(finished_hyps, [0] * len(finished_hyps), [0] * len(finished_hyps))
+            if len(finished_hyps) > 4 * beam:
+                finished_hyps = nlargest(2 * beam, finished_hyps, key=lambda x: x.score)
+
 #            finished_hyps = sorted(finished_hyps, key=lambda x:-x.score)
 #
 #            if len(finished_hyps) > beam:
@@ -538,8 +544,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
 
             hypothesis_list, time_idx_list, symbols_added_list = expanded_hyps, expanded_times, expanded_symbols
                
-        finished_hyps = sorted(finished_hyps, key=lambda x:-x.score)
-        hypothesis  =  finished_hyps[0]
+        hypothesis  =  nlargest(1, finished_hyps, key=lambda x: x.score)[0]
         return hypothesis
 
     def prune(self, beam, hyps, times, symbols):
