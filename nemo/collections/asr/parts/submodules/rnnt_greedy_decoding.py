@@ -521,18 +521,11 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
         V = self._blank_index
 
         looptime = 0
-#        while len(finished_hyps) < beam * beam * beam and len(hypothesis_list) > 0: #* beam * beam:
         
         while len(hypothesis_list) > 0: #* beam * beam:
-#            print("finished_hyps", len(finished_hyps))
-#            print(time_idx_list)
-#            print([(x.score, x.y_sequence) for x in hypothesis_list])
-#            print()
             expanded_hyps = []
             expanded_times = []
             expanded_symbols = []
-#            print()
-#            print("LOOPTIME", looptime)
             looptime += 1
 
             for i in range(len(hypothesis_list)):
@@ -562,9 +555,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
 
                 blank_score = logp[:,self._blank_index:self._blank_index+1]
                 cumsum = torch.cumsum(blank_score, dim=0)
-#                print("cumsum is", cumsum.shape)
                 logp[1:,:-1] += cumsum[:-1,:]
-#                logp[1:,:] += cumsum[:-1,:] # also works
 
                 logp_blank = cumsum[-1, 0].item()
 
@@ -574,7 +565,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
 
                 loops = beam
 
-                if logp_blank > vv[0]:
+                if logp_blank > vv[-1] and logp_blank > vv[0] - 2:
                     # now blank prediction
                     this_time_idx = time_idx + n
                     expanded_hyp = copy.deepcopy(hypothesis)
@@ -586,12 +577,14 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                         expanded_symbols.append(0)
                     else:
                         finished_hyps.append(hypothesis)
-#                        print("ADDING FINISHED with score", hypothesis.score, 'and length', len(hypothesis.y_sequence))
-#                    loops -= 1
+                    loops -= 1
 
                 for j in range(loops):
                     jump, k = kk[j] // V, kk[j] % V
                     v = vv[j]
+
+                    if v < vv[0] - 3:
+                        break
 
                     this_time_idx = time_idx + jump
                     this_symbols_added = symbols_added
@@ -625,15 +618,11 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
 
             expanded_hyps, expanded_times, expanded_symbols = self.dedup_lists_by_field(expanded_hyps, expanded_times, expanded_symbols)
             expanded_hyps, expanded_times, expanded_symbols = self.prune(beam, expanded_hyps, expanded_times, expanded_symbols)
-#            expanded_hyps, expanded_times, expanded_symbols =  zip(*sorted(zip(expanded_hyps, expanded_times, expanded_symbols), key=lambda x:-x[0].score))
 
             hypothesis_list, time_idx_list, symbols_added_list = expanded_hyps, expanded_times, expanded_symbols
                
         finished_hyps = sorted(finished_hyps, key=lambda x:-x.score)
-#        print("HERE finished_hyps")
-#        print([(x.score, x.y_sequence) for x in finished_hyps])
         hypothesis  =  finished_hyps[0]
-#        print("BEST SCORE", hypothesis.score)
         return hypothesis
 
     def prune(self, beam, hyps, times, symbols):
@@ -646,7 +635,6 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
 
         for key, value in time_to_scores.items():
             time_to_scores[key].sort()
-#            print("BEST SCORE at time", key, "is", time_to_scores[key][-1])
 
         pruned_hyps, pruned_times, pruned_symbols = [], [], []
         for (hyp, time, symbol) in zip(hyps, times, symbols):
@@ -654,15 +642,11 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                 pruned_hyps.append(hyp)
                 pruned_times.append(time)
                 pruned_symbols.append(symbol)
-#                print("ADDING hyp with score", hyp.score, 'for time', time)
 
             elif hyp.score >= time_to_scores[time][-beam]:
                 pruned_hyps.append(hyp)
                 pruned_times.append(time)
                 pruned_symbols.append(symbol)
-#                print("ADDING hyp with score", hyp.score, 'for time', time)
-#            else:
-#                print("DISCARDING hyp with score", hyp.score, 'for time', time)
 
         return pruned_hyps, pruned_times, pruned_symbols
 
@@ -681,7 +665,6 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                 unique_times.append(time)
                 unique_symbols.append(symbol)
             else:
-#                unique_hyps[seen[key]].score = max(unique_hyps[seen[key]].score , hyp.score)
                 unique_hyps[seen[key]].score = np.logaddexp(unique_hyps[seen[key]].score , hyp.score)
 
                 if symbol > symbols[seen[key]]:

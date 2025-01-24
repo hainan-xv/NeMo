@@ -395,6 +395,7 @@ class AbstractRNNTDecoding(ConfidenceMixin):
                 search_type='default',
                 score_norm=self.cfg.beam.get('score_norm', True),
                 softmax_temperature=self.cfg.beam.get('softmax_temperature', 1.0),
+                window_size=self.cfg.beam.get('window_size', 1),
                 preserve_alignments=self.preserve_alignments,
             )
 
@@ -409,6 +410,7 @@ class AbstractRNNTDecoding(ConfidenceMixin):
                 score_norm=self.cfg.beam.get('score_norm', True),
                 tsd_max_sym_exp_per_step=self.cfg.beam.get('tsd_max_sym_exp', 10),
                 softmax_temperature=self.cfg.beam.get('softmax_temperature', 1.0),
+                window_size=self.cfg.beam.get('window_size', 1),
                 preserve_alignments=self.preserve_alignments,
             )
 
