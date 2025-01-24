@@ -401,10 +401,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                 partial_hypothesis = partial_hypotheses[batch_idx] if partial_hypotheses is not None else None
                 if self.window_size == 1:
                     hypothesis = self._greedy_decode(inseq, logitlen, partial_hypotheses=partial_hypothesis)
-                elif self.window_size < 0 and self.beam == 1:
-#                    hypothesis = self._greedy_decode_lookahead_sum(inseq, logitlen, partial_hypotheses=partial_hypothesis, window_size=-self.window_size)
-                    hypothesis = self._greedy_decode_lookahead_beam(inseq, logitlen, partial_hypotheses=partial_hypothesis, window_size=-self.window_size, beam=self.beam)
-                elif self.window_size < 0 and self.beam > 1:
+                elif self.window_size < 0:
                     hypothesis = self._greedy_decode_lookahead_beam(inseq, logitlen, partial_hypotheses=partial_hypothesis, window_size=-self.window_size, beam=self.beam)
                 else:
                     hypothesis = self._greedy_decode_lookahead(inseq, logitlen, partial_hypotheses=partial_hypothesis, window_size=self.window_size)
@@ -427,21 +424,21 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
         # out_len: [seq_len]
 
         # Initialize blank state and empty label set in Hypothesis
-        hypothesis_list = [rnnt_utils.Hypothesis(score=0.0, y_sequence=[], dec_state=None, timestep=[], last_token=None)]
+
+        g, hidden_prime = self._pred_step(self._SOS, None)
+        hypothesis_list = [rnnt_utils.Hypothesis(score=0.0, y_sequence=[], dec_out=[g], dec_state=hidden_prime, timestep=[], last_token=None)]
+
         time_idx_list = [0]
         symbols_added_list = [0]
         finished_hyps = []
 
         out_len = out_len.item()
         V = self._blank_index
-
-        looptime = 0
         
         while len(hypothesis_list) > 0: #* beam * beam:
             expanded_hyps = []
             expanded_times = []
             expanded_symbols = []
-            looptime += 1
 
             for i in range(len(hypothesis_list)):
                 hypothesis = hypothesis_list[i]
@@ -454,15 +451,8 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
 
                 f = x.narrow(dim=0, start=time_idx, length=n)
                 f = torch.reshape(f, [1, n, -1])
+                g = hypothesis.dec_out[0]
 
-                # In the first timestep, we initialize the network with RNNT Blank
-                # In later timesteps, we provide previous predicted label as input.
-                if hypothesis.last_token is None and hypothesis.dec_state is None:
-                    last_label = self._SOS
-                else:
-                    last_label = label_collate([[hypothesis_list[i].last_token]])
-
-                g, hidden_prime = self._pred_step(last_label, hypothesis.dec_state)
                 logp = self._joint_step(f, g, log_normalize=True)[0, :, 0, :]
                 # torch.max(0) op doesnt exist for FP 16.
                 if logp.dtype != torch.float32:
@@ -501,20 +491,22 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                     if v < vv[0] - 3:
                         break
 
+                    new_g, new_hidden_prime = self._pred_step(k, hypothesis.dec_state)
                     this_time_idx = time_idx + jump
                     this_symbols_added = symbols_added
                     expanded_hyp = copy.deepcopy(hypothesis)
                     expanded_hyp.y_sequence.append(k)
                     expanded_hyp.score += v
                     expanded_hyp.timestep.append(this_time_idx)
-                    expanded_hyp.dec_state = hidden_prime
+                    expanded_hyp.dec_state = new_hidden_prime
+                    expanded_hyp.dec_out = [new_g]
                     expanded_hyp.last_token = k
 
                     if jump > 0:
                         this_symbols_added = 0
                     else:
                         this_symbols_added += 1
-                        if this_symbols_added >= 5:
+                        if this_symbols_added >= self.max_symbols:
                             this_symbols_added = 0
                             this_time_idx += 1
 
@@ -526,7 +518,6 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                         finished_hyps.append(hypothesis)
 
             finished_hyps, _, _ = self.dedup_lists_by_field(finished_hyps, [0] * len(finished_hyps), [0] * len(finished_hyps))
-
 
             if len(expanded_hyps) == 0:
                 break
@@ -580,8 +571,8 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                 unique_times.append(time)
                 unique_symbols.append(symbol)
             else:
-                unique_hyps[seen[key]].score = max(unique_hyps[seen[key]].score , hyp.score)
-#                unique_hyps[seen[key]].score = np.logaddexp(unique_hyps[seen[key]].score , hyp.score)
+#                unique_hyps[seen[key]].score = max(unique_hyps[seen[key]].score , hyp.score)
+                unique_hyps[seen[key]].score = np.logaddexp(unique_hyps[seen[key]].score , hyp.score)
 
                 if symbol > symbols[seen[key]]:
                     unique_symbols[seen[key]] = symbol
