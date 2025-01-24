@@ -434,8 +434,10 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
 
         out_len = out_len.item()
         V = self._blank_index
+
+        finished_hyp_best_score = float('-inf')
         
-        while len(hypothesis_list) > 0: #* beam * beam:
+        while len(hypothesis_list) > 0:
             expanded_hyps = []
             expanded_times = []
             expanded_symbols = []
@@ -510,14 +512,23 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                             this_symbols_added = 0
                             this_time_idx += 1
 
-                    if this_time_idx < out_len:
-                        expanded_hyps.append(expanded_hyp)
-                        expanded_times.append(this_time_idx)
-                        expanded_symbols.append(this_symbols_added)
-                    else:
-                        finished_hyps.append(hypothesis)
+                    if expanded_hyp.score > finished_hyp_best_score - 4:
+                        if this_time_idx < out_len:
+                            expanded_hyps.append(expanded_hyp)
+                            expanded_times.append(this_time_idx)
+                            expanded_symbols.append(this_symbols_added)
+                        else:
+                            finished_hyps.append(hypothesis)
+                            finished_hyp_best_score = max(finished_hyp_best_score, hypothesis.score)
 
             finished_hyps, _, _ = self.dedup_lists_by_field(finished_hyps, [0] * len(finished_hyps), [0] * len(finished_hyps))
+#            finished_hyps = sorted(finished_hyps, key=lambda x:-x.score)
+#
+#            if len(finished_hyps) > beam:
+#                finished_hyps = finished_hyps[:beam]
+#                finished_hyp_cutoff = finished_hyps[-1].score
+
+            
 
             if len(expanded_hyps) == 0:
                 break
