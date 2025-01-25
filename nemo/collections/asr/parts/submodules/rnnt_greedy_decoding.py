@@ -440,7 +440,9 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
 
         device = x.device
         finished_hyp_best_score = float('-inf')
-       
+
+        cache = {}
+
         x = torch.reshape(x, [1, T, -1]) 
         while len(hypothesis_list) > 0:
             expanded_hyps = []
@@ -561,7 +563,15 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                 if h.dec_out is None:
                     k = h.last_token
 #                    print("K and H>", k, h.dec_state)
-                    new_g, new_hidden_prime = self._pred_step(k, h.dec_state)
+                    text = h.y_sequence
+#                    if len(text) > 2:
+#                        text = text[-2:]
+                    text = tuple(text)
+                    if text in cache:
+                        new_g, new_hidden_prime = cache[text]
+                    else:
+                        new_g, new_hidden_prime = self._pred_step(k, h.dec_state)
+                        cache[text] = new_g, new_hidden_prime
                     h.dec_out = [new_g]
                     h.dec_state = new_hidden_prime
                 
