@@ -469,7 +469,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
             cumsum = torch.cumsum(blank_score, dim=1) # beam, T, 1, 1
 
             logp[:,1:,:,:-1] += cumsum[:,:-1,:,:]
-            logp = logp + float('-inf') * torch.reshape(out_bound_mask, [len(hypothesis_list), -1, 1, 1])
+            logp = logp - 999999.0 * torch.reshape(out_bound_mask, [len(hypothesis_list), -1, 1, 1])
 
             logp = torch.reshape(logp[:,:,:,:-1], [len(hypothesis_list), -1])
 
@@ -527,7 +527,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                     expanded_hyp.score += v
                     expanded_hyp.timestep.append(this_time_idx)
 #                    expanded_hyp.dec_state = new_hidden_prime
-#                    expanded_hyp.dec_out = [new_g]
+                    expanded_hyp.dec_out = None
                     expanded_hyp.last_token = k
 
                     if jump > 0:
@@ -558,10 +558,12 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
             expanded_hyps, expanded_times, expanded_symbols = self.dedup_lists_by_field(expanded_hyps, expanded_times, expanded_symbols)
             expanded_hyps, expanded_times, expanded_symbols = self.prune(beam, expanded_hyps, expanded_times, expanded_symbols)
             for h in expanded_hyps:
-                k = h.last_token
-                new_g, new_hidden_prime = self._pred_step(k, h.dec_state)
-                h.dec_out = [new_g]
-                h.dec_state = new_hidden_prime
+                if h.dec_out is None:
+                    k = h.last_token
+#                    print("K and H>", k, h.dec_state)
+                    new_g, new_hidden_prime = self._pred_step(k, h.dec_state)
+                    h.dec_out = [new_g]
+                    h.dec_state = new_hidden_prime
                 
 
             hypothesis_list, time_idx_list, symbols_added_list = expanded_hyps, expanded_times, expanded_symbols
