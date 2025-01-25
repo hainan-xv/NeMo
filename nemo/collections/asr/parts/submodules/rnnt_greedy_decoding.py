@@ -562,10 +562,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
             for h in expanded_hyps:
                 if h.dec_out is None:
                     k = h.last_token
-#                    print("K and H>", k, h.dec_state)
                     text = h.y_sequence
-#                    if len(text) > 2:
-#                        text = text[-2:]
                     text = tuple(text)
                     if text in cache:
                         new_g, new_hidden_prime = cache[text]
