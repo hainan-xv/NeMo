@@ -519,15 +519,15 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                     if v < vv[0] - 3:
                         break
 
-                    new_g, new_hidden_prime = self._pred_step(k, hypothesis.dec_state)
+#                    new_g, new_hidden_prime = self._pred_step(k, hypothesis.dec_state)
                     this_time_idx = time_idx + jump
                     this_symbols_added = symbols_added
                     expanded_hyp = copy.deepcopy(hypothesis)
                     expanded_hyp.y_sequence.append(k)
                     expanded_hyp.score += v
                     expanded_hyp.timestep.append(this_time_idx)
-                    expanded_hyp.dec_state = new_hidden_prime
-                    expanded_hyp.dec_out = [new_g]
+#                    expanded_hyp.dec_state = new_hidden_prime
+#                    expanded_hyp.dec_out = [new_g]
                     expanded_hyp.last_token = k
 
                     if jump > 0:
@@ -547,23 +547,22 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                             finished_hyps.append(hypothesis)
                             finished_hyp_best_score = max(finished_hyp_best_score, hypothesis.score)
 
+
             finished_hyps, _, _ = self.dedup_lists_by_field(finished_hyps, [0] * len(finished_hyps), [0] * len(finished_hyps))
             if len(finished_hyps) > 4 * beam:
                 finished_hyps = nlargest(2 * beam, finished_hyps, key=lambda x: x.score)
-
-#            finished_hyps = sorted(finished_hyps, key=lambda x:-x.score)
-#
-#            if len(finished_hyps) > beam:
-#                finished_hyps = finished_hyps[:beam]
-#                finished_hyp_cutoff = finished_hyps[-1].score
-
-            
 
             if len(expanded_hyps) == 0:
                 break
 
             expanded_hyps, expanded_times, expanded_symbols = self.dedup_lists_by_field(expanded_hyps, expanded_times, expanded_symbols)
             expanded_hyps, expanded_times, expanded_symbols = self.prune(beam, expanded_hyps, expanded_times, expanded_symbols)
+            for h in expanded_hyps:
+                k = h.last_token
+                new_g, new_hidden_prime = self._pred_step(k, h.dec_state)
+                h.dec_out = [new_g]
+                h.dec_state = new_hidden_prime
+                
 
             hypothesis_list, time_idx_list, symbols_added_list = expanded_hyps, expanded_times, expanded_symbols
                
