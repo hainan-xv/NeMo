@@ -447,62 +447,39 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
             expanded_times = []
             expanded_symbols = []
 
-            print("NUMBER OF HYPS", len(hypothesis_list))
-
             batch_indices = torch.LongTensor([0] * len(hypothesis_list)).to(device)
             expanded_batch_indices = batch_indices.unsqueeze(1).expand(-1, window_size)
             offsets = torch.arange(window_size, device=device)
 
             time_indices_tensor = torch.LongTensor(time_idx_list).to(device)
             expanded_time_indices = time_indices_tensor.unsqueeze(1) + offsets.unsqueeze(0)
-
-            print("HERE HERE expanded_time_indices", expanded_time_indices)
-            in_bound_mask = (expanded_time_indices < out_len).float()
-            print("HERE HERE inbound", in_bound_mask)
-
+            out_bound_mask = (expanded_time_indices >= out_len).float()
             expanded_time_indices = torch.clamp(expanded_time_indices, min=0, max=out_len - 1)
 
-#            print('HERE expanded_time_indices', expanded_time_indices)
-            print("HERE indicies", expanded_batch_indices, expanded_time_indices)
             f = x[expanded_batch_indices, expanded_time_indices]
-            print('HERE f', f.shape)
-
             g_list = [hyp.dec_out[0] for hyp in hypothesis_list]
             g = torch.stack(g_list)
             g = torch.reshape(g, [len(hypothesis_list), 1, -1])
 
-            print('HERE g', g.shape)
-            logp = self.joint.joint(f, g) #[0, :, 0, :]
-
-            logp = torch.nn.functional.log_softmax(logp, dim=-1)
-
-            print("HERE logp", logp.shape)
-            if logp.dtype != torch.float32:
-                logp = logp.float()
+            logp = self.joint.joint(f, g)
+            logp = logp.log_softmax(dim=-1)
 
             # logp: beam x T x 1 x V
             blank_score = logp[:,:,:,-1:]
-
-            print("blank_score", blank_score.shape)
-
             cumsum = torch.cumsum(blank_score, dim=1) # beam, T, 1, 1
-  
-            print("cumsum", cumsum.shape)
 
             logp[:,1:,:,:-1] += cumsum[:,:-1,:,:]
-
-            logp = logp - 999 * (1 - torch.reshape(in_bound_mask, [len(hypothesis_list), -1, 1, 1]))
-
-            print('logp', logp.shape) # beam, T, 1, V
+            logp = logp - 999 * torch.reshape(out_bound_mask, [len(hypothesis_list), -1, 1, 1])
 
             logp = torch.reshape(logp[:,:,:,:-1], [len(hypothesis_list), -1])
 
+            if logp.dtype != torch.float32:
+                logp = logp.float()
+
             vvs, kks = logp.topk(beam, -1)
-            print("vv, kk", vvs.shape, kks.shape)
 
             vvs = vvs.tolist()
             kks = kks.tolist()
-            print("vvs, kks", vvs, kks)
 
             for i in range(len(hypothesis_list)):
                 hypothesis = hypothesis_list[i]
@@ -513,30 +490,40 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                 if time_idx + n > out_len:
                     n = out_len - time_idx
 
-#                f = x.narrow(dim=1, start=time_idx, length=n)
-#                f = torch.reshape(f, [1, n, -1])
-#                g = hypothesis.dec_out[0]
-#
-#                logp = self._joint_step(f, g, log_normalize=True)[0, :, 0, :]
-#                # torch.max(0) op doesnt exist for FP 16.
-#                if logp.dtype != torch.float32:
-#                    logp = logp.float()
-#
-#                blank_score = logp[:,self._blank_index:self._blank_index+1]
-#                cumsum = torch.cumsum(blank_score, dim=0)
-#                logp[1:,:-1] += cumsum[:-1,:]
-#
-#                logp_blank = cumsum[-1, 0].item()
-#
-#                vv, kk = logp[:,:-1].flatten().topk(beam, -1)
-                print("I is", i)
                 kk = kks[i]
                 vv = vvs[i]
-                logp_blank = cumsum[i, -1, 0, 0].item()
+                logp_blank = cumsum[i, n-1, 0, 0].item()
+
+                print("FIRST", kk, vv, logp_blank)
+                print("CUMSUM", cumsum[i, :, 0, 0])
+
+                kk1 = copy.deepcopy( kk)
+
+                f = x.narrow(dim=1, start=time_idx, length=n)
+                f = torch.reshape(f, [1, n, -1])
+                g = hypothesis.dec_out[0]
+
+                logp = self._joint_step(f, g, log_normalize=True)[0, :, 0, :]
+                # torch.max(0) op doesnt exist for FP 16.
+                if logp.dtype != torch.float32:
+                    logp = logp.float()
+
+                blank_score = logp[:,-1:]
+                this_cumsum = torch.cumsum(blank_score, dim=0)
+                logp[1:,:-1] += this_cumsum[:-1,:]
+
+                logp_blank = this_cumsum[-1, 0].item()
+
+                vv, kk = logp[:,:-1].flatten().topk(beam, -1)
+                vv = vv.tolist()
+                kk = kk.tolist()
+                print("SECND", kk, vv, logp_blank)
+                print("CUMSUM", this_cumsum[:,0])
+
+#                assert(kk1 == kk)
 
                 loops = beam
-
-                if logp_blank > vv[-1]: # and logp_blank > vv[0] - 2:
+                if logp_blank > vv[-1] and logp_blank > vv[0] - 2:
                     # now blank prediction
                     this_time_idx = time_idx + n
                     expanded_hyp = copy.deepcopy(hypothesis)
@@ -554,6 +541,8 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                 for j in range(loops):
                     jump, k = kk[j] // V, kk[j] % V
                     v = vv[j]
+
+                    assert time_idx + jump < out_len
 
                     if v < vv[0] - 3:
                         break
