@@ -469,7 +469,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
             cumsum = torch.cumsum(blank_score, dim=1) # beam, T, 1, 1
 
             logp[:,1:,:,:-1] += cumsum[:,:-1,:,:]
-            logp = logp - 999 * torch.reshape(out_bound_mask, [len(hypothesis_list), -1, 1, 1])
+            logp = logp + float('-inf') * torch.reshape(out_bound_mask, [len(hypothesis_list), -1, 1, 1])
 
             logp = torch.reshape(logp[:,:,:,:-1], [len(hypothesis_list), -1])
 
@@ -493,34 +493,6 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                 kk = kks[i]
                 vv = vvs[i]
                 logp_blank = cumsum[i, n-1, 0, 0].item()
-
-                print("FIRST", kk, vv, logp_blank)
-                print("CUMSUM", cumsum[i, :, 0, 0])
-
-                kk1 = copy.deepcopy( kk)
-
-                f = x.narrow(dim=1, start=time_idx, length=n)
-                f = torch.reshape(f, [1, n, -1])
-                g = hypothesis.dec_out[0]
-
-                logp = self._joint_step(f, g, log_normalize=True)[0, :, 0, :]
-                # torch.max(0) op doesnt exist for FP 16.
-                if logp.dtype != torch.float32:
-                    logp = logp.float()
-
-                blank_score = logp[:,-1:]
-                this_cumsum = torch.cumsum(blank_score, dim=0)
-                logp[1:,:-1] += this_cumsum[:-1,:]
-
-                logp_blank = this_cumsum[-1, 0].item()
-
-                vv, kk = logp[:,:-1].flatten().topk(beam, -1)
-                vv = vv.tolist()
-                kk = kk.tolist()
-                print("SECND", kk, vv, logp_blank)
-                print("CUMSUM", this_cumsum[:,0])
-
-#                assert(kk1 == kk)
 
                 loops = beam
                 if logp_blank > vv[-1] and logp_blank > vv[0] - 2:
