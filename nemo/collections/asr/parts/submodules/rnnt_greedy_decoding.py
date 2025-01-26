@@ -352,6 +352,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
         confidence_method_cfg: Optional[DictConfig] = None,
         window_size: int = 0,
         beam: int = 1,
+        pruning_opts: str = '999 999',
     ):
         super().__init__(
             decoder_model=decoder_model,
@@ -364,6 +365,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
         )
         self.window_size = window_size
         self.beam = beam
+        self.pruning_opts = pruning_opts
 
     @typecheck()
     def forward(
@@ -404,7 +406,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                 if self.window_size == 1:
                     hypothesis = self._greedy_decode(inseq, logitlen, partial_hypotheses=partial_hypothesis)
                 elif self.window_size < 0:
-                    hypothesis = self._greedy_decode_lookahead_beam(inseq, logitlen, partial_hypotheses=partial_hypothesis, window_size=-self.window_size, beam=self.beam)
+                    hypothesis = self._greedy_decode_lookahead_beam(inseq, logitlen, partial_hypotheses=partial_hypothesis, window_size=-self.window_size, beam=self.beam, pruning_opts=self.pruning_opts)
                 else:
                     hypothesis = self._greedy_decode_lookahead(inseq, logitlen, partial_hypotheses=partial_hypothesis, window_size=self.window_size)
                 hypotheses.append(hypothesis)
@@ -420,12 +422,15 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
 
     @torch.no_grad()
     def _greedy_decode_lookahead_beam(
-        self, x: torch.Tensor, out_len: torch.Tensor, window_size: int, beam: int, partial_hypotheses: Optional[rnnt_utils.Hypothesis] = None
+        self, x: torch.Tensor, out_len: torch.Tensor, window_size: int, beam: int, pruning_opts: str, partial_hypotheses: Optional[rnnt_utils.Hypothesis] = None
     ):
         # x: [T, 1, D]
         # out_len: [seq_len]
 
         # Initialize blank state and empty label set in Hypothesis
+
+        # 3, 
+        prune_a, prune_b = [int(i) for i in pruning_opts.split()]
 
         g, hidden_prime = self._pred_step(self._SOS, None)
         hypothesis_list = [rnnt_utils.Hypothesis(score=0.0, y_sequence=[], dec_out=[g], dec_state=hidden_prime, timestep=[], last_token=None)]
@@ -497,7 +502,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                 logp_blank = cumsum[i, n-1, 0, 0].item()
 
                 loops = beam
-                if logp_blank > vv[-1] and logp_blank > vv[0] - 3:
+                if logp_blank > vv[-1] and logp_blank > vv[0] - prune_a:
                     # now blank prediction
                     this_time_idx = time_idx + n
                     expanded_hyp = copy.deepcopy(hypothesis)
@@ -516,7 +521,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                     jump, k = kk[j] // V, kk[j] % V
                     v = vv[j]
 
-                    if v < vv[0] - 3:
+                    if v < vv[0] - prune_a:
                         break
 
                     this_time_idx = time_idx + jump
@@ -536,7 +541,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                             this_symbols_added = 0
                             this_time_idx += 1
 
-                    if expanded_hyp.score > finished_hyp_best_score - 4:
+                    if expanded_hyp.score > finished_hyp_best_score - prune_b:
                         if this_time_idx < out_len:
                             expanded_hyps.append(expanded_hyp)
                             expanded_times.append(this_time_idx)
@@ -547,8 +552,9 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
 
 
             finished_hyps, _, _ = self.dedup_lists_by_field(finished_hyps, [0] * len(finished_hyps), [0] * len(finished_hyps))
-            if len(finished_hyps) > 4 * beam:
-                finished_hyps = nlargest(2 * beam, finished_hyps, key=lambda x: x.score)
+
+#            if len(finished_hyps) > 4 * beam:
+#                finished_hyps = nlargest(2 * beam, finished_hyps, key=lambda x: x.score)
 
             if len(expanded_hyps) == 0:
                 break
@@ -574,32 +580,32 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
         return hypothesis
 
     def prune(self, beam, hyps, times, symbols):
-        best_score_per_frame = -99999.9
-        best_time = -1
-        best_score = -99999.9
+#        best_score_per_frame = -99999.9
+#        best_time = -1
+#        best_score = -99999.9
         time_to_scores = {}
         for (hyp, time, symbol) in zip(hyps, times, symbols):
             if time in time_to_scores:
                 time_to_scores[time].append(hyp.score)
             else:
                 time_to_scores[time] = [hyp.score]
-            if time > 20:
-                best_here = hyp.score / (time + len(hyp.y_sequence))
-                if best_here > best_score_per_frame:
-                    best_score_per_frame = best_here
-                    best_time = time
-                    best_score = hyp.score
+#            if time > 20:
+#                best_here = hyp.score / (time + len(hyp.y_sequence))
+#                if best_here > best_score_per_frame:
+#                    best_score_per_frame = best_here
+#                    best_time = time
+#                    best_score = hyp.score
 
         for key, value in time_to_scores.items():
             time_to_scores[key].sort()
 
         pruned_hyps, pruned_times, pruned_symbols = [], [], []
         for (hyp, time, symbol) in zip(hyps, times, symbols):
-            if time > 20:
-                if hyp.score / (time + len(hyp.y_sequence)) < best_score_per_frame - 2.0:
-                    continue
-                if time < best_time and hyp.score < best_score - 2.0:
-                    continue
+#            if time > 20:
+#                if hyp.score / (time + len(hyp.y_sequence)) < best_score_per_frame - 2.0:
+#                    continue
+#                if time < best_time and hyp.score < best_score - 2.0:
+#                    continue
 
             if len(time_to_scores[time]) < beam:
                 pruned_hyps.append(hyp)
