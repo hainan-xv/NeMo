@@ -497,7 +497,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                 logp_blank = cumsum[i, n-1, 0, 0].item()
 
                 loops = beam
-                if logp_blank > vv[-1] and logp_blank > vv[0] - 2:
+                if logp_blank > vv[-1] and logp_blank > vv[0] - 3:
                     # now blank prediction
                     this_time_idx = time_idx + n
                     expanded_hyp = copy.deepcopy(hypothesis)
@@ -516,19 +516,15 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                     jump, k = kk[j] // V, kk[j] % V
                     v = vv[j]
 
-                    assert time_idx + jump < out_len
-
                     if v < vv[0] - 3:
                         break
 
-#                    new_g, new_hidden_prime = self._pred_step(k, hypothesis.dec_state)
                     this_time_idx = time_idx + jump
                     this_symbols_added = symbols_added
                     expanded_hyp = copy.deepcopy(hypothesis)
                     expanded_hyp.y_sequence.append(k)
                     expanded_hyp.score += v
                     expanded_hyp.timestep.append(this_time_idx)
-#                    expanded_hyp.dec_state = new_hidden_prime
                     expanded_hyp.dec_out = None
                     expanded_hyp.last_token = k
 
@@ -562,10 +558,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
             for h in expanded_hyps:
                 if h.dec_out is None:
                     k = h.last_token
-#                    print("K and H>", k, h.dec_state)
                     text = h.y_sequence
-#                    if len(text) > 2:
-#                        text = text[-2:]
                     text = tuple(text)
                     if text in cache:
                         new_g, new_hidden_prime = cache[text]
@@ -575,25 +568,39 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                     h.dec_out = [new_g]
                     h.dec_state = new_hidden_prime
                 
-
             hypothesis_list, time_idx_list, symbols_added_list = expanded_hyps, expanded_times, expanded_symbols
                
         hypothesis  =  nlargest(1, finished_hyps, key=lambda x: x.score)[0]
         return hypothesis
 
     def prune(self, beam, hyps, times, symbols):
+        best_score_per_frame = -99999.9
+        best_time = -1
+        best_score = -99999.9
         time_to_scores = {}
         for (hyp, time, symbol) in zip(hyps, times, symbols):
             if time in time_to_scores:
                 time_to_scores[time].append(hyp.score)
             else:
                 time_to_scores[time] = [hyp.score]
+            if time > 20:
+                best_here = hyp.score / (time + len(hyp.y_sequence))
+                if best_here > best_score_per_frame:
+                    best_score_per_frame = best_here
+                    best_time = time
+                    best_score = hyp.score
 
         for key, value in time_to_scores.items():
             time_to_scores[key].sort()
 
         pruned_hyps, pruned_times, pruned_symbols = [], [], []
         for (hyp, time, symbol) in zip(hyps, times, symbols):
+            if time > 20:
+                if hyp.score / (time + len(hyp.y_sequence)) < best_score_per_frame - 2.0:
+                    continue
+                if time < best_time and hyp.score < best_score - 2.0:
+                    continue
+
             if len(time_to_scores[time]) < beam:
                 pruned_hyps.append(hyp)
                 pruned_times.append(time)
