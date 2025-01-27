@@ -553,15 +553,25 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
 
             finished_hyps, _, _ = self.dedup_lists_by_field(finished_hyps, [0] * len(finished_hyps), [0] * len(finished_hyps))
 
-#            if len(finished_hyps) > 4 * beam:
-#                finished_hyps = nlargest(2 * beam, finished_hyps, key=lambda x: x.score)
-
             if len(expanded_hyps) == 0:
                 break
 
             expanded_hyps, expanded_times, expanded_symbols = self.dedup_lists_by_field(expanded_hyps, expanded_times, expanded_symbols)
-            expanded_hyps, expanded_times, expanded_symbols = self.prune(beam, expanded_hyps, expanded_times, expanded_symbols)
-            for h in expanded_hyps:
+            if len(expanded_hyps) > beam:
+                hypothesis_list, time_idx_list, symbols_added_list = map(list, zip(*nlargest(beam, zip(expanded_hyps, expanded_times, expanded_symbols), key=lambda x: x[0].score)))
+                hypothesis_list_2, time_idx_list_2, symbols_added_list_2 = map(list, zip(*nlargest(len(expanded_hyps) - beam, zip(expanded_hyps, expanded_times, expanded_symbols), key=lambda x: -x[0].score)))
+
+                unique_texts = {tuple(h.y_sequence) for h in hypothesis_list}
+                for i in range(len(hypothesis_list_2)):
+                    if tuple(hypothesis_list_2[i].y_sequence) in unique_texts:
+                        hypothesis_list.append(hypothesis_list_2[i])
+                        time_idx_list.append(time_idx_list_2[i])
+                        symbols_added_list.append(symbols_added_list_2[i])
+            else:
+                hypothesis_list, time_idx_list, symbols_added_list = expanded_hyps, expanded_times, expanded_symbols
+
+
+            for h in hypothesis_list:
                 if h.dec_out is None:
                     k = h.last_token
                     text = h.y_sequence
@@ -574,7 +584,6 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                     h.dec_out = [new_g]
                     h.dec_state = new_hidden_prime
                 
-            hypothesis_list, time_idx_list, symbols_added_list = expanded_hyps, expanded_times, expanded_symbols
                
         hypothesis  =  nlargest(1, finished_hyps, key=lambda x: x.score)[0]
         return hypothesis
