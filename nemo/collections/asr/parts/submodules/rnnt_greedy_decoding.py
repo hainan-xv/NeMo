@@ -351,7 +351,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
         preserve_frame_confidence: bool = False,
         confidence_method_cfg: Optional[DictConfig] = None,
         window_size: int = 0,
-        beam: int = 1,
+        beam = 1,
         pruning_opts: str = '999 999',
     ):
         super().__init__(
@@ -422,7 +422,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
 
     @torch.no_grad()
     def _greedy_decode_lookahead_beam(
-        self, x: torch.Tensor, out_len: torch.Tensor, window_size: int, beam: int, pruning_opts: str, partial_hypotheses: Optional[rnnt_utils.Hypothesis] = None
+        self, x: torch.Tensor, out_len: torch.Tensor, window_size: int, beam, pruning_opts: str, partial_hypotheses: Optional[rnnt_utils.Hypothesis] = None
     ):
         # x: [T, 1, D]
         # out_len: [seq_len]
@@ -458,6 +458,8 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
             expanded_batch_indices = batch_indices.unsqueeze(1).expand(-1, window_size)
             offsets = torch.arange(window_size, device=device)
 
+#            print("HERE time_idx_list", time_idx_list)
+
             time_indices_tensor = torch.LongTensor(time_idx_list).to(device)
             expanded_time_indices = time_indices_tensor.unsqueeze(1) + offsets.unsqueeze(0)
             out_bound_mask = (expanded_time_indices >= out_len).float()
@@ -483,26 +485,32 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
             if logp.dtype != torch.float32:
                 logp = logp.float()
 
-            vvs, kks = logp.topk(beam, -1)
+            vvs, _ = logp.topk(1, -1)
 
             vvs = vvs.tolist()
-            kks = kks.tolist()
 
             for i in range(len(hypothesis_list)):
                 hypothesis = hypothesis_list[i]
                 time_idx = time_idx_list[i]
                 symbols_added = symbols_added_list[i]
 
+                threshold = vvs[i][0] - beam
+
+                kk = torch.where(logp[i] > threshold)
+                vv = logp[i][kk]
+#                print("KK IS", kk)
+#                print("VV IS", vv)
+
                 n = window_size
                 if time_idx + n > out_len:
                     n = out_len - time_idx
 
-                kk = kks[i]
-                vv = vvs[i]
+                kk = kk[0].tolist()
+                vv = vv.tolist()
                 logp_blank = cumsum[i, n-1, 0, 0].item()
 
-                loops = beam
-                if logp_blank > vv[-1] and logp_blank > vv[0] - prune_a:
+                loops = len(kk)
+                if logp_blank > threshold:
                     # now blank prediction
                     this_time_idx = time_idx + n
                     expanded_hyp = copy.deepcopy(hypothesis)
@@ -515,14 +523,12 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                     else:
                         finished_hyps.append(hypothesis)
                         finished_hyp_best_score = max(finished_hyp_best_score, hypothesis.score)
-                    loops -= 1
 
                 for j in range(loops):
                     jump, k = kk[j] // V, kk[j] % V
                     v = vv[j]
 
-                    if v < vv[0] - prune_a:
-                        break
+                    assert v >= threshold
 
                     this_time_idx = time_idx + jump
                     this_symbols_added = symbols_added
@@ -557,19 +563,24 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                 break
 
             expanded_hyps, expanded_times, expanded_symbols = self.dedup_lists_by_field(expanded_hyps, expanded_times, expanded_symbols)
-            if len(expanded_hyps) > beam:
-                hypothesis_list, time_idx_list, symbols_added_list = map(list, zip(*nlargest(beam, zip(expanded_hyps, expanded_times, expanded_symbols), key=lambda x: x[0].score)))
-                hypothesis_list_2, time_idx_list_2, symbols_added_list_2 = map(list, zip(*nlargest(len(expanded_hyps) - beam, zip(expanded_hyps, expanded_times, expanded_symbols), key=lambda x: -x[0].score)))
 
-                unique_texts = {tuple(h.y_sequence) for h in hypothesis_list}
-                for i in range(len(hypothesis_list_2)):
-                    if tuple(hypothesis_list_2[i].y_sequence) in unique_texts:
-                        hypothesis_list.append(hypothesis_list_2[i])
-                        time_idx_list.append(time_idx_list_2[i])
-                        symbols_added_list.append(symbols_added_list_2[i])
-            else:
-                hypothesis_list, time_idx_list, symbols_added_list = expanded_hyps, expanded_times, expanded_symbols
+#            if len(expanded_hyps) > beam:
+#                hypothesis_list, time_idx_list, symbols_added_list = map(list, zip(*nlargest(beam, zip(expanded_hyps, expanded_times, expanded_symbols), key=lambda x: x[0].score)))
+#                hypothesis_list_2, time_idx_list_2, symbols_added_list_2 = map(list, zip(*nlargest(len(expanded_hyps) - beam, zip(expanded_hyps, expanded_times, expanded_symbols), key=lambda x: -x[0].score)))
+#
+#                unique_texts = {tuple(h.y_sequence) for h in hypothesis_list}
+#                for i in range(len(hypothesis_list_2)):
+#                    if tuple(hypothesis_list_2[i].y_sequence) in unique_texts:
+#                        hypothesis_list.append(hypothesis_list_2[i])
+#                        time_idx_list.append(time_idx_list_2[i])
+#                        symbols_added_list.append(symbols_added_list_2[i])
+#            else:
+#                hypothesis_list, time_idx_list, symbols_added_list = expanded_hyps, expanded_times, expanded_symbols
 
+            threshold = max(a.score for a in expanded_hyps) - beam
+            hypothesis_list, time_idx_list, symbols_added_list = map(list, zip(*[(a, b, c) for a, b, c in zip(expanded_hyps, expanded_times, expanded_symbols) if a.score > threshold]))
+
+#            hypothesis_list, time_idx_list, symbols_added_list = expanded_hyps, expanded_times, expanded_symbols
 
             for h in hypothesis_list:
                 if h.dec_out is None:
