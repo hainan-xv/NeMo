@@ -1361,11 +1361,12 @@ class BeamRNNTInfer(Typing):
         out_len = encoded_lengths.item()
 #        for t in range(encoded_lengths):
         while len(t_to_kept_hyps) > 0:
-            print("ALL KEYS", t_to_kept_hyps.keys())
+            print("ALL KEYS", sorted(t_to_kept_hyps.keys()))
             t = min(t_to_kept_hyps.keys())
+#            print("AT", t)
             kept_hyps = t_to_kept_hyps.pop(t)
 
-            print("HYPS", [j.y_sequence for _, i in t_to_kept_hyps.items() for j in i])
+#            print("HYPS", [j.y_sequence for _, i in t_to_kept_hyps.items() for j in i])
 
             n = self.window_size
             if t + n > out_len:
@@ -1454,7 +1455,7 @@ class BeamRNNTInfer(Typing):
                                 t_to_list_exp[new_t] = [new_hyp]
 
 
-            for the_t, value in t_to_list_exp.items():
+            for the_t, value in t_to_list_b.items():
                 if the_t in t_to_kept_hyps:
                     t_to_kept_hyps[the_t] = t_to_kept_hyps[the_t] + sorted(value, key=lambda x: x.score, reverse=True)[:beam]
                 else:
