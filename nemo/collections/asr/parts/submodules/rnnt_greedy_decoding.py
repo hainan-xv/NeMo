@@ -518,8 +518,6 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                     jump, k = kk[j] // V, kk[j] % V
                     v = vv[j]
 
-                    assert v >= threshold
-
                     this_time_idx = time_idx + jump
                     this_symbols_added = symbols_added
                     expanded_hyp = copy.deepcopy(hypothesis)
@@ -554,25 +552,8 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
 
             expanded_hyps, expanded_times, expanded_symbols = self.dedup_lists_by_field(expanded_hyps, expanded_times, expanded_symbols)
 
-#            if len(expanded_hyps) > beam:
-#                hypothesis_list, time_idx_list, symbols_added_list = map(list, zip(*nlargest(beam, zip(expanded_hyps, expanded_times, expanded_symbols), key=lambda x: x[0].score)))
-#                hypothesis_list_2, time_idx_list_2, symbols_added_list_2 = map(list, zip(*nlargest(len(expanded_hyps) - beam, zip(expanded_hyps, expanded_times, expanded_symbols), key=lambda x: -x[0].score)))
-#
-#                unique_texts = {tuple(h.y_sequence) for h in hypothesis_list}
-#                for i in range(len(hypothesis_list_2)):
-#                    if tuple(hypothesis_list_2[i].y_sequence) in unique_texts:
-#                        hypothesis_list.append(hypothesis_list_2[i])
-#                        time_idx_list.append(time_idx_list_2[i])
-#                        symbols_added_list.append(symbols_added_list_2[i])
-#            else:
-#                hypothesis_list, time_idx_list, symbols_added_list = expanded_hyps, expanded_times, expanded_symbols
-
             threshold = max(a.score for a in expanded_hyps) - beam
             hypothesis_list, time_idx_list, symbols_added_list = map(list, zip(*[(a, b, c) for a, b, c in zip(expanded_hyps, expanded_times, expanded_symbols) if a.score >= threshold]))
-
-#            hypothesis_list, time_idx_list, symbols_added_list = expanded_hyps, expanded_times, expanded_symbols
-
-
 
 
             if len(hypothesis_list) > max_alive:
@@ -600,45 +581,6 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
         hypothesis  =  nlargest(1, finished_hyps, key=lambda x: x.score)[0]
         return hypothesis
 
-    def prune(self, beam, hyps, times, symbols):
-#        best_score_per_frame = -99999.9
-#        best_time = -1
-#        best_score = -99999.9
-        time_to_scores = {}
-        for (hyp, time, symbol) in zip(hyps, times, symbols):
-            if time in time_to_scores:
-                time_to_scores[time].append(hyp.score)
-            else:
-                time_to_scores[time] = [hyp.score]
-#            if time > 20:
-#                best_here = hyp.score / (time + len(hyp.y_sequence))
-#                if best_here > best_score_per_frame:
-#                    best_score_per_frame = best_here
-#                    best_time = time
-#                    best_score = hyp.score
-
-        for key, value in time_to_scores.items():
-            time_to_scores[key].sort()
-
-        pruned_hyps, pruned_times, pruned_symbols = [], [], []
-        for (hyp, time, symbol) in zip(hyps, times, symbols):
-#            if time > 20:
-#                if hyp.score / (time + len(hyp.y_sequence)) < best_score_per_frame - 2.0:
-#                    continue
-#                if time < best_time and hyp.score < best_score - 2.0:
-#                    continue
-
-            if len(time_to_scores[time]) < beam:
-                pruned_hyps.append(hyp)
-                pruned_times.append(time)
-                pruned_symbols.append(symbol)
-
-            elif hyp.score >= time_to_scores[time][-beam]:
-                pruned_hyps.append(hyp)
-                pruned_times.append(time)
-                pruned_symbols.append(symbol)
-
-        return pruned_hyps, pruned_times, pruned_symbols
 
     def dedup_lists_by_field(self, hyps, times, symbols):
         seen = {}

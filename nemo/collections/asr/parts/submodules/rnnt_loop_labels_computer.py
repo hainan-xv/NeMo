@@ -415,19 +415,11 @@ class GreedyBatchedRNNTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMeth
             torch.less(time_indices, encoder_output_length, out=active_mask)
             torch.logical_and(active_mask, blank_mask, out=advance_mask)
 
-#            if advance_mask.any():
-#                print("HERE some blanks")
-#                print("HERE advance_mask", advance_mask)
-#            else:
-#                print("HERE great all non blanks")
-
             # inner loop: find next non-blank labels (if exist)
             while advance_mask.any():
                 # same as: time_indices_current_labels[advance_mask] = time_indices[advance_mask], but non-blocking
                 # store current time indices to use further for storing the results
                 torch.where(advance_mask, time_indices, time_indices_current_labels, out=time_indices_current_labels)
-#                print("HERE time_indices_current_labels", time_indices_current_labels)
-#                print("HERE bad batch_indices", batch_indices, safe_time_indices)
 
                 expanded_time_indices = safe_time_indices.unsqueeze(1) + offsets.unsqueeze(0)
                 expanded_time_indices = torch.clamp(expanded_time_indices, min=0, max=max_time - 1)
