@@ -1361,18 +1361,20 @@ class BeamRNNTInfer(Typing):
         out_len = encoded_lengths.item()
 #        for t in range(encoded_lengths):
         while len(t_to_kept_hyps) > 0:
-#            print("ALL KEYS", t_to_kept_hyps.keys())
+            print("ALL KEYS", t_to_kept_hyps.keys())
             t = min(t_to_kept_hyps.keys())
+            kept_hyps = t_to_kept_hyps.pop(t)
 
-#            print("HYPS", [j.y_sequence for _, i in t_to_kept_hyps.items() for j in i])
+            print("HYPS", [j.y_sequence for _, i in t_to_kept_hyps.items() for j in i])
 
             n = self.window_size
             if t + n > out_len:
-                n = out_len - time_idx
+                n = out_len - t
 
+            if n <= 0:
+                break
             enc_out_t = h[t : t + n].unsqueeze(0)  # [1, n, D]
 
-            kept_hyps = t_to_kept_hyps.pop(t)
 
             # Perform prefix search to obtain hypothesis
             hyps = self.prefix_search(
@@ -1402,10 +1404,11 @@ class BeamRNNTInfer(Typing):
 
             B = logp.shape[0]
 
-            print("LOGP SHAPE", logp.shape)
+            logp[:,:-1,:,-1] -= 9999999.9
             logp = torch.reshape(logp[:,:,:,:], [B, -1])
 
             beam_logp, beam_idx = logp.topk(self.max_candidates, dim=-1)
+#            print("HAHA ", beam_logp, beam_idx)
 
             # Compute k expansions for all the current hypotheses
             k_expansions = select_k_expansions(
@@ -1416,7 +1419,9 @@ class BeamRNNTInfer(Typing):
             t_to_list_exp = {}
             for i, hyp in enumerate(hyps):  # For all hypothesis
                 for kk, new_score in k_expansions[i]:  # for all expansion within these hypothesis
-                    k, jump = kk % self.blank, kk // self.blank
+                    k, jump = kk % (1 + self.blank), kk // (1 + self.blank)
+
+#                    print("K JUMP", k, jump)
                     new_hyp = Hypothesis(
                         y_sequence=hyp.y_sequence[:],
                         score=new_score,
@@ -1449,57 +1454,38 @@ class BeamRNNTInfer(Typing):
                                 t_to_list_exp[new_t] = [new_hyp]
 
 
-            # If there were no token expansions in any of the hypotheses,
-            # Early exit
-            if len(t_to_list_exp) == 0:
-                for key, value in t_to_list_exp.items():
-                    t_to_list_exp[key] = sorted(value, key=lambda x: x.score, reverse=True)[:beam]
+            for the_t, value in t_to_list_exp.items():
+                if the_t in t_to_kept_hyps:
+                    t_to_kept_hyps[the_t] = t_to_kept_hyps[the_t] + sorted(value, key=lambda x: x.score, reverse=True)[:beam]
+                else:
+                    t_to_kept_hyps[the_t] = sorted(value, key=lambda x: x.score, reverse=True)[:beam]
 
-            else:
-                for the_t, list_exp in t_to_list_exp.items():
-                    # Decode a batch of beam states and scores
-                    beam_dec_out, beam_state = self.decoder.batch_score_hypothesis(
-                        list_exp,
-                        cache,
-                        # self.language_model is not None,
-                    )
+            for the_t, list_exp in t_to_list_exp.items():
+                # Decode a batch of beam states and scores
+                beam_dec_out, beam_state = self.decoder.batch_score_hypothesis(
+                    list_exp,
+                    cache,
+                    # self.language_model is not None,
+                )
 
-#                    # If this isnt the last mAES step
-#                    if n < (self.maes_num_steps - 1):
-#                        # For all expanded hypothesis
-#                        for i, hyp in enumerate(list_exp):
-#                            # Preserve the decoder logits for the current beam
-#                            hyp.dec_out.append(beam_dec_out[i])
-#                            hyp.dec_state = beam_state[i]
-#
-#                        # Copy the expanded hypothesis
-#                        hyps = list_exp[:]
-#
-#                    else:
+                # For all expansions, add the score for the blank label
+                for i, hyp in enumerate(list_exp):
 
-                    if True:
-#                        # Extract the log probabilities
-#                        beam_logp, _ = self.resolve_joint_output(beam_enc_out, torch.stack(beam_dec_out))
-#                        print("HERE ANOTHER BEAMLOGP", beam_logp.shape)
-#                        beam_logp = beam_logp[:, 0, 0, :]
+                    # Preserve the decoder's output and state
+                    hyp.dec_out.append(beam_dec_out[i])
+                    hyp.dec_state = beam_state[i]
+
+                # Finally, update the kept hypothesis of sorted top Beam candidates
+                kept_hyps = sorted(list_exp, key=lambda x: x.score, reverse=True)[:beam]
+                if the_t in t_to_kept_hyps:
+                   t_to_kept_hyps[the_t] = t_to_kept_hyps[the_t] + kept_hyps
+                else:
+                   t_to_kept_hyps[the_t] = kept_hyps
 
 
-                        # For all expansions, add the score for the blank label
-                        for i, hyp in enumerate(list_exp):
-#                            hyp.score += float(beam_logp[i, self.blank])
+#            print("UPDATED t_to_kept_hyps", t_to_kept_hyps)
 
-                            # Preserve the decoder's output and state
-                            hyp.dec_out.append(beam_dec_out[i])
-                            hyp.dec_state = beam_state[i]
-
-                        # Finally, update the kept hypothesis of sorted top Beam candidates
-                        kept_hyps = sorted(list_exp, key=lambda x: x.score, reverse=True)[:beam]
-                        if the_t in t_to_kept_hyps:
-                           t_to_kept_hyps[the_t] = t_to_kept_hyps[the_t] + kept_hyps
-                        else:
-                           t_to_kept_hyps[the_t] = kept_hyps
-
-
+        
         # Sort the hypothesis with best scores
         return self.sort_nbest(kept_hyps)
 
