@@ -1359,23 +1359,18 @@ class BeamRNNTInfer(Typing):
         t_to_kept_hyps[0] = kept_hyps
 
         out_len = encoded_lengths.item()
-#        for t in range(encoded_lengths):
         while len(t_to_kept_hyps) > 0:
-            print("ALL KEYS", sorted(t_to_kept_hyps.keys()))
+#            print("ALL KEYS", sorted(t_to_kept_hyps.keys()))
             t = min(t_to_kept_hyps.keys())
 #            print("AT", t)
             kept_hyps = t_to_kept_hyps.pop(t)
 
 #            print("HYPS", [j.y_sequence for _, i in t_to_kept_hyps.items() for j in i])
 
-            n = self.window_size
-            if t + n > out_len:
-                n = out_len - t
-
+            n = min(self.window_size, out_len - t)
             if n <= 0:
                 break
             enc_out_t = h[t : t + n].unsqueeze(0)  # [1, n, D]
-
 
             # Perform prefix search to obtain hypothesis
             hyps = self.prefix_search(
@@ -1383,7 +1378,6 @@ class BeamRNNTInfer(Typing):
                 enc_out_t,
                 prefix_alpha=self.maes_prefix_alpha,
             )  # type: List[Hypothesis]
-            kept_hyps = []
 
             # Prepare output tensor
             beam_enc_out = enc_out_t
@@ -1401,7 +1395,7 @@ class BeamRNNTInfer(Typing):
 
             blank_score = logp[:,:,:,-1:]   # [beam, n, 1, 1]
             cumsum = torch.cumsum(blank_score, dim=1) # beam, n, 1, 1
-            logp[:,1:,:,:-1] += cumsum[:,:-1,:,:]
+            logp[:,1:,:,:] += cumsum[:,:-1,:,:]
 
             B = logp.shape[0]
 
