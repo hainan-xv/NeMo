@@ -271,6 +271,8 @@ class BeamRNNTInfer(Typing):
             # self.search_algorithm = self.nsc_beam_search
         elif search_type == "maes":
             self.search_algorithm = self.modified_adaptive_expansion_search
+        elif search_type == "wind":
+            self.search_algorithm = self.wind_beam_search
         else:
             raise NotImplementedError(
                 f"The search type ({search_type}) supplied is not supported!\n"
@@ -1300,6 +1302,203 @@ class BeamRNNTInfer(Typing):
                         del h.alignments[-1]
 
             return B
+
+    def wind_beam_search(
+        self, h: torch.Tensor, encoded_lengths: torch.Tensor, partial_hypotheses: Optional[Hypothesis] = None
+    ) -> List[Hypothesis]:
+        """
+        Based on/modified from https://ieeexplore.ieee.org/document/9250505
+
+        Args:
+            h: Encoded speech features (1, T_max, D_enc)
+
+        Returns:
+            nbest_hyps: N-best decoding results
+        """
+        if partial_hypotheses is not None:
+            raise NotImplementedError("`partial_hypotheses` support is not supported")
+
+        h = h[0]  # [T, D]
+
+        # prepare the batched beam states
+        beam = min(self.beam_size, self.vocab_size)
+        beam_state = self.decoder.initialize_state(
+            torch.zeros(1, device=h.device, dtype=h.dtype)
+        )  # [L, B, H], [L, B, H] for LSTMS
+
+        # Initialize first hypothesis for the beam (blank)
+        init_tokens = [
+            Hypothesis(
+                y_sequence=[self.blank],
+                score=0.0,
+                dec_state=self.decoder.batch_select_state(beam_state, 0),
+                timestep=[-1],
+                length=0,
+            )
+        ]
+
+        cache = {}
+
+        # Decode a batch of beam states and scores
+        beam_dec_out, beam_state = self.decoder.batch_score_hypothesis(init_tokens, cache)
+        state = beam_state[0]
+
+        # Initialize first hypothesis for the beam (blank) for kept hypotheses
+        kept_hyps = [
+            Hypothesis(
+                y_sequence=[self.blank],
+                score=0.0,
+                dec_state=state,
+                dec_out=[beam_dec_out[0]],
+                timestep=[-1],
+                length=0,
+            )
+        ]
+
+        t_to_kept_hyps = {}
+        t_to_kept_hyps[0] = kept_hyps
+
+        out_len = encoded_lengths.item()
+#        for t in range(encoded_lengths):
+        while len(t_to_kept_hyps) > 0:
+            t = min(t_to_kept_hyps.keys())
+
+            n = self.window_size
+            if t + n > out_len:
+                n = out_len - time_idx
+
+            enc_out_t = h[t : t + n].unsqueeze(0)  # [1, n, D]
+
+            kept_hyps = t_to_kept_hyps.pop(t)
+
+            # Perform prefix search to obtain hypothesis
+            hyps = self.prefix_search(
+                sorted(kept_hyps, key=lambda x: len(x.y_sequence), reverse=True),
+                enc_out_t,
+                prefix_alpha=self.maes_prefix_alpha,
+            )  # type: List[Hypothesis]
+            kept_hyps = []
+
+            # Prepare output tensor
+            beam_enc_out = enc_out_t
+
+            # List that contains the blank token emisions
+            t_to_list_b = {}
+            duplication_check = [hyp.y_sequence for hyp in hyps]
+
+            # Repeat for number of mAES steps
+            for n in range(self.maes_num_steps):
+                # Pack the decoder logits for all current hypothesis
+                beam_dec_out = torch.stack([h.dec_out[-1] for h in hyps])  # [H, 1, D]
+
+                # Extract the log probabilities
+                logp, ilm_ytm = self.resolve_joint_output(beam_enc_out, beam_dec_out)
+                logp = logp.log_softmax(-1)
+
+                print("YTM shape", logp.shape)  # [beam, n, 1, V]
+                blank_score = logp[:,:,:,-1:]   # [beam, n, 1, 1]
+                cumsum = torch.cumsum(blank_score, dim=1) # beam, n, 1, 1
+                logp[:,1:,:,:-1] += cumsum[:,:-1,:,:]
+                b = logp.shape[0]
+                logp = torch.reshape(logp[:,:,:,:-1], [b, -1])
+
+                beam_logp, beam_idx = logp.topk(self.max_candidates, dim=-1)
+
+                # Compute k expansions for all the current hypotheses
+                k_expansions = select_k_expansions(
+                    hyps, beam_idx, beam_logp, self.maes_expansion_gamma, self.maes_expansion_beta
+                )
+
+                # List that contains the hypothesis after prefix expansion
+                t_to_list_exp = {}
+                for i, hyp in enumerate(hyps):  # For all hypothesis
+                    for kk, new_score in k_expansions[i]:  # for all expansion within these hypothesis
+                        k, jump = kk % self.blank, kk // self.blank
+                        new_hyp = Hypothesis(
+                            y_sequence=hyp.y_sequence[:],
+                            score=new_score,
+                            dec_out=hyp.dec_out[:],
+                            dec_state=hyp.dec_state,
+                            lm_state=hyp.lm_state,
+                            lm_scores=hyp.lm_scores,
+                            timestep=hyp.timestep[:],
+                            length=t,
+                        )
+
+                        t += jump
+                        # If the expansion was for blank
+                        if k == self.blank:
+                            t += 1
+                            if t in t_to_list_b:
+                                t_to_list_b[t].append(new_hyp)
+                            else:
+                                t_to_list_b[t] = [new_hyp]
+                        else:
+                            # If the expansion was a token
+                            # new_hyp.y_sequence.append(int(k))
+                            if (new_hyp.y_sequence + [int(k)]) not in duplication_check:
+                                new_hyp.y_sequence.append(int(k))
+                                new_hyp.timestep.append(t)
+                                
+                                if t in t_to_list_exp:
+                                    t_to_list_exp[t].append(new_hyp)
+                                else:
+                                    t_to_list_exp[t] = [new_hyp]
+
+
+                # If there were no token expansions in any of the hypotheses,
+                # Early exit
+                if len(t_to_list_exp) == 0:
+                    for key, value in t_to_list_exp.items():
+                        t_to_list_exp[key] = sorted(value, key=lambda x: x.score, reverse=True)[:beam]
+
+                    # Early exit
+                    break
+
+                else:
+                    for key, list_exp in t_to_list_exp.items():
+                        # Decode a batch of beam states and scores
+                        beam_dec_out, beam_state = self.decoder.batch_score_hypothesis(
+                            list_exp,
+                            cache,
+                            # self.language_model is not None,
+                        )
+
+                        # If this isnt the last mAES step
+                        if n < (self.maes_num_steps - 1):
+                            # For all expanded hypothesis
+                            for i, hyp in enumerate(list_exp):
+                                # Preserve the decoder logits for the current beam
+                                hyp.dec_out.append(beam_dec_out[i])
+                                hyp.dec_state = beam_state[i]
+
+                            # Copy the expanded hypothesis
+                            hyps = list_exp[:]
+
+                        else:
+                            # Extract the log probabilities
+                            beam_logp, _ = self.resolve_joint_output(beam_enc_out, torch.stack(beam_dec_out))
+                            beam_logp = beam_logp[:, 0, 0, :]
+
+                            # For all expansions, add the score for the blank label
+                            for i, hyp in enumerate(list_exp):
+                                hyp.score += float(beam_logp[i, self.blank])
+
+                                # Preserve the decoder's output and state
+                                hyp.dec_out.append(beam_dec_out[i])
+                                hyp.dec_state = beam_state[i]
+
+                            # Finally, update the kept hypothesis of sorted top Beam candidates
+                            kept_hyps = sorted(list_b + list_exp, key=lambda x: x.score, reverse=True)[:beam]
+                            t = key
+                            if t in t_to_kept_hyp:
+                               t_to_kept_hyps[t] = t_to_kept_hyps[t] + kept_hyps
+                            else:
+                               t_to_kept_hyps[t] = kept_hyps
+
+
+        # Sort the hypothesis with best scores
+        return self.sort_nbest(kept_hyps)
 
     def modified_adaptive_expansion_search(
         self, h: torch.Tensor, encoded_lengths: torch.Tensor, partial_hypotheses: Optional[Hypothesis] = None

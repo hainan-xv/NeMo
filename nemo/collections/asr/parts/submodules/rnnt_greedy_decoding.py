@@ -557,7 +557,9 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
 
 
             if len(hypothesis_list) > max_alive:
-                hypothesis_list, time_idx_list, symbols_added_list = map(list, zip(*nlargest(max_alive, zip(expanded_hyps, expanded_times, expanded_symbols), key=lambda x: x[0].score / (x[1] + len(x[0].y_sequence)))))
+#                hypothesis_list, time_idx_list, symbols_added_list = map(list, zip(*nlargest(max_alive, zip(expanded_hyps, expanded_times, expanded_symbols), key=lambda x: x[0].score )))
+#                hypothesis_list, time_idx_list, symbols_added_list = map(list, zip(*nlargest(max_alive, zip(expanded_hyps, expanded_times, expanded_symbols), key=lambda x: x[0].score / (x[1] + len(x[0].y_sequence)))))
+                hypothesis_list, time_idx_list, symbols_added_list = map(list, zip(*nlargest(max_alive, zip(expanded_hyps, expanded_times, expanded_symbols), key=lambda x: x[0].score / (0.001 + x[1]))))
 
 
 
