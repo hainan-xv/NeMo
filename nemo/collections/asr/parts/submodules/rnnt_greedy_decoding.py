@@ -352,7 +352,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
         confidence_method_cfg: Optional[DictConfig] = None,
         window_size: int = 0,
         beam = 1,
-        pruning_opts: str = '999 999',
+        pruning_opts: str = '999999',
     ):
         super().__init__(
             decoder_model=decoder_model,
@@ -365,7 +365,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
         )
         self.window_size = window_size
         self.beam = beam
-        self.pruning_opts = pruning_opts
+        self.max_alive = int(pruning_opts)
 
     @typecheck()
     def forward(
@@ -406,7 +406,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                 if self.window_size == 1:
                     hypothesis = self._greedy_decode(inseq, logitlen, partial_hypotheses=partial_hypothesis)
                 elif self.window_size < 0:
-                    hypothesis = self._greedy_decode_lookahead_beam(inseq, logitlen, partial_hypotheses=partial_hypothesis, window_size=-self.window_size, beam=self.beam, pruning_opts=self.pruning_opts)
+                    hypothesis = self._greedy_decode_lookahead_beam(inseq, logitlen, partial_hypotheses=partial_hypothesis, window_size=-self.window_size, beam=self.beam, max_alive=self.max_alive)
                 else:
                     hypothesis = self._greedy_decode_lookahead(inseq, logitlen, partial_hypotheses=partial_hypothesis, window_size=self.window_size)
                 hypotheses.append(hypothesis)
@@ -422,15 +422,13 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
 
     @torch.no_grad()
     def _greedy_decode_lookahead_beam(
-        self, x: torch.Tensor, out_len: torch.Tensor, window_size: int, beam, pruning_opts: str, partial_hypotheses: Optional[rnnt_utils.Hypothesis] = None
+        self, x: torch.Tensor, out_len: torch.Tensor, window_size: int, beam, max_alive: int, partial_hypotheses: Optional[rnnt_utils.Hypothesis] = None
     ):
         # x: [T, 1, D]
         # out_len: [seq_len]
 
         # Initialize blank state and empty label set in Hypothesis
 
-        # 3, 
-        prune_a, prune_b = [int(i) for i in pruning_opts.split()]
 
         g, hidden_prime = self._pred_step(self._SOS, None)
         hypothesis_list = [rnnt_utils.Hypothesis(score=0.0, y_sequence=[], dec_out=[g], dec_state=hidden_prime, timestep=[], last_token=None)]
@@ -458,8 +456,6 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
             expanded_batch_indices = batch_indices.unsqueeze(1).expand(-1, window_size)
             offsets = torch.arange(window_size, device=device)
 
-#            print("HERE time_idx_list", time_idx_list)
-
             time_indices_tensor = torch.LongTensor(time_idx_list).to(device)
             expanded_time_indices = time_indices_tensor.unsqueeze(1) + offsets.unsqueeze(0)
             out_bound_mask = (expanded_time_indices >= out_len).float()
@@ -482,12 +478,8 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
 
             logp = torch.reshape(logp[:,:,:,:-1], [len(hypothesis_list), -1])
 
-            if logp.dtype != torch.float32:
-                logp = logp.float()
-
-            vvs, _ = logp.topk(1, -1)
-
-            vvs = vvs.tolist()
+            vvs = logp.topk(1, -1)[0].tolist()
+            cumsum = cumsum[:,:,0,0].tolist()
 
             for i in range(len(hypothesis_list)):
                 hypothesis = hypothesis_list[i]
@@ -496,10 +488,8 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
 
                 threshold = vvs[i][0] - beam
 
-                kk = torch.where(logp[i] > threshold)
+                kk = torch.where(logp[i] >= threshold)
                 vv = logp[i][kk]
-#                print("KK IS", kk)
-#                print("VV IS", vv)
 
                 n = window_size
                 if time_idx + n > out_len:
@@ -507,7 +497,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
 
                 kk = kk[0].tolist()
                 vv = vv.tolist()
-                logp_blank = cumsum[i, n-1, 0, 0].item()
+                logp_blank = cumsum[i][n-1]
 
                 loops = len(kk)
                 if logp_blank > threshold:
@@ -547,7 +537,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                             this_symbols_added = 0
                             this_time_idx += 1
 
-                    if expanded_hyp.score > finished_hyp_best_score - prune_b:
+                    if expanded_hyp.score >= finished_hyp_best_score - beam:
                         if this_time_idx < out_len:
                             expanded_hyps.append(expanded_hyp)
                             expanded_times.append(this_time_idx)
@@ -578,10 +568,21 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
 #                hypothesis_list, time_idx_list, symbols_added_list = expanded_hyps, expanded_times, expanded_symbols
 
             threshold = max(a.score for a in expanded_hyps) - beam
-            hypothesis_list, time_idx_list, symbols_added_list = map(list, zip(*[(a, b, c) for a, b, c in zip(expanded_hyps, expanded_times, expanded_symbols) if a.score > threshold]))
+            hypothesis_list, time_idx_list, symbols_added_list = map(list, zip(*[(a, b, c) for a, b, c in zip(expanded_hyps, expanded_times, expanded_symbols) if a.score >= threshold]))
 
 #            hypothesis_list, time_idx_list, symbols_added_list = expanded_hyps, expanded_times, expanded_symbols
 
+
+
+
+            if len(hypothesis_list) > max_alive:
+                hypothesis_list, time_idx_list, symbols_added_list = map(list, zip(*nlargest(max_alive, zip(expanded_hyps, expanded_times, expanded_symbols), key=lambda x: x[0].score / (x[1] + len(x[0].y_sequence)))))
+
+
+
+
+
+#            print("NUM HYPS", len(hypothesis_list))
             for h in hypothesis_list:
                 if h.dec_out is None:
                     k = h.last_token

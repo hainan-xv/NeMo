@@ -304,7 +304,7 @@ class AbstractRNNTDecoding(ConfidenceMixin):
                         confidence_method_cfg=self.confidence_method_cfg,
                         window_size=self.cfg.greedy.get('window_size', 0),
                         beam=self.cfg.greedy.get('beam', 0),
-                        pruning_opts=self.cfg.greedy.get('pruning_opts', '999 999'),
+                        pruning_opts=self.cfg.greedy.get('pruning_opts', '999'),
                     )
                 else:
                     self.decoding = rnnt_greedy_decoding.GreedyTDTInfer(
