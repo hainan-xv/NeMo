@@ -1360,13 +1360,27 @@ class BeamRNNTInfer(Typing):
 
         best_score = -999900.9
         out_len = encoded_lengths.item()
+        stay_count = 0
+        last_t = -1
         while len(t_to_kept_hyps) > 0:
 #            print("ALL KEYS", sorted(t_to_kept_hyps.keys()))
             t = min(t_to_kept_hyps.keys())
-#            print("AT", t)
+
             if t >= out_len:
                 break
             kept_hyps = t_to_kept_hyps.pop(t)
+
+            print("AT", t)
+            print("stay count", stay_count)
+            if t == last_t:
+                stay_count += 1
+#                if stay_count == 3:
+#                    stay_count = 0
+#                    continue
+            else:
+                stay_count = 0
+
+            last_t = t
 
             best_score_here = max([h.score for h in kept_hyps])
             if best_score_here < best_score - 2.0:
@@ -1403,7 +1417,8 @@ class BeamRNNTInfer(Typing):
             cumsum = torch.cumsum(blank_score, dim=1) # beam, n, 1, 1
             logp[:,1:,:,:] += cumsum[:,:-1,:,:]
             logp[:,:-1,:,-1] -= 9999999.9
-#            logp[:,0,:,:] -= 999999.9
+            if stay_count == 3:
+                logp[:,0,:,:] -= 999999.9
             logp = torch.reshape(logp[:,:,:,:], [B, -1])
 
             beam_logp, beam_idx = logp.topk(self.max_candidates, dim=-1)
@@ -1415,7 +1430,6 @@ class BeamRNNTInfer(Typing):
 
             # List that contains the hypothesis after prefix expansion
             t_to_list_exp = {}
-            stay_exp = {}
             for i, hyp in enumerate(hyps):  # For all hypothesis
                 for kk, new_score in k_expansions[i]:  # for all expansion within these hypothesis
                     k, jump = kk % (1 + self.blank), kk // (1 + self.blank)
@@ -1442,16 +1456,22 @@ class BeamRNNTInfer(Typing):
                     elif jump > 0:
                         # If the expansion was a token
                         # new_hyp.y_sequence.append(int(k))
+                        new_hyp.y_sequence.append(int(k))
+                        new_hyp.timestep.append(t)
+                        
+                        if new_t in t_to_list_exp:
+                            t_to_list_exp[new_t].append(new_hyp)
+                        else:
+                            t_to_list_exp[new_t] = [new_hyp]
+                    else: 
                         if (new_hyp.y_sequence + [int(k)]) not in duplication_check:
                             new_hyp.y_sequence.append(int(k))
                             new_hyp.timestep.append(t)
-                            
+
                             if new_t in t_to_list_exp:
                                 t_to_list_exp[new_t].append(new_hyp)
                             else:
                                 t_to_list_exp[new_t] = [new_hyp]
-                    else: 
-
 
             for the_t, value in t_to_list_b.items():
                 to_append = sorted(value, key=lambda x: x.score, reverse=True)[:beam] 
