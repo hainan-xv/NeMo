@@ -1358,34 +1358,28 @@ class BeamRNNTInfer(Typing):
         t_to_kept_hyps = {}
         t_to_kept_hyps[0] = kept_hyps
 
-        best_score = -999900.9
         out_len = encoded_lengths.item()
         stay_count = 0
         last_t = -1
         while len(t_to_kept_hyps) > 0:
-#            print("ALL KEYS", sorted(t_to_kept_hyps.keys()))
             t = min(t_to_kept_hyps.keys())
 
-            if t >= out_len:
-                break
             kept_hyps = t_to_kept_hyps.pop(t)
 
-            print("AT", t)
-            print("stay count", stay_count)
+            kept_hyps = self.recombine_hypotheses(kept_hyps)
+            if t >= out_len:
+                print("DONE!")
+                break
+            kept_hyps = sorted(kept_hyps, key=lambda x: x.score, reverse=True)[:beam] 
+
             if t == last_t:
                 stay_count += 1
-#                if stay_count == 3:
-#                    stay_count = 0
-#                    continue
             else:
                 stay_count = 0
 
-            last_t = t
+            print("AT", t, stay_count)
 
-            best_score_here = max([h.score for h in kept_hyps])
-            if best_score_here < best_score - 2.0:
-                print("SKIP")
-                continue
+            last_t = t
 
             n = min(self.window_size, out_len - t)
 
@@ -1397,9 +1391,6 @@ class BeamRNNTInfer(Typing):
                 beam_enc_out,
                 prefix_alpha=self.maes_prefix_alpha,
             )  # type: List[Hypothesis]
-
-            # Prepare output tensor
-#            beam_enc_out = enc_out_t
 
             # List that contains the blank token emisions
             t_to_list_b = {}
@@ -1417,8 +1408,12 @@ class BeamRNNTInfer(Typing):
             cumsum = torch.cumsum(blank_score, dim=1) # beam, n, 1, 1
             logp[:,1:,:,:] += cumsum[:,:-1,:,:]
             logp[:,:-1,:,-1] -= 9999999.9
+
             if stay_count == 3:
                 logp[:,0,:,:] -= 999999.9
+            if stay_count == 4:
+                break
+
             logp = torch.reshape(logp[:,:,:,:], [B, -1])
 
             beam_logp, beam_idx = logp.topk(self.max_candidates, dim=-1)
