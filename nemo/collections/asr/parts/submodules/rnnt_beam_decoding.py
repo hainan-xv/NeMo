@@ -1358,29 +1358,34 @@ class BeamRNNTInfer(Typing):
         t_to_kept_hyps = {}
         t_to_kept_hyps[0] = kept_hyps
 
+        best_score = -999900.9
         out_len = encoded_lengths.item()
         while len(t_to_kept_hyps) > 0:
 #            print("ALL KEYS", sorted(t_to_kept_hyps.keys()))
             t = min(t_to_kept_hyps.keys())
 #            print("AT", t)
+            if t >= out_len:
+                break
             kept_hyps = t_to_kept_hyps.pop(t)
 
-#            print("HYPS", [j.y_sequence for _, i in t_to_kept_hyps.items() for j in i])
+            best_score_here = max([h.score for h in kept_hyps])
+            if best_score_here < best_score - 2.0:
+                print("SKIP")
+                continue
 
             n = min(self.window_size, out_len - t)
-            if n <= 0:
-                break
-            enc_out_t = h[t : t + n].unsqueeze(0)  # [1, n, D]
+
+            beam_enc_out = h[t : t + n].unsqueeze(0)  # [1, n, D]
 
             # Perform prefix search to obtain hypothesis
             hyps = self.prefix_search(
                 sorted(kept_hyps, key=lambda x: len(x.y_sequence), reverse=True),
-                enc_out_t,
+                beam_enc_out,
                 prefix_alpha=self.maes_prefix_alpha,
             )  # type: List[Hypothesis]
 
             # Prepare output tensor
-            beam_enc_out = enc_out_t
+#            beam_enc_out = enc_out_t
 
             # List that contains the blank token emisions
             t_to_list_b = {}
@@ -1391,19 +1396,17 @@ class BeamRNNTInfer(Typing):
 
             # Extract the log probabilities
             logp, _ = self.resolve_joint_output(beam_enc_out, beam_dec_out)
-            logp = logp.log_softmax(-1)
+#            logp = logp.log_softmax(-1)
+            B = logp.shape[0]
 
             blank_score = logp[:,:,:,-1:]   # [beam, n, 1, 1]
             cumsum = torch.cumsum(blank_score, dim=1) # beam, n, 1, 1
             logp[:,1:,:,:] += cumsum[:,:-1,:,:]
-
-            B = logp.shape[0]
-
             logp[:,:-1,:,-1] -= 9999999.9
+#            logp[:,0,:,:] -= 999999.9
             logp = torch.reshape(logp[:,:,:,:], [B, -1])
 
             beam_logp, beam_idx = logp.topk(self.max_candidates, dim=-1)
-#            print("HAHA ", beam_logp, beam_idx)
 
             # Compute k expansions for all the current hypotheses
             k_expansions = select_k_expansions(
@@ -1412,11 +1415,11 @@ class BeamRNNTInfer(Typing):
 
             # List that contains the hypothesis after prefix expansion
             t_to_list_exp = {}
+            stay_exp = {}
             for i, hyp in enumerate(hyps):  # For all hypothesis
                 for kk, new_score in k_expansions[i]:  # for all expansion within these hypothesis
                     k, jump = kk % (1 + self.blank), kk // (1 + self.blank)
 
-#                    print("K JUMP", k, jump)
                     new_hyp = Hypothesis(
                         y_sequence=hyp.y_sequence[:],
                         score=new_score,
@@ -1436,7 +1439,7 @@ class BeamRNNTInfer(Typing):
                             t_to_list_b[new_t].append(new_hyp)
                         else:
                             t_to_list_b[new_t] = [new_hyp]
-                    else:
+                    elif jump > 0:
                         # If the expansion was a token
                         # new_hyp.y_sequence.append(int(k))
                         if (new_hyp.y_sequence + [int(k)]) not in duplication_check:
@@ -1447,13 +1450,15 @@ class BeamRNNTInfer(Typing):
                                 t_to_list_exp[new_t].append(new_hyp)
                             else:
                                 t_to_list_exp[new_t] = [new_hyp]
+                    else: 
 
 
             for the_t, value in t_to_list_b.items():
+                to_append = sorted(value, key=lambda x: x.score, reverse=True)[:beam] 
                 if the_t in t_to_kept_hyps:
-                    t_to_kept_hyps[the_t] = t_to_kept_hyps[the_t] + sorted(value, key=lambda x: x.score, reverse=True)[:beam]
+                    t_to_kept_hyps[the_t] = t_to_kept_hyps[the_t] + to_append
                 else:
-                    t_to_kept_hyps[the_t] = sorted(value, key=lambda x: x.score, reverse=True)[:beam]
+                    t_to_kept_hyps[the_t] = to_append
 
             for the_t, list_exp in t_to_list_exp.items():
                 # Decode a batch of beam states and scores
@@ -1476,10 +1481,6 @@ class BeamRNNTInfer(Typing):
                    t_to_kept_hyps[the_t] = t_to_kept_hyps[the_t] + kept_hyps
                 else:
                    t_to_kept_hyps[the_t] = kept_hyps
-
-
-#            print("UPDATED t_to_kept_hyps", t_to_kept_hyps)
-
         
         # Sort the hypothesis with best scores
         return self.sort_nbest(kept_hyps)
