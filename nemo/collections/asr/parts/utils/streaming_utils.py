@@ -1204,6 +1204,9 @@ class BatchedFrameASRRNNT(FrameBatchASR):
         self.infer_logits()
 
         self.unmerged = [[] for _ in range(self.batch_size)]
+
+        print("ALL self.all_alignments", self.all_alignments)
+
         for idx, alignments in enumerate(self.all_alignments):
 
             signal_end_idx = self.frame_bufferer.signal_end_index[idx]
