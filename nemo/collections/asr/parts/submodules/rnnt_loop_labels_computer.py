@@ -266,11 +266,11 @@ class GreedyBatchedRNNTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMeth
             try:
                 check_cuda_python_cuda_graphs_conditional_nodes_supported()
                 self.cuda_graphs_mode = self.CudaGraphsMode.FULL_GRAPH
-            except (ImportError, ModuleNotFoundError) as e:
+            except (ImportError, ModuleNotFoundError, EnvironmentError) as e:
                 logging.warning(
                     "No conditional node support for Cuda.\n"
                     "Cuda graphs with while loops are disabled, decoding speed will be slower\n"
-                    f"Reason: {e.msg}"
+                    f"Reason: {e}"
                 )
                 self.cuda_graphs_mode = self.CudaGraphsMode.NO_WHILE_LOOPS
         self.reset_cuda_graphs_state()
@@ -474,9 +474,9 @@ class GreedyBatchedRNNTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMeth
                     torch.logical_and(
                         torch.logical_and(
                             labels != self._blank_index,
-                            batched_hyps.last_timestep_lasts >= self.max_symbols,
+                            batched_hyps.last_timestamp_lasts >= self.max_symbols,
                         ),
-                        batched_hyps.last_timestep == time_indices,
+                        batched_hyps.last_timestamp == time_indices,
                     ),
                 )
                 time_indices += force_blank_mask  # emit blank => advance time indices
@@ -878,9 +878,9 @@ class GreedyBatchedRNNTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMeth
             torch.logical_and(
                 torch.logical_and(
                     self.state.labels != self._blank_index,
-                    self.state.batched_hyps.last_timestep_lasts >= self.max_symbols,
+                    self.state.batched_hyps.last_timestamp_lasts >= self.max_symbols,
                 ),
-                self.state.batched_hyps.last_timestep == self.state.time_indices,
+                self.state.batched_hyps.last_timestamp == self.state.time_indices,
             ),
         )
         self.state.time_indices.add_(force_blank_mask)  # emit blank => advance time indices

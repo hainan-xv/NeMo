@@ -13,6 +13,11 @@ on:
   pull_request_target:
     paths:
       - '**.py'
+    types: [ opened, synchronize, reopened, labeled, unlabeled ]
+
+defaults:
+  run:
+    shell: bash -x -e -u -o pipefail {0}
 
 jobs:
   reformat_with_isort_and_black:
@@ -46,6 +51,7 @@ jobs:
 
       - name: black
         uses: psf/black@stable
+        if: ${{ steps.changed-files.outputs.any_changed == 'true' }}
         with:
           options: "--verbose"
           # apply only to changed files (pass explicitly the files)
@@ -54,6 +60,7 @@ jobs:
 
       - name: isort
         uses: isort/isort-action@v1
+        if: ${{ steps.changed-files.outputs.any_changed == 'true' }}
         with:
           isort-version: "5.13.2"
           # reformat all files with isort – safe since the whole repo is already reformatted

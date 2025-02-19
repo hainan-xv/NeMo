@@ -40,6 +40,7 @@ class AppState(metaclass=Singleton):
         self._global_rank = None
         self._tensor_model_parallel_rank = None
         self._expert_model_parallel_rank = None
+        self._expert_tensor_parallel_rank = None
         self._pipeline_model_parallel_rank = None
         self._data_parallel_rank = None
 
@@ -48,14 +49,18 @@ class AppState(metaclass=Singleton):
         self._tensor_model_parallel_size = None
         self._tensor_model_parallel_group = None
         self._expert_model_parallel_size = None
+        self._expert_tensor_parallel_size = None
         self._pipeline_model_parallel_size = None
         self._virtual_pipeline_model_parallel_size = None
+        self._encoder_tensor_model_parallel_size = None
+        self._encoder_pipeline_model_parallel_size = None
         self._pipeline_model_parallel_group = None
         self._pipeline_model_parallel_split_rank = None
         self._is_megatron_initialized = False
         self._data_parallel_size = None
         self._data_parallel_group = None
         self._use_tp_pp_dp_mapping = False
+        self._num_distributed_optimizer_instances = 1
         self._megatron_checkpoint_version = None
         self._use_fp8 = False
         self._context_parallel_size = None
@@ -178,11 +183,43 @@ class AppState(metaclass=Singleton):
 
     @expert_model_parallel_size.setter
     def expert_model_parallel_size(self, size):
-        """Property sets the number of GPUs in each expert parallel group.
-        Args:
-            size (int):  Number of GPUs in each expert parallel group.
+        """Property returns the number of GPUs in each expert parallel group.
+        Returns:
+            Number of GPUs in each expert parallel group.
         """
         self._expert_model_parallel_size = size
+
+    @property
+    def expert_tensor_parallel_size(self):
+        """Property returns the number of GPUs in each expert tensor parallel group.
+        Returns:
+            Number of GPUs in each expert tensor parallel group.
+        """
+        return self._expert_tensor_parallel_size
+
+    @expert_tensor_parallel_size.setter
+    def expert_tensor_parallel_size(self, size):
+        """Property sets the number of GPUs in each expert tensor parallel group.
+        Args:
+            size (int):  Number of GPUs in each tensor expert parallel group.
+        """
+        self._expert_tensor_parallel_size = size
+
+    @property
+    def expert_tensor_parallel_rank(self):
+        """Property returns the expert tensor model parallel rank.
+        Returns:
+            Tensor model parallel rank.
+        """
+        return self._expert_tensor_parallel_rank
+
+    @expert_tensor_parallel_rank.setter
+    def expert_tensor_parallel_rank(self, rank):
+        """Property sets the expert tensor model parallel rank.
+        Args:
+            rank (int):  Tensor model parallel rank.
+        """
+        self._expert_tensor_parallel_rank = rank
 
     @property
     def pipeline_model_parallel_size(self):
@@ -201,12 +238,60 @@ class AppState(metaclass=Singleton):
         self._pipeline_model_parallel_size = size
 
     @property
+    def encoder_tensor_model_parallel_size(self):
+        """Property returns the number of GPUs in each model parallel group.
+        Returns:
+            Number of GPUs in each model parallel group.
+        """
+        return self._encoder_tensor_model_parallel_size
+
+    @encoder_tensor_model_parallel_size.setter
+    def encoder_tensor_model_parallel_size(self, size):
+        """Property sets the number of GPUs in each model parallel group.
+        Args:
+            size (int):  Number of GPUs in each model parallel group.
+        """
+        self._encoder_tensor_model_parallel_size = size
+
+    @property
+    def encoder_pipeline_model_parallel_size(self):
+        """Property returns the number of GPUs in each model parallel group.
+        Returns:
+            Number of GPUs in each model parallel group.
+        """
+        return self._encoder_pipeline_model_parallel_size
+
+    @encoder_pipeline_model_parallel_size.setter
+    def encoder_pipeline_model_parallel_size(self, size):
+        """Property sets the number of GPUs in each model parallel group.
+        Args:
+            size (int):  Number of GPUs in each model parallel group.
+        """
+        self._encoder_pipeline_model_parallel_size = size
+
+    @property
     def use_tp_pp_dp_mapping(self):
         return self._use_tp_pp_dp_mapping
 
     @use_tp_pp_dp_mapping.setter
     def use_tp_pp_dp_mapping(self, use_new_mapping):
         self._use_tp_pp_dp_mapping = use_new_mapping
+
+    @property
+    def num_distributed_optimizer_instances(self):
+        """Property returns the factor by which the Partial DistOpt is sharded.
+        Returns:
+            The partial DistOpt shard factor
+        """
+        return self._num_distributed_optimizer_instances
+
+    @num_distributed_optimizer_instances.setter
+    def num_distributed_optimizer_instances(self, shard_factor):
+        """Property sets the factor by which the Partial DistOpt is sharded.
+        Args:
+            shard_factor (int):  The partial DistOpt shard factor.
+        """
+        self._num_distributed_optimizer_instances = shard_factor
 
     @property
     def virtual_pipeline_model_parallel_size(self):
@@ -335,6 +420,38 @@ class AppState(metaclass=Singleton):
             rank (int):  Virtual pipeline parallel rank.
         """
         self._virtual_pipeline_model_parallel_rank = rank
+
+    @property
+    def encoder_tensor_model_parallel_rank(self):
+        """Property returns the encoder tensor model parallel rank.
+        Returns:
+            Tensor model parallel rank.
+        """
+        return self._encoder_tensor_model_parallel_rank
+
+    @encoder_tensor_model_parallel_rank.setter
+    def encoder_tensor_model_parallel_rank(self, rank):
+        """Property sets the encoder tensor model parallel rank.
+        Args:
+            rank (int):  Tensor model parallel rank.
+        """
+        self._encoder_tensor_model_parallel_rank = rank
+
+    @property
+    def encoder_pipeline_model_parallel_rank(self):
+        """Property returns the encoder pipeline model parallel rank.
+        Returns:
+            Tensor model parallel rank.
+        """
+        return self._encoder_pipeline_model_parallel_rank
+
+    @encoder_pipeline_model_parallel_rank.setter
+    def encoder_pipeline_model_parallel_rank(self, rank):
+        """Property sets the encoder pipeline model parallel rank.
+        Args:
+            rank (int):  Tensor model parallel rank.
+        """
+        self._encoder_pipeline_model_parallel_rank = rank
 
     @property
     def pipeline_model_parallel_split_rank(self):
