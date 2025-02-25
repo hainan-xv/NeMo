@@ -1205,7 +1205,7 @@ class BatchedFrameASRRNNT(FrameBatchASR):
 
         self.unmerged = [[] for _ in range(self.batch_size)]
 
-        print("ALL self.all_alignments", self.all_alignments)
+        print("ALL self.all_alignments", len(self.all_alignments[0][0]))
 
         for idx, alignments in enumerate(self.all_alignments):
 
@@ -1224,6 +1224,7 @@ class BatchedFrameASRRNNT(FrameBatchASR):
                 ]
 
                 ids, toks = self._alignment_decoder(alignment, self.asr_model.tokenizer, self.blank_id)
+                print("IDS TOKS", ids, toks)
 
                 if len(ids) > 0 and a_idx < signal_end_idx:
                     self.unmerged[idx] = inplace_buffer_merge(

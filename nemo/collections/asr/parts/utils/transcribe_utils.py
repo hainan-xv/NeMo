@@ -80,7 +80,6 @@ def get_buffered_pred_feat_rnnt(
                     asr.reset()
                     asr.read_audio_file(audio_files, delay, model_stride_in_secs)
                     hyp_list = asr.transcribe(tokens_per_chunk, delay)
-                    print("HYPLIST HERE", hyp_list)
                     hyps.extend(hyp_list)
 
                     batch.clear()
@@ -94,7 +93,6 @@ def get_buffered_pred_feat_rnnt(
                 audio_files = [sample for sample in batch]
                 asr.read_audio_file(audio_files, delay, model_stride_in_secs)
                 hyp_list = asr.transcribe(tokens_per_chunk, delay)
-                print("HYPLIST HERE", hyp_list)
                 hyps.extend(hyp_list)
 
                 batch.clear()
@@ -110,7 +108,6 @@ def get_buffered_pred_feat_rnnt(
                 print("hyp:", hyp)
                 print("ref:", ref)
 
-    print("HYP BEFORE WRAPPING", hyps)
     wrapped_hyps = wrap_transcription(hyps)
     return wrapped_hyps
 

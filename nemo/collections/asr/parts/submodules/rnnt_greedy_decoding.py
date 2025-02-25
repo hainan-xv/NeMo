@@ -408,7 +408,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
 
         print("x is", x.shape)
 #        print("partial is", partial_hypotheses.y_sequence if partial_hypotheses is not None else None)
-        assert False
+#        assert False
 
         # Initialize blank state and empty label set in Hypothesis
         hypothesis = rnnt_utils.Hypothesis(score=0.0, y_sequence=[], dec_state=None, timestep=[], last_token=None)
@@ -2518,7 +2518,6 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
 
         print("x is", x.shape)
         print("partial is", partial_hypotheses.y_sequence if partial_hypotheses is not None else None)
-        assert False
 
         hypothesis = rnnt_utils.Hypothesis(score=0.0, y_sequence=[], dec_state=None, timestep=[], last_token=None)
 
@@ -2584,8 +2583,6 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
 
                 skip = self.durations[d_k]
 
-                print("SKIP IS", skip, "K IS", k, "AT", time_idx)
-
                 if self.preserve_alignments:
                     # insert logprobs into last timestep
                     hypothesis.alignments[-1].append((logp.to('cpu'), torch.tensor(k, dtype=torch.int32)))
@@ -2624,10 +2621,13 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
 
             if self.preserve_alignments:
                 # convert Ti-th logits into a torch array
-                hypothesis.alignments.append([])  # blank buffer for next timestep
+                for i in range(skip):
+                    hypothesis.alignments.append([])  # blank buffer for next timestep
+#                    hypothesis.alignments[-1].append((0.0, torch.tensor(self._blank_index, dtype=torch.int32)))
 
             if self.preserve_frame_confidence:
-                hypothesis.frame_confidence.append([])  # blank buffer for next timestep
+                for i in range(skip):
+                    hypothesis.frame_confidence.append([])  # blank buffer for next timestep
 
             if symbols_added == self.max_symbols:
                 time_idx += 1
