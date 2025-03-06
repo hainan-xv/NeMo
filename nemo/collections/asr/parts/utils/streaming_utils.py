@@ -1219,6 +1219,10 @@ class BatchedFrameASRRNNT(FrameBatchASR):
                 else:  # all other cases
                     offset = 1
 
+                ids, toks = self._alignment_decoder(alignment, self.asr_model.tokenizer, self.blank_id)
+                print("OLD IDS TOKS", ids, toks)
+
+                print("CUTTING", len(alignment) - offset - delay , len(alignment) - offset - delay + tokens_per_chunk)
                 alignment = alignment[
                     len(alignment) - offset - delay : len(alignment) - offset - delay + tokens_per_chunk
                 ]
