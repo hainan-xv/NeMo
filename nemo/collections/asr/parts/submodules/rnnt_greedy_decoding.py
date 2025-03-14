@@ -406,10 +406,6 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
         # x: [T, 1, D]
         # out_len: [seq_len]
 
-        print("x is", x.shape)
-#        print("partial is", partial_hypotheses.y_sequence if partial_hypotheses is not None else None)
-#        assert False
-
         # Initialize blank state and empty label set in Hypothesis
         hypothesis = rnnt_utils.Hypothesis(score=0.0, y_sequence=[], dec_state=None, timestep=[], last_token=None)
 
@@ -509,8 +505,6 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
 
         # Unpack the hidden states
         hypothesis.dec_state = self.decoder.batch_select_state(hypothesis.dec_state, 0)
-
-        print("HYP now", hypothesis.y_sequence)
 
         return hypothesis
 
@@ -2516,9 +2510,6 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
 
         # Initialize blank state and empty label set in Hypothesis
 
-        print("x is", x.shape)
-        print("partial is", partial_hypotheses.y_sequence if partial_hypotheses is not None else None)
-
         hypothesis = rnnt_utils.Hypothesis(score=0.0, y_sequence=[], dec_state=None, timestep=[], last_token=None)
 
         if partial_hypotheses is not None:
@@ -2644,7 +2635,6 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
 
         # Unpack the hidden states
         hypothesis.dec_state = self.decoder.batch_select_state(hypothesis.dec_state, 0)
-        print("HYP now", hypothesis.y_sequence)
 
         return hypothesis
 

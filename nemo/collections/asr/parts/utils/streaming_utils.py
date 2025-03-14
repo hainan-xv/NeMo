@@ -984,7 +984,6 @@ class BatchedFeatureFrameBufferer(FeatureFrameBufferer):
             return frame_buffers
         return []
 
-
 class BatchedFrameASRRNNT(FrameBatchASR):
     """
     Batched implementation of FrameBatchASR for RNNT models, where the batch dimension is independent audio samples.
@@ -1133,7 +1132,6 @@ class BatchedFrameASRRNNT(FrameBatchASR):
         del feat_signals, feat_signal_lens
 
         encoded, encoded_len = self.asr_model(processed_signal=feat_signal, processed_signal_length=feat_signal_len)
-
         # filter out partial hypotheses from older batch subset
         if self.stateful_decoding and self.previous_hypotheses is not None:
             new_prev_hypothesis = []
@@ -1205,7 +1203,7 @@ class BatchedFrameASRRNNT(FrameBatchASR):
 
         self.unmerged = [[] for _ in range(self.batch_size)]
 
-        print("ALL self.all_alignments", len(self.all_alignments[0][0]))
+#        print("ALL self.all_alignments", len(self.all_alignments[0][0]))
 
         for idx, alignments in enumerate(self.all_alignments):
 
@@ -1219,16 +1217,9 @@ class BatchedFrameASRRNNT(FrameBatchASR):
                 else:  # all other cases
                     offset = 1
 
-                ids, toks = self._alignment_decoder(alignment, self.asr_model.tokenizer, self.blank_id)
-                print("OLD IDS TOKS", ids, toks)
-
-                print("CUTTING", len(alignment) - offset - delay , len(alignment) - offset - delay + tokens_per_chunk)
-                alignment = alignment[
-                    len(alignment) - offset - delay : len(alignment) - offset - delay + tokens_per_chunk
-                ]
-
-                ids, toks = self._alignment_decoder(alignment, self.asr_model.tokenizer, self.blank_id)
-                print("IDS TOKS", ids, toks)
+                cut_a, cut_b = len(alignment) - offset - delay, len(alignment) - offset - delay + tokens_per_chunk
+                this_alignment = alignment[cut_a:cut_b]
+                ids, toks = self._alignment_decoder(this_alignment, self.asr_model.tokenizer, self.blank_id)
 
                 if len(ids) > 0 and a_idx < signal_end_idx:
                     self.unmerged[idx] = inplace_buffer_merge(
@@ -1266,7 +1257,6 @@ class BatchedFrameASRRNNT(FrameBatchASR):
         decoded_prediction = [p for p in preds]
         hypothesis = self.asr_model.tokenizer.ids_to_text(decoded_prediction)
         return hypothesis
-
 
 class LongestCommonSubsequenceBatchedFrameASRRNNT(BatchedFrameASRRNNT):
     """
@@ -1338,6 +1328,9 @@ class LongestCommonSubsequenceBatchedFrameASRRNNT(BatchedFrameASRRNNT):
 
                 else:
                     ids, toks = self._alignment_decoder(alignment, self.asr_model.tokenizer, self.blank_id)
+                    if len(ids) == 1 and a_idx == signal_end_idx - 1:
+                        ids = []
+
                     if len(ids) > 0 and a_idx < signal_end_idx:
 
                         if self.alignment_basepath is not None:
