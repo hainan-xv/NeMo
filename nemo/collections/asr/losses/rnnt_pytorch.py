@@ -41,10 +41,12 @@ class RNNTLossPytorch(Loss):
         """
         return {"loss": NeuralType(elements_type=LossType())}
 
-    def __init__(self, blank, reduction):
+    def __init__(self, blank, reduction, is_terminal: List[int] = [], sigma=0.0):
         super().__init__()
         self.blank = blank
         self.reduction = reduction
+        self.is_terminal = is_terminal
+        self.sigma = sigma
 
     def forward(self, acts, labels, act_lens, label_lens):
         # CPU patch for FP16
@@ -65,6 +67,10 @@ class RNNTLossPytorch(Loss):
             losses = losses.sum() / label_lens.sum()  # same as above but longer samples weigh more
 
         return losses
+
+    def logsumexp(self, a, b):
+        ret = torch.logsumexp(torch.stack([a, b]), dim=0)
+        return ret
 
     def compute_forward_prob(self, acts, labels, act_lens, label_lens):
         B, T, U, _ = acts.shape
@@ -94,18 +100,17 @@ class RNNTLossPytorch(Loss):
                         # here both t and u are > 0, this state is reachable
                         # with two possibilities: (t - 1, u) with a blank emission
                         # or (t, u - 1) with a label emission.
-                        log_alpha[:, t, u] = torch.logsumexp(
-                            torch.stack(
-                                [
-                                    log_alpha[:, t - 1, u] + acts[:, t - 1, u, self.blank],
-                                    log_alpha[:, t, u - 1]
-                                    + torch.gather(
-                                        acts[:, t, u - 1], dim=1, index=labels[:, u - 1].view(-1, 1).type(torch.int64)
-                                    ).reshape(-1),
-                                ]
-                            ),
-                            dim=0,
-                        )
+
+                        for b in range(B):
+                            if not self.is_terminal[labels[b, u - 1]]:
+                                blank_score = acts[b, t - 1, u, self.blank] - self.sigma
+                            else:
+                                blank_score = acts[b, t - 1, u, self.blank]
+
+                            log_alpha[b, t, u] = self.logsumexp(
+                                log_alpha[b, t - 1, u] + blank_score,
+                                log_alpha[b, t, u - 1] + acts[b, t, u - 1, labels[b, u - 1]]
+                            )
 
         log_probs = []
         for b in range(B):
@@ -114,6 +119,7 @@ class RNNTLossPytorch(Loss):
                 log_alpha[b, act_lens[b] - 1, label_lens[b]] + acts[b, act_lens[b] - 1, label_lens[b], self.blank]
             )
             log_probs.append(to_append)
+            assert self.is_terminal[labels[b, label_lens[b] - 1]]
         log_prob = torch.stack(log_probs)
 
         return log_prob
@@ -143,14 +149,13 @@ class TDTLossPytorch(Loss):
         """
         return {"loss": NeuralType(elements_type=LossType())}
 
-    def __init__(self, blank: int, durations: List[int] = [], reduction: str = 'sum', sigma: float = 0.0, is_terminal: List[int] = []):
+    def __init__(self, blank: int, durations: List[int] = [], reduction: str = 'sum', sigma: float = 0.0):
         super().__init__()
         self.blank = blank
         self.durations = durations
         self.n_durations = len(durations)
         self.reduction = reduction
         self.sigma = sigma
-        self.is_terminal = is_terminal
 
     def forward(self, acts, labels, act_lens, label_lens):
         label_acts = acts[:, :, :, : -self.n_durations]
@@ -218,10 +223,7 @@ class TDTLossPytorch(Loss):
                                         + acts[b, t - l, u, self.blank]
                                         + duration_acts[b, t - l, u, n]
                                     )
-                                    if not self.is_terminal[labels[b, u - 1]]:
-                                        pass
-                                    else:
-                                        log_alpha[b, t, u] = self.logsumexp(tmp, 1.0 * log_alpha[b, t, u])
+                                    log_alpha[b, t, u] = self.logsumexp(tmp, 1.0 * log_alpha[b, t, u])
 
                                 # non-blank emissions.
                                 tmp = (
@@ -229,10 +231,7 @@ class TDTLossPytorch(Loss):
                                     + acts[b, t - l, u - 1, labels[b, u - 1]]
                                     + duration_acts[b, t - l, u - 1, n]
                                 )
-                                if not self.is_terminal[labels[b, u - 1]] and l > 1:
-                                    pass
-                                else:
-                                    log_alpha[b, t, u] = self.logsumexp(tmp, 1.0 * log_alpha[b, t, u])
+                                log_alpha[b, t, u] = self.logsumexp(tmp, 1.0 * log_alpha[b, t, u])
 
         log_probs = []
         for b in range(B):
@@ -246,8 +245,6 @@ class TDTLossPytorch(Loss):
                         + acts[b, act_lens[b] - l, label_lens[b], self.blank]
                         + duration_acts[b, act_lens[b] - l, label_lens[b], n]
                     )
-                    assert self.is_terminal[labels[b, label_lens[b] - 1]]
-
                     tt = self.logsumexp(bb, 1.0 * tt)
 
             log_probs.append(tt)

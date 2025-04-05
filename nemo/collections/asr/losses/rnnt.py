@@ -274,9 +274,18 @@ def resolve_rnnt_loss(loss_name: str, blank_idx: int, loss_kwargs: dict = None) 
         # Update loss config's forced float32 flag if set to None
         loss_config.force_float32 = not numba_utils.is_numba_cuda_fp16_supported()
 
+        vocab_file = loss_kwargs.pop('vocab_file', '')
+        is_terminal = read_vocab_file(vocab_file)
+
         fastemit_lambda = loss_kwargs.pop('fastemit_lambda', 0.0)
         clamp = loss_kwargs.pop('clamp', -1.0)
-        loss_func = RNNTLossNumba(blank=blank_idx, reduction='none', fastemit_lambda=fastemit_lambda, clamp=clamp)
+        sigma = loss_kwargs.pop('sigma', 0.0)
+        loss_func = RNNTLossNumba(blank=blank_idx,
+                                  reduction='none',
+                                  fastemit_lambda=fastemit_lambda,
+                                  is_terminal=is_terminal,
+                                  sigma=sigma,
+                                  clamp=clamp)
         _warn_unused_additional_kwargs(loss_name, loss_kwargs)
 
     elif loss_name == 'pytorch':
@@ -312,9 +321,6 @@ def resolve_rnnt_loss(loss_name: str, blank_idx: int, loss_kwargs: dict = None) 
         durations = loss_kwargs.pop('durations', None)
         sigma = loss_kwargs.pop('sigma', 0.0)
         omega = loss_kwargs.pop('omega', 0.0)
-        vocab_file = loss_kwargs.pop('vocab_file', '')
-
-        is_terminal = read_vocab_file(vocab_file)
 
         loss_func = TDTLossNumba(
             blank=blank_idx,
@@ -324,7 +330,6 @@ def resolve_rnnt_loss(loss_name: str, blank_idx: int, loss_kwargs: dict = None) 
             clamp=clamp,
             sigma=sigma,
             omega=omega,
-            is_terminal=is_terminal,
         )
         _warn_unused_additional_kwargs(loss_name, loss_kwargs)
 
