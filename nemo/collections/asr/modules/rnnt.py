@@ -1364,7 +1364,7 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
                     "decoder_outputs can only be None for fused step!"
                 )
 
-            out = self.joint(encoder_outputs, decoder_outputs, transcripts)  # [B, T, U, V + 1]
+            out = self.joint(encoder_outputs, decoder_outputs)  # [B, T, U, V + 1]
             return out
 
         else:
@@ -1523,7 +1523,7 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         """
         return self.pred(prednet_output)
 
-    def joint_after_projection(self, f: torch.Tensor, g: torch.Tensor, transcription: torch.Tensor) -> torch.Tensor:
+    def joint_after_projection(self, f: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
         """
         Compute the joint step of the network after projection.
 

@@ -67,7 +67,7 @@ class AbstractRNNTJoint(NeuralModule, ABC):
         """
         raise NotImplementedError()
 
-    def joint(self, f: torch.Tensor, g: torch.Tensor, transcription: torch.Tensor) -> torch.Tensor:
+    def joint(self, f: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
         """
         Compute the joint step of the network.
 
@@ -97,7 +97,7 @@ class AbstractRNNTJoint(NeuralModule, ABC):
         Returns:
             Logits / log softmaxed tensor of shape (B, T, U, V + 1).
         """
-        return self.joint_after_projection(self.project_encoder(f), self.project_prednet(g), transcription)
+        return self.joint_after_projection(self.project_encoder(f), self.project_prednet(g))
 
     @property
     def num_classes_with_blank(self):

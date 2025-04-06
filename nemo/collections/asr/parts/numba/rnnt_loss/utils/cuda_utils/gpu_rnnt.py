@@ -164,6 +164,8 @@ class GPURNNT:
         ######## START EXECUTION ########
         self.log_softmax(acts, denom)
 
+#        print("HERE", self.is_terminal, self.sigma)
+
         # Compute alphas
         gpu_rnnt_kernel.compute_alphas_kernel[self.minibatch_, self.maxU_, self.stream_, 0](
             acts,

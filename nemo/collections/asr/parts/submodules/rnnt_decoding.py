@@ -211,6 +211,8 @@ class AbstractRNNTDecoding(ConfidenceMixin):
         self.joint_fused_batch_size = self.cfg.get('fused_batch_size', None)
         self.compute_timestamps = self.cfg.get('compute_timestamps', None)
         self.word_seperator = self.cfg.get('word_seperator', ' ')
+        self.vocab_file = self.cfg.get('vocab_file', '')
+        self.sigma = self.cfg.get('sigma', 0.0)
 
         self._is_tdt = self.durations is not None and self.durations != []  # this means it's a TDT model.
         if self._is_tdt:
@@ -279,6 +281,8 @@ class AbstractRNNTDecoding(ConfidenceMixin):
                         decoder_model=decoder,
                         joint_model=joint,
                         blank_index=self.blank_id,
+                        vocab_file=self.vocab_file,
+                        sigma=self.sigma,
                         max_symbols_per_step=(
                             self.cfg.greedy.get('max_symbols', None)
                             or self.cfg.greedy.get('max_symbols_per_step', None)

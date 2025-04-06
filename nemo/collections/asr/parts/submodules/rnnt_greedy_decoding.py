@@ -44,6 +44,18 @@ from nemo.core.classes import Typing, typecheck
 from nemo.core.neural_types import AcousticEncodedRepresentation, HypothesisType, LengthsType, NeuralType
 from nemo.utils import logging
 
+def read_vocab_file(vocab_file):
+    if vocab_file == '':
+        return []
+
+    ifile = open(vocab_file, 'r')
+    is_terminal_list = []
+    for line in ifile:
+        token, _ = line.split()
+        is_terminal = token[0] == '▁' or token[-1] == '>'
+        is_terminal_list.append(is_terminal)
+
+    return is_terminal_list
 
 def pack_hypotheses(
     hypotheses: List[rnnt_utils.Hypothesis],
@@ -222,7 +234,7 @@ class _GreedyRNNTInfer(Typing, ConfidenceMethodMixin):
         # output: [B, 1, K]
         return self.decoder.predict(label, hidden, add_sos=add_sos, batch_size=batch_size)
 
-    def _joint_step(self, enc, pred, last_label, log_normalize: Optional[bool] = None):
+    def _joint_step(self, enc, pred, log_normalize: Optional[bool] = None):
         """
         Common joint step based on AbstractRNNTJoint implementation.
 
@@ -235,7 +247,7 @@ class _GreedyRNNTInfer(Typing, ConfidenceMethodMixin):
              logits of shape (B, T=1, U=1, V + 1)
         """
         with torch.no_grad():
-            logits = self.joint.joint(enc, pred, last_label)
+            logits = self.joint.joint(enc, pred)
 
             if log_normalize is None:
                 if not logits.is_cuda:  # Use log softmax only if on CPU
@@ -337,6 +349,8 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
         decoder_model: rnnt_abstract.AbstractRNNTDecoder,
         joint_model: rnnt_abstract.AbstractRNNTJoint,
         blank_index: int,
+        vocab_file: str,
+        sigma: float,
         max_symbols_per_step: Optional[int] = None,
         preserve_alignments: bool = False,
         preserve_frame_confidence: bool = False,
@@ -351,6 +365,9 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
             preserve_frame_confidence=preserve_frame_confidence,
             confidence_method_cfg=confidence_method_cfg,
         )
+
+        self.is_terminal = read_vocab_file(vocab_file)
+        self.sigma = sigma
 
     @typecheck()
     def forward(
@@ -448,9 +465,12 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                 # Perform prediction network and joint network steps.
                 g, hidden_prime = self._pred_step(last_label, hypothesis.dec_state)
                 # If preserving per-frame confidence, log_normalize must be true
-                logp = self._joint_step(f, g, log_normalize=True if self.preserve_frame_confidence else None)[
+                logp = self._joint_step(f, g, log_normalize=True)[
                     0, 0, 0, :
                 ]
+
+                if last_label != self._SOS and not self.is_terminal[last_label]:
+                    logp[self._blank_index] -= self.sigma
 
                 del g
 
@@ -2546,17 +2566,13 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
                 # In later timesteps, we provide previous predicted label as input.
                 if hypothesis.last_token is None and hypothesis.dec_state is None:
                     last_label = self._SOS
-                    LL = 0
                 else:
                     last_label = label_collate([[hypothesis.last_token]])
-                    LL = last_label
-
-                LL = torch.LongTensor([[LL]]).to(f.device)
 
                 # Perform prediction network and joint network steps.
                 g, hidden_prime = self._pred_step(last_label, hypothesis.dec_state)
                 # If preserving per-frame confidence, log_normalize must be true
-                logits = self._joint_step(f, g, LL, log_normalize=False)
+                logits = self._joint_step(f, g, log_normalize=False)
                 logp = logits[0, 0, 0, : -len(self.durations)]
                 if self.preserve_frame_confidence:
                     logp = torch.log_softmax(logp, -1)
