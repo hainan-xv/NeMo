@@ -502,6 +502,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                     hypothesis.timestep.append(time_idx)
                     hypothesis.dec_state = hidden_prime
                     hypothesis.last_token = k
+                    print("HERE", time_idx,  k)
 
                 # Increment token counter.
                 symbols_added += 1
