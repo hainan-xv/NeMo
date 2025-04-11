@@ -78,30 +78,27 @@ class RNNTLossPytorch(Loss):
         log_alpha = torch.zeros(B, T, U)
         log_alpha = log_alpha.to(acts.device)
 
-        for t in range(T):
-            for u in range(U):
-                if u == 0:
-                    if t == 0:
-                        # this is the base case: (t=0, u=0) with log-alpha = 0.
-                        log_alpha[:, t, u] = 0.0
+        for b in range(B):
+            for t in range(T):
+                for u in range(U):
+                    if u == 0:
+                        if t == 0:
+                            # this is the base case: (t=0, u=0) with log-alpha = 0.
+                            log_alpha[b, t, u] = 0.0
+                        else:
+                            # this is case for (t = 0, u > 0), reached by (t, u - 1)
+                            # emitting a blank symbol.
+                            log_alpha[b, t, u] = log_alpha[b, t - 1, u] + acts[b, t - 1, 0, self.blank]
                     else:
-                        # this is case for (t = 0, u > 0), reached by (t, u - 1)
-                        # emitting a blank symbol.
-                        log_alpha[:, t, u] = log_alpha[:, t - 1, u] + acts[:, t - 1, 0, self.blank]
-                else:
-                    if t == 0:
-                        # in case of (u > 0, t = 0), this is only reached from
-                        # (t, u - 1) with a label emission.
-                        gathered = torch.gather(
-                            acts[:, t, u - 1], dim=1, index=labels[:, u - 1].view(-1, 1).type(torch.int64)
-                        ).reshape(-1)
-                        log_alpha[:, t, u] = log_alpha[:, t, u - 1] + gathered.to(log_alpha.device)
-                    else:
-                        # here both t and u are > 0, this state is reachable
-                        # with two possibilities: (t - 1, u) with a blank emission
-                        # or (t, u - 1) with a label emission.
+                        if t == 0:
+                            # in case of (u > 0, t = 0), this is only reached from
+                            # (t, u - 1) with a label emission.
+                            log_alpha[b, t, u] = log_alpha[b, t, u - 1] + acts[b, t, u - 1, labels[b, u - 1]]
+                        else:
+                            # here both t and u are > 0, this state is reachable
+                            # with two possibilities: (t - 1, u) with a blank emission
+                            # or (t, u - 1) with a label emission.
 
-                        for b in range(B):
                             if not self.is_terminal[labels[b, u - 1]]:
                                 blank_score = acts[b, t - 1, u, self.blank] - self.sigma
                             else:
