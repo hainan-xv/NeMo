@@ -40,7 +40,7 @@ INF = 10000.0
 
 @cuda.jit(device=True, inline=True)
 def logp(
-    denom: torch.Tensor, acts: torch.Tensor, maxT: int, maxU: int, alphabet_size: int, mb: int, t: int, u: int, v: int
+    denom: torch.Tensor, acts: torch.Tensor, maxT: int, maxU: int, alphabet_size: int, mb: int, t: int, u: int, v: int, is_terminal: torch.Tensor, sigma: float
 ):
     """
     Compute the sum of log probability from the activation tensor and its denominator.
@@ -61,7 +61,13 @@ def logp(
         The sum of logprobs[mb, t, u, v] + denom[mb, t, u]
     """
     col = (mb * maxT + t) * maxU + u
-    return denom[col] + acts[col * alphabet_size + v]
+    term = 0
+    if v != alphabet_size - 1: # not blank
+        if is_terminal[v]:
+            term = t * sigma
+        else:
+            term = -t * sigma
+    return denom[col] + acts[col * alphabet_size + v] + term
 
 
 @cuda.jit(device=True, inline=True)
@@ -142,24 +148,22 @@ def compute_alphas_kernel(
             # for t in range(1, T) step to initialize alphas[b, t, 0]
             if t > 0 and t < T:
                 alphas[offset + t * maxU + u] = alphas[offset + (t - 1) * maxU + u] + logp(
-                    denom, acts, maxT, maxU, alphabet_size, b, t - 1, 0, blank_
+                    denom, acts, maxT, maxU, alphabet_size, b, t - 1, 0, blank_, is_terminal, sigma
                 )
         elif u < U:
             # for u in range(1, U) step to initialize alphas[b, 0, u]
             if t == 0:
                 alphas[offset + u] = alphas[offset + u - 1] + logp(
-                    denom, acts, maxT, maxU, alphabet_size, b, 0, u - 1, labels[u - 1]
+                    denom, acts, maxT, maxU, alphabet_size, b, 0, u - 1, labels[u - 1], is_terminal, sigma
                 )
 
             # for t in range(1, T) for u in range(1, U) step to compute alphas[b, t, u]
             elif t > 0 and t < T:
                 no_emit = alphas[offset + (t - 1) * maxU + u] + logp(
-                    denom, acts, maxT, maxU, alphabet_size, b, t - 1, u, blank_
+                    denom, acts, maxT, maxU, alphabet_size, b, t - 1, u, blank_, is_terminal, sigma
                 )
-                if u > 0 and not is_terminal[labels[u - 1]]:  # previous token is not terminal means we're in between a word
-                    no_emit -= sigma
                 emit = alphas[offset + t * maxU + u - 1] + logp(
-                    denom, acts, maxT, maxU, alphabet_size, b, t, u - 1, labels[u - 1]
+                    denom, acts, maxT, maxU, alphabet_size, b, t, u - 1, labels[u - 1], is_terminal, sigma
                 )
 
                 alphas[offset + t * maxU + u] = rnnt_helper.log_sum_exp(emit, no_emit)
@@ -171,9 +175,10 @@ def compute_alphas_kernel(
     # log-likelihood of forward pass.
     if u == 0:
         loglike = alphas[offset + (T - 1) * maxU + U - 1] + logp(
-            denom, acts, maxT, maxU, alphabet_size, b, T - 1, U - 1, blank_
+            denom, acts, maxT, maxU, alphabet_size, b, T - 1, U - 1, blank_, is_terminal, sigma
         )
         llForward[b] = loglike
+        print("FORWARD LOSS", loglike)
 
 
 @cuda.jit()
@@ -234,7 +239,7 @@ def compute_betas_kernel(
 
     # Initilize beta[b, t=T-1, u=U-1] for all b in B with log_probs[b, t=T-1, u=U-1, blank]
     if u == 0:
-        betas[offset + (T - 1) * maxU + U - 1] = logp(denom, acts, maxT, maxU, alphabet_size, b, T - 1, U - 1, blank_)
+        betas[offset + (T - 1) * maxU + U - 1] = logp(denom, acts, maxT, maxU, alphabet_size, b, T - 1, U - 1, blank_, is_terminal, sigma)
 
     # sync until all betas are initialized
     cuda.syncthreads()
@@ -248,23 +253,21 @@ def compute_betas_kernel(
             # for t in reversed(range(T - 1)) step to initialize betas[b, t, U-1]
             if t >= 0 and t < (T - 1):
                 betas[offset + t * maxU + U - 1] = betas[offset + (t + 1) * maxU + U - 1] + logp(
-                    denom, acts, maxT, maxU, alphabet_size, b, t, U - 1, blank_
+                    denom, acts, maxT, maxU, alphabet_size, b, t, U - 1, blank_, is_terminal, sigma
                 )
         elif u < U:
             if t == T - 1:
                 # for u in reversed(range(U - 1)) step to initialize betas[b, T-1, u]
                 betas[offset + (T - 1) * maxU + u] = betas[offset + (T - 1) * maxU + u + 1] + logp(
-                    denom, acts, maxT, maxU, alphabet_size, b, T - 1, u, labels[u]
+                    denom, acts, maxT, maxU, alphabet_size, b, T - 1, u, labels[u], is_terminal, sigma
                 )
             elif (t >= 0) and (t < T - 1):
                 # for t in reversed(range(T - 1)) for u in reversed(range(U - 1)) step to compute betas[b, t, u]
                 no_emit = betas[offset + (t + 1) * maxU + u] + logp(
-                    denom, acts, maxT, maxU, alphabet_size, b, t, u, blank_
+                    denom, acts, maxT, maxU, alphabet_size, b, t, u, blank_, is_terminal, sigma
                 )
-                if u > 0 and not is_terminal[labels[u - 1]]:
-                    no_emit -= sigma
                 emit = betas[offset + t * maxU + u + 1] + logp(
-                    denom, acts, maxT, maxU, alphabet_size, b, t, u, labels[u]
+                    denom, acts, maxT, maxU, alphabet_size, b, t, u, labels[u], is_terminal, sigma
                 )
                 betas[offset + t * maxU + u] = rnnt_helper.log_sum_exp(emit, no_emit)
 
@@ -275,6 +278,7 @@ def compute_betas_kernel(
     # log-likelihood of backward pass.
     if u == 0:
         llBackward[b] = betas[offset]
+        print("BACKWARD LOSS", betas[offset])
 
 
 @cuda.jit()
@@ -362,6 +366,11 @@ def compute_grad_kernel(
             # remember, `col` represents the tri-index [b, t, u]
             # therefore; logpk = denom[b, t, u] + acts[b, t, u, v]
             logpk = denom[col] + acts[col * alphabet_size + idx]
+            if idx != blank_:
+                if is_terminal[idx]:
+                    logpk += sigma * t
+                else:
+                    logpk -= sigma * t
             # initialize the grad of the sample acts[b, t, u, v]
             grad = math.exp(alphas[col] + betas[col] + logpk - logll[mb])
 
@@ -392,10 +401,7 @@ def compute_grad_kernel(
             # grad of blank across t < T;
             # grad[b, t<T-1, u, v=blank] -= exp(alphas[b, t, u] + logpk - logll[b] betas[b, t + 1, u])
             if (idx == blank_) and (t < T - 1):
-                if u > 0 and not is_terminal[labels[u - 1]]:
-                    grad -= math.exp(alphas[col] + logpk - sigma - logll[mb] + betas[col + maxU])
-                else:
-                    grad -= math.exp(alphas[col] + logpk - logll[mb] + betas[col + maxU])
+                grad -= math.exp(alphas[col] + logpk - logll[mb] + betas[col + maxU])
 
             # grad of correct token across u < U;
             # grad[b, t, u<U-1, v=label[u]] -= exp(alphas[b, t, u] + logpk - logll[b] + betas[b, t, u+1])

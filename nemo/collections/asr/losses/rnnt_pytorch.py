@@ -104,10 +104,16 @@ class RNNTLossPytorch(Loss):
 
                             blank_score = acts[b, t - 1, u, self.blank]
 
-                            log_alpha[b, t, u] = self.logsumexp(
-                                log_alpha[b, t - 1, u] + blank_score,
-                                log_alpha[b, t, u - 1] + acts[b, t, u - 1, labels[b, u - 1]]
-                            )
+                            if self.is_terminal[labels[b, u - 1]]:
+                                log_alpha[b, t, u] = self.logsumexp(
+                                    log_alpha[b, t - 1, u] + blank_score,
+                                    log_alpha[b, t, u - 1] + acts[b, t, u - 1, labels[b, u - 1]] + self.sigma * t
+                                )
+                            else:
+                                log_alpha[b, t, u] = self.logsumexp(
+                                    log_alpha[b, t - 1, u] + blank_score,
+                                    log_alpha[b, t, u - 1] + acts[b, t, u - 1, labels[b, u - 1]] - self.sigma * t
+                                )
 
         log_probs = []
         for b in range(B):
