@@ -94,38 +94,6 @@ class GPURNNT:
             self.num_threads_ = numba.get_num_threads()
         torch.set_num_threads(_torch_num_threads)
 
-    def log_softmax(self, acts: torch.Tensor, denom: torch.Tensor):
-        """
-        Computes the log softmax denominator of the input activation tensor
-        and stores the result in denom.
-
-        Args:
-            acts: Activation tensor of shape [B, T, U, V+1]. The input must be represented as a flat tensor
-                of shape [B * T * U * (V+1)] to allow pointer indexing.
-            denom: A zero tensor of same shape as acts.
-
-        Updates:
-            This kernel inplace updates the `denom` tensor
-        """
-        # // trans_acts + pred_acts -> log_softmax denominator
-        reduce.reduce_max(
-            acts,
-            denom,
-            rows=self.alphabet_size_,
-            cols=self.minibatch_ * self.maxT_ * self.maxU_,
-            minus=False,
-            stream=self.stream_,
-        )
-
-        reduce.reduce_exp(
-            acts,
-            denom,
-            rows=self.alphabet_size_,
-            cols=self.minibatch_ * self.maxT_ * self.maxU_,
-            minus=True,
-            stream=self.stream_,
-        )
-
     def compute_cost_and_score(
         self,
         acts: torch.Tensor,
@@ -162,7 +130,7 @@ class GPURNNT:
         used_offset, (denom, alphas, betas, llForward, llBackward) = self._prepare_workspace()
 
         ######## START EXECUTION ########
-        self.log_softmax(acts, denom)
+#        self.log_softmax(acts, denom)
 
 #        print("HERE", self.is_terminal, self.sigma)
 

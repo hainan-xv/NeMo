@@ -67,7 +67,7 @@ def logp(
             term = t * sigma
         else:
             term = -t * sigma
-    return denom[col] + acts[col * alphabet_size + v] + term
+    return acts[col * alphabet_size + v] + term
 
 
 @cuda.jit(device=True, inline=True)
@@ -365,54 +365,31 @@ def compute_grad_kernel(
         while idx < alphabet_size:
             # remember, `col` represents the tri-index [b, t, u]
             # therefore; logpk = denom[b, t, u] + acts[b, t, u, v]
-            logpk = denom[col] + acts[col * alphabet_size + idx]
-            if idx != blank_:
-                if is_terminal[idx]:
-                    logpk += sigma * t
-                else:
-                    logpk -= sigma * t
-            # initialize the grad of the sample acts[b, t, u, v]
-            grad = math.exp(alphas[col] + betas[col] + logpk - logll[mb])
+            logpk = acts[col * alphabet_size + idx]
 
-            # If FastEmit regularization is enabled, calculate the gradeint of probability of predicting the next label
-            # at the current timestep.
-            # The formula for this is Equation 9 in https://arxiv.org/abs/2010.11148, multiplied by the log probability
-            # of the current step (t, u), normalized by the total log likelihood.
-            # Once the gradient has been calculated, scale it by `fastemit_lambda`, as in Equation 10.
-            if fastemit_lambda > 0.0 and u < U - 1:
-                fastemit_grad = fastemit_lambda * math.exp(
-                    alphas[col]  # alphas(t, u)
-                    + (denom[col] + acts[col * alphabet_size + labels[u]])  # y_hat(t, u)
-                    + betas[col + 1]  # betas(t, u+1)
-                    + logpk  # log Pr(k|t, u)
-                    - logll[mb]  # total log likelihood for normalization
-                )
-            else:
-                fastemit_grad = 0.0
+#            if idx != blank_:
+#                if is_terminal[idx]:
+#                    logpk += sigma * t
+#                else:
+#                    logpk -= sigma * t
 
-            # Update the gradient of act[b, t, u, v] with the gradient from FastEmit regularization
-            grad = grad + fastemit_grad
+            grad = 0
 
             # // grad to last blank transition
             # grad[b, T-1, U-1, v=blank] -= exp(alphas[b, t, u) + logpk - logll[b])
             if (idx == blank_) and (t == T - 1) and (u == U - 1):
-                grad -= math.exp(alphas[col] + logpk - logll[mb])
-
-            # grad of blank across t < T;
-            # grad[b, t<T-1, u, v=blank] -= exp(alphas[b, t, u] + logpk - logll[b] betas[b, t + 1, u])
-            if (idx == blank_) and (t < T - 1):
-                grad -= math.exp(alphas[col] + logpk - logll[mb] + betas[col + maxU])
-
-            # grad of correct token across u < U;
-            # grad[b, t, u<U-1, v=label[u]] -= exp(alphas[b, t, u] + logpk - logll[b] + betas[b, t, u+1])
-            # Scale the gradient by (1.0 + FastEmit_lambda) in log space, then exponentiate
-            if (u < U - 1) and (idx == labels[u]):
+                grad = alphas[col] - logll[mb]
+            elif (idx == blank_) and (t < T - 1):
+                grad = alphas[col] - logll[mb] + betas[col + maxU]
+            elif (u < U - 1) and (idx == labels[u]):
                 # exp(log(1 + fastemit_lambda) + ...) is numerically more stable than
                 # multiplying (1.0 + fastemit_lambda) with result.
-                grad -= math.exp(math.log1p(fastemit_lambda) + alphas[col] + logpk - logll[mb] + betas[col + 1])
+                grad = alphas[col] - logll[mb] + betas[col + 1]
+            else:
+                grad = -999999
 
             # update grads[b, t, u, v] = grad
-            grads[col * alphabet_size + idx] = grad
+            grads[col * alphabet_size + idx] = -math.exp(grad + logpk)
 
             # clamp gradient (if needed)
             if clamp > 0.0:

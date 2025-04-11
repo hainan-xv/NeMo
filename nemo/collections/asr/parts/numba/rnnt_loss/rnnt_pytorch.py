@@ -438,6 +438,8 @@ class RNNTLossNumba(Module):
             # NOTE manually done log_softmax for CPU version,
             # log_softmax is computed within GPU version.
             acts = torch.nn.functional.log_softmax(acts, -1)
+        else:
+            acts = torch.nn.functional.log_softmax(acts, -1)
 
         return self.loss(
             acts, labels, act_lens, label_lens, self.blank, self.reduction, self.fastemit_lambda, self.clamp, self.is_terminal, self.sigma

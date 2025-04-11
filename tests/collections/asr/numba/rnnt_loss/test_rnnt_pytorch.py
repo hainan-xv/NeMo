@@ -84,7 +84,7 @@ class TestRNNTLoss:
 
             B, T, U, V = 1, 15, 8, 4  # here V is number of non blank labels
             B, T, U, V = 1, 5, 3, 3  # here V is number of non blank labels
-            sigma = 1
+            sigma = 0
 
             is_terminal = [1.0 for i in range(V)]
 #            is_terminal = [random.randint(0, 1) for _ in range(V)]
@@ -109,6 +109,7 @@ class TestRNNTLoss:
 
             print("TWO losses", pt_cost, ag_cost)
             print("ISTERMINAL", is_terminal)
+            print("GRADs", pt_token_grads, ag_token_grads)
             print("GRAD IDFF", pt_token_grads - ag_token_grads)
             assert np.allclose(pt_cost, ag_cost, rtol=1e-6), "tdt costs mismatch."
             assert np.allclose(pt_token_grads, ag_token_grads, rtol=1e-2), "td token gradient mismatch."
