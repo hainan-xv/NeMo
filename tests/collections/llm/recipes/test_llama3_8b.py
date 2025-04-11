@@ -1,3 +1,17 @@
+# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import nemo_run as run
 import pytest
 
@@ -7,7 +21,7 @@ from nemo.collections.llm.gpt.data.squad import SquadDataModule
 from nemo.collections.llm.gpt.model.llama import Llama3Config8B, LlamaModel
 from nemo.collections.llm.peft.lora import LoRA
 from nemo.collections.llm.recipes import llama3_8b
-from nemo.lightning import AutoResume, Trainer
+from nemo.lightning import Trainer
 
 
 class TestLlama3_8B:
