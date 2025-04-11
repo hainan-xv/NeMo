@@ -20,6 +20,18 @@ from nemo.utils.import_utils import safe_import_from
 
 te, HAVE_TE = safe_import_from("transformer_engine", "pytorch")
 
+from dataclasses import dataclass
+
+
+@dataclass
+class TEConfig:
+    """Config POD for Transformer Enginer config
+    Options:
+    - fp8_autocast (bool): indicated whether to autocast to FP8 or not.
+    """
+
+    fp8_autocast: bool = False
+
 
 def te_accelerate(model, fp8_autocast=False):
     """
@@ -39,7 +51,7 @@ def te_accelerate(model, fp8_autocast=False):
 
 @torch.no_grad
 def _apply_basic_module_replacement(model):
-    for name, module in model.named_modules():
+    for name, module in model.named_children():
         if isinstance(module, torch.nn.Linear):
             has_bias = module.bias is not None
             if any(p % 16 != 0 for p in module.weight.shape):
@@ -51,17 +63,19 @@ def _apply_basic_module_replacement(model):
             if has_bias:
                 te_module.bias.copy_(module.bias)
 
-            setattr(module, name.split(".")[-1], te_module)
+            setattr(model, name, te_module)
         elif isinstance(module, torch.nn.LayerNorm):
             te_module = te.LayerNorm(module.normalized_shape[0], eps=module.eps, params_dtype=module.weight.dtype)
             te_module.weight.copy_(module.weight)
             te_module.bias.copy_(module.bias)
-            setattr(module, name.split(".")[-1], te_module)
+            setattr(model, name, te_module)
         elif isinstance(module, torch.nn.RMSNorm):
             te_module = te.RMSNorm(module.normalized_shape[0], eps=module.eps, dtype=module.weight.dtype)
             te_module.weight.copy_(module.weight)
             te_module.bias.copy_(module.bias)
-            setattr(module, name.split(".")[-1], te_module)
+            setattr(model, name, te_module)
+        else:
+            _apply_basic_module_replacement(module)
 
 
 def is_te_accelerated(model):

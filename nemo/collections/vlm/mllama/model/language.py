@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import math
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import List, Literal, Optional, Union
@@ -22,16 +21,9 @@ from megatron.core import InferenceParams, parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
-
 from megatron.core.models.gpt.gpt_model import GPTModel as MCoreGPTModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.attention import Attention
-from megatron.core.transformer.custom_layers.transformer_engine import (
-    TEColumnParallelLinear,
-    TEDotProductAttention,
-    TELayerNormColumnParallelLinear,
-    TERowParallelLinear,
-)
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
@@ -44,22 +36,36 @@ from megatron.core.transformer.utils import sharded_state_dict_default
 from megatron.core.utils import make_viewless_tensor
 from torch import Tensor, nn
 
-from nemo.utils import logging
-
 try:
-    from megatron.core.transformer.custom_layers.transformer_engine import TEDelayedScaling, TENorm
+    from megatron.core.transformer.custom_layers.transformer_engine import (
+        TEColumnParallelLinear,
+        TEDelayedScaling,
+        TEDotProductAttention,
+        TELayerNormColumnParallelLinear,
+        TENorm,
+        TERowParallelLinear,
+    )
 
     HAVE_TE = True
     LayerNormImpl = TENorm
 except ImportError:
     from megatron.core.transformer.torch_layer_norm import WrappedTorchLayerNorm
 
+    # These Defaults are needed to make sure the code compiles
+    TEColumnParallelLinear = None
+    TEDotProductAttention = None
+    TELayerNormColumnParallelLinear = None
+    TERowParallelLinear = None
     HAVE_TE = False
     LayerNormImpl = WrappedTorchLayerNorm
 
 
 @dataclass
 class MLlamaCrossAttentionSubmodules:
+    """
+    Defines the submodules required for cross-attention layers in the Llama architecture.
+    """
+
     linear_q: Union[ModuleSpec, type] = None
     linear_kv: Union[ModuleSpec, type] = None
     core_attention: Union[ModuleSpec, type] = None
@@ -69,6 +75,10 @@ class MLlamaCrossAttentionSubmodules:
 
 
 class CrossAttentionTextModel(MCoreGPTModel):
+    """
+    GPT-based model with integrated cross-attention layers for multimodal tasks.
+    """
+
     def __init__(
         self,
         config: TransformerConfig,
@@ -122,6 +132,7 @@ class CrossAttentionTextModel(MCoreGPTModel):
             self._thresh = self.num_frozen_embeddings - 1
 
     def get_partially_trainable_embedding(self, x):
+        """Get word embedding w/ few extra learnable tokens."""
         xz = torch.zeros_like(x, device=x.device)
         oz = torch.ones_like(x, device=x.device)
         x_orig = torch.minimum(x, torch.tensor(self._thresh, device=x.device))
@@ -148,7 +159,7 @@ class CrossAttentionTextModel(MCoreGPTModel):
         packed_seq_params: PackedSeqParams = None,
         extra_block_kwargs: dict = None,
     ) -> Tensor:
-
+        """Forward."""
         # Decoder embedding.
         if decoder_input is not None:
             pass
@@ -170,6 +181,11 @@ class CrossAttentionTextModel(MCoreGPTModel):
                 packed_seq_params=None,
             )
             rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
+        if decoder_input is not None:
+            dtype = decoder_input.dtype
+        else:
+            dtype = torch.bfloat16
+        cross_attention_bias = cross_attention_masks.to(dtype) * torch.finfo(dtype).min
 
         # Run decoder.
         hidden_states = self.decoder(
@@ -178,9 +194,10 @@ class CrossAttentionTextModel(MCoreGPTModel):
             inference_params=inference_params,
             rotary_pos_emb=rotary_pos_emb,
             packed_seq_params=packed_seq_params,
-            cross_attention_masks=cross_attention_masks,
+            cross_attention_masks=None,
             full_text_row_masked_out_mask=full_text_row_masked_out_mask,
             xattn_caches=xattn_caches,
+            cross_attention_bias=cross_attention_bias,
             **(extra_block_kwargs or {}),
         )
 
@@ -203,6 +220,10 @@ class CrossAttentionTextModel(MCoreGPTModel):
 
 
 class CrossAttentionTransformerBlock(TransformerBlock):
+    """
+    Transformer block with integrated cross-attention layers for multimodal tasks.
+    """
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
@@ -220,7 +241,7 @@ class CrossAttentionTransformerBlock(TransformerBlock):
                     submodules=TransformerLayerSubmodules(
                         cross_attention=ModuleSpec(
                             module=MLlamaCrossAttention,
-                            params={"attn_mask_type": AttnMaskType.arbitrary},
+                            params={"attn_mask_type": AttnMaskType.no_mask},
                             submodules=MLlamaCrossAttentionSubmodules(
                                 linear_q=TELayerNormColumnParallelLinear,  # This wraps attention_norm before attention
                                 linear_kv=TEColumnParallelLinear,
@@ -250,6 +271,7 @@ class CrossAttentionTransformerBlock(TransformerBlock):
         assert len(self.xattn_layers) == len(self.layers), 'Check PP implementation for cross attention layers!'
 
     def _get_layer_offset(self):
+        """Get correct layer offset when encoder pipeline parallel size > 0."""
         encoder_pipeline_model_parallel_size = getattr(self.config, "encoder_pipeline_model_parallel_size", 0)
         decoder_pipeline_model_parallel_rank = (
             parallel_state.get_pipeline_model_parallel_rank() - encoder_pipeline_model_parallel_size
@@ -264,9 +286,12 @@ class CrossAttentionTransformerBlock(TransformerBlock):
         cross_attention_masks: Tensor = None,
         full_text_row_masked_out_mask: Tensor = None,
         rotary_pos_emb: Tensor = None,
+        attention_bias: Tensor = None,
+        cross_attention_bias: Tensor = None,
         inference_params: InferenceParams = None,
         packed_seq_params: PackedSeqParams = None,
     ):
+        """Forward."""
         # hidden_states (float): [s, b, h]
         # attention_mask (bool): [1, 1, s, s]
 
@@ -317,32 +342,26 @@ class CrossAttentionTransformerBlock(TransformerBlock):
                     layer: TransformerLayer
                     xattn_layer: Union[DummyCrossAttentionTransformerLayer, CrossAttentionTransformerLayer]
                     with self.offload_context:
-                        if (len(self.cuda_graphs) == 0) or (not self.training):
-                            hidden_states, context = xattn_layer(
-                                hidden_states=hidden_states,
-                                cross_attention_masks=cross_attention_masks,
-                                xattn_cache=xattn_caches[l_no],
-                                full_text_row_masked_out_mask=full_text_row_masked_out_mask,
-                                rotary_pos_emb=rotary_pos_emb,
-                                inference_params=inference_params,
-                                packed_seq_params=packed_seq_params,
-                            )
-                            hidden_states, context = layer(
-                                hidden_states=hidden_states,
-                                attention_mask=attention_mask,
-                                rotary_pos_emb=rotary_pos_emb,
-                                inference_params=inference_params,
-                                packed_seq_params=packed_seq_params,
-                            )
-                            # CUDA graph doesn't output context and is expected to be None
-                            assert (context is None) or (not self.config.enable_cuda_graph) or (not self.training)
-                        else:
-                            assert (len(self.cuda_graphs) > l_no) and (
-                                self.current_microbatch < len(self.cuda_graphs[l_no])
-                            )
-                            hidden_states = self.cuda_graphs[l_no][self.current_microbatch](
-                                hidden_states, is_first_microbatch=(self.current_microbatch == 0)
-                            )
+                        hidden_states, context = xattn_layer(
+                            hidden_states=hidden_states,
+                            cross_attention_masks=cross_attention_masks,
+                            xattn_cache=xattn_caches[l_no],
+                            full_text_row_masked_out_mask=full_text_row_masked_out_mask,
+                            rotary_pos_emb=rotary_pos_emb,
+                            cross_attention_bias=cross_attention_bias,
+                            inference_params=None,  # Skip inference_params for xattn
+                            packed_seq_params=packed_seq_params,
+                        )
+                        hidden_states, context = layer(
+                            hidden_states=hidden_states,
+                            attention_mask=attention_mask,
+                            rotary_pos_emb=rotary_pos_emb,
+                            attention_bias=attention_bias,
+                            inference_params=inference_params,
+                            packed_seq_params=packed_seq_params,
+                        )
+                        # CUDA graph doesn't output context and is expected to be None
+                        assert (context is None) or (not self.config.enable_cuda_graph) or (not self.training)
 
                     if (
                         torch.is_grad_enabled()
@@ -361,12 +380,13 @@ class CrossAttentionTransformerBlock(TransformerBlock):
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: dict = None
     ) -> ShardedStateDict:
+        """Update shareded state dict for cross-attention layers"""
         sharded_state_dict = {}
 
         layer_prefix = f'{prefix}layers.'
         num_layers = self.config.num_layers
         for layer in self.layers:
-            offset = layer._get_layer_offset()
+            offset = layer._get_layer_offset(layer.config)
             global_layer_offset = layer.layer_number - 1  # self.layer_number starts at 1
             state_dict_prefix = f'{layer_prefix}{global_layer_offset - offset}.'  # module list index in TransformerBlock # pylint: disable=line-too-long
             sharded_prefix = layer_prefix
@@ -379,7 +399,7 @@ class CrossAttentionTransformerBlock(TransformerBlock):
         for xlayer in self.xattn_layers:
             if isinstance(xlayer, DummyCrossAttentionTransformerLayer):
                 continue
-            offset = xlayer._get_layer_offset()
+            offset = xlayer._get_layer_offset(xlayer.config)
             global_layer_offset = xlayer.layer_number - 1
             state_dict_prefix = f'{xlayer_prefix}{global_layer_offset - offset}.'  # module list index in TransformerBlock # pylint: disable=line-too-long
             sharded_prefix = f'{xlayer_prefix}{global_layer_offset}.'
@@ -399,6 +419,10 @@ class CrossAttentionTransformerBlock(TransformerBlock):
 
 
 class CrossAttentionTransformerLayer(TransformerLayer):
+    """
+    Transformer layer with cross-attention for integration.
+    """
+
     def __init__(
         self,
         config: TransformerConfig,
@@ -417,6 +441,7 @@ class CrossAttentionTransformerLayer(TransformerLayer):
         self.gate_ffn = nn.Parameter(torch.zeros(1, dtype=self.config.params_dtype))
 
     def compute_xattn_kv_cache(self, xattn_tokens: Tensor) -> Tensor:
+        """Compute cross-attention kv cahce."""
         return self.cross_attention._compute_xattn_kv_cache(xattn_tokens)
 
     def forward(
@@ -426,9 +451,11 @@ class CrossAttentionTransformerLayer(TransformerLayer):
         xattn_cache=None,
         full_text_row_masked_out_mask=None,
         rotary_pos_emb=None,
+        cross_attention_bias=None,
         inference_params=None,
         packed_seq_params=None,
     ):
+        """Forward."""
         # hidden_states: [s, b, h]
 
         # Residual connection.
@@ -444,6 +471,7 @@ class CrossAttentionTransformerLayer(TransformerLayer):
             xattn_cache=xattn_cache,
             full_text_row_masked_out_mask=full_text_row_masked_out_mask,
             rotary_pos_emb=rotary_pos_emb,
+            cross_attention_bias=cross_attention_bias,
             inference_params=inference_params,
         )
 
@@ -507,11 +535,13 @@ class DummyCrossAttentionTransformerLayer(MegatronModule):
         return hidden_states, None
 
     def compute_xattn_kv_cache(self, xattn_tokens: Tensor) -> Optional[Tensor]:
+        # pylint: disable=C0115,C0116
         return None
 
 
 class MLlamaCrossAttention(Attention):
-    """Cross-attention layer class for Llama VLM support
+    """
+    Cross-attention layer for Llama multimodal tasks.
 
     Cross-attention layer takes input with size [s, b, h] and context with size
     [s, b, h] and returns output of the same size.
@@ -574,6 +604,7 @@ class MLlamaCrossAttention(Attention):
         )
 
     def get_key_value_tensors(self, key_value_states):
+        """Get key value tensors."""
         mixed_kv, _ = self.linear_kv(key_value_states)
 
         # [sk, b, (np * 2 * hn)] --> [sk, b, np, 2 * hn]
@@ -590,7 +621,7 @@ class MLlamaCrossAttention(Attention):
         return key, value
 
     def get_query_tensor(self, hidden_states):
-
+        """ "Get query tensor."""
         # Attention head [sq, b, h] --> [sq, b, hp]
         query, _ = self.linear_q(hidden_states)
 
@@ -607,6 +638,7 @@ class MLlamaCrossAttention(Attention):
         return query
 
     def get_query_key_value_tensors(self, hidden_states, key_value_states):
+        """Get query key value tensors."""
         query = self.get_query_tensor(hidden_states)
         key, value = self.get_key_value_tensors(key_value_states)
         return query, key, value
@@ -619,8 +651,17 @@ class MLlamaCrossAttention(Attention):
         full_text_row_masked_out_mask=None,
         inference_params=None,
         rotary_pos_emb=None,
+        rotary_pos_cos=None,
+        rotary_pos_sin=None,
+        cross_attention_bias=None,
         packed_seq_params=None,
     ):
+        """Forward."""
+        # hidden_states: [sq, b, h]
+        if self.config.flash_decode:
+            rotary_pos_emb = None
+        else:
+            assert rotary_pos_cos is None and rotary_pos_sin is None
 
         # For self attention we just duplicate the rotary_pos_emb if it isn't already
         if rotary_pos_emb is not None and not isinstance(rotary_pos_emb, tuple):
@@ -637,8 +678,8 @@ class MLlamaCrossAttention(Attention):
         # ===================================================
         # Adjust key, value, and rotary_pos_emb for inference
         # ===================================================
-        key, value, rotary_pos_emb, attn_mask_type = self._adjust_key_value_for_inference(
-            inference_params, key, value, rotary_pos_emb
+        query, key, value, rotary_pos_emb, attn_mask_type = self._adjust_key_value_for_inference(
+            inference_params, query, key, value, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin
         )
 
         if packed_seq_params is not None:
@@ -650,9 +691,6 @@ class MLlamaCrossAttention(Attention):
         # core attention computation
         # ==================================
 
-        # In TE "True" means masked out
-        cross_attention_masks = torch.where(cross_attention_masks == 0, False, True)
-
         if self.checkpoint_core_attention and self.training:
             core_attn_out = self._checkpointed_attention_forward(
                 query,
@@ -660,6 +698,7 @@ class MLlamaCrossAttention(Attention):
                 value,
                 cross_attention_masks,
                 attn_mask_type=attn_mask_type,
+                attention_bias=cross_attention_bias,
                 packed_seq_params=packed_seq_params,
             )
         else:
@@ -669,6 +708,7 @@ class MLlamaCrossAttention(Attention):
                 value,
                 cross_attention_masks,
                 attn_mask_type=attn_mask_type,
+                attention_bias=cross_attention_bias,
                 packed_seq_params=packed_seq_params,
             )
 
@@ -693,30 +733,3 @@ class MLlamaCrossAttention(Attention):
     def _compute_xattn_kv_cache(self, xattn_tokens: Tensor) -> Tensor:
         key, value = self.get_key_value_tensors(xattn_tokens)
         return torch.stack([key, value])
-
-
-def apply_rope_scaling(
-    inv_freq,
-    factor: int = 8,
-    low_freq_factor: int = 1,
-    high_freq_factor: int = 4,
-    old_context_len: int = 8192,
-):
-    logging.info(
-        f"Apply rope scaling with factor={factor}, low_freq_factor={low_freq_factor}, high_freq_factor={high_freq_factor}, old_context_len={old_context_len}."
-    )
-
-    low_freq_wavelen = old_context_len / low_freq_factor
-    high_freq_wavelen = old_context_len / high_freq_factor
-
-    wavelen = 2 * math.pi / inv_freq
-    # wavelen < high_freq_wavelen: do nothing
-    # wavelen > low_freq_wavelen: divide by factor
-    inv_freq_llama = torch.where(wavelen > low_freq_wavelen, inv_freq / factor, inv_freq)
-    # otherwise: interpolate between the two, using a smooth factor
-    smooth_factor = (old_context_len / wavelen - low_freq_factor) / (high_freq_factor - low_freq_factor)
-    smoothed_inv_freq = (1 - smooth_factor) * inv_freq_llama / factor + smooth_factor * inv_freq_llama
-    is_medium_freq = ~(wavelen < high_freq_wavelen) * ~(wavelen > low_freq_wavelen)
-    inv_freq_llama = torch.where(is_medium_freq, smoothed_inv_freq, inv_freq_llama)
-
-    return inv_freq_llama

@@ -68,11 +68,10 @@ python transcribe_speech_parallel.py \
 
 """
 
-
 import itertools
 import json
 import os
-from dataclasses import dataclass, is_dataclass
+from dataclasses import dataclass, field, is_dataclass
 from typing import Optional
 
 import lightning.pytorch as ptl
@@ -94,8 +93,8 @@ from nemo.utils.get_rank import is_global_rank_zero
 @dataclass
 class ParallelTranscriptionConfig:
     model: Optional[str] = None  # name
-    predict_ds: ASRDatasetConfig = ASRDatasetConfig(
-        return_sample_id=True, num_workers=4, min_duration=0, max_duration=40
+    predict_ds: ASRDatasetConfig = field(
+        default_factory=lambda: ASRDatasetConfig(return_sample_id=True, num_workers=4, min_duration=0, max_duration=40)
     )
     output_path: str = MISSING
 
@@ -105,14 +104,16 @@ class ParallelTranscriptionConfig:
 
     # decoding strategy for RNNT models
     # Double check whether fused_batch_size=-1 is right
-    rnnt_decoding: RNNTDecodingConfig = RNNTDecodingConfig(fused_batch_size=-1)
+    rnnt_decoding: RNNTDecodingConfig = field(default_factory=lambda: RNNTDecodingConfig(fused_batch_size=-1))
 
     # decoder type: ctc or rnnt, can be used to switch between CTC and RNNT decoder for Hybrid RNNT/CTC models
     decoder_type: Optional[str] = None
     # att_context_size can be set for cache-aware streaming models with multiple look-aheads
     att_context_size: Optional[list] = None
 
-    trainer: TrainerConfig = TrainerConfig(devices=-1, accelerator="gpu", strategy="ddp")
+    trainer: TrainerConfig = field(
+        default_factory=lambda: TrainerConfig(devices=-1, accelerator="gpu", strategy="ddp")
+    )
 
 
 def match_train_config(predict_ds, train_ds):
@@ -163,6 +164,14 @@ def main(cfg: ParallelTranscriptionConfig):
     cfg.predict_ds.return_sample_id = True
     cfg.predict_ds = match_train_config(predict_ds=cfg.predict_ds, train_ds=model.cfg.train_ds)
 
+    if cfg.predict_ds.use_lhotse:
+        OmegaConf.set_struct(cfg.predict_ds, False)
+        cfg.trainer.use_distributed_sampler = False
+        cfg.predict_ds.force_finite = True
+        cfg.predict_ds.force_map_dataset = True
+        cfg.predict_ds.do_transcribe = True
+        OmegaConf.set_struct(cfg.predict_ds, True)
+
     if isinstance(model, EncDecMultiTaskModel):
         cfg.trainer.use_distributed_sampler = False
         OmegaConf.set_struct(cfg.predict_ds, False)
@@ -172,7 +181,7 @@ def main(cfg: ParallelTranscriptionConfig):
 
     trainer = ptl.Trainer(**cfg.trainer)
 
-    if isinstance(model, EncDecMultiTaskModel):
+    if cfg.predict_ds.use_lhotse:
         OmegaConf.set_struct(cfg.predict_ds, False)
         cfg.predict_ds.global_rank = trainer.global_rank
         cfg.predict_ds.world_size = trainer.world_size
