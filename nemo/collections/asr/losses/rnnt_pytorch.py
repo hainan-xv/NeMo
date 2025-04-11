@@ -93,16 +93,16 @@ class RNNTLossPytorch(Loss):
                         if t == 0:
                             # in case of (u > 0, t = 0), this is only reached from
                             # (t, u - 1) with a label emission.
-                            log_alpha[b, t, u] = log_alpha[b, t, u - 1] + acts[b, t, u - 1, labels[b, u - 1]]
+                            if self.is_terminal[labels[b, u - 1]]:
+                                log_alpha[b, t, u] = log_alpha[b, t, u - 1] + acts[b, t, u - 1, labels[b, u - 1]] + self.sigma * t
+                            else:
+                                log_alpha[b, t, u] = log_alpha[b, t, u - 1] + acts[b, t, u - 1, labels[b, u - 1]] - self.sigma * t
                         else:
                             # here both t and u are > 0, this state is reachable
                             # with two possibilities: (t - 1, u) with a blank emission
                             # or (t, u - 1) with a label emission.
 
-                            if not self.is_terminal[labels[b, u - 1]]:
-                                blank_score = acts[b, t - 1, u, self.blank] - self.sigma
-                            else:
-                                blank_score = acts[b, t - 1, u, self.blank]
+                            blank_score = acts[b, t - 1, u, self.blank]
 
                             log_alpha[b, t, u] = self.logsumexp(
                                 log_alpha[b, t - 1, u] + blank_score,
