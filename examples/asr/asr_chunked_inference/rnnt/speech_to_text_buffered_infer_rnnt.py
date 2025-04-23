@@ -221,6 +221,7 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
         cfg.decoding.preserve_alignments = True  # required to compute the middle token for transducers.
         cfg.decoding.fused_batch_size = -1  # temporarily stop fused batch during inference.
         cfg.decoding.beam.return_best_hypothesis = True  # return and write the best hypothsis only
+    cfg.decoding.strategy = "greedy"
 
     # Setup decoding strategy
     if hasattr(asr_model, 'change_decoding_strategy'):

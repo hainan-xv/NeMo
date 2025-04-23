@@ -1119,6 +1119,7 @@ class BatchedFrameASRRNNT(FrameBatchASR):
                 continue
 
             batch = next(data_iters[idx])
+#            print('BATCH IS', batch)
             feat_signal, feat_signal_len = batch
             feat_signal, feat_signal_len = feat_signal.to(device), feat_signal_len.to(device)
 
@@ -1197,6 +1198,32 @@ class BatchedFrameASRRNNT(FrameBatchASR):
         del encoded, encoded_len
         del best_hyp, pred
 
+    def find_most_frequent_elements(self, arr):
+        result = []
+        
+        for t in range(len(arr)):
+            # Count occurrences of each element in the row
+            counter = {}
+            for num in arr[t]:
+                num = num[0] if len(num) > 0 else 1024
+#                print("NUM IS", num)
+                counter[num] = counter.get(num, 0) + 1
+            
+            # Find the element with maximum frequency
+            max_count = 0
+            most_frequent = -1
+            
+            for num, count in counter.items():
+                if count > max_count and num != 1024:
+                    max_count = count
+                    most_frequent = num
+
+            if len(arr[t]) != 0:        
+                result.append((most_frequent, max_count / len(arr[t])))
+       
+        result = [i for i in result if i[0] != -1] 
+        return result
+
     def transcribe(
         self,
         tokens_per_chunk: int,
@@ -1210,6 +1237,9 @@ class BatchedFrameASRRNNT(FrameBatchASR):
         self.unmerged = [[] for _ in range(self.batch_size)]
         for idx, alignments in enumerate(self.all_alignments):
 
+            aggregated_alignments = [[] for i in range(len(alignments) + tokens_per_chunk * (len(alignments) - 1))]
+            print("BEFORE", len(aggregated_alignments))
+
             signal_end_idx = self.frame_bufferer.signal_end_index[idx]
             if signal_end_idx is None:
                 raise ValueError("Signal did not end")
@@ -1220,9 +1250,18 @@ class BatchedFrameASRRNNT(FrameBatchASR):
                 else:  # all other cases
                     offset = 1
 
+#                print("HERE len(alignment)", len(alignment))
+#                print("TWO IDX", len(alignment) - offset - delay, len(alignment) - offset - delay + tokens_per_chunk)
+
+                for ii in range(4, len(alignment) - 4):
+                    idx2 = ii - (len(alignment) - offset - delay) + a_idx * tokens_per_chunk
+                    if idx2 >= 0 and idx2 < len(aggregated_alignments):
+                        aggregated_alignments[idx2].append(alignment[ii])
+
                 alignment = alignment[
                     len(alignment) - offset - delay : len(alignment) - offset - delay + tokens_per_chunk
                 ]
+
 
                 ids, toks = self._alignment_decoder(alignment, self.asr_model.tokenizer, self.blank_id)
 
@@ -1233,6 +1272,13 @@ class BatchedFrameASRRNNT(FrameBatchASR):
                         delay,
                         model=self.asr_model,
                     )
+
+            print("HERE aggregated_alignments", aggregated_alignments)
+            most_freq = self.find_most_frequent_elements(aggregated_alignments)
+            print("HERE most_freq", most_freq)
+
+#        for idx in range(len(aggregated_alignments)):
+            
 
         output = []
         for idx in range(self.batch_size):
@@ -1245,7 +1291,10 @@ class BatchedFrameASRRNNT(FrameBatchASR):
 
         for t in range(len(alignments)):
             for u in range(len(alignments[t])):
-                _, token_id = alignments[t][u]  # (logprob, token_id)
+                if type(alignments[t][u]) == tuple:
+                    _, token_id = alignments[t][u]  # (logprob, token_id)
+                else:
+                    token_id = alignments[t][u]
                 token_id = int(token_id)
                 if token_id != blank_id:
                     token = tokenizer.ids_to_tokens([token_id])[0]
