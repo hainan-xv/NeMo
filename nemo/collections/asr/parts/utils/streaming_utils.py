@@ -1237,9 +1237,6 @@ class BatchedFrameASRRNNT(FrameBatchASR):
         self.unmerged = [[] for _ in range(self.batch_size)]
         for idx, alignments in enumerate(self.all_alignments):
 
-            aggregated_alignments = [[] for i in range(len(alignments) + tokens_per_chunk * (len(alignments) - 1))]
-            print("BEFORE", len(aggregated_alignments))
-
             signal_end_idx = self.frame_bufferer.signal_end_index[idx]
             if signal_end_idx is None:
                 raise ValueError("Signal did not end")
@@ -1250,39 +1247,51 @@ class BatchedFrameASRRNNT(FrameBatchASR):
                 else:  # all other cases
                     offset = 1
 
-#                print("HERE len(alignment)", len(alignment))
-#                print("TWO IDX", len(alignment) - offset - delay, len(alignment) - offset - delay + tokens_per_chunk)
-
-                for ii in range(4, len(alignment) - 4):
-                    idx2 = ii - (len(alignment) - offset - delay) + a_idx * tokens_per_chunk
-                    if idx2 >= 0 and idx2 < len(aggregated_alignments):
-                        aggregated_alignments[idx2].append(alignment[ii])
-
+                longer_alignment = alignment[
+                    : len(alignment) - offset - delay + tokens_per_chunk
+                ]
                 alignment = alignment[
                     len(alignment) - offset - delay : len(alignment) - offset - delay + tokens_per_chunk
                 ]
 
-
                 ids, toks = self._alignment_decoder(alignment, self.asr_model.tokenizer, self.blank_id)
+                longer_ids, longer_toks = self._alignment_decoder(longer_alignment, self.asr_model.tokenizer, self.blank_id)
 
                 if len(ids) > 0 and a_idx < signal_end_idx:
-                    self.unmerged[idx] = inplace_buffer_merge(
-                        self.unmerged[idx],
-                        ids,
-                        delay,
-                        model=self.asr_model,
-                    )
+                    if a_idx == 0 or len(last_ids) == 0:
+                        print("EXISTING", self.unmerged[idx])
+                        self.unmerged[idx] = inplace_buffer_merge(
+                            self.unmerged[idx],
+                            ids,
+                            delay,
+                            model=self.asr_model,
+                        )
+#                        print("NEW", longer_ids, longer_toks)
+                        print("IDS", ids, toks)
+                        print("NEW", self.unmerged[idx])
+                    else:
+                        id_to_match = last_ids[-1]
+#                        print("TO MATCH", id_to_match)
+#                        print("NEW", longer_ids, longer_toks)
+                        print("EXISTING", self.unmerged[idx])
+                        print("IDS", ids, toks)
+                        print("LONGER IDS", longer_ids, longer_toks)
+                        self.unmerged[idx] = inplace_buffer_merge(
+                            self.unmerged[idx],
+                            ids,
+                            delay,
+                            model=self.asr_model,
+                        )
+                        print("NEW", self.unmerged[idx])
+                        print()
 
-            print("HERE aggregated_alignments", aggregated_alignments)
-            most_freq = self.find_most_frequent_elements(aggregated_alignments)
-            print("HERE most_freq", most_freq)
-
-#        for idx in range(len(aggregated_alignments)):
-            
+                last_ids, last_toks = ids, toks
 
         output = []
+        print("self.unmerged", self.unmerged)
         for idx in range(self.batch_size):
             output.append(self.greedy_merge(self.unmerged[idx]))
+        print("OUTPUT IS", output)
         return output
 
     def _alignment_decoder(self, alignments, tokenizer, blank_id):
