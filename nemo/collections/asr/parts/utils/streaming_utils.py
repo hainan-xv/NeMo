@@ -1257,41 +1257,47 @@ class BatchedFrameASRRNNT(FrameBatchASR):
                 ids, toks = self._alignment_decoder(alignment, self.asr_model.tokenizer, self.blank_id)
                 longer_ids, longer_toks = self._alignment_decoder(longer_alignment, self.asr_model.tokenizer, self.blank_id)
 
+#                last_ids = []
                 if len(ids) > 0 and a_idx < signal_end_idx:
-                    if a_idx == 0 or len(last_ids) == 0:
-                        print("EXISTING", self.unmerged[idx])
+                    if a_idx == 0 or len(self.unmerged[idx]) == 0:
                         self.unmerged[idx] = inplace_buffer_merge(
                             self.unmerged[idx],
                             ids,
                             delay,
                             model=self.asr_model,
                         )
-#                        print("NEW", longer_ids, longer_toks)
-                        print("IDS", ids, toks)
-                        print("NEW", self.unmerged[idx])
                     else:
-                        id_to_match = last_ids[-1]
-#                        print("TO MATCH", id_to_match)
-#                        print("NEW", longer_ids, longer_toks)
-                        print("EXISTING", self.unmerged[idx])
-                        print("IDS", ids, toks)
-                        print("LONGER IDS", longer_ids, longer_toks)
+                        id_to_match = self.unmerged[idx][-1]
+#                        print("EXISTING", self.unmerged[idx])
+#                        print("IDS", ids, toks)
+#                        print("LONGER IDS", longer_ids, longer_toks)
+#
+#                        print("LOOKING FOR", id_to_match)
+                        start = len(longer_ids) - len(ids)
+                        end = max(-1, start - 4)
+                        for i in range(start, end, -1):
+                            if longer_ids[i] == id_to_match:
+#                                print("FOUND MATCH AT", i)
+                                ids = longer_ids[i+1:]
+                                toks = longer_toks[i+1:]
+
+#                        print("ADDING", toks)
                         self.unmerged[idx] = inplace_buffer_merge(
                             self.unmerged[idx],
                             ids,
                             delay,
                             model=self.asr_model,
                         )
-                        print("NEW", self.unmerged[idx])
-                        print()
+#                        print("NEW", self.unmerged[idx])
+#                        print()
 
-                last_ids, last_toks = ids, toks
+#                    last_ids, last_toks = ids, toks
 
         output = []
-        print("self.unmerged", self.unmerged)
+#        print("self.unmerged", self.unmerged)
         for idx in range(self.batch_size):
             output.append(self.greedy_merge(self.unmerged[idx]))
-        print("OUTPUT IS", output)
+#        print("OUTPUT IS", output)
         return output
 
     def _alignment_decoder(self, alignments, tokenizer, blank_id):
