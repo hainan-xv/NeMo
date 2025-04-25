@@ -624,7 +624,7 @@ class BatchedAlignments:
 
 
 def batched_hyps_to_hypotheses(
-    batched_hyps: BatchedHyps, alignments: Optional[BatchedAlignments] = None, batch_size=None
+    batched_hyps: BatchedHyps, audio_lengths, alignments: Optional[BatchedAlignments] = None, batch_size=None
 ) -> List[Hypothesis]:
     """
     Convert batched hypotheses to a list of Hypothesis objects.
@@ -676,21 +676,40 @@ def batched_hyps_to_hypotheses(
             hypotheses[i].alignments = []
             if alignments.with_frame_confidence:
                 hypotheses[i].frame_confidence = []
-            _, grouped_counts = torch.unique_consecutive(
+            times, grouped_counts = torch.unique_consecutive(
                 alignments.timestamps[i, : alignment_lengths[i]], return_counts=True
             )
+#            print("HERE alignments.timestamps[i, : alignment_lengths[i]]", alignments.timestamps[i, : alignment_lengths[i]].tolist())
+#            print("HERE  labels", alignment_labels[i,:alignment_lengths[i]])
+#            print("HERE self.current_lengths", alignments.current_lengths)
+#            print("HERE times", times.tolist())
+#            print("HERE grouped_counts", grouped_counts.tolist())
             start = 0
-            for timestamp_cnt in grouped_counts.tolist():
+            for ii, timestamp_cnt in enumerate(grouped_counts.tolist()):
+                time = times[ii]
+                if ii < len(grouped_counts.tolist()) - 1:
+                    next_time = times[ii + 1]
+                else:
+                    next_time = time + 1
+
                 if alignments.with_alignments:
                     hypotheses[i].alignments.append(
                         [
-                            (alignment_logits[i, start + j], alignment_labels[i, start + j])
+                            (alignment_labels[i, start + j].item())
+#                            (alignment_logits[i, start + j], alignment_labels[i, start + j])
                             for j in range(timestamp_cnt)
                         ]
                     )
+                    for iii in range(next_time - time - 1):
+                        hypotheses[i].alignments.append([])
+
                 if alignments.with_frame_confidence:
                     hypotheses[i].frame_confidence.append(
                         [frame_confidence[i, start + j] for j in range(timestamp_cnt)]
                     )
                 start += timestamp_cnt
+            if len(hypotheses[i].alignments) < audio_lengths[i]:
+                hypotheses[i].alignments = hypotheses[i].alignments + [[] for jj in range(audio_lengths[i] - len(hypotheses[i].alignments))]
+
+#            print("HERE hypotheses[i].alignments is", hypotheses[i].alignments)
     return hypotheses

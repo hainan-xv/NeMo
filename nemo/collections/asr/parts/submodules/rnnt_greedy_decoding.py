@@ -2574,9 +2574,6 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
             score=0.0, y_sequence=[], dec_state=None, timestamp=[], token_duration=[], last_token=None
         )
 
-#        assert False
-#        print("HERE x.shape", x.shape)
-
         if partial_hypotheses is not None:
             hypothesis.last_token = partial_hypotheses.last_token
             hypothesis.y_sequence = (
@@ -2638,7 +2635,6 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
 
                 skip = self.durations[d_k]
 
-
                 if self.preserve_frame_confidence:
                     # insert confidence into last timestep
                     hypothesis.frame_confidence[-1].append(
@@ -2647,14 +2643,14 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
                         else self._get_confidence_tensor(logp)
                     )
 
-                del logp
-
                 # If blank token is predicted, exit inner loop, move onto next timestep t
                 # Append token to label set, update RNN state.
                 if self.preserve_alignments:
                     # insert logprobs into last timestep
-#                    hypothesis.alignments[-1].append((logp.to('cpu'), torch.tensor(k, dtype=torch.int32)))
                     hypothesis.alignments[-1].append((k))
+#                    hypothesis.alignments[-1].append((logp.to('cpu'), torch.tensor(k, dtype=torch.int32)))
+
+                del logp
 
                 if k != self._blank_index:
                     hypothesis.y_sequence.append(k)
@@ -2678,10 +2674,8 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
 
             if self.preserve_alignments:
                 # convert Ti-th logits into a torch array
-                for tt in range(skip - 1):
-#                    hypothesis.alignments.append([])  # blank buffer for next timestep
-                    hypothesis.alignments.append([self._blank_index])  # blank buffer for next timestep
-                hypothesis.alignments.append([])
+                for tt in range(skip):
+                    hypothesis.alignments.append([])  # blank buffer for next timestep
 
             if self.preserve_frame_confidence:
                 hypothesis.frame_confidence.append([])  # blank buffer for next timestep
@@ -2701,9 +2695,6 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
 
         # Unpack the hidden states
         hypothesis.dec_state = self.decoder.batch_select_state(hypothesis.dec_state, 0)
-#        print("output", hypothesis.y_sequence)
-#        print("alignment", hypothesis.alignments)
-#        print()
 
         return hypothesis
 
@@ -2896,7 +2887,7 @@ class GreedyBatchedTDTInfer(_GreedyRNNTInfer, WithOptionalCudaGraphs):
             raise NotImplementedError("`partial_hypotheses` support is not implemented")
 
         batched_hyps, alignments, last_decoder_state = self._decoding_computer(x=x, out_len=out_len)
-        hyps = rnnt_utils.batched_hyps_to_hypotheses(batched_hyps, alignments, batch_size=x.shape[0])
+        hyps = rnnt_utils.batched_hyps_to_hypotheses(batched_hyps, out_len.tolist(), alignments, batch_size=x.shape[0])
         for hyp, state in zip(hyps, self.decoder.batch_split_states(last_decoder_state)):
             hyp.dec_state = state
         return hyps
