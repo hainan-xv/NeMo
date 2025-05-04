@@ -2647,8 +2647,8 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
                 # Append token to label set, update RNN state.
                 if self.preserve_alignments:
                     # insert logprobs into last timestep
-                    hypothesis.alignments[-1].append((k))
-#                    hypothesis.alignments[-1].append((logp.to('cpu'), torch.tensor(k, dtype=torch.int32)))
+#                    hypothesis.alignments[-1].append((k))
+                    hypothesis.alignments[-1].append((logp.to('cpu'), torch.tensor(k, dtype=torch.int32)))
 
                 del logp
 
