@@ -32,7 +32,7 @@ class StatelessNet(torch.nn.Module):
         dropout: dropout rate on the embedding outputs.
     """
 
-    def __init__(self, context_size, vocab_size, emb_dim, blank_idx, normalization_mode, dropout):
+    def __init__(self, context_size, vocab_size, emb_dim, blank_idx, normalization_mode, dropout, is_terminal):
         super().__init__()
         assert context_size > 0
         self.context_size = context_size
@@ -40,6 +40,7 @@ class StatelessNet(torch.nn.Module):
         self.emb_dim = emb_dim
         self.dropout = torch.nn.Dropout(dropout)
         self.norm = torch.nn.Identity()
+        self.is_terminal = torch.LongTensor(is_terminal)
         if normalization_mode == 'layer':
             self.norm = torch.nn.LayerNorm(emb_dim, elementwise_affine=False)
 
@@ -82,9 +83,13 @@ class StatelessNet(torch.nn.Module):
         """
         outs = []
 
+        if y.device != self.is_terminal.device:
+            self.is_terminal = self.is_terminal.to(y.device)
+
         [B, U] = y.shape
         appended_y = y
         if state != None:
+            assert state[0].shape[0] == 1
             appended_y = torch.concat([state[0], y], axis=1)
             context_size = appended_y.shape[1]
 
@@ -102,10 +107,30 @@ class StatelessNet(torch.nn.Module):
                 # Context has just the right size. Copy directly.
                 padded_state = appended_y
 
+#            print("PADDED", padded_state)
             for i in range(self.context_size):
                 out = self.embeds[i](padded_state[:, self.context_size - 1 - i : self.context_size - i])
                 outs.append(out)
+
+            # outs: smaller index means closer history
+            # padded_state: larger index means closer history
+
+            for i in range(self.context_size - 1): #, 0, -1):
+                if self.is_terminal[padded_state[0, self.context_size - 1 - i]].item() == 1:
+#                    print(i, "needs RESETTING")
+                    for j in range(i + 1, self.context_size):
+#                        print("RESET", j, outs[j].shape)
+                        outs[j] = outs[j] * 0
         else:
+            is_terminal = self.is_terminal[y]  # [B, U]
+#            print("IS TERMINAL", is_terminal)
+
+#           a b c d e f g:
+
+#           a b c d e f g
+#             a b c d e f 
+#               a b c d e
+
             for i in range(self.context_size):
                 out = self.embeds[i](y)
 
@@ -114,7 +139,14 @@ class StatelessNet(torch.nn.Module):
                         :, :-i, :
                     ].clone()  # needs clone() here or it might complain about src and dst mem location have overlaps.
                     out[:, :i, :] *= 0.0
+
+                    T = out.shape[1]
+                    for j in range(i):
+                        out[:,j:,:] = out[:,j:,:] * (1 - is_terminal).view(B, -1, 1)[:,:T-j,:]
+
                 outs.append(out)
+
+#            print("OUTS is", outs[0].shape, outs[1].shape)
 
         out = self.dropout(torch.concat(outs, axis=-1))
         out = self.norm(out)

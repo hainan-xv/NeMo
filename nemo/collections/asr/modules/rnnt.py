@@ -51,6 +51,18 @@ from nemo.core.neural_types import (
 )
 from nemo.utils import logging
 
+def read_vocab_file(vocab_file):
+    if vocab_file == '':
+        return []
+
+    ifile = open(vocab_file, 'r')
+    is_terminal_list = []
+    for line in ifile:
+        token, _ = line.split()
+        is_terminal = token[0] == '▁' or token[-1] == '>'
+        is_terminal_list.append(is_terminal)
+
+    return is_terminal_list
 
 class StatelessTransducerDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable):
     """A Stateless Neural Network Transducer Decoder / Prediction Network.
@@ -114,6 +126,7 @@ class StatelessTransducerDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable):
         self,
         prednet: Dict[str, Any],
         vocab_size: int,
+        vocab_file: str,
         context_size: int = 1,
         normalization_mode: Optional[str] = None,
     ):
@@ -121,6 +134,9 @@ class StatelessTransducerDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable):
         self.pred_hidden = prednet['pred_hidden']
         self.blank_idx = vocab_size
         self.context_size = context_size
+        self.is_terminal = read_vocab_file(vocab_file)
+
+#        print("HERE IS TERMINAL", self.is_terminal)
 
         # Initialize the model (blank token increases vocab size by 1)
         super().__init__(vocab_size=vocab_size, blank_idx=self.blank_idx, blank_as_pad=True)
@@ -136,6 +152,7 @@ class StatelessTransducerDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable):
                 "blank_idx": self.blank_idx,
                 "normalization_mode": normalization_mode,
                 "dropout": dropout,
+                "is_terminal": self.is_terminal,
             }
         )
         self._rnnt_export = False
