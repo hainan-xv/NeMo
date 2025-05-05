@@ -27,6 +27,7 @@ def rnn(
     input_size: int,
     hidden_size: int,
     num_layers: int,
+    use_reset_lstm: bool,
     norm: Optional[str] = None,
     forget_gate_bias: Optional[float] = 1.0,
     dropout: Optional[float] = 0.0,
@@ -81,6 +82,7 @@ def rnn(
             input_size=input_size,
             hidden_size=hidden_size,
             num_layers=num_layers,
+            use_reset_lstm=use_reset_lstm,
             dropout=dropout,
             forget_gate_bias=forget_gate_bias,
             t_max=t_max,
@@ -212,12 +214,9 @@ class ResetMaskLSTM(nn.Module):
             batch_size = input.size(1)
             mask_permute = (0, 1)  # Keep mask as is
 
-        
         # Make sure reset_mask matches expected format
         if reset_mask.dim() != 2:
             raise ValueError("reset_mask should be 2D with shape (seq_len, batch) or (batch, seq_len)")
-
-#        reset_mask.fill_(False)
             
         # Ensure reset_mask has the right shape for processing
         if self.batch_first and reset_mask.size(0) == seq_len and reset_mask.size(1) == batch_size:
@@ -226,9 +225,6 @@ class ResetMaskLSTM(nn.Module):
         elif not self.batch_first and reset_mask.size(0) == batch_size and reset_mask.size(1) == seq_len:
             # Transpose if mask is in (batch, seq_len) but batch_first=False
             reset_mask = reset_mask.transpose(0, 1)
-
-#        print("THREE DIMENSION", input.shape, reset_mask.shape)
-#        print("seq_len, batch_size", seq_len, batch_size)
         
         # Initialize hidden state if not provided
         if hx is None:
@@ -291,6 +287,7 @@ class LSTMDropout(torch.nn.Module):
         input_size: int,
         hidden_size: int,
         num_layers: int,
+        use_reset_lstm: bool,
         dropout: Optional[float],
         forget_gate_bias: Optional[float],
         t_max: Optional[int] = None,
@@ -327,33 +324,39 @@ class LSTMDropout(torch.nn.Module):
         """
         super(LSTMDropout, self).__init__()
 
-        self.lstm = ResetMaskLSTM(
-            input_size=input_size, hidden_size=hidden_size, num_layers=num_layers, dropout=dropout, proj_size=proj_size
-        )
+        self.use_reset_lstm = use_reset_lstm
+        if use_reset_lstm:
+            self.lstm = ResetMaskLSTM(
+                input_size=input_size, hidden_size=hidden_size, num_layers=num_layers, dropout=dropout, proj_size=proj_size
+            )
+        else:
+            self.lstm = nn.LSTM(
+                input_size=input_size, hidden_size=hidden_size, num_layers=num_layers, dropout=dropout, proj_size=proj_size
+            )
 
-#        if t_max is not None:
-#            # apply chrono init
-#            for name, v in self.lstm.named_parameters():
-#                if 'bias' in name:
-#                    p = getattr(self.lstm, name)
-#                    n = p.nelement()
-#                    hidden_size = n // 4
-#                    p.data.fill_(0)
-#                    p.data[hidden_size : 2 * hidden_size] = torch.log(
-#                        torch.nn.init.uniform_(p.data[0:hidden_size], 1, t_max - 1)
-#                    )
-#                    # forget gate biases = log(uniform(1, Tmax-1))
-#                    p.data[0:hidden_size] = -p.data[hidden_size : 2 * hidden_size]
-#                    # input gate biases = -(forget gate biases)
-#
-#        elif forget_gate_bias is not None:
-#            for name, v in self.lstm.named_parameters():
-#                if "bias_ih" in name:
-#                    bias = getattr(self.lstm, name)
-#                    bias.data[hidden_size : 2 * hidden_size].fill_(forget_gate_bias)
-#                if "bias_hh" in name:
-#                    bias = getattr(self.lstm, name)
-#                    bias.data[hidden_size : 2 * hidden_size] *= float(hidden_hidden_bias_scale)
+            if t_max is not None:
+                # apply chrono init
+                for name, v in self.lstm.named_parameters():
+                    if 'bias' in name:
+                        p = getattr(self.lstm, name)
+                        n = p.nelement()
+                        hidden_size = n // 4
+                        p.data.fill_(0)
+                        p.data[hidden_size : 2 * hidden_size] = torch.log(
+                            torch.nn.init.uniform_(p.data[0:hidden_size], 1, t_max - 1)
+                        )
+                        # forget gate biases = log(uniform(1, Tmax-1))
+                        p.data[0:hidden_size] = -p.data[hidden_size : 2 * hidden_size]
+                        # input gate biases = -(forget gate biases)
+
+            elif forget_gate_bias is not None:
+                for name, v in self.lstm.named_parameters():
+                    if "bias_ih" in name:
+                        bias = getattr(self.lstm, name)
+                        bias.data[hidden_size : 2 * hidden_size].fill_(forget_gate_bias)
+                    if "bias_hh" in name:
+                        bias = getattr(self.lstm, name)
+                        bias.data[hidden_size : 2 * hidden_size] *= float(hidden_hidden_bias_scale)
 
         self.dropout = torch.nn.Dropout(dropout) if dropout else None
 
@@ -362,9 +365,12 @@ class LSTMDropout(torch.nn.Module):
                 v.data *= float(weights_init_scale)
 
     def forward(
-        self, x: torch.Tensor, reset_mask: torch.Tensor, h: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        self, x: torch.Tensor, reset_mask: Optional[torch.Tensor], h: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        x, h = self.lstm(input=x, reset_mask=reset_mask, hx=h)
+        if self.use_reset_lstm:
+            x, h = self.lstm(input=x, reset_mask=reset_mask, hx=h)
+        else:
+            x, h = self.lstm(x, h)
 
         if self.dropout:
             x = self.dropout(x)
@@ -404,6 +410,7 @@ class RNNLayer(torch.nn.Module):
                 weights_init_scale=weights_init_scale,
                 hidden_hidden_bias_scale=hidden_hidden_bias_scale,
                 proj_size=proj_size,
+                use_reset_lstm=use_reset_lstm,
             )
         else:
             self.rnn = rnn_type(input_size=input_size, hidden_size=hidden_size, bias=not batch_norm)

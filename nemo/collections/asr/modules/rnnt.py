@@ -52,7 +52,7 @@ from nemo.core.neural_types import (
 from nemo.utils import logging
 
 def read_vocab_file(vocab_file):
-    if vocab_file == '':
+    if vocab_file == '' or vocab_file is None:
         return []
 
     ifile = open(vocab_file, 'r')
@@ -630,7 +630,8 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
         self,
         prednet: Dict[str, Any],
         vocab_size: int,
-        vocab_file: str,
+        use_reset_lstm: bool = False,
+        vocab_file: str = None,
         normalization_mode: Optional[str] = None,
         random_state_sampling: bool = False,
         blank_as_pad: bool = True,
@@ -639,7 +640,8 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
         self.pred_hidden = prednet['pred_hidden']
         self.pred_rnn_layers = prednet["pred_rnn_layers"]
         self.blank_idx = vocab_size
-        self.is_terminal = torch.Tensor(read_vocab_file(vocab_file))
+        self.use_reset_lstm = use_reset_lstm
+        self.is_terminal = torch.Tensor(read_vocab_file(vocab_file)) if vocab_file != '' else None
 
         # Initialize the model (blank token increases vocab size by 1)
         super().__init__(vocab_size=vocab_size, blank_idx=self.blank_idx, blank_as_pad=blank_as_pad)
@@ -656,6 +658,7 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
             vocab_size=vocab_size,  # add 1 for blank symbol
             pred_n_hidden=self.pred_hidden,
             pred_rnn_layers=self.pred_rnn_layers,
+            use_reset_lstm=self.use_reset_lstm,
             forget_gate_bias=forget_gate_bias,
             t_max=t_max,
             norm=normalization_mode,
@@ -681,8 +684,6 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
         if self.is_terminal.device != y.device:
             self.is_terminal = self.is_terminal.to(y.device)
 
-        reset_mask = self.is_terminal[y]
-#        print("RESET MASK IS", reset_mask.shape, reset_mask)
         g, states = self.predict(y, state=states, add_sos=add_sos)  # (B, U, D)
         g = g.transpose(1, 2)  # (B, D, U)
 
@@ -756,18 +757,15 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
         dtype = _p.dtype
 
         # If y is not None, it is of shape [B, U] with dtype long.
-#        original_y  = y
         if y is not None:
             if y.device != device:
                 y = y.to(device)
             if self.is_terminal.device != device:
                 self.is_terminal = self.is_terminal.to(device)
-            reset_mask = self.is_terminal[y]
-#            print("HERE y not None RESETMASK", reset_mask.shape, reset_mask)
+            reset_mask = self.is_terminal[y] if self.use_reset_lstm else None
 
             # (B, U) -> (B, U, H)
             y = self.prediction["embed"](y)
-#            print("EMB Y", y.shape)
         else:
             # Y is not provided, assume zero tensor with shape [B, 1, H] is required
             # Emulates output of embedding of pad token.
@@ -784,8 +782,9 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
             B, U, H = y.shape
             start = torch.zeros((B, 1, H), device=y.device, dtype=y.dtype)
             y = torch.cat([start, y], dim=1).contiguous()  # (B, U + 1, H)
-            to_append = torch.ones(B, 1).to(y.device).bool()
-            reset_mask = torch.cat([to_append, reset_mask], dim=1)
+            if self.use_reset_lstm:
+                to_append = torch.ones(B, 1).to(y.device).bool()
+                reset_mask = torch.cat([to_append, reset_mask], dim=1)
         else:
             start = None  # makes del call later easier
 
@@ -797,16 +796,10 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
 
         # Forward step through RNN
         y = y.transpose(0, 1)  # (U + 1, B, H)
-#        print("HERE Y IS", y.shape)
-#        if y.shape[0] == 1:
-#            print("FORCE SET TRUE", original_y)
-#            reset_mask = torch.ones(1, y.shape[1]).to(y.device).bool()
-#        print("CALING PREDICTION y, reset")
-#        print("Y", original_y)
-#        print("LOOKUP", self.is_terminal[original_y])
-#        print("RESET", reset_mask)
-#        print()
-        g, hid = self.prediction["dec_rnn"](y, reset_mask, state)
+        if self.use_reset_lstm:
+            g, hid = self.prediction["dec_rnn"](y, reset_mask, state)
+        else:
+            g, hid = self.prediction["dec_rnn"](y, state)
         g = g.transpose(0, 1)  # (B, U + 1, H)
 
         del y, start, state
@@ -822,6 +815,7 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
         vocab_size,
         pred_n_hidden,
         pred_rnn_layers,
+        use_reset_lstm,
         forget_gate_bias,
         t_max,
         norm,
@@ -859,6 +853,7 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
                     input_size=pred_n_hidden,
                     hidden_size=rnn_hidden_size if rnn_hidden_size > 0 else pred_n_hidden,
                     num_layers=pred_rnn_layers,
+                    use_reset_lstm=use_reset_lstm,
                     norm=norm,
                     forget_gate_bias=forget_gate_bias,
                     t_max=t_max,
