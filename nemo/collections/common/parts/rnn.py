@@ -18,6 +18,7 @@ from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import torch
+import torch.nn as nn
 
 from nemo.utils import logging
 
@@ -148,6 +149,142 @@ class OverLastDim(torch.nn.Module):
         return x
 
 
+class ResetMaskLSTM(nn.Module):
+    def __init__(self, input_size: int, hidden_size: int, 
+                 num_layers: int = 1, bias: bool = True,
+                 batch_first: bool = False, dropout: float = 0.0,
+                 proj_size: int = 0, device=None, dtype=None):
+        super(ResetMaskLSTM, self).__init__()
+        
+        # Store settings
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.bias = bias
+        self.batch_first = batch_first
+        self.dropout = dropout
+        self.proj_size = proj_size
+        
+        # Create underlying LSTM
+        self.lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            bias=bias,
+            batch_first=batch_first,
+            dropout=dropout,
+            bidirectional=False,  # As specified, always False
+            proj_size=proj_size,
+            device=device,
+            dtype=dtype
+        )
+        
+        # Create trainable initial states
+        output_size = proj_size if proj_size > 0 else hidden_size
+        self.h0 = nn.Parameter(torch.zeros(num_layers, 1, output_size, device=device, dtype=dtype))
+        self.c0 = nn.Parameter(torch.zeros(num_layers, 1, hidden_size, device=device, dtype=dtype))
+        
+    def forward(self, input: torch.Tensor, 
+                reset_mask: torch.Tensor,
+                hx: Optional[Tuple[torch.Tensor, torch.Tensor]] = None) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Forward pass with reset mask capability.
+        
+        Args:
+            input: Input sequence tensor of shape (seq_len, batch, input_size) or 
+                  (batch, seq_len, input_size) if batch_first=True
+            reset_mask: Binary mask of shape (seq_len, batch) or (batch, seq_len) 
+                       indicating positions to reset hidden states
+            hx: Initial hidden state tuple (h_0, c_0) or None
+                
+        Returns:
+            output: Tensor of shape (seq_len, batch, hidden_size) or 
+                    (batch, seq_len, hidden_size) if batch_first=True
+            hidden: Tuple of tensors (h_n, c_n) representing the final hidden state
+        """
+        # Get dimensions
+        if self.batch_first:
+            seq_len = input.size(1)
+            batch_size = input.size(0)
+            mask_permute = (1, 0)  # For adjusting mask if needed
+        else:
+            seq_len = input.size(0)
+            batch_size = input.size(1)
+            mask_permute = (0, 1)  # Keep mask as is
+
+        
+        # Make sure reset_mask matches expected format
+        if reset_mask.dim() != 2:
+            raise ValueError("reset_mask should be 2D with shape (seq_len, batch) or (batch, seq_len)")
+
+#        reset_mask.fill_(False)
+            
+        # Ensure reset_mask has the right shape for processing
+        if self.batch_first and reset_mask.size(0) == seq_len and reset_mask.size(1) == batch_size:
+            # Transpose if mask is in (seq_len, batch) but batch_first=True
+            reset_mask = reset_mask.transpose(0, 1)
+        elif not self.batch_first and reset_mask.size(0) == batch_size and reset_mask.size(1) == seq_len:
+            # Transpose if mask is in (batch, seq_len) but batch_first=False
+            reset_mask = reset_mask.transpose(0, 1)
+
+#        print("THREE DIMENSION", input.shape, reset_mask.shape)
+#        print("seq_len, batch_size", seq_len, batch_size)
+        
+        # Initialize hidden state if not provided
+        if hx is None:
+            h = self.h0.expand(self.num_layers, batch_size, -1).contiguous()
+            c = self.c0.expand(self.num_layers, batch_size, -1).contiguous()
+            hx = (h, c)
+        
+        # Process sequence step by step
+        outputs = []
+        h, c = hx
+        
+        for t in range(seq_len):
+            # Extract current input step
+            if self.batch_first:
+                x_t = input[:, t:t+1, :]  # Keep time dimension for LSTM
+            else:
+                x_t = input[t:t+1, :, :]
+            
+            # Check reset mask for current step
+            if self.batch_first:
+                mask_t = reset_mask[:, t]
+            else:
+                mask_t = reset_mask[t, :]
+            
+            # Reset hidden states according to mask
+            # For positions where mask is True (1), use initial state
+            mask_expanded_h = mask_t.unsqueeze(0).unsqueeze(2).expand_as(h).bool()
+            mask_expanded_c = mask_t.unsqueeze(0).unsqueeze(2).expand_as(c).bool()
+            
+            h_reset = self.h0.expand(self.num_layers, batch_size, -1)
+            c_reset = self.c0.expand(self.num_layers, batch_size, -1)
+            
+            h = torch.where(mask_expanded_h, h_reset, h)
+            c = torch.where(mask_expanded_c, c_reset, c)
+            
+            # Run LSTM cell for current timestep
+            out_t, (h, c) = self.lstm(x_t, (h, c))
+            
+            # Store output
+            outputs.append(out_t)
+        
+        # Concatenate outputs
+        if self.batch_first:
+            output = torch.cat(outputs, dim=1)
+        else:
+            output = torch.cat(outputs, dim=0)
+        
+        return output, (h, c)
+    
+    def flatten_parameters(self):
+        """
+        Calls LSTM's flatten_parameters method to enable faster execution.
+        """
+        self.lstm.flatten_parameters()
+
+
 class LSTMDropout(torch.nn.Module):
     def __init__(
         self,
@@ -190,33 +327,33 @@ class LSTMDropout(torch.nn.Module):
         """
         super(LSTMDropout, self).__init__()
 
-        self.lstm = torch.nn.LSTM(
+        self.lstm = ResetMaskLSTM(
             input_size=input_size, hidden_size=hidden_size, num_layers=num_layers, dropout=dropout, proj_size=proj_size
         )
 
-        if t_max is not None:
-            # apply chrono init
-            for name, v in self.lstm.named_parameters():
-                if 'bias' in name:
-                    p = getattr(self.lstm, name)
-                    n = p.nelement()
-                    hidden_size = n // 4
-                    p.data.fill_(0)
-                    p.data[hidden_size : 2 * hidden_size] = torch.log(
-                        torch.nn.init.uniform_(p.data[0:hidden_size], 1, t_max - 1)
-                    )
-                    # forget gate biases = log(uniform(1, Tmax-1))
-                    p.data[0:hidden_size] = -p.data[hidden_size : 2 * hidden_size]
-                    # input gate biases = -(forget gate biases)
-
-        elif forget_gate_bias is not None:
-            for name, v in self.lstm.named_parameters():
-                if "bias_ih" in name:
-                    bias = getattr(self.lstm, name)
-                    bias.data[hidden_size : 2 * hidden_size].fill_(forget_gate_bias)
-                if "bias_hh" in name:
-                    bias = getattr(self.lstm, name)
-                    bias.data[hidden_size : 2 * hidden_size] *= float(hidden_hidden_bias_scale)
+#        if t_max is not None:
+#            # apply chrono init
+#            for name, v in self.lstm.named_parameters():
+#                if 'bias' in name:
+#                    p = getattr(self.lstm, name)
+#                    n = p.nelement()
+#                    hidden_size = n // 4
+#                    p.data.fill_(0)
+#                    p.data[hidden_size : 2 * hidden_size] = torch.log(
+#                        torch.nn.init.uniform_(p.data[0:hidden_size], 1, t_max - 1)
+#                    )
+#                    # forget gate biases = log(uniform(1, Tmax-1))
+#                    p.data[0:hidden_size] = -p.data[hidden_size : 2 * hidden_size]
+#                    # input gate biases = -(forget gate biases)
+#
+#        elif forget_gate_bias is not None:
+#            for name, v in self.lstm.named_parameters():
+#                if "bias_ih" in name:
+#                    bias = getattr(self.lstm, name)
+#                    bias.data[hidden_size : 2 * hidden_size].fill_(forget_gate_bias)
+#                if "bias_hh" in name:
+#                    bias = getattr(self.lstm, name)
+#                    bias.data[hidden_size : 2 * hidden_size] *= float(hidden_hidden_bias_scale)
 
         self.dropout = torch.nn.Dropout(dropout) if dropout else None
 
@@ -225,9 +362,9 @@ class LSTMDropout(torch.nn.Module):
                 v.data *= float(weights_init_scale)
 
     def forward(
-        self, x: torch.Tensor, h: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        self, x: torch.Tensor, reset_mask: torch.Tensor, h: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        x, h = self.lstm(x, h)
+        x, h = self.lstm(input=x, reset_mask=reset_mask, hx=h)
 
         if self.dropout:
             x = self.dropout(x)
