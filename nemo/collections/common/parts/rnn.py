@@ -254,12 +254,16 @@ class ResetMaskLSTM(nn.Module):
             mask_expanded_h = mask_t.unsqueeze(0).unsqueeze(2).expand_as(h).bool()
             mask_expanded_c = mask_t.unsqueeze(0).unsqueeze(2).expand_as(c).bool()
             
-            h_reset = self.h0.expand(self.num_layers, batch_size, -1)
-            c_reset = self.c0.expand(self.num_layers, batch_size, -1)
+            h_reset = self.h0.expand(self.num_layers, batch_size, -1) * 0
+            c_reset = self.c0.expand(self.num_layers, batch_size, -1) * 0
+
+            if self.training:
+                h += torch.randn_like(h)
+                c += torch.randn_like(c)
             
             h = torch.where(mask_expanded_h, h_reset, h)
             c = torch.where(mask_expanded_c, c_reset, c)
-            
+
             # Run LSTM cell for current timestep
             out_t, (h, c) = self.lstm(x_t, (h, c))
             
