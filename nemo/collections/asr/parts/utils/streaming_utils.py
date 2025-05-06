@@ -1222,7 +1222,7 @@ class BatchedFrameASRRNNT(FrameBatchASR):
                     offset = 1
 
                 longer_alignment = alignment[
-                    len(alignment) - offset - delay - 4: len(alignment) - offset - delay + tokens_per_chunk
+                    len(alignment) - offset - delay : len(alignment) - offset - delay + tokens_per_chunk
                 ]
                 alignment = alignment[
                     len(alignment) - offset - delay : len(alignment) - offset - delay + tokens_per_chunk
@@ -1246,6 +1246,8 @@ class BatchedFrameASRRNNT(FrameBatchASR):
                         id_to_match = self.unmerged[idx][-1]
                         start = len(longer_ids) - len(ids) - 1
                         end = -1
+                        start = len(longer_ids) - len(ids)
+                        end = max(-1, start - 4)
 #                        print("LOOKINGFOR", id_to_match, start, end)
                         for i in range(start, end, -1):
                             if longer_ids[i] == id_to_match:
