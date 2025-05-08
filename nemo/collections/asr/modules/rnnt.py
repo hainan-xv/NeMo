@@ -1143,6 +1143,60 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
         cfg = adapter_utils.update_adapter_cfg_input_dim(self, cfg, module_dim=self.pred_hidden)
         return cfg
 
+class CombinedDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable):
+    def __init__(
+        self,
+        prednet: Dict[str, Any],
+        vocab_size: int,
+        context_size: int,
+        normalization_mode: str,
+        random_state_sampling: bool = False,
+        blank_as_pad: bool = True,
+    ):
+        self.pred_hidden = prednet['pred_hidden']
+        self.pred_rnn_layers = prednet["pred_rnn_layers"]
+        self.blank_idx = vocab_size
+        super().__init__(vocab_size=vocab_size, blank_idx=self.blank_idx, blank_as_pad=blank_as_pad)
+
+        self.lstm = RNNTDecoder(prednet, vocab_size)
+
+        self.stateless = StatelessTransducerDecoder(prednet, vocab_size, context_size, normalization_mode)
+
+    @typecheck()
+    def forward(self, targets, target_length, states=None):
+        g1, l1, s1 = self.lstm(targets=targets, target_length=target_length, states=states)
+        g2, l2, s2 = self.stateless(targets=targets, target_length=target_length, states=states)
+        return g1, l1, s1
+
+    def initialize_state(self, y: torch.Tensor) -> List[torch.Tensor]:
+        s1 = self.lstm.initialize_state(y)
+        s2 = self.stateless.initialize_state(y)
+
+        return s1
+
+    def predict(
+        self,
+        y: Optional[torch.Tensor] = None,
+        state: Optional[torch.Tensor] = None,
+        add_sos: bool = True,
+        batch_size: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        y1, s1 = self.lstm.predict(y, state, add_sos, batch_size)
+#        y2, s2 = self.stateless.predict(y, state, add_sos, batch_size)
+        return y1, s1
+
+    def score_hypothesis(
+        self, hypothesis: rnnt_utils.Hypothesis, cache: Dict[Tuple[int], Any]
+    ) -> Tuple[torch.Tensor, List[torch.Tensor], torch.Tensor]:
+        y1, s1, l1 = self.lstm.score_hypothesis(hypothesis, cache)
+        y2, s2, l2 = self.stateless.score_hypothesis(hypothesis, cache)
+        return y1, s1, l1
+
+    def batch_select_state(self, batch_states: List[torch.Tensor], idx: int) -> List[List[torch.Tensor]]:
+        s1 = self.lstm.batch_select_state(batch_states, idx)
+        s2 = self.lstm.batch_select_state(batch_states, idx)
+        return s1
+
 
 class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin):
     """A Recurrent Neural Network Transducer Joint Network (RNN-T Joint Network).
