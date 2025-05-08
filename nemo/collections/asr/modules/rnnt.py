@@ -1166,7 +1166,7 @@ class CombinedDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable):
     def forward(self, targets, target_length, states=None):
         g1, l1, s1 = self.lstm(targets=targets, target_length=target_length, states=states)
         g2, l2, s2 = self.stateless(targets=targets, target_length=target_length, states=states)
-        return g1, l1, s1
+        return g1 + g2, l1, s1 + s2
 
     def initialize_state(self, y: torch.Tensor) -> List[torch.Tensor]:
         s1 = self.lstm.initialize_state(y)
