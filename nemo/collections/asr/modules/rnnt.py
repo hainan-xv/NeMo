@@ -1166,13 +1166,27 @@ class CombinedDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable):
     def forward(self, targets, target_length, states=None):
         g1, l1, s1 = self.lstm(targets=targets, target_length=target_length, states=states)
         g2, l2, s2 = self.stateless(targets=targets, target_length=target_length, states=states)
-        return g1 + g2, l1, s1 + s2
+        return g1 + g2, l1, list(s1) + list(s2)
 
     def initialize_state(self, y: torch.Tensor) -> List[torch.Tensor]:
         s1 = self.lstm.initialize_state(y)
         s2 = self.stateless.initialize_state(y)
 
-        return s1
+        return list(s1) + list(s2)
+
+    def merge_states(self, s1, s2):
+        if s1 is None and s2 is None:
+            return None
+        if s2 is None:
+            return s1
+        return list(s1) + list(s2)
+
+    def break_states(self, s):
+        if s is None:
+            return None, None
+        if len(s) == 3:
+            return s[:2], s[2:]
+        return s[:2], None
 
     def predict(
         self,
@@ -1181,21 +1195,24 @@ class CombinedDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable):
         add_sos: bool = True,
         batch_size: Optional[int] = None,
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
-        y1, s1 = self.lstm.predict(y, state, add_sos, batch_size)
-#        y2, s2 = self.stateless.predict(y, state, add_sos, batch_size)
-        return y1, s1
+        s1, s2 = self.break_states(state)
+        y1, s1 = self.lstm.predict(y, s1, add_sos, batch_size)
+        y2, s2 = self.stateless.predict(y, s2, add_sos, batch_size)
+        return y1 + y2, self.merge_states(s1, s2)
 
     def score_hypothesis(
         self, hypothesis: rnnt_utils.Hypothesis, cache: Dict[Tuple[int], Any]
     ) -> Tuple[torch.Tensor, List[torch.Tensor], torch.Tensor]:
         y1, s1, l1 = self.lstm.score_hypothesis(hypothesis, cache)
         y2, s2, l2 = self.stateless.score_hypothesis(hypothesis, cache)
-        return y1, s1, l1
+        assert l1 is None
+        assert l2 is None
+        return y1 + y2, self.merge_states(s1, s2), None
 
     def batch_select_state(self, batch_states: List[torch.Tensor], idx: int) -> List[List[torch.Tensor]]:
         s1 = self.lstm.batch_select_state(batch_states, idx)
         s2 = self.lstm.batch_select_state(batch_states, idx)
-        return s1
+        return self.merge_states(s1, s2)
 
 
 class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin):
