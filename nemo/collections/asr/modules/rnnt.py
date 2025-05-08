@@ -1162,11 +1162,49 @@ class CombinedDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable):
 
         self.stateless = StatelessTransducerDecoder(prednet, vocab_size, context_size, normalization_mode)
 
+        d = self.pred_hidden
+
+        self.key   = torch.nn.Linear(d, d)
+        self.value = torch.nn.Linear(d, d)
+        self.query = torch.nn.Linear(d, d)
+        self.scale = d ** -0.5
+
+    def merge_outputs(self, a, b):
+        B, D, T = a.shape      
+        a, b = a.transpose(1, 2), b.transpose(1, 2)
+
+        a = torch.reshape(a, [-1, D])
+        b = torch.reshape(b, [-1, D])
+
+        x = torch.stack([a, b], dim=1)
+
+        q = self.query(x)  # [B, D]
+        k = self.key(x)    # [B, D]
+        v = self.value(x)  # [B, D]
+
+        scores = torch.bmm(q, k.transpose(1, 2)) * self.scale
+
+        attn_weights = torch.nn.functional.softmax(scores, dim=-1)
+
+        output = torch.bmm(attn_weights, v)
+
+        a_out = output[:, 0, :]  # [B, D]
+        b_out = output[:, 1, :]  # [B, D]
+
+#        print("AOUT", a_out.shape, b_out.shape)
+        out = a_out + b_out
+        out = torch.reshape(out, [B, T, D]).transpose(1, 2)
+        return out
+
     @typecheck()
     def forward(self, targets, target_length, states=None):
-        g1, l1, s1 = self.lstm(targets=targets, target_length=target_length, states=states)
-        g2, l2, s2 = self.stateless(targets=targets, target_length=target_length, states=states)
-        return g1 + g2, l1, list(s1) + list(s2)
+        a, l1, s1 = self.lstm(targets=targets, target_length=target_length, states=states)
+        b, l2, s2 = self.stateless(targets=targets, target_length=target_length, states=states)
+
+        out = self.merge_outputs(a, b)
+#        print("A B", a.shape, b.shape)  : both B, D, T
+
+        return out, l1, list(s1) + list(s2)
 
     def initialize_state(self, y: torch.Tensor) -> List[torch.Tensor]:
         s1 = self.lstm.initialize_state(y)
@@ -1196,9 +1234,10 @@ class CombinedDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable):
         batch_size: Optional[int] = None,
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         s1, s2 = self.break_states(state)
-        y1, s1 = self.lstm.predict(y, s1, add_sos, batch_size)
-        y2, s2 = self.stateless.predict(y, s2, add_sos, batch_size)
-        return y1 + y2, self.merge_states(s1, s2)
+        a, s1 = self.lstm.predict(y, s1, add_sos, batch_size)
+        b, s2 = self.stateless.predict(y, s2, add_sos, batch_size)
+        out = self.merge_outputs(a, b)
+        return out, self.merge_states(s1, s2)
 
     def score_hypothesis(
         self, hypothesis: rnnt_utils.Hypothesis, cache: Dict[Tuple[int], Any]
