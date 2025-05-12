@@ -51,8 +51,6 @@ class GPURNNT:
         clamp: float,
         num_threads: int,
         stream,
-        is_terminal,
-        sigma,
     ):
         """
         Helper class to launch the CUDA Kernels to compute the Transducer Loss.
@@ -83,8 +81,6 @@ class GPURNNT:
         self.clamp_ = abs(clamp)
         self.num_threads_ = num_threads
         self.stream_ = stream  # type: cuda.cudadrv.driver.Stream
-        self.is_terminal = cuda.as_cuda_array(is_terminal)
-        self.sigma = sigma
 
         _torch_num_threads = torch.get_num_threads()
         if num_threads > 0:
@@ -132,8 +128,6 @@ class GPURNNT:
         ######## START EXECUTION ########
 #        self.log_softmax(acts, denom)
 
-#        print("HERE", self.is_terminal, self.sigma)
-
         # Compute alphas
         gpu_rnnt_kernel.compute_alphas_kernel[self.minibatch_, self.maxU_, self.stream_, 0](
             acts,
@@ -148,8 +142,6 @@ class GPURNNT:
             self.maxU_,
             self.alphabet_size_,
             self.blank_,
-            self.is_terminal,
-            self.sigma,
         )
 
         if training:
@@ -167,8 +159,6 @@ class GPURNNT:
                 self.maxU_,
                 self.alphabet_size_,
                 self.blank_,
-                self.is_terminal,
-                self.sigma,
             )
 
             # Compute gradient
@@ -191,8 +181,6 @@ class GPURNNT:
                 self.blank_,
                 self.fastemit_lambda_,
                 self.clamp_,
-                self.is_terminal,
-                self.sigma,
             )
 
         # // cost copy, negate (for log likelihood) and update with additional regularizers

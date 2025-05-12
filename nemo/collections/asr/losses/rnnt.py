@@ -84,19 +84,6 @@ class RNNTLossConfig:
     force_float32: bool = True  # default True for now for all losses except graph-based
 
 
-def read_vocab_file(vocab_file):
-    if vocab_file == '':
-        return []
-
-    ifile = open(vocab_file, 'r')
-    is_terminal_list = []
-    for line in ifile:
-        token, _ = line.split()
-        is_terminal = token[0] == '▁' or token[-1] == '>'
-        is_terminal_list.append(is_terminal)
-
-    return is_terminal_list
-
 # Resolved list of available RNNT losses
 RNNT_LOSS_RESOLVER = {
     "warprnnt": RNNTLossConfig(
@@ -275,7 +262,6 @@ def resolve_rnnt_loss(loss_name: str, blank_idx: int, loss_kwargs: dict = None) 
         loss_config.force_float32 = not numba_utils.is_numba_cuda_fp16_supported()
 
         vocab_file = loss_kwargs.pop('vocab_file', '')
-        is_terminal = read_vocab_file(vocab_file)
 
         fastemit_lambda = loss_kwargs.pop('fastemit_lambda', 0.0)
         clamp = loss_kwargs.pop('clamp', -1.0)
@@ -284,7 +270,6 @@ def resolve_rnnt_loss(loss_name: str, blank_idx: int, loss_kwargs: dict = None) 
         loss_func = RNNTLossNumba(blank=blank_idx,
                                   reduction='none',
                                   fastemit_lambda=fastemit_lambda,
-                                  is_terminal=is_terminal,
                                   sigma=sigma,
                                   clamp=clamp)
         _warn_unused_additional_kwargs(loss_name, loss_kwargs)

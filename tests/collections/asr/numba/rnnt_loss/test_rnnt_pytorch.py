@@ -80,35 +80,28 @@ class TestRNNTLoss:
     @pytest.mark.parametrize('device', DEVICES)
     def test_case_randomized_act_label(self, device):
         if device == 'cuda':
-#            numba_utils.skip_numba_cuda_test_if_unsupported(__NUMBA_MINIMUM_VERSION__)
 
             B, T, U, V = 1, 15, 8, 4  # here V is number of non blank labels
             B, T, U, V = 1, 5, 3, 3  # here V is number of non blank labels
             sigma = 0
 
-            is_terminal = [1.0 for i in range(V)]
-#            is_terminal = [random.randint(0, 1) for _ in range(V)]
-#            is_terminal = [0.0 for i in range(V)]
 
             acts = torch.rand([B, T, U, V + 1])
             labels = [[random.randrange(0, V) for i in range(U - 1)] for j in range(B)]
 
-            is_terminal[labels[0][-1]] = 1
-
-            fn_pt = RNNTLossNumba(blank=V, reduction='sum', sigma=sigma, is_terminal=is_terminal)
+            fn_pt = RNNTLossNumba(blank=V, reduction='sum')
             pt_cost, pt_grads = wrap_and_call(fn_pt, acts, labels, device)
 
             pt_token_grads = pt_grads[:,:,:,:]
 
             fn_ag = RNNTLossPytorch(
-                blank=V, reduction='sum', sigma=sigma, is_terminal=is_terminal
+                blank=V, reduction='sum'
             )  # ag for automatic gradient computation
             ag_cost, ag_grads = wrap_and_call(fn_ag, acts, labels, device)
 
             ag_token_grads = ag_grads
 
             print("TWO losses", pt_cost, ag_cost)
-            print("ISTERMINAL", is_terminal)
             print("GRADs", pt_token_grads, ag_token_grads)
             print("GRAD IDFF", pt_token_grads - ag_token_grads)
             assert np.allclose(pt_cost, ag_cost, rtol=1e-6), "tdt costs mismatch."

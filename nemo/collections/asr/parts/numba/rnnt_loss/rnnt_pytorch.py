@@ -39,7 +39,7 @@ __all__ = ['rnnt_loss', 'RNNTLossNumba', 'MultiblankRNNTLossNumba', 'TDTLossNumb
 
 class _RNNTNumba(Function):
     @staticmethod
-    def forward(ctx, acts, labels, act_lens, label_lens, blank, reduction, fastemit_lambda, clamp, is_terminal, sigma):
+    def forward(ctx, acts, labels, act_lens, label_lens, blank, reduction, fastemit_lambda, clamp):
         """
         log_probs: Tensor of (batch x seqLength x labelLength x outputDim) containing output from network
         labels: 2 dimensional Tensor containing all the targets of the batch with zero padded
@@ -70,8 +70,6 @@ class _RNNTNumba(Function):
             fastemit_lambda=fastemit_lambda,
             clamp=clamp,
             num_threads=0,
-            is_terminal=is_terminal,
-            sigma=sigma,
         )
 
         if reduction in ['sum', 'mean']:
@@ -268,7 +266,7 @@ class _MultiblankRNNTNumba(Function):
 
 
 def rnnt_loss(
-    acts, labels, act_lens, label_lens, blank=0, reduction='mean', fastemit_lambda: float = 0.0, clamp: float = 0.0, is_terminal = None, sigma = 0.0
+    acts, labels, act_lens, label_lens, blank=0, reduction='mean', fastemit_lambda: float = 0.0, clamp: float = 0.0
 ):
     """RNN Transducer Loss (functional form)
     Args:
@@ -295,7 +293,7 @@ def rnnt_loss(
         # log_softmax is computed within GPU version.
         acts = torch.nn.functional.log_softmax(acts, -1)
 
-    return _RNNTNumba.apply(acts, labels, act_lens, label_lens, blank, reduction, fastemit_lambda, clamp, is_terminal, sigma)
+    return _RNNTNumba.apply(acts, labels, act_lens, label_lens, blank, reduction, fastemit_lambda, clamp)
 
 
 def multiblank_rnnt_loss(
@@ -405,15 +403,13 @@ class RNNTLossNumba(Module):
         clamp: Float value. When set to value >= 0.0, will clamp the gradient to [-clamp, clamp].
     """
 
-    def __init__(self, blank=0, reduction='mean', fastemit_lambda: float = 0.0, clamp: float = -1, is_terminal = None, sigma = 0.0):
+    def __init__(self, blank=0, reduction='mean', fastemit_lambda: float = 0.0, clamp: float = -1):
         super(RNNTLossNumba, self).__init__()
         self.blank = blank
         self.fastemit_lambda = fastemit_lambda
         self.clamp = float(clamp) if clamp > 0 else 0.0
         self.reduction = reduction
         self.loss = _RNNTNumba.apply
-        self.is_terminal = is_terminal
-        self.sigma = sigma
 
     def forward(self, acts, labels, act_lens, label_lens):
         """
@@ -442,7 +438,7 @@ class RNNTLossNumba(Module):
             acts = torch.nn.functional.log_softmax(acts, -1)
 
         return self.loss(
-            acts, labels, act_lens, label_lens, self.blank, self.reduction, self.fastemit_lambda, self.clamp, self.is_terminal, self.sigma
+            acts, labels, act_lens, label_lens, self.blank, self.reduction, self.fastemit_lambda, self.clamp
         )
 
 
@@ -587,7 +583,6 @@ class TDTLossNumba(Module):
             self.clamp,
             self.sigma,
             self.omega,
-            self.is_terminal,
         )
 
 

@@ -41,12 +41,10 @@ class RNNTLossPytorch(Loss):
         """
         return {"loss": NeuralType(elements_type=LossType())}
 
-    def __init__(self, blank, reduction, is_terminal: List[int] = [], sigma=0.0):
+    def __init__(self, blank, reduction):
         super().__init__()
         self.blank = blank
         self.reduction = reduction
-        self.is_terminal = is_terminal
-        self.sigma = sigma
 
     def forward(self, acts, labels, act_lens, label_lens):
         # CPU patch for FP16
@@ -93,10 +91,7 @@ class RNNTLossPytorch(Loss):
                         if t == 0:
                             # in case of (u > 0, t = 0), this is only reached from
                             # (t, u - 1) with a label emission.
-                            if self.is_terminal[labels[b, u - 1]]:
-                                log_alpha[b, t, u] = log_alpha[b, t, u - 1] + acts[b, t, u - 1, labels[b, u - 1]] + self.sigma * t
-                            else:
-                                log_alpha[b, t, u] = log_alpha[b, t, u - 1] + acts[b, t, u - 1, labels[b, u - 1]] - self.sigma * t
+                            log_alpha[b, t, u] = log_alpha[b, t, u - 1] + acts[b, t, u - 1, labels[b, u - 1]]
                         else:
                             # here both t and u are > 0, this state is reachable
                             # with two possibilities: (t - 1, u) with a blank emission
@@ -104,16 +99,10 @@ class RNNTLossPytorch(Loss):
 
                             blank_score = acts[b, t - 1, u, self.blank]
 
-                            if self.is_terminal[labels[b, u - 1]]:
-                                log_alpha[b, t, u] = self.logsumexp(
-                                    log_alpha[b, t - 1, u] + blank_score,
-                                    log_alpha[b, t, u - 1] + acts[b, t, u - 1, labels[b, u - 1]] + self.sigma * t
-                                )
-                            else:
-                                log_alpha[b, t, u] = self.logsumexp(
-                                    log_alpha[b, t - 1, u] + blank_score,
-                                    log_alpha[b, t, u - 1] + acts[b, t, u - 1, labels[b, u - 1]] - self.sigma * t
-                                )
+                            log_alpha[b, t, u] = self.logsumexp(
+                                log_alpha[b, t - 1, u] + blank_score,
+                                log_alpha[b, t, u - 1] + acts[b, t, u - 1, labels[b, u - 1]]
+                            )
 
         log_probs = []
         for b in range(B):
@@ -122,7 +111,6 @@ class RNNTLossPytorch(Loss):
                 log_alpha[b, act_lens[b] - 1, label_lens[b]] + acts[b, act_lens[b] - 1, label_lens[b], self.blank]
             )
             log_probs.append(to_append)
-            assert self.is_terminal[labels[b, label_lens[b] - 1]]
         log_prob = torch.stack(log_probs)
 
         return log_prob

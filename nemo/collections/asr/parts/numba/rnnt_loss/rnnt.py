@@ -146,8 +146,6 @@ def rnnt_loss_gpu(
     fastemit_lambda: float,
     clamp: float,
     num_threads: int,
-    is_terminal: torch.Tensor,
-    sigma: float,
 ):
     """
     Wrapper method for accessing GPU RNNT loss.
@@ -189,9 +187,6 @@ def rnnt_loss_gpu(
     # Select GPU index
     cuda.select_device(acts.device.index)
     gpu_workspace = torch.zeros(gpu_size, device=acts.device, dtype=torch.float32, requires_grad=False)
-    is_terminal_workspace = torch.zeros(len(is_terminal), device=acts.device, dtype=torch.long, requires_grad=False)
-    for i in range(0, len(is_terminal)):
-        is_terminal_workspace[i] = is_terminal[i]
 
     ### VIEW TENSORS AS VECTORS FOR POINTER INDEXING ###
     acts, acts_shape = rnnt_helper.flatten_tensor(acts)
@@ -207,8 +202,6 @@ def rnnt_loss_gpu(
         clamp=clamp,
         num_threads=num_threads,
         stream=stream,
-        is_terminal=is_terminal_workspace,
-        sigma=sigma,
     )
 
     if grads is None:

@@ -45,19 +45,6 @@ from nemo.core.classes import Typing, typecheck
 from nemo.core.neural_types import AcousticEncodedRepresentation, HypothesisType, LengthsType, NeuralType
 from nemo.utils import logging
 
-def read_vocab_file(vocab_file):
-    if vocab_file == '':
-        return []
-
-    ifile = open(vocab_file, 'r')
-    is_terminal_list = []
-    for line in ifile:
-        token, _ = line.split()
-        is_terminal = token[0] == '▁' or token[-1] == '>'
-        is_terminal_list.append(is_terminal)
-
-    return is_terminal_list
-
 def pack_hypotheses(
     hypotheses: List[rnnt_utils.Hypothesis],
     logitlen: torch.Tensor,
@@ -380,8 +367,6 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
             confidence_method_cfg=confidence_method_cfg,
         )
 
-        self.is_terminal = read_vocab_file(vocab_file)
-        self.sigma = sigma
 
     @typecheck()
     def forward(
@@ -482,9 +467,6 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                 logp = self._joint_step(f, g, log_normalize=True)[
                     0, 0, 0, :
                 ]
-
-                if last_label != self._SOS and not self.is_terminal[last_label]:
-                    logp[self._blank_index] -= self.sigma
 
                 del g
 
