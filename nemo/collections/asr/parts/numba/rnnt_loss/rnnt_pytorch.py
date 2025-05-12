@@ -567,7 +567,7 @@ class TDTLossNumba(Module):
         label_acts, duration_acts = torch.split(
             acts, [acts.shape[-1] - len(self.durations), len(self.durations)], dim=-1
         )
-        label_acts = label_acts.contiguous()
+        label_acts = torch.nn.functional.log_softmax(label_acts, -1).contiguous()
         duration_acts = torch.nn.functional.log_softmax(duration_acts, dim=-1).contiguous()
 
         return self.loss(

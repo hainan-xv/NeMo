@@ -1001,9 +1001,9 @@ def compute_tdt_alphas_kernel(
                 emit = -INF  # emit stores the score for non-blank emissions.
                 for i in range(num_durations):
                     if t >= durations[i]:
-                        if durations[i] > 1:
-                            pass
-                        else:
+#                        if durations[i] > 1:
+#                            pass
+#                        else:
                             emit = rnnt_helper.log_sum_exp(
                                 emit,  # current score
                                 alphas[offset + (t - durations[i]) * maxU + u - 1]  # alpha(t - duration, u - 1)
@@ -1055,7 +1055,7 @@ def compute_tdt_alphas_kernel(
                 break
 
         llForward[b] = loglike
-#        print("FORWARD", llForward[b])
+        print("FORWARD", llForward[b])
 
 
 @cuda.jit()
@@ -1224,7 +1224,7 @@ def compute_tdt_betas_kernel(
     # After final sync, betas[b, 0, 0] gives log-likelihood of backward pass, same with conventional Transducers.
     if u == 0:
         llBackward[b] = betas[offset]
-#        print("BACKWARD", betas[offset])
+        print("BACKWARD", betas[offset])
 
 
 @cuda.jit()

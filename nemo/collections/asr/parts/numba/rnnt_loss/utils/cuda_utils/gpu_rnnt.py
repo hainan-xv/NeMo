@@ -569,7 +569,6 @@ class GPUTDT(GPURNNT):
         _, (denom, alphas, betas, llForward, llBackward, durations) = self._prepare_workspace()
 
         ######## START EXECUTION ########
-        self.log_softmax(label_acts, denom)
 
         r = random.uniform(0, 1)
         if r < self.omega:

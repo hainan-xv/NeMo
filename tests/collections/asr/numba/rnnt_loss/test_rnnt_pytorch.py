@@ -75,27 +75,62 @@ def wrap_and_call(fn, acts, labels, device):
     return costs.data.cpu().numpy(), grad
 
 
-class TestRNNTLoss:
+#class TestRNNTLoss:
+#    @pytest.mark.unit
+#    @pytest.mark.parametrize('device', DEVICES)
+#    def test_case_randomized_act_label(self, device):
+#        if device == 'cuda':
+#
+#            B, T, U, V = 1, 15, 8, 4  # here V is number of non blank labels
+#            B, T, U, V = 1, 5, 3, 3  # here V is number of non blank labels
+#            sigma = 0
+#
+#
+#            acts = torch.rand([B, T, U, V + 1])
+#            labels = [[random.randrange(0, V) for i in range(U - 1)] for j in range(B)]
+#
+#            fn_pt = RNNTLossNumba(blank=V, reduction='sum')
+#            pt_cost, pt_grads = wrap_and_call(fn_pt, acts, labels, device)
+#
+#            pt_token_grads = pt_grads[:,:,:,:]
+#
+#            fn_ag = RNNTLossPytorch(
+#                blank=V, reduction='sum'
+#            )  # ag for automatic gradient computation
+#            ag_cost, ag_grads = wrap_and_call(fn_ag, acts, labels, device)
+#
+#            ag_token_grads = ag_grads
+#
+#            print("TWO losses", pt_cost, ag_cost)
+#            print("GRADs", pt_token_grads, ag_token_grads)
+#            print("GRAD IDFF", pt_token_grads - ag_token_grads)
+#            assert np.allclose(pt_cost, ag_cost, rtol=1e-6), "tdt costs mismatch."
+#            assert np.allclose(pt_token_grads, ag_token_grads, rtol=1e-2), "td token gradient mismatch."
+
+
+class TestTDTLoss:
     @pytest.mark.unit
     @pytest.mark.parametrize('device', DEVICES)
     def test_case_randomized_act_label(self, device):
         if device == 'cuda':
 
             B, T, U, V = 1, 15, 8, 4  # here V is number of non blank labels
-            B, T, U, V = 1, 5, 3, 3  # here V is number of non blank labels
+            B, T, U, V , D = 1, 15, 8, 4, 3  # here V is number of non blank labels
+            B, T, U, V , D = 1, 5, 3, 3, 3  # here V is number of non blank labels
             sigma = 0
 
+            durations = [0, 1, 2]
 
-            acts = torch.rand([B, T, U, V + 1])
+            acts = torch.rand([B, T, U, V + 1 + D])
             labels = [[random.randrange(0, V) for i in range(U - 1)] for j in range(B)]
 
-            fn_pt = RNNTLossNumba(blank=V, reduction='sum')
+            fn_pt = TDTLossNumba(blank=V, reduction='sum', durations=durations)
             pt_cost, pt_grads = wrap_and_call(fn_pt, acts, labels, device)
 
             pt_token_grads = pt_grads[:,:,:,:]
 
-            fn_ag = RNNTLossPytorch(
-                blank=V, reduction='sum'
+            fn_ag = TDTLossPytorch(
+                blank=V, reduction='sum', durations=durations
             )  # ag for automatic gradient computation
             ag_cost, ag_grads = wrap_and_call(fn_ag, acts, labels, device)
 
@@ -106,7 +141,6 @@ class TestRNNTLoss:
             print("GRAD IDFF", pt_token_grads - ag_token_grads)
             assert np.allclose(pt_cost, ag_cost, rtol=1e-6), "tdt costs mismatch."
             assert np.allclose(pt_token_grads, ag_token_grads, rtol=1e-2), "td token gradient mismatch."
-
 
 if __name__ == "__main__":
     pytest.main([__file__])
