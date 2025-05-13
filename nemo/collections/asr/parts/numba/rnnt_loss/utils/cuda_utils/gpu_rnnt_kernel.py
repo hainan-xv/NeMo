@@ -340,32 +340,16 @@ def compute_grad_kernel(
     U = ylen[mb] + 1  # select target length of current sample, +1 for the blank token
     labels: torch.Tensor = mlabels[mb]  # labels = mlabels + mb * (maxU - 1);
 
-    # Buffered gradient calculations, broadcast across B=b, T=t and U=u, looped over V with some constant stride.
-    # Look up gradient calculation from rnnt_numpy.compute_gradient()
     if t < T and u < U:
-        # For cuda kernels, maximum number of threads per block is limited to some value.
-        # However, it may be the case that vocabulary size is larger than this limit
-        # To work around this, an arbitrary thread buffer size is chosen such that,
-        # 1) each element within the thread pool operates independently of the other
-        # 2) An inner while loop moves the index of each buffer element by the size of the buffer itself,
-        #    such that all elements of the vocabulary size are covered in (V + 1 // thread_buffer) number of steps.
-        # As such, each thread will perform the while loop at least (V + 1 // thread_buffer) number of times
         while idx < alphabet_size:
-            # remember, `col` represents the tri-index [b, t, u]
-            # therefore; logpk = denom[b, t, u] + acts[b, t, u, v]
             logpk = acts[col * alphabet_size + idx]
-
             grad = 0
 
-            # // grad to last blank transition
-            # grad[b, T-1, U-1, v=blank] -= exp(alphas[b, t, u) + logpk - logll[b])
             if (idx == blank_) and (t == T - 1) and (u == U - 1):
                 grad = alphas[col] - logll[mb]
             elif (idx == blank_) and (t < T - 1):
                 grad = alphas[col] - logll[mb] + betas[col + maxU]
             elif (u < U - 1) and (idx == labels[u]):
-                # exp(log(1 + fastemit_lambda) + ...) is numerically more stable than
-                # multiplying (1.0 + fastemit_lambda) with result.
                 grad = alphas[col] - logll[mb] + betas[col + 1]
             else:
                 grad = -999999
@@ -380,8 +364,6 @@ def compute_grad_kernel(
                 g = max(g, -clamp)
                 grads[col * alphabet_size + idx] = g
 
-            # update internal index through the thread_buffer;
-            # until idx < V + 1, such that entire vocabulary has been updated.
             idx += GPU_RNNT_THREAD_SIZE
 
 
@@ -1303,21 +1285,16 @@ def compute_tdt_grad_kernel(
     U = ylen[mb] + 1  # select target length of current sample, +1 for the blank token
     labels: torch.Tensor = mlabels[mb]  # labels = mlabels + mb * (maxU - 1);
 
-    # Buffered gradient calculations, broadcast across B=b, T=t and U=u, looped over V with some constant stride.
-    # Look up gradient calculation from rnnt_numpy.compute_gradient()
-
     if t < T and u < U:
-        logpk_blank = (
-            denom[col] + acts[col * alphabet_size + blank_] - sigma
-        )  # whenever sigma is used, it is for logit under-normalization.
+        logpk_blank = acts[col * alphabet_size + blank_]
 
         if idx < num_durations:
             grad = 0.0
-            if t + durations[idx] < T and u < U - 1:  # for labelA
+            if t + durations[idx] < T and u < U - 1:
                 if durations[idx] > 1:
                     pass
                 else:
-                    logpk_label = denom[col] + acts[col * alphabet_size + labels[u]] - sigma
+                    logpk_label = acts[col * alphabet_size + labels[u]]
                     grad -= math.exp(alphas[col] + betas[col + 1 + durations[idx] * maxU] + logpk_label - logll[mb])
 
             if t + durations[idx] < T and durations[idx] > 0:  # for blank in the middle
@@ -1329,65 +1306,24 @@ def compute_tdt_grad_kernel(
             grad = grad * math.exp(duration_acts[col * num_durations + idx])
             duration_grads[col * num_durations + idx] = grad
 
-        # For cuda kernels, maximum number of threads per block is limited to some value.
-        # However, it may be the case that vocabulary size is larger than this limit
-        # To work around this, an arbitrary thread buffer size is chosen such that,
-        # 1) each element within the thread pool operates independently of the other
-        # 2) An inner while loop moves the index of each buffer element by the size of the buffer itself,
-        #    such that all elements of the vocabulary size are covered in (V + 1 // thread_buffer) number of steps.
-        # As such, each thread will perform the while loop at least (V + 1 // thread_buffer) number of times
         while idx < alphabet_size:
-            # remember, `col` represents the tri-index [b, t, u]
-            # therefore; logpk = denom[b, t, u] + acts[b, t, u, v]
-            logpk = denom[col] + acts[col * alphabet_size + idx]
+            logpk = acts[col * alphabet_size + idx]
             # initialize the grad of the sample acts[b, t, u, v]
-            grad = math.exp(alphas[col] + betas[col] + logpk - logll[mb])
+            grad = 0 #math.exp(alphas[col] + betas[col] + logpk - logll[mb])
 
-            # If FastEmit regularization is enabled, calculate the gradeint of probability of predicting the next label
-            # at the current timestep.
-            # The formula for this is Equation 9 in https://arxiv.org/abs/2010.11148, multiplied by the log probability
-            # of the current step (t, u), normalized by the total log likelihood.
-            # Once the gradient has been calculated, scale it by `fastemit_lambda`, as in Equation 10.
-            if fastemit_lambda > 0.0 and u < U - 1:
-                fastemit_grad = 0.0
-
-                for i in range(num_durations):
-                    if t + durations[i] < T:
-                        if durations[i] > 1:
-                            pass
-                        else:
-                            fastemit_grad += fastemit_lambda * math.exp(
-                                alphas[col]  # alphas(t, u)
-                                + (denom[col] + acts[col * alphabet_size + labels[u]])  # log prob of token emission
-                                + duration_acts[col * num_durations + i]  # duration log-prob
-                                + betas[col + 1 + durations[i] * maxU]  # betas(t, u+1)
-                                + logpk  # log Pr(k|t, u)
-                                - sigma  # for logit under-normalization
-                                - logll[mb]  # total log likelihood for normalization
-                            )
-            else:
-                fastemit_grad = 0.0
-
-            # Update the gradient of act[b, t, u, v] with the gradient from FastEmit regularization
-            grad = grad + fastemit_grad
-
-            # grad to last blank transition
-            # grad[b, T-1, U-1, v=blank] -= exp(alphas[b, t, u] + logpk - sigma - logll[b] + logp(duration) for all possible non-zero durations.
             if idx == blank_ and u == U - 1:
                 for i in range(num_durations):
                     if durations[i] == 0:
                         continue
                     if t == T - durations[i]:
                         grad -= math.exp(
-                            alphas[col] + logpk - sigma - logll[mb] + duration_acts[col * num_durations + i]
+                            alphas[col] + logpk - logll[mb] + duration_acts[col * num_durations + i]
                         )
 
-            # grad of blank across t < T;
-            # grad[b, t<T-1, u, v=blank] -= exp(alphas[b, t, u] + logpk - sigma + logp_duration - logll[b] + betas[b, t + duration, u]) for all non-zero durations
             if idx == blank_:
-                if u > 0:
-                    pass
-                else:
+#                if u > 0:
+#                    pass
+#                else:
                     for i in range(num_durations):
                         if durations[i] == 0:
                             continue
@@ -1395,32 +1331,27 @@ def compute_tdt_grad_kernel(
                             grad -= math.exp(
                                 alphas[col]
                                 + logpk
-                                - sigma
                                 - logll[mb]
                                 + betas[col + maxU * durations[i]]
                                 + duration_acts[col * num_durations + i]
                             )
 
-            # grad of correct token across u < U;
-            # grad[b, t, u<U-1, v=label[u]] -= exp(alphas[b, t, u] + logpk - sigma + logp_duration - logll[b] + betas[b, t + duration, u + 1]) for all blank durations.
-            # Scale the gradient by (1.0 + FastEmit_lambda) in log space, then exponentiate
             if u < U - 1 and idx == labels[u]:
-                # exp(log(1 + fastemit_lambda) + ...) is numerically more stable than
-                # multiplying (1.0 + fastemit_lambda) with result.
                 for i in range(num_durations):
                     if t + durations[i] < T:
-                        if durations[i] > 1:
-                            pass
-                        else:
+#                        if durations[i] > 1:
+#                            pass
+#                        else:
                             grad -= math.exp(
-                                math.log1p(fastemit_lambda)
-                                + alphas[col]
+                                alphas[col]
                                 + logpk
-                                - sigma
                                 - logll[mb]
                                 + betas[col + 1 + maxU * durations[i]]
                                 + duration_acts[col * num_durations + i]
                             )
+#            if idx != blank_ and idx != labels[i]:
+#               grad = 0
+                        
 
             # update grads[b, t, u, v] = grad
             label_grads[col * alphabet_size + idx] = grad

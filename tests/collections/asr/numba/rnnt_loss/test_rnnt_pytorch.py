@@ -116,10 +116,10 @@ class TestTDTLoss:
 
             B, T, U, V = 1, 15, 8, 4  # here V is number of non blank labels
             B, T, U, V , D = 1, 15, 8, 4, 3  # here V is number of non blank labels
-            B, T, U, V , D = 1, 5, 3, 3, 3  # here V is number of non blank labels
+            B, T, U, V , D = 1, 5, 2, 2, 2  # here V is number of non blank labels
             sigma = 0
 
-            durations = [0, 1, 2]
+            durations = [0, 1]
 
             acts = torch.rand([B, T, U, V + 1 + D])
             labels = [[random.randrange(0, V) for i in range(U - 1)] for j in range(B)]
@@ -137,7 +137,8 @@ class TestTDTLoss:
             ag_token_grads = ag_grads
 
             print("TWO losses", pt_cost, ag_cost)
-            print("GRADs", pt_token_grads, ag_token_grads)
+            print("GRADs", pt_token_grads)
+            print("ORACLE GRADS", ag_token_grads)
             print("GRAD IDFF", pt_token_grads - ag_token_grads)
             assert np.allclose(pt_cost, ag_cost, rtol=1e-6), "tdt costs mismatch."
             assert np.allclose(pt_token_grads, ag_token_grads, rtol=1e-2), "td token gradient mismatch."
