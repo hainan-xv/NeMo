@@ -170,7 +170,6 @@ def compute_alphas_kernel(
             denom, acts, maxT, maxU, alphabet_size, b, T - 1, U - 1, blank_
         )
         llForward[b] = loglike
-        print("FORWARD LOSS", loglike)
 
 
 @cuda.jit()
@@ -268,7 +267,6 @@ def compute_betas_kernel(
     # log-likelihood of backward pass.
     if u == 0:
         llBackward[b] = betas[offset]
-        print("BACKWARD LOSS", betas[offset])
 
 
 @cuda.jit()
@@ -1037,7 +1035,6 @@ def compute_tdt_alphas_kernel(
                 break
 
         llForward[b] = loglike
-        print("FORWARD", llForward[b])
 
 
 @cuda.jit()
@@ -1206,7 +1203,6 @@ def compute_tdt_betas_kernel(
     # After final sync, betas[b, 0, 0] gives log-likelihood of backward pass, same with conventional Transducers.
     if u == 0:
         llBackward[b] = betas[offset]
-        print("BACKWARD", betas[offset])
 
 
 @cuda.jit()
