@@ -570,8 +570,17 @@ class TDTLossNumba(Module):
         label_acts = torch.nn.functional.log_softmax(label_acts, -1).contiguous() - self.sigma
         B, T, U, V = label_acts.shape
 
-        scale_factors = torch.linspace(2.0, 1.0, U).to(label_acts.device)
+#        scale_factors = torch.linspace(2.0, 1.0, U).to(label_acts.device)
+#        scale_factors = scale_factors.view(1, 1, U, 1)
+
+        base = 1.002
+        u_indices = torch.arange(U, device=label_acts.device)
+        distance_from_end = (U - 1) - u_indices
+        scale_factors = base ** distance_from_end
         scale_factors = scale_factors.view(1, 1, U, 1)
+
+#        print("HEREU  U",  U, scale_factors)
+#        print("SHAPE", label_acts.shape)
         label_acts = label_acts * scale_factors
 
         duration_acts = torch.nn.functional.log_softmax(duration_acts, dim=-1).contiguous()
