@@ -537,6 +537,8 @@ class TDTLossNumba(Module):
     def __init__(
         self,
         blank,
+        is_special,
+        scale_factor,
         durations=None,
         reduction='mean',
         fastemit_lambda: float = 0.0,
@@ -545,6 +547,7 @@ class TDTLossNumba(Module):
         omega: float = 0.0,
     ):
         super(TDTLossNumba, self).__init__()
+        self.scale_factor = scale_factor
         self.blank = blank
         self.durations = durations if durations is not None else []
         self.fastemit_lambda = fastemit_lambda
@@ -553,6 +556,13 @@ class TDTLossNumba(Module):
         self.loss = _TDTNumba.apply
         self.sigma = sigma
         self.omega = omega
+
+        i2special = [False for i in range(blank + 1)]
+        for i in is_special.split():
+            i = int(i)
+            i2special[i] = True
+
+        self.is_special = torch.tensor(i2special, dtype=torch.bool)
 
     def forward(self, acts, labels, act_lens, label_lens):
         """
@@ -570,18 +580,30 @@ class TDTLossNumba(Module):
         label_acts = torch.nn.functional.log_softmax(label_acts, -1).contiguous() - self.sigma
         B, T, U, V = label_acts.shape
 
-#        scale_factors = torch.linspace(2.0, 1.0, U).to(label_acts.device)
-#        scale_factors = scale_factors.view(1, 1, U, 1)
+#        print("HERE", B, T, U, V, labels.shape)
+        if self.is_special.device != labels.device:
+            self.is_special = self.is_special.to(labels.device)
 
-        base = 1.002
-        u_indices = torch.arange(U, device=label_acts.device)
-        distance_from_end = (U - 1) - u_indices
-        scale_factors = base ** distance_from_end
-        scale_factors = scale_factors.view(1, 1, U, 1)
+        scale_tensor = torch.ones(B, 1, U - 1, 1, 
+                       device=label_acts.device)
 
-#        print("HEREU  U",  U, scale_factors)
-#        print("SHAPE", label_acts.shape)
-        label_acts = label_acts * scale_factors
+        is_special = self.is_special[labels]
+        is_special_reshaped = torch.reshape(is_special, [B, 1, U - 1, 1])
+
+        scale_tensor = torch.where(is_special_reshaped, 
+                                   scale_tensor * self.scale_factor,  scale_tensor)
+
+#        print("HERE ", scale_tensor.shape)
+#        print("HERE", label_acts.shape)
+
+        label_acts[:,:,:-1,:] = label_acts[:,:,:-1,:] * scale_tensor
+
+#        is_special = self.is_special[labels]
+#
+#        scale_factor = self.scale_factor
+#
+#        mask = is_special.unsqueeze(1).unsqueeze(3).expand(B, T, U - 1, V)
+#        label_acts[:,:,:-1,:] = torch.where(mask, label_acts[:,:,:-1,:] * scale_factor, label_acts[:,:,:-1,:])
 
         duration_acts = torch.nn.functional.log_softmax(duration_acts, dim=-1).contiguous()
 

@@ -305,6 +305,8 @@ def resolve_rnnt_loss(loss_name: str, blank_idx: int, loss_kwargs: dict = None) 
         durations = loss_kwargs.pop('durations', None)
         sigma = loss_kwargs.pop('sigma', 0.0)
         omega = loss_kwargs.pop('omega', 0.0)
+        is_special = loss_kwargs.pop('is_special', '')
+        scale_factor = loss_kwargs.pop('scale_factor', 1.1)
 
         loss_func = TDTLossNumba(
             blank=blank_idx,
@@ -314,6 +316,8 @@ def resolve_rnnt_loss(loss_name: str, blank_idx: int, loss_kwargs: dict = None) 
             clamp=clamp,
             sigma=sigma,
             omega=omega,
+            is_special=is_special,
+            scale_factor=scale_factor,
         )
         _warn_unused_additional_kwargs(loss_name, loss_kwargs)
 
