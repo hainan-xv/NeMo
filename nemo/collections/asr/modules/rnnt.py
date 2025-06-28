@@ -29,7 +29,7 @@
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig
 
 from nemo.collections.asr.modules import rnnt_abstract
 from nemo.collections.asr.parts.submodules import stateless_net
@@ -379,13 +379,26 @@ class StatelessTransducerDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable):
     @classmethod
     def batch_replace_states_mask(
         cls,
-        src_states: list[torch.Tensor],
-        dst_states: list[torch.Tensor],
+        src_states: tuple[torch.Tensor, torch.Tensor] | list[torch.Tensor],
+        dst_states: tuple[torch.Tensor, torch.Tensor] | list[torch.Tensor],
         mask: torch.Tensor,
+        other_src_states: Optional[tuple[torch.Tensor, torch.Tensor] | list[torch.Tensor]] = None,
     ):
-        """Replace states in dst_states with states from src_states using the mask"""
+        """
+        Replaces states in `dst_states` with states from `src_states` based on the given `mask`.
+
+        Args:
+            mask (torch.Tensor): When True, selects values from `src_states`, otherwise `out` or `other_src_states`(if provided).
+            src_states (tuple[torch.Tensor, torch.Tensor]): Values selected at indices where `mask` is True.
+            dst_states (tuple[torch.Tensor, torch.Tensor], optional): The output states.
+            other_src_states (tuple[torch.Tensor, torch.Tensor], optional): Values selected at indices where `mask` is False.
+
+        Note:
+            This operation is performed without CPU-GPU synchronization by using `torch.where`.
+        """
+        other = other_src_states if other_src_states is not None else dst_states
         # same as `dst_states[0][mask] = src_states[0][mask]`, but non-blocking
-        torch.where(mask.unsqueeze(-1), src_states[0], dst_states[0], out=dst_states[0])
+        torch.where(mask.unsqueeze(-1), src_states[0], other[0], out=dst_states[0])
 
     @classmethod
     def batch_replace_states_all(
@@ -1021,6 +1034,57 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
 
         return None
 
+    @classmethod
+    def batch_aggregate_states_beam(
+        cls,
+        src_states: tuple[torch.Tensor, torch.Tensor],
+        batch_size: int,
+        beam_size: int,
+        indices: torch.Tensor,
+        dst_states: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Aggregates decoder states based on the given indices.
+        Args:
+            src_states (Tuple[torch.Tensor, torch.Tensor]): source states of
+                shape `([L x (batch_size * beam_size, H)], [L x (batch_size * beam_size, H)])`
+            batch_size (int): The size of the batch.
+            beam_size (int): The size of the beam.
+            indices (torch.Tensor): A tensor of shape `(batch_size, beam_size)` containing
+                the indices in beam that map the source states to the destination states.
+            dst_states (Optional[Tuple[torch.Tensor, torch.Tensor]]): If provided, the method
+                updates these tensors in-place.
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]:
+        Note:
+            - The `indices` tensor is expanded to match the shape of the source states
+            during the gathering operation.
+        """
+        layers_num = src_states[0].shape[0]
+        layers_dim = src_states[0].shape[-1]
+
+        beam_shape = torch.Size((layers_num, batch_size, beam_size, layers_dim))
+        flat_shape = torch.Size((layers_num, batch_size * beam_size, layers_dim))
+
+        # Expand indices to match the source states' shape
+        indices_expanded = indices[None, :, :, None].expand(beam_shape)
+
+        if dst_states is not None:
+            # Perform in-place gathering into dst_states
+            torch.gather(
+                src_states[0].view(beam_shape), dim=2, index=indices_expanded, out=dst_states[0].view(beam_shape)
+            )
+            torch.gather(
+                src_states[1].view(beam_shape), dim=2, index=indices_expanded, out=dst_states[1].view(beam_shape)
+            )
+            return dst_states
+
+        # Gather and reshape into the output format
+        return (
+            torch.gather(src_states[0].view(beam_shape), dim=2, index=indices_expanded).view(flat_shape),
+            torch.gather(src_states[1].view(beam_shape), dim=2, index=indices_expanded).view(flat_shape),
+        )
+
     def batch_concat_states(self, batch_states: List[List[torch.Tensor]]) -> List[torch.Tensor]:
         """Concatenate a batch of decoder state to a packed state.
 
@@ -1057,13 +1121,27 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
         src_states: Tuple[torch.Tensor, torch.Tensor],
         dst_states: Tuple[torch.Tensor, torch.Tensor],
         mask: torch.Tensor,
+        other_src_states: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
-        """Replace states in dst_states with states from src_states using the mask"""
+        """
+        Replaces states in `dst_states` with states from `src_states` based on the given `mask`.
+
+        Args:
+            mask (torch.Tensor): When True, selects values from `src_states`, otherwise `out` or `other_src_states`(if provided).
+            src_states (Tuple[torch.Tensor, torch.Tensor]): Values selected at indices where `mask` is True.
+            dst_states (Tuple[torch.Tensor, torch.Tensor])): The output states.
+            other_src_states (Tuple[torch.Tensor, torch.Tensor], optional): Values selected at indices where `mask` is False.
+
+        Note:
+            This operation is performed without CPU-GPU synchronization by using `torch.where`.
+        """
         # same as `dst_states[i][mask] = src_states[i][mask]`, but non-blocking
         # we need to cast, since LSTM is calculated in fp16 even if autocast to bfloat16 is enabled
+
+        other = other_src_states if other_src_states is not None else dst_states
         dtype = dst_states[0].dtype
-        torch.where(mask.unsqueeze(0).unsqueeze(-1), src_states[0].to(dtype), dst_states[0], out=dst_states[0])
-        torch.where(mask.unsqueeze(0).unsqueeze(-1), src_states[1].to(dtype), dst_states[1], out=dst_states[1])
+        torch.where(mask.unsqueeze(0).unsqueeze(-1), src_states[0].to(dtype), other[0].to(dtype), out=dst_states[0])
+        torch.where(mask.unsqueeze(0).unsqueeze(-1), src_states[1].to(dtype), other[1].to(dtype), out=dst_states[1])
 
     @classmethod
     def batch_replace_states_all(
@@ -1281,6 +1359,7 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
     ):
         super().__init__()
 
+        assert vocab_file != ''
         self.vocabulary = vocabulary
 
         self._vocab_size = num_classes
@@ -1309,17 +1388,7 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         self.preserve_memory = preserve_memory
 
         self.is_special_list = self.read_vocab_file(vocab_file)
-        self.is_special = None
-        self.one_idx = 0
-
-        if durations is not None and len(durations) > 0 and durations[0] == 0:
-            self.one_idx = 1
-
-        if durations is not None and len(durations) > 0:
-            self.one_distribution = [-1000.0 for i in range(len(durations))]
-            for i in range(self.one_idx + 1):
-                self.one_distribution[i] = 0.0   # allowing duration 0 and 1
-            self.one_distribution = torch.Tensor(self.one_distribution)
+        print("LIST IS", self.is_special_list)
 
         if preserve_memory:
             logging.warning(
@@ -1352,26 +1421,6 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         # to change, requires running ``model.temperature = T`` explicitly
         self.temperature = 1.0
 
-#    def state_dict(self, *args, **kwargs):
-#        """Override state_dict to include custom_list"""
-#        state_dict = super().state_dict(*args, **kwargs)
-#        state_dict['is_special'] = self.is_special
-#        state_dict['one_distribution'] = self.one_distribution 
-#
-#        return state_dict
-#
-#    def load_state_dict(self, state_dict, strict=True):
-#        """Override load_state_dict to handle custom_list"""
-#        is_special = state_dict.pop('is_special', None)
-#        one_distribution = state_dict.pop('one_distribution', None)
-#
-#        super().load_state_dict(state_dict, strict)
-#
-#        if is_special is not None:
-#            self.one_distribution = one_distribution
-#            self.is_special = is_special
-
-
 
     def read_vocab_file(self, vocab_file):
         if vocab_file == '':
@@ -1383,6 +1432,7 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
             is_special = token[0] == '▁' or token[-1] == '>'
             is_special_list.append(is_special)
 
+        is_special_list.append(True)  # for blank
         return is_special_list
 
 
@@ -1467,7 +1517,7 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
                         sub_dec = sub_dec.narrow(dim=1, start=0, length=int(max_sub_transcript_length + 1))
 
                     # Perform joint => [sub-batch, T', U', V + 1]
-                    sub_joint = self.joint(sub_enc, sub_dec, sub_transcripts)
+                    sub_joint = self.joint(sub_enc, sub_dec)
 
                     del sub_dec
 
@@ -1569,8 +1619,8 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         """
         return self.pred(prednet_output)
 
-    def joint_after_projection(self, f: torch.Tensor, g: torch.Tensor, transcription: torch.Tensor) -> torch.Tensor:
-        """
+    def joint_after_projection(self, f: torch.Tensor, g: torch.Tensor, transcription) -> torch.Tensor:
+        r"""
         Compute the joint step of the network after projection.
 
         Here,
@@ -1604,17 +1654,17 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
 
         B, _, U, _ = g.shape
 
-        if self.is_special == None:
-            self.is_special = torch.LongTensor(self.is_special_list).to(f.device)
-            self.one_distribution = self.one_distribution.to(f.device)
+        self.is_special = torch.LongTensor(self.is_special_list).to(f.device)
+#        print("HERE self.is_special", self.is_special.shape)
+#        print("HERE transcription", transcription)
 
         trans_is_special = self.is_special[transcription]
 
-        if trans_is_special.shape[1] < U:
-            BOS = torch.ones([B, 1], dtype=torch.long).to(g.device)
-            trans_is_special = torch.cat([BOS, trans_is_special], dim=-1)
-
-        trans_is_special = torch.reshape(trans_is_special, [B, 1, U, 1])
+#        if trans_is_special.shape[1] < U:
+#            BOS = torch.ones([B, 1], dtype=torch.long).to(g.device)
+#            trans_is_special = torch.cat([BOS, trans_is_special], dim=-1)
+#
+#        trans_is_special = torch.reshape(trans_is_special, [B, 1, U, 1])
 
         if self.training and self.masking_prob > 0:
             [B, _, U, _] = g.shape
@@ -1632,12 +1682,12 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
 
         res = self.joint_net(inp)  # [B, T, U, V + 1]
 
-        n = self._num_extra_outputs  # same as num_durations
-        # if special, nothing changes; else, adding one_distribution which masks out >=2 durations
-        res[:,:,:,-n:] = res[:,:,:,-n:] * trans_is_special + (res[:,:,:,-n:] + self.one_distribution) * (1 - trans_is_special)
-
-        # -n-1 corresponds to the blank token probability, which doesn't change if special, but masked out if non-special - basically, not allowing blank to follow non-special tokens
-        res[:,:,:,-n-1:-n] = res[:,:,:,-n-1:-n] * trans_is_special + (res[:,:,:,-n-1:-n] - 1000) * (1 - trans_is_special)
+#        n = self._num_extra_outputs  # same as num_durations
+#        # if special, nothing changes; else, adding one_distribution which masks out >=2 durations
+#        res[:,:,:,-n:] = res[:,:,:,-n:] * trans_is_special + (res[:,:,:,-n:] + self.one_distribution) * (1 - trans_is_special)
+#
+#        # -n-1 corresponds to the blank token probability, which doesn't change if special, but masked out if non-special - basically, not allowing blank to follow non-special tokens
+#        res[:,:,:,-n-1:-n] = res[:,:,:,-n-1:-n] * trans_is_special + (res[:,:,:,-n-1:-n] - 1000) * (1 - trans_is_special)
 
         del inp
 
@@ -2104,7 +2154,7 @@ class SampledRNNTJoint(RNNTJoint):
         transcript: torch.Tensor,
         transcript_lengths: torch.Tensor,
     ) -> torch.Tensor:
-        """
+        r"""
         Compute the sampled joint step of the network.
 
         Reference: `Memory-Efficient Training of RNN-Transducer with Sampled Softmax <https://arxiv.org/abs/2203.16868>`__.
