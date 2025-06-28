@@ -1654,16 +1654,6 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         B, _, U, _ = g.shape
 
         self.is_special = torch.LongTensor(self.is_special_list).to(f.device)
-#        print("HERE self.is_special", self.is_special.shape)
-#        print("HERE transcription", transcription)
-
-        trans_is_special = self.is_special[transcription]
-
-#        if trans_is_special.shape[1] < U:
-#            BOS = torch.ones([B, 1], dtype=torch.long).to(g.device)
-#            trans_is_special = torch.cat([BOS, trans_is_special], dim=-1)
-#
-#        trans_is_special = torch.reshape(trans_is_special, [B, 1, U, 1])
 
         if self.training and self.masking_prob > 0:
             [B, _, U, _] = g.shape
@@ -1681,12 +1671,22 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
 
         res = self.joint_net(inp)  # [B, T, U, V + 1]
 
-#        n = self._num_extra_outputs  # same as num_durations
-#        # if special, nothing changes; else, adding one_distribution which masks out >=2 durations
-#        res[:,:,:,-n:] = res[:,:,:,-n:] * trans_is_special + (res[:,:,:,-n:] + self.one_distribution) * (1 - trans_is_special)
-#
-#        # -n-1 corresponds to the blank token probability, which doesn't change if special, but masked out if non-special - basically, not allowing blank to follow non-special tokens
-#        res[:,:,:,-n-1:-n] = res[:,:,:,-n-1:-n] * trans_is_special + (res[:,:,:,-n-1:-n] - 1000) * (1 - trans_is_special)
+        chunk_size = 14
+        chunk_end_mask = torch.arange(res.size(1), device=res.device) % chunk_size == (chunk_size - 1)  # [T]
+        
+        # Create mask for non-special tokens
+        non_special_mask = self.is_special[transcription] == 0  # [B, U]
+        
+        # Combine conditions: chunk_end_mask[t] AND non_special_mask[b, u]
+        # We need to broadcast these masks to match [B, T, U] dimensions
+        combined_mask = chunk_end_mask[None, :, None] & non_special_mask[:, None, :]  # [B, T, U]
+
+#        print("HERE combined_mask", combined_mask.shape, res[:,:,1:,:].shape)
+        
+        # Apply the subtraction only to the last token position (V-1) where mask is True
+#        print(res[:,:,1:,:][combined_mask].shape)
+#        res[:,:,1:,:][combined_mask, -1] -= 999
+        res[:,:,1:,-1][combined_mask] -= 999
 
         del inp
 
