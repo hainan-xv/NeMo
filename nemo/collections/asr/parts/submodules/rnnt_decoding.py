@@ -300,6 +300,7 @@ class AbstractRNNTDecoding(ConfidenceMixin):
                     self.decoding = rnnt_greedy_decoding.GreedyRNNTInfer(
                         decoder_model=decoder,
                         joint_model=joint,
+                        vocab_file=self.cfg.get('vocab_file', ''),
                         blank_index=self.blank_id,
                         max_symbols_per_step=(
                             self.cfg.greedy.get('max_symbols', None)

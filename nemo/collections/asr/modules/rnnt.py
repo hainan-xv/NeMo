@@ -1671,22 +1671,21 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
 
         res = self.joint_net(inp)  # [B, T, U, V + 1]
 
-        chunk_size = 14
-        chunk_end_mask = torch.arange(res.size(1), device=res.device) % chunk_size == (chunk_size - 1)  # [T]
-        
-        # Create mask for non-special tokens
-        non_special_mask = self.is_special[transcription] == 0  # [B, U]
-        
-        # Combine conditions: chunk_end_mask[t] AND non_special_mask[b, u]
-        # We need to broadcast these masks to match [B, T, U] dimensions
-        combined_mask = chunk_end_mask[None, :, None] & non_special_mask[:, None, :]  # [B, T, U]
+        if res.shape[1] > 12:
+#            print("TRAINING")
+            chunk_size = 14
+            chunk_end_mask = torch.arange(res.size(1), device=res.device) % chunk_size == (chunk_size - 1)  # [T]
+            
+            # Create mask for non-special tokens
+            non_special_mask = self.is_special[transcription] == 0  # [B, U]
+            
+            # Combine conditions: chunk_end_mask[t] AND non_special_mask[b, u]
+            # We need to broadcast these masks to match [B, T, U] dimensions
+            combined_mask = chunk_end_mask[None, :, None] & non_special_mask[:, None, :]  # [B, T, U]
 
-#        print("HERE combined_mask", combined_mask.shape, res[:,:,1:,:].shape)
-        
-        # Apply the subtraction only to the last token position (V-1) where mask is True
-#        print(res[:,:,1:,:][combined_mask].shape)
-#        res[:,:,1:,:][combined_mask, -1] -= 999
-        res[:,:,1:,-1][combined_mask] -= 999
+            res[:,:,1:,:][...,-1][combined_mask] -= 999
+#        else:
+#            print("NOT TRAINING")
 
         del inp
 

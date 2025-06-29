@@ -350,6 +350,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
         self,
         decoder_model: rnnt_abstract.AbstractRNNTDecoder,
         joint_model: rnnt_abstract.AbstractRNNTJoint,
+        vocab_file: str,
         blank_index: int,
         max_symbols_per_step: Optional[int] = None,
         preserve_alignments: bool = False,
@@ -365,6 +366,22 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
             preserve_frame_confidence=preserve_frame_confidence,
             confidence_method_cfg=confidence_method_cfg,
         )
+
+        print("VOCAB IS", vocab_file)
+        self.is_special_list = self.read_vocab_file(vocab_file)
+
+    def read_vocab_file(self, vocab_file):
+        if vocab_file == '':
+            return None
+        ifile = open(vocab_file, 'r')
+        is_special_list = []
+        for line in ifile:
+            token, _ = line.split()
+            is_special = token[0] == '▁' or token[-1] == '>'
+            is_special_list.append(is_special)
+
+        is_special_list.append(True)  # for blank
+        return is_special_list
 
     @typecheck()
     def forward(
@@ -471,6 +488,9 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                 # torch.max(0) op doesnt exist for FP 16.
                 if logp.dtype != torch.float32:
                     logp = logp.float()
+
+                if time_idx % 14 == 13 and self.is_special_list[last_label]:
+                    logp[-1] -= 999.9
 
                 # get index k, of max prob
                 v, k = logp.max(0)
