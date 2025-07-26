@@ -292,8 +292,8 @@ class WER(Metric):
         self,
         predictions: torch.Tensor,
         predictions_lengths: torch.Tensor,
-        targets: torch.Tensor,
-        targets_lengths: torch.Tensor,
+        targets, #: torch.Tensor,
+        targets_lengths, #: torch.Tensor,
         predictions_mask: Optional[torch.Tensor] = None,
         input_ids: Optional[torch.Tensor] = None,
     ):
@@ -312,16 +312,22 @@ class WER(Metric):
         scores = 0
         references = []
         with torch.no_grad():
-            tgt_lenths_cpu_tensor = targets_lengths.long().cpu()
-            targets_cpu_tensor = targets.long().cpu()
+#            print("HERE TWO")
+#            print("targets", targets)
+#            print("len", targets_lengths)
+#            tgt_lenths_cpu_tensor = targets_lengths.long().cpu()
+#            targets_cpu_tensor = targets.long().cpu()
             # check batch_dim_index is first dim
             if self.batch_dim_index != 0:
+                assert False
                 targets_cpu_tensor = move_dimension_to_the_front(targets_cpu_tensor, self.batch_dim_index)
             # iterate over batch
-            for ind in range(targets_cpu_tensor.shape[0]):
-                tgt_len = tgt_lenths_cpu_tensor[ind].item()
-                target = targets_cpu_tensor[ind][:tgt_len].numpy().tolist()
-                reference = self.decoding.decode_tokens_to_str(target)
+            for ind in range(predictions.shape[0]):
+#                tgt_len = tgt_lenths_cpu_tensor[ind].item()
+#                target = targets_cpu_tensor[ind][:tgt_len].numpy().tolist()
+#                reference = self.decoding.decode_tokens_to_str(target)
+                reference = targets[ind]
+
                 references.append(reference)
             hypotheses = self.decode(predictions, predictions_lengths, predictions_mask, input_ids, targets)
 

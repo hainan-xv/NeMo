@@ -170,7 +170,8 @@ class AudioText(_Collection):
                         else:
                             raise ValueError("lang required in manifest when using aggregate tokenizers")
                     else:
-                        text_tokens = parser(text)
+                        text_tokens = text
+#                        text_tokens = parser(text)
                 else:
                     text_tokens = []
 

@@ -632,19 +632,19 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
         self._test_dl = self._setup_dataloader_from_config(config=test_data_config)
 
-    @property
-    def input_types(self) -> Optional[Dict[str, NeuralType]]:
-        if hasattr(self.preprocessor, '_sample_rate'):
-            input_signal_eltype = AudioSignal(freq=self.preprocessor._sample_rate)
-        else:
-            input_signal_eltype = AudioSignal()
-
-        return {
-            "input_signal": NeuralType(('B', 'T'), input_signal_eltype, optional=True),
-            "input_signal_length": NeuralType(tuple('B'), LengthsType(), optional=True),
-            "processed_signal": NeuralType(('B', 'D', 'T'), SpectrogramType(), optional=True),
-            "processed_signal_length": NeuralType(tuple('B'), LengthsType(), optional=True),
-        }
+#    @property
+#    def input_types(self) -> Optional[Dict[str, NeuralType]]:
+#        if hasattr(self.preprocessor, '_sample_rate'):
+#            input_signal_eltype = AudioSignal(freq=self.preprocessor._sample_rate)
+#        else:
+#            input_signal_eltype = AudioSignal()
+#
+#        return {
+#            "input_signal": NeuralType(('B', 'T'), input_signal_eltype, optional=True),
+#            "input_signal_length": NeuralType(tuple('B'), LengthsType(), optional=True),
+#            "processed_signal": NeuralType(('B', 'D', 'T'), SpectrogramType(), optional=True),
+#            "processed_signal_length": NeuralType(tuple('B'), LengthsType(), optional=True),
+#        }
 
     @property
     def output_types(self) -> Optional[Dict[str, NeuralType]]:
@@ -712,7 +712,11 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         if AccessMixin.is_access_enabled(self.model_guid):
             AccessMixin.reset_registry(self)
 
-        signal, signal_len, transcript, transcript_len = batch
+        signal, signal_len, text, transcript_len = batch
+
+        transcript, transcript_len = tokenize_transcript(text, self.joint.vocabulary)
+        transcript = transcript.to(signal.device)
+        transcript_len = transcript_len.to(signal.device)
 
         # forward() only performs encoder forward
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
@@ -756,7 +760,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 self.wer.update(
                     predictions=encoded,
                     predictions_lengths=encoded_len,
-                    targets=transcript,
+                    targets=text,
                     targets_lengths=transcript_len,
                 )
                 _, scores, words = self.wer.compute()
@@ -1085,3 +1089,75 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
     @wer.setter
     def wer(self, wer):
         self._wer = wer
+
+
+
+
+
+
+
+
+def tokenize_transcript(transcript, vocabulary):
+    """
+    Tokenize transcript sentences using subword vocabulary.
+    
+    Args:
+        transcript: List of strings, each being a complete sentence
+        vocabulary: List of strings, each being a subword token
+        
+    Returns:
+        tokens: Tensor of shape [B, U] with token IDs, padded with zeros
+        transcript_len: Tensor of shape [B] with actual lengths before padding
+    """
+    # Create vocabulary lookup
+    vocab_to_id = {token: idx for idx, token in enumerate(vocabulary)}
+    
+    all_token_ids = []
+    
+    for sentence in transcript:
+        # Split into words and add begin-of-word character
+        words = sentence.split()
+        prefixed_words = ["▁" + word for word in words]
+        
+        sentence_token_ids = []
+        
+        for word in prefixed_words:
+            # Greedy left-to-right longest match
+            i = 0
+            while i < len(word):
+                # Find longest match starting at position i
+                longest_match = None
+                longest_match_len = 0
+                
+                for j in range(len(word), i, -1):  # Try from longest to shortest
+                    candidate = word[i:j]
+                    if candidate in vocab_to_id:
+                        longest_match = candidate
+                        longest_match_len = j - i
+                        break
+                
+                if longest_match is None:
+                    raise ValueError(f"Cannot tokenize word '{word}' at position {i}")
+                
+                sentence_token_ids.append(vocab_to_id[longest_match])
+                i += longest_match_len
+        
+        all_token_ids.append(sentence_token_ids)
+    
+    # Get lengths before padding
+    lengths = [len(token_ids) for token_ids in all_token_ids]
+    max_length = max(lengths) if lengths else 0
+    
+    # Pad sequences with zeros
+    padded_sequences = []
+    for token_ids in all_token_ids:
+        padded = token_ids + [0] * (max_length - len(token_ids))
+        padded_sequences.append(padded)
+    
+    # Convert to tensors
+    tokens = torch.tensor(padded_sequences, dtype=torch.long)
+    transcript_len = torch.tensor(lengths, dtype=torch.long)
+    
+    return tokens, transcript_len
+
+

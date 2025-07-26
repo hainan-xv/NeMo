@@ -76,9 +76,9 @@ def _speech_collate_fn(batch, pad_id):
     has_audio = audio_lengths[0] is not None
     if has_audio:
         max_audio_len = max(audio_lengths).item()
-    has_tokens = tokens_lengths[0] is not None
-    if has_tokens:
-        max_tokens_len = max(tokens_lengths).item()
+    has_tokens = True # tokens_lengths[0] is not None
+#    if has_tokens:
+#        max_tokens_len = max(tokens_lengths).item()
 
     audio_signal, tokens = [], []
     for b in batch:
@@ -93,10 +93,10 @@ def _speech_collate_fn(batch, pad_id):
                 sig = torch.nn.functional.pad(sig, pad)
             audio_signal.append(sig)
         if has_tokens:
-            tokens_i_len = tokens_i_len.item()
-            if tokens_i_len < max_tokens_len:
-                pad = (0, max_tokens_len - tokens_i_len)
-                tokens_i = torch.nn.functional.pad(tokens_i, pad, value=pad_id)
+#            tokens_i_len = tokens_i_len.item()
+#            if tokens_i_len < max_tokens_len:
+#                pad = (0, max_tokens_len - tokens_i_len)
+#                tokens_i = torch.nn.functional.pad(tokens_i, pad, value=pad_id)
             tokens.append(tokens_i)
 
     if has_audio:
@@ -104,15 +104,16 @@ def _speech_collate_fn(batch, pad_id):
         audio_lengths = torch.stack(audio_lengths)
     else:
         audio_signal, audio_lengths = None, None
-    if has_tokens:
-        tokens = torch.stack(tokens)
-        tokens_lengths = torch.stack(tokens_lengths)
-    else:
-        tokens = None
-        tokens_lengths = None
+#    if has_tokens:
+#        tokens = torch.stack(tokens)
+#        tokens_lengths = torch.stack(tokens_lengths)
+#    else:
+#        tokens = None
+#        tokens_lengths = None
     if sample_ids is None:
-        return audio_signal, audio_lengths, tokens, tokens_lengths
+        return audio_signal, audio_lengths, tokens, 0
     else:
+        assert False
         sample_ids = torch.tensor(sample_ids, dtype=torch.int32)
         return audio_signal, audio_lengths, tokens, tokens_lengths, sample_ids
 
@@ -429,16 +430,16 @@ class _AudioTextDataset(Dataset):
         manifest_parse_func: Optional function to parse manifest entries. Defaults to None.
     """
 
-    @property
-    def output_types(self) -> Optional[Dict[str, NeuralType]]:
-        """Returns definitions of module output ports."""
-        return {
-            'audio_signal': NeuralType(('B', 'T'), AudioSignal()),
-            'a_sig_length': NeuralType(tuple('B'), LengthsType()),
-            'transcripts': NeuralType(('B', 'T'), LabelsType()),
-            'transcript_length': NeuralType(tuple('B'), LengthsType()),
-            'sample_id': NeuralType(tuple('B'), LengthsType(), optional=True),
-        }
+#    @property
+#    def output_types(self) -> Optional[Dict[str, NeuralType]]:
+#        """Returns definitions of module output ports."""
+#        return {
+#            'audio_signal': NeuralType(('B', 'T'), AudioSignal()),
+#            'a_sig_length': NeuralType(tuple('B'), LengthsType()),
+#            'transcripts': NeuralType(('B', 'T'), LabelsType()),
+#            'transcript_length': NeuralType(tuple('B'), LengthsType()),
+#            'sample_id': NeuralType(tuple('B'), LengthsType(), optional=True),
+#        }
 
     def __init__(
         self,
@@ -463,6 +464,8 @@ class _AudioTextDataset(Dataset):
 
         # If necessary, cache manifests and audio from object store
         cache_datastore_manifests(manifest_filepaths=manifest_filepath, cache_audio=True)
+
+        parser = None
 
         self.manifest_processor = ASRManifestProcessor(
             manifest_filepath=manifest_filepath,
@@ -511,7 +514,8 @@ class _AudioTextDataset(Dataset):
         if self.return_sample_id:
             output = f, fl, torch.tensor(t).long(), torch.tensor(tl).long(), index
         else:
-            output = f, fl, torch.tensor(t).long(), torch.tensor(tl).long()
+#            output = f, fl, torch.tensor(t).long(), torch.tensor(tl).long()
+            output = f, fl, t, 0 
 
         return output
 
@@ -652,16 +656,16 @@ class AudioToBPEDataset(_AudioTextDataset):
         manifest_parse_func: Optional function to parse manifest entries. Defaults to None.
     """
 
-    @property
-    def output_types(self) -> Optional[Dict[str, NeuralType]]:
-        """Returns definitions of module output ports."""
-        return {
-            'audio_signal': NeuralType(('B', 'T'), AudioSignal()),
-            'a_sig_length': NeuralType(tuple('B'), LengthsType()),
-            'transcripts': NeuralType(('B', 'T'), LabelsType()),
-            'transcript_length': NeuralType(tuple('B'), LengthsType()),
-            'sample_id': NeuralType(tuple('B'), LengthsType(), optional=True),
-        }
+#    @property
+#    def output_types(self) -> Optional[Dict[str, NeuralType]]:
+#        """Returns definitions of module output ports."""
+#        return {
+#            'audio_signal': NeuralType(('B', 'T'), AudioSignal()),
+#            'a_sig_length': NeuralType(tuple('B'), LengthsType()),
+#            'transcripts': NeuralType(('B', 'T'), LabelsType()),
+#            'transcript_length': NeuralType(tuple('B'), LengthsType()),
+#            'sample_id': NeuralType(tuple('B'), LengthsType(), optional=True),
+#        }
 
     def __init__(
         self,
