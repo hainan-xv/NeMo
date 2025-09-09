@@ -228,18 +228,18 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             }
         )
 
-    @property
-    def output_types(self):
-        """Returns definitions of module output ports."""
-        return OrderedDict(
-            {
-                "outputs": NeuralType(('B', 'D', 'T'), AcousticEncodedRepresentation()),
-                "encoded_lengths": NeuralType(('B', 'T'), LengthsType()),
-                "cache_last_channel_next": NeuralType(('D', 'B', 'T', 'D'), ChannelType(), optional=True),
-                "cache_last_time_next": NeuralType(('D', 'B', 'D', 'T'), ChannelType(), optional=True),
-                "cache_last_channel_next_len": NeuralType(tuple('B'), LengthsType(), optional=True),
-            }
-        )
+#    @property
+#    def output_types(self):
+#        """Returns definitions of module output ports."""
+#        return OrderedDict(
+#            {
+#                "outputs": NeuralType(('B', 'D', 'T'), AcousticEncodedRepresentation()),
+#                "encoded_lengths": NeuralType(('B', 'T'), LengthsType()),
+#                "cache_last_channel_next": NeuralType(('D', 'B', 'T', 'D'), ChannelType(), optional=True),
+#                "cache_last_time_next": NeuralType(('D', 'B', 'D', 'T'), ChannelType(), optional=True),
+#                "cache_last_channel_next_len": NeuralType(tuple('B'), LengthsType(), optional=True),
+#            }
+#        )
 
     @property
     def output_types_for_export(self):
@@ -677,8 +677,11 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                 torch.clamp(cache_last_channel_len + cache_keep_size, max=cache_len),
             )
         else:
-            chunked, length = chunk_concat_audio(audio_signal.transpose(1, 2), length, chunk_size)
-            audio_signal = chunked.transpose(1,2)
+            if chunk_size != -1:
+                chunked, length = chunk_concat_audio(audio_signal.transpose(1, 2), length, chunk_size)
+                audio_signal = chunked.transpose(1,2)
+            else:
+                audio_signal = audio_signal.transpose(1,2)
             return audio_signal, length
 
     def update_max_seq_length(self, seq_length: int, device):

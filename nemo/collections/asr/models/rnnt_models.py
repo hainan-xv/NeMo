@@ -50,6 +50,7 @@ from nemo.core.classes.mixins import AccessMixin
 from nemo.core.neural_types import AcousticEncodedRepresentation, AudioSignal, LengthsType, NeuralType, SpectrogramType, IntType
 from nemo.utils import logging
 
+from nemo.collections.asr.modules.conformer_encoder import chunk_concat_audio
 
 class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTranscriptionMixin):
     """Base class for encoder decoder RNNT-based models."""
@@ -650,12 +651,12 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             "processed_signal_length": NeuralType(tuple('B'), LengthsType(), optional=True),
         }
 
-    @property
-    def output_types(self) -> Optional[Dict[str, NeuralType]]:
-        return {
-            "outputs": NeuralType(('B', 'D', 'T'), AcousticEncodedRepresentation()),
-            "encoded_lengths": NeuralType(('B', 'T'), LengthsType()),
-        }
+#    @property
+#    def output_types(self) -> Optional[Dict[str, NeuralType]]:
+#        return {
+#            "outputs": NeuralType(('B', 'D', 'T'), AcousticEncodedRepresentation()),
+#            "encoded_lengths": NeuralType(('B', 'T'), LengthsType()),
+#        }
 
     @typecheck()
     def forward(
@@ -723,13 +724,12 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
         signal, signal_len, transcript, transcript_len = batch
 
-        chunk_size = random.choice(self.sample_sizes)
 
         # forward() only performs encoder forward
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
             encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
         else:
-            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len, chunk_size=chunk_size)
+            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len, chunk_size=-1)
         del signal
 
         # During training, loss must be computed, so decoder forward is necessary
@@ -744,35 +744,40 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
         # If experimental fused Joint-Loss-WER is not used
         if not self.joint.fuse_loss_wer:
-            # Compute full joint and loss
-            joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder, encoder_lengths=encoded_len)
-            loss_value = self.loss(
-                log_probs=joint, targets=transcript, input_lengths=(encoded_len != 0).sum(dim=1), target_lengths=target_length
-            )
 
-            # Add auxiliary losses, if registered
-            loss_value = self.add_auxiliary_losses(loss_value)
-
-            # Reset access registry
-            if AccessMixin.is_access_enabled(self.model_guid):
-                AccessMixin.reset_registry(self)
-
-            tensorboard_logs = {
-                'train_loss': loss_value,
-                'learning_rate': self._optimizer.param_groups[0]['lr'],
-                'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
-            }
-
-            if (sample_id + 1) % log_every_n_steps == 0:
-                self.wer.update(
-                    predictions=encoded,
-                    predictions_lengths=encoded_len,
-                    targets=transcript,
-                    targets_lengths=transcript_len,
+            loss_value = 0
+            for chunk_size in self.sample_sizes:
+                chunked, length = chunk_concat_audio(encoded, encoded_len, chunk_size)
+                # Compute full joint and loss
+                joint = self.joint(encoder_outputs=chunked.transpose(1,2), decoder_outputs=decoder, encoder_lengths=length)
+                loss_value += self.loss(
+                    log_probs=joint, targets=transcript, input_lengths=(length != 0).sum(dim=1), target_lengths=target_length
                 )
-                _, scores, words = self.wer.compute()
-                self.wer.reset()
-                tensorboard_logs.update({'training_batch_wer': scores.float() / words})
+            
+
+                # Add auxiliary losses, if registered
+                loss_value = self.add_auxiliary_losses(loss_value)
+
+                # Reset access registry
+                if AccessMixin.is_access_enabled(self.model_guid):
+                    AccessMixin.reset_registry(self)
+
+                tensorboard_logs = {
+                    'train_loss': loss_value,
+                    'learning_rate': self._optimizer.param_groups[0]['lr'],
+                    'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
+                }
+
+                if (sample_id + 1) % log_every_n_steps == 0:
+                    self.wer.update(
+                        predictions=chunked,
+                        predictions_lengths=length,
+                        targets=transcript,
+                        targets_lengths=transcript_len,
+                    )
+                    _, scores, words = self.wer.compute()
+                    self.wer.reset()
+                    tensorboard_logs.update({'training_batch_wer': scores.float() / words})
 
         else:
             # If experimental fused Joint-Loss-WER is used
