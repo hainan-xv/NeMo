@@ -752,7 +752,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 joint = self.joint(encoder_outputs=chunked.transpose(1,2), decoder_outputs=decoder, encoder_lengths=length)
                 loss_value += self.loss(
                     log_probs=joint, targets=transcript, input_lengths=(length != 0).sum(dim=1), target_lengths=target_length
-                )
+                ) / len(self.sample_sizes)
             
 
                 # Add auxiliary losses, if registered
@@ -762,22 +762,24 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 if AccessMixin.is_access_enabled(self.model_guid):
                     AccessMixin.reset_registry(self)
 
-                tensorboard_logs = {
-                    'train_loss': loss_value,
-                    'learning_rate': self._optimizer.param_groups[0]['lr'],
-                    'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
-                }
 
-                if (sample_id + 1) % log_every_n_steps == 0:
-                    self.wer.update(
-                        predictions=chunked,
-                        predictions_lengths=length,
-                        targets=transcript,
-                        targets_lengths=transcript_len,
-                    )
-                    _, scores, words = self.wer.compute()
-                    self.wer.reset()
-                    tensorboard_logs.update({'training_batch_wer': scores.float() / words})
+            tensorboard_logs = {
+                'train_loss': loss_value,
+                'learning_rate': self._optimizer.param_groups[0]['lr'],
+                'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
+            }
+
+            if (sample_id + 1) % log_every_n_steps == 0:
+                self.wer.update(
+                    predictions=chunked.transpose(1,2),
+                    predictions_lengths=length,
+                    targets=transcript,
+                    targets_lengths=transcript_len,
+                )
+                _, scores, words = self.wer.compute()
+                self.wer.reset()
+                tensorboard_logs.update({'training_batch_wer': scores.float() / words})
+
 
         else:
             # If experimental fused Joint-Loss-WER is used
