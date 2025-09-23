@@ -1839,8 +1839,8 @@ class RNNTAttJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMix
         """
        
         # Append zero frame (same as original)
-        zeros = torch.zeros_like(f[:, :, :1, :])  # [B, T, 1, D]
-        f = torch.cat([f, zeros], dim=2)  # [B, T, C+1, D]
+#        zeros = torch.zeros_like(f[:, :, :1, :])  # [B, T, 1, D]
+#        f = torch.cat([f, zeros], dim=2)  # [B, T, C+1, D]
         
         B, T, C, D = f.shape
         B, U, D = g.shape
