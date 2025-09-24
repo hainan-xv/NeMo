@@ -878,7 +878,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
             self.wer.update(
                 predictions=encoded,
-                predictions_lengths=encoded_len,
+                predictions_lengths=length,
                 targets=transcript,
                 targets_lengths=transcript_len,
             )
