@@ -1886,7 +1886,7 @@ class RNNTAttJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMix
         indices = torch.arange(C, device=attention_scores.device).view(1, 1, 1, 1, C)
         
         # Create mask
-        mask = torch.logical_and(indices >= (sizes_expanded), indices != C - 1)
+        mask = indices >= (sizes_expanded)
 
 #        print("MASK IS", sizes, mask.shape, mask)
           
