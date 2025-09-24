@@ -834,11 +834,15 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
             encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
         else:
-            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len, chunk_size=self.inference_chunk)
+            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len, chunk_size=-1)
         del signal
 
+        chunk_size = self.sample_sizes[0]
+        chunked, length = chunk_concat_audio(encoded, encoded_len, chunk_size)
+
+
         best_hyp_text = self.decoding.rnnt_decoder_predictions_tensor(
-            encoder_output=encoded, encoded_lengths=encoded_len, return_hypotheses=False
+            encoder_output=chunked.transpose(1,2), encoded_lengths=length, return_hypotheses=False
         )
 
         if isinstance(sample_id, torch.Tensor):
@@ -852,16 +856,19 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
             encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
         else:
-            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len, chunk_size=self.inference_chunk)
+            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len, chunk_size=-1)
         del signal
 
+        chunk_size = self.sample_sizes[0]
+        chunked, length = chunk_concat_audio(encoded, encoded_len, chunk_size)
         tensorboard_logs = {}
 
         # If experimental fused Joint-Loss-WER is not used
         if not self.joint.fuse_loss_wer:
             if self.compute_eval_loss:
+                assert False
                 decoder, target_length, states = self.decoder(targets=transcript, target_length=transcript_len)
-                joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder)
+                joint = self.joint(encoder_outputs=chunked.transpose(1,2), decoder_outputs=decoder)
 
                 loss_value = self.loss(
                     log_probs=joint, targets=transcript, input_lengths=encoded_len, target_lengths=target_length
