@@ -877,7 +877,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 tensorboard_logs['val_loss'] = loss_value
 
             self.wer.update(
-                predictions=encoded,
+                predictions=chunked.transpose(1,2),
                 predictions_lengths=length,
                 targets=transcript,
                 targets_lengths=transcript_len,
