@@ -42,7 +42,7 @@ from nemo.collections.asr.parts.preprocessing.segment import ChannelSelectorType
 from nemo.collections.asr.parts.submodules.rnnt_decoding import RNNTDecoding, RNNTDecodingConfig
 from nemo.collections.asr.parts.utils.asr_batching import get_semi_sorted_batch_sampler
 from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
-from nemo.collections.asr.parts.utils.transcribe_utils import process_timestamp_outputs
+from nemo.collections.asr.parts.utils.timestamp_utils import process_timestamp_outputs
 from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
 from nemo.collections.common.parts.preprocessing.parsers import make_parser
 from nemo.core.classes.common import PretrainedModelInfo, typecheck
@@ -291,7 +291,6 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             * An optional list of beam search transcript texts / Hypothesis / NBestHypothesis.
         """
 
-#        print("HERE override_config", override_config)
         override_config.chunk_size = self.inference_chunk
 
         timestamps = timestamps or (override_config.timestamps if override_config is not None else None)
@@ -305,13 +304,13 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 with open_dict(self.cfg.decoding):
                     self.cfg.decoding.compute_timestamps = True
                     self.cfg.decoding.preserve_alignments = True
-                self.change_decoding_strategy(self.cfg.decoding, verbose=False)
             else:
                 return_hypotheses = False
                 with open_dict(self.cfg.decoding):
                     self.cfg.decoding.compute_timestamps = False
                     self.cfg.decoding.preserve_alignments = False
-                self.change_decoding_strategy(self.cfg.decoding, verbose=False)
+
+            self.change_decoding_strategy(self.cfg.decoding, verbose=False)
 
         return super().transcribe(
             audio=audio,

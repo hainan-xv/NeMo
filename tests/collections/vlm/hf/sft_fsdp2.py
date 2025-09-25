@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -123,7 +123,7 @@ if __name__ == '__main__':
                 log_every_n_steps=1,
                 limit_val_batches=0.0,
                 num_sanity_val_steps=0,
-                accumulate_grad_batches=10,
+                accumulate_grad_batches=2,
                 gradient_clip_val=grad_clip,
                 use_distributed_sampler=use_dist_samp,
                 logger=wandb,

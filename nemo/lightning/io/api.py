@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,9 +13,9 @@
 # limitations under the License.
 
 from pathlib import Path
-from typing import Callable, Optional, Type, overload
-import fiddle as fdl
+from typing import Any, Callable, Optional, Type, overload
 
+import fiddle as fdl
 import lightning.pytorch as pl
 
 from nemo.lightning.io.mixin import ConnectorMixin, ConnT, ModelConnector, load
@@ -36,7 +36,8 @@ def load_context(path: Path, subpath: Optional[str] = None, build: bool = True):
 
     Args:
         path (Path): The path to the json-file or directory containing 'io.json'.
-        subpath (Optional[str]): Subpath to selectively load only specific objects inside the TrainerContext. Defaults to None.
+        subpath (Optional[str]): Subpath to selectively load only specific objects inside the TrainerContext.
+            Defaults to None.
         build (bool): Whether to build the TrainerContext. Defaults to True.
             Otherwise, the TrainerContext is returned as a Config[TrainerContext] object.
     Returns
@@ -109,7 +110,7 @@ def model_exporter(target: Type[ConnectorMixin], ext: str) -> Callable[[Type[Con
 
 
 def import_ckpt(
-    model: pl.LightningModule, source: str, output_path: Optional[Path] = None, overwrite: bool = False
+    model: pl.LightningModule, source: str, output_path: Optional[Path] = None, overwrite: bool = False, **kwargs
 ) -> Path:
     """
     Imports a checkpoint into a model using the model's associated importer, typically for
@@ -163,18 +164,52 @@ def import_ckpt(
         raise ValueError("Model must be an instance of ConnectorMixin")
 
     importer: ModelConnector = model.importer(source)
-    ckpt_path = importer(overwrite=overwrite, output_path=output_path)
+    ckpt_path = importer(overwrite=overwrite, output_path=output_path, **kwargs)
     importer.on_import_ckpt(model)
     return ckpt_path
 
 
 def load_connector_from_trainer_ckpt(path: Path, target: str) -> ModelConnector:
-    model: pl.LightningModule = load_context(path).model
+    """
+    Loads a ModelConnector from a trainer checkpoint for exporting the model to a different format.
+    This function first loads the model from the trainer checkpoint using the TrainerContext,
+    then retrieves the appropriate exporter based on the target format.
+
+    Args:
+        path (Path): Path to the trainer checkpoint directory or file.
+        target (str): The target format identifier for which to load the connector
+            (e.g., "hf" for HuggingFace format).
+
+    Returns:
+        ModelConnector: The loaded connector instance configured for the specified target format.
+
+    Raises:
+        ValueError: If the loaded model does not implement ConnectorMixin.
+
+    Example:
+        connector = load_connector_from_trainer_ckpt(
+            Path("/path/to/checkpoint"),
+            "hf"
+        )
+    """
+    model: pl.LightningModule = load_context(path, subpath="model")
 
     if not isinstance(model, ConnectorMixin):
         raise ValueError("Model must be an instance of ConnectorMixin")
 
     return model.exporter(target, path)
+
+
+def _verify_peft_export(path: Path, target: str):
+    if target == "hf" and (path / "weights" / "adapter_metadata.json").exists():
+        raise ValueError(
+            f"Your checkpoint \n`{path}`\ncontains PEFT weights, but your specified export target `hf` should be "
+            f"used for full model checkpoints. "
+            f"\nIf you want to convert NeMo 2 PEFT to Hugging Face PEFT checkpoint, set `target='hf-peft'`. "
+            f"If you want to merge LoRA weights back to the base model and export the merged full model, "
+            f"run `llm.peft.merge_lora` first before exporting. See "
+            f"https://docs.nvidia.com/nemo-framework/user-guide/latest/sft_peft/peft_nemo2.html for more details."
+        )
 
 
 def export_ckpt(
@@ -183,6 +218,8 @@ def export_ckpt(
     output_path: Optional[Path] = None,
     overwrite: bool = False,
     load_connector: Callable[[Path, str], ModelConnector] = load_connector_from_trainer_ckpt,
+    modelopt_export_kwargs: dict[str, Any] = None,
+    **kwargs,
 ) -> Path:
     """
     Exports a checkpoint from a model using the model's associated exporter, typically for
@@ -208,6 +245,7 @@ def export_ckpt(
             This is useful for model updates where retaining old checkpoint files is not required.
         load_connector (Callable[[Path, str], ModelConnector]): A function to load the appropriate
             exporter based on the model and target format. Defaults to `load_connector_from_trainer_ckpt`.
+        modelopt_export_kwargs (Dict[str, Any]): Additional keyword arguments for ModelOpt export to HuggingFace.
 
     Returns
     -------
@@ -223,7 +261,21 @@ def export_ckpt(
         nemo_ckpt_path = Path("/path/to/model.ckpt")
         export_path = export_ckpt(nemo_ckpt_path, "hf")
     """
-    exporter: ModelConnector = load_connector(path, target)
+    from nemo.collections.llm.modelopt.quantization.quantizer import export_hf_checkpoint
+
     _output_path = output_path or Path(path) / target
 
-    return exporter(overwrite=overwrite, output_path=_output_path)
+    if target == "hf":
+        try:
+            modelopt_export_kwargs = modelopt_export_kwargs or {}
+            # First try to export via ModelOpt route. If rejected, return to the default route
+            output = export_hf_checkpoint(path, _output_path, **modelopt_export_kwargs)
+        except RuntimeError:
+            output = None
+        if output is not None:
+            return output
+
+    _verify_peft_export(path, target)
+    exporter: ModelConnector = load_connector(path, target)
+
+    return exporter(overwrite=overwrite, output_path=_output_path, **kwargs)

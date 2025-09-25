@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import logging
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Generic, Optional, TypeVar, Union
@@ -39,14 +39,12 @@ from typing_extensions import Self, override
 from nemo.lightning.ckpt_utils import WEIGHTS_PATH, ckpt_to_dir
 from nemo.lightning.io.capture import IOProtocol
 from nemo.lightning.io.mixin import IOMixin
+from nemo.utils import logging
 
 try:
     from nemo.utils.callbacks.dist_ckpt_io import AsyncCompatibleCheckpointIO
 except ImportError:
     AsyncCompatibleCheckpointIO = CheckpointIO
-
-
-log = logging.getLogger(__name__)
 
 
 LightningModuleT = TypeVar("LightningModuleT", bound=pl.LightningModule)
@@ -119,7 +117,7 @@ def ckpt_to_weights_subdir(filepath: Union[str, Path], is_saving) -> Path:
     and then return the weights subdirectory, if it exists."""
     filepath = ckpt_to_dir(filepath=filepath)
     base_dir = filepath
-    assert isinstance(base_dir, Path)
+    assert not isinstance(base_dir, str)
     if base_dir.parts[-1] != WEIGHTS_PATH:
         maybe_base_dir = base_dir / WEIGHTS_PATH
         if maybe_base_dir.is_dir() or is_saving:
@@ -131,7 +129,7 @@ def ckpt_to_weights_subdir(filepath: Union[str, Path], is_saving) -> Path:
             base_dir.base_model_path = base_dir.base_model_path / WEIGHTS_PATH
     if is_saving:
         assert base_dir.parts[-1] == WEIGHTS_PATH
-        assert base_dir.parent == Path(filepath)
+        assert base_dir.parent == filepath
     return base_dir
 
 
@@ -197,13 +195,35 @@ class MegatronCheckpointIO(AsyncCompatibleCheckpointIO, IOMixin):
         validate_sharding_integrity = not (self.validated_consistency and self.assume_constant_structure)
         self.validated_consistency = True
 
-        return dist_checkpointing.save(
+        rank = torch.distributed.get_rank()
+        iteration = _get_iteration_from_checkpoint(checkpoint)
+        start_time = time.time()
+        async_save_request = dist_checkpointing.save(
             sharded_state_dict=checkpoint,
             checkpoint_dir=checkpoint_dir,
             sharded_strategy=self.save_sharded_strategy,
             validate_access_integrity=validate_sharding_integrity,
             async_sharded_save=self.async_save,
         )
+        end_time = time.time()
+        log_parts = (
+            "Global Checkpoint Save",
+            f"Rank: {rank}",
+            f"Iteration: {iteration}" if iteration is not None else None,
+            f"Start time: {start_time:.3f}s",
+            f"Save duration: {end_time - start_time:.3f}s",
+        )
+        log_message = " : ".join(part for part in log_parts if part is not None)
+        logging.info(log_message)
+
+        def iter_finalize_fn():
+            logging.info(f'Successfully saved checkpoint from iteration {int(iteration):7d} to {path}')
+
+        if self.async_save:
+            assert async_save_request is not None
+            async_save_request.add_finalize_fn(iter_finalize_fn)
+
+        return async_save_request
 
     @override
     def load_checkpoint(
@@ -272,6 +292,7 @@ class MegatronCheckpointIO(AsyncCompatibleCheckpointIO, IOMixin):
             # Default behavior
             strict = StrictHandling.ASSUME_OK_UNEXPECTED
 
+        start_time = time.time()
         checkpoint = dist_checkpointing.load(
             sharded_state_dict=sharded_state_dict,
             checkpoint_dir=str(path),
@@ -279,7 +300,14 @@ class MegatronCheckpointIO(AsyncCompatibleCheckpointIO, IOMixin):
             strict=strict,
         )
         checkpoint = _fix_tensors_device(checkpoint)
-
+        end_time = time.time()
+        duration = end_time - start_time
+        logging.info(
+            "Global Checkpoint Load : "
+            f"Rank : {torch.distributed.get_rank()} : "
+            f"Start time : {start_time:.3f}s : "
+            f"Time spent in load_checkpoint: {duration:.3f}s"
+        )
         return checkpoint
 
     @override
@@ -293,7 +321,7 @@ class MegatronCheckpointIO(AsyncCompatibleCheckpointIO, IOMixin):
         fs = get_filesystem(path)
         if fs.exists(path):
             fs.rm(path, recursive=True)
-            log.debug(f"Removed checkpoint: {path}")
+            logging.debug(f"Removed checkpoint: {path}")
 
     def _determine_dist_ckpt_save_strategy(self):
         """Determine the saving strategy based on constructor args.
@@ -433,3 +461,13 @@ def is_distributed_ckpt(path) -> bool:
     checkpoint_dir = ckpt_to_dir(path)
     fs = get_filesystem(checkpoint_dir)
     return fs.isdir(checkpoint_dir) and dist_checkpointing.check_is_distributed_checkpoint(checkpoint_dir)
+
+
+def _get_iteration_from_checkpoint(checkpoint: Dict[str, Any]) -> Optional[int]:
+    return (
+        checkpoint.get("loops", {})
+        .get("fit_loop", {})
+        .get("epoch_loop.batch_progress", {})
+        .get("total", {})
+        .get("completed", None)
+    )

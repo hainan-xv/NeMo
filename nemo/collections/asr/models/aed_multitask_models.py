@@ -18,7 +18,6 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from math import ceil
 from typing import Any, Dict, List, Optional, Union
-
 import numpy as np
 import torch
 from lightning.pytorch import Trainer
@@ -29,7 +28,7 @@ from nemo.collections.asr.data.audio_to_text_lhotse_prompted import (
     PromptedAudioToTextLhotseDataset,
     PromptedAudioToTextMiniBatch,
 )
-from nemo.collections.asr.metrics import BLEU, WER
+from nemo.collections.asr.metrics import MultiTaskMetric
 from nemo.collections.asr.models.asr_model import ASRModel, ExportableEncDecModel
 from nemo.collections.asr.parts.mixins import ASRBPEMixin, ASRModuleMixin, ASRTranscriptionMixin
 from nemo.collections.asr.parts.mixins.transcription import (
@@ -41,6 +40,7 @@ from nemo.collections.asr.parts.preprocessing.segment import ChannelSelectorType
 from nemo.collections.asr.parts.submodules.multitask_decoding import MultiTaskDecoding, MultiTaskDecodingConfig
 from nemo.collections.asr.parts.submodules.token_classifier import TokenClassifier
 from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
+from nemo.collections.asr.parts.utils.timestamp_utils import process_aed_timestamp_outputs
 from nemo.collections.common import tokenizers
 from nemo.collections.common.data.lhotse.dataloader import get_lhotse_dataloader_from_config
 from nemo.collections.common.metrics import GlobalAverageLossMetric
@@ -221,12 +221,22 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
 
         self.val_loss = GlobalAverageLossMetric(dist_sync_on_step=False, take_avg_loss=True)
 
-        # TODO: PytorchMetrics lets you join two metrics together to save compute.
-        # But need to make wer and bleu have same outputs first
-        self.wer = WER(self.decoding, log_prediction=self.cfg.get("log_prediction"))
-        self.bleu = BLEU(
-            self.decoding, tokenize=self.cfg.get('bleu_tokenizer', "13a"), log_prediction=False
-        )  # Wer is handling logging
+        # Setup metric logger. Use `get` for backcompatibility with aed checkpointing.
+        if (metric_cfg := cfg.get("multitask_metrics_cfg")) is None:
+            metric_cfg = DictConfig(
+                {
+                    "metrics": {
+                        "wer": {
+                            "_target_": "nemo.collections.asr.metrics.WER",
+                        },
+                        "bleu": {
+                            "_target_": "nemo.collections.asr.metrics.BLEU",
+                        },
+                    }
+                }
+            )
+        self.metric_cfg = metric_cfg
+        self.metric = MultiTaskMetric(model=self, cfg=metric_cfg)
 
         # Setup encoder adapters (from ASRAdapterModelMixin)
         self.setup_adapters()
@@ -255,6 +265,9 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
             log_softmax_module=self.log_softmax,
             tokenizer=self.tokenizer,
         )
+
+        # Update metric logger
+        self.metric = MultiTaskMetric(model=self, cfg=self.metric_cfg)
 
         # Update config
         with open_dict(self.cfg.decoding):
@@ -381,6 +394,9 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
             tokenizer=self.tokenizer,
         )
 
+        # Update metric logger
+        self.metric = MultiTaskMetric(model=self, cfg=self.metric_cfg)
+
         with open_dict(self.cfg.decoding):
             self.cfg.decoding = decoding_cfg
 
@@ -443,6 +459,9 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
             defaults=OmegaConf.to_container(pd) if (pd := self.cfg.get('prompt_defaults')) is not None else None,
         )
 
+        # Update metric logger
+        self.metric = MultiTaskMetric(model=self, cfg=self.metric_cfg)
+
         # Update config
         with open_dict(self.cfg):
             self.cfg.prompt_format = self.prompt_format
@@ -498,8 +517,17 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
             A list of transcriptions (or raw log probabilities if logprobs is True) in the same order 
             as paths2audio_files
         """
-        if timestamps:
-            raise NotImplementedError("Computing timestamps are not supported for this model yet.")
+        if timestamps is not None:
+            # TODO: Handle this key gracefully later
+
+            if timestamps is True:
+                timestamps = 'yes'
+            elif timestamps is False:
+                timestamps = 'no'
+            else:
+                timestamps = str(timestamps)
+                assert timestamps in ('yes', 'no', 'timestamp', 'notimestamp', '1', '0')
+            prompt['timestamp'] = timestamps
 
         if override_config is None:
             trcfg = MultiTaskTranscriptionConfig(
@@ -690,7 +718,6 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
 
     # PTL-specific methods
     def training_step(self, batch: PromptedAudioToTextMiniBatch, batch_nb):
-
         if batch is None:
             return torch.tensor([0.0])
 
@@ -717,19 +744,37 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
             loss_mask = lens_to_mask(input_ids_lens, maxlen) & ~lens_to_mask(batch.prompt_lens - 1, maxlen)
         else:
             loss_mask = None
-        audio_loss = self.loss(log_probs=transf_log_probs, labels=labels, output_mask=loss_mask)
+        transf_loss = self.loss(log_probs=transf_log_probs, labels=labels, output_mask=loss_mask)
 
-        tensorboard_logs = {
-            'train_loss': audio_loss,
-            'learning_rate': torch.as_tensor(self._optimizer.param_groups[0]['lr']),
-            'batch_size': torch.as_tensor(batch.audio.shape[0]),
-            'num_frames': num_frames,
-            'num_tokens': num_tokens,
-            'input_to_padding_ratio': num_frames / tot_frames,
-            'output_to_padding_ratio': num_tokens / tot_tokens,
-        }
+        # Train step evaluation. From other asr models.
+        if hasattr(self, '_trainer') and self._trainer is not None:
+            log_every_n_steps = self._trainer.log_every_n_steps
+        else:
+            log_every_n_steps = 1
+        metric_dict = (
+            self.metric.eval(
+                batch=batch,
+                predictions=enc_states,
+                predictions_lengths=encoded_len,
+                predictions_mask=enc_mask,
+                prefix="training_batch",
+            )
+            if (batch_nb + 1) % log_every_n_steps == 0
+            else {}
+        )
 
-        return {'loss': audio_loss, 'log': tensorboard_logs}
+        metric_dict.update(
+            {
+                'train_loss': transf_loss,
+                'learning_rate': torch.as_tensor(self._optimizer.param_groups[0]['lr']),
+                'batch_size': torch.as_tensor(batch.audio.shape[0]),
+                'num_frames': num_frames,
+                'num_tokens': num_tokens,
+                'input_to_padding_ratio': num_frames / tot_frames,
+                'output_to_padding_ratio': num_tokens / tot_tokens,
+            }
+        )
+        return {"loss": transf_loss, "log": metric_dict}
 
     def validation_pass(self, batch: PromptedAudioToTextMiniBatch, batch_idx, dataloader_idx=0, eval_mode="val"):
         input_ids, labels = batch.get_decoder_inputs_outputs()
@@ -752,35 +797,20 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
         else:
             loss_mask = None
             num_measurements = transf_log_probs.shape[0] * transf_log_probs.shape[1]
+
         transf_loss = self.loss(log_probs=transf_log_probs, labels=labels, output_mask=loss_mask)
         self.val_loss(loss=transf_loss, num_measurements=num_measurements)
-        output_dict = {f'{eval_mode}_loss': transf_loss}
 
-        self.wer.update(
+        metric_dict = self.metric.eval(
+            batch=batch,
             predictions=enc_states,
             predictions_lengths=encoded_len,
-            targets=batch.transcript,
-            targets_lengths=batch.transcript_lens,
             predictions_mask=enc_mask,
-            input_ids=batch.prompt,
+            prefix=eval_mode,
+            return_all_metrics=True,  # Need all metrics for computation at end of cycle.
         )
-        wer, wer_num, wer_denom = self.wer.compute()
-        output_dict.update({"val_wer": wer, "val_wer_num": wer_num, "val_wer_denom": wer_denom})
-        self.wer.reset()
-
-        self.bleu.update(
-            predictions=enc_states,
-            predictions_lengths=encoded_len,
-            targets=batch.transcript,
-            targets_lengths=batch.transcript_lens,
-            predictions_mask=enc_mask,
-            input_ids=batch.prompt,
-        )
-        bleu_metrics = self.bleu.compute(prefix=f"{eval_mode}_")
-        output_dict.update(bleu_metrics)
-        self.bleu.reset()
-
-        return output_dict
+        metric_dict[f"{eval_mode}_loss"] = transf_loss
+        return metric_dict
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         metrics = self.validation_pass(batch, batch_idx, dataloader_idx, eval_mode="val")
@@ -792,10 +822,10 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
 
     def test_step(self, batch, batch_idx, dataloader_idx=0):
         metrics = self.validation_pass(batch, batch_idx, dataloader_idx, eval_mode="test")
-        if type(self.trainer.val_dataloaders) == list and len(self.trainer.val_dataloaders) > 1:
-            self.validation_step_outputs[dataloader_idx].append(metrics)
+        if type(self.trainer.test_dataloaders) == list and len(self.trainer.test_dataloaders) > 1:
+            self.test_step_outputs[dataloader_idx].append(metrics)
         else:
-            self.validation_step_outputs.append(metrics)
+            self.test_step_outputs.append(metrics)
         return metrics
 
     def test_dataloader(self):
@@ -958,19 +988,23 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
 
         del enc_states, enc_mask, decoder_input_ids
 
+        hypotheses = process_aed_timestamp_outputs(
+            hypotheses, self.encoder.subsampling_factor, self.cfg['preprocessor']['window_stride']
+        )
+
         return hypotheses
 
     def _setup_transcribe_dataloader(self, config: Dict) -> 'torch.utils.data.DataLoader':
         """
         Setup function for a temporary data loader which wraps the provided audio file.
         Args:
-            config: A python dictionary which contains the following keys:
-            paths2audio_files: (a list) of paths to audio files. The files should be relatively short fragments. \
-                Recommended length per file is between 5 and 25 seconds.
-            batch_size: (int) batch size to use during inference. \
-                Bigger will result in better throughput performance but would use more memory.
-            temp_dir: (str) A temporary directory where the audio manifest is temporarily
-                stored.
+            config: A python dictionary which contains keys such as:
+                paths2audio_files: (a list) of paths to audio files. The files should be relatively short fragments. \
+                    Recommended length per file is between 5 and 25 seconds.
+                batch_size: (int) batch size to use during inference. \
+                    Bigger will result in better throughput performance but would use more memory.
+                temp_dir: (str) A temporary directory where the audio manifest is temporarily
+                    stored.
         Returns:
             A pytorch DataLoader for the given audio file(s).
         """
@@ -987,7 +1021,7 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
             'batch_size': batch_size,
             'trim_silence': False,
             'shuffle': False,
-            'num_workers': min(batch_size, os.cpu_count() - 1),
+            'num_workers': config.get('num_workers', min(batch_size, os.cpu_count() - 1)),
             'pin_memory': True,
             'use_lhotse': True,
             'use_bucketing': False,
@@ -1042,7 +1076,26 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
                 raise ValueError(f"Expected str or dict, got {type(item)}")
             default_turn = [t for t in trcfg.prompt if t["role"] == "user"]
             default_turn = default_turn[0]["slots"] if default_turn else {}
-            for k, dv in (("source_lang", "en"), ("target_lang", "en"), ("taskname", "asr"), ("pnc", "yes")):
+
+            # check for prompt format
+            if self.prompt_format == 'canary':
+                if 'timestamp' in default_turn and default_turn['timestamp']:
+                    raise ValueError(
+                        "Timestamp feature is not supported in Canary prompt format. Please use latest canary-1b-flash or canary-180m-flash"
+                    )
+                if 'context' in default_turn and default_turn['context']:
+                    raise ValueError(
+                        "Context feature is not supported in Canary prompt format. Please use latest canary-1b-flash or canary-180m-flash"
+                    )
+
+            for k, dv in (
+                ("source_lang", "en"),
+                ("target_lang", "en"),
+                ("taskname", "asr"),
+                ("pnc", "yes"),
+                ("context", ""),
+                ("timestamp", 'notimestamp'),
+            ):
                 if k not in entry:
                     # last-chance fallback injecting legacy Canary defaults if none were provided.
                     entry[k] = default_turn.get(k, dv)
@@ -1080,16 +1133,21 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
             processed_signal_length=processed_signal_length,
         )
 
-        text = self.decoding.decode_predictions_tensor(
+        hypotheses = self.decoding.decode_predictions_tensor(
             encoder_hidden_states=enc_states,
             encoder_input_mask=enc_mask,
             decoder_input_ids=batch.prompt,
             return_hypotheses=False,
         )
+
+        hypotheses = process_aed_timestamp_outputs(
+            hypotheses, self.encoder.subsampling_factor, self.cfg['preprocessor']['window_stride']
+        )
+
         if batch.cuts:
-            return list(zip(batch.cuts, text))
+            return list(zip(batch.cuts, hypotheses))
         else:
-            return text
+            return hypotheses
 
     @property
     def adapter_module_names(self) -> List[str]:

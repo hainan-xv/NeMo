@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# pylint: skip-file
+# flake8: noqa
+
 import itertools
 import re
 from collections import OrderedDict
@@ -24,7 +27,15 @@ from omegaconf.omegaconf import open_dict
 from torch import Tensor
 
 from nemo.collections.common.tokenizers.sentencepiece_tokenizer import SentencePieceTokenizer
-from nemo.collections.nlp.metrics.prompt_learning_metrics import AccuracyScore, BLEUScore, ROUGEScores
+
+try:
+    from nemo.collections.nlp.metrics.prompt_learning_metrics import AccuracyScore, BLEUScore, ROUGEScores
+except ModuleNotFoundError:
+    from abc import ABC
+
+    AccuracyScore = ABC
+    BLEUScore = ABC
+    ROUGEScores = ABC
 from nemo.collections.nlp.models.language_modeling.megatron_base_model import MegatronBaseModel
 from nemo.collections.nlp.modules.common import (
     PromptEncoder,
@@ -178,7 +189,7 @@ class MegatronBasePromptLearningModel(MegatronBaseModel, TextGeneration):
         for task in task_templates:
             self.task_templates[task.taskname] = {
                 "prompt_template": task.prompt_template,
-                "prompt_template_fields": re.findall("\{(.*?)\}", task.prompt_template),
+                "prompt_template_fields": re.findall(r"\{(.*?)\}", task.prompt_template),
                 "answer_only_loss": task.get("answer_only_loss", False),
                 "answer_field": task.get("answer_field", None),
                 "truncate_field": task.truncate_field,

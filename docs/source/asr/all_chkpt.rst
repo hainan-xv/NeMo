@@ -40,10 +40,38 @@ French
 
 -----------------------------
 
+Arabic
+^^^^^^^
+.. csv-table::
+   :file: data/benchmark_ar.csv
+   :align: left
+   :widths: 50,50
+   :header-rows: 1
+------------------------------
+
 Russian
 ^^^^^^^
 .. csv-table::
    :file: data/benchmark_ru.csv
+   :align: left
+   :widths: 50,50
+   :header-rows: 1
+
+-----------------------------
+
+Portuguese
+^^^^^^^^^^
+.. csv-table::
+   :file: data/benchmark_pt.csv
+   :align: left
+   :widths: 50,50
+   :header-rows: 1
+-----------------------------
+
+Belarusian
+^^^^^^^
+.. csv-table::
+   :file: data/benchmark_be.csv
    :align: left
    :widths: 50,50
    :header-rows: 1
@@ -60,10 +88,10 @@ Japanese
 
 -----------------------------
 
-Chinese
+Armenian
 ^^^^^^^
 .. csv-table::
-   :file: data/benchmark_cn.csv
+   :file: data/benchmark_hy.csv
    :align: left
    :widths: 50,50
    :header-rows: 1
@@ -140,15 +168,6 @@ Italian
 
 -----------------------------
 
-Belarusian
-^^^^^^^^^^
-.. csv-table::
-   :file: data/benchmark_by.csv
-   :align: left
-   :widths: 50,50
-   :header-rows: 1
-
------------------------------
 
 Croatian
 ^^^^^^^^
@@ -209,6 +228,7 @@ Hindi
    :header-rows: 1
 
 -----------------------------
+
 Marathi
 ^^^^^^^
 .. csv-table::
@@ -220,7 +240,7 @@ Marathi
 -----------------------------
 
 Mandarin
-^^^^^^^
+^^^^^^^^
 .. csv-table::
    :file: data/benchmark_zh.csv
    :align: left
