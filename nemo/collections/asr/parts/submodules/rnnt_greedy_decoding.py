@@ -227,8 +227,8 @@ class _GreedyRNNTInfer(Typing, ConfidenceMethodMixin):
 
         else:
             # Label is an integer
-            if label == self._SOS:
-                return self.decoder.predict(None, hidden, add_sos=add_sos, batch_size=batch_size)
+#            if label == self._SOS:  # TODO(hainan)
+#                return self.decoder.predict(None, hidden, add_sos=add_sos, batch_size=batch_size)
 
             label = label_collate([[label]])
 
@@ -765,8 +765,10 @@ class GreedyBatchedRNNTInfer(_GreedyRNNTInfer, WithOptionalCudaGraphs):
 
         batched_hyps, alignments, last_decoder_state = self._decoding_computer(x=x, out_len=out_len)
         hyps = rnnt_utils.batched_hyps_to_hypotheses(batched_hyps, alignments, batch_size=x.shape[0])
-        for hyp, state in zip(hyps, self.decoder.batch_split_states(last_decoder_state)):
-            hyp.dec_state = state
+        if self.decoder.state_size_is_fixed():
+            for hyp, state_item in zip(hyps, self.decoding_computer.split_batched_state(batched_state)):
+                hyp.dec_state = state_item
+
         return hyps
 
     def _greedy_decode_blank_as_pad_loop_frames(
