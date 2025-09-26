@@ -232,6 +232,8 @@ class _GreedyRNNTInfer(Typing, ConfidenceMethodMixin):
 
             label = label_collate([[label]])
 
+#        print("LABEL IS", label.device)
+        label = label.to(next(self.joint.pred.parameters()).device)
         # output: [B, 1, K]
         return self.decoder.predict(label, hidden, add_sos=add_sos, batch_size=batch_size)
 
@@ -517,7 +519,9 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                 del hypothesis.frame_confidence[-1]
 
         # Unpack the hidden states
-        hypothesis.dec_state = self.decoder.batch_select_state(hypothesis.dec_state, 0)
+
+        print("DEC STATE", hypothesis.dec_state.transformer_state.shape)                
+#        hypothesis.dec_state = self.decoder.batch_select_state(hypothesis.dec_state, 0)
 
         return hypothesis
 

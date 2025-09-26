@@ -846,6 +846,8 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
                 tensorboard_logs['val_loss'] = loss_value
 
+#            print("DEVICES", encoded.device, encoded_len.device, transcript.device, transcript_len.device)
+
             self.wer.update(
                 predictions=encoded,
                 predictions_lengths=encoded_len,
