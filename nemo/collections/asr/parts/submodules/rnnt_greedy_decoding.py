@@ -520,7 +520,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
 
         # Unpack the hidden states
 
-        print("DEC STATE", hypothesis.dec_state.transformer_state.shape)                
+#        print("DEC STATE", hypothesis.dec_state.transformer_state.shape)                
 #        hypothesis.dec_state = self.decoder.batch_select_state(hypothesis.dec_state, 0)
 
         return hypothesis

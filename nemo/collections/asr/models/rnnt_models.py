@@ -721,7 +721,8 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         del signal
 
         # During training, loss must be computed, so decoder forward is necessary
-        decoder, target_length, states = self.decoder(targets=transcript, target_length=transcript_len)
+#        decoder, target_length, states = self.decoder(targets=transcript, target_length=transcript_len)
+        decoder, _, target_length = self.decoder(targets=transcript, target_length=transcript_len)
 
         if hasattr(self, '_trainer') and self._trainer is not None:
             log_every_n_steps = self._trainer.log_every_n_steps
@@ -734,6 +735,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         if not self.joint.fuse_loss_wer:
             # Compute full joint and loss
             joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder)
+#            print("HERE transcript", transcript, target_length)
             loss_value = self.loss(
                 log_probs=joint, targets=transcript, input_lengths=encoded_len, target_lengths=target_length
             )
