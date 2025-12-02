@@ -46,7 +46,7 @@ from nemo.core.classes.common import typecheck
 from nemo.core.classes.exportable import Exportable
 from nemo.core.classes.mixins import AccessMixin, adapter_mixins
 from nemo.core.classes.module import NeuralModule
-from nemo.core.neural_types import AcousticEncodedRepresentation, ChannelType, LengthsType, NeuralType, SpectrogramType
+from nemo.core.neural_types import AcousticEncodedRepresentation, ChannelType, LengthsType, NeuralType, SpectrogramType, IntType
 from nemo.utils import logging
 
 __all__ = ['ConformerEncoder']
@@ -207,6 +207,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             {
                 "audio_signal": NeuralType(('B', 'D', 'T'), SpectrogramType()),
                 "length": NeuralType(tuple('B'), LengthsType()),
+                "chunk_size": NeuralType(tuple(), IntType()),
                 "cache_last_channel": NeuralType(('D', 'B', 'T', 'D'), ChannelType(), optional=True),
                 "cache_last_time": NeuralType(('D', 'B', 'D', 'T'), ChannelType(), optional=True),
                 "cache_last_channel_len": NeuralType(tuple('B'), LengthsType(), optional=True),
@@ -220,24 +221,25 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             {
                 "audio_signal": NeuralType(('B', 'D', 'T'), SpectrogramType()),
                 "length": NeuralType(tuple('B'), LengthsType()),
+                "chunk_size": NeuralType(tuple(), IntType()),
                 "cache_last_channel": NeuralType(('B', 'D', 'T', 'D'), ChannelType(), optional=True),
                 "cache_last_time": NeuralType(('B', 'D', 'D', 'T'), ChannelType(), optional=True),
                 "cache_last_channel_len": NeuralType(tuple('B'), LengthsType(), optional=True),
             }
         )
 
-    @property
-    def output_types(self):
-        """Returns definitions of module output ports."""
-        return OrderedDict(
-            {
-                "outputs": NeuralType(('B', 'D', 'T'), AcousticEncodedRepresentation()),
-                "encoded_lengths": NeuralType(tuple('B'), LengthsType()),
-                "cache_last_channel_next": NeuralType(('D', 'B', 'T', 'D'), ChannelType(), optional=True),
-                "cache_last_time_next": NeuralType(('D', 'B', 'D', 'T'), ChannelType(), optional=True),
-                "cache_last_channel_next_len": NeuralType(tuple('B'), LengthsType(), optional=True),
-            }
-        )
+#    @property
+#    def output_types(self):
+#        """Returns definitions of module output ports."""
+#        return OrderedDict(
+#            {
+#                "outputs": NeuralType(('B', 'D', 'T'), AcousticEncodedRepresentation()),
+#                "encoded_lengths": NeuralType(('B', 'T'), LengthsType()),
+#                "cache_last_channel_next": NeuralType(('D', 'B', 'T', 'D'), ChannelType(), optional=True),
+#                "cache_last_time_next": NeuralType(('D', 'B', 'D', 'T'), ChannelType(), optional=True),
+#                "cache_last_channel_next_len": NeuralType(tuple('B'), LengthsType(), optional=True),
+#            }
+#        )
 
     @property
     def output_types_for_export(self):
@@ -517,19 +519,20 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
 
     @typecheck()
     def forward(
-        self, audio_signal, length, cache_last_channel=None, cache_last_time=None, cache_last_channel_len=None
+        self, audio_signal, chunk_size, length, cache_last_channel=None, cache_last_time=None, cache_last_channel_len=None
     ):
         self.update_max_seq_length(seq_length=audio_signal.size(2), device=audio_signal.device)
         return self.forward_internal(
             audio_signal,
             length,
+            chunk_size,
             cache_last_channel=cache_last_channel,
             cache_last_time=cache_last_time,
             cache_last_channel_len=cache_last_channel_len,
         )
 
     def forward_internal(
-        self, audio_signal, length, cache_last_channel=None, cache_last_time=None, cache_last_channel_len=None
+        self, audio_signal, length, chunk_size, cache_last_channel=None, cache_last_time=None, cache_last_channel_len=None
     ):
         if length is None:
             length = audio_signal.new_full(
@@ -674,6 +677,11 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                 torch.clamp(cache_last_channel_len + cache_keep_size, max=cache_len),
             )
         else:
+            if chunk_size != -1:
+                chunked, length = chunk_concat_audio(audio_signal.transpose(1, 2), length, chunk_size)
+                audio_signal = chunked.transpose(1,2)
+            else:
+                audio_signal = audio_signal.transpose(1,2)
             return audio_signal, length
 
     def update_max_seq_length(self, seq_length: int, device):
@@ -1252,3 +1260,38 @@ class ConformerChangeConfig:
     # corresponding to left and right context, or -1 for full context.
     # If None is provided, the attention context size isn't changed.
     att_context_size: Optional[List[int]] = None
+
+
+def chunk_concat_audio(audio_signal, audio_len, chunk_size):
+    B, T, D = audio_signal.shape
+    # Calculate number of chunks (with potential padding)
+    num_chunks = (T + chunk_size - 1) // chunk_size
+    padded_T = num_chunks * chunk_size
+
+    # Pad the input if necessary with zeros
+    if padded_T > T:
+        padding = torch.zeros(B, padded_T - T, D, dtype=audio_signal.dtype, device=audio_signal.device)
+        padded_signal = torch.cat([audio_signal, padding], dim=1)
+    else:
+        padded_signal = audio_signal
+
+    # Calculate actual sizes for each chunk for each utterance (vectorized)
+    # Create chunk start and end positions
+    chunk_starts = torch.arange(num_chunks, device=audio_signal.device) * chunk_size  # [num_chunks]
+    chunk_ends = chunk_starts + chunk_size  # [num_chunks]
+
+    # Broadcast for all utterances in batch
+    audio_len_expanded = audio_len.unsqueeze(1)  # [B, 1]
+    chunk_starts_expanded = chunk_starts.unsqueeze(0)  # [1, num_chunks]
+    chunk_ends_expanded = chunk_ends.unsqueeze(0)  # [1, num_chunks]
+
+    # For each chunk, calculate how many samples are actually valid
+    # Clamp chunk end to not exceed actual audio length
+    actual_chunk_ends = torch.min(chunk_ends_expanded, audio_len_expanded)  # [B, num_chunks]
+    # Calculate actual chunk size (0 if chunk starts beyond audio length)
+    chunk_sizes = torch.clamp(actual_chunk_ends - chunk_starts_expanded, min=0)  # [B, num_chunks]
+
+    # Reshape to [B, num_chunks, chunk_size, D]
+    result = padded_signal.view(B, num_chunks, chunk_size * D)
+
+    return result, chunk_sizes

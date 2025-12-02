@@ -138,6 +138,7 @@ class TranscriptionConfig:
 
     # Set to True to output greedy timestamp information (only supported models) and returns full alignment hypotheses
     timestamps: Optional[bool] = None
+    chunk_size: int = 1
 
     # Set to True to return hypotheses instead of text from the transcribe function
     return_hypotheses: bool = False
@@ -385,6 +386,7 @@ def main(cfg: TranscriptionConfig) -> Union[TranscriptionConfig, List[Hypothesis
 
             override_cfg = asr_model.get_transcribe_config()
             override_cfg.batch_size = cfg.batch_size
+            override_cfg.chunk_size = cfg.chunk_size
             override_cfg.num_workers = cfg.num_workers
             override_cfg.return_hypotheses = cfg.return_hypotheses
             override_cfg.channel_selector = cfg.channel_selector

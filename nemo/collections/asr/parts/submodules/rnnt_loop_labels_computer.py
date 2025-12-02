@@ -53,6 +53,7 @@ class LoopLabelsState:
 
     encoder_output_projected: torch.Tensor  # projected output from the encoder for decoding algorithm
     encoder_output_length: torch.Tensor  # length of the (projected) output from the encoder
+    encoder_output_length_chunks: torch.Tensor
 
     labels: torch.Tensor  # storage for current labels
     scores: torch.Tensor  # storage for current scores
@@ -92,6 +93,7 @@ class LoopLabelsState:
         logits_dim: int,
         preserve_alignments=False,
         preserve_frame_confidence=False,
+        joint_with_attn=False,
     ):
         """
 
@@ -110,12 +112,19 @@ class LoopLabelsState:
         self.float_dtype = float_dtype
         self.batch_size = batch_size
         self.max_time = max_time
+        self.joint_with_attn = joint_with_attn
 
         self.encoder_output_projected = torch.zeros(
             (self.batch_size, self.max_time, encoder_dim),
             dtype=float_dtype,
             device=self.device,
         )
+        if self.joint_with_attn:
+            self.encoder_output_length_chunks = torch.zeros(
+                (self.batch_size, self.max_time),
+                dtype=torch.long,
+                device=self.device,
+            )
         self.encoder_output_length = torch.zeros((self.batch_size,), dtype=torch.long, device=self.device)
 
         self.labels = torch.zeros([self.batch_size], dtype=torch.long, device=self.device)
@@ -303,6 +312,10 @@ class GreedyBatchedRNNTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMeth
         """
         batch_size, max_time, _unused = encoder_output.shape
         device = encoder_output.device
+        joint_with_attn = encoder_output_length.dim() == 2
+        if joint_with_attn:
+            encoder_output_length_chunks = encoder_output_length
+            encoder_output_length = (encoder_output_length != 0).sum(dim=1)
 
         # do not recalculate joint projection, project only once
         encoder_output_projected = self.joint.project_encoder(encoder_output)
@@ -367,6 +380,11 @@ class GreedyBatchedRNNTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMeth
                 self.joint.joint_after_projection(
                     encoder_output_projected[batch_indices, safe_time_indices].unsqueeze(1),
                     decoder_output,
+                    **(
+                        {"f_len": encoder_output_length_chunks[batch_indices, safe_time_indices]}
+                        if joint_with_attn
+                        else {}
+                    ),
                 )
                 .squeeze(1)
                 .squeeze(1)
@@ -406,6 +424,11 @@ class GreedyBatchedRNNTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMeth
                     self.joint.joint_after_projection(
                         encoder_output_projected[batch_indices, safe_time_indices].unsqueeze(1),
                         decoder_output,
+                        **(
+                            {"f_len": encoder_output_length_chunks[batch_indices, safe_time_indices]}
+                            if joint_with_attn
+                            else {}
+                        ),
                     )
                     .squeeze(1)
                     .squeeze(1)
@@ -515,6 +538,13 @@ class GreedyBatchedRNNTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMeth
             self._graph_reinitialize(encoder_output, encoder_output_length)
 
         # copy (projected) encoder output and lenghts
+        joint_with_attn = encoder_output_length.dim() == 2
+        if joint_with_attn:
+            encoder_output_length_chunks = encoder_output_length
+            encoder_output_length = (encoder_output_length != 0).sum(dim=1)
+            self.state.encoder_output_length_chunks[:current_batch_size, :current_max_time] = (
+                encoder_output_length_chunks
+            )
         self.state.encoder_output_projected[:current_batch_size, :current_max_time, ...].copy_(encoder_output)
         self.state.encoder_output_length[: encoder_output_length.shape[0]].copy_(encoder_output_length)
         # set length to zero for elements outside the current batch
@@ -591,7 +621,7 @@ class GreedyBatchedRNNTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMeth
         encoder_output_length: torch.Tensor,
     ):
         batch_size, max_time, encoder_dim = encoder_output_projected.shape
-
+        joint_with_attn = encoder_output_length.dim() == 2
         self.state = LoopLabelsState(
             batch_size=batch_size,
             max_time=max(max_time, self.INITIAL_MAX_TIME),
@@ -602,6 +632,7 @@ class GreedyBatchedRNNTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMeth
             logits_dim=self.joint.num_classes_with_blank,
             preserve_alignments=self.preserve_alignments,
             preserve_frame_confidence=self.preserve_frame_confidence,
+            joint_with_attn=joint_with_attn,
         )
 
         self.state.last_decoder_state = self.decoder.initialize_state(encoder_output_projected)
@@ -762,6 +793,15 @@ class GreedyBatchedRNNTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMeth
                     1
                 ),
                 self.state.decoder_output,
+                **(
+                    {
+                        "f_len": self.state.encoder_output_length_chunks[
+                            self.state.batch_indices, self.state.safe_time_indices
+                        ]
+                    }
+                    if self.state.joint_with_attn
+                    else {}
+                ),
             )
             .squeeze(1)
             .squeeze(1)
@@ -815,6 +855,15 @@ class GreedyBatchedRNNTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMeth
                     1
                 ),
                 self.state.decoder_output,
+                **(
+                    {
+                        "f_len": self.state.encoder_output_length_chunks[
+                            self.state.batch_indices, self.state.safe_time_indices
+                        ]
+                    }
+                    if self.state.joint_with_attn
+                    else {}
+                ),
             )
             .squeeze(1)
             .squeeze(1)
