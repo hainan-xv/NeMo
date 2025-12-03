@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,10 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# flake8: noqa
 
 import itertools
 import json
 import os
+from abc import ABC
 from functools import partial
 from typing import List, Optional, Union
 
@@ -44,8 +47,14 @@ from nemo.collections.multimodal.speech_llm.modules.perception_modules import (
 )
 from nemo.collections.multimodal.speech_llm.parts.mixins.adapter_mixin import SpeechLLMAdapterMixin
 from nemo.collections.multimodal.speech_llm.parts.utils.data_utils import get_nested_dict_value
-from nemo.collections.nlp.models.language_modeling.megatron_gpt_model import MegatronGPTModel
-from nemo.collections.nlp.models.language_modeling.megatron_gpt_sft_model import MegatronGPTSFTModel
+
+try:
+    from nemo.collections.nlp.models.language_modeling.megatron_gpt_model import MegatronGPTModel
+    from nemo.collections.nlp.models.language_modeling.megatron_gpt_sft_model import MegatronGPTSFTModel
+except (ImportError, ModuleNotFoundError):
+    MegatronGPTModel = ABC
+    MegatronGPTSFTModel = ABC
+
 from nemo.collections.nlp.modules.common.megatron.utils import (
     average_losses_across_data_parallel_group,
     build_position_ids,
@@ -1446,6 +1455,9 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
                 continue
             # Expand on_validation_epoch_end from parent class MegatronGPTModel as on_validation_epoch_end doesnt take outputs arg
             loss_vals = [x['loss'] for x in output]
+            assert (
+                self.cfg.get("virtual_pipeline_model_parallel_size", None) is None
+            ), "Virtual pipeline model parallel size is no longer supported for nemo 1.0"
             if parallel_state.is_pipeline_last_stage():
                 # only the last pipeline parallel stages return loss with their batch size
                 if self.cfg.data.get('validation_drop_last', True):

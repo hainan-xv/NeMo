@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,14 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# flake8: noqa: F821
+
 import copy
 import io
+import math
 import os
 from typing import Dict, List, Optional, Union
 
 import numpy as np
 import torch
-import webdataset as wds
 from omegaconf import DictConfig, ListConfig, open_dict
 
 from nemo.collections.asr.data.audio_to_text import (
@@ -30,6 +33,7 @@ from nemo.collections.asr.data.audio_to_text import (
 from nemo.collections.asr.data.audio_to_text_dataset import ConcatDataset, convert_to_config_list, get_chain_dataset
 from nemo.collections.asr.parts.preprocessing.features import WaveformFeaturizer
 from nemo.collections.asr.parts.preprocessing.segment import ChannelSelectorType
+from nemo.collections.common.data.blendable_dataset import BlendableDataset
 from nemo.collections.common.parts.preprocessing import collections
 from nemo.collections.multimodal.speech_llm.parts.utils.data_utils import (
     TextProcessing,
@@ -38,12 +42,9 @@ from nemo.collections.multimodal.speech_llm.parts.utils.data_utils import (
     get_num_samples_from_files,
     maybe_cast_to_list,
 )
-from nemo.collections.nlp.data.language_modeling.megatron.base_dataset_utils import (
-    get_datasets_weights_and_num_samples,
-)
-from nemo.collections.nlp.data.language_modeling.megatron.blendable_dataset import BlendableDataset
 from nemo.core.classes import Dataset, IterableDataset
 from nemo.utils import logging
+from nemo.utils import webdataset as wds
 from nemo.utils.distributed import webdataset_split_by_workers
 
 try:
@@ -245,7 +246,6 @@ class AudioTextDataset(TextProcessing, Dataset):
             :note: below args are for miscellaneous purposes
 
         context_file: Optional[Union[List[str], str]] = None, if provided, will use this file to load random questions from, if question is not in manifest.
-        sample_alpha: Optional[float] = None, for SPE subword sampling
         audio_locator: Optional[str] = None, a special string to split the context into multiple audio segments.
     """
 
@@ -281,7 +281,6 @@ class AudioTextDataset(TextProcessing, Dataset):
         answer_key: str = 'answer',
         end_string: Optional[str] = None,
         context_file: Optional[Union[List[str], str]] = None,
-        sample_alpha: Optional[float] = None,
         audio_locator: Optional[str] = None,
         add_boa_eoa: Optional[bool] = False,
         boa_string: Optional[str] = "<BOA>",
@@ -306,7 +305,6 @@ class AudioTextDataset(TextProcessing, Dataset):
             context_key=context_key,
             answer_key=answer_key,
             end_string=end_string,
-            sample_alpha=sample_alpha,
             audio_locator=audio_locator,
             add_boa_eoa=add_boa_eoa,
             boa_string=boa_string,
@@ -651,7 +649,6 @@ class TarredAudioTextDataset(TextProcessing, IterableDataset):
             :note: Below args are for miscellaneous purposes
 
         context_file: Optional[Union[List[str], str]] = None, if provided, will use this file to load random questions from, if question is not in manifest.
-        sample_alpha: Optional[float] = None, for SPE subword sampling
 
     """
 
@@ -689,7 +686,6 @@ class TarredAudioTextDataset(TextProcessing, IterableDataset):
         answer_key: str = 'answer',
         end_string: Optional[str] = None,
         context_file: Optional[Union[List[str], str]] = None,
-        sample_alpha: Optional[float] = None,
     ):
         super().__init__(
             tokenizer=tokenizer,
@@ -710,7 +706,6 @@ class TarredAudioTextDataset(TextProcessing, IterableDataset):
             context_key=context_key,
             answer_key=answer_key,
             end_string=end_string,
-            sample_alpha=sample_alpha,
         )
         self.is_megatron_iterable = True
         self.shard_manifests = shard_manifests
@@ -885,7 +880,7 @@ def get_tarred_audio_text_dataset(
     if bucketing_weights:
         for idx, weight in enumerate(bucketing_weights):
             if not isinstance(weight, int) or weight <= 0:
-                raise ValueError(f"bucket weights must be positive integers")
+                raise ValueError("bucket weights must be positive integers")
 
     if len(manifest_filepaths) != len(tarred_audio_filepaths):
         raise ValueError(
@@ -893,7 +888,7 @@ def get_tarred_audio_text_dataset(
         )
 
     if 'labels' not in config:
-        logging.warning(f"dataset does not have explicitly defined labels")
+        logging.warning("dataset does not have explicitly defined labels")
 
     if 'max_utts' in config:
         raise ValueError('"max_utts" parameter is not supported for tarred datasets')
@@ -939,7 +934,6 @@ def get_tarred_audio_text_dataset(
             context_key=config.get('context_key', 'context'),
             answer_key=config.get('answer_key', 'answer'),
             end_string=config.get('end_string', None),
-            sample_alpha=config.get('sample_alpha', None),
             context_file=config.get('context_file', None),
         )
 
@@ -996,7 +990,7 @@ def get_concat_tarred_audio_text_dataset(
         datasets
     ):
         logging.info(
-            f"concat_sampling_probabilities is not provided or is not of the same size as datasets, using uniform sampling."
+            "concat_sampling_probabilities is not provided or is not of the same size as datasets, using uniform sampling."
         )
         concat_sampling_probabilities = [1.0 / len(datasets)] * len(datasets)
 
@@ -1091,7 +1085,7 @@ def get_audio_text_dataset_from_config(
         elif len(config.get('concat_sampling_probabilities', None)) != len(manifest_filepath):
             raise ValueError(
                 (
-                    f"concat_sampling_probabilities must be of the same size as manifest_filepath.",
+                    "concat_sampling_probabilities must be of the same size as manifest_filepath.",
                     f"Provided size {len(config.concat_sampling_probabilities)}, number of datasets {len(manifest_filepath)}",
                 )
             )
@@ -1142,7 +1136,6 @@ def get_audio_text_dataset_from_config(
             context_key=config.get('context_key', 'context'),
             answer_key=config.get('answer_key', 'answer'),
             end_string=config.get('end_string', None),
-            sample_alpha=config.get('sample_alpha', None),
             context_file=context_file,
             audio_locator=config.get('audio_locator', None),
             add_boa_eoa=config.get('add_boa_eoa', False),
@@ -1158,3 +1151,36 @@ def get_audio_text_dataset_from_config(
         return dataset
     else:
         return datasets
+
+
+def get_datasets_weights_and_num_samples(data_prefix, num_samples):
+
+    # The data prefix should be in the format of:
+    #   weight-1, data-prefix-1, weight-2, data-prefix-2, ..
+    assert len(data_prefix) % 2 == 0
+    num_datasets = len(data_prefix) // 2
+    weights = [0] * num_datasets
+    prefixes = [0] * num_datasets
+    for i in range(num_datasets):
+        weights[i] = float(data_prefix[2 * i])
+        prefixes[i] = (data_prefix[2 * i + 1]).strip()
+    # Normalize weights
+    weight_sum = 0.0
+    for weight in weights:
+        weight_sum += weight
+    assert weight_sum > 0.0
+    weights = [weight / weight_sum for weight in weights]
+
+    # Add 0.5% (the 1.005 factor) so in case the bleding dataset does
+    # not uniformly distribute the number of samples, we still have
+    # samples left to feed to the network.
+    # TODO: check data leakage between train/val/test?
+    datasets_train_valid_test_num_samples = []
+    for weight in weights:
+        # Comes here when we have seperate train,test and validation datasets.
+        if isinstance(num_samples, int):
+            datasets_train_valid_test_num_samples.append(int(math.ceil(num_samples * weight * 1.005)))
+        else:
+            datasets_train_valid_test_num_samples.append([int(math.ceil(val * weight * 1.005)) for val in num_samples])
+
+    return prefixes, weights, datasets_train_valid_test_num_samples

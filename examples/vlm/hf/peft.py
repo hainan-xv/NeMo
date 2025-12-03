@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+from nemo.utils.decorators import deprecated_warning
+
+deprecated_warning(
+    old_method="Automodel on NVIDIA/NeMo", new_method="https://github.com/NVIDIA-NeMo/Automodel repo", wait_seconds=2
+)
 
 import fiddle as fdl
 import torch

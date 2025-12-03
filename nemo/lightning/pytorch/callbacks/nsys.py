@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,7 +17,15 @@ from typing import List, Optional
 import torch
 from lightning.pytorch.callbacks.callback import Callback
 
+try:
+    from megatron.core.utils import configure_nvtx_profiling
+
+    HAVE_MCORE_UTILS = True
+except ImportError:
+    HAVE_MCORE_UTILS = False
+
 from nemo.utils import logging
+from nemo.utils.app_state import AppState
 from nemo.utils.get_rank import get_rank
 
 
@@ -48,9 +56,10 @@ class NsysCallback(Callback):
         end_step (int): Global batch to end profiling
         ranks (List[int]): Global rank IDs to profile
         gen_shape (bool): Generate model and kernel details including input shapes
+        nvtx_ranges (bool): Insert NVTX ranges to categorize execution
 
     Example:
-        >>> callback = NsysCallback(start_step=100, end_step=200, ranks=[0, 1], gen_shape=True)
+        >>> callback = NsysCallback(start_step=100, end_step=200, ranks=[0, 1], gen_shape=True, nvtx_ranges=False)
         >>> trainer = Trainer(callbacks=[callback])
     """
 
@@ -60,6 +69,7 @@ class NsysCallback(Callback):
         end_step: int,
         ranks: List[int] = [0],
         gen_shape: bool = False,
+        nvtx_ranges: bool = False,
     ):
         assert type(start_step) is int, f'Nsys start_step must be of type int. Found: {type(start_step)}'
         self._nsys_profile_start_step = start_step
@@ -73,6 +83,11 @@ class NsysCallback(Callback):
 
         self._nsys_profile_ranks = ranks
         self._nsys_profile_gen_shape = gen_shape
+
+        app_state = AppState()
+        app_state._nvtx_ranges = nvtx_ranges
+        if nvtx_ranges and HAVE_MCORE_UTILS:
+            configure_nvtx_profiling(True)  # Enable NVTX profiling in MCore
 
         logging.info(
             f'Nsys profiling setup with start_step: {self._nsys_profile_start_step},'

@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import lightning.pytorch as pl
 from torch import nn
 from typing_extensions import Self
 
@@ -49,6 +50,15 @@ class FNMixin:
         >>> model.forall(lambda module: not module.parameters().requires_grad, recurse=True)
         True
     """
+
+    def __init_subclass__(cls, **kwargs):
+        # Add OneLogger timing hooks for LightningModule subclasses to enable telemetry tracking
+        if issubclass(cls, pl.LightningModule):
+            from nemo.lightning.callback_group import hook_class_init_with_callbacks
+
+            hook_class_init_with_callbacks(cls, "on_model_init_start", "on_model_init_end")
+
+        super().__init_subclass__(**kwargs)
 
     def forall(self, func: fn.ModulePredicate, recurse: bool = False) -> bool:
         """

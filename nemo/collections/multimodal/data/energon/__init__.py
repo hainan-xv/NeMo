@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,11 +15,13 @@
 
 from nemo.collections.multimodal.data.energon.base import EnergonMultiModalDataModule
 from nemo.collections.multimodal.data.energon.config import (
+    AudioToken,
     ImageTextSample,
     ImageToken,
-    LLaVATemplateConfig,
     MultiModalSampleConfig,
+    VideoToken,
 )
+from nemo.collections.multimodal.data.energon.conversation import LLaVATemplateConfig, MLlamaTemplateConfig
 from nemo.collections.multimodal.data.energon.sample_encoder import (
     BaseSampleEncoder,
     InterleavedSampleEncoder,
@@ -30,9 +32,12 @@ from nemo.collections.multimodal.data.energon.sample_encoder import (
 __all__ = [
     "EnergonMultiModalDataModule",
     "ImageToken",
+    "AudioToken",
+    "VideoToken",
     "ImageTextSample",
     "MultiModalSampleConfig",
     "LLaVATemplateConfig",
+    "MLlamaTemplateConfig",
     "BaseSampleEncoder",
     "VQASampleEncoder",
     "InterleavedSampleEncoder",

@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -92,15 +92,16 @@ def flux_training() -> run.Partial:
                 context_parallel_size=1,
                 sequence_parallel=False,
                 pipeline_dtype=torch.bfloat16,
+                gradient_accumulation_fusion=True,
                 ddp=run.Config(
                     DistributedDataParallelConfig,
-                    use_custom_fsdp=True,
-                    data_parallel_sharding_strategy='MODEL_AND_OPTIMIZER_STATES',
+                    data_parallel_sharding_strategy='optim_grads_params',
                     check_for_nan_in_grad=True,
                     grad_reduce_in_fp32=True,
-                    overlap_grad_reduce=True,
                     overlap_param_gather=True,
+                    overlap_grad_reduce=True,
                 ),
+                fsdp='megatron',
             ),
             plugins=nl.MegatronMixedPrecision(precision="bf16-mixed"),
             num_sanity_val_steps=0,
@@ -116,6 +117,7 @@ def flux_training() -> run.Partial:
                     every_n_train_steps=1000,
                     save_top_k=3,
                     mode='max',
+                    save_last=False,
                 ),
                 run.Config(TimingCallback),
             ],
@@ -143,7 +145,7 @@ def flux_training() -> run.Partial:
 
 
 @run.cli.factory(target=llm.train)
-def convergence_test() -> run.Partial:
+def convergence_test(megatron_fsdp=True) -> run.Partial:
     '''
     A convergence recipe with real data loader.
     Image and text embedding calculated on the fly.
@@ -157,6 +159,12 @@ def convergence_test() -> run.Partial:
     recipe.model.flux_params.device = 'cuda'
     recipe.trainer.devices = 8
     recipe.data = flux_datamodule('/dataset/fill50k/fill50k_tarfiles/')
+    recipe.trainer.max_steps = 30000
+    if megatron_fsdp is True:
+        configure_megatron_fsdp(recipe)
+    else:
+        configure_ddp(recipe)
+
     return recipe
 
 
@@ -175,17 +183,84 @@ def full_model_tp2_dp4_mock() -> run.Partial:
     recipe.trainer.strategy.tensor_model_parallel_size = 2
     recipe.trainer.devices = 8
     recipe.data.global_batch_size = 8
+
     return recipe
 
 
 @run.cli.factory(target=llm.train)
-def unit_test() -> run.Partial:
+def fp8_test(megatron_fsdp=True) -> run.Partial:
     '''
     Basic functional test, with mock dataset,
     text/vae encoders not initialized, ddp strategy,
     frozen and trainable layers both set to 1
     '''
     recipe = flux_training()
+    recipe.trainer.devices = 1
+    recipe.model.flux_params.t5_params = None  # run.Config(T5Config, version='/ckpts/text_encoder_2')
+    recipe.model.flux_params.clip_params = None  # run.Config(ClipConfig, version='/ckpts/text_encoder')
+    recipe.model.flux_params.vae_config = (
+        None  # run.Config(AutoEncoderConfig, ckpt='/ckpts/ae.safetensors', ch_mult=[1,2,4,4], attn_resolutions=[])
+    )
+    recipe.model.flux_params.device = 'cuda'
+    recipe.model.flux_params.flux_config = run.Config(
+        FluxConfig,
+        num_joint_layers=5,
+        num_single_layers=10,
+    )
+    recipe.data.global_batch_size = 8
+    if megatron_fsdp:
+        configure_megatron_fsdp(recipe)
+    else:
+        configure_ddp(recipe)
+    recipe.trainer.plugins = run.Config(
+        nl.MegatronMixedPrecision,
+        precision="bf16-mixed",
+        fp8='hybrid',
+        fp8_margin=0,
+        fp8_amax_history_len=1024,
+        fp8_amax_compute_algo="max",
+        fp8_params=False,
+    )
+    recipe.trainer.max_steps = 100
+    return recipe
+
+
+def configure_megatron_fsdp(recipe) -> run.Partial:
+    recipe.trainer.strategy.ddp = run.Config(
+        DistributedDataParallelConfig,
+        data_parallel_sharding_strategy='optim_grads_params',  # Custom FSDP
+        check_for_nan_in_grad=True,
+        grad_reduce_in_fp32=True,
+        overlap_param_gather=True,  # Megatron FSDP requires this
+        overlap_grad_reduce=True,  # Megatron FSDP requires this
+        use_megatron_fsdp=True,
+    )
+    recipe.trainer.strategy.fsdp = 'megatron'
+    return recipe
+
+
+def configure_ddp(recipe) -> run.Partial:
+    recipe.trainer.strategy.ddp = run.Config(
+        DistributedDataParallelConfig,
+        check_for_nan_in_grad=True,
+        grad_reduce_in_fp32=True,
+    )
+    recipe.trainer.strategy.fsdp = None
+    return recipe
+
+
+@run.cli.factory(target=llm.train)
+def unit_test(megatron_fsdp=True) -> run.Partial:
+    '''
+    Basic functional test, with mock dataset,
+    text/vae encoders not initialized, ddp strategy,
+    frozen and trainable layers both set to 1
+    '''
+    recipe = flux_training()
+    if megatron_fsdp:
+        recipe = configure_megatron_fsdp(recipe)
+    else:
+        recipe = configure_ddp(recipe)
     recipe.model.flux_params.t5_params = None  # run.Config(T5Config, version='/ckpts/text_encoder_2')
     recipe.model.flux_params.clip_params = None  # run.Config(ClipConfig, version='/ckpts/text_encoder')
     recipe.model.flux_params.vae_config = (
@@ -194,12 +269,7 @@ def unit_test() -> run.Partial:
     recipe.model.flux_params.device = 'cuda'
     recipe.model.flux_params.flux_config = run.Config(FluxConfig, num_joint_layers=1, num_single_layers=1)
     recipe.data.global_batch_size = 1
-    recipe.trainer.strategy.ddp = run.Config(
-        DistributedDataParallelConfig,
-        check_for_nan_in_grad=True,
-        grad_reduce_in_fp32=True,
-    )
-    recipe.trainer.max_steps = 10
+    recipe.trainer.max_steps = 100
     return recipe
 
 

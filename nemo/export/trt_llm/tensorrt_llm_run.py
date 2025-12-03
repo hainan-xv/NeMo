@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -249,6 +249,10 @@ def _forward(
         end_id = sampling_config.end_id
         num_beams = sampling_config.num_beams
 
+        for k in sampling_kwargs.keys():
+            if not hasattr(sampling_config, k):
+                raise TypeError(f"Unknown sampling args '{k}'")
+
         with torch.no_grad():
             prompt_tasks = None if task_ids is None else ",".join(str(task) for task in task_ids)
 
@@ -277,6 +281,7 @@ def _forward(
                 streaming=streaming,
                 output_sequence_lengths=True,
                 return_dict=True,
+                **sampling_kwargs,
             )
 
             torch.cuda.synchronize()

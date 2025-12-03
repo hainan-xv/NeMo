@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,7 +25,12 @@ from PIL import Image
 from tqdm import tqdm
 from transformers import AutoModel, AutoTokenizer
 
-from nemo.collections.nlp.data.language_modeling.megatron import indexed_dataset
+try:
+    from nemo.collections.nlp.data.language_modeling.megatron import indexed_dataset
+
+    HAVE_NLP = True
+except (ImportError, ModuleNotFoundError):
+    HAVE_NLP = False
 
 """
 You can run this script as follows

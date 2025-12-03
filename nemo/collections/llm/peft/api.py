@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -36,6 +36,7 @@ from nemo.utils import logging
 
 @factory
 def gpt_lora() -> PEFT:
+    """ """
     return LoRA()
 
 
@@ -75,6 +76,7 @@ def export_lora(
 def merge_lora(
     lora_checkpoint_path: str,
     output_path: str,
+    legacy_ckpt: bool = False,
 ) -> None:
     """
     Merges the LoRA adapter weights into the base model's weights.
@@ -100,6 +102,10 @@ def merge_lora(
         accelerator="cpu",
         strategy=MegatronStrategy(ddp="pytorch", setup_optimizers=False, plugins=bf16_mixed()),
     )
+
+    # Load ckpt saved with TE < 1.14
+    if legacy_ckpt:
+        trainer.strategy.ckpt_load_strictness = False
 
     model, lora = _load_base_model_and_lora(lora_checkpoint_path)
     _setup_trainer_and_restore_model_and_adapter(Path(lora_checkpoint_path), trainer, model, lora)
@@ -158,11 +164,15 @@ def _setup_trainer_and_restore_model_and_adapter(
     model.trainer = trainer
 
     lora(model)
+    weights_dir = ckpt_to_weights_subdir(lora_checkpoint_path, is_saving=False)
+    sharded_sd_metadata = trainer.strategy.unwrapped_checkpoint_io.load_content_metadata(weights_dir)
     adapter_sharded_state_dict = {
-        k: v for k, v in trainer.strategy.megatron_parallel.sharded_state_dict().items() if ".adapter." in k
+        k: v
+        for k, v in trainer.strategy.megatron_parallel.sharded_state_dict(metadata=sharded_sd_metadata).items()
+        if ".adapter." in k
     }
     adapter_state = trainer.strategy.checkpoint_io.load_checkpoint(
-        ckpt_to_weights_subdir(lora_checkpoint_path, is_saving=False), sharded_state_dict=adapter_sharded_state_dict
+        weights_dir, sharded_state_dict=adapter_sharded_state_dict
     )
     trainer.strategy.load_model_state_dict(adapter_state, strict=False)
 
@@ -170,10 +180,14 @@ def _setup_trainer_and_restore_model_and_adapter(
 def _save_merged_weight(output_path: str, merged_weights: dict, model: pl.LightningModule, trainer: Trainer):
     weight_path = ckpt_to_weights_subdir(output_path, is_saving=True)
     Path(weight_path).mkdir(parents=True, exist_ok=True)
-    dist_checkpointing.save(merged_weights, str(ckpt_to_weights_subdir(output_path, is_saving=True)))
+    dist_checkpointing.save(
+        merged_weights,
+        str(ckpt_to_weights_subdir(output_path, is_saving=True)),
+        content_metadata=trainer.strategy.sharded_state_dict_metadata,
+    )
     if hasattr(model.tokenizer, "save_pretrained"):
         model.tokenizer.save_pretrained("/tmp/nemo_tokenizer")
-        model.tokenizer = AutoTokenizer("/tmp/nemo_tokenizer")
+        model.tokenizer = AutoTokenizer("/tmp/nemo_tokenizer", trust_remote_code=True)
     if hasattr(trainer.model, "__io__") and hasattr(trainer.model.tokenizer, '__io__'):
         trainer.model.__io__.tokenizer = trainer.model.tokenizer.__io__
     TrainerContext.from_trainer(trainer).io_dump(ckpt_to_context_subdir(output_path), yaml_attrs=["model"])

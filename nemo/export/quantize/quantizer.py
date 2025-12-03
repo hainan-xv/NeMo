@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,7 +23,13 @@ from megatron.core import parallel_state
 from megatron.core.transformer.module import Float16Module
 from omegaconf.omegaconf import DictConfig, open_dict
 
-from nemo.collections.nlp.models.language_modeling.megatron_gpt_model import MegatronGPTModel
+try:
+    from nemo.collections.nlp.models.language_modeling.megatron_gpt_model import MegatronGPTModel
+except (ImportError, ModuleNotFoundError):
+    from abc import ABC
+
+    MegatronGPTModel = ABC
+
 from nemo.collections.nlp.parts.utils_funcs import torch_dtype_from_precision
 from nemo.utils import logging
 from nemo.utils.distributed import temporary_directory
@@ -40,6 +46,7 @@ try:
         "int4_awq": mtq.INT4_AWQ_CFG,
         "w4a8_awq": mtq.W4A8_AWQ_BETA_CFG,
         "int4": mtq.INT4_BLOCKWISE_WEIGHT_ONLY_CFG,
+        "nvfp4": mtq.NVFP4_DEFAULT_CFG,
     }
 
     HAVE_MODELOPT = True

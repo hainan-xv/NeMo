@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import logging
 import os
 import shutil
 from pathlib import Path, PosixPath, WindowsPath
@@ -23,6 +22,7 @@ from filelock import FileLock, Timeout
 from lightning.pytorch.trainer.states import TrainerFn
 
 from nemo.lightning.ckpt_utils import ckpt_to_context_subdir
+from nemo.utils import logging
 
 # Dynamically inherit from the correct Path subclass based on the operating system.
 if os.name == 'nt':
@@ -72,7 +72,7 @@ class Connector(BasePath, Generic[SourceT, TargetT]):
         """Should be implemented to initialize the target type from the source type."""
         raise NotImplementedError()
 
-    def apply(self, output_path: Path) -> Path:
+    def apply(self, output_path: Path, **kwargs) -> Path:
         """Should be implemented to apply the transformation and save the result at the output path."""
         raise NotImplementedError()
 
@@ -83,7 +83,7 @@ class Connector(BasePath, Generic[SourceT, TargetT]):
 
         return super().__new__(cls, *args, **kwargs)
 
-    def __call__(self, output_path: Optional[Path] = None, overwrite: bool = False) -> Path:
+    def __call__(self, output_path: Optional[Path] = None, overwrite: bool = False, **kwargs) -> Path:
         _output_path = output_path or self.local_path()
         lock_path = _output_path.with_suffix(_output_path.suffix + '.lock')
         lock = FileLock(lock_path)
@@ -98,7 +98,7 @@ class Connector(BasePath, Generic[SourceT, TargetT]):
                     shutil.rmtree(_output_path)
 
                 if not _output_path.exists():
-                    to_return = self.apply(_output_path)
+                    to_return = self.apply(_output_path, **kwargs)
                     _output_path = to_return or _output_path
 
         except Timeout:
@@ -229,12 +229,22 @@ class ModelConnector(Connector, Generic[SourceT, TargetT]):
         -------
             Tuple[pl.LightningModule, pl.Trainer]: The loaded model and the trainer configured with the model.
         """
+        from nemo.collections.llm.modelopt import set_modelopt_spec_if_exists_in_ckpt
         from nemo.lightning import MegatronStrategy, Trainer, _strategy_lib
         from nemo.lightning.io.api import load_context
 
         model = load_context(path, subpath="model")
+
+        # disable FP8 model loading for LoRA export
+        # (base model loaded in FP8 during training but can be loaded in BF16 during export)
+        # FP8 SFT model export is not supported
+        model.config.fp8 = None
+        model.config.fp8_param = False
+
         # skip initialization since a checkpoint is loaded in this function
         model.config.perform_initialization = False
+        # set modelopt spec if required
+        set_modelopt_spec_if_exists_in_ckpt(model, path)
 
         is_peft_ckpt = model.model_transform is not None
         callbacks = []
@@ -265,11 +275,17 @@ class ModelConnector(Connector, Generic[SourceT, TargetT]):
 
             model.trainer = _trainer
             model = model.model_transform(model)
+            load_path = ckpt_to_weights_subdir(path, is_saving=False)
+            sharded_sd_metadata = _trainer.strategy.unwrapped_checkpoint_io.load_content_metadata(load_path)
             adapter_sharded_state_dict = {
-                k: v for k, v in _trainer.strategy.megatron_parallel.sharded_state_dict().items() if ".adapter." in k
+                k: v
+                for k, v in _trainer.strategy.megatron_parallel.sharded_state_dict(
+                    metadata=sharded_sd_metadata
+                ).items()
+                if ".adapter." in k
             }
             adapter_state = _trainer.strategy.checkpoint_io.load_checkpoint(
-                ckpt_to_weights_subdir(path, is_saving=False), sharded_state_dict=adapter_sharded_state_dict
+                load_path, sharded_state_dict=adapter_sharded_state_dict
             )
             _trainer.strategy.load_model_state_dict(adapter_state, strict=False)
         else:

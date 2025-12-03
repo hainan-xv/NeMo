@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,12 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Callable
 
 import torch
 import torch.nn as nn
+from megatron.core import parallel_state
 from megatron.core.models.common.vision_module.vision_module import VisionModule
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.transformer.transformer_config import TransformerConfig
 from torch.nn import functional as F
 
@@ -161,15 +164,36 @@ class FluxControlNet(VisionModule):
         # ContolNet Blocks
         self.controlnet_double_blocks = nn.ModuleList()
         for _ in range(config.num_joint_layers):
-            self.controlnet_double_blocks.append(zero_module(nn.Linear(self.hidden_size, self.hidden_size)))
+            self.controlnet_double_blocks.append(
+                zero_module(
+                    ColumnParallelLinear(
+                        self.hidden_size,
+                        self.hidden_size,
+                        config=config,
+                        init_method=nn.init.normal_,
+                        gather_output=True,
+                    )
+                )
+            )
 
         self.controlnet_single_blocks = nn.ModuleList()
         for _ in range(config.num_single_layers):
-            self.controlnet_single_blocks.append(zero_module(nn.Linear(self.hidden_size, self.hidden_size)))
+            self.controlnet_single_blocks.append(
+                zero_module(
+                    ColumnParallelLinear(
+                        self.hidden_size,
+                        self.hidden_size,
+                        config=config,
+                        init_method=nn.init.normal_,
+                        gather_output=True,
+                    )
+                )
+            )
 
         if config.conditioning_embedding_channels is not None:
             self.input_hint_block = ControlNetConditioningEmbedding(
-                conditioning_embedding_channels=conditioning_embedding_channels, block_out_channels=(16, 16, 16, 16)
+                conditioning_embedding_channels=config.conditioning_embedding_channels,
+                block_out_channels=(16, 16, 16, 16),
             )
             self.controlnet_x_embedder = torch.nn.Linear(config.in_channels, self.hidden_size)
         else:
@@ -183,6 +207,7 @@ class FluxControlNet(VisionModule):
         Args:
             flux (FluxTransformer): A pre-trained Flux Transformer model.
         """
+        logging.info("Loading ControlNet layer weights from Flux...")
         self.pos_embed.load_state_dict(flux.pos_embed.state_dict())
         self.img_embed.load_state_dict(flux.img_embed.state_dict())
         self.txt_embed.load_state_dict(flux.txt_embed.state_dict())
@@ -190,6 +215,37 @@ class FluxControlNet(VisionModule):
         self.vector_embedding.load_state_dict(flux.vector_embedding.state_dict())
         self.double_blocks.load_state_dict(flux.double_blocks.state_dict(), strict=False)
         self.single_blocks.load_state_dict(flux.single_blocks.state_dict(), strict=False)
+
+    def get_fp8_context(self):
+        "context manager for fp8 recipe"
+        # This is first and last 2 for mamba
+        if not self.config.fp8:
+            fp8_context = nullcontext()
+        else:
+            import transformer_engine  # To keep out TE dependency when not training in fp8
+
+            if self.config.fp8 == "e4m3":
+                fp8_format = transformer_engine.common.recipe.Format.E4M3
+            elif self.config.fp8 == "hybrid":
+                fp8_format = transformer_engine.common.recipe.Format.HYBRID
+            else:
+                raise ValueError("E4M3 and HYBRID are the only supported FP8 formats.")
+
+            fp8_recipe = transformer_engine.common.recipe.DelayedScaling(
+                margin=self.config.fp8_margin,
+                interval=self.config.fp8_interval,
+                fp8_format=fp8_format,
+                amax_compute_algo=self.config.fp8_amax_compute_algo,
+                amax_history_len=self.config.fp8_amax_history_len,
+                override_linear_precision=(False, False, not self.config.fp8_wgrad),
+            )
+            fp8_group = None
+            if parallel_state.model_parallel_is_initialized():
+                fp8_group = parallel_state.get_amax_reduction_group(with_context_parallel=True)
+            fp8_context = transformer_engine.pytorch.fp8_autocast(
+                enabled=True, fp8_recipe=fp8_recipe, fp8_group=fp8_group
+            )
+        return fp8_context
 
     def forward(
         self,
@@ -246,33 +302,37 @@ class FluxControlNet(VisionModule):
 
         double_block_samples = ()
         for id_block, block in enumerate(self.double_blocks):
-            hidden_states, encoder_hidden_states = block(
-                hidden_states=hidden_states,
-                encoder_hidden_states=encoder_hidden_states,
-                rotary_pos_emb=rotary_pos_emb,
-                emb=vec_emb,
-            )
-            double_block_samples = double_block_samples + (hidden_states,)
+            with self.get_fp8_context():
+                hidden_states, encoder_hidden_states = block(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    rotary_pos_emb=rotary_pos_emb,
+                    emb=vec_emb,
+                )
+                double_block_samples = double_block_samples + (hidden_states,)
 
         hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=0)
 
         single_block_samples = ()
         for id_block, block in enumerate(self.single_blocks):
-            hidden_states = block(
-                hidden_states=hidden_states,
-                rotary_pos_emb=rotary_pos_emb,
-                emb=vec_emb,
-            )
-            single_block_samples = single_block_samples + (hidden_states[encoder_hidden_states.shape[0] :, ...],)
+            with self.get_fp8_context():
+                hidden_states, _ = block(
+                    hidden_states=hidden_states,
+                    rotary_pos_emb=rotary_pos_emb,
+                    emb=vec_emb,
+                )
+                single_block_samples = single_block_samples + (hidden_states[encoder_hidden_states.shape[0] :, ...],)
 
         controlnet_double_block_samples = ()
         for double_block_sample, control_block in zip(double_block_samples, self.controlnet_double_blocks):
-            double_block_sample = control_block(double_block_sample)
+            double_block_sample, bias = control_block(double_block_sample)
+            double_block_sample = double_block_sample + bias if bias else double_block_sample
             controlnet_double_block_samples += (double_block_sample,)
 
         controlnet_single_block_samples = ()
         for single_block_sample, control_block in zip(single_block_samples, self.controlnet_single_blocks):
-            single_block_sample = control_block(single_block_sample)
+            single_block_sample, bias = control_block(single_block_sample)
+            single_block_sample = single_block_sample + bias if bias else single_block_sample
             controlnet_single_block_samples += (single_block_sample,)
 
         controlnet_double_block_samples = [sample * conditioning_scale for sample in controlnet_double_block_samples]
@@ -306,6 +366,48 @@ class FluxControlnetForwardWrapper(VisionModule):
         self.flux_controlnet = FluxControlNet(flux_controlnet_config)
         if flux_controlnet_config.load_from_flux_transformer:
             self.flux_controlnet.load_from_flux_transformer(self.flux)
+
+    def forward(
+        self,
+        packed_noisy_model_input,
+        control_image,
+        prompt_embeds,
+        pooled_prompt_embeds,
+        timesteps,
+        latent_image_ids,
+        text_ids,
+        guidance_vec,
+    ):
+        '''
+        Forward pass for the FluxControlnetForwardWrapper model.
+        '''
+        # NOTE: This module is wrapped with Fully Sharded Data Parallel (FSDP).
+        # To ensure that FSDP can accurately capture the forward and backward
+        # processes, it is crucial that the output tensor from this forward
+        # function can be used to construct a complete autograd graph.
+        controlnet_double_block_samples, controlnet_single_block_samples = self.flux_controlnet(
+            img=packed_noisy_model_input,
+            controlnet_cond=control_image,
+            txt=prompt_embeds,
+            y=pooled_prompt_embeds,
+            timesteps=timesteps / 1000,
+            img_ids=latent_image_ids,
+            txt_ids=text_ids,
+            guidance=guidance_vec,
+        )
+        noise_pred = self.flux(
+            img=packed_noisy_model_input,
+            txt=prompt_embeds,
+            y=pooled_prompt_embeds,
+            timesteps=timesteps / 1000,
+            img_ids=latent_image_ids,
+            txt_ids=text_ids,
+            guidance=guidance_vec,
+            controlnet_double_block_samples=controlnet_double_block_samples,
+            controlnet_single_block_samples=controlnet_single_block_samples,
+        )
+
+        return noise_pred
 
 
 class MegatronFluxControlNetModel(MegatronFluxModel):
@@ -348,8 +450,8 @@ class MegatronFluxControlNetModel(MegatronFluxModel):
             self.configure_vae(self.vae_config)
             self.configure_scheduler()
             self.configure_text_encoders(self.clip_params, self.t5_params)
-            ## Have to disable requiring grads for those params not getting one, otherwise custom fsdp fails at assert
-            ## when there is no single layer, encoder_hidden_states related params are not included in computation graph
+            # Have to disable requiring grads for those params not getting one, otherwise custom fsdp fails at assert
+            # when there is no single layer, encoder_hidden_states related params are not included in computation graph
             for name, param in self.module.named_parameters():
                 if self.flux_controlnet_config.num_single_layers == 0:
                     if 'context' in name or 'added' in name:
@@ -369,8 +471,9 @@ class MegatronFluxControlNetModel(MegatronFluxModel):
         '''
         Calling the controlnet forward pass.
         '''
-        # FSDP module -> Bfloat16 module -> ForwardWrapper -> flux controlnet
-        return self.module.module.module.flux_controlnet(*args, **kwargs)
+        # FSDP module -> Bfloat16 module -> ForwardWrapper
+        forward_wrapper = self.module.module.module
+        return forward_wrapper(*args, **kwargs)
 
     def training_step(self, batch, batch_idx=None) -> torch.Tensor:
         '''
@@ -465,26 +568,15 @@ class MegatronFluxControlNetModel(MegatronFluxModel):
             self.autocast_dtype in (torch.half, torch.bfloat16),
             dtype=self.autocast_dtype,
         ):
-            controlnet_double_block_samples, controlnet_single_block_samples = self.forward(
-                img=packed_noisy_model_input,
-                controlnet_cond=control_image,
-                txt=prompt_embeds,
-                y=pooled_prompt_embeds,
-                timesteps=timesteps / 1000,
-                img_ids=latent_image_ids,
-                txt_ids=text_ids,
-                guidance=guidance_vec,
-            )
-            noise_pred = self.module.module.module.flux(
-                img=packed_noisy_model_input,
-                txt=prompt_embeds,
-                y=pooled_prompt_embeds,
-                timesteps=timesteps / 1000,
-                img_ids=latent_image_ids,
-                txt_ids=text_ids,
-                guidance=guidance_vec,
-                controlnet_double_block_samples=controlnet_double_block_samples,
-                controlnet_single_block_samples=controlnet_single_block_samples,
+            noise_pred = self.forward(
+                packed_noisy_model_input=packed_noisy_model_input,
+                control_image=control_image,
+                prompt_embeds=prompt_embeds,
+                pooled_prompt_embeds=pooled_prompt_embeds,
+                timesteps=timesteps,
+                latent_image_ids=latent_image_ids,
+                text_ids=text_ids,
+                guidance_vec=guidance_vec,
             )
 
             target = (noise - latents).transpose(0, 1)

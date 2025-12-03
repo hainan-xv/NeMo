@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,23 +14,19 @@
 
 import lightning.pytorch as pl
 import torch
-import torch.nn.functional as F
-from torch.distributed._composable.fsdp import MixedPrecisionPolicy
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
 
 from nemo.collections.common.tokenizers.huggingface.auto_tokenizer import AutoTokenizer
 from nemo.collections.llm import fn
+from nemo.collections.llm.gpt.model.hf_auto_model_for_causal_lm import masked_cross_entropy
 from nemo.lightning import io
 from nemo.lightning.pytorch.strategies.utils import fsdp2_strategy_parallelize
 from nemo.utils import logging
+from nemo.utils.import_utils import safe_import_from
 
-
-def masked_cross_entropy(logits, targets, mask=None):
-    if mask is not None:
-        loss = F.cross_entropy(logits, targets, reduction='none')
-        return torch.mean(loss[mask == 1])
-    else:
-        return F.cross_entropy(logits, targets)
+MixedPrecisionPolicy, _ = safe_import_from(
+    "torch.distributed.fsdp", "MixedPrecisionPolicy", fallback_module="torch.distributed._composable.fsdp"
+)
 
 
 class HFAutoModelForSpeechSeq2Seq(pl.LightningModule, io.IOMixin, fn.FNMixin):
@@ -49,6 +45,13 @@ class HFAutoModelForSpeechSeq2Seq(pl.LightningModule, io.IOMixin, fn.FNMixin):
         cast_forward_inputs=True,
         parallelize_fn=None,
     ):
+        from nemo.utils.decorators import deprecated_warning
+
+        deprecated_warning(
+            old_method="Automodel on NVIDIA/NeMo",
+            new_method="https://github.com/NVIDIA-NeMo/Automodel repo",
+            wait_seconds=2,
+        )
         super().__init__()
         self.save_hyperparameters()
         self.model_name = model_name

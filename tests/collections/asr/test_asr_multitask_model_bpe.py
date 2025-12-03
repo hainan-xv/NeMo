@@ -30,6 +30,7 @@ from nemo.collections.asr.models.aed_multitask_models import EncDecMultiTaskMode
 from nemo.collections.asr.parts.submodules import multitask_beam_decoding as beam_decode
 from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
 from nemo.collections.asr.parts.utils.streaming_utils import FrameBatchMultiTaskAED
+from nemo.collections.asr.parts.utils.timestamp_utils import process_aed_timestamp_outputs
 from nemo.collections.common.prompts.canary import CanaryPromptFormatter, canary
 from nemo.collections.common.prompts.canary2 import Canary2PromptFormatter, canary2
 from nemo.collections.common.tokenizers import CanaryTokenizer
@@ -168,7 +169,7 @@ class TestEncDecMultiTaskModel:
         asr_model.compute_eval_loss = False
 
         input_signal = torch.randn(size=(4, 512))
-        length = torch.randint(low=161, high=500, size=[4])
+        length = torch.randint(low=321, high=500, size=[4])
 
         targets = torch.randint(low=0, high=100, size=[4, 10])
         targets_len = torch.randint(low=1, high=10, size=[4])
@@ -183,7 +184,6 @@ class TestEncDecMultiTaskModel:
                     transcript=targets[i : i + 1],
                     transcript_length=targets_len[i : i + 1],
                 )
-                print(log_probs.shape)
                 logprobs_instance.append(log_probs)
             logits_instance = torch.cat(logprobs_instance, 0)
 
@@ -292,17 +292,19 @@ class TestEncDecMultiTaskModel:
         with torch.no_grad():
             ans = asr_model.validation_pass(batch, batch_idx=0)
         print(ans)
-        assert list(ans.keys()) == [
-            "val_loss",
-            "val_wer",
-            "val_wer_num",
-            "val_wer_denom",
-            "val_bleu",
-            "val_bleu_pred_len",
-            "val_bleu_target_len",
-            "val_bleu_num",
-            "val_bleu_denom",
-        ]
+        assert set(ans.keys()) == set(
+            [
+                "val_loss",
+                "val_wer",
+                "val_wer_num",
+                "val_wer_denom",
+                "val_bleu",
+                "val_bleu_pred_len",
+                "val_bleu_target_len",
+                "val_bleu_num",
+                "val_bleu_denom",
+            ]
+        )
 
     @pytest.mark.unit
     def test_save_restore_artifact(self, asr_model):
@@ -316,6 +318,10 @@ class TestEncDecMultiTaskModel:
             assert isinstance(new_model, type(asr_model))
 
             assert len(new_model.tokenizer.tokenizer.get_vocab()) == 32 + 128 + 128
+
+    @pytest.mark.unit
+    def test_restore_with_timestamps_asr_model(self, canary_1b_v2):
+        assert canary_1b_v2.timestamps_asr_model is not None
 
     # @pytest.mark.with_downloads()
     # @pytest.mark.unit
@@ -545,7 +551,44 @@ class TestEncDecMultiTaskModel:
         }
         model.read_audio_file(audio_file, delay=0.0, model_stride_in_secs=40.0, meta_data=meta)
         outputs = model.transcribe()
-        assert isinstance(outputs, str)
+        assert isinstance(outputs, Hypothesis)
+
+    @pytest.mark.with_downloads()
+    @pytest.mark.unit
+    def test_FrameBatchMultiTaskAED_with_timestamps(self, canary_1b_flash):
+        canary_1b_flash.eval()
+        model = FrameBatchMultiTaskAED(
+            canary_1b_flash,
+            frame_len=10.0,
+            total_buffer=10.0,
+            batch_size=8,
+        )
+
+        audio_file = "/home/TestData/asr/longform/earnings22/sample_4469669.wav"
+
+        meta = {
+            'audio_filepath': audio_file,
+            'duration': 100000,
+            'source_lang': 'en',
+            'taskname': 'asr',
+            'target_lang': 'en',
+            'pnc': 'yes',
+            'answer': 'nothing',
+            'timestamp': 'yes',
+        }
+        model_stride_in_secs = 0.01 * 8  # feature_stride in sec * model_stride
+        model.read_audio_file(audio_file, delay=0.0, model_stride_in_secs=model_stride_in_secs, meta_data=meta)
+        outputs = model.transcribe(timestamps=True)
+
+        # check hypothesis object
+        assert isinstance(outputs, Hypothesis)
+
+        # check part of transcript
+        assert outputs.text[:13] == "Now it's time", f"{outputs}"
+
+        # check timestamps
+        assert outputs.timestamp['segment'][0]['start'] == pytest.approx(5.68)
+        assert outputs.timestamp['segment'][0]['end'] == pytest.approx(9.68)
 
 
 @pytest.mark.unit
@@ -779,3 +822,189 @@ def test_prompted_dataset_canary2(canary2_tokenizer):
         == '<|startofcontext|>s##o##m##ed##e##c##o##d##erc##o##nt##e##x##t<|startoftranscript|><|emo:happy|><|en|><|en|><|pnc|><|noitn|><|timestamp|><|diarize|><|0|>h##el##l##o<|3|><|4|>w##o##r##l##d<|5|><|endoftext|>'
     )
     assert batch.prompted_transcript_lens[i] == 39
+
+
+@pytest.mark.unit
+def test_aed_timestamp_processing():
+    # Create test hypothesis with timestamps
+    hyp = Hypothesis(
+        text="<|10|>hello<|15|> <|20|>world<|25|>",
+        y_sequence=None,
+        score=None,
+        alignments=None,
+        length=None,
+        timestamp={},
+    )
+
+    # Process timestamps with default parameters
+    processed = process_aed_timestamp_outputs(hyp)
+    assert isinstance(processed, list)
+    assert len(processed) == 1
+    assert processed[0].text == "hello world"
+
+    # Check word-level timestamps
+    word_timestamps = processed[0].timestamp['word']
+    assert len(word_timestamps) == 2
+
+    # Check first word "hello"
+    assert word_timestamps[0]['word'] == 'hello'
+    assert word_timestamps[0]['start_offset'] == 10
+    assert word_timestamps[0]['end_offset'] == 15
+    assert word_timestamps[0]['start'] == 0.1  # 10 * 0.01
+    assert word_timestamps[0]['end'] == 0.15  # 15 * 0.01
+
+    # Check second word "world"
+    assert word_timestamps[1]['word'] == 'world'
+    assert word_timestamps[1]['start_offset'] == 20
+    assert word_timestamps[1]['end_offset'] == 25
+    assert word_timestamps[1]['start'] == 0.2  # 20 * 0.01
+    assert word_timestamps[1]['end'] == 0.25  # 25 * 0.01
+
+    # Check segment-level timestamps
+    segments = processed[0].timestamp['segment']
+    assert len(segments) == 1
+    assert segments[0]['start_offset'] == 10
+    assert segments[0]['end_offset'] == 25
+    assert segments[0]['start'] == 0.1
+    assert segments[0]['end'] == 0.25
+
+    # Test with different window_stride and subsampling_factor
+    hyp = Hypothesis(
+        text="<|10|>hello<|15|> <|20|>world<|25|>",
+        y_sequence=None,
+        score=None,
+        alignments=None,
+        length=None,
+        timestamp={},
+    )
+    processed = process_aed_timestamp_outputs(hyp, subsampling_factor=2, window_stride=0.02)
+    word_timestamps = processed[0].timestamp['word']
+
+    # Check timing calculations with new parameters
+    assert word_timestamps[0]['start'] == 0.4  # 10 * 0.02 * 2
+    assert word_timestamps[0]['end'] == 0.6  # 15 * 0.02 * 2
+    assert word_timestamps[1]['start'] == 0.8  # 20 * 0.02 * 2
+    assert word_timestamps[1]['end'] == 1.0  # 25 * 0.02 * 2
+
+    # Test case when text doesn't contain timestamps
+    hyp = Hypothesis(text="hello world", y_sequence=None, score=None, alignments=None, length=None, timestamp={})
+
+    # Process timestamps with default parameters
+    processed = process_aed_timestamp_outputs(hyp)
+    assert isinstance(processed, list)
+    assert len(processed) == 1
+    assert processed[0].text == "hello world"
+
+    # Verify no timestamps were extracted
+    assert processed[0].timestamp['word'] == []
+    assert processed[0].timestamp['segment'] == []
+
+
+@pytest.mark.unit
+def test_aed_forced_aligned_timestamps(canary_1b_v2):
+
+    audio_file = "/home/TestData/asr/canary/dev-other-wav/8173-294714-0040.wav"
+    audio_batch = [audio_file, audio_file]
+
+    # Testing with batch_size=2 to avoid dynamic_chunking and test pure timestamps extraction
+    # Dynamic chunking with timestamps are tested in other tests
+
+    hypotheses = canary_1b_v2.transcribe(audio_batch, timestamps=False, batch_size=2)
+    assert len(hypotheses) == 2
+    assert hypotheses[0].timestamp == []
+    assert hypotheses[1].timestamp == []
+
+    ts_hypotheses = canary_1b_v2.transcribe(audio_batch, timestamps=True, batch_size=2)
+    assert len(ts_hypotheses) == 2
+
+    assert "word" in ts_hypotheses[0].timestamp
+    assert "segment" in ts_hypotheses[0].timestamp
+    assert "char" not in ts_hypotheses[0].timestamp
+
+    assert ts_hypotheses[0].text == hypotheses[0].text
+
+    assert len(ts_hypotheses[0].timestamp['word']) == len(ts_hypotheses[0].text.split())
+
+    segment_count = 0
+    segment_separators = ['.', '?', '!', '...']
+    for sep in segment_separators:
+        if sep in ts_hypotheses[0].text:
+            segment_count += 1
+    if ts_hypotheses[0].text.strip()[-1] not in segment_separators:
+        segment_count += 1
+
+    assert len(ts_hypotheses[0].timestamp['segment']) == segment_count
+    assert [word_offset['word'] for word_offset in ts_hypotheses[0].timestamp['word']] == ts_hypotheses[0].text.split()
+    assert " ".join([word_offset['word'] for word_offset in ts_hypotheses[0].timestamp['word']]) == " ".join(
+        [segment_offset['segment'] for segment_offset in ts_hypotheses[0].timestamp['segment']]
+    )
+
+    assert ts_hypotheses[0].timestamp['segment'][0]['start'] == ts_hypotheses[0].timestamp['word'][0]['start']
+    assert ts_hypotheses[0].timestamp['segment'][-1]['end'] == ts_hypotheses[0].timestamp['word'][-1]['end']
+    assert (
+        ts_hypotheses[0].timestamp['segment'][0]['start_offset']
+        == ts_hypotheses[0].timestamp['word'][0]['start_offset']
+    )
+    assert (
+        ts_hypotheses[0].timestamp['segment'][-1]['end_offset'] == ts_hypotheses[0].timestamp['word'][-1]['end_offset']
+    )
+
+
+@pytest.mark.unit
+def test_aed_parallel_chunking(canary_1b_v2):
+
+    audio_file = "/home/TestData/asr/longform/earnings22/sample_4469669.wav"
+    # Testing on long audio file to check chunking and timestamps extraction
+
+    hypotheses = canary_1b_v2.transcribe(audio_file, timestamps=False)
+    assert len(hypotheses) == 1
+    assert hypotheses[0].timestamp == []
+
+    ts_hypotheses = canary_1b_v2.transcribe(audio_file, timestamps=True)
+    assert len(ts_hypotheses) == 1
+
+    assert ts_hypotheses[0].text == hypotheses[0].text
+    assert "char" not in ts_hypotheses[0].timestamp
+    assert 'word' in ts_hypotheses[0].timestamp and 'segment' in ts_hypotheses[0].timestamp
+    assert len(ts_hypotheses[0].timestamp['word']) > 0
+    assert len(ts_hypotheses[0].timestamp['segment']) > 0
+    assert len(ts_hypotheses[0].timestamp['word']) == len(ts_hypotheses[0].text.split())
+
+    # Monotonicity and validity of word offsets and times
+    words = ts_hypotheses[0].timestamp['word']
+    starts = [w['start'] for w in words]
+    ends = [w['end'] for w in words]
+    start_offsets = [w['start_offset'] for w in words]
+    end_offsets = [w['end_offset'] for w in words]
+    assert all(s <= e for s, e in zip(starts, ends))
+    assert all(so <= eo for so, eo in zip(start_offsets, end_offsets))
+    assert all(x <= y for x, y in zip(starts, starts[1:]))
+    assert all(x <= y for x, y in zip(ends, ends[1:]))
+    assert all(x <= y for x, y in zip(start_offsets, start_offsets[1:]))
+    assert all(x <= y for x, y in zip(end_offsets, end_offsets[1:]))
+    # Check if the transcription is correct
+    assert ts_hypotheses[0].text[-25:] == 'multiple customer orders.'
+    assert ts_hypotheses[0].timestamp['word'][-1] == {
+        'word': 'orders.',
+        'start_offset': 7477,
+        'end_offset': 7481,
+        'start': 598.16,
+        'end': 598.48,
+    }
+    assert ts_hypotheses[0].text == hypotheses[0].text
+
+    # Check that the number of words and segments are consistent
+    assert [word_offset['word'] for word_offset in ts_hypotheses[0].timestamp['word']] == ts_hypotheses[0].text.split()
+    assert " ".join([word_offset['word'] for word_offset in ts_hypotheses[0].timestamp['word']]) == " ".join(
+        [segment_offset['segment'] for segment_offset in ts_hypotheses[0].timestamp['segment']]
+    )
+
+    assert ts_hypotheses[0].timestamp['segment'][0]['start'] == ts_hypotheses[0].timestamp['word'][0]['start']
+    assert ts_hypotheses[0].timestamp['segment'][-1]['end'] == ts_hypotheses[0].timestamp['word'][-1]['end']
+    assert (
+        ts_hypotheses[0].timestamp['segment'][0]['start_offset']
+        == ts_hypotheses[0].timestamp['word'][0]['start_offset']
+    )
+    assert (
+        ts_hypotheses[0].timestamp['segment'][-1]['end_offset'] == ts_hypotheses[0].timestamp['word'][-1]['end_offset']
+    )

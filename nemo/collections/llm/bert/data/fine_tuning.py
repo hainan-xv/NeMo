@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -153,22 +153,22 @@ class FineTuningDataModule(pl.LightningDataModule):
         # pylint: disable=C0115,C0116
         return self._create_dataloader(
             self._create_dataset(
-                self.train_path,
+                self.validation_path,
                 max_num_samples=self.max_train_samples,
                 **self.dataset_kwargs,
             ),
-            mode="train",
+            mode="validation",
         )
 
     def test_dataloader(self) -> DataLoader:
         # pylint: disable=C0115,C0116
         return self._create_dataloader(
             self._create_dataset(
-                self.train_path,
+                self.test_path,
                 max_num_samples=self.max_train_samples,
                 **self.dataset_kwargs,
             ),
-            mode="train",
+            mode="test",
         )
 
     @lru_cache
