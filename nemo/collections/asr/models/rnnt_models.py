@@ -68,7 +68,11 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         self.preprocessor = EncDecRNNTModel.from_config_dict(self.cfg.preprocessor)
         self.encoder = EncDecRNNTModel.from_config_dict(self.cfg.encoder)
 
-        self.sample_sizes = self.cfg.sample_sizes
+        try:
+            self.sample_sizes = self.cfg.sample_sizes
+        except AttributeError:
+            self.sample_sizes = [1]
+
         self.inference_chunk = self.sample_sizes[0]
 
         # Update config values required by components dynamically
