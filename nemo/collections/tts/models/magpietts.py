@@ -50,7 +50,7 @@ from nemo.collections.tts.parts.utils.helpers import (
     get_mask_from_lengths,
     plot_alignment_to_numpy,
 )
-from nemo.collections.tts.parts.utils.tts_dataset_utils import stack_tensors
+from nemo.collections.tts.parts.utils.tts_dataset_utils import chunk_and_tokenize_text_by_sentence, stack_tensors
 from nemo.core.classes import ModelPT
 from nemo.core.classes.common import PretrainedModelInfo
 from nemo.utils import logging
@@ -3507,6 +3507,35 @@ class MagpieTTSModel(ModelPT):
 
         return transcript
 
+    def _needs_longform_inference(self, text: str, language: str) -> bool:
+        """Determine if longform inference is needed for the given text."""
+        # Average Number of words in 20 seconds of audio for each supported language.
+        longform_word_thresholds = {
+            "en": 45,
+            "es": 73,
+            "fr": 69,
+            "vi": 50,
+            "it": 53,
+            "de": 50,
+            "zh": 100,
+        }
+        # For Zh word count cannot be calculated by split(), hence calculating character count.
+        if language == "zh":
+            word_count = len(list(text))
+        else:
+            word_count = len(text.split())
+        is_longform = word_count >= longform_word_thresholds[language]
+
+        if is_longform:
+            if language == "zh":
+                logging.info("Longform inference is not supported for Mandarin, attempting to use standard inference.")
+                is_longform = False
+            elif language != "en":
+                logging.info(
+                    "Longform is best supported for English. For other languages, longform performance may not be optimal."
+                )
+        return is_longform
+
     def do_tts(
         self,
         transcript: str,
@@ -3601,28 +3630,67 @@ class MagpieTTSModel(ModelPT):
                 f"Using '{tokenizer_name}'. Available: {available_tokenizers}"
             )
 
-        # Tokenize the transcript text
-        tokens = self.tokenizer.encode(text=normalized_text, tokenizer_name=tokenizer_name)
-        tokens = tokens + [self.eos_id]  # Add EOS token (BOS not used per dataset convention)
-        text_tensor = torch.tensor([tokens], device=self.device, dtype=torch.long)
-        text_lens = torch.tensor([len(tokens)], device=self.device, dtype=torch.long)
+        # Detect if longform inference is needed based on word count
+        is_longform = self._needs_longform_inference(normalized_text, language)
 
-        # Create batch dictionary
-        batch = {
-            'text': text_tensor,
-            'text_lens': text_lens,
-            'speaker_indices': speaker_index,
-        }
-
-        # Run inference
         with torch.no_grad():
-            output = self.infer_batch(
-                batch,
-                use_cfg=use_cfg,
-                use_local_transformer_for_inference=True,
-            )
+            if is_longform:
+                # Longform path - process text - sentence by sentence
+                chunked_tokens, chunked_tokens_len, _ = chunk_and_tokenize_text_by_sentence(
+                    normalized_text, tokenizer_name, self.tokenizer, self.eos_id
+                )
 
-        return output.predicted_audio, output.predicted_audio_lens
+                chunk_state = self.create_longform_chunk_state(batch_size=1)
+                all_codes = []
+
+                for chunk_idx, (tokens, tokens_len) in enumerate(zip(chunked_tokens, chunked_tokens_len)):
+                    batch = {
+                        'text': tokens.unsqueeze(0).to(self.device),
+                        'text_lens': torch.tensor([tokens_len], device=self.device, dtype=torch.long),
+                        'speaker_indices': speaker_index,
+                    }
+                    end_of_text = [chunk_idx == len(chunked_tokens) - 1]
+                    beginning_of_text = chunk_idx == 0
+
+                    output = self.generate_long_form_speech(
+                        batch,
+                        chunk_state=chunk_state,
+                        end_of_text=end_of_text,
+                        beginning_of_text=beginning_of_text,
+                        use_cfg=use_cfg,
+                    )
+                    if output.predicted_codes_lens[0] > 0:
+                        all_codes.append(output.predicted_codes[0, :, : output.predicted_codes_lens[0]])
+
+                # Concatenate and convert to audio
+                if len(all_codes) > 0:
+                    concatenated_codes = torch.cat(all_codes, dim=1).unsqueeze(0)
+                    codes_lens = torch.tensor([concatenated_codes.shape[2]], device=self.device, dtype=torch.long)
+                    predicted_audio, predicted_audio_lens, _ = self.codes_to_audio(concatenated_codes, codes_lens)
+                    return predicted_audio, predicted_audio_lens
+                else:
+                    return torch.zeros(1, 0, device=self.device), torch.zeros(1, device=self.device, dtype=torch.long)
+
+            else:
+                # Standard path - single utterance inference
+                tokens = self.tokenizer.encode(text=normalized_text, tokenizer_name=tokenizer_name)
+                tokens = tokens + [self.eos_id]  # Add EOS token (BOS not used per dataset convention)
+                text_tensor = torch.tensor([tokens], device=self.device, dtype=torch.long)
+                text_lens = torch.tensor([len(tokens)], device=self.device, dtype=torch.long)
+
+                batch = {
+                    'text': text_tensor,
+                    'text_lens': text_lens,
+                    'speaker_indices': speaker_index,
+                }
+
+                output = self.infer_batch(
+                    batch,
+                    use_cfg=use_cfg,
+                    use_local_transformer_for_inference=True,
+                )
+
+                return output.predicted_audio, output.predicted_audio_lens
 
     @classmethod
     def list_available_models(cls) -> List[PretrainedModelInfo]:
