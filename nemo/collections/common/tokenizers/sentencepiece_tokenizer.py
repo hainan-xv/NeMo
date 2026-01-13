@@ -197,9 +197,7 @@ class PunctuationAwareSentencePieceTokenizer(TokenizerSpec, ChatTemplateMixin):
         
         for i, part in enumerate(parts):
             if len(part) == 0:
-                print("WEIRD", text)
-                print("WEIRD parts", parts)
-                assert False
+                continue
 
             # Check if last character is punctuation
             if part[-1] in self.punct_to_id.keys():
@@ -208,14 +206,12 @@ class PunctuationAwareSentencePieceTokenizer(TokenizerSpec, ChatTemplateMixin):
                 new_punct_id = self.punct_to_id[part[-1]]
             else:
                 word = part
-                new_punct_id = self.punct_to_id['<no_punc>']
-
-            # Check if this is the last part (sentence-ending punctuation)
-            is_last = (i == len(parts) - 1)
+                new_punct_id = self.no_punct_id
                 
             # Tokenize the word
-            word_tokens = self.tokenizer.text_to_tokens(word)
-            word_ids = self.tokenizer.tokens_to_ids(word_tokens)
+#            word_tokens = self.tokenizer.text_to_tokens(word)
+#            word_ids = self.tokenizer.tokens_to_ids(word_tokens)
+            word_ids = self.tokenizer.text_to_ids(word)
             
             # Attach punctuation to first token of the word
             for j, token_id in enumerate(word_ids):
@@ -226,8 +222,8 @@ class PunctuationAwareSentencePieceTokenizer(TokenizerSpec, ChatTemplateMixin):
 
             last_punct_id = new_punct_id
 
-        if last_punct_id != self.no_punct_id:
-            result.append([self.bow_id, self.no_punct_id])
+#        if last_punct_id != self.no_punct_id:
+        result.append([self.bow_id, last_punct_id])
         
         return self.convert_2d_to_1d(result)
 
