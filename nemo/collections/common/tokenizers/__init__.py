@@ -18,7 +18,7 @@ from nemo.collections.common.tokenizers.canary_tokenizer import CanaryTokenizer
 from nemo.collections.common.tokenizers.char_tokenizer import CharTokenizer
 from nemo.collections.common.tokenizers.huggingface.auto_tokenizer import AutoTokenizer
 from nemo.collections.common.tokenizers.regex_tokenizer import RegExTokenizer
-from nemo.collections.common.tokenizers.sentencepiece_tokenizer import SentencePieceTokenizer
+from nemo.collections.common.tokenizers.sentencepiece_tokenizer import SentencePieceTokenizer, PunctuationAwareSentencePieceTokenizer
 from nemo.collections.common.tokenizers.tiktoken_tokenizer import TiktokenTokenizer
 from nemo.collections.common.tokenizers.tokenizer_spec import TokenizerSpec
 from nemo.collections.common.tokenizers.word_tokenizer import WordTokenizer
@@ -32,6 +32,7 @@ __all__ = [
     "AutoTokenizer",
     "RegExTokenizer",
     "SentencePieceTokenizer",
+    "PunctuationAwareSentencePieceTokenizer",
     "TokenizerSpec",
     "WordTokenizer",
 ]

@@ -722,7 +722,12 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         del signal
 
         # During training, loss must be computed, so decoder forward is necessary
-        decoder, target_length, states = self.decoder(targets=transcript, target_length=transcript_len)
+        if len(transcript.shape) == 2:
+            decoder, target_length, states = self.decoder(targets=transcript, target_length=transcript_len)
+        elif len(transcript.shape) == 3:
+            decoder, target_length, states = self.decoder(targets=transcript[...,0], target_length=transcript_len)
+        else:
+            assert False
 
         if hasattr(self, '_trainer') and self._trainer is not None:
             log_every_n_steps = self._trainer.log_every_n_steps

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from asyncio import FastChildWatcher
 import os
 import re
 from typing import Dict, List, Optional, Union
@@ -27,7 +28,222 @@ from nemo.utils import logging
 
 __all__ = ['SentencePieceTokenizer', 'create_spt_model']
 
+class PunctuationAwareSentencePieceTokenizer(TokenizerSpec, ChatTemplateMixin):
+    """
+    A wrapper around SentencePieceTokenizer that handles punctuation separately.
+    
+    Returns a 2D list where each element is [subword_id, punctuation_before].
+    Punctuation is attached to the beginning of the following word.
+    Sentence-ending punctuation is attached to a special begin-of-word token.
+    """
+    
+    def __init__(
+        self,
+        model_path: str,
+        special_tokens: Optional[dict] = None,
+        legacy: bool = False,
+        ignore_extra_whitespaces: bool = True,
+        chat_template: Optional[str] = None,
+        punctuation_chars: Optional[str] = None,
+    ):
+        """
+        Initialize the tokenizer.
+        
+        Args:
+            model_path: Path to the SentencePiece model file
+            special_tokens: Dictionary of special tokens
+            legacy: Whether to use legacy mode
+            ignore_extra_whitespaces: Whether to ignore extra whitespaces
+            chat_template: Optional chat template
+            punctuation_chars: Custom string of punctuation characters.
+                              If None, uses default: '.,!?;:()[]{}"\''
+        """
+        self.tokenizer = SentencePieceTokenizer(
+            model_path=model_path,
+            special_tokens=special_tokens,
+            legacy=legacy,
+            ignore_extra_whitespaces=ignore_extra_whitespaces,
+            chat_template=chat_template,
+        )
 
+        # Create token-to-id and id-to-token maps for the underlying SentencePiece model's subwords
+        self.sp_model = self.tokenizer.tokenizer  # This is a sentencepiece.SentencePieceProcessor
+        self.token_to_id = {self.sp_model.id_to_piece(i): i for i in range(self.sp_model.get_piece_size())}
+        self.id_to_token = {i: self.sp_model.id_to_piece(i) for i in range(self.sp_model.get_piece_size())}
+        
+        # Default punctuation characters
+        if punctuation_chars is None:
+            punctuation_chars = '.,!?;:()"'
+
+        self.punct_to_id = {} 
+        for char in punctuation_chars:
+            self.punct_to_id[char] = len(self.punct_to_id)
+        self.punct_to_id['<no_punc>'] = len(self.punct_to_id)
+
+        self.id_to_punct = {v: k for k, v in self.punct_to_id.items()}
+        # Get the begin-of-word token from SentencePiece
+#        self._begin_of_word_token = '▁'▁''
+        self.no_punct_id = self.punct_to_id['<no_punc>']
+        self.bow_id = self.token_to_id['▁']
+        # Concatenate all subwords and all punctuations to form self.vocabs
+        self.vocabs = list(self.token_to_id.keys()) + list(self.punct_to_id.keys())
+
+
+    def ensure_correct_format(self, text):
+        """
+        Make sure there are no single punctuations when splitting by word. 
+        If found, attach it to the word before it.
+        
+        Args:
+            text: string to check/clean
+        Returns:
+            string, possibly modified
+        """
+        # Early out for empty or trivial case
+        if not text or text.strip() == '':
+            return text
+
+        # Use the punctuation characters from the class, falling back to default if not present
+        puncts = getattr(self, "punctuation_chars", '.,!?;:()"')
+        # Split into tokens separated by spaces
+        parts = text.strip().split()
+        new_parts = []
+        for part in parts:
+            # If this part is a single punctuation (possibly repeated) and not a word
+            if all(char in puncts for char in part) and len(part) == 1:
+                # Attach this to previous word if possible, else just leave it
+                if new_parts:
+                    new_parts[-1] += part
+                else:
+                    new_parts.append(part)
+            else:
+                new_parts.append(part)
+        return " ".join(new_parts)
+
+    def text_to_tokens(sell, text):
+        assert False # no need for this function!
+        # ids = self.text_to_ids(text)
+        # result = []
+        # for a, b in idx:
+        #     subword = self.id_to_token(a)
+        #     punct = self.id_to_punct(b) if b != self.no_punct_id else ''
+
+    def tokens_to_text(self, tokens):
+        assert False
+
+    def tokens_to_ids(self, tokens):
+        assert False
+
+    def ids_to_text(self, ids):
+        """
+        Convert a 2D list of [subword_id, punctuation_before_id] pairs back to text.
+
+        Args:
+            ids: 2D list of [subword_id, punctuation_before_id]
+
+        Returns:
+            Reconstructed text string from token and punctuation IDs.
+        """
+        text = ''
+        current_word_tokens = []
+
+        try:
+            for subword_id, punct_id in ids:
+                # Get subword token and punctuation string
+                token = self.id_to_token[subword_id]
+                punct = self.id_to_punct[punct_id] if punct_id != self.no_punct_id else ""
+                text += punct + token
+        except:  # this part will be removed once decoding code is rewritten
+            for subword_id in ids:
+                # Get subword token and punctuation string
+                subword_id = subword_id % 1000
+                token = self.id_to_token[subword_id]
+                text += token
+
+        return text.replace("▁", " ")
+
+
+    def text_to_ids(self, text):
+        """
+        Convert text to a 2D list of [ubword_id, punctuation_before_id] pairs.
+        
+        Simplified logic:
+        - Split text by spaces
+        - For each space-separated string, check the last character
+        - If it's punctuation, separate it; otherwise feed whole string to tokenizer
+        
+        Args:
+            text: Input text string
+            
+        Returns:
+            2D list where each element is [subword_id, punctuation_before_id]
+            punctuation_before is a string or the id for no punctuation
+        """
+        # Normalize whitespace
+        text = self.ensure_correct_format(text)
+        text = re.sub(r'\s+', ' ', text.strip())
+        
+        # Split by spaces
+        parts = text.split(' ')
+        
+        result = []
+
+        
+        last_punct_id = self.no_punct_id
+        
+        for i, part in enumerate(parts):
+            # Check if last character is punctuation
+            if part[-1] in self.punct_to_id.keys():
+                # Separate punctuation from word
+                word = part[:-1]
+                new_punct_id = self.punct_to_id[part[-1]]
+            else:
+                word = part
+                new_punct_id = self.punct_to_id['<no_punc>']
+
+            # Check if this is the last part (sentence-ending punctuation)
+            is_last = (i == len(parts) - 1)
+                
+            # Tokenize the word
+            word_tokens = self.tokenizer.text_to_tokens(word)
+#            print("HERE word_tokens", word_tokens)
+            word_ids = self.tokenizer.tokens_to_ids(word_tokens)
+            
+            # Attach punctuation to first token of the word
+            for j, token_id in enumerate(word_ids):
+                if j == 0:
+                    result.append([token_id, last_punct_id])
+                else:
+                    result.append([token_id, self.no_punct_id])
+
+            last_punct_id = new_punct_id
+
+        if last_punct_id != self.no_punct_id:
+            result.append([self.bow_id, self.no_punct_id])
+        
+        return result
+
+    def ids_to_tokens(self, ids: List[int]) -> List[List[Union[int, str]]]:
+        """
+        Convert a list of token IDs to a 2D list of [subword_id, punctuation_before] pairs.
+        
+        Args:
+            ids: List of token IDs
+            
+        Returns:
+            List of [subword_id, punctuation_before] pairs
+        """
+        token_pairs = []
+        for id in ids:
+            token_pairs.append([id, ''])
+        return token_pairs
+
+    # Expose underlying tokenizer methods for compatibility
+    @property
+    def vocab_size(self) -> int:
+        """Get the vocabulary size."""
+        return self.tokenizer.vocab_size
+        
 class SentencePieceTokenizer(TokenizerSpec, ChatTemplateMixin):
     """Sentencepiecetokenizer https://github.com/google/sentencepiece.
 

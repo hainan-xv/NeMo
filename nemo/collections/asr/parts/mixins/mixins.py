@@ -93,7 +93,7 @@ class ASRBPEMixin(ABC):
                 with open_dict(self.cfg.tokenizer):
                     self.cfg.tokenizer.hf_kwargs = tokenizer_cfg.get('hf_kwargs')
 
-        if self.tokenizer_type not in ['bpe', 'wpe']:
+        if self.tokenizer_type not in ['bpe', 'wpe', 'punct_bpe']:
             raise ValueError(
                 "`tokenizer.type` must be either `bpe` for SentencePiece tokenizer or "
                 "`wpe` for BERT based tokenizer"
@@ -153,6 +153,61 @@ class ASRBPEMixin(ABC):
             self.tokenizer.tokenizer.vocab_size = len(vocabulary)
             self.tokenizer.tokenizer.get_vocab = get_vocab
             self.tokenizer.tokenizer.all_special_tokens = self.tokenizer.special_token_to_id
+
+        elif self.tokenizer_type == 'punct_bpe':
+            # This is a BPE Tokenizer
+            if 'model_path' in self.tokenizer_cfg:
+                model_path = self.tokenizer_cfg.get('model_path')
+            else:
+                model_path = os.path.join(self.tokenizer_dir, 'tokenizer.model')
+            model_path = self.register_artifact('tokenizer.model_path', model_path)
+            self.model_path = model_path
+
+            if 'special_tokens' in self.tokenizer_cfg:
+                special_tokens = self.tokenizer_cfg['special_tokens']
+
+                if special_tokens is not None:
+                    raise ValueError("`special_tokens` are no longer supported for SentencePiece based tokenizers.")
+
+            if "custom_tokenizer" in self.tokenizer_cfg:
+                self.tokenizer = self.from_config_dict(
+                    {"_target_": tokenizer_cfg["custom_tokenizer"]["_target_"], "model_path": model_path}
+                )
+            else:
+                self.tokenizer = tokenizers.PunctuationAwareSentencePieceTokenizer(model_path=model_path)
+
+            if 'vocab_path' in self.tokenizer_cfg:
+                vocab_path = self.tokenizer_cfg.get('vocab_path')
+            else:
+                vocab_path = os.path.join(self.tokenizer_dir, 'vocab.txt')
+            vocab_path = self.register_artifact('tokenizer.vocab_path', vocab_path)
+            self.vocab_path = vocab_path
+
+            try:
+                if 'spe_tokenizer_vocab' in self.tokenizer_cfg:
+                    spe_vocab_path = self.tokenizer_cfg.get('spe_tokenizer_vocab')
+                else:
+                    spe_vocab_path = os.path.join(self.tokenizer_dir, 'tokenizer.vocab')
+                spe_vocab_path = self.register_artifact('tokenizer.spe_tokenizer_vocab', spe_vocab_path)
+                self.spe_vocab_path = spe_vocab_path
+            except FileNotFoundError:
+                # fallback case for older checkpoints that did not preserve the tokenizer.vocab
+                self.spe_vocab_path = None
+
+            vocabulary = {}
+            for i in range(self.tokenizer.vocab_size):
+                piece = self.tokenizer.ids_to_tokens([i])
+                piece = piece[0][0]
+                vocabulary[piece] = i + 1
+
+            # wrapper method to get vocabulary conveniently
+            def get_vocab():
+                return vocabulary
+
+            # attach utility values to the tokenizer wrapper
+#            self.tokenizer.vocab_size = len(vocabulary)
+            self.tokenizer.get_vocab = get_vocab
+#            self.tokenizer.all_special_tokens = self.tokenizer.special_token_to_id
 
         else:
             # This is a WPE Tokenizer
@@ -483,7 +538,11 @@ class ASRBPEMixin(ABC):
                     logging.info(f"Saved {nemo_object_name} at {os.path.join(dir, new_name)}")
 
     def _derive_tokenizer_properties(self):
-        vocab = self.tokenizer.tokenizer.get_vocab()
+        try:
+            vocab = self.tokenizer.tokenizer.get_vocab()
+        except:
+            vocab = self.tokenizer.vocabs
+
 
         self.tokenizer.supports_capitalization = bool(extract_capitalized_tokens_from_vocab(vocab))
         self.tokenizer.supported_punctuation = extract_punctuation_from_vocab(vocab)

@@ -79,6 +79,7 @@ def _speech_collate_fn(batch, pad_id):
             sig, sig_len, tokens_i, tokens_i_len, _ = b
         else:
             sig, sig_len, tokens_i, tokens_i_len = b
+
         if has_audio:
             sig_len = sig_len.item()
             if sig_len < max_audio_len:
@@ -88,7 +89,12 @@ def _speech_collate_fn(batch, pad_id):
         if has_tokens:
             tokens_i_len = tokens_i_len.item()
             if tokens_i_len < max_tokens_len:
-                pad = (0, max_tokens_len - tokens_i_len)
+                # If tokens_i is a 2D tensor (e.g., [T, 2]), pad in dim=0 (time dimension)
+                # Otherwise, for 1D tensor, pad as before
+                if tokens_i.dim() == 2:
+                    pad = (0, 0, 0, max_tokens_len - tokens_i_len)
+                else:
+                    pad = (0, max_tokens_len - tokens_i_len)
                 tokens_i = torch.nn.functional.pad(tokens_i, pad, value=pad_id)
             tokens.append(tokens_i)
 
@@ -645,7 +651,7 @@ class AudioToBPEDataset(_AudioTextDataset):
         return {
             'audio_signal': NeuralType(('B', 'T'), AudioSignal()),
             'a_sig_length': NeuralType(tuple('B'), LengthsType()),
-            'transcripts': NeuralType(('B', 'T'), LabelsType()),
+            'transcripts': NeuralType(('B', 'T', 'T'), LabelsType()) if self.three_dimension else NeuralType(('B', 'T'), LabelsType()),
             'transcript_length': NeuralType(tuple('B'), LengthsType()),
             'sample_id': NeuralType(tuple('B'), LengthsType(), optional=True),
         }
@@ -680,6 +686,8 @@ class AudioToBPEDataset(_AudioTextDataset):
             pad_id = tokenizer.pad_id
         else:
             pad_id = 0
+
+        self.three_dimension = ('PunctuationAwareSentencePieceTokenizer' == type(tokenizer).__name__)
 
         class TokenizerWrapper:
             def __init__(self, tokenizer):

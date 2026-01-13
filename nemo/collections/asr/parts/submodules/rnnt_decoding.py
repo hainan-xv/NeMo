@@ -18,6 +18,7 @@ from abc import abstractmethod, abstractproperty
 from dataclasses import dataclass, field, is_dataclass
 from typing import Dict, List, Optional, Set, Union
 
+from nemo.collections.common.tokenizers import PunctuationAwareSentencePieceTokenizer
 import numpy as np
 import torch
 from omegaconf import OmegaConf
@@ -962,6 +963,8 @@ class AbstractRNNTDecoding(ConfidenceMixin):
         Decodes a list of tokens ids to a string.
         """
         if hasattr(self, 'tokenizer') and isinstance(self.tokenizer, AggregateTokenizer):
+            return self.tokenizer.ids_to_text(tokens)
+        elif hasattr(self, 'tokenizer') and isinstance(self.tokenizer, PunctuationAwareSentencePieceTokenizer):
             return self.tokenizer.ids_to_text(tokens)
         else:
             return self.decode_tokens_to_str(self.decode_ids_to_tokens(tokens))
