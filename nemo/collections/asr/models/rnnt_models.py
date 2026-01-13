@@ -79,6 +79,9 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         self.decoder = EncDecRNNTModel.from_config_dict(self.cfg.decoder)
         self.joint = EncDecRNNTModel.from_config_dict(self.cfg.joint)
 
+
+        self.vocab_size = self.cfg.decoder.vocab_size + 1  # +1 for blank
+
         # Setup RNNT Loss
         loss_name, loss_kwargs = self.extract_rnnt_loss_cfg(self.cfg.get("loss", None))
 
@@ -707,6 +710,12 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         encoded, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
         return encoded, encoded_len
 
+    def convert_2d_to_1d(self, t):
+        n = self.vocab_size - 1025
+        a = t // n
+        b = t % n + 1025
+        return torch.stack([a, b], dim=-1)
+
     # PTL-specific methods
     def training_step(self, batch, batch_nb):
         # Reset access registry
@@ -714,6 +723,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             AccessMixin.reset_registry(self)
 
         signal, signal_len, transcript, transcript_len = batch
+        transcript = self.convert_2d_to_1d(transcript)
 
         # forward() only performs encoder forward
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
@@ -813,6 +823,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
     def predict_step(self, batch, batch_idx, dataloader_idx=0):
         signal, signal_len, transcript, transcript_len, sample_id = batch
+        transcript = self.convert_2d_to_1d(transcript)
 
         # forward() only performs encoder forward
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
@@ -831,6 +842,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
     def validation_pass(self, batch, batch_idx, dataloader_idx=0):
         signal, signal_len, transcript, transcript_len = batch
+        transcript = self.convert_2d_to_1d(transcript)
 
         # forward() only performs encoder forward
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:

@@ -77,10 +77,13 @@ class PunctuationAwareSentencePieceTokenizer(TokenizerSpec, ChatTemplateMixin):
 
         self.punctuation_chars = punctuation_chars
         self.punct_to_id = {} 
+        self.punct_to_id0 = {} 
         for char in punctuation_chars:
             self.punct_to_id[char] = len(self.punct_to_id) + len(self.token_to_id) + 1# punctuation and tokens use disjointed intervals
+            self.punct_to_id0[char] = len(self.punct_to_id0)
 
         self.punct_to_id['<no_punc>'] = len(self.punct_to_id) + len(self.token_to_id) + 1
+        self.punct_to_id0['<no_punc>'] = len(self.punct_to_id0)
 
         self.id_to_punct = {v: k for k, v in self.punct_to_id.items()}
         self.no_punct_id = self.punct_to_id['<no_punc>']
@@ -125,11 +128,6 @@ class PunctuationAwareSentencePieceTokenizer(TokenizerSpec, ChatTemplateMixin):
 
     def text_to_tokens(sell, text):
         assert False # no need for this function!
-        # ids = self.text_to_ids(text)
-        # result = []
-        # for a, b in idx:
-        #     subword = self.id_to_token(a)
-        #     punct = self.id_to_punct(b) if b != self.no_punct_id else ''
 
     def tokens_to_text(self, tokens):
         assert False
@@ -150,19 +148,22 @@ class PunctuationAwareSentencePieceTokenizer(TokenizerSpec, ChatTemplateMixin):
         text = ''
         current_word_tokens = []
 
-        try:
+        if len(ids) == 0:
+            return ''
+
+        if len(ids[0]) == 2:
             for subword_id, punct_id in ids:
+#                punct_id  -=  len(self.id_to_token) + 1
                 # Get subword token and punctuation string
                 token = self.id_to_token[subword_id]
                 punct = self.id_to_punct[punct_id] if punct_id != self.no_punct_id else ""
                 text += punct + token
-        except:  # this part will be removed once decoding code is rewrittenA
-            assert False
-            for subword_id in ids:
+        else:  # this part will be removed once decoding code is rewrittenA
+            for subword_id, punct_id in self.convert_1d_to_2d(ids):
                 # Get subword token and punctuation string
-                subword_id = subword_id % 1000
                 token = self.id_to_token[subword_id]
-                text += token
+                punct = self.id_to_punct[punct_id] if punct_id != self.no_punct_id else ""
+                text += punct + token
 
         return text.replace("▁", " ")
 
@@ -188,16 +189,18 @@ class PunctuationAwareSentencePieceTokenizer(TokenizerSpec, ChatTemplateMixin):
         text = re.sub(r'\s+', ' ', text.strip())
         
         # Split by spaces
-        parts = text.split(' ')
+        parts = text.split()
 
-        print("PARTS ARE", parts)
-        
         result = []
-
         
         last_punct_id = self.no_punct_id
         
         for i, part in enumerate(parts):
+            if len(part) == 0:
+                print("WEIRD", text)
+                print("WEIRD parts", parts)
+                assert False
+
             # Check if last character is punctuation
             if part[-1] in self.punct_to_id.keys():
                 # Separate punctuation from word
@@ -226,6 +229,24 @@ class PunctuationAwareSentencePieceTokenizer(TokenizerSpec, ChatTemplateMixin):
         if last_punct_id != self.no_punct_id:
             result.append([self.bow_id, self.no_punct_id])
         
+        return self.convert_2d_to_1d(result)
+
+    def convert_2d_to_1d(self, a):
+        result = []
+        for i, j in a:
+            j -= 1 + len(self.token_to_id)
+#            assert (j >= 0)
+#            print("I J", i, j)
+            result.append(i * len(self.punct_to_id) + j)
+
+        return result
+
+
+    def convert_1d_to_2d(self, a):
+        result = []
+        for aa in a:
+            i, j = aa // len(self.punct_to_id), aa % len(self.punct_to_id)
+            result.append([i, 1 + len(self.token_to_id) + j])
         return result
 
     def ids_to_tokens(self, ids: List[int]) -> List[List[Union[int, str]]]:
@@ -238,10 +259,11 @@ class PunctuationAwareSentencePieceTokenizer(TokenizerSpec, ChatTemplateMixin):
         Returns:
             List of [subword_id, punctuation_before] pairs
         """
-        token_pairs = []
-        for id in ids:
-            token_pairs.append([id, ''])
-        return token_pairs
+        return False
+#        token_pairs = []
+#        for id in ids:
+#            token_pairs.append([id, ''])
+#        return token_pairs
 
     # Expose underlying tokenizer methods for compatibility
     @property
@@ -834,3 +856,4 @@ def create_spt_model(
         for token in vocab:
             f.write(f"{token}\n")
     return f'{output_dir}/tokenizer.model', vocab_file
+

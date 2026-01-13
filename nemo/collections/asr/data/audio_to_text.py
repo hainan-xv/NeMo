@@ -651,7 +651,7 @@ class AudioToBPEDataset(_AudioTextDataset):
         return {
             'audio_signal': NeuralType(('B', 'T'), AudioSignal()),
             'a_sig_length': NeuralType(tuple('B'), LengthsType()),
-            'transcripts': NeuralType(('B', 'T', 'T'), LabelsType()) if self.three_dimension else NeuralType(('B', 'T'), LabelsType()),
+            'transcripts': NeuralType(('B', 'T'), LabelsType()),
             'transcript_length': NeuralType(tuple('B'), LengthsType()),
             'sample_id': NeuralType(tuple('B'), LengthsType(), optional=True),
         }
@@ -686,8 +686,6 @@ class AudioToBPEDataset(_AudioTextDataset):
             pad_id = tokenizer.pad_id
         else:
             pad_id = 0
-
-        self.three_dimension = ('PunctuationAwareSentencePieceTokenizer' == type(tokenizer).__name__)
 
         class TokenizerWrapper:
             def __init__(self, tokenizer):

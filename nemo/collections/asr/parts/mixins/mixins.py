@@ -196,8 +196,8 @@ class ASRBPEMixin(ABC):
 
             vocabulary = {}
             for i in range(self.tokenizer.vocab_size):
-                piece = self.tokenizer.ids_to_tokens([i])
-                piece = piece[0][0]
+                piece = self.tokenizer.id_to_token[i]
+#                piece = piece[0]
                 vocabulary[piece] = i + 1
 
             # wrapper method to get vocabulary conveniently
