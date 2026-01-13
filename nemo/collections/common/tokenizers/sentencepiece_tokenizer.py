@@ -75,14 +75,14 @@ class PunctuationAwareSentencePieceTokenizer(TokenizerSpec, ChatTemplateMixin):
         if punctuation_chars is None:
             punctuation_chars = '.,!?;:()"'
 
+        self.punctuation_chars = punctuation_chars
         self.punct_to_id = {} 
         for char in punctuation_chars:
-            self.punct_to_id[char] = len(self.punct_to_id)
-        self.punct_to_id['<no_punc>'] = len(self.punct_to_id)
+            self.punct_to_id[char] = len(self.punct_to_id) + len(self.token_to_id) + 1# punctuation and tokens use disjointed intervals
+
+        self.punct_to_id['<no_punc>'] = len(self.punct_to_id) + len(self.token_to_id) + 1
 
         self.id_to_punct = {v: k for k, v in self.punct_to_id.items()}
-        # Get the begin-of-word token from SentencePiece
-#        self._begin_of_word_token = '▁'▁''
         self.no_punct_id = self.punct_to_id['<no_punc>']
         self.bow_id = self.token_to_id['▁']
         # Concatenate all subwords and all punctuations to form self.vocabs
@@ -104,7 +104,7 @@ class PunctuationAwareSentencePieceTokenizer(TokenizerSpec, ChatTemplateMixin):
             return text
 
         # Use the punctuation characters from the class, falling back to default if not present
-        puncts = getattr(self, "punctuation_chars", '.,!?;:()"')
+        puncts = self.punctuation_chars
         # Split into tokens separated by spaces
         parts = text.strip().split()
         new_parts = []
@@ -113,7 +113,10 @@ class PunctuationAwareSentencePieceTokenizer(TokenizerSpec, ChatTemplateMixin):
             if all(char in puncts for char in part) and len(part) == 1:
                 # Attach this to previous word if possible, else just leave it
                 if new_parts:
-                    new_parts[-1] += part
+                    if new_parts[-1][-1] not in puncts:
+                        new_parts[-1] += part
+                    else:
+                        new_parts[-1] = part
                 else:
                     new_parts.append(part)
             else:
@@ -153,7 +156,8 @@ class PunctuationAwareSentencePieceTokenizer(TokenizerSpec, ChatTemplateMixin):
                 token = self.id_to_token[subword_id]
                 punct = self.id_to_punct[punct_id] if punct_id != self.no_punct_id else ""
                 text += punct + token
-        except:  # this part will be removed once decoding code is rewritten
+        except:  # this part will be removed once decoding code is rewrittenA
+            assert False
             for subword_id in ids:
                 # Get subword token and punctuation string
                 subword_id = subword_id % 1000
@@ -185,6 +189,8 @@ class PunctuationAwareSentencePieceTokenizer(TokenizerSpec, ChatTemplateMixin):
         
         # Split by spaces
         parts = text.split(' ')
+
+        print("PARTS ARE", parts)
         
         result = []
 
@@ -206,7 +212,6 @@ class PunctuationAwareSentencePieceTokenizer(TokenizerSpec, ChatTemplateMixin):
                 
             # Tokenize the word
             word_tokens = self.tokenizer.text_to_tokens(word)
-#            print("HERE word_tokens", word_tokens)
             word_ids = self.tokenizer.tokens_to_ids(word_tokens)
             
             # Attach punctuation to first token of the word

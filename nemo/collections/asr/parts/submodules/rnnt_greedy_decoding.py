@@ -475,8 +475,12 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                 if logp.dtype != torch.float32:
                     logp = logp.float()
 
+                punc_logp = logp[self._blank_index + 1:]
+                punc_v, punc_k = punc_logp.max(0)
+                punc_k = punc_k.item() + self._blank_index + 1  # K is the label at timestep t_s in inner loop, s >= 0.
                 # get index k, of max prob
-                v, k = logp.max(0)
+
+                v, k = logp[:self._blank_index + 1].max(0)
                 k = k.item()  # K is the label at timestep t_s in inner loop, s >= 0.
 
                 if self.preserve_alignments:
@@ -494,7 +498,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                     not_blank = False
                 else:
                     # Append token to label set, update RNN state.
-                    hypothesis.y_sequence.append(k)
+                    hypothesis.y_sequence.append([k, punc_k])
                     hypothesis.score += float(v)
                     hypothesis.timestamp.append(time_idx)
                     hypothesis.dec_state = hidden_prime

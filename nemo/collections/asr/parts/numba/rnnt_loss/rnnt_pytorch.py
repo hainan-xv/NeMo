@@ -402,9 +402,10 @@ class RNNTLossNumba(Module):
         clamp: Float value. When set to value >= 0.0, will clamp the gradient to [-clamp, clamp].
     """
 
-    def __init__(self, blank=0, reduction='mean', fastemit_lambda: float = 0.0, clamp: float = -1):
+    def __init__(self, num_classes, blank=0, reduction='mean', fastemit_lambda: float = 0.0, clamp: float = -1):
         super(RNNTLossNumba, self).__init__()
         self.blank = blank
+        self.num_classes = num_classes
         self.fastemit_lambda = fastemit_lambda
         self.clamp = float(clamp) if clamp > 0 else 0.0
         self.reduction = reduction
@@ -622,7 +623,10 @@ def certify_inputs(log_probs, labels, lengths, label_lengths):
         )
 
     check_dim(log_probs, 4, "log_probs")
-    check_dim(labels, 2, "labels")
+    try:
+        check_dim(labels, 2, "labels")
+    except:
+        check_dim(labels, 3, "labels")
     check_dim(lengths, 1, "lenghts")
     check_dim(label_lengths, 1, "label_lenghts")
     max_T = torch.max(lengths)

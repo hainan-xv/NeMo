@@ -203,7 +203,7 @@ def resolve_rnnt_default_loss_name() -> str:
     return RNNT_LOSS_RESOLVER['default'].loss_name
 
 
-def resolve_rnnt_loss(loss_name: str, blank_idx: int, loss_kwargs: dict = None) -> torch.nn.Module:
+def resolve_rnnt_loss(loss_name: str, num_classes: int, blank_idx: int, loss_kwargs: dict = None) -> torch.nn.Module:
     loss_function_names = list(RNNT_LOSS_RESOLVER.keys())
 
     if loss_name not in loss_function_names:
@@ -263,7 +263,7 @@ def resolve_rnnt_loss(loss_name: str, blank_idx: int, loss_kwargs: dict = None) 
 
         fastemit_lambda = loss_kwargs.pop('fastemit_lambda', 0.0)
         clamp = loss_kwargs.pop('clamp', -1.0)
-        loss_func = RNNTLossNumba(blank=blank_idx, reduction='none', fastemit_lambda=fastemit_lambda, clamp=clamp)
+        loss_func = RNNTLossNumba(num_classes=num_classes, blank=blank_idx, reduction='none', fastemit_lambda=fastemit_lambda, clamp=clamp)
         _warn_unused_additional_kwargs(loss_name, loss_kwargs)
 
     elif loss_name == 'pytorch':
@@ -337,7 +337,7 @@ class RNNTLoss(Loss):
         """
         return {
             "log_probs": NeuralType(('B', 'T', 'T', 'D'), LogprobsType()),
-            "targets": NeuralType(('B', 'T'), LabelsType()),
+            "targets": NeuralType(('B', 'T', 'D'), LabelsType()),  # hainan
             "input_lengths": NeuralType(tuple('B'), LengthsType()),
             "target_lengths": NeuralType(tuple('B'), LengthsType()),
         }
@@ -350,7 +350,7 @@ class RNNTLoss(Loss):
         """
         return {"loss": NeuralType(elements_type=LossType())}
 
-    def __init__(self, num_classes, reduction: str = 'mean_batch', loss_name: str = "default", loss_kwargs=None):
+    def __init__(self, num_classes, blank_id, reduction: str = 'mean_batch', loss_name: str = "default", loss_kwargs=None):
         """
         RNN-T Loss function based on https://github.com/HawkAaron/warp-transducer.
         Optionally, can utilize a numba implementation of the same loss without having to compile the loss,
@@ -413,9 +413,9 @@ class RNNTLoss(Loss):
         if reduction not in [None, 'mean', 'sum', 'mean_batch', 'mean_volume']:
             raise ValueError('`reduction` must be one of [mean, sum, mean_batch, mean_volume]')
 
-        self._blank = num_classes
+        self._blank = blank_id
         self.reduction = reduction
-        self._loss = resolve_rnnt_loss(loss_name, blank_idx=self._blank, loss_kwargs=loss_kwargs)
+        self._loss = resolve_rnnt_loss(loss_name, num_classes=num_classes, blank_idx=self._blank, loss_kwargs=loss_kwargs)
         self._force_float32 = RNNT_LOSS_RESOLVER[loss_name].force_float32
         self._fp16_compat_checked = False
 

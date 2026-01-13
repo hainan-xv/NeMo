@@ -89,6 +89,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
         self.loss = RNNTLoss(
             num_classes=num_classes,
+            blank_id=1024,
             loss_name=loss_name,
             loss_kwargs=loss_kwargs,
             reduction=self.cfg.get("rnnt_reduction", "mean_batch"),

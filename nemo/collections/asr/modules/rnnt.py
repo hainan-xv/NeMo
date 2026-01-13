@@ -1707,19 +1707,14 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         if self.preserve_memory:
             torch.cuda.empty_cache()
 
-        # If log_softmax is automatic
-        if self.log_softmax is None:
-            if not res.is_cuda:  # Use log softmax only if on CPU
-                if self.temperature != 1.0:
-                    res = (res / self.temperature).log_softmax(dim=-1)
-                else:
-                    res = res.log_softmax(dim=-1)
-        else:
-            if self.log_softmax:
-                if self.temperature != 1.0:
-                    res = (res / self.temperature).log_softmax(dim=-1)
-                else:
-                    res = res.log_softmax(dim=-1)
+        n = 1024
+        punct_logits = res[..., n+1:].clone().log_softmax(dim=-1)
+        token_logits = res[..., :n+1].clone().log_softmax(dim=-1)
+
+        res = torch.cat([
+            token_logits,
+            punct_logits,
+        ], dim=-1)
 
         return res
 

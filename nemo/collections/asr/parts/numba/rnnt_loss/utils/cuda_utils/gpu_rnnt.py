@@ -77,6 +77,7 @@ class GPURNNT:
             workspace
         )  # a flat vector of floatX numbers that represents allocated memory slices
         self.blank_ = blank
+
         self.fastemit_lambda_ = fastemit_lambda
         self.clamp_ = abs(clamp)
         self.num_threads_ = num_threads
@@ -161,7 +162,7 @@ class GPURNNT:
         self.log_softmax(acts, denom)
 
         # Compute alphas
-        gpu_rnnt_kernel.compute_alphas_kernel[self.minibatch_, self.maxU_, self.stream_, 0](
+        gpu_rnnt_kernel.multistream_compute_alphas_kernel[self.minibatch_, self.maxU_, self.stream_, 0](
             acts,
             denom,
             alphas,
@@ -172,13 +173,14 @@ class GPURNNT:
             self.minibatch_,
             self.maxT_,
             self.maxU_,
+            2,
             self.alphabet_size_,
             self.blank_,
         )
 
         if training:
             # Compute betas
-            gpu_rnnt_kernel.compute_betas_kernel[self.minibatch_, self.maxU_, self.stream_, 0](
+            gpu_rnnt_kernel.multistream_compute_betas_kernel[self.minibatch_, self.maxU_, self.stream_, 0](
                 acts,
                 denom,
                 betas,
@@ -189,6 +191,7 @@ class GPURNNT:
                 self.minibatch_,
                 self.maxT_,
                 self.maxU_,
+                2,
                 self.alphabet_size_,
                 self.blank_,
             )
@@ -196,7 +199,7 @@ class GPURNNT:
             # Compute gradient
             grad_blocks_per_grid = self.minibatch_ * self.maxT_ * self.maxU_
             grad_threads_per_block = gpu_rnnt_kernel.GPU_RNNT_THREAD_SIZE
-            gpu_rnnt_kernel.compute_grad_kernel[grad_blocks_per_grid, grad_threads_per_block, self.stream_, 0](
+            gpu_rnnt_kernel.multistream_compute_grad_kernel[grad_blocks_per_grid, grad_threads_per_block, self.stream_, 0](
                 grads,
                 acts,
                 denom,
@@ -209,6 +212,7 @@ class GPURNNT:
                 self.minibatch_,
                 self.maxT_,
                 self.maxU_,
+                2,
                 self.alphabet_size_,
                 self.blank_,
                 self.fastemit_lambda_,
