@@ -1418,6 +1418,12 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         self._num_extra_outputs = num_extra_outputs
         self._num_classes = num_classes + 1 + num_extra_outputs  # 1 is for blank
 
+        self.token_size = -1
+        for i in range(len(vocabulary)):
+            if vocabulary[i] == '<no_punc>':
+                self.token_size = i
+        print("TOKENISIZE", self.token_size)
+
         self.masking_prob = masking_prob
         if self.masking_prob > 0.0:
             assert self.masking_prob < 1.0, "masking_prob must be between 0 and 1"
@@ -1707,7 +1713,7 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         if self.preserve_memory:
             torch.cuda.empty_cache()
 
-        n = 1024
+        n = self.token_size
         punct_logits = res[..., n+1:].clone().log_softmax(dim=-1)
         token_logits = res[..., :n+1].clone().log_softmax(dim=-1)
 

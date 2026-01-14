@@ -78,12 +78,14 @@ class PunctuationAwareSentencePieceTokenizer(TokenizerSpec, ChatTemplateMixin):
         self.punctuation_chars = punctuation_chars
         self.punct_to_id = {} 
         self.punct_to_id0 = {} 
+
+        self.punct_to_id['<no_punc>'] = len(self.punct_to_id) + len(self.token_to_id) + 1
+        self.punct_to_id0['<no_punc>'] = len(self.punct_to_id0)
+
         for char in punctuation_chars:
             self.punct_to_id[char] = len(self.punct_to_id) + len(self.token_to_id) + 1# punctuation and tokens use disjointed intervals
             self.punct_to_id0[char] = len(self.punct_to_id0)
 
-        self.punct_to_id['<no_punc>'] = len(self.punct_to_id) + len(self.token_to_id) + 1
-        self.punct_to_id0['<no_punc>'] = len(self.punct_to_id0)
 
         self.id_to_punct = {v: k for k, v in self.punct_to_id.items()}
         self.no_punct_id = self.punct_to_id['<no_punc>']
@@ -156,6 +158,7 @@ class PunctuationAwareSentencePieceTokenizer(TokenizerSpec, ChatTemplateMixin):
 #                punct_id  -=  len(self.id_to_token) + 1
                 # Get subword token and punctuation string
                 token = self.id_to_token[subword_id]
+
                 punct = self.id_to_punct[punct_id] if punct_id != self.no_punct_id else ""
                 text += punct + token
         else:  # this part will be removed once decoding code is rewrittenA

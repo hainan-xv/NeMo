@@ -82,6 +82,12 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
         self.vocab_size = self.cfg.decoder.vocab_size + 1  # +1 for blank
 
+        self.token_size = -1
+        for i in range(len(self.cfg.labels)):
+            if self.cfg.labels[i] == '<no_punc>':
+                self.token_size = i
+#        print("TOKENISIZE", self.token_size)
+
         # Setup RNNT Loss
         loss_name, loss_kwargs = self.extract_rnnt_loss_cfg(self.cfg.get("loss", None))
 
@@ -92,7 +98,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
         self.loss = RNNTLoss(
             num_classes=num_classes,
-            blank_id=1024,
+            blank_id=self.token_size,
             loss_name=loss_name,
             loss_kwargs=loss_kwargs,
             reduction=self.cfg.get("rnnt_reduction", "mean_batch"),
@@ -711,9 +717,9 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         return encoded, encoded_len
 
     def convert_2d_to_1d(self, t):
-        n = self.vocab_size - 1025
+        n = self.vocab_size - self.token_size - 1
         a = t // n
-        b = t % n + 1025
+        b = t % n + self.token_size + 1
         return torch.stack([a, b], dim=-1)
 
     # PTL-specific methods
