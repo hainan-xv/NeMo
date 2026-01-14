@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from asyncio import FastChildWatcher
 import os
 import re
 from typing import Dict, List, Optional, Union
@@ -86,7 +85,6 @@ class PunctuationAwareSentencePieceTokenizer(TokenizerSpec, ChatTemplateMixin):
             self.punct_to_id[char] = len(self.punct_to_id) + len(self.token_to_id) + 1# punctuation and tokens use disjointed intervals
             self.punct_to_id0[char] = len(self.punct_to_id0)
 
-
         self.id_to_punct = {v: k for k, v in self.punct_to_id.items()}
         self.no_punct_id = self.punct_to_id['<no_punc>']
         self.bow_id = self.token_to_id['▁']
@@ -155,7 +153,6 @@ class PunctuationAwareSentencePieceTokenizer(TokenizerSpec, ChatTemplateMixin):
 
         if len(ids[0]) == 2:
             for subword_id, punct_id in ids:
-#                punct_id  -=  len(self.id_to_token) + 1
                 # Get subword token and punctuation string
                 token = self.id_to_token[subword_id]
 
@@ -168,7 +165,8 @@ class PunctuationAwareSentencePieceTokenizer(TokenizerSpec, ChatTemplateMixin):
                 punct = self.id_to_punct[punct_id] if punct_id != self.no_punct_id else ""
                 text += punct + token
 
-        return text.replace("▁", " ")
+        text = text.replace("▁", " ").replace("<unk>", " <unk>")
+        return text
 
 
     def text_to_ids(self, text):
@@ -211,9 +209,6 @@ class PunctuationAwareSentencePieceTokenizer(TokenizerSpec, ChatTemplateMixin):
                 word = part
                 new_punct_id = self.no_punct_id
                 
-            # Tokenize the word
-#            word_tokens = self.tokenizer.text_to_tokens(word)
-#            word_ids = self.tokenizer.tokens_to_ids(word_tokens)
             word_ids = self.tokenizer.text_to_ids(word)
             
             # Attach punctuation to first token of the word
@@ -225,7 +220,6 @@ class PunctuationAwareSentencePieceTokenizer(TokenizerSpec, ChatTemplateMixin):
 
             last_punct_id = new_punct_id
 
-#        if last_punct_id != self.no_punct_id:
         result.append([self.bow_id, last_punct_id])
         
         return self.convert_2d_to_1d(result)
@@ -234,8 +228,6 @@ class PunctuationAwareSentencePieceTokenizer(TokenizerSpec, ChatTemplateMixin):
         result = []
         for i, j in a:
             j -= 1 + len(self.token_to_id)
-#            assert (j >= 0)
-#            print("I J", i, j)
             result.append(i * len(self.punct_to_id) + j)
 
         return result
@@ -258,11 +250,7 @@ class PunctuationAwareSentencePieceTokenizer(TokenizerSpec, ChatTemplateMixin):
         Returns:
             List of [subword_id, punctuation_before] pairs
         """
-        return False
-#        token_pairs = []
-#        for id in ids:
-#            token_pairs.append([id, ''])
-#        return token_pairs
+        assert False
 
     # Expose underlying tokenizer methods for compatibility
     @property
@@ -855,4 +843,3 @@ def create_spt_model(
         for token in vocab:
             f.write(f"{token}\n")
     return f'{output_dir}/tokenizer.model', vocab_file
-

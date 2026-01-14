@@ -1422,7 +1422,7 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         for i in range(len(vocabulary)):
             if vocabulary[i] == '<no_punc>':
                 self.token_size = i
-        print("TOKENISIZE", self.token_size)
+        print("HERE no punc token id", self.token_size)
 
         self.masking_prob = masking_prob
         if self.masking_prob > 0.0:
@@ -1716,11 +1716,7 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         n = self.token_size
         punct_logits = res[..., n+1:].clone().log_softmax(dim=-1)
         token_logits = res[..., :n+1].clone().log_softmax(dim=-1)
-
-        res = torch.cat([
-            token_logits,
-            punct_logits,
-        ], dim=-1)
+        res = torch.cat([token_logits, punct_logits], dim=-1)
 
         return res
 

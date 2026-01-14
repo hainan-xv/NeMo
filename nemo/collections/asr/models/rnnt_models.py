@@ -79,14 +79,12 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         self.decoder = EncDecRNNTModel.from_config_dict(self.cfg.decoder)
         self.joint = EncDecRNNTModel.from_config_dict(self.cfg.joint)
 
-
         self.vocab_size = self.cfg.decoder.vocab_size + 1  # +1 for blank
 
         self.token_size = -1
         for i in range(len(self.cfg.labels)):
             if self.cfg.labels[i] == '<no_punc>':
                 self.token_size = i
-#        print("TOKENISIZE", self.token_size)
 
         # Setup RNNT Loss
         loss_name, loss_kwargs = self.extract_rnnt_loss_cfg(self.cfg.get("loss", None))
