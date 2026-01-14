@@ -162,7 +162,7 @@ class _GreedyRNNTInfer(Typing, ConfidenceMethodMixin):
         """Returns definitions of module input ports."""
         return {
             "encoder_output": NeuralType(('B', 'D', 'T'), AcousticEncodedRepresentation()),
-            "encoded_lengths": NeuralType(tuple('B'), LengthsType()),
+            "encoded_lengths": NeuralType(('B', 'T'), LengthsType()),
             "partial_hypotheses": [NeuralType(elements_type=HypothesisType(), optional=True)],  # must always be last
         }
 
@@ -239,7 +239,7 @@ class _GreedyRNNTInfer(Typing, ConfidenceMethodMixin):
         # output: [B, 1, K]
         return self.decoder.predict(label, hidden, add_sos=add_sos, batch_size=batch_size)
 
-    def _joint_step(self, enc, pred, log_normalize: Optional[bool] = None):
+    def _joint_step(self, enc, pred, enc_len, log_normalize: Optional[bool] = None):
         """
         Common joint step based on AbstractRNNTJoint implementation.
 
@@ -252,7 +252,7 @@ class _GreedyRNNTInfer(Typing, ConfidenceMethodMixin):
              logits of shape (B, T=1, U=1, V + 1)
         """
         with torch.no_grad():
-            logits = self.joint.joint(enc, pred)
+            logits = self.joint.joint(enc, pred, enc_len)
 
             if log_normalize is None:
                 if not logits.is_cuda:  # Use log softmax only if on CPU
@@ -402,7 +402,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
             # Process each sequence independently
             for batch_idx in range(encoder_output.size(0)):
                 inseq = encoder_output[batch_idx, :, :].unsqueeze(1)  # [T, 1, D]
-                logitlen = encoded_lengths[batch_idx]
+                logitlen = encoded_lengths[batch_idx:batch_idx+1]
 
                 partial_hypothesis = partial_hypotheses[batch_idx] if partial_hypotheses is not None else None
                 hypothesis = self._greedy_decode(inseq, logitlen, partial_hypotheses=partial_hypothesis)
@@ -444,8 +444,13 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
         if self.preserve_frame_confidence:
             hypothesis.frame_confidence = [[]]
 
-        # For timestep t in X_t
-        for time_idx in range(out_len):
+        out_len_list = out_len.tolist()[0]
+
+        self.max_symbols = x.shape[-1] //  self.joint.encoder_hidden
+
+        for time_idx in range(len(out_len_list)):
+            if out_len_list[time_idx] == 0:
+                break
             # Extract encoder embedding at timestep t
             # f = x[time_idx, :, :].unsqueeze(0)  # [1, 1, D]
             f = x.narrow(dim=0, start=time_idx, length=1)
@@ -465,7 +470,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                 # Perform prediction network and joint network steps.
                 g, hidden_prime = self._pred_step(last_label, hypothesis.dec_state)
                 # If preserving per-frame confidence, log_normalize must be true
-                logp = self._joint_step(f, g, log_normalize=True if self.preserve_frame_confidence else None)[
+                logp = self._joint_step(f, g, out_len[:,time_idx:time_idx+1], log_normalize=True if self.preserve_frame_confidence else None)[
                     0, 0, 0, :
                 ]
 

@@ -23,6 +23,7 @@ from lightning.pytorch import Trainer
 from omegaconf import DictConfig, OmegaConf, open_dict
 from torch.utils.data import DataLoader
 
+import random
 from nemo.collections.asr.data import audio_to_text_dataset
 from nemo.collections.asr.data.audio_to_text import _AudioTextDataset
 from nemo.collections.asr.data.audio_to_text_dali import AudioToCharDALIDataset, DALIOutputs
@@ -46,9 +47,10 @@ from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_confi
 from nemo.collections.common.parts.preprocessing.parsers import make_parser
 from nemo.core.classes.common import PretrainedModelInfo, typecheck
 from nemo.core.classes.mixins import AccessMixin
-from nemo.core.neural_types import AcousticEncodedRepresentation, AudioSignal, LengthsType, NeuralType, SpectrogramType
+from nemo.core.neural_types import AcousticEncodedRepresentation, AudioSignal, LengthsType, NeuralType, SpectrogramType, IntType
 from nemo.utils import logging
 
+from nemo.collections.asr.modules.conformer_encoder import chunk_concat_audio
 
 class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTranscriptionMixin):
     """Base class for encoder decoder RNNT-based models."""
@@ -65,6 +67,13 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         # Initialize components
         self.preprocessor = EncDecRNNTModel.from_config_dict(self.cfg.preprocessor)
         self.encoder = EncDecRNNTModel.from_config_dict(self.cfg.encoder)
+
+        try:
+            self.sample_sizes = self.cfg.sample_sizes
+        except AttributeError:
+            self.sample_sizes = [1]
+
+        self.inference_chunk = self.sample_sizes[0]
 
         # Update config values required by components dynamically
         with open_dict(self.cfg.decoder):
@@ -293,6 +302,9 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             * A list of greedy transcript texts / Hypothesis
             * An optional list of beam search transcript texts / Hypothesis / NBestHypothesis.
         """
+
+#        print("HERE override_config", override_config)
+        override_config.chunk_size = self.inference_chunk
 
         timestamps = timestamps or (override_config.timestamps if override_config is not None else None)
         if timestamps is not None:
@@ -650,20 +662,21 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         return {
             "input_signal": NeuralType(('B', 'T'), input_signal_eltype, optional=True),
             "input_signal_length": NeuralType(tuple('B'), LengthsType(), optional=True),
+            "chunk_size": NeuralType(tuple(), IntType(), optional=True),
             "processed_signal": NeuralType(('B', 'D', 'T'), SpectrogramType(), optional=True),
             "processed_signal_length": NeuralType(tuple('B'), LengthsType(), optional=True),
         }
 
-    @property
-    def output_types(self) -> Optional[Dict[str, NeuralType]]:
-        return {
-            "outputs": NeuralType(('B', 'D', 'T'), AcousticEncodedRepresentation()),
-            "encoded_lengths": NeuralType(tuple('B'), LengthsType()),
-        }
+#    @property
+#    def output_types(self) -> Optional[Dict[str, NeuralType]]:
+#        return {
+#            "outputs": NeuralType(('B', 'D', 'T'), AcousticEncodedRepresentation()),
+#            "encoded_lengths": NeuralType(('B', 'T'), LengthsType()),
+#        }
 
     @typecheck()
     def forward(
-        self, input_signal=None, input_signal_length=None, processed_signal=None, processed_signal_length=None
+        self, input_signal=None, input_signal_length=None, chunk_size=None, processed_signal=None, processed_signal_length=None
     ):
         """
         Forward pass of the model. Note that for RNNT Models, the forward pass of the model is a 3 step process,
@@ -695,6 +708,11 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         """
         has_input_signal = input_signal is not None and input_signal_length is not None
         has_processed_signal = processed_signal is not None and processed_signal_length is not None
+
+        if chunk_size is None:
+            chunk_size = self.inference_chunk
+            assert False
+
         if (has_input_signal ^ has_processed_signal) is False:
             raise ValueError(
                 f"{self} Arguments ``input_signal`` and ``input_signal_length`` are mutually exclusive "
@@ -711,7 +729,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         if self.spec_augmentation is not None and self.training:
             processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
 
-        encoded, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
+        encoded, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length, chunk_size=chunk_size)
         return encoded, encoded_len
 
     def convert_2d_to_1d(self, t):
@@ -729,11 +747,12 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         signal, signal_len, transcript, transcript_len = batch
         transcript = self.convert_2d_to_1d(transcript)
 
+
         # forward() only performs encoder forward
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
             encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
         else:
-            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
+            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len, chunk_size=-1)
         del signal
 
         # During training, loss must be computed, so decoder forward is necessary
@@ -753,18 +772,24 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
         # If experimental fused Joint-Loss-WER is not used
         if not self.joint.fuse_loss_wer:
-            # Compute full joint and loss
-            joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder)
-            loss_value = self.loss(
-                log_probs=joint, targets=transcript, input_lengths=encoded_len, target_lengths=target_length
-            )
 
-            # Add auxiliary losses, if registered
-            loss_value = self.add_auxiliary_losses(loss_value)
+            loss_value = 0
+            for chunk_size in self.sample_sizes:
+                chunked, length = chunk_concat_audio(encoded, encoded_len, chunk_size)
+                # Compute full joint and loss
+                joint = self.joint(encoder_outputs=chunked.transpose(1,2), decoder_outputs=decoder, encoder_lengths=length)
+                loss_value += self.loss(
+                    log_probs=joint, targets=transcript, input_lengths=(length != 0).sum(dim=1), target_lengths=target_length
+                ) / len(self.sample_sizes)
+            
 
-            # Reset access registry
-            if AccessMixin.is_access_enabled(self.model_guid):
-                AccessMixin.reset_registry(self)
+                # Add auxiliary losses, if registered
+                loss_value = self.add_auxiliary_losses(loss_value)
+
+                # Reset access registry
+                if AccessMixin.is_access_enabled(self.model_guid):
+                    AccessMixin.reset_registry(self)
+
 
             tensorboard_logs = {
                 'train_loss': loss_value,
@@ -774,14 +799,15 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
             if (sample_id + 1) % log_every_n_steps == 0:
                 self.wer.update(
-                    predictions=encoded,
-                    predictions_lengths=encoded_len,
+                    predictions=chunked.transpose(1,2),
+                    predictions_lengths=length,
                     targets=transcript,
                     targets_lengths=transcript_len,
                 )
                 _, scores, words = self.wer.compute()
                 self.wer.reset()
                 tensorboard_logs.update({'training_batch_wer': scores.float() / words})
+
 
         else:
             # If experimental fused Joint-Loss-WER is used
@@ -833,7 +859,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
             encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
         else:
-            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
+            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len, chunk_size=self.inference_chunk)
         del signal
 
         best_hyp_text = self.decoding.rnnt_decoder_predictions_tensor(
@@ -852,7 +878,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
             encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
         else:
-            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
+            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len, chunk_size=self.inference_chunk)
         del signal
 
         tensorboard_logs = {}
@@ -931,15 +957,19 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         return test_logs
 
     def multi_validation_epoch_end(self, outputs, dataloader_idx: int = 0):
-        if self.compute_eval_loss:
-            val_loss_mean = torch.stack([x['val_loss'] for x in outputs]).mean()
-            val_loss_log = {'val_loss': val_loss_mean}
-        else:
-            val_loss_log = {}
-        wer_num = torch.stack([x['val_wer_num'] for x in outputs]).sum()
-        wer_denom = torch.stack([x['val_wer_denom'] for x in outputs]).sum()
-        tensorboard_logs = {**val_loss_log, 'val_wer': wer_num.float() / wer_denom}
-        return {**val_loss_log, 'log': tensorboard_logs}
+        try:
+            if self.compute_eval_loss:
+                val_loss_mean = torch.stack([x['val_loss'] for x in outputs]).mean()
+                val_loss_log = {'val_loss': val_loss_mean}
+            else:
+                val_loss_log = {}
+            wer_num = torch.stack([x['val_wer_num'] for x in outputs]).sum()
+            wer_denom = torch.stack([x['val_wer_denom'] for x in outputs]).sum()
+            tensorboard_logs = {**val_loss_log, 'val_wer': wer_num.float() / wer_denom}
+            return {**val_loss_log, 'log': tensorboard_logs}
+        except:
+            tensorboard_logs = {'val_wer': 1.0}
+            return {'log': tensorboard_logs}
 
     def multi_test_epoch_end(self, outputs, dataloader_idx: int = 0):
         if self.compute_eval_loss:
@@ -955,7 +985,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
     """ Transcription related methods """
 
     def _transcribe_forward(self, batch: Any, trcfg: TranscribeConfig):
-        encoded, encoded_len = self.forward(input_signal=batch[0], input_signal_length=batch[1])
+        encoded, encoded_len = self.forward(input_signal=batch[0], input_signal_length=batch[1], chunk_size=trcfg.chunk_size)
         output = dict(encoded=encoded, encoded_len=encoded_len)
         return output
 

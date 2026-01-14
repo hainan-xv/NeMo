@@ -57,6 +57,7 @@ class InternalTranscribeConfig:
 @dataclass
 class TranscribeConfig:
     batch_size: int = 4
+    chunk_size: int = -1
     return_hypotheses: bool = False
     num_workers: Optional[int] = None
     channel_selector: ChannelSelectorType = None
