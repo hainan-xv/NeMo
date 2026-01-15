@@ -68,12 +68,12 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         self.preprocessor = EncDecRNNTModel.from_config_dict(self.cfg.preprocessor)
         self.encoder = EncDecRNNTModel.from_config_dict(self.cfg.encoder)
 
-        try:
-            self.sample_sizes = self.cfg.sample_sizes
-        except AttributeError:
-            self.sample_sizes = [1]
-
-        self.inference_chunk = self.sample_sizes[0]
+#        try:
+#            self.sample_sizes = self.cfg.sample_sizes
+#        except AttributeError:
+#            self.sample_sizes = [1]
+#
+#        self.inference_chunk = self.sample_sizes[0]
 
         # Update config values required by components dynamically
         with open_dict(self.cfg.decoder):
@@ -304,7 +304,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         """
 
 #        print("HERE override_config", override_config)
-        override_config.chunk_size = self.inference_chunk
+#        override_config.chunk_size = self.inference_chunk
 
         timestamps = timestamps or (override_config.timestamps if override_config is not None else None)
         if timestamps is not None:
@@ -709,9 +709,9 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         has_input_signal = input_signal is not None and input_signal_length is not None
         has_processed_signal = processed_signal is not None and processed_signal_length is not None
 
-        if chunk_size is None:
-            chunk_size = self.inference_chunk
-            assert False
+#        if chunk_size is None:
+#            chunk_size = self.inference_chunk
+#            assert False
 
         if (has_input_signal ^ has_processed_signal) is False:
             raise ValueError(
@@ -732,7 +732,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         encoded, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length, chunk_size=chunk_size)
         return encoded, encoded_len
 
-    def convert_2d_to_1d(self, t):
+    def convert_1d_to_2d(self, t):
         n = self.vocab_size - self.token_size - 1
         a = t // n
         b = t % n + self.token_size + 1
@@ -745,8 +745,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             AccessMixin.reset_registry(self)
 
         signal, signal_len, transcript, transcript_len = batch
-        transcript = self.convert_2d_to_1d(transcript)
-
+        transcript = self.convert_1d_to_2d(transcript)
 
         # forward() only performs encoder forward
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
@@ -774,21 +773,22 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         if not self.joint.fuse_loss_wer:
 
             loss_value = 0
-            for chunk_size in self.sample_sizes:
-                chunked, length = chunk_concat_audio(encoded, encoded_len, chunk_size)
-                # Compute full joint and loss
-                joint = self.joint(encoder_outputs=chunked.transpose(1,2), decoder_outputs=decoder, encoder_lengths=length)
-                loss_value += self.loss(
-                    log_probs=joint, targets=transcript, input_lengths=(length != 0).sum(dim=1), target_lengths=target_length
-                ) / len(self.sample_sizes)
-            
 
-                # Add auxiliary losses, if registered
-                loss_value = self.add_auxiliary_losses(loss_value)
+            chunk_size = self.encoder.att_context_size[1] + 1
 
-                # Reset access registry
-                if AccessMixin.is_access_enabled(self.model_guid):
-                    AccessMixin.reset_registry(self)
+            chunked, length = chunk_concat_audio(encoded, encoded_len, chunk_size)
+            # Compute full joint and loss
+            joint = self.joint(encoder_outputs=chunked.transpose(1,2), decoder_outputs=decoder, encoder_lengths=length)
+            loss_value += self.loss(
+                log_probs=joint, targets=transcript, input_lengths=(length != 0).sum(dim=1), target_lengths=target_length
+            )
+        
+            # Add auxiliary losses, if registered
+            loss_value = self.add_auxiliary_losses(loss_value)
+
+            # Reset access registry
+            if AccessMixin.is_access_enabled(self.model_guid):
+                AccessMixin.reset_registry(self)
 
 
             tensorboard_logs = {
@@ -853,7 +853,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
     def predict_step(self, batch, batch_idx, dataloader_idx=0):
         signal, signal_len, transcript, transcript_len, sample_id = batch
-        transcript = self.convert_2d_to_1d(transcript)
+        transcript = self.convert_1d_to_2d(transcript)
 
         # forward() only performs encoder forward
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
@@ -872,32 +872,36 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
     def validation_pass(self, batch, batch_idx, dataloader_idx=0):
         signal, signal_len, transcript, transcript_len = batch
-        transcript = self.convert_2d_to_1d(transcript)
+        transcript = self.convert_1d_to_2d(transcript)
 
         # forward() only performs encoder forward
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
             encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
         else:
-            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len, chunk_size=self.inference_chunk)
+            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len, chunk_size=-1)
         del signal
 
         tensorboard_logs = {}
 
         # If experimental fused Joint-Loss-WER is not used
         if not self.joint.fuse_loss_wer:
-            if self.compute_eval_loss:
-                decoder, target_length, states = self.decoder(targets=transcript, target_length=transcript_len)
-                joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder)
+#            if self.compute_eval_loss:
+#                decoder, target_length, states = self.decoder(targets=transcript, target_length=transcript_len)
+#                joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder)
+#
+#                loss_value = self.loss(
+#                    log_probs=joint, targets=transcript, input_lengths=encoded_len, target_lengths=target_length
+#                )
+#
+#                tensorboard_logs['val_loss'] = loss_value
 
-                loss_value = self.loss(
-                    log_probs=joint, targets=transcript, input_lengths=encoded_len, target_lengths=target_length
-                )
+            chunk_size = self.encoder.att_context_size[1] + 1
 
-                tensorboard_logs['val_loss'] = loss_value
+            chunked, length = chunk_concat_audio(encoded, encoded_len, chunk_size)
 
             self.wer.update(
-                predictions=encoded,
-                predictions_lengths=encoded_len,
+                predictions=chunked.transpose(1,2),
+                predictions_lengths=length,
                 targets=transcript,
                 targets_lengths=transcript_len,
             )

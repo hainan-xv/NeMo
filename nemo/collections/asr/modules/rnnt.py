@@ -29,6 +29,7 @@
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
+import random
 import torch.nn.functional as F
 import torch.nn as nn
 from omegaconf import DictConfig, OmegaConf
@@ -1888,6 +1889,12 @@ class RNNTAttJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMix
 
         self._vocab_size = num_classes
         self._num_extra_outputs = num_extra_outputs
+
+        self.token_size = -1
+        for i in range(len(vocabulary)):
+            if vocabulary[i] == '<no_punc>':
+                self.token_size = i
+        print("HERE no punc token id", self.token_size)
         self._num_classes = num_classes + 1 + num_extra_outputs  # 1 is for blank
 
         self.masking_prob = masking_prob
@@ -2265,9 +2272,7 @@ class RNNTAttJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMix
 
         B, T, D = f.shape
         f = torch.reshape(f, [B, T, -1, self.joint_hidden])
-#        print("JOINING", f.shape, g.shape, f_len)
         inp = self.cross_attention(f, g, f_len)
-#        print("SUCESS JOINING", inp.shape)
 
         res = self.joint_net(inp)  # [B, T, U, V + 1]
 
@@ -2276,19 +2281,25 @@ class RNNTAttJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMix
         if self.preserve_memory:
             torch.cuda.empty_cache()
 
-        # If log_softmax is automatic
-        if self.log_softmax is None:
-            if not res.is_cuda:  # Use log softmax only if on CPU
-                if self.temperature != 1.0:
-                    res = (res / self.temperature).log_softmax(dim=-1)
-                else:
-                    res = res.log_softmax(dim=-1)
-        else:
-            if self.log_softmax:
-                if self.temperature != 1.0:
-                    res = (res / self.temperature).log_softmax(dim=-1)
-                else:
-                    res = res.log_softmax(dim=-1)
+        n = self.token_size
+        lambda_value = -0.01  # or whatever value you want to use
+
+        if self.training:
+            token_logits = res[..., :n+1].clone().log_softmax(dim=-1)
+
+            t_offset = torch.arange(token_logits.size(1), device=token_logits.device, dtype=token_logits.dtype)  # [T]
+            t_offset = t_offset * lambda_value  # [T]
+
+            t_offset = t_offset.view(1, -1, 1, 1)
+
+            token_logits = token_logits + t_offset
+
+            if random.random() > 0.5:
+                punct_logits = res[..., n+1:].clone().log_softmax(dim=-1)
+            else:
+                punct_logits = res[..., n+1:].clone() * 0
+
+            res = torch.cat([token_logits, punct_logits], dim=-1)
 
         return res
 
