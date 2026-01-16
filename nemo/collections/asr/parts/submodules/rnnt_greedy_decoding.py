@@ -484,6 +484,12 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                 v, k = logp.max(0)
                 k = k.item()  # K is the label at timestep t_s in inner loop, s >= 0.
 
+                if k == last_label and k == 941:
+                    logp[k] = -999999999.0
+                    v, k = logp.max(0)
+                    k = k.item()  # K is the label at timestep t_s in inner loop, s >= 0.
+                    
+
                 if self.preserve_alignments:
                     # insert logprobs into last timestep
                     hypothesis.alignments[-1].append((logp.to('cpu'), torch.tensor(k, dtype=torch.int32)))

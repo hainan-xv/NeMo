@@ -296,7 +296,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         """
 
 #        print("HERE override_config", override_config)
-        override_config.chunk_size = self.inference_chunk
+#        override_config.chunk_size = self.inference_chunk
 
         timestamps = timestamps or (override_config.timestamps if override_config is not None else None)
         if timestamps is not None:
@@ -973,9 +973,12 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         encoded = outputs.pop('encoded')
         encoded_len = outputs.pop('encoded_len')
 
+        chunked, length = chunk_concat_audio(encoded, encoded_len, self.inference_chunk)
+
         hyp = self.decoding.rnnt_decoder_predictions_tensor(
-            encoded,
-            encoded_len,
+#            encoded,
+#            encoded_len,
+            chunked.transpose(1, 2), length,
             return_hypotheses=trcfg.return_hypotheses,
             partial_hypotheses=trcfg.partial_hypothesis,
         )
