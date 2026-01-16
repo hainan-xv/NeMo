@@ -106,6 +106,25 @@ class PunctuationAwareSentencePieceTokenizer(TokenizerSpec, ChatTemplateMixin):
         if not text or text.strip() == '':
             return text
 
+        # Dashes
+        text = re.sub(r'[\u2010-\u2015\u2212]', '-', text)
+
+        # Quotes
+        text = re.sub(r'[\u2018\u2019\u201A\u201B\u2032\u2035]', "'", text)
+        text = re.sub(r'[\u201C\u201D\u201E\u201F\u2033\u2036]', '"', text)
+
+        # Whitespace
+        text = re.sub(r'[\u00A0\u2000-\u200B\u202F\u205F\u3000]', ' ', text)
+        text = re.sub(r' +', ' ', text)
+
+        # Ellipsis
+        text = text.replace('\u2026', '...')
+
+        text = text.replace('...', '.')
+
+        text = text.replace('==', '')
+
+
         # Use the punctuation characters from the class, falling back to default if not present
         puncts = self.punctuation_chars
         # Split into tokens separated by spaces
@@ -186,6 +205,7 @@ class PunctuationAwareSentencePieceTokenizer(TokenizerSpec, ChatTemplateMixin):
             punctuation_before is a string or the id for no punctuation
         """
         # Normalize whitespace
+        original_text = text
         text = self.ensure_correct_format(text)
         text = re.sub(r'\s+', ' ', text.strip())
         
@@ -221,6 +241,12 @@ class PunctuationAwareSentencePieceTokenizer(TokenizerSpec, ChatTemplateMixin):
             last_punct_id = new_punct_id
 
         result.append([self.bow_id, last_punct_id])
+
+#        if self.check_bow(result):
+#            print("WEIRD INPUT", text)
+#            print("WEIRD original INPUT", original_text)
+#            print("WEIRD INPUT out", result)
+#            print("RECONSTRUCTED", self.ids_to_text(result))
         
         return self.convert_2d_to_1d(result)
 
@@ -232,6 +258,19 @@ class PunctuationAwareSentencePieceTokenizer(TokenizerSpec, ChatTemplateMixin):
 
         return result
 
+    def check_bow(self, result):
+        bow_count = 1
+        last_label = -1
+        for i, j in result:
+            if i == last_label:
+                bow_count += 1
+                if bow_count == 3:
+                    return True
+            else:
+                last_label = i
+                bow_count = 1
+
+        return False
 
     def convert_1d_to_2d(self, a):
         result = []
