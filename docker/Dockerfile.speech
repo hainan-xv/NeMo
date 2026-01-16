@@ -119,16 +119,16 @@ RUN INSTALL_MSG=$(/bin/bash /tmp/nemo/scripts/installers/install_graphviz.sh --d
   else echo "Skipping failed graphviz installation"; fi \
   else echo "graphviz installed successfully"; fi
 
-# install k2, skip if installation fails
-COPY scripts /tmp/nemo/scripts/
-RUN INSTALL_MSG=$(/bin/bash /tmp/nemo/scripts/installers/install_k2.sh); INSTALL_CODE=$?; \
-  echo ${INSTALL_MSG}; \
-  if [ ${INSTALL_CODE} -ne 0 ]; then \
-  echo "k2 installation failed";  \
-  if [ "${REQUIRE_K2}" = true ]; then \
-  exit ${INSTALL_CODE};  \
-  else echo "Skipping failed k2 installation"; fi \
-  else echo "k2 installed successfully"; fi
+## install k2, skip if installation fails
+#COPY scripts /tmp/nemo/scripts/
+#RUN INSTALL_MSG=$(/bin/bash /tmp/nemo/scripts/installers/install_k2.sh); INSTALL_CODE=$?; \
+#  echo ${INSTALL_MSG}; \
+#  if [ ${INSTALL_CODE} -ne 0 ]; then \
+#  echo "k2 installation failed";  \
+#  if [ "${REQUIRE_K2}" = true ]; then \
+#  exit ${INSTALL_CODE};  \
+#  else echo "Skipping failed k2 installation"; fi \
+#  else echo "k2 installed successfully"; fi
 
 # install nemo dependencies
 WORKDIR /tmp/nemo
