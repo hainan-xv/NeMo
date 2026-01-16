@@ -714,7 +714,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         encoded, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
         return encoded, encoded_len
 
-    def convert_2d_to_1d(self, t):
+    def convert_1d_to_2d(self, t):
         n = self.vocab_size - self.token_size - 1
         a = t // n
         b = t % n + self.token_size + 1
@@ -727,7 +727,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             AccessMixin.reset_registry(self)
 
         signal, signal_len, transcript, transcript_len = batch
-        transcript = self.convert_2d_to_1d(transcript)
+        transcript = self.convert_1d_to_2d(transcript)
 
         # forward() only performs encoder forward
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
@@ -827,7 +827,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
     def predict_step(self, batch, batch_idx, dataloader_idx=0):
         signal, signal_len, transcript, transcript_len, sample_id = batch
-        transcript = self.convert_2d_to_1d(transcript)
+        transcript = self.convert_1d_to_2d(transcript)
 
         # forward() only performs encoder forward
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
@@ -846,7 +846,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
     def validation_pass(self, batch, batch_idx, dataloader_idx=0):
         signal, signal_len, transcript, transcript_len = batch
-        transcript = self.convert_2d_to_1d(transcript)
+        transcript = self.convert_1d_to_2d(transcript)
 
         # forward() only performs encoder forward
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:

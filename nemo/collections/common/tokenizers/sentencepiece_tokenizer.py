@@ -151,7 +151,7 @@ class PunctuationAwareSentencePieceTokenizer(TokenizerSpec, ChatTemplateMixin):
         if len(ids) == 0:
             return ''
 
-        if len(ids[0]) == 2:
+        if isinstance(ids[0], list) and len(ids[0]) == 2:
             for subword_id, punct_id in ids:
                 # Get subword token and punctuation string
                 token = self.id_to_token[subword_id]
