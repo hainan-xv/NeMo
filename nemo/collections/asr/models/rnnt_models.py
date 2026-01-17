@@ -999,9 +999,12 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         encoded = outputs.pop('encoded')
         encoded_len = outputs.pop('encoded_len')
 
+        chunk_size = self.encoder.att_context_size[1] + 1
+        chunked, length = chunk_concat_audio(encoded, encoded_len, chunk_size)
+
         hyp = self.decoding.rnnt_decoder_predictions_tensor(
-            encoded,
-            encoded_len,
+            chunked.transpose(1, 2),
+            length,
             return_hypotheses=trcfg.return_hypotheses,
             partial_hypotheses=trcfg.partial_hypothesis,
         )
