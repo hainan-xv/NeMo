@@ -651,6 +651,7 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
         self,
         prednet: Dict[str, Any],
         vocab_size: int,
+        labels: list = None,
         normalization_mode: Optional[str] = None,
         random_state_sampling: bool = False,
         blank_as_pad: bool = True,
