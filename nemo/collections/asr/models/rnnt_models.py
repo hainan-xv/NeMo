@@ -71,7 +71,8 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         try:
             self.sample_sizes = self.cfg.sample_sizes
         except AttributeError:
-            self.sample_sizes = [14,7]
+            self.sample_sizes = [self.cfg.encoder.att_context_size[1] + 1]
+#            self.sample_sizes = [14,7]
 
         self.inference_chunk = self.sample_sizes[0]
         print("HERE SAMPLESIZES", self.sample_sizes)
@@ -964,7 +965,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
     """ Transcription related methods """
 
     def _transcribe_forward(self, batch: Any, trcfg: TranscribeConfig):
-        encoded, encoded_len = self.forward(input_signal=batch[0], input_signal_length=batch[1], chunk_size=trcfg.chunk_size)
+        encoded, encoded_len = self.forward(input_signal=batch[0], input_signal_length=batch[1], chunk_size=-1)
         output = dict(encoded=encoded, encoded_len=encoded_len)
         return output
 
