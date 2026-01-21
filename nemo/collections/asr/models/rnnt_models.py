@@ -68,11 +68,14 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         self.preprocessor = EncDecRNNTModel.from_config_dict(self.cfg.preprocessor)
         self.encoder = EncDecRNNTModel.from_config_dict(self.cfg.encoder)
 
-        try:
+        self.sample_sizes = [-1]
+        if hasattr(self.cfg, "sample_sizes"):
             self.sample_sizes = self.cfg.sample_sizes
-        except AttributeError:
+        elif isinstance(self.cfg.encoder.att_context_size[1], int):
             self.sample_sizes = [self.cfg.encoder.att_context_size[1] + 1]
 #            self.sample_sizes = [14,7]
+        else:
+            self.sample_sizes = [-1]
 
         self.inference_chunk = self.sample_sizes[0]
         print("HERE SAMPLESIZES", self.sample_sizes)
@@ -742,8 +745,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len, chunk_size=-1)
         del signal
 
-        # During training, loss must be computed, so decoder forward is necessary
-        decoder, target_length, states = self.decoder(targets=transcript, target_length=transcript_len)
+        decoder, _, target_length = self.decoder(targets=transcript, target_length=transcript_len)
 
         if hasattr(self, '_trainer') and self._trainer is not None:
             log_every_n_steps = self._trainer.log_every_n_steps
@@ -754,12 +756,12 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
         # If experimental fused Joint-Loss-WER is not used
         if not self.joint.fuse_loss_wer:
-
             loss_value = 0
             for chunk_size in self.sample_sizes:
                 chunked, length = chunk_concat_audio(encoded, encoded_len, chunk_size)
                 # Compute full joint and loss
                 joint = self.joint(encoder_outputs=chunked.transpose(1,2), decoder_outputs=decoder, encoder_lengths=length)
+            
                 loss_value += self.loss(
                     log_probs=joint, targets=transcript, input_lengths=(length != 0).sum(dim=1), target_lengths=target_length
                 ) / len(self.sample_sizes)
@@ -874,6 +876,8 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 )
 
                 tensorboard_logs['val_loss'] = loss_value
+
+#            print("DEVICES", encoded.device, encoded_len.device, transcript.device, transcript_len.device)
 
             self.wer.update(
                 predictions=encoded,

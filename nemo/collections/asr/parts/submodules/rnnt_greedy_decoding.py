@@ -231,11 +231,13 @@ class _GreedyRNNTInfer(Typing, ConfidenceMethodMixin):
 
         else:
             # Label is an integer
-            if label == self._SOS:
-                return self.decoder.predict(None, hidden, add_sos=add_sos, batch_size=batch_size)
+#            if label == self._SOS:  # TODO(hainan)
+#                return self.decoder.predict(None, hidden, add_sos=add_sos, batch_size=batch_size)
 
             label = label_collate([[label]])
 
+#        print("LABEL IS", label.device)
+        label = label.to(next(self.joint.pred.parameters()).device)
         # output: [B, 1, K]
         return self.decoder.predict(label, hidden, add_sos=add_sos, batch_size=batch_size)
 
@@ -532,7 +534,9 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                 del hypothesis.frame_confidence[-1]
 
         # Unpack the hidden states
-        hypothesis.dec_state = self.decoder.batch_select_state(hypothesis.dec_state, 0)
+
+#        print("DEC STATE", hypothesis.dec_state.transformer_state.shape)                
+#        hypothesis.dec_state = self.decoder.batch_select_state(hypothesis.dec_state, 0)
 
         return hypothesis
 
@@ -805,16 +809,23 @@ class GreedyBatchedRNNTInfer(_GreedyRNNTInfer, WithOptionalCudaGraphs):
             prev_batched_state=batched_state,
         )
         hyps = rnnt_utils.batched_hyps_to_hypotheses(batched_hyps, alignments, batch_size=x.shape[0])
-        for hyp, state_item in zip(hyps, self.decoding_computer.split_batched_state(batched_state)):
-            hyp.dec_state = state_item
-
-        if partial_hypotheses:
-            for i, (hyp, hyp_continuation) in enumerate(zip(partial_hypotheses, hyps)):
-                if hyp is not None:
-                    hyp.merge_(hyp_continuation)
-                else:
-                    partial_hypotheses[i] = hyp_continuation
-            return partial_hypotheses
+#<<<<<<< HEAD
+#        for hyp, state_item in zip(hyps, self.decoding_computer.split_batched_state(batched_state)):
+#            hyp.dec_state = state_item
+#
+#        if partial_hypotheses:
+#            for i, (hyp, hyp_continuation) in enumerate(zip(partial_hypotheses, hyps)):
+#                if hyp is not None:
+#                    hyp.merge_(hyp_continuation)
+#                else:
+#                    partial_hypotheses[i] = hyp_continuation
+#            return partial_hypotheses
+#=======
+#        if self.decoder.state_size_is_fixed():
+#            for hyp, state_item in zip(hyps, self.decoding_computer.split_batched_state(batched_state)):
+#                hyp.dec_state = state_item
+#
+#>>>>>>> xformer_xducer
         return hyps
 
     def _greedy_decode_blank_as_pad_loop_frames(
