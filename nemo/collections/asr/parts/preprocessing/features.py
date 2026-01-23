@@ -87,6 +87,7 @@ def normalize_batch(x, seq_len, normalize_type):
             torch.sum(torch.where(valid_mask.unsqueeze(1), x - x_mean.unsqueeze(2), 0.0) ** 2, axis=2)
             / (x_mean_denominator.unsqueeze(1) - 1.0)
         )
+        x_std = x_std.masked_fill(x_std.isnan(), 0.0)  # edge case: only 1 frame in denominator
         # make sure x_std is not zero
         x_std += CONSTANT
         return (x - x_mean.unsqueeze(2)) / x_std.unsqueeze(2), x_mean, x_std
@@ -131,7 +132,7 @@ def clean_spectrogram_batch(spectrogram: torch.Tensor, spectrogram_len: torch.Te
 
 
 def splice_frames(x, frame_splicing):
-    """ Stacks frames together across feature dim
+    """Stacks frames together across feature dim
 
     input is batch_size, feature_dim, num_frames
     output is batch_size, feature_dim*frame_splicing, num_frames
@@ -261,7 +262,7 @@ class FilterbankFeatures(nn.Module):
         highfreq=None,
         log=True,
         log_zero_guard_type="add",
-        log_zero_guard_value=2 ** -24,
+        log_zero_guard_value=2**-24,
         dither=CONSTANT,
         pad_to=16,
         max_duration=16.7,
@@ -304,10 +305,13 @@ class FilterbankFeatures(nn.Module):
             )
         logging.info(f"PADDING: {pad_to}")
 
+        self.sample_rate = sample_rate
         self.win_length = n_window_size
         self.hop_length = n_window_stride
         self.n_fft = n_fft or 2 ** math.ceil(math.log2(self.win_length))
         self.stft_pad_amount = (self.n_fft - self.hop_length) // 2 if exact_pad else None
+        self.exact_pad = exact_pad
+        self.sample_rate = sample_rate
 
         if exact_pad:
             logging.info("STFT using exact pad")
@@ -321,15 +325,6 @@ class FilterbankFeatures(nn.Module):
         window_fn = torch_windows.get(window, None)
         window_tensor = window_fn(self.win_length, periodic=False) if window_fn else None
         self.register_buffer("window", window_tensor)
-        self.stft = lambda x: torch.stft(
-            x,
-            n_fft=self.n_fft,
-            hop_length=self.hop_length,
-            win_length=self.win_length,
-            center=False if exact_pad else True,
-            window=self.window.to(dtype=torch.float),
-            return_complex=True,
-        )
 
         self.normalize = normalize
         self.log = log
@@ -388,6 +383,18 @@ class FilterbankFeatures(nn.Module):
         logging.debug(f"using grads: {use_grads}")
         logging.debug(f"nb_augmentation_prob: {nb_augmentation_prob}")
 
+    def stft(self, x):
+        return torch.stft(
+            x,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            win_length=self.win_length,
+            center=False if self.exact_pad else True,
+            window=self.window.to(dtype=torch.float, device=x.device),
+            return_complex=True,
+            pad_mode="constant",
+        )
+
     def log_zero_guard_value_fn(self, x):
         if isinstance(self.log_zero_guard_value, str):
             if self.log_zero_guard_value == "tiny":
@@ -406,7 +413,7 @@ class FilterbankFeatures(nn.Module):
     def get_seq_len(self, seq_len):
         # Assuming that center is True is stft_pad_amount = 0
         pad_amount = self.stft_pad_amount * 2 if self.stft_pad_amount is not None else self.n_fft // 2 * 2
-        seq_len = torch.floor_divide((seq_len + pad_amount - self.n_fft), self.hop_length) + 1
+        seq_len = torch.floor_divide((seq_len + pad_amount - self.n_fft), self.hop_length)
         return seq_len.to(dtype=torch.long)
 
     @property
@@ -414,11 +421,14 @@ class FilterbankFeatures(nn.Module):
         return self.fb
 
     def forward(self, x, seq_len, linear_spec=False):
-        seq_len = self.get_seq_len(seq_len)
+        seq_len_time = seq_len
+        seq_len_unfixed = self.get_seq_len(seq_len)
+        # fix for seq_len = 0 for streaming; if size was 0, it is always padded to 1, and normalizer fails
+        seq_len = torch.where(seq_len == 0, torch.zeros_like(seq_len_unfixed), seq_len_unfixed)
 
         if self.stft_pad_amount is not None:
             x = torch.nn.functional.pad(
-                x.unsqueeze(1), (self.stft_pad_amount, self.stft_pad_amount), "reflect"
+                x.unsqueeze(1), (self.stft_pad_amount, self.stft_pad_amount), "constant"
             ).squeeze(1)
 
         # dither (only in training mode for eval determinism)
@@ -427,10 +437,12 @@ class FilterbankFeatures(nn.Module):
 
         # do preemphasis
         if self.preemph is not None:
+            timemask = torch.arange(x.shape[1], device=x.device).unsqueeze(0) < seq_len_time.unsqueeze(1)
             x = torch.cat((x[:, 0].unsqueeze(1), x[:, 1:] - self.preemph * x[:, :-1]), dim=1)
+            x = x.masked_fill(~timemask, 0.0)
 
         # disable autocast to get full range of stft values
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast(x.device.type, enabled=False):
             x = self.stft(x)
 
         # torch stft returns complex tensor (of shape [B,N,T]); so convert to magnitude
@@ -452,8 +464,11 @@ class FilterbankFeatures(nn.Module):
         if linear_spec:
             return x, seq_len
 
-        # dot with filterbank energies
-        x = torch.matmul(self.fb.to(x.dtype), x)
+        # disable autocast, otherwise it might be automatically casted to fp16
+        # on fp16 compatible GPUs and get NaN values for input value of 65520
+        with torch.amp.autocast(x.device.type, enabled=False):
+            # dot with filterbank energies
+            x = torch.matmul(self.fb.to(x.dtype), x)
         # log features if required
         if self.log:
             if self.log_zero_guard_type == "add":
@@ -508,7 +523,7 @@ class FilterbankFeaturesTA(nn.Module):
         highfreq: Optional[float] = None,
         log: bool = True,
         log_zero_guard_type: str = "add",
-        log_zero_guard_value: Union[float, str] = 2 ** -24,
+        log_zero_guard_value: Union[float, str] = 2**-24,
         dither: float = 1e-5,
         window: str = "hann",
         pad_to: int = 0,
@@ -579,7 +594,7 @@ class FilterbankFeaturesTA(nn.Module):
 
     @property
     def filter_banks(self):
-        """ Matches the analogous class """
+        """Matches the analogous class"""
         return self._mel_spec_extractor.mel_scale.fb
 
     def _resolve_log_zero_guard_value(self, dtype: torch.dtype) -> float:
@@ -624,7 +639,7 @@ class FilterbankFeaturesTA(nn.Module):
 
     def _extract_spectrograms(self, signals: torch.Tensor) -> torch.Tensor:
         # Complex FFT needs to be done in single precision
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast('cuda', enabled=False):
             features = self._mel_spec_extractor(waveform=signals)
         return features
 

@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -132,3 +132,15 @@ class PoolingMLPConnectors(NeuralModule, Exportable, AccessMixin):
         outputs = self.mlp(outputs)
         outputs_len = torch.div(length, self.pooling_factor, rounding_mode='floor')
         return outputs.transpose(1, 2), outputs_len
+
+
+class IdentityConnectors(NeuralModule, Exportable, AccessMixin):
+    def __init__(
+        self,
+        *args,
+        **kwargs,
+    ):
+        super().__init__()
+
+    def forward(self, audio_signal, length=None, *args, **kwargs):
+        return audio_signal, length

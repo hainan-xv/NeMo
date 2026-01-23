@@ -30,9 +30,9 @@ except (ImportError, ModuleNotFoundError):
 
 try:
     from megatron.core.parallel_state import (
-        get_data_modulo_expert_parallel_group,
         get_data_parallel_group,
         get_data_parallel_world_size,
+        get_expert_data_parallel_group,
     )
     from megatron.core.tensor_parallel import copy_tensor_model_parallel_attributes
 
@@ -74,7 +74,7 @@ def _multi_tensor_copy_this_to_that(this, that, overflow_buf):
 
 def _get_grad_data_group(is_expert_group):
     if is_expert_group:
-        data_group = get_data_modulo_expert_parallel_group()
+        data_group = get_expert_data_parallel_group()
     else:
         data_group = get_data_parallel_group(with_context_parallel=True)
     return data_group
@@ -119,7 +119,7 @@ class GradBucket(object):
         self.data.zero_()
 
     def allreduce_buffer(self):
-        """Synchronous buffer data allreduce """
+        """Synchronous buffer data allreduce"""
         self.data.div_(get_data_parallel_world_size())
         torch.distributed.all_reduce(self.data, group=self._data_group)
 
@@ -175,7 +175,7 @@ class MainParamsOptimizerWrapper(torch.optim.Optimizer):
     Arguments:
         optimizer: base optimizer such as Adam or SGD.
         fp32_grad_accum: to enable the use of fp32 in gradient accumulation and allreduce.
-        contiguous_grad_bucket: to enable allocating the master gradients in the 
+        contiguous_grad_bucket: to enable allocating the master gradients in the
             contiguous memory space to reduce memory fragmentation.
         async_grad_allreduce: enable asynchronous gradient allreduce that is executed
             along with the training step backprop.
@@ -339,6 +339,7 @@ class MainParamsOptimizerWrapper(torch.optim.Optimizer):
 
     def _make_param_hook(self, param, main_param, i, grad_chunk_info, is_expert_group):
         """Create the grad accumulation and all-reduce hook for backprop."""
+
         # Hook used for back-prop.
         def param_hook(*unused):
             # Accumulates gradients on main gradients
@@ -361,7 +362,9 @@ class MainParamsOptimizerWrapper(torch.optim.Optimizer):
                 else:
                     tensor.div_(grad_mult)
                     torch.distributed.all_reduce(
-                        tensor, group=data_group, async_op=True,
+                        tensor,
+                        group=data_group,
+                        async_op=True,
                     )
 
             # Asynchronous gradients allreduce accross data_parallel ranks
@@ -451,6 +454,10 @@ class MainParamsOptimizerWrapper(torch.optim.Optimizer):
         if self._async_grad_allreduce:
             torch.cuda.synchronize()
 
+        closure = kwargs.pop('closure', None)
+        # Allows applications to specify closure as None without erroring due to duplicate specification
+        assert closure is None, f"closure should be None but was passed {closure}"
+
         # Step the optimizer.
         self.optimizer.step(closure=None, **kwargs)
 
@@ -473,12 +480,16 @@ class MainParamsOptimizerWrapper(torch.optim.Optimizer):
         if optimizer_key not in state_dict:
             optimizer_key = 'optimizer_state_dict'
             logging.info('***WARNING*** loading optimizer from ' 'an old checkpoint ...')
+        if 'state' not in state_dict[optimizer_key]:
+            state_dict[optimizer_key]['state'] = {}
         self.optimizer.load_state_dict(state_dict[optimizer_key])
 
         # Copy data for the main params.
         fp32_from_float16_params_key = 'fp32_from_fp16_params'
         if fp32_from_float16_params_key not in state_dict:
             fp32_from_float16_params_key = 'fp32_from_fp16'
+        if fp32_from_float16_params_key not in state_dict:
+            state_dict[fp32_from_float16_params_key] = []
         for current_group, saved_group in zip(self.fp32_from_float16_groups, state_dict[fp32_from_float16_params_key]):
             for current_param, saved_param in zip(current_group, saved_group):
                 current_param.data.copy_(saved_param.data)
@@ -489,7 +500,7 @@ class MainParamsOptimizerWrapper(torch.optim.Optimizer):
 
     @contextmanager
     def no_sync(self):
-        """ A context manager to disable gradient synchronizations across
+        """A context manager to disable gradient synchronizations across
         data-parallel ranks."""
         old_require_backward_grad_sync = self._require_backward_grad_sync
         self._require_backward_grad_sync = False

@@ -44,21 +44,9 @@ __repository_url__ = package_info.__repository_url__
 __version__ = package_info.__version__
 
 
-if os.path.exists('nemo/README.md'):
-    with open("nemo/README.md", "r", encoding='utf-8') as fh:
-        long_description = fh.read()
+with open("README.md", "r", encoding='utf-8') as fh:
+    long_description = fh.read()
     long_description_content_type = "text/markdown"
-
-elif os.path.exists('README.rst'):
-    # codec is used for consistent encoding
-    long_description = codecs.open(
-        os.path.join(os.path.abspath(os.path.dirname(__file__)), 'README.rst'), 'r', encoding='utf-8',
-    ).read()
-    long_description_content_type = "text/x-rst"
-
-else:
-    long_description = 'See ' + __homepage__
-    long_description_content_type = "text/plain"
 
 
 ###############################################################################
@@ -67,11 +55,12 @@ else:
 
 
 def req_file(filename, folder="requirements"):
-    with open(os.path.join(folder, filename), encoding='utf-8') as f:
-        content = f.readlines()
-    # you may also want to remove whitespace characters
-    # Example: `\n` at the end of each line
-    return [x.strip() for x in content]
+    files = [filename] if not isinstance(filename, list) else filename
+    ans = []
+    for file in files:
+        with open(os.path.join(folder, file), encoding='utf-8') as f:
+            ans.extend(list(map(str.strip, f.readlines())))
+    return ans
 
 
 install_requires = req_file("requirements.txt")
@@ -79,34 +68,95 @@ install_requires = req_file("requirements.txt")
 extras_require = {
     # User packages
     'test': req_file("requirements_test.txt"),
+    'run': req_file("requirements_run.txt"),
     # Lightning Collections Packages
-    'core': req_file("requirements_lightning.txt"),
-    'common': req_file('requirements_common.txt'),
+    'core': req_file(["requirements_lightning.txt", "requirements_automodel.txt"]),
+    'lightning': req_file(["requirements_lightning.txt"]),
+    'automodel': req_file(["requirements_automodel.txt"]),
+    'common-only': req_file('requirements_common.txt'),
     # domain packages
-    'asr': req_file("requirements_asr.txt"),
-    'nlp': req_file("requirements_nlp.txt"),
+    'asr-only': req_file("requirements_asr.txt"),
+    'ctc_segmentation': req_file("requirements.txt", folder="tools/ctc_segmentation"),
+    'nlp-only': req_file("requirements_nlp.txt"),
     'tts': req_file("requirements_tts.txt"),
     'slu': req_file("requirements_slu.txt"),
-    'multimodal': req_file("requirements_multimodal.txt"),
+    'multimodal-only': req_file("requirements_multimodal.txt"),
+    'audio': req_file("requirements_audio.txt"),
+    'deploy': req_file("requirements_deploy.txt"),
+    'eval': req_file("requirements_eval.txt"),
 }
 
 
-extras_require['all'] = list(chain(extras_require.values()))
+extras_require['all'] = list(chain(val for key, val in extras_require.items() if key != 'deploy'))
 
 # Add lightning requirements as needed
-extras_require['common'] = list(chain([extras_require['common'], extras_require['core']]))
-extras_require['test'] = list(chain([extras_require['tts'], extras_require['core'], extras_require['common'],]))
-extras_require['asr'] = list(chain([extras_require['asr'], extras_require['core'], extras_require['common']]))
-extras_require['nlp'] = list(chain([extras_require['nlp'], extras_require['core'], extras_require['common'],]))
-extras_require['tts'] = list(chain([extras_require['tts'], extras_require['core'], extras_require['common'],]))
-extras_require['multimodal'] = list(
-    chain([extras_require['multimodal'], extras_require['nlp'], extras_require['core'], extras_require['common'],])
+extras_require['common'] = extras_require['common-only']
+
+extras_require['common'] = list(
+    chain(
+        extras_require['common'],
+        extras_require['core'],
+    )
 )
-
-# TTS has extra dependencies
-extras_require['tts'] = list(chain([extras_require['tts'], extras_require['asr']]))
-
-extras_require['slu'] = list(chain([extras_require['slu'], extras_require['asr']]))
+extras_require['test'] = list(
+    chain(
+        extras_require['test'],
+        extras_require['tts'],
+        extras_require['common'],
+    )
+)
+extras_require['asr'] = extras_require['asr-only']
+extras_require['asr'] = list(
+    chain(
+        extras_require['asr'],
+        extras_require['ctc_segmentation'],
+        extras_require['common'],
+    )
+)
+extras_require['nlp'] = extras_require['nlp-only']
+extras_require['nlp'] = list(
+    chain(
+        extras_require['nlp'],
+        extras_require['eval'],
+        extras_require['common'],
+    )
+)
+extras_require['llm'] = extras_require['nlp']
+extras_require['tts'] = list(
+    chain(
+        extras_require['tts'],
+        extras_require['asr'],
+        extras_require['common'],
+    )
+)
+extras_require['multimodal'] = extras_require['multimodal-only']
+extras_require['multimodal'] = list(
+    chain(
+        extras_require['multimodal'],
+        extras_require['nlp'],
+        extras_require['common'],
+    )
+)
+extras_require['audio'] = list(
+    chain(
+        extras_require['audio'],
+        extras_require['common'],
+    )
+)
+extras_require['slu'] = list(
+    chain(
+        extras_require['slu'],
+        extras_require['asr'],
+    )
+)
+extras_require['deploy'] = list(
+    chain(
+        extras_require['nlp'],
+        extras_require['multimodal'],
+        extras_require['tts'],
+        extras_require['deploy'],
+    )
+)
 
 
 ###############################################################################
@@ -132,7 +182,8 @@ class StyleCommand(distutils_cmd.Command):
             command.extend(['--check', '--diff'])
 
         self.announce(
-            msg='Running command: %s' % str(' '.join(command)), level=distutils_log.INFO,
+            msg='Running command: %s' % str(' '.join(command)),
+            level=distutils_log.INFO,
         )
 
         return_code = subprocess.call(command)
@@ -140,10 +191,18 @@ class StyleCommand(distutils_cmd.Command):
         return return_code
 
     def _isort(self, scope, check):
-        return self.__call_checker(base_command=self.__ISORT_BASE.split(), scope=scope, check=check,)
+        return self.__call_checker(
+            base_command=self.__ISORT_BASE.split(),
+            scope=scope,
+            check=check,
+        )
 
     def _black(self, scope, check):
-        return self.__call_checker(base_command=self.__BLACK_BASE.split(), scope=scope, check=check,)
+        return self.__call_checker(
+            base_command=self.__BLACK_BASE.split(),
+            scope=scope,
+            check=check,
+        )
 
     def _pass(self):
         self.announce(msg='\033[32mPASS\x1b[0m', level=distutils_log.INFO)
@@ -226,6 +285,7 @@ setuptools.setup(
         'Operating System :: OS Independent',
     ],
     packages=setuptools.find_packages(),
+    python_requires='>=3.10',
     install_requires=install_requires,
     # List additional groups of dependencies here (e.g. development
     # dependencies). You can install these using the following syntax,
@@ -234,11 +294,16 @@ setuptools.setup(
     extras_require=extras_require,
     # Add in any packaged data.
     include_package_data=True,
-    exclude=['tools', 'tests', 'nemo.deploy', 'nemo.export'],
+    exclude=['tools', 'tests'],
     package_data={'': ['*.tsv', '*.txt', '*.far', '*.fst', '*.cpp', 'Makefile']},
     zip_safe=False,
     # PyPI package information.
     keywords=__keywords__,
     # Custom commands.
     cmdclass={'style': StyleCommand},
+    entry_points={
+        "nemo_run.cli": [
+            "llm = nemo.collections.llm",
+        ],
+    },
 )

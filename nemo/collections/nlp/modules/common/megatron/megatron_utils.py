@@ -15,12 +15,13 @@
 
 import os
 import shutil
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import torch
 import wget
 from torch.hub import _get_torch_home
 
+from nemo.core.classes.common import PretrainedModelInfo
 from nemo.utils import logging
 
 __all__ = [
@@ -55,14 +56,14 @@ MEGATRON_CONFIG_MAP = {
     },
     "megatron-bert-345m-uncased": {
         "config": CONFIGS["345m"],
-        "checkpoint": "https://api.ngc.nvidia.com/v2/models/nvidia/megatron_bert_345m/versions/v0.0/files/release/mp_rank_00/model_optim_rng.pt",
+        "checkpoint": "https://api.ngc.nvidia.com/v2/models/nvidia/megatron_bert_345m/versions/v0.0/files/release/mp_rank_00/model_optim_rng.pt",  # pylint: disable=line-too-long
         "vocab": "https://s3.amazonaws.com/models.huggingface.co/bert/bert-large-uncased-vocab.txt",
         "do_lower_case": True,
         "tokenizer_name": "bert-large-uncased",
     },
     "megatron-bert-345m-cased": {
         "config": CONFIGS["345m"],
-        "checkpoint": "https://api.ngc.nvidia.com/v2/models/nvidia/megatron_bert_345m/versions/v0.1_cased/files/release/mp_rank_00/model_optim_rng.pt",
+        "checkpoint": "https://api.ngc.nvidia.com/v2/models/nvidia/megatron_bert_345m/versions/v0.1_cased/files/release/mp_rank_00/model_optim_rng.pt",  # pylint: disable=line-too-long
         "vocab": "https://s3.amazonaws.com/models.huggingface.co/bert/bert-large-cased-vocab.txt",
         "do_lower_case": False,
         "tokenizer_name": "bert-large-cased",
@@ -83,14 +84,14 @@ MEGATRON_CONFIG_MAP = {
     },
     "biomegatron-bert-345m-uncased": {
         "config": CONFIGS["345m"],
-        "checkpoint": "https://api.ngc.nvidia.com/v2/models/nvidia/biomegatron345muncased/versions/0/files/MegatronBERT.pt",
+        "checkpoint": "https://api.ngc.nvidia.com/v2/models/nvidia/biomegatron345muncased/versions/0/files/MegatronBERT.pt",  # pylint: disable=line-too-long
         "vocab": "https://api.ngc.nvidia.com/v2/models/nvidia/biomegatron345muncased/versions/0/files/vocab.txt",
         "do_lower_case": True,
         "tokenizer_name": "bert-large-uncased",
     },
     "biomegatron-bert-345m-cased": {
         "config": CONFIGS["345m"],
-        "checkpoint": "https://api.ngc.nvidia.com/v2/models/nvidia/biomegatron345mcased/versions/0/files/MegatronBERT.pt",
+        "checkpoint": "https://api.ngc.nvidia.com/v2/models/nvidia/biomegatron345mcased/versions/0/files/MegatronBERT.pt",  # pylint: disable=line-too-long
         "vocab": "https://api.ngc.nvidia.com/v2/models/nvidia/biomegatron345mcased/versions/0/files/vocab.txt",
         "do_lower_case": False,
         "tokenizer_name": "bert-large-cased",
@@ -98,16 +99,30 @@ MEGATRON_CONFIG_MAP = {
 }
 
 
-def compute_model_parallel_rank(local_rank, model_parallel_size):
+def compute_model_parallel_rank(local_rank: int, model_parallel_size: int) -> int:
+    """Calculates the model_parallel_rank from the local rank and the model parallel size
+
+    Args:
+        local_rank (int): The local rank of the process.
+        model_parallel_size (int): The number of ranks in the model parallel group.
+
+    Returns:
+        int: The model parallel rank corresponding to the given local rank.
+    """
     return local_rank % model_parallel_size
 
 
 def get_megatron_pretrained_bert_models() -> List[str]:
-    from nemo.collections.nlp.models.language_modeling.megatron_bert_model import MegatronBertModel
+    """Retrieves the names of all available pretrained Megatron-BERT models.
 
-    all_pretrained_megatron_bert_models = [
-        model.pretrained_model_name for model in MegatronBertModel.list_available_models()
-    ]
+    This function uses the NeMo MegatronBertModel class to list all available
+    pretrained model configurations, extracting each model's name.
+
+    Returns:
+        List[str]: A list of pretrained Megatron-BERT model names.
+    """
+
+    all_pretrained_megatron_bert_models = [model.pretrained_model_name for model in list_available_models()]
     return all_pretrained_megatron_bert_models
 
 
@@ -207,6 +222,8 @@ def _download(path: str, url: str):
         os.makedirs(MEGATRON_CACHE, exist_ok=True)
         logging.info(f"Downloading from {url} to {path}")
         downloaded_path = wget.download(url)
+        if not os.path.exists(downloaded_path):
+            raise FileNotFoundError(f"Downloaded file not found: {downloaded_path}")
         shutil.move(downloaded_path, path)
     # wait until the master process downloads the file and writes it to the cache dir
     if torch.distributed.is_initialized():
@@ -230,13 +247,53 @@ def is_lower_cased_megatron(pretrained_model_name):
 
 def get_megatron_tokenizer(pretrained_model_name: str):
     """
-    Takes a pretrained_model_name for megatron such as "megatron-bert-cased" and returns the according 
+    Takes a pretrained_model_name for megatron such as "megatron-bert-cased" and returns the according
     tokenizer name for tokenizer instantiating.
 
     Args:
         pretrained_model_name: pretrained_model_name for megatron such as "megatron-bert-cased"
-    Returns: 
+    Returns:
         tokenizer name for tokenizer instantiating
     """
     _check_megatron_name(pretrained_model_name)
     return MEGATRON_CONFIG_MAP[pretrained_model_name]["tokenizer_name"]
+
+
+def list_available_models() -> Optional[PretrainedModelInfo]:
+    """
+    This function returns a list of pre-trained model which can be instantiated directly from NVIDIA's NGC cloud.
+    Returns:
+        List of available pre-trained models.
+    """
+    result = []
+    for vocab in ['cased', 'uncased']:
+        result.append(
+            PretrainedModelInfo(
+                pretrained_model_name=f"megatron_bert_345m_{vocab}",
+                # pylint: disable=C0301
+                location=f"https://api.ngc.nvidia.com/v2/models/nvidia/nemo/megatron_bert_345m_{vocab}/versions/1/files/megatron_bert_345m_{vocab}.nemo",
+                description=f"345M parameter BERT Megatron model with {vocab} vocab.",
+            )
+        )
+    for vocab_size in ['50k', '30k']:
+        for vocab in ['cased', 'uncased']:
+            result.append(
+                PretrainedModelInfo(
+                    pretrained_model_name=f"biomegatron345m_biovocab_{vocab_size}_{vocab}",
+                    # pylint: disable=C0301
+                    location=f"https://api.ngc.nvidia.com/v2/models/nvidia/nemo/biomegatron345m_biovocab_{vocab_size}_{vocab}/versions/1/files/BioMegatron345m-biovocab-{vocab_size}-{vocab}.nemo",
+                    # pylint: disable=C0301
+                    description="Megatron 345m parameters model with biomedical vocabulary ({vocab_size} size) {vocab}, pre-trained on PubMed biomedical text corpus.",
+                )
+            )
+    for vocab in ['cased', 'uncased']:
+        result.append(
+            PretrainedModelInfo(
+                pretrained_model_name=f"biomegatron-bert-345m-{vocab}",
+                # pylint: disable=C0301
+                location=f"https://api.ngc.nvidia.com/v2/models/nvidia/nemo/biomegatron345m{vocab}/versions/1/files/BioMegatron345m{vocab.capitalize()}.nemo",
+                # pylint: disable=C0301
+                description=f"Megatron pretrained on {vocab} biomedical dataset PubMed with 345 million parameters.",
+            )
+        )
+    return result

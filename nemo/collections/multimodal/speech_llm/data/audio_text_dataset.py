@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,14 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# flake8: noqa: F821
+
 import copy
 import io
+import math
 import os
 from typing import Dict, List, Optional, Union
 
 import numpy as np
 import torch
-import webdataset as wds
 from omegaconf import DictConfig, ListConfig, open_dict
 
 from nemo.collections.asr.data.audio_to_text import (
@@ -29,19 +32,19 @@ from nemo.collections.asr.data.audio_to_text import (
 )
 from nemo.collections.asr.data.audio_to_text_dataset import ConcatDataset, convert_to_config_list, get_chain_dataset
 from nemo.collections.asr.parts.preprocessing.features import WaveformFeaturizer
-from nemo.collections.asr.parts.utils.audio_utils import ChannelSelectorType
+from nemo.collections.asr.parts.preprocessing.segment import ChannelSelectorType
+from nemo.collections.common.data.blendable_dataset import BlendableDataset
 from nemo.collections.common.parts.preprocessing import collections
 from nemo.collections.multimodal.speech_llm.parts.utils.data_utils import (
+    TextProcessing,
+    build_loss_mask,
     ceil_to_nearest,
     get_num_samples_from_files,
     maybe_cast_to_list,
 )
-from nemo.collections.nlp.data.language_modeling.megatron.base_dataset_utils import (
-    get_datasets_weights_and_num_samples,
-)
-from nemo.collections.nlp.data.language_modeling.megatron.blendable_dataset import BlendableDataset
 from nemo.core.classes import Dataset, IterableDataset
-from nemo.utils import logging, logging_mode
+from nemo.utils import logging
+from nemo.utils import webdataset as wds
 from nemo.utils.distributed import webdataset_split_by_workers
 
 try:
@@ -68,7 +71,7 @@ def _audio_collate_fn(audio_signals, audio_lengths):
     """
 
     max_audio_len = 0
-    has_audio = audio_lengths[0] is not None
+    has_audio = len(audio_lengths) > 0 and audio_lengths[0] is not None
     if has_audio:
         max_audio_len = max(audio_lengths).item()
 
@@ -90,25 +93,12 @@ def _audio_collate_fn(audio_signals, audio_lengths):
     return audio_signals_padded, audio_lengths
 
 
-def _build_loss_mask(processed_example: Dict, answer_only_loss: bool = True):
-    """Pad input_ids in batch to max batch length while building loss mask"""
-    # function copied from nemo/collections/nlp/data/language_modelling/megatron/gpt_sft_dataset.py
-    input_ids = processed_example['input_ids']
-    answer_start_idx = processed_example['answer_start_idx']
-    if answer_only_loss:
-        loss_mask = [float(idx >= answer_start_idx) for idx in range(len(input_ids))]
-    else:
-        loss_mask = [1.0] * len(input_ids)
-
-    return loss_mask
-
-
 def _collate_item(item: Union[torch.Tensor, np.ndarray, List], max_length: int, pad_id: int = 0):
     # function copied from nemo/collections/nlp/data/language_modelling/megatron/gpt_sft_dataset.py
     item = maybe_cast_to_list(item)
     # max_length = max([len(x) for x in item]) if item else 0
     # here [0] should be tokenizer.pad_id
-    item = [x + [pad_id] * (max_length - len(x)) for x in item]
+    item = [x[:max_length] + [pad_id] * (max_length - len(x)) for x in item]
     return item
 
 
@@ -132,9 +122,10 @@ def _speechllm_audio_text_collate_fn(
     context_lengths = torch.LongTensor([item['context_length'] for item in batch])
     answers = [item['answer_ids'] for item in batch]
 
-    loss_mask = [_build_loss_mask(item)[1:] for item in batch]
+    loss_mask = [build_loss_mask(item)[1:] for item in batch]
 
-    max_length = max([len(x) for x in input_ids]) + tokens_to_generate
+    # add 1 for actual max length in batch
+    max_length = max([len(x) for x in input_ids]) + tokens_to_generate + 1
     # increase max length to nearest multiple of 4 or 8
     if pad_to_max_length:
         max_length = max_seq_length
@@ -205,216 +196,30 @@ def _speechllm_multi_audio_text_collate_fn(
     return batch
 
 
-class TextProcessing(object):
-    """
-    Text processing pipeline for AudioTextDataset and TarredAudioTextDataset.
-    This class is adapted from the one used in nemo/collections/nlp/data/language_modeling/megatron/gpt_sft_dataset.py
-    """
-
-    def __init__(
-        self,
-        tokenizer: 'nemo.collections.common.tokenizers.TokenizerSpec',
-        max_seq_length: int = 1024,
-        min_seq_length: int = 1,
-        add_bos: bool = False,
-        add_eos: bool = True,
-        add_sep: bool = False,
-        sep_id: Optional[int] = None,
-        seed: int = 1234,
-        separate_prompt_and_response_with_newline: bool = False,
-        answer_only_loss: bool = True,
-        truncation_field: str = "answer",
-        pad_to_max_length: bool = False,  # (@adithyare) allows for much faster training especially in PEFT settings.
-        prompt_template: str = None,
-        virtual_tokens: int = 0,
-        tokens_to_generate: int = 0,
-        context_key: str = 'context',
-        answer_key: str = 'answer',
-        end_string: Optional[str] = None,
-        sample_alpha: Optional[float] = None,
-        audio_locator: Optional[str] = None,
-    ):
-        self.context_key = context_key
-        self.answer_key = answer_key
-        self.tokenizer = tokenizer
-        self.max_seq_length = max_seq_length
-        self.min_seq_length = min_seq_length
-        self.seed = seed
-        self.separate_prompt_and_response_with_newline = separate_prompt_and_response_with_newline
-        self.answer_only_loss = answer_only_loss
-        self.truncation_field = truncation_field
-        self.pad_to_max_length = pad_to_max_length
-        self.prompt_template = prompt_template
-        self.virtual_tokens = virtual_tokens
-        self.tokens_to_generate = tokens_to_generate
-        self.add_bos = add_bos
-        self.add_eos = add_eos
-        self.add_sep = add_sep
-        self.end_string = end_string
-        self.sample_alpha = sample_alpha
-        self.audio_locator = audio_locator
-
-        if add_bos and hasattr(tokenizer, "bos_id") and tokenizer.bos_id > 0:
-            self.bos_id = tokenizer.bos_id
-        else:
-            self.bos_id = None
-
-        if add_eos and hasattr(tokenizer, "eos_id") and tokenizer.eos_id > 0:
-            self.eos_id = tokenizer.eos_id
-        else:
-            self.eos_id = None
-
-        if hasattr(tokenizer, "pad_id") and tokenizer.pad_id > 0:
-            self.pad_id = tokenizer.pad_id
-        else:
-            self.pad_id = self.eos_id if self.eos_id is not None else 0
-
-        self.sep_id = sep_id if add_sep else None
-
-        if self.prompt_template is not None:
-            # When providing things like newlines in the prompt template via the CLI, they are escaped. This line unescapes them.
-            self.prompt_template = self.prompt_template.encode('utf-8').decode('unicode_escape')
-        assert self.truncation_field in ["answer", "context"]
-
-    def _process_example(self, context: str, output: str):
-        """
-        Create an example by concatenating text and answer.
-        Truncation is carried out when needed, but it is performed only on the prompt side.
-        BOS, EOS, and SEP, are added if specified.
-
-        function copied from nemo/collections/nlp/data/language_modelling/megatron/gpt_sft_dataset.py
-        """
-        if self.prompt_template is not None:
-            if self.context_key not in self.prompt_template or self.answer_key not in self.prompt_template:
-                if "input" in self.prompt_template and "output" in self.prompt_template:
-                    logging.warning(
-                        f"Using 'input' and 'output' as context and answer keys, since given ones ({self.context_key}, {self.answer_key}) are not found in the prompt template: {self.prompt_template}.",
-                        mode=logging_mode.ONCE,
-                    )
-                    self.context_key = "input"
-                    self.answer_key = "output"
-            assert f'{{{self.context_key}}}' in self.prompt_template
-            assert f'{{{self.answer_key}}}' in self.prompt_template
-            # Make sure that '{output}' always occurs at the end of the prompt template string
-            assert self.prompt_template.index(f'{{{self.answer_key}}}') == len(self.prompt_template) - len(
-                f'{{{self.answer_key}}}'
-            )
-            # Get the context by replacing only the input
-            original_context = context
-            context = (
-                self.prompt_template.replace(f'{{{self.context_key}}}', context)
-                .replace(f'{{{self.answer_key}}}', '')
-                .strip(' ')
-            )
-            # Replace the input and output placeholders with the actual input and output
-            text = self.prompt_template.replace(f'{{{self.context_key}}}', original_context).replace(
-                f'{{{self.answer_key}}}', output
-            )
-
-        elif self.separate_prompt_and_response_with_newline:
-            text = context + '\n' + output
-        else:
-            text = context + ' ' + output
-
-        if self.virtual_tokens:
-            # (@adithyare) we are going to insert "pad/eos" tokens in the beginning of the text and context
-            # these pad/eos tokens are placeholders for virtual tokens
-            pre_pad = [self.tokenizer.eos_id] * self.virtual_tokens
-        else:
-            pre_pad = []
-        answer_text = text[len(context) :]
-        answer_ids = pre_pad + self.tokenizer.text_to_ids(answer_text, self.sample_alpha)
-        if self.end_string:
-            answer_ids += self.tokenizer.text_to_ids(self.end_string)
-
-        if self.audio_locator is None:
-            # signle audio case
-            context_ids = self.tokenizer.text_to_ids(context)
-            context_start_idx = [0]
-        else:
-            # multiple audio case
-            context_ids = []
-            context_start_idx = []
-            for context_seg in context.split(self.audio_locator):
-                context_start_idx.append(len(context_ids))
-                context_ids.extend(self.tokenizer.text_to_ids(context_seg))
-        context_ids = pre_pad + context_ids
-        context_start_idx = [x + len(pre_pad) for x in context_start_idx]
-
-        # for the long context cases, collate_fn includes self.tokens_to_generate for padding
-        total_ids = len(context_ids) + max(len(answer_ids), self.tokens_to_generate)
-        if self.add_bos:
-            total_ids += 1
-        if self.add_sep:
-            total_ids += 1
-        # Only training need to consider eos token
-        if self.add_eos and self.tokens_to_generate == 0:
-            total_ids += 1
-
-        # If the total number of token is greater than the max, we will try to truncate the answer
-        if total_ids > self.max_seq_length:
-            truncation_length = total_ids - self.max_seq_length
-            if self.truncation_field == "answer":
-                answer_ids = answer_ids[: -min(truncation_length, len(answer_ids))]
-            elif self.truncation_field == "context":
-                context_ids = context_ids[: -min(truncation_length, len(context_ids))]
-
-        input_ids = context_ids
-        answer_start_idx = len(input_ids)
-
-        # Adds bos token in the start
-        if self.add_bos:
-            context_ids = [self.tokenizer.bos_id] + context_ids
-            input_ids = [self.tokenizer.bos_id] + input_ids
-            answer_start_idx += 1
-
-        # Adds sep token between text/prompt and answer
-        if self.add_sep:
-            context_ids = context_ids + [self.sep_id]
-            input_ids = input_ids + [self.sep_id]
-            answer_start_idx += 1
-
-        input_ids = input_ids + answer_ids
-
-        # Only training need to consider eos token
-        if self.add_eos and self.tokens_to_generate == 0:
-            input_ids = input_ids + [self.tokenizer.eos_id]
-
-        if len(input_ids) > self.max_seq_length:
-            logging.warning(f'Input ids length {len(input_ids)} exceed max sequence length {self.max_seq_length}')
-            input_ids = input_ids[: self.max_seq_length]
-
-        processed_example = {
-            'input_ids': input_ids,
-            'answer_start_idx': answer_start_idx,
-            'context_ids': context_ids,
-            'context_length': len(context_ids),
-            'answer_ids': answer_ids,
-            'context_start_idx': context_start_idx,
-        }
-
-        return processed_example
-
-
 class AudioTextDataset(TextProcessing, Dataset):
     """
     Dataset that loads tensors via a json file containing paths to audio files, transcripts, and durations (in seconds).
     Each new line is a different sample. Example below:
-    {"audio_filepath": "1.wav", "duration": 1.12, "question": "what is the capital of France?", "answer": "Paris"}
-    {"audio_filepath": "2.wav", "duration": 2.15, "question": "what is the capital of Italy?", "answer": "Rome"}
+
+    .. code-block:: json
+
+        {"audio_filepath": "1.wav", "duration": 1.12, "question": "what is the capital of France?", "answer": "Paris"}
+        {"audio_filepath": "2.wav", "duration": 2.15, "question": "what is the capital of Italy?", "answer": "Rome"}
+
     Args:
         manifest_filepath: Path to manifest json as described above. Can be comma-separated paths.
         tokenizer: text tokenizer object
         sample_rate (int): Sample rate to resample loaded audio to
         int_values (bool): If true, load samples as 32-bit integers. Defauts to False.
-        augmentor (nemo.collections.asr.parts.perturb.AudioAugmentor): An AudioAugmentor object used to augment loaded
-            audio
+        augmentor (nemo.collections.asr.parts.perturb.AudioAugmentor): An AudioAugmentor object used to augment loaded audio
         max_duration: If audio exceeds this length, do not include in dataset
         min_duration: If audio is less than this length, do not include in dataset
         max_utts: Limit number of utterances
         trim: whether or not to trim silence. Defaults to False
         channel_selector (int | Iterable[int] | str): select a single channel or a subset of channels from multi-channel audio. If set to `'average'`, it performs averaging across channels. Disabled if set to `None`. Defaults to `None`. Uses zero-based indexing.
-        --------- NLP SPECIFIC ARGS -------------
+
+            :note: below args are NLP-specific
+
         max_seq_length (int): maximum sequence length for each dataset examples. Examples will either be truncated to fit this length or dropped if they cannot be truncated.
         min_seq_length (int): min length of each data example in the dataset. Data examples will be dropped if they do not meet the min length requirements.
         add_bos (bool): Whether to add a beginning of sentence token to each data example
@@ -430,11 +235,17 @@ class AudioTextDataset(TextProcessing, Dataset):
         answer_only_loss: If True, will compute the loss only on the answer part of the input. If False, will compute the loss on the entire input.
         truncation_field: Field to use for truncation. (Options: "answer", "context"). Field to be used for truncation if the combined length exceeds the max sequence length.
         pad_to_max_length: Whether to pad the input to the max sequence length. If False, will pad to the max length of the current batch.
-        prompt_template: Prompt template to inject via an fstring. Formatted like Q: {input}\n\nA: {output}
+        prompt_template: Prompt template to inject via an fstring. Formatted like:
+
+            .. code-block:: text
+
+                Q: {input}\\n\\nA: {output}
+
         end_string: Optional[str] = None, if not None, add this string to the end of the answer.
-        --------------- additional args for misc purposes ----------------
+
+            :note: below args are for miscellaneous purposes
+
         context_file: Optional[Union[List[str], str]] = None, if provided, will use this file to load random questions from, if question is not in manifest.
-        sample_alpha: Optional[float] = None, for SPE subword sampling
         audio_locator: Optional[str] = None, a special string to split the context into multiple audio segments.
     """
 
@@ -470,8 +281,10 @@ class AudioTextDataset(TextProcessing, Dataset):
         answer_key: str = 'answer',
         end_string: Optional[str] = None,
         context_file: Optional[Union[List[str], str]] = None,
-        sample_alpha: Optional[float] = None,
         audio_locator: Optional[str] = None,
+        add_boa_eoa: Optional[bool] = False,
+        boa_string: Optional[str] = "<BOA>",
+        eoa_string: Optional[str] = "<EOA>",
     ):
         super().__init__(
             tokenizer=tokenizer,
@@ -492,8 +305,10 @@ class AudioTextDataset(TextProcessing, Dataset):
             context_key=context_key,
             answer_key=answer_key,
             end_string=end_string,
-            sample_alpha=sample_alpha,
             audio_locator=audio_locator,
+            add_boa_eoa=add_boa_eoa,
+            boa_string=boa_string,
+            eoa_string=eoa_string,
         )
 
         if isinstance(manifest_filepath, str):
@@ -785,26 +600,30 @@ class TarredAudioTextDataset(TextProcessing, IterableDataset):
         pad_id (id): Token used to pad when collating samples in batches.
             If this is None, pads using 0s.
             Defaults to None.
-        shard_strategy (str): Tarred dataset shard distribution strategy chosen as a str value during ddp.
-            -   `scatter`: The default shard strategy applied by WebDataset, where each node gets
-                a unique set of shards, which are permanently pre-allocated and never changed at runtime.
-            -   `replicate`: Optional shard strategy, where each node gets all of the set of shards
-                available in the tarred dataset, which are permanently pre-allocated and never changed at runtime.
-                The benefit of replication is that it allows each node to sample data points from the entire
-                dataset independently of other nodes, and reduces dependence on value of `shuffle_n`.
+        shard_strategy (str): Tarred dataset shard distribution strategy chosen as a
+            str value during ddp.
 
-                .. warning::
-                    Replicated strategy allows every node to sample the entire set of available tarfiles,
-                    and therefore more than one node may sample the same tarfile, and even sample the same
-                    data points! As such, there is no assured guarantee that all samples in the dataset will be
-                    sampled at least once during 1 epoch. Scattered strategy, on the other hand, on specific
-                    occasions (when the number of shards is not divisible with ``world_size``), will not sample
-                    the entire dataset. For these reasons it is not advisable to use tarred datasets as validation
-                    or test datasets.
+            - `scatter`: The default shard strategy applied by WebDataset, where each node gets
+              a unique set of shards, which are permanently pre-allocated and never changed at runtime.
+            - `replicate`: Optional shard strategy, where each node gets all of the set of shards
+              available in the tarred dataset, which are permanently pre-allocated and never changed at runtime.
+              The benefit of replication is that it allows each node to sample data points from the entire
+              dataset independently of other nodes, and reduces dependence on value of `shuffle_n`.
+
+            :warning: Replicated strategy allows every node to sample the entire set of available tarfiles,
+                and therefore more than one node may sample the same tarfile, and even sample the same
+                data points! As such, there is no assured guarantee that all samples in the dataset will be
+                sampled at least once during 1 epoch. Scattered strategy, on the other hand, on specific
+                occasions (when the number of shards is not divisible with ``world_size``), will not sample
+                the entire dataset. For these reasons it is not advisable to use tarred datasets as validation
+                or test datasets.
+
         shard_manifests (bool): Whether or not to try / shard manifests. Defaults to False.
         global_rank (int): Worker rank, used for partitioning shards. Defaults to 0.
         world_size (int): Total number of processes, used for partitioning shards. Defaults to 0.
-        --------- NLP SPECIFIC ARGS -------------
+
+            :note: Below args are NLP-specific
+
         max_seq_length (int): maximum sequence length for each dataset examples. Examples will either be truncated to fit this length or dropped if they cannot be truncated.
         min_seq_length (int): min length of each data example in the dataset. Data examples will be dropped if they do not meet the min length requirements.
         add_bos (bool): Whether to add a beginning of sentence token to each data example
@@ -819,11 +638,18 @@ class TarredAudioTextDataset(TextProcessing, IterableDataset):
         answer_only_loss: If True, will compute the loss only on the answer part of the input. If False, will compute the loss on the entire input.
         truncation_field: Field to use for truncation. (Options: "answer", "context"). Field to be used for truncation if the combined length exceeds the max sequence length.
         pad_to_max_length: Whether to pad the input to the max sequence length. If False, will pad to the max length of the current batch.
-        prompt_template: Prompt template to inject via an fstring. Formatted like Q: {input}\n\nA: {output}
+        prompt_template: Prompt template to inject via an fstring. Formatted like:
+
+            .. code-block:: text
+
+                Q: {input}\\n\\nA: {output}
+
         end_string: Optional[str] = None, if not None, add this string to the end of the answer.
-        --------------- additional args for misc purposes ----------------
+
+            :note: Below args are for miscellaneous purposes
+
         context_file: Optional[Union[List[str], str]] = None, if provided, will use this file to load random questions from, if question is not in manifest.
-        sample_alpha: Optional[float] = None, for SPE subword sampling
+
     """
 
     def __init__(
@@ -860,7 +686,6 @@ class TarredAudioTextDataset(TextProcessing, IterableDataset):
         answer_key: str = 'answer',
         end_string: Optional[str] = None,
         context_file: Optional[Union[List[str], str]] = None,
-        sample_alpha: Optional[float] = None,
     ):
         super().__init__(
             tokenizer=tokenizer,
@@ -881,7 +706,6 @@ class TarredAudioTextDataset(TextProcessing, IterableDataset):
             context_key=context_key,
             answer_key=answer_key,
             end_string=end_string,
-            sample_alpha=sample_alpha,
         )
         self.is_megatron_iterable = True
         self.shard_manifests = shard_manifests
@@ -1056,7 +880,7 @@ def get_tarred_audio_text_dataset(
     if bucketing_weights:
         for idx, weight in enumerate(bucketing_weights):
             if not isinstance(weight, int) or weight <= 0:
-                raise ValueError(f"bucket weights must be positive integers")
+                raise ValueError("bucket weights must be positive integers")
 
     if len(manifest_filepaths) != len(tarred_audio_filepaths):
         raise ValueError(
@@ -1064,7 +888,7 @@ def get_tarred_audio_text_dataset(
         )
 
     if 'labels' not in config:
-        logging.warning(f"dataset does not have explicitly defined labels")
+        logging.warning("dataset does not have explicitly defined labels")
 
     if 'max_utts' in config:
         raise ValueError('"max_utts" parameter is not supported for tarred datasets')
@@ -1110,7 +934,6 @@ def get_tarred_audio_text_dataset(
             context_key=config.get('context_key', 'context'),
             answer_key=config.get('answer_key', 'answer'),
             end_string=config.get('end_string', None),
-            sample_alpha=config.get('sample_alpha', None),
             context_file=config.get('context_file', None),
         )
 
@@ -1167,7 +990,7 @@ def get_concat_tarred_audio_text_dataset(
         datasets
     ):
         logging.info(
-            f"concat_sampling_probabilities is not provided or is not of the same size as datasets, using uniform sampling."
+            "concat_sampling_probabilities is not provided or is not of the same size as datasets, using uniform sampling."
         )
         concat_sampling_probabilities = [1.0 / len(datasets)] * len(datasets)
 
@@ -1251,6 +1074,7 @@ def get_audio_text_dataset_from_config(
         manifest_filepath = config.manifest_filepath
 
     data_cls = MultiAudioTextDataset if config.get('audio_locator', None) else AudioTextDataset
+    logging.info(f"Using `{data_cls.__name__}` for dataset")
     datasets = []
     if is_train:
         # Construct the data prefix list for `get_datasets_weights_and_num_samples()`
@@ -1261,7 +1085,7 @@ def get_audio_text_dataset_from_config(
         elif len(config.get('concat_sampling_probabilities', None)) != len(manifest_filepath):
             raise ValueError(
                 (
-                    f"concat_sampling_probabilities must be of the same size as manifest_filepath.",
+                    "concat_sampling_probabilities must be of the same size as manifest_filepath.",
                     f"Provided size {len(config.concat_sampling_probabilities)}, number of datasets {len(manifest_filepath)}",
                 )
             )
@@ -1312,9 +1136,11 @@ def get_audio_text_dataset_from_config(
             context_key=config.get('context_key', 'context'),
             answer_key=config.get('answer_key', 'answer'),
             end_string=config.get('end_string', None),
-            sample_alpha=config.get('sample_alpha', None),
             context_file=context_file,
             audio_locator=config.get('audio_locator', None),
+            add_boa_eoa=config.get('add_boa_eoa', False),
+            boa_string=config.get('boa_string', None),
+            eoa_string=config.get('eoa_string', None),
         )
         datasets.append(dataset)
 
@@ -1325,3 +1151,36 @@ def get_audio_text_dataset_from_config(
         return dataset
     else:
         return datasets
+
+
+def get_datasets_weights_and_num_samples(data_prefix, num_samples):
+
+    # The data prefix should be in the format of:
+    #   weight-1, data-prefix-1, weight-2, data-prefix-2, ..
+    assert len(data_prefix) % 2 == 0
+    num_datasets = len(data_prefix) // 2
+    weights = [0] * num_datasets
+    prefixes = [0] * num_datasets
+    for i in range(num_datasets):
+        weights[i] = float(data_prefix[2 * i])
+        prefixes[i] = (data_prefix[2 * i + 1]).strip()
+    # Normalize weights
+    weight_sum = 0.0
+    for weight in weights:
+        weight_sum += weight
+    assert weight_sum > 0.0
+    weights = [weight / weight_sum for weight in weights]
+
+    # Add 0.5% (the 1.005 factor) so in case the bleding dataset does
+    # not uniformly distribute the number of samples, we still have
+    # samples left to feed to the network.
+    # TODO: check data leakage between train/val/test?
+    datasets_train_valid_test_num_samples = []
+    for weight in weights:
+        # Comes here when we have seperate train,test and validation datasets.
+        if isinstance(num_samples, int):
+            datasets_train_valid_test_num_samples.append(int(math.ceil(num_samples * weight * 1.005)))
+        else:
+            datasets_train_valid_test_num_samples.append([int(math.ceil(val * weight * 1.005)) for val in num_samples])
+
+    return prefixes, weights, datasets_train_valid_test_num_samples

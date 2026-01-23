@@ -42,6 +42,7 @@ https://docs.nvidia.com/deeplearning/nemo/user-guide/docs/en/main/asr/asr_langua
 import contextlib
 import inspect
 import json
+from abc import ABC
 from argparse import ArgumentParser
 
 import editdistance
@@ -52,7 +53,11 @@ import torch
 import tqdm
 from transformers import AutoModelForCausalLM
 
-from nemo.collections.nlp.models.language_modeling import TransformerLMModel
+try:
+    from nemo.collections.nlp.models.language_modeling import TransformerLMModel
+except (ImportError, ModuleNotFoundError):
+    TransformerLMModel = ABC
+
 from nemo.collections.nlp.modules.common.tokenizer_utils import get_tokenizer
 from nemo.utils import logging
 
@@ -224,23 +229,13 @@ def main():
     dataset = BeamScoresDataset(args.beams_file, model_tokenizer, args.eval_manifest, args.beam_size, max_seq_length)
     data_loader = torch.utils.data.DataLoader(dataset=dataset, batch_size=args.batch_size)
 
-    if args.use_amp:
-        if torch.cuda.is_available() and hasattr(torch.cuda, 'amp') and hasattr(torch.cuda.amp, 'autocast'):
-            logging.info("AMP is enabled!\n")
-            autocast = torch.cuda.amp.autocast
-    else:
-
-        @contextlib.contextmanager
-        def autocast():
-            yield
-
     if "attention_mask" in inspect.getfullargspec(model.forward).args:
         support_att_mask = True
     else:
         support_att_mask = False
     logging.info(f"Rescoring with beam_size: {args.beam_size}")
     logging.info("Calculating the scores...")
-    with autocast():
+    with torch.amp.autocast(model.device.type, enabled=args.use_amp):
         with torch.no_grad():
             am_scores, lm_scores, dists, ref_lens, lens_in_chars = [], [], [], [], []
             for batch in tqdm.tqdm(data_loader):

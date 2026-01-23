@@ -47,7 +47,7 @@ class Hypothesis:
         `blank` tokens, and optionally merging word-pieces). Should be used as decoded string for
         Word Error Rate calculation.
 
-    timestep: (Optional) A list of integer indices representing at which index in the decoding
+    timestamp: (Optional) A list of integer indices representing at which index in the decoding
         process did the token appear. Should be of same length as the number of non-blank tokens.
 
     alignments: (Optional) Represents the CTC / RNNT token alignments as integer tokens along an axis of
@@ -85,6 +85,8 @@ class Hypothesis:
     tokens: (Optional) A list of decoded tokens (can be characters or word-pieces.
 
     last_token (Optional): A token or batch of tokens which was predicted in the last step.
+
+    last_frame (Optional): Index of the last decoding step hypothesis was updated including blank token prediction.
     """
 
     score: float
@@ -92,7 +94,8 @@ class Hypothesis:
     text: Optional[str] = None
     dec_out: Optional[List[torch.Tensor]] = None
     dec_state: Optional[Union[List[List[torch.Tensor]], List[torch.Tensor]]] = None
-    timestep: Union[List[int], torch.Tensor] = field(default_factory=list)
+    timestep: List[int] = None,
+    timestamp: Union[List[int], torch.Tensor] = field(default_factory=list)
     alignments: Optional[Union[List[int], List[List[int]]]] = None
     frame_confidence: Optional[Union[List[float], List[List[float]]]] = None
     token_confidence: Optional[List[float]] = None
@@ -104,22 +107,24 @@ class Hypothesis:
     ngram_lm_state: Optional[Union[Dict[str, Any], List[Any]]] = None
     tokens: Optional[Union[List[int], torch.Tensor]] = None
     last_token: Optional[torch.Tensor] = None
+    token_duration: Optional[torch.Tensor] = None
+    last_frame: Optional[int] = None
 
     @property
     def non_blank_frame_confidence(self) -> List[float]:
-        """Get per-frame confidence for non-blank tokens according to self.timestep
+        """Get per-frame confidence for non-blank tokens according to self.timestamp
 
         Returns:
-            List with confidence scores. The length of the list is the same as `timestep`.
+            List with confidence scores. The length of the list is the same as `timestamp`.
         """
         non_blank_frame_confidence = []
-        # self.timestep can be a dict for RNNT
-        timestep = self.timestep['timestep'] if isinstance(self.timestep, dict) else self.timestep
-        if len(timestep) != 0 and self.frame_confidence is not None:
+        # self.timestamp can be a dict for RNNT
+        timestamp = self.timestamp['timestep'] if isinstance(self.timestamp, dict) else self.timestamp
+        if len(timestamp) != 0 and self.frame_confidence is not None:
             if any(isinstance(i, list) for i in self.frame_confidence):  # rnnt
                 t_prev = -1
                 offset = 0
-                for t in timestep:
+                for t in timestamp:
                     if t != t_prev:
                         t_prev = t
                         offset = 0
@@ -127,7 +132,7 @@ class Hypothesis:
                         offset += 1
                     non_blank_frame_confidence.append(self.frame_confidence[t][offset])
             else:  # ctc
-                non_blank_frame_confidence = [self.frame_confidence[t] for t in timestep]
+                non_blank_frame_confidence = [self.frame_confidence[t] for t in timestamp]
         return non_blank_frame_confidence
 
     @property
@@ -138,6 +143,40 @@ class Hypothesis:
             List with words (str).
         """
         return [] if self.text is None else self.text.split()
+
+    def merge_(self, other: "Hypothesis") -> "Hypothesis":
+        """Merge (inplace) current hypothesis with another one."""
+        self.score += other.score
+        if self.y_sequence is None:
+            self.y_sequence = other.y_sequence
+        elif isinstance(self.y_sequence, torch.Tensor):
+            self.y_sequence = torch.cat((self.y_sequence, other.y_sequence), dim=0)
+        else:
+            self.y_sequence.extend(other.y_sequence)
+        self.dec_state = other.dec_state
+        if self.timestamp is None:
+            self.timestamp = other.timestamp
+        elif isinstance(self.timestamp, torch.Tensor):
+            self.timestamp = torch.cat((self.timestamp, other.timestamp), dim=0)
+        else:
+            self.timestamp.extend(other.timestamp)
+        self.length += other.length
+        self.last_token = other.last_token
+        if self.alignments is None:
+            self.alignments = other.alignments
+        else:
+            self.alignments.extend(other.alignments)
+        if self.frame_confidence is None:
+            self.frame_confidence = other.frame_confidence
+        else:
+            self.frame_confidence.extend(other.frame_confidence)
+        # Invalidated. Need to rerun decode_hypothesis here.
+        self.text = None
+        return self
+
+    def clean_decoding_state_(self):
+        """Clean the decoding state to save memory."""
+        self.dec_state = None
 
 
 @dataclass
@@ -184,7 +223,11 @@ def is_prefix(x: List[int], pref: List[int]) -> bool:
 
 
 def select_k_expansions(
-    hyps: List[Hypothesis], topk_idxs: torch.Tensor, topk_logps: torch.Tensor, gamma: float, beta: int,
+    hyps: List[Hypothesis],
+    topk_idxs: torch.Tensor,
+    topk_logps: torch.Tensor,
+    gamma: float,
+    beta: int,
 ) -> List[Tuple[int, Hypothesis]]:
     """
     Obtained from https://github.com/espnet/espnet
@@ -212,7 +255,10 @@ def select_k_expansions(
         k_best_exp_idx = k_best_exp_val[0]
         k_best_exp = k_best_exp_val[1]
 
-        expansions = sorted(filter(lambda x: (k_best_exp - gamma) <= x[1], hyp_i), key=lambda x: x[1],)
+        expansions = sorted(
+            filter(lambda x: (k_best_exp - gamma) <= x[1], hyp_i),
+            key=lambda x: x[1],
+        )
 
         if len(expansions) > 0:
             k_expansions.append(expansions)
@@ -236,7 +282,8 @@ class BatchedHyps:
 
         Args:
             batch_size: batch size for hypotheses
-            init_length: initial estimate for the length of hypotheses (if the real length is higher, tensors will be reallocated)
+            init_length: initial estimate for the length of hypotheses (if the real length is higher,
+                tensors will be reallocated)
             device: device for storing hypotheses
             float_dtype: float type for scores
         """
@@ -245,31 +292,40 @@ class BatchedHyps:
         if batch_size <= 0:
             raise ValueError(f"batch_size must be > 0, got {batch_size}")
         self._max_length = init_length
+        self.batch_size = batch_size
+        self.device = device
+        self.float_dtype = float_dtype
 
-        # batch of current lengths of hypotheses and correspoinding timesteps
+        # batch of current lengths of hypotheses and correspoinding timestamps
         self.current_lengths = torch.zeros(batch_size, device=device, dtype=torch.long)
         # tensor for storing transcripts
         self.transcript = torch.zeros((batch_size, self._max_length), device=device, dtype=torch.long)
-        # tensor for storing timesteps corresponding to transcripts
-        self.timesteps = torch.zeros((batch_size, self._max_length), device=device, dtype=torch.long)
+        # tensor for storing timestamps corresponding to transcripts
+        self.timestamps = torch.zeros((batch_size, self._max_length), device=device, dtype=torch.long)
+        # tensor for storing durations corresponding to transcripts tokens
+        self.token_durations = torch.zeros((batch_size, self._max_length), device=device, dtype=torch.long)
         # accumulated scores for hypotheses
         self.scores = torch.zeros(batch_size, device=device, dtype=float_dtype)
 
-        # tracking last timestep of each hyp to avoid infinite looping (when max symbols per frame is restricted)
-        # last observed timestep (with label) for each hypothesis
-        self.last_timestep = torch.full((batch_size,), -1, device=device, dtype=torch.long)
-        # number of labels for the last timestep
-        self.last_timestep_lasts = torch.zeros(batch_size, device=device, dtype=torch.long)
+        # tracking last timestamp of each hyp to avoid infinite looping (when max symbols per frame is restricted)
+        # last observed timestamp (with label) for each hypothesis
+        self.last_timestamp = torch.full((batch_size,), -1, device=device, dtype=torch.long)
+        # number of labels for the last timestamp
+        self.last_timestamp_lasts = torch.zeros(batch_size, device=device, dtype=torch.long)
         self._batch_indices = torch.arange(batch_size, device=device)
         self._ones_batch = torch.ones_like(self._batch_indices)
 
     def clear_(self):
+        """
+        Clears batched hypotheses state.
+        """
         self.current_lengths.fill_(0)
         self.transcript.fill_(0)
-        self.timesteps.fill_(0)
+        self.timestamps.fill_(0)
+        self.token_durations.fill_(0)
         self.scores.fill_(0.0)
-        self.last_timestep.fill_(-1)
-        self.last_timestep_lasts.fill_(0)
+        self.last_timestamp.fill_(-1)
+        self.last_timestamp_lasts.fill_(0)
 
     def _allocate_more(self):
         """
@@ -277,11 +333,17 @@ class BatchedHyps:
         to maintain O(1) insertion time complexity
         """
         self.transcript = torch.cat((self.transcript, torch.zeros_like(self.transcript)), dim=-1)
-        self.timesteps = torch.cat((self.timesteps, torch.zeros_like(self.timesteps)), dim=-1)
+        self.timestamps = torch.cat((self.timestamps, torch.zeros_like(self.timestamps)), dim=-1)
+        self.token_durations = torch.cat((self.token_durations, torch.zeros_like(self.token_durations)), dim=-1)
         self._max_length *= 2
 
     def add_results_(
-        self, active_indices: torch.Tensor, labels: torch.Tensor, time_indices: torch.Tensor, scores: torch.Tensor
+        self,
+        active_indices: torch.Tensor,
+        labels: torch.Tensor,
+        time_indices: torch.Tensor,
+        scores: torch.Tensor,
+        token_durations: Optional[torch.Tensor] = None,
     ):
         """
         Add results (inplace) from a decoding step to the batched hypotheses.
@@ -299,11 +361,20 @@ class BatchedHyps:
             self._allocate_more()
 
         self.add_results_no_checks_(
-            active_indices=active_indices, labels=labels, time_indices=time_indices, scores=scores
+            active_indices=active_indices,
+            labels=labels,
+            time_indices=time_indices,
+            scores=scores,
+            token_durations=token_durations,
         )
 
     def add_results_no_checks_(
-        self, active_indices: torch.Tensor, labels: torch.Tensor, time_indices: torch.Tensor, scores: torch.Tensor
+        self,
+        active_indices: torch.Tensor,
+        labels: torch.Tensor,
+        time_indices: torch.Tensor,
+        scores: torch.Tensor,
+        token_durations: Optional[torch.Tensor] = None,
     ):
         """
         Add results (inplace) from a decoding step to the batched hypotheses without checks.
@@ -315,24 +386,32 @@ class BatchedHyps:
             labels: non-blank labels to add
             time_indices: tensor of time index for each label
             scores: label scores
+            token_durations: predicted durations for each token by TDT head
         """
         # accumulate scores
         self.scores[active_indices] += scores
 
-        # store transcript and timesteps
+        # store transcript and timestamps
         active_lengths = self.current_lengths[active_indices]
         self.transcript[active_indices, active_lengths] = labels
-        self.timesteps[active_indices, active_lengths] = time_indices
-        # store last observed timestep + number of observation for the current timestep
-        self.last_timestep_lasts[active_indices] = torch.where(
-            self.last_timestep[active_indices] == time_indices, self.last_timestep_lasts[active_indices] + 1, 1
+        self.timestamps[active_indices, active_lengths] = time_indices
+        if token_durations is not None:
+            self.token_durations[active_indices, active_lengths] = token_durations
+        # store last observed timestamp + number of observation for the current timestamp
+        self.last_timestamp_lasts[active_indices] = torch.where(
+            self.last_timestamp[active_indices] == time_indices, self.last_timestamp_lasts[active_indices] + 1, 1
         )
-        self.last_timestep[active_indices] = time_indices
+        self.last_timestamp[active_indices] = time_indices
         # increase lengths
         self.current_lengths[active_indices] += 1
 
     def add_results_masked_(
-        self, active_mask: torch.Tensor, labels: torch.Tensor, time_indices: torch.Tensor, scores: torch.Tensor
+        self,
+        active_mask: torch.Tensor,
+        labels: torch.Tensor,
+        time_indices: torch.Tensor,
+        scores: torch.Tensor,
+        token_durations: Optional[torch.Tensor] = None,
     ):
         """
         Add results (inplace) from a decoding step to the batched hypotheses.
@@ -342,15 +421,25 @@ class BatchedHyps:
             labels: non-blank labels to add
             time_indices: tensor of time index for each label
             scores: label scores
+            token_durations: token durations for TDT
         """
         if (self.current_lengths + active_mask).max() >= self._max_length:
             self._allocate_more()
         self.add_results_masked_no_checks_(
-            active_mask=active_mask, labels=labels, time_indices=time_indices, scores=scores
+            active_mask=active_mask,
+            labels=labels,
+            time_indices=time_indices,
+            scores=scores,
+            token_durations=token_durations,
         )
 
     def add_results_masked_no_checks_(
-        self, active_mask: torch.Tensor, labels: torch.Tensor, time_indices: torch.Tensor, scores: torch.Tensor
+        self,
+        active_mask: torch.Tensor,
+        labels: torch.Tensor,
+        time_indices: torch.Tensor,
+        scores: torch.Tensor,
+        token_durations: Optional[torch.Tensor] = None,
     ):
         """
         Add results (inplace) from a decoding step to the batched hypotheses without checks.
@@ -362,32 +451,84 @@ class BatchedHyps:
             labels: non-blank labels to add
             time_indices: tensor of time index for each label
             scores: label scores
+            token_durations: token durations for TDT
         """
         # accumulate scores
         # same as self.scores[active_mask] += scores[active_mask], but non-blocking
         torch.where(active_mask, self.scores + scores, self.scores, out=self.scores)
 
-        # store transcript and timesteps
+        # store transcript and timestamps
         self.transcript[self._batch_indices, self.current_lengths] = labels
-        self.timesteps[self._batch_indices, self.current_lengths] = time_indices
-        # store last observed timestep + number of observation for the current timestep
-        # if last_timestep == time_indices, increase; else set to 1
+        self.timestamps[self._batch_indices, self.current_lengths] = time_indices
+        if token_durations is not None:
+            self.token_durations[self._batch_indices, self.current_lengths] = token_durations
+        # store last observed timestamp + number of observation for the current timestamp
+        # if last_timestamp == time_indices, increase; else set to 1
         torch.where(
-            torch.logical_and(active_mask, self.last_timestep == time_indices),
-            self.last_timestep_lasts + 1,
-            self.last_timestep_lasts,
-            out=self.last_timestep_lasts,
+            torch.logical_and(active_mask, self.last_timestamp == time_indices),
+            self.last_timestamp_lasts + 1,
+            self.last_timestamp_lasts,
+            out=self.last_timestamp_lasts,
         )
         torch.where(
-            torch.logical_and(active_mask, self.last_timestep != time_indices),
+            torch.logical_and(active_mask, self.last_timestamp != time_indices),
             self._ones_batch,
-            self.last_timestep_lasts,
-            out=self.last_timestep_lasts,
+            self.last_timestamp_lasts,
+            out=self.last_timestamp_lasts,
         )
-        # same as: self.last_timestep[active_mask] = time_indices[active_mask], but non-blocking
-        torch.where(active_mask, time_indices, self.last_timestep, out=self.last_timestep)
+        # same as: self.last_timestamp[active_mask] = time_indices[active_mask], but non-blocking
+        torch.where(active_mask, time_indices, self.last_timestamp, out=self.last_timestamp)
         # increase lengths
         self.current_lengths += active_mask
+
+    def get_last_labels(self, pad_id: int = -1):
+        """Get last labels. For elements without labels use pad_id"""
+        return torch.where(
+            self.current_lengths > 0, self.transcript[self._batch_indices, self.current_lengths - 1], pad_id
+        )
+
+    def clone(self) -> "BatchedHyps":
+        """Return a copy of self"""
+        batched_hyps = BatchedHyps(
+            batch_size=self.batch_size,
+            init_length=self._max_length,
+            device=self.device,
+            float_dtype=self.float_dtype,
+        )
+        batched_hyps.current_lengths.copy_(self.current_lengths)
+        batched_hyps.transcript.copy_(self.transcript)
+        batched_hyps.timestamps.copy_(self.timestamps)
+        batched_hyps.token_durations.copy_(self.token_durations)
+        batched_hyps.scores.copy_(self.scores)
+        batched_hyps.last_timestamp.copy_(self.last_timestamp)
+        batched_hyps.last_timestamp_lasts.copy_(self.last_timestamp_lasts)
+        return batched_hyps
+
+    def merge_(self, other: "BatchedHyps") -> "BatchedHyps":
+        """
+        Merge two batched hypotheses structures.
+        NB: this will reallocate memory
+
+        Args:
+            other: BatchedHyps
+        """
+        self.transcript = torch.cat((self.transcript, torch.zeros_like(other.transcript)), dim=-1)
+        self.timestamps = torch.cat((self.timestamps, torch.zeros_like(other.timestamps)), dim=-1)
+        self.token_durations = torch.cat((self.token_durations, torch.zeros_like(other.token_durations)), dim=-1)
+        self._max_length += other._max_length
+
+        indices = torch.arange(other.transcript.shape[1], device=self.current_lengths.device)
+        shifted_indices = self.current_lengths[:, None] + indices[None, :]
+        self.transcript.scatter_(dim=1, index=shifted_indices, src=other.transcript)
+        self.timestamps.scatter_(dim=1, index=shifted_indices, src=other.timestamps)
+        self.token_durations.scatter_(dim=1, index=shifted_indices, src=other.token_durations)
+
+        self.current_lengths += other.current_lengths
+        self.scores += other.scores
+        self.last_timestamp.copy_(other.last_timestamp)
+        self.last_timestamp_lasts.copy_(other.last_timestamp_lasts)
+
+        return self
 
 
 class BatchedAlignments:
@@ -422,13 +563,17 @@ class BatchedAlignments:
             raise ValueError(f"init_length must be > 0, got {init_length}")
         if batch_size <= 0:
             raise ValueError(f"batch_size must be > 0, got {batch_size}")
+        self.batch_size = batch_size
+        self.logits_dim = logits_dim
+        self.device = device
+        self.float_dtype = float_dtype
         self.with_frame_confidence = store_frame_confidence
         self.with_duration_confidence = with_duration_confidence
         self.with_alignments = store_alignments
         self._max_length = init_length
 
-        # tensor to store observed timesteps (for alignments / confidence scores)
-        self.timesteps = torch.zeros((batch_size, self._max_length), device=device, dtype=torch.long)
+        # tensor to store observed timestamps (for alignments / confidence scores)
+        self.timestamps = torch.zeros((batch_size, self._max_length), device=device, dtype=torch.long)
         # current lengths of the utterances (alignments)
         self.current_lengths = torch.zeros(batch_size, device=device, dtype=torch.long)
 
@@ -452,8 +597,11 @@ class BatchedAlignments:
         self._batch_indices = torch.arange(batch_size, device=device)
 
     def clear_(self):
+        """
+        Clears batched hypotheses state.
+        """
         self.current_lengths.fill_(0)
-        self.timesteps.fill_(0)
+        self.timestamps.fill_(0)
         self.logits.fill_(0.0)
         self.labels.fill_(0)
         self.frame_confidence.fill_(0)
@@ -463,7 +611,7 @@ class BatchedAlignments:
         Allocate 2x space for tensors, similar to common C++ std::vector implementations
         to maintain O(1) insertion time complexity
         """
-        self.timesteps = torch.cat((self.timesteps, torch.zeros_like(self.timesteps)), dim=-1)
+        self.timestamps = torch.cat((self.timestamps, torch.zeros_like(self.timestamps)), dim=-1)
         if self.with_alignments:
             self.logits = torch.cat((self.logits, torch.zeros_like(self.logits)), dim=1)
             self.labels = torch.cat((self.labels, torch.zeros_like(self.labels)), dim=-1)
@@ -498,8 +646,8 @@ class BatchedAlignments:
             self._allocate_more()
 
         active_lengths = self.current_lengths[active_indices]
-        # store timesteps - same for alignments / confidence
-        self.timesteps[active_indices, active_lengths] = time_indices
+        # store timestamps - same for alignments / confidence
+        self.timestamps[active_indices, active_lengths] = time_indices
 
         if self.with_alignments and logits is not None and labels is not None:
             self.logits[active_indices, active_lengths] = logits
@@ -554,11 +702,11 @@ class BatchedAlignments:
             labels: tensor with decoded labels (can contain blank)
             confidence: optional tensor with confidence for each item in batch
         """
-        # store timesteps - same for alignments / confidence
-        self.timesteps[self._batch_indices, self.current_lengths] = time_indices
+        # store timestamps - same for alignments / confidence
+        self.timestamps[self._batch_indices, self.current_lengths] = time_indices
 
         if self.with_alignments and logits is not None and labels is not None:
-            self.timesteps[self._batch_indices, self.current_lengths] = time_indices
+            self.timestamps[self._batch_indices, self.current_lengths] = time_indices
             self.logits[self._batch_indices, self.current_lengths] = logits
             self.labels[self._batch_indices, self.current_lengths] = labels
 
@@ -566,6 +714,25 @@ class BatchedAlignments:
             self.frame_confidence[self._batch_indices, self.current_lengths] = confidence
         # increase lengths
         self.current_lengths += active_mask
+
+    def clone(self) -> "BatchedAlignments":
+        """Return a copy of self"""
+        batched_alignments = BatchedAlignments(
+            batch_size=self.batch_size,
+            logits_dim=self.logits_dim,
+            init_length=self._max_length,
+            device=self.device,
+            float_dtype=self.float_dtype,
+            store_alignments=self.with_alignments,
+            store_frame_confidence=self.with_frame_confidence,
+            with_duration_confidence=self.with_duration_confidence,
+        )
+        batched_alignments.current_lengths.copy_(self.current_lengths)
+        batched_alignments.timestamps.copy_(self.timestamps)
+        batched_alignments.logits.copy_(self.logits)
+        batched_alignments.labels.copy_(self.labels)
+        batched_alignments.frame_confidence.copy_(self.frame_confidence)
+        return batched_alignments
 
 
 def batched_hyps_to_hypotheses(
@@ -586,11 +753,23 @@ def batched_hyps_to_hypotheses(
     """
     assert batch_size is None or batch_size <= batched_hyps.scores.shape[0]
     num_hyps = batched_hyps.scores.shape[0] if batch_size is None else batch_size
+    # NB: clone is not necessary anymore, since CUDA graph decoder always returns an independent copy
+    scores = batched_hyps.scores.cpu()
+    current_lengths = batched_hyps.current_lengths.cpu()
+    transcript = batched_hyps.transcript.cpu()
+    timestamps = batched_hyps.timestamps.cpu()
     hypotheses = [
         Hypothesis(
-            score=batched_hyps.scores[i].item(),
-            y_sequence=batched_hyps.transcript[i, : batched_hyps.current_lengths[i]],
-            timestep=batched_hyps.timesteps[i, : batched_hyps.current_lengths[i]],
+            score=scores[i].item(),
+            y_sequence=transcript[i, : current_lengths[i]],
+            timestamp=timestamps[i, : batched_hyps.current_lengths[i]],
+            token_duration=(
+                durations
+                if not torch.all(
+                    (durations := batched_hyps.token_durations[i, : batched_hyps.current_lengths[i]]) == 0
+                )
+                else torch.empty(0)
+            ),
             alignments=None,
             dec_state=None,
         )
@@ -611,17 +790,20 @@ def batched_hyps_to_hypotheses(
             if alignments.with_frame_confidence:
                 hypotheses[i].frame_confidence = []
             _, grouped_counts = torch.unique_consecutive(
-                alignments.timesteps[i, : alignment_lengths[i]], return_counts=True
+                alignments.timestamps[i, : alignment_lengths[i]], return_counts=True
             )
             start = 0
-            for timestep_cnt in grouped_counts.tolist():
+            for timestamp_cnt in grouped_counts.tolist():
                 if alignments.with_alignments:
                     hypotheses[i].alignments.append(
-                        [(alignment_logits[i, start + j], alignment_labels[i, start + j]) for j in range(timestep_cnt)]
+                        [
+                            (alignment_logits[i, start + j], alignment_labels[i, start + j])
+                            for j in range(timestamp_cnt)
+                        ]
                     )
                 if alignments.with_frame_confidence:
                     hypotheses[i].frame_confidence.append(
-                        [frame_confidence[i, start + j] for j in range(timestep_cnt)]
+                        [frame_confidence[i, start + j] for j in range(timestamp_cnt)]
                     )
-                start += timestep_cnt
+                start += timestamp_cnt
     return hypotheses

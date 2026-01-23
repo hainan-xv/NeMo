@@ -99,8 +99,8 @@ from nemo.utils import logging
 
 def extract_transcriptions(hyps):
     """
-        The transcribed_texts returned by CTC and RNNT models are different.
-        This method would extract and return the text section of the hypothesis.
+    The transcribed_texts returned by CTC and RNNT models are different.
+    This method would extract and return the text section of the hypothesis.
     """
     if isinstance(hyps[0], Hypothesis):
         transcriptions = []
@@ -127,7 +127,7 @@ def perform_streaming(
         # would pass the whole audio at once through the model like offline mode in order to compare the results with the stremaing mode
         # the output of the model in the offline and streaming mode should be exactly the same
         with torch.inference_mode():
-            with autocast():
+            with autocast:
                 processed_signal, processed_signal_length = streaming_buffer.get_all_audios()
                 with torch.no_grad():
                     (
@@ -156,7 +156,7 @@ def perform_streaming(
     pred_out_stream = None
     for step_num, (chunk_audio, chunk_lengths) in enumerate(streaming_buffer_iter):
         with torch.inference_mode():
-            with autocast():
+            with autocast:
                 # keep_all_outputs needs to be True for the last step of streaming when model is trained with att_context_style=regular
                 # otherwise the last outputs would get dropped
 
@@ -210,7 +210,10 @@ def perform_streaming(
 def main():
     parser = ArgumentParser()
     parser.add_argument(
-        "--asr_model", type=str, required=True, help="Path to an ASR model .nemo file or name of a pretrained model.",
+        "--asr_model",
+        type=str,
+        required=True,
+        help="Path to an ASR model .nemo file or name of a pretrained model.",
     )
     parser.add_argument(
         "--device", type=str, help="The device to load the model onto and perform the streaming", default="cuda"
@@ -283,7 +286,19 @@ def main():
         help="Sets the att_context_size for the models which support multiple lookaheads",
     )
 
+    parser.add_argument(
+        "--matmul-precision",
+        type=str,
+        default="high",
+        choices=["highest", "high", "medium"],
+        help="Set torch matmul precision",
+    )
+
+    parser.add_argument("--strategy", type=str, default="greedy_batch", help="decoding strategy to use")
+
     args = parser.parse_args()
+
+    torch.set_float32_matmul_precision(args.matmul_precision)
     if (args.audio_file is None and args.manifest_file is None) or (
         args.audio_file is not None and args.manifest_file is not None
     ):
@@ -310,29 +325,22 @@ def main():
             raise ValueError("Model does not support multiple lookaheads.")
 
     global autocast
-    if (
-        args.use_amp
-        and torch.cuda.is_available()
-        and hasattr(torch.cuda, 'amp')
-        and hasattr(torch.cuda.amp, 'autocast')
-    ):
-        logging.info("AMP enabled!\n")
-        autocast = torch.cuda.amp.autocast
-    else:
-
-        @contextlib.contextmanager
-        def autocast():
-            yield
+    autocast = torch.amp.autocast(asr_model.device.type, enabled=args.use_amp)
 
     # configure the decoding config
     decoding_cfg = asr_model.cfg.decoding
     with open_dict(decoding_cfg):
-        decoding_cfg.strategy = "greedy"
+        decoding_cfg.strategy = args.strategy
         decoding_cfg.preserve_alignments = False
         if hasattr(asr_model, 'joint'):  # if an RNNT model
-            decoding_cfg.greedy.max_symbols = 10
             decoding_cfg.fused_batch_size = -1
-        asr_model.change_decoding_strategy(decoding_cfg)
+            if not (max_symbols := decoding_cfg.greedy.get("max_symbols")) or max_symbols <= 0:
+                decoding_cfg.greedy.max_symbols = 10
+        if hasattr(asr_model, "cur_decoder"):
+            # hybrid model, explicitly pass decoder type, otherwise it will be set to "rnnt"
+            asr_model.change_decoding_strategy(decoding_cfg, decoder_type=asr_model.cur_decoder)
+        else:
+            asr_model.change_decoding_strategy(decoding_cfg)
 
     asr_model = asr_model.to(args.device)
     asr_model.eval()
@@ -431,7 +439,7 @@ def main():
                 "streaming_out_"
                 + os.path.splitext(os.path.basename(args.asr_model))[0]
                 + "_"
-                + os.path.splitext(os.path.basename(args.test_manifest))[0]
+                + os.path.splitext(os.path.basename(args.manifest_file))[0]
                 + ".json"
             )
 

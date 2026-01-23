@@ -473,12 +473,18 @@ class SqueezeExcite(nn.Module):
             self.set_max_len(max_len)
         dtype = x.dtype
         # Computes in float32 to avoid instabilities during training with AMP.
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast(x.device.type, enabled=False):
             # Create sample mask - 1 represents value, 0 represents pad
             mask = self.make_pad_mask(lengths, max_audio_length=max_len, device=x.device)
             mask = ~mask  # 0 represents value, 1 represents pad
-            x = x.float()  # For stable AMP, SE must be computed at fp32.
-            x.masked_fill_(mask, 0.0)  # mask padded values explicitly to 0
+
+            # Ensure SE runs in FP32: cast fc weights and activations to float32
+            if self.fc[0].weight.dtype != torch.float32:
+                self.fc.float()
+            if x.dtype != torch.float32:
+                x = x.float()
+
+            x = x.masked_fill(mask, 0.0)  # mask padded values explicitly to 0
             y = self._se_pool_step(x, mask)  # [B, C, 1]
             y = y.transpose(1, -1)  # [B, 1, C]
             y = self.fc(y)  # [B, 1, C]
@@ -490,6 +496,8 @@ class SqueezeExcite(nn.Module):
 
             y = torch.sigmoid(y)
             y = x * y
+            # Cast back to original dtype for downstream consistency
+            y = y.to(dtype)
         return y, lengths
 
     def _se_pool_step(self, x, mask):
@@ -510,8 +518,8 @@ class SqueezeExcite(nn.Module):
         return y
 
     def set_max_len(self, max_len, seq_range=None):
-        """ Sets maximum input length.
-            Pre-calculates internal seq_range mask.
+        """Sets maximum input length.
+        Pre-calculates internal seq_range mask.
         """
         self.max_len = max_len
         if seq_range is None:

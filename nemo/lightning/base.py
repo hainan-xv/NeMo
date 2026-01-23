@@ -1,15 +1,27 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import gc
-import inspect
 import os
 from pathlib import Path
-from typing import Generic, Optional, Type, TypeVar
+from typing import Optional
 
 import torch
 import torch.distributed
-from pytorch_lightning import LightningModule, Trainer
+from lightning.pytorch import Trainer
 from torch import nn
 
-from nemo.lightning import io
 
 DEFAULT_NEMO_CACHE_HOME = Path.home() / ".cache" / "nemo"
 NEMO_CACHE_HOME = Path(os.getenv("NEMO_HOME", DEFAULT_NEMO_CACHE_HOME))
@@ -18,32 +30,8 @@ NEMO_DATASETS_CACHE = Path(os.getenv("NEMO_DATASETS_CACHE", DEFAULT_NEMO_DATASET
 DEFAULT_NEMO_MODELS_CACHE = NEMO_CACHE_HOME / "models"
 NEMO_MODELS_CACHE = Path(os.getenv("NEMO_MODELS_CACHE", DEFAULT_NEMO_MODELS_CACHE))
 
-
-ModelT = TypeVar("ModelT", bound=LightningModule)
-
-
-class ModelConfig(Generic[ModelT], io.IOMixin):
-    def model_cls(self) -> Type[ModelT]:
-        raise NotImplementedError("Must be implemented by subclass")
-
-    @property
-    def model_type(self) -> Type[ModelT]:
-        return self.model_cls()
-
-    def init(self, *args, data=None, cpu: bool = False, **kwargs) -> ModelT:
-        model_cls = self.model_cls()
-        if data:
-            kwargs.update(data.model_kwargs())
-
-        signature = inspect.signature(model_cls.__init__)
-        filtered_kwargs = {k: v for k, v in kwargs.items() if k in signature.parameters}
-
-        model = model_cls(self, *args, **filtered_kwargs)
-
-        if not cpu:
-            model.cuda(torch.cuda.current_device())
-
-        return model
+if os.getenv('TOKENIZERS_PARALLELISM') is None:
+    os.putenv('TOKENIZERS_PARALLELISM', 'True')
 
 
 def get_vocab_size(
@@ -51,12 +39,12 @@ def get_vocab_size(
     vocab_size: int,
     make_vocab_size_divisible_by: int = 128,
 ) -> int:
+    """returns `vocab size + padding` to make sure sum is dividable by `make_vocab_size_divisible_by`"""
     from nemo.utils import logging
 
     after = vocab_size
     multiple = make_vocab_size_divisible_by * config.tensor_model_parallel_size
-    while (after % multiple) != 0:
-        after += 1
+    after = ((after + multiple - 1) // multiple) * multiple
     logging.info(
         f"Padded vocab_size: {after}, original vocab_size: {vocab_size}, dummy tokens:" f" {after - vocab_size}."
     )
@@ -65,6 +53,7 @@ def get_vocab_size(
 
 
 def teardown(trainer: Trainer, model: Optional[nn.Module] = None) -> None:
+    """Destroys distributed environment and cleans up cache / collects garbage"""
     # Destroy torch distributed
     if torch.distributed.is_initialized():
         from megatron.core import parallel_state
@@ -75,8 +64,11 @@ def teardown(trainer: Trainer, model: Optional[nn.Module] = None) -> None:
     trainer._teardown()  # noqa: SLF001
     if model is not None:
         for obj in gc.get_objects():
-            if torch.is_tensor(obj) and obj.is_cuda:
-                del obj
+            try:
+                if torch.is_tensor(obj) and obj.is_cuda:
+                    del obj
+            except:
+                pass
 
     gc.collect()
     torch.cuda.empty_cache()

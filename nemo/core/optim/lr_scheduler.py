@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# pylint: disable=C0115,C0116
+# pylint: disable=C0301
+# flake8: noqa
+
 import copy
 import dataclasses
 import inspect
@@ -27,7 +31,7 @@ import torch.utils.data.dataloader as dataloader
 from omegaconf import DictConfig, OmegaConf
 from torch.optim.lr_scheduler import _LRScheduler
 
-from nemo.core.config import SchedulerParams, get_scheduler_config, register_scheduler_params
+from nemo.core.config.schedulers import SchedulerParams, get_scheduler_config, register_scheduler_params
 from nemo.utils import logging
 from nemo.utils.model_utils import maybe_update_config_version
 
@@ -97,7 +101,14 @@ class SquareRootConstantPolicy(_LRScheduler):
     """
 
     def __init__(
-        self, optimizer, *, constant_steps=None, constant_ratio=None, max_steps=None, min_lr=0.0, last_epoch=-1
+        self,
+        optimizer,
+        *,
+        constant_steps=None,
+        constant_ratio=None,
+        max_steps=None,
+        min_lr=0.0,
+        last_epoch=-1,
     ):
         assert not (
             constant_steps is not None and constant_ratio is not None
@@ -114,7 +125,7 @@ class SquareRootConstantPolicy(_LRScheduler):
         else:
             self.constant_steps = 0
 
-        self.constant_lr = 1 / (constant_steps ** 0.5)
+        self.constant_lr = 1 / (constant_steps**0.5)
         self.min_lr = min_lr
         super().__init__(optimizer, last_epoch)
 
@@ -216,6 +227,49 @@ class WarmupHoldPolicy(WarmupPolicy):
         return self._get_lr(step)
 
 
+class WarmupHoldAnnealOneMinusSquareRoot(WarmupHoldPolicy):
+    """Learning rate scheduler with warmup, hold, and one-minus-square-root annealing phases.
+
+    This scheduler follows a three-phase pattern:
+    1. Warmup phase: LR increases linearly from 0 to base_lr
+    2. Hold phase: LR remains constant at base_lr
+    3. Annealing phase: LR decreases following a one-minus-square-root curve from base_lr to min_lr
+
+    The annealing follows the formula: LR = base_lr * (1 - sqrt((step - hold_steps)/(max_steps - hold_steps)))
+    The min_lr is enforced after the annealing phase. i.e. the learning rate will not decay below min_lr.
+
+    Reference: https://arxiv.org/html/2408.11029
+    """
+
+    def __init__(self, optimizer, *, max_steps, last_epoch=-1, min_lr=0.0, **kwargs):
+        super().__init__(optimizer=optimizer, max_steps=max_steps, **kwargs, last_epoch=last_epoch, min_lr=min_lr)
+
+    def _get_lr(self, step):
+        mult = 1 - ((step - self.hold_steps) / (self.max_steps - self.hold_steps)) ** 0.5  # from 1 to 0
+        out_lr = [max(self.min_lr, initial_lr * mult) for initial_lr in self.base_lrs]
+        return out_lr
+
+
+class WarmupHoldAnnealLinear(WarmupHoldPolicy):
+    """Learning rate scheduler with warmup, hold, and linear annealing phases.
+
+    This scheduler follows a three-phase pattern:
+    1. Warmup phase: LR increases linearly from 0 to base_lr
+    2. Hold phase: LR remains constant at base_lr
+    3. Annealing phase: LR decreases linearly from base_lr to min_lr
+
+    Reference: https://arxiv.org/pdf/2404.06395
+    """
+
+    def __init__(self, optimizer, *, max_steps, last_epoch=-1, min_lr=0.0, **kwargs):
+        super().__init__(optimizer=optimizer, max_steps=max_steps, **kwargs, last_epoch=last_epoch, min_lr=min_lr)
+
+    def _get_lr(self, step):
+        ratio = (step - self.hold_steps) / (self.max_steps - self.hold_steps)  # from 0 to 1
+        out_lr = [initial_lr - (initial_lr - self.min_lr) * ratio for initial_lr in self.base_lrs]
+        return out_lr
+
+
 class WarmupAnnealHoldPolicy(_LRScheduler):
     """Adds warmup kwargs and warmup logic to lr policy.
     All arguments should be passed as kwargs for clarity,
@@ -279,6 +333,16 @@ class WarmupAnnealHoldPolicy(_LRScheduler):
             )
 
         step = self.last_epoch
+
+        # Reset learning rate
+        if len(self.optimizer.param_groups) > 0 and 'reset_lr' in self.optimizer.param_groups[0].keys():
+            reset_lr = self.optimizer.param_groups[0]['reset_lr']
+            num_steps = reset_lr['num_steps']
+            step -= num_steps
+            if reset_lr['if_init_step'] and reset_lr['reset_lr_steps']:
+                self.decay_steps -= num_steps
+                self.max_steps -= num_steps
+                self.optimizer.param_groups[0]['reset_lr']['if_init_step'] = False
 
         # Warmup steps
         if self.warmup_steps > 0 and step <= self.warmup_steps:
@@ -364,7 +428,7 @@ def _poly_decay(initial_lr, step, decay_steps, power, min_lr, cycle):
 
 def _noam_hold_annealing(initial_lr, step, warmup_steps, hold_steps, decay_rate, min_lr):
     # hold_steps = total number of steps to hold the LR, not the warmup + hold steps.
-    T_warmup_decay = max(1, warmup_steps ** decay_rate)
+    T_warmup_decay = max(1, warmup_steps**decay_rate)
     T_hold_decay = max(1, (step - hold_steps) ** decay_rate)
     lr = (initial_lr * T_warmup_decay) / T_hold_decay
     lr = max(lr, min_lr)
@@ -453,7 +517,15 @@ class CosineAnnealing(WarmupAnnealHoldPolicy):
 
 class NoamAnnealing(_LRScheduler):
     def __init__(
-        self, optimizer, *, d_model, warmup_steps=None, warmup_ratio=None, max_steps=None, min_lr=0.0, last_epoch=-1
+        self,
+        optimizer,
+        *,
+        d_model,
+        warmup_steps=None,
+        warmup_ratio=None,
+        max_steps=None,
+        min_lr=0.0,
+        last_epoch=-1,
     ):
         self._normalize = d_model ** (-0.5)
         assert not (
@@ -593,7 +665,7 @@ class T5InverseSquareRootAnnealing(SquareRootConstantPolicy):
         super().__init__(optimizer=optimizer, max_steps=max_steps, **kwargs, last_epoch=last_epoch, min_lr=min_lr)
 
     def _get_lr(self, step):
-        return [1 / (step ** 0.5) for _ in self.base_lrs]
+        return [1 / (step**0.5) for _ in self.base_lrs]
 
 
 class PolynomialDecayAnnealing(WarmupPolicy):
@@ -975,6 +1047,8 @@ AVAILABLE_SCHEDULERS = {
     'CosineAnnealing': CosineAnnealing,
     'NoamAnnealing': NoamAnnealing,
     'NoamHoldAnnealing': NoamHoldAnnealing,
+    'WarmupHoldAnnealOneMinusSquareRoot': WarmupHoldAnnealOneMinusSquareRoot,
+    'WarmupHoldAnnealLinear': WarmupHoldAnnealLinear,
     'WarmupAnnealing': WarmupAnnealing,
     'InverseSquareRootAnnealing': InverseSquareRootAnnealing,
     'T5InverseSquareRootAnnealing': T5InverseSquareRootAnnealing,

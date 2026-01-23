@@ -15,12 +15,12 @@
 import math
 import random
 
+import lightning.pytorch as pl
 import omegaconf
 import pytest
-import pytorch_lightning as pl
 import torch
 import torch.optim
-from pytorch_lightning.utilities import rank_zero_only
+from lightning.pytorch.utilities import rank_zero_only
 
 from nemo.core import config, optim
 from nemo.core.optim.lr_scheduler import AVAILABLE_SCHEDULERS
@@ -323,7 +323,6 @@ class TestOptimizersSchedulers:
             'threshold_mode': 'rel',
             'min_lr': 1e-6,
             'eps': 1e-7,
-            'verbose': True,
             'cooldown': 1,
         }
         basic_sched_config = {
@@ -883,6 +882,150 @@ class TestOptimizersSchedulers:
 
         assert final_lr == self.MIN_LR
 
+
+class TestWarmupHoldAnnealSchedulers:
+    INITIAL_LR = 0.1
+    MIN_LR = 0.01
+    MAX_STEPS = 100
+
+    @pytest.mark.unit
+    def test_WarmupHoldAnnealOneMinusSquareRoot(self):
+        model = TempModel()
+        opt_cls = optim.get_optimizer('novograd')
+        opt = opt_cls(model.parameters(), lr=self.INITIAL_LR)
+
+        # Test case 1: No warmup, no hold
+        policy = optim.lr_scheduler.WarmupHoldAnnealOneMinusSquareRoot(
+            opt, warmup_ratio=None, hold_ratio=None, max_steps=self.MAX_STEPS, min_lr=self.MIN_LR
+        )
+        initial_lr = policy.get_last_lr()[0]
+        assert initial_lr == self.INITIAL_LR
+
+        # Simulate training steps
+        lrs = []
+        for i in range(self.MAX_STEPS):
+            current_lr = policy.get_last_lr()[0]
+            lrs.append(current_lr)
+            assert current_lr <= self.INITIAL_LR
+            opt.step()
+            policy.step()
+
+        # Check final LR
+        policy.step()
+        final_lr = policy.get_last_lr()[0]
+        assert final_lr == self.MIN_LR
+
+        # Test case 2: With warmup and hold
+        warmup_ratio = 0.1  # 10% warmup
+        hold_ratio = 0.2  # 20% hold
+        warmup_steps = int(warmup_ratio * self.MAX_STEPS)
+        hold_steps = int(hold_ratio * self.MAX_STEPS)
+
+        policy = optim.lr_scheduler.WarmupHoldAnnealOneMinusSquareRoot(
+            opt, warmup_ratio=warmup_ratio, hold_ratio=hold_ratio, max_steps=self.MAX_STEPS, min_lr=self.MIN_LR
+        )
+
+        initial_lr = policy.get_last_lr()[0]
+        assert initial_lr < self.INITIAL_LR  # Should start at a lower LR
+
+        # Simulate training steps
+        lrs = []
+        for i in range(self.MAX_STEPS):
+            current_lr = policy.get_last_lr()[0]
+            lrs.append(current_lr)
+
+            # During warmup, LR should increase
+            if i < warmup_steps:
+                if i > 0:
+                    assert current_lr >= lrs[i - 1]
+                assert current_lr <= self.INITIAL_LR
+
+            # During hold, LR should remain constant
+            elif i < warmup_steps + hold_steps:
+                assert abs(current_lr - self.INITIAL_LR) < 1e-6
+
+            # During annealing, LR should decrease
+            else:
+                if i > warmup_steps + hold_steps:
+                    assert current_lr <= lrs[i - 1]
+
+            opt.step()
+            policy.step()
+
+        # Check final LR
+        policy.step()
+        final_lr = policy.get_last_lr()[0]
+        assert final_lr == self.MIN_LR
+
+    @pytest.mark.unit
+    def test_WarmupHoldAnnealLinear(self):
+        model = TempModel()
+        opt_cls = optim.get_optimizer('novograd')
+        opt = opt_cls(model.parameters(), lr=self.INITIAL_LR)
+
+        # Test case 1: No warmup, no hold
+        policy = optim.lr_scheduler.WarmupHoldAnnealLinear(
+            opt, warmup_ratio=None, hold_ratio=None, max_steps=self.MAX_STEPS, min_lr=self.MIN_LR
+        )
+        initial_lr = policy.get_last_lr()[0]
+        assert initial_lr == self.INITIAL_LR
+
+        # Simulate training steps
+        lrs = []
+        for i in range(self.MAX_STEPS):
+            current_lr = policy.get_last_lr()[0]
+            lrs.append(current_lr)
+            assert current_lr <= self.INITIAL_LR
+            opt.step()
+            policy.step()
+
+        # Check final LR
+        policy.step()
+        final_lr = policy.get_last_lr()[0]
+        assert final_lr == self.MIN_LR
+
+        # Test case 2: With warmup and hold
+        warmup_ratio = 0.1  # 10% warmup
+        hold_ratio = 0.2  # 20% hold
+        warmup_steps = int(warmup_ratio * self.MAX_STEPS)
+        hold_steps = int(hold_ratio * self.MAX_STEPS)
+
+        policy = optim.lr_scheduler.WarmupHoldAnnealLinear(
+            opt, warmup_ratio=warmup_ratio, hold_ratio=hold_ratio, max_steps=self.MAX_STEPS, min_lr=self.MIN_LR
+        )
+
+        initial_lr = policy.get_last_lr()[0]
+        assert initial_lr < self.INITIAL_LR  # Should start at a lower LR
+
+        # Simulate training steps
+        lrs = []
+        for i in range(self.MAX_STEPS):
+            current_lr = policy.get_last_lr()[0]
+            lrs.append(current_lr)
+
+            # During warmup, LR should increase
+            if i < warmup_steps:
+                if i > 0:
+                    assert current_lr >= lrs[i - 1]
+                assert current_lr <= self.INITIAL_LR
+
+            # During hold, LR should remain constant
+            elif i < warmup_steps + hold_steps:
+                assert abs(current_lr - self.INITIAL_LR) < 1e-6
+
+            # During annealing, LR should decrease
+            else:
+                if i > warmup_steps + hold_steps:
+                    assert current_lr <= lrs[i - 1]
+
+            opt.step()
+            policy.step()
+
+        # Check final LR
+        policy.step()
+        final_lr = policy.get_last_lr()[0]
+        assert final_lr == self.MIN_LR
+
     @pytest.mark.unit
     def test_CosineAnnealing_with_noop_steps(self):
         model = TempModel()
@@ -936,7 +1079,13 @@ class TestOptimizersSchedulers:
                 enable_progress_bar=False,
             )
             max_steps = optim.lr_scheduler.compute_max_steps(
-                max_epochs, accumulate_grad_batches, limit_train_batches, devices, dataset_len, batch_size, drop_last,
+                max_epochs,
+                accumulate_grad_batches,
+                limit_train_batches,
+                devices,
+                dataset_len,
+                batch_size,
+                drop_last,
             )
             model = ExampleModel(batch_size, dataset_len, drop_last, max_steps)
             trainer.callbacks.append(Callback())
@@ -991,7 +1140,13 @@ class TestOptimizersSchedulers:
             dataset_len = random.randint(20, devices * 500)
             batch_size = random.randint(math.ceil(5.0 / devices), min(dataset_len // devices, 128))
             train(
-                max_epochs, accumulate_grad_batches, limit_train_batches, devices, batch_size, dataset_len, drop_last,
+                max_epochs,
+                accumulate_grad_batches,
+                limit_train_batches,
+                devices,
+                batch_size,
+                dataset_len,
+                drop_last,
             )
 
     @pytest.mark.unit

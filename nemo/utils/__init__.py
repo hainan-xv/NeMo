@@ -21,6 +21,7 @@ from nemo.utils.cast_utils import (
     avoid_float16_autocast_context,
     cast_all,
     cast_tensor,
+    monkeypatched,
 )
 from nemo.utils.dtype import str_to_dtype
 from nemo.utils.nemo_logging import Logger as _Logger
@@ -31,5 +32,13 @@ try:
     from nemo.utils.lightning_logger_patch import add_memory_handlers_to_pl_logger
 
     add_memory_handlers_to_pl_logger()
+except ModuleNotFoundError:
+    pass
+
+try:
+    import webdataset
+    from nemo.utils.data_utils import wds_url_opener
+
+    webdataset.tariterators.url_opener = wds_url_opener
 except ModuleNotFoundError:
     pass

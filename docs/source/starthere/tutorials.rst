@@ -65,7 +65,7 @@ Tutorial Overview
      - `DreamBooth Tutorial <https://github.com/NVIDIA/NeMo/blob/main/tutorials/multimodal/DreamBooth%20Tutorial.ipynb>`_
    * - Multimodal
      - Preparations and Advanced Applications: Stable Diffusion XL Quantization Tutorial
-     - `DreamBooth Tutorial <https://github.com/NVIDIA/NeMo/blob/main/tutorials/multimodal/SDXL%20Quantization.ipynb>`_
+     - `SDXL Quantization Tutorial <https://github.com/NVIDIA/NeMo/blob/main/tutorials/multimodal/SDXL%20Quantization.ipynb>`_
 
 .. list-table:: **Automatic Speech Recognition (ASR) Tutorials**
    :widths: 15 30 55
@@ -152,9 +152,6 @@ Tutorial Overview
    * - ASR
      - ASR Confidence Estimation
      - `ASR Confidence Estimation <https://colab.research.google.com/github/NVIDIA/NeMo/blob/stable/tutorials/asr/ASR_Confidence_Estimation.ipynb>`_
-   * - ASR
-     - Confidence-based Ensembles
-     - `Confidence-based Ensembles <https://colab.research.google.com/github/NVIDIA/NeMo/blob/stable/tutorials/asr/Confidence_Ensembles.ipynb>`_
 
 .. list-table:: **Text-to-Speech (TTS) Tutorials**
    :widths: 15 35 50

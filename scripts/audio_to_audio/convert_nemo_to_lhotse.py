@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,7 +14,7 @@
 
 import argparse
 
-from nemo.collections.asr.data.audio_to_audio_lhotse import convert_manifest_nemo_to_lhotse
+from nemo.collections.audio.data.audio_to_audio_lhotse import convert_manifest_nemo_to_lhotse
 
 
 def parse_args():

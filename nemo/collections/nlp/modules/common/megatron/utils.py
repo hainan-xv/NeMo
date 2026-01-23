@@ -15,11 +15,9 @@
 """Utilities for models."""
 import itertools
 import math
-from typing import Dict, Iterator, List, Tuple, Union
+from typing import Dict, Iterator, List, Optional, Tuple, Union
 
 import torch
-import torch.nn as nn
-
 from torch import Tensor
 
 from nemo.utils import logging, logging_mode
@@ -94,7 +92,7 @@ def parallel_lm_logits(
     tensor_model_parallel = parallel_state.get_tensor_model_parallel_world_size() > 1
 
     # async grad allreduce can only be used when not using sequence parallelism
-    async_grad_allreduce = async_tensor_model_parallel_allreduce and tensor_model_parallel and not sequence_parallel
+    allreduce_dgrad = async_tensor_model_parallel_allreduce and tensor_model_parallel and not sequence_parallel
 
     # copy input_ to model parallel region if needed
     if async_tensor_model_parallel_allreduce or sequence_parallel:
@@ -109,7 +107,7 @@ def parallel_lm_logits(
         weight=word_embeddings_weight,
         bias=bias,
         gradient_accumulation_fusion=gradient_accumulation_fusion,
-        async_grad_allreduce=async_grad_allreduce,
+        allreduce_dgrad=allreduce_dgrad,
         sequence_parallel=sequence_parallel,
     )
 
@@ -413,16 +411,19 @@ def get_all_params_for_weight_decay_optimization(
     return tuple(filter(lambda g: len(g['params']) > 0, param_groups))
 
 
-def split_list(inputs, num_chunks):
+def split_list(inputs, num_chunks, enforce_divisible_batch: Optional[bool] = True):
     """
     Split a list into equal sized chunks
     """
     chunk_size = len(inputs) // num_chunks
-    assert len(inputs) % chunk_size == 0, "Issue with batch size configuration!"
+    if enforce_divisible_batch:
+        assert len(inputs) % chunk_size == 0, "Issue with batch size configuration!"
     return [inputs[i : i + chunk_size] for i in range(0, len(inputs), chunk_size)]
 
 
-def get_iterator_k_split(batch: Union[Dict, List[torch.Tensor]], num_microbatches: int) -> Iterator:
+def get_iterator_k_split(
+    batch: Union[Dict, List[torch.Tensor]], num_microbatches: int, enforce_divisible_batch: Optional[bool] = True
+) -> Iterator:
     """
     Split a batch into k microbatches, where the batch size is divisible by k. Batch could be
     a dictionary of tensors or a list of tensors. A dictionary batch could also have items of List type,
@@ -442,8 +443,18 @@ def get_iterator_k_split(batch: Union[Dict, List[torch.Tensor]], num_microbatche
 
         # Split tensor items
         items = list(tensor_items.items())
-        assert items[0][1].shape[0] % num_microbatches == 0, "Issue with batch size configuration!"
+
+        if enforce_divisible_batch:
+            if items[0][1].shape[0] % num_microbatches != 0:
+                raise ValueError(
+                    f"Issue with batch size configuration: batch size {items[0][1].shape[0]} is not divisible by {num_microbatches}!"
+                )
+
         split_batch = [torch.tensor_split(item[1], num_microbatches, dim=0) for item in items]
+        # handle the case where the batch size from dynamic bucketting is not divisible
+        if items[0][1].shape[0] % num_microbatches != 0:
+            chunk_size = split_batch[0][-1].shape[0]
+            split_batch = [[j[:chunk_size] for j in i] for i in split_batch]
 
         if len(list_items) == 0:
             # Only have tensor items
@@ -453,7 +464,10 @@ def get_iterator_k_split(batch: Union[Dict, List[torch.Tensor]], num_microbatche
         else:
             # Split list items
             list_items = list(list_items.items())
-            split_list_batch = [split_list(item[1], num_microbatches) for item in list_items]
+            split_list_batch = [
+                split_list(item[1], num_microbatches, enforce_divisible_batch=enforce_divisible_batch)
+                for item in list_items
+            ]
             # Merge tensor and list items
             all_keys = [item[0] for item in items] + [item[0] for item in list_items]
             all_split_batch = split_batch + split_list_batch
@@ -464,9 +478,25 @@ def get_iterator_k_split(batch: Union[Dict, List[torch.Tensor]], num_microbatche
     else:
         # Split a list of torch tensors
         assert batch[0].shape[0] % num_microbatches == 0, "Issue with batch size configuration!"
-        split_batch = [
-            torch.tensor_split(item, num_microbatches, dim=0) if torch.is_tensor(item) else item for item in batch
-        ]
+        split_batch = []
+        for item in batch:
+            if torch.is_tensor(item):
+                split_batch.append(torch.tensor_split(item, num_microbatches, dim=0))
+            elif isinstance(item, list):
+                if isinstance(item[0], torch.Tensor):
+                    split_tensors = [torch.tensor_split(elem, num_microbatches, dim=0) for elem in item]
+                    split_tuple = []
+                    for mbi in range(num_microbatches):
+                        split_tuple.append([split_tensors[i][mbi] for i in range(len(split_tensors))])
+                    split_tuple = tuple(split_tuple)
+                    split_batch.append(split_tuple)
+                else:
+                    split_batch.append(split_list(item, num_microbatches))
+            elif item is None:
+                split_batch.append(item)
+            else:
+                raise ValueError(f"Unsupported item type: {type(item)}")
+
         microbatches = [
             [elem[i] if elem is not None else elem for elem in split_batch] for i in range(num_microbatches)
         ]

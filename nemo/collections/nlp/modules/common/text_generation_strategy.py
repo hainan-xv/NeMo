@@ -12,26 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# flake8: noqa
+# pylint: skip-file
+
 import abc
-import copy
-import os
-import re
 import warnings
 from typing import List, Set, Tuple
 
 import torch
 from transformers import CLIPImageProcessor
+
+from nemo.collections.common.tokenizers.chat_template_mixin import explode_chat_template_input, is_chat_input
 from nemo.collections.nlp.modules.common.lm_utils import pad_batch
 from nemo.collections.nlp.modules.common.megatron.module import Float16Module
 from nemo.collections.nlp.modules.common.megatron.utils import get_ltor_masks_and_position_ids
-
-try:
-    from apex.transformer.pipeline_parallel.utils import get_num_microbatches
-
-    HAVE_APEX = True
-
-except (ImportError, ModuleNotFoundError):
-    HAVE_APEX = False
+from nemo.utils import logging
 
 try:
     from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
@@ -43,6 +38,13 @@ try:
 except (ImportError, ModuleNotFoundError):
 
     HAVE_MEGATRON_CORE = False
+
+try:
+    from megatron.core.num_microbatches_calculator import get_num_microbatches
+
+except (ImportError, ModuleNotFoundError):
+    logging.warning("Megatron num_microbatches_calculator not found, using Apex version.")
+    from apex.transformer.pipeline_parallel.utils import get_num_microbatches
 
 
 # the text representation of eos_id, it applies for all tokenizers
@@ -74,7 +76,7 @@ class TextGenerationStrategy:
                     batch,
                 ]
             ),
-            model=[self.forward_model],
+            model=[self.forward_model] if not isinstance(self.forward_model, list) else self.forward_model,
             num_microbatches=get_num_microbatches(),
             forward_only=True,
             seq_length=tensor_shape[0],
@@ -94,7 +96,12 @@ class TextGenerationStrategy:
             Tuple[torch.Tensor], the tokenized and padded torch tensor and the token context length tensor.
         """
         tokenizer = self.model.tokenizer
-        if add_BOS:
+        if is_chat_input(sentences):
+            assert getattr(
+                tokenizer, 'has_chat_template', False
+            ), "Got chat-template input but tokenizer does not support chat template formating."
+            context_tokens = list(map(tokenizer.text_to_ids, explode_chat_template_input(sentences)))
+        elif add_BOS:
             context_tokens = [[tokenizer.bos_id] + tokenizer.text_to_ids(s) for s in sentences]
         elif hasattr(tokenizer.tokenizer, "get_prefix_tokens"):
             # chatglm: add tokenizer.gmask_id, tokenizer.sop_id
@@ -411,122 +418,7 @@ class GriffinModelTextGenerationStrategy(TextGenerationStrategy):
 
 
 def neva_process_prompts(prompt, tokenizer, multimodal_cfg, num_media_latents, conv_template):
-    from nemo.collections.multimodal.data.neva.neva_dataset import (
-        DEFAULT_IMAGE_TOKEN,
-        preprocess_llama_2,
-        preprocess_llama_3,
-        preprocess_multimodal,
-        preprocess_nv_dpo,
-        preprocess_nvgpt,
-        preprocess_v1,
-    )
-
-    list_data_dict = []
-    if multimodal_cfg["conv_template"] in ["nvgpt", "nv_steerlm", "nv_dpo"]:
-        record = {
-            'system': (
-                '\n'
-                if multimodal_cfg["conv_template"] == 'nv_dpo'
-                else 'A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user\'s questions.\n\n'
-            ),
-            'conversations': [
-                {'from': 'User', 'value': prompt},
-                {
-                    'from': 'Assistant',
-                    'value': '',
-                },
-            ],
-        }
-
-        for turn in record['conversations']:
-            if turn.get('value') is not None:
-                turn['value'] = re.sub('<image>', f'{DEFAULT_IMAGE_TOKEN}\n', turn['value'])
-        list_data_dict.append(record)
-
-        # overwrite the media_type in multimodal_cfg to image for image inference using video neva
-        # if the prompt does not contain video, then the media_type is image
-        if list_data_dict[0]['conversations'][0]['value'].find('video') == -1:
-            if multimodal_cfg.get('media_type') is not None and multimodal_cfg.get('num_frames') is not None:
-                multimodal_cfg['media_type'] = 'image'
-                multimodal_cfg['num_frames'] = 1
-
-        sources = preprocess_multimodal(copy.deepcopy(list_data_dict), multimodal_cfg, num_media_latents)
-        if multimodal_cfg["conv_template"] in ["nvgpt", "nv_steerlm"]:
-            data_dict = preprocess_nvgpt(sources, tokenizer, multimodal_cfg)
-        else:
-            data_dict = preprocess_nv_dpo(sources, tokenizer, multimodal_cfg)
-
-    elif multimodal_cfg["conv_template"] == "llama_2":
-        record = {
-            'conversations': [
-                {
-                    'from': 'human',
-                    'value': prompt,
-                },
-                {
-                    'from': 'gpt',
-                    'value': '',
-                },
-            ],
-        }
-
-        for turn in record['conversations']:
-            if turn.get('value') is not None:
-                turn['value'] = re.sub('<image>', f'{DEFAULT_IMAGE_TOKEN}\n', turn['value'])
-        list_data_dict.append(record)
-
-        sources = preprocess_multimodal(
-            copy.deepcopy(list_data_dict), multimodal_cfg, num_media_latents
-        )  # HARDCODED FOR NOW
-        data_dict = preprocess_llama_2(sources, tokenizer, multimodal_cfg)
-    elif multimodal_cfg["conv_template"] == "llama_3":
-        record = {
-            'conversations': [
-                {
-                    'from': 'human',
-                    'value': prompt,
-                },
-                {
-                    'from': 'gpt',
-                    'value': '',
-                },
-            ],
-        }
-
-        for turn in record['conversations']:
-            if turn.get('value') is not None:
-                turn['value'] = re.sub('<image>', f'{DEFAULT_IMAGE_TOKEN}\n', turn['value'])
-        list_data_dict.append(record)
-        sources = preprocess_multimodal(
-            copy.deepcopy(list_data_dict), multimodal_cfg, num_media_latents
-        )  # HARDCODED FOR NOW
-        data_dict = preprocess_llama_3(sources, tokenizer, multimodal_cfg)
-    elif multimodal_cfg["conv_template"] == "v1":
-        record = {
-            'conversations': [
-                {
-                    'from': 'human',
-                    'value': prompt,
-                },
-                {
-                    'from': 'gpt',
-                    'value': '',
-                },
-            ],
-        }
-
-        for turn in record['conversations']:
-            if turn.get('value') is not None:
-                turn['value'] = re.sub('<image>', f'{DEFAULT_IMAGE_TOKEN}\n', turn['value'])
-        list_data_dict.append(record)
-
-        sources = preprocess_multimodal(
-            copy.deepcopy(list_data_dict), multimodal_cfg, num_media_latents
-        )  # HARDCODED FOR NOW
-        data_dict = preprocess_v1(sources, tokenizer, multimodal_cfg)
-    else:
-        raise ValueError(f"Conversation template `{conv_template}` is not supported in Neva now.")
-    return data_dict['tokens'].tolist()
+    raise NotImplementedError("This method is deprecated.")
 
 
 class NevaModelTextGenerationStrategy(TextGenerationStrategy):
@@ -556,6 +448,7 @@ class NevaModelTextGenerationStrategy(TextGenerationStrategy):
             media_type=getattr(self.data_cfg, 'media_type', 'image'),
             num_frames=getattr(self.data_cfg, 'num_frames', 1),
             mm_mlp_adapter_type=getattr(self.cfg.mm_cfg, 'mm_mlp_adapter_type', 'linear'),
+            use_lita=getattr(self.cfg.mm_cfg, 'use_lita', False),
         )
         if self.multimodal_cfg['crop_size'] is None:
             image_processor = CLIPImageProcessor.from_pretrained(
@@ -577,6 +470,21 @@ class NevaModelTextGenerationStrategy(TextGenerationStrategy):
                 width_num_patches += 1
 
         self.num_media_latents = height_num_patches * width_num_patches
+        # add config for lita
+        if self.multimodal_cfg['use_lita']:
+            if self.cfg.mm_cfg.get('lita'):
+                lita = {
+                    'lita_video_arch': getattr(self.cfg.mm_cfg.lita, 'lita_video_arch', 'temporal_spatial_pool'),
+                    'visual_token_format': getattr(self.cfg.mm_cfg.lita, 'visual_token_format', 'v1'),
+                    'sample_frames': getattr(self.cfg.mm_cfg.lita, 'sample_frames', 1),
+                }
+                self.multimodal_cfg['lita'] = lita
+            else:
+                self.multimodal_cfg['use_lita'] = False
+                raise Warning(
+                    'Use lita has been set True but Lita config not found in the config file'
+                    'LITA will be disabled for this run.'
+                )
 
     def clip_max_len(self, maxlen: int) -> int:
         """clip the max len based on the LM model max sequence length"""
@@ -659,6 +567,7 @@ class NevaModelTextGenerationStrategy(TextGenerationStrategy):
             # not using type2use. uncomment it if it is used
             # if type_ids is not None:
             #     types2use = type_ids[:, context_length - 1].view(batch_size, -1)
+            media = None
 
         """Prepare batch for each of the inference steps"""
         attention_mask_repeat = None
@@ -975,14 +884,25 @@ class McoreRetroModelTextGenerationStrategy(TextGenerationStrategy):
 
 
 def model_inference_strategy_dispatcher(model, **args):
-    from nemo.collections.multimodal.models.multimodal_llm.neva.neva_model import MegatronNevaModel
-    from nemo.collections.nlp.models.language_modeling.megatron_gpt_model import MegatronGPTModel
-    from nemo.collections.nlp.models.language_modeling.megatron_gpt_prompt_learning_model import (
-        MegatronGPTPromptLearningModel,
-    )
-    from nemo.collections.nlp.models.language_modeling.megatron_griffin_model import MegatronGriffinModel
-    from nemo.collections.nlp.models.language_modeling.megatron_retrieval_model import MegatronRetrievalModel
-    from nemo.collections.nlp.models.language_modeling.megatron_retro_model import MegatronRetroModel
+    try:
+        from nemo.collections.nlp.models.language_modeling.megatron_gpt_model import MegatronGPTModel
+        from nemo.collections.nlp.models.language_modeling.megatron_gpt_prompt_learning_model import (
+            MegatronGPTPromptLearningModel,
+        )
+        from nemo.collections.nlp.models.language_modeling.megatron_griffin_model import MegatronGriffinModel
+        from nemo.collections.nlp.models.language_modeling.megatron_mamba_model import MegatronMambaModel
+        from nemo.collections.nlp.models.language_modeling.megatron_retrieval_model import MegatronRetrievalModel
+        from nemo.collections.nlp.models.language_modeling.megatron_retro_model import MegatronRetroModel
+    except (ImportError, ModuleNotFoundError):
+        from abc import ABC
+
+        MegatronGPTModel = ABC
+        MegatronGPTPromptLearningModel = ABC
+        MegatronGriffinModel = ABC
+        MegatronMambaModel = ABC
+        MegatronRetrievalModel = ABC
+        MegatronRetroModel = ABC
+
     from nemo.collections.nlp.modules.common.retro_inference_strategies import (
         RetroFileQAModelTextGenerationStrategy,
         RetroModelTextGenerationStrategy,
@@ -991,8 +911,8 @@ def model_inference_strategy_dispatcher(model, **args):
 
     if isinstance(model, MegatronGriffinModel):
         return GriffinModelTextGenerationStrategy(model)
-    if isinstance(model, MegatronNevaModel):
-        return NevaModelTextGenerationStrategy(model)
+    if isinstance(model, MegatronMambaModel):
+        return GPTModelTextGenerationStrategy(model)
     if isinstance(model, MegatronGPTPromptLearningModel):
         return PromptLearningModelTextGenerationStrategy(model, **args)
     elif isinstance(model, MegatronGPTModel) and not (isinstance(model, MegatronRetroModel)):

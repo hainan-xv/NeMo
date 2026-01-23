@@ -1,72 +1,71 @@
-import pickle
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from pathlib import Path
-from typing import Any, Callable, Optional, Type, TypeVar
+from typing import Any, Callable, Optional, Type, overload
 
 import fiddle as fdl
-import pytorch_lightning as pl
+import lightning.pytorch as pl
 
-from nemo.lightning.io.mixin import ConnectorMixin, ConnT, ModelConnector
-from nemo.lightning.io.pl import TrainerCheckpoint
-
-CkptType = TypeVar("CkptType")
+from nemo.lightning.io.mixin import ConnectorMixin, ConnT, ModelConnector, load
+from nemo.lightning.io.pl import TrainerContext
 
 
-def load(path: Path, output_type: Type[CkptType] = Any) -> CkptType:
+@overload
+def load_context(path: Path, subpath: Optional[str] = None, build: bool = True) -> TrainerContext: ...
+
+
+@overload
+def load_context(path: Path, subpath: Optional[str] = None, build: bool = False) -> fdl.Config[TrainerContext]: ...
+
+
+def load_context(path: Path, subpath: Optional[str] = None, build: bool = True):
     """
-    Loads a configuration from a pickle file and constructs an object of the specified type.
+    Loads a TrainerContext from a json-file or directory.
 
     Args:
-        path (Path): The path to the pickle file or directory containing 'io.pkl'.
-        output_type (Type[CkptType]): The type of the object to be constructed from the loaded data.
-
+        path (Path): The path to the json-file or directory containing 'io.json'.
+        subpath (Optional[str]): Subpath to selectively load only specific objects inside the TrainerContext.
+            Defaults to None.
+        build (bool): Whether to build the TrainerContext. Defaults to True.
+            Otherwise, the TrainerContext is returned as a Config[TrainerContext] object.
     Returns
     -------
-        CkptType: An instance of the specified type constructed from the loaded configuration.
-
-    Raises
-    ------
-        FileNotFoundError: If the specified file does not exist.
+        TrainerContext: The loaded TrainerContext instance.
 
     Example:
-        loaded_model = load("/path/to/model", output_type=MyModel)
+        # Load the entire context
+        checkpoint: TrainerContext = load_ckpt("/path/to/checkpoint")
+
+        # Load a subpath of the context, for eg: model.config
+        checkpoint: TrainerContext = load_ckpt("/path/to/checkpoint", subpath="model.config")
+
     """
-    del output_type  # Just for type-hint
-
-    _path = Path(path)
-    if hasattr(_path, 'is_dir') and _path.is_dir():
-        _path = Path(_path) / "io.pkl"
-    elif hasattr(_path, 'isdir') and _path.isdir:
-        _path = Path(_path) / "io.pkl"
-
-    if not _path.is_file():
-        raise FileNotFoundError(f"No such file: '{_path}'")
-
-    with open(_path, "rb") as f:
-        config = pickle.load(f)
-
-    return fdl.build(config)
+    if not isinstance(path, Path):
+        path = Path(path)
+    try:
+        return load(path, output_type=TrainerContext, subpath=subpath, build=build)
+    except FileNotFoundError:
+        # Maintain backwards compatibility with checkpoints that don't have '/context' dir.
+        if path.parts[-1] == 'context':
+            path = path.parent
+        else:
+            path = path / 'context'
+        return load(path, output_type=TrainerContext, subpath=subpath, build=build)
 
 
-def load_ckpt(path: Path) -> TrainerCheckpoint:
-    """
-    Loads a TrainerCheckpoint from a pickle file or directory.
-
-    Args:
-        path (Path): The path to the pickle file or directory containing 'io.pkl'.
-
-    Returns
-    -------
-        TrainerCheckpoint: The loaded TrainerCheckpoint instance.
-
-    Example:
-        checkpoint: TrainerCheckpoint = load_ckpt("/path/to/checkpoint")
-    """
-    return load(path, output_type=TrainerCheckpoint)
-
-
-def model_importer(
-    target: Type[ConnectorMixin], ext: str, default_path: Optional[str] = None
-) -> Callable[[Type[ConnT]], Type[ConnT]]:
+def model_importer(target: Type[ConnectorMixin], ext: str) -> Callable[[Type[ConnT]], Type[ConnT]]:
     """
     Registers an importer for a model with a specified file extension and an optional default path.
 
@@ -81,16 +80,14 @@ def model_importer(
         to the model class.
 
     Example:
-        @model_importer(MyModel, "hf", default_path="path/to/default")
+        @model_importer(MyModel, "hf")
         class MyModelHfImporter(io.ModelConnector):
             ...
     """
-    return target.register_importer(ext, default_path=default_path)
+    return target.register_importer(ext)
 
 
-def model_exporter(
-    target: Type[ConnectorMixin], ext: str, default_path: Optional[str] = None
-) -> Callable[[Type[ConnT]], Type[ConnT]]:
+def model_exporter(target: Type[ConnectorMixin], ext: str) -> Callable[[Type[ConnT]], Type[ConnT]]:
     """
     Registers an exporter for a model with a specified file extension and an optional default path.
 
@@ -105,15 +102,15 @@ def model_exporter(
         to the model class.
 
     Example:
-        @model_exporter(MyModel, "hf", default_path="path/to/default")
+        @model_exporter(MyModel, "hf")
         class MyModelHFExporter(io.ModelConnector):
             ...
     """
-    return target.register_exporter(ext, default_path=default_path)
+    return target.register_exporter(ext)
 
 
 def import_ckpt(
-    model: pl.LightningModule, source: str, output_path: Optional[Path] = None, overwrite: bool = False
+    model: pl.LightningModule, source: str, output_path: Optional[Path] = None, overwrite: bool = False, **kwargs
 ) -> Path:
     """
     Imports a checkpoint into a model using the model's associated importer, typically for
@@ -161,22 +158,58 @@ def import_ckpt(
 
     Example:
         model = Mistral7BModel()
-        imported_path = import_ckpt(model, "hf")
+        imported_path = import_ckpt(model, "hf://mistralai/Mistral-7B-v0.1")
     """
     if not isinstance(model, ConnectorMixin):
         raise ValueError("Model must be an instance of ConnectorMixin")
 
     importer: ModelConnector = model.importer(source)
-    return importer(overwrite=overwrite, output_path=output_path)
+    ckpt_path = importer(overwrite=overwrite, output_path=output_path, **kwargs)
+    importer.on_import_ckpt(model)
+    return ckpt_path
 
 
 def load_connector_from_trainer_ckpt(path: Path, target: str) -> ModelConnector:
-    model: pl.LightningModule = load_ckpt(path).model
+    """
+    Loads a ModelConnector from a trainer checkpoint for exporting the model to a different format.
+    This function first loads the model from the trainer checkpoint using the TrainerContext,
+    then retrieves the appropriate exporter based on the target format.
+
+    Args:
+        path (Path): Path to the trainer checkpoint directory or file.
+        target (str): The target format identifier for which to load the connector
+            (e.g., "hf" for HuggingFace format).
+
+    Returns:
+        ModelConnector: The loaded connector instance configured for the specified target format.
+
+    Raises:
+        ValueError: If the loaded model does not implement ConnectorMixin.
+
+    Example:
+        connector = load_connector_from_trainer_ckpt(
+            Path("/path/to/checkpoint"),
+            "hf"
+        )
+    """
+    model: pl.LightningModule = load_context(path, subpath="model")
 
     if not isinstance(model, ConnectorMixin):
         raise ValueError("Model must be an instance of ConnectorMixin")
 
     return model.exporter(target, path)
+
+
+def _verify_peft_export(path: Path, target: str):
+    if target == "hf" and (path / "weights" / "adapter_metadata.json").exists():
+        raise ValueError(
+            f"Your checkpoint \n`{path}`\ncontains PEFT weights, but your specified export target `hf` should be "
+            f"used for full model checkpoints. "
+            f"\nIf you want to convert NeMo 2 PEFT to Hugging Face PEFT checkpoint, set `target='hf-peft'`. "
+            f"If you want to merge LoRA weights back to the base model and export the merged full model, "
+            f"run `llm.peft.merge_lora` first before exporting. See "
+            f"https://docs.nvidia.com/nemo-framework/user-guide/latest/sft_peft/peft_nemo2.html for more details."
+        )
 
 
 def export_ckpt(
@@ -185,6 +218,8 @@ def export_ckpt(
     output_path: Optional[Path] = None,
     overwrite: bool = False,
     load_connector: Callable[[Path, str], ModelConnector] = load_connector_from_trainer_ckpt,
+    modelopt_export_kwargs: dict[str, Any] = None,
+    **kwargs,
 ) -> Path:
     """
     Exports a checkpoint from a model using the model's associated exporter, typically for
@@ -210,6 +245,7 @@ def export_ckpt(
             This is useful for model updates where retaining old checkpoint files is not required.
         load_connector (Callable[[Path, str], ModelConnector]): A function to load the appropriate
             exporter based on the model and target format. Defaults to `load_connector_from_trainer_ckpt`.
+        modelopt_export_kwargs (Dict[str, Any]): Additional keyword arguments for ModelOpt export to HuggingFace.
 
     Returns
     -------
@@ -225,7 +261,21 @@ def export_ckpt(
         nemo_ckpt_path = Path("/path/to/model.ckpt")
         export_path = export_ckpt(nemo_ckpt_path, "hf")
     """
-    exporter: ModelConnector = load_connector(path, target)
+    from nemo.collections.llm.modelopt.quantization.quantizer import export_hf_checkpoint
+
     _output_path = output_path or Path(path) / target
 
-    return exporter(overwrite=overwrite, output_path=_output_path)
+    if target == "hf":
+        try:
+            modelopt_export_kwargs = modelopt_export_kwargs or {}
+            # First try to export via ModelOpt route. If rejected, return to the default route
+            output = export_hf_checkpoint(path, _output_path, **modelopt_export_kwargs)
+        except RuntimeError:
+            output = None
+        if output is not None:
+            return output
+
+    _verify_peft_export(path, target)
+    exporter: ModelConnector = load_connector(path, target)
+
+    return exporter(overwrite=overwrite, output_path=_output_path, **kwargs)
