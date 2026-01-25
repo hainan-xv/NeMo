@@ -70,9 +70,11 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
         try:
             self.sample_sizes = self.cfg.sample_sizes
-        except AttributeError:
-            self.sample_sizes = [self.cfg.encoder.att_context_size[1] + 1]
-#            self.sample_sizes = [14,7]
+        except:
+            try:
+                self.sample_sizes = [self.cfg.encoder.att_context_size[1] + 1]
+            except:
+                self.sample_sizes = [-1]
 
         self.inference_chunk = self.sample_sizes[0]
         print("HERE SAMPLESIZES", self.sample_sizes)

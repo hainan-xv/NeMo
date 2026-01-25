@@ -305,6 +305,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         reduction_factor=1,
         ff_expansion_factor=4,
         self_attention_model='rel_pos',
+        chat_chunksize=None,
         n_heads=4,
         att_context_size=None,
         att_context_probs=None,
