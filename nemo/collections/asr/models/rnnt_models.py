@@ -52,6 +52,7 @@ from nemo.utils import logging
 
 from nemo.collections.asr.modules.conformer_encoder import chunk_concat_audio
 
+
 class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTranscriptionMixin):
     """Base class for encoder decoder RNNT-based models."""
 
@@ -735,7 +736,6 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             AccessMixin.reset_registry(self)
 
         signal, signal_len, transcript, transcript_len = batch
-
 
         # forward() only performs encoder forward
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:

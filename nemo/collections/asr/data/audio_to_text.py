@@ -693,8 +693,20 @@ class AudioToBPEDataset(_AudioTextDataset):
                 if isinstance(args[0], List) and self.is_aggregate:
                     t = []
                     for span in args[0]:
-                        t.extend(self._tokenizer.text_to_ids(span['str'], span['lang']))
+                        # Strip whitespace to prevent multiple consecutive ▁ tokens
+                        text = span['str'].strip() if isinstance(span['str'], str) else span['str']
+                        t.extend(self._tokenizer.text_to_ids(text, span['lang']))
                     return t
+
+                # Strip leading/trailing whitespace from text before tokenization
+                # This prevents SentencePiece from creating multiple consecutive ▁ (word boundary) tokens
+                # which would be invalid tokenization (e.g., "  hello" -> [▁, ▁, ▁hello] is invalid)
+                if isinstance(args[0], str):
+                    import re
+                    text = args[0].strip()
+                    # Also collapse multiple internal spaces to single space
+                    text = re.sub(r' +', ' ', text)
+                    args = (text,) + args[1:]
 
                 t = self._tokenizer.text_to_ids(*args)
                 return t
@@ -1290,8 +1302,20 @@ class TarredAudioToBPEDataset(_TarredAudioToTextDataset):
                 if isinstance(args[0], List) and self.is_aggregate:
                     t = []
                     for span in args[0]:
-                        t.extend(self._tokenizer.text_to_ids(span['str'], span['lang']))
+                        # Strip whitespace to prevent multiple consecutive ▁ tokens
+                        text = span['str'].strip() if isinstance(span['str'], str) else span['str']
+                        t.extend(self._tokenizer.text_to_ids(text, span['lang']))
                     return t
+
+                # Strip leading/trailing whitespace from text before tokenization
+                # This prevents SentencePiece from creating multiple consecutive ▁ (word boundary) tokens
+                # which would be invalid tokenization (e.g., "  hello" -> [▁, ▁, ▁hello] is invalid)
+                if isinstance(args[0], str):
+                    import re
+                    text = args[0].strip()
+                    # Also collapse multiple internal spaces to single space
+                    text = re.sub(r' +', ' ', text)
+                    args = (text,) + args[1:]
 
                 t = self._tokenizer.text_to_ids(*args)
                 return t
