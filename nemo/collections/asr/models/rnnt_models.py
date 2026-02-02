@@ -153,75 +153,191 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         This method determines the chunk size based on configuration and validates that the
         joint network supports CHAT mode (i.e., is an instance of RNNTAttJoint).
         
+        Supports multi-lookahead mode where encoder samples from multiple context sizes
+        during training (e.g., [[70,13],[70,6],[-1,-1]]). In this case, chunk_size is determined
+        dynamically based on the encoder's sampled context.
+        
+        Unlimited context [-1,-1] is supported - when sampled, it uses the largest chunk_size
+        from the other configured contexts.
+        
         Chunk size determination logic:
-        1. If cfg.chat_chunk_size is explicitly set, use it
-        2. Else if encoder uses 'chunked_limited' attention with a single [left, right] context,
-           use right_context + 1 as the chunk size
-        3. Otherwise, CHAT mode is disabled (chat_chunk_size = None)
+        1. If cfg.chat_chunk_size is explicitly set, use it (validate against encoder contexts)
+        2. Else if encoder uses multi-lookahead, enable dynamic chunk size mode
+        3. Else if encoder uses single chunked_limited context, infer chunk_size
+        4. Otherwise, CHAT mode is disabled (chat_chunk_size = None)
         """
+        # Initialize multi-lookahead attributes
+        self.chat_chunk_sizes = None  # All possible chunk sizes for multi-lookahead (unique, sorted)
+        self.chat_context_to_chunk_size = {}  # Mapping from context tuple to chunk size
+        self.chat_multi_lookahead = False
+        self.chat_has_unlimited_context = False  # Whether [-1,-1] is one of the contexts
+        
         # Check if chat_chunk_size is explicitly set in config
         explicit_chunk_size = self.cfg.get('chat_chunk_size', None)
         
-        if explicit_chunk_size is not None:
-            # Explicit chunk size provided - validate joint type
-            if not isinstance(self.joint, RNNTAttJoint):
+        if not isinstance(self.joint, RNNTAttJoint):
+            if explicit_chunk_size is not None:
                 raise ValueError(
                     f"chat_chunk_size is set to {explicit_chunk_size}, but the joint network is not "
                     f"RNNTAttJoint (got {type(self.joint).__name__}). "
                     f"CHAT mode requires RNNTAttJoint as the joint network."
                 )
-            self.chat_chunk_size = explicit_chunk_size
-            logging.info(f"CHAT mode enabled with explicit chunk_size={self.chat_chunk_size}")
-        elif isinstance(self.joint, RNNTAttJoint):
-            # Joint is RNNTAttJoint but no explicit chunk size - try to infer from encoder
-            encoder_cfg = self.cfg.get('encoder', {})
-            att_context_style = encoder_cfg.get('att_context_style', 'regular')
-            att_context_size = encoder_cfg.get('att_context_size', None)
+            # Standard RNNT mode - no chunking
+            self.chat_chunk_size = None
+            return
+        
+        # Joint is RNNTAttJoint - determine chunk size(s)
+        encoder_cfg = self.cfg.get('encoder', {})
+        att_context_style = encoder_cfg.get('att_context_style', 'regular')
+        
+        # Get all possible context sizes from encoder
+        att_context_size_all = getattr(self.encoder, 'att_context_size_all', None)
+        
+        if att_context_style == 'chunked_limited' and att_context_size_all is not None:
+            # Compute chunk sizes from encoder contexts
+            # First pass: collect all finite chunk sizes
+            finite_chunk_sizes = []
+            has_unlimited = False
             
-            if att_context_style == 'chunked_limited' and att_context_size is not None:
-                # Convert OmegaConf ListConfig to Python list if needed
-                if hasattr(att_context_size, '__iter__') and not isinstance(att_context_size, str):
-                    att_context_size = list(att_context_size)
-                
-                if isinstance(att_context_size, (list, tuple)):
-                    if len(att_context_size) == 2 and isinstance(att_context_size[0], int):
-                        # Single context: [left, right]
-                        right_context = att_context_size[1]
-                        if right_context >= 0:
-                            self.chat_chunk_size = right_context + 1
-                            logging.info(
-                                f"CHAT mode enabled with inferred chunk_size={self.chat_chunk_size} "
-                                f"from encoder att_context_size={att_context_size}"
-                            )
-                        else:
-                            raise ValueError(
-                                f"RNNTAttJoint requires a valid chunk size, but encoder has unlimited "
-                                f"right context (att_context_size={att_context_size}). "
-                                f"Please set 'chat_chunk_size' explicitly in the model config."
-                            )
-                    else:
-                        raise ValueError(
-                            f"RNNTAttJoint requires a single [left, right] attention context size, "
-                            f"but found multiple context sizes: {att_context_size}. "
-                            f"Please set 'chat_chunk_size' explicitly in the model config."
-                        )
-                else:
+            for ctx in att_context_size_all:
+                if isinstance(ctx, (list, tuple)) and len(ctx) == 2:
+                    right_context = ctx[1]
+                    if right_context >= 0:
+                        chunk_size = right_context + 1
+                        finite_chunk_sizes.append(chunk_size)
+                        self.chat_context_to_chunk_size[tuple(ctx)] = chunk_size
+                    elif right_context == -1:
+                        # Unlimited context - will use largest chunk size
+                        has_unlimited = True
+            
+            if not finite_chunk_sizes:
+                if has_unlimited:
                     raise ValueError(
-                        f"Could not infer chunk size from encoder config (got type {type(att_context_size)}). "
-                        f"Please set 'chat_chunk_size' explicitly in the model config."
+                        f"RNNTAttJoint requires at least one finite chunk size, but all contexts are unlimited. "
+                        f"encoder att_context_size_all={att_context_size_all}. "
+                        f"Please set 'chat_chunk_size' explicitly or add a finite context."
                     )
+                raise ValueError(
+                    f"RNNTAttJoint requires valid chunk sizes, but could not derive any from "
+                    f"encoder att_context_size_all={att_context_size_all}. "
+                    f"Please set 'chat_chunk_size' explicitly in the model config."
+                )
+            
+            # Get unique chunk sizes sorted (largest first)
+            all_chunk_sizes = sorted(set(finite_chunk_sizes), reverse=True)
+            largest_chunk_size = all_chunk_sizes[0]
+            
+            # Second pass: assign largest chunk size to unlimited contexts
+            if has_unlimited:
+                self.chat_has_unlimited_context = True
+                for ctx in att_context_size_all:
+                    if isinstance(ctx, (list, tuple)) and len(ctx) == 2:
+                        if ctx[1] == -1:
+                            self.chat_context_to_chunk_size[tuple(ctx)] = largest_chunk_size
+            
+            # Check if multi-lookahead mode (more than one context)
+            if len(att_context_size_all) > 1:
+                self.chat_chunk_sizes = all_chunk_sizes
+                self.chat_multi_lookahead = True
+                
+                if explicit_chunk_size is not None:
+                    # Validate explicit chunk size is one of the possible values
+                    if explicit_chunk_size not in self.chat_chunk_sizes:
+                        raise ValueError(
+                            f"Explicit chat_chunk_size={explicit_chunk_size} is not consistent with "
+                            f"encoder's multi-lookahead contexts. Possible chunk sizes: {self.chat_chunk_sizes}"
+                        )
+                    self.chat_chunk_size = explicit_chunk_size
+                    logging.info(
+                        f"CHAT multi-lookahead mode with explicit chunk_size={self.chat_chunk_size}. "
+                        f"All possible chunk sizes: {self.chat_chunk_sizes}"
+                        f"{' (includes unlimited context using largest)' if has_unlimited else ''}"
+                    )
+                else:
+                    # Dynamic mode - chunk size determined per forward pass
+                    self.chat_chunk_size = None
+                    logging.info(
+                        f"CHAT multi-lookahead mode enabled with dynamic chunk sizes: {self.chat_chunk_sizes}. "
+                        f"Chunk size will be determined per forward pass based on encoder's sampled context."
+                        f"{' Unlimited context [-1,-1] will use largest chunk size.' if has_unlimited else ''}"
+                    )
+            else:
+                # Single context mode
+                self.chat_chunk_size = all_chunk_sizes[0]
+                if explicit_chunk_size is not None and explicit_chunk_size != self.chat_chunk_size:
+                    logging.warning(
+                        f"Explicit chat_chunk_size={explicit_chunk_size} differs from encoder's "
+                        f"context-derived chunk_size={self.chat_chunk_size}. Using explicit value."
+                    )
+                    self.chat_chunk_size = explicit_chunk_size
+                logging.info(
+                    f"CHAT mode enabled with chunk_size={self.chat_chunk_size} "
+                    f"from encoder att_context_size"
+                )
+        elif att_context_style == 'regular':
+            # Full context encoder - must have explicit chunk size
+            if explicit_chunk_size is not None:
+                self.chat_chunk_size = explicit_chunk_size
+                logging.info(f"CHAT mode enabled with explicit chunk_size={self.chat_chunk_size} (full context encoder)")
             else:
                 raise ValueError(
                     f"RNNTAttJoint requires chunk size, but encoder is not configured with "
                     f"'chunked_limited' attention style (got '{att_context_style}'). "
-                    f"Please set 'chat_chunk_size' explicitly in the model config or configure "
-                    f"the encoder with att_context_style='chunked_limited'."
+                    f"Please set 'chat_chunk_size' explicitly in the model config."
                 )
         else:
-            # Standard RNNT mode - no chunking
-            self.chat_chunk_size = None
+            raise ValueError(
+                f"RNNTAttJoint requires chunk size, but encoder has unsupported "
+                f"attention style '{att_context_style}'. "
+                f"Please set 'chat_chunk_size' explicitly in the model config."
+            )
 
-    def _prepare_chat_decoding(self):
+    def _get_current_chat_chunk_size(self) -> int:
+        """
+        Get the current CHAT chunk size based on encoder's sampled context.
+        
+        For multi-lookahead mode, this queries the encoder's currently sampled
+        attention context and returns the corresponding chunk size. This uses the
+        pre-computed context-to-chunk-size mapping which handles:
+        - Regular contexts: chunk_size = right_context + 1
+        - Unlimited contexts [-1,-1]: chunk_size = largest from other contexts
+        
+        For single context mode or explicit chunk size, returns the fixed chunk size.
+        
+        Returns:
+            int: The chunk size to use for the current forward pass.
+        """
+        # If explicit chunk size is set, use it
+        if self.chat_chunk_size is not None:
+            return self.chat_chunk_size
+        
+        # Multi-lookahead mode - get from encoder's current context
+        if self.chat_multi_lookahead:
+            current_context = getattr(self.encoder, '_current_att_context_size', None)
+            if current_context is not None and len(current_context) >= 2:
+                # Use the pre-computed mapping (handles unlimited contexts)
+                context_key = tuple(current_context)
+                if context_key in self.chat_context_to_chunk_size:
+                    return self.chat_context_to_chunk_size[context_key]
+                else:
+                    # Context not in mapping - compute directly or use largest
+                    right_context = current_context[1]
+                    if right_context >= 0:
+                        return right_context + 1
+                    else:
+                        # Unlimited context not in mapping - use largest
+                        return self.chat_chunk_sizes[0]
+            else:
+                # Fallback to largest chunk size
+                logging.warning(
+                    "Could not get current context from encoder, using largest chunk size"
+                )
+                return self.chat_chunk_sizes[0]
+        
+        # Should not reach here if CHAT mode is properly configured
+        raise RuntimeError("CHAT mode is enabled but no chunk size could be determined")
+
+    def _prepare_chat_decoding(self, chunk_size: int = None):
         """
         Prepare the decoder for CHAT mode by overriding max_symbols_per_step
         and disabling CUDA graphs (not yet supported for CHAT).
@@ -229,13 +345,21 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         For CHAT models, the max_symbols_per_step should be set to chunk_size
         to ensure enough tokens can be emitted per chunk. This method overrides
         the configured value and prints a warning once.
-        """
-        if self.chat_chunk_size is None:
-            return
         
-        # Calculate the appropriate max_symbols for CHAT mode
-        # Match the non-batched _greedy_decode() which uses chunk_size
-        chat_max_symbols = self.chat_chunk_size
+        Args:
+            chunk_size: Optional explicit chunk size. If None, uses self.chat_chunk_size
+                       or the largest chunk size for multi-lookahead mode.
+        """
+        # Determine chunk size to use
+        if chunk_size is not None:
+            chat_max_symbols = chunk_size
+        elif self.chat_chunk_size is not None:
+            chat_max_symbols = self.chat_chunk_size
+        elif self.chat_multi_lookahead and self.chat_chunk_sizes:
+            # Use largest chunk size for decoding in multi-lookahead mode
+            chat_max_symbols = self.chat_chunk_sizes[0]
+        else:
+            return  # No CHAT mode
         
         # Get the decoder from the decoding module
         decoder = getattr(self.decoding, 'decoding', None)
@@ -247,8 +371,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             current_max_symbols = getattr(decoder, 'max_symbols', None)
             logging.warning(
                 f"CHAT mode: Overriding max_symbols_per_step from {current_max_symbols} to {chat_max_symbols} "
-                f"(= chunk_size = {self.chat_chunk_size}). "
-                f"The configured value will not be used for CHAT decoding."
+                f"(= chunk_size). The configured value will not be used for CHAT decoding."
             )
             
             # Check if CUDA graphs are enabled and warn
@@ -879,9 +1002,16 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         # If experimental fused Joint-Loss-WER is not used
         if not self.joint.fuse_loss_wer:
             # CHAT mode: chunk the encoder output for cross-attention joint
+            # Determine chunk size (fixed or dynamic for multi-lookahead)
+            current_chunk_size = None
             if self.chat_chunk_size is not None:
+                current_chunk_size = self.chat_chunk_size
+            elif self.chat_multi_lookahead:
+                current_chunk_size = self._get_current_chat_chunk_size()
+            
+            if current_chunk_size is not None:
                 chunked, chunk_lengths = chunk_concat_audio(
-                    encoded.transpose(1, 2), encoded_len, self.chat_chunk_size
+                    encoded.transpose(1, 2), encoded_len, current_chunk_size
                 )
                 # Compute full joint and loss with chunked encoder outputs
                 joint = self.joint(
@@ -921,9 +1051,9 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
             if (sample_id + 1) % log_every_n_steps == 0:
                 # For WER calculation, use chunked outputs in CHAT mode
-                if self.chat_chunk_size is not None:
+                if current_chunk_size is not None:
                     # Prepare decoder for CHAT mode (override max_symbols)
-                    self._prepare_chat_decoding()
+                    self._prepare_chat_decoding(current_chunk_size)
                     wer_encoded = chunked.transpose(1, 2)
                     # Number of valid chunks per utterance (for sequence length)
                     wer_lengths = (chunk_lengths != 0).sum(dim=1)
@@ -993,12 +1123,17 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
         del signal
 
+        # Determine chunk size for CHAT mode (use largest for multi-lookahead inference)
+        chunk_size = self.chat_chunk_size
+        if chunk_size is None and self.chat_multi_lookahead and self.chat_chunk_sizes:
+            chunk_size = self.chat_chunk_sizes[0]  # Largest chunk size
+        
         # CHAT mode: chunk the encoder output for decoding
-        if self.chat_chunk_size is not None:
+        if chunk_size is not None:
             # Prepare decoder for CHAT mode (override max_symbols)
-            self._prepare_chat_decoding()
+            self._prepare_chat_decoding(chunk_size)
             chunked, chunk_lengths = chunk_concat_audio(
-                encoded.transpose(1, 2), encoded_len, self.chat_chunk_size
+                encoded.transpose(1, 2), encoded_len, chunk_size
             )
             # Number of valid chunks per utterance
             num_valid_chunks = (chunk_lengths != 0).sum(dim=1)
@@ -1020,35 +1155,126 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
     def validation_pass(self, batch, batch_idx, dataloader_idx=0):
         signal, signal_len, transcript, transcript_len = batch
 
-        # forward() only performs encoder forward
-        if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
-            encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
-        else:
-            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
-        del signal
-
         tensorboard_logs = {}
-
-        # CHAT mode: chunk the encoder output
-        if self.chat_chunk_size is not None:
-            # Prepare decoder for CHAT mode (override max_symbols)
-            self._prepare_chat_decoding()
-            chunked, chunk_lengths = chunk_concat_audio(
-                encoded.transpose(1, 2), encoded_len, self.chat_chunk_size
-            )
-            wer_encoded = chunked.transpose(1, 2)
-            # Number of valid chunks per utterance (for sequence length)
-            wer_lengths = (chunk_lengths != 0).sum(dim=1)
-        else:
-            wer_encoded = encoded
-            wer_lengths = encoded_len
-            chunk_lengths = None
 
         # If experimental fused Joint-Loss-WER is not used
         if not self.joint.fuse_loss_wer:
-            if self.compute_eval_loss:
+            # Multi-lookahead CHAT mode: evaluate all contexts with their encoder configurations
+            if self.chat_multi_lookahead and self.chat_context_to_chunk_size:
+                all_losses = []
                 decoder, target_length, states = self.decoder(targets=transcript, target_length=transcript_len)
-                if self.chat_chunk_size is not None:
+                
+                # Get all contexts from encoder
+                att_context_size_all = getattr(self.encoder, 'att_context_size_all', [])
+                original_context = getattr(self.encoder, 'att_context_size', att_context_size_all[0] if att_context_size_all else None)
+                
+                # Track best streaming WER for val_wer fallback (if no unlimited)
+                best_streaming_wer = None
+                best_streaming_chunk_size = 0
+                has_unlimited_wer = False
+                
+                for ctx in att_context_size_all:
+                    ctx_tuple = tuple(ctx)
+                    chunk_size = self.chat_context_to_chunk_size.get(ctx_tuple)
+                    if chunk_size is None:
+                        continue
+                    
+                    is_unlimited = (ctx[0] == -1 and ctx[1] == -1)
+                    
+                    # Set encoder context and re-encode
+                    self.encoder.set_default_att_context_size(ctx)
+                    if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
+                        encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
+                    else:
+                        encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
+                    
+                    # Prepare decoder for this chunk size
+                    self._prepare_chat_decoding(chunk_size)
+                    
+                    # Chunk the encoder output
+                    chunked, chunk_lengths = chunk_concat_audio(
+                        encoded.transpose(1, 2), encoded_len, chunk_size
+                    )
+                    wer_encoded = chunked.transpose(1, 2)
+                    wer_lengths = (chunk_lengths != 0).sum(dim=1)
+                    
+                    # Compute loss for this context
+                    if self.compute_eval_loss:
+                        joint = self.joint(
+                            encoder_outputs=wer_encoded,
+                            decoder_outputs=decoder,
+                            encoder_lengths=chunk_lengths,
+                        )
+                        loss_value = self.loss(
+                            log_probs=joint,
+                            targets=transcript,
+                            input_lengths=wer_lengths,
+                            target_lengths=target_length,
+                        )
+                        all_losses.append(loss_value)
+                    
+                    # Compute WER for this context
+                    self.wer.update(
+                        predictions=wer_encoded,
+                        predictions_lengths=wer_lengths,
+                        targets=transcript,
+                        targets_lengths=transcript_len,
+                    )
+                    wer, wer_num, wer_denom = self.wer.compute()
+                    self.wer.reset()
+                    
+                    # Log WER based on context type
+                    if is_unlimited:
+                        # Unlimited context: use for val_wer
+                        tensorboard_logs['val_wer_num'] = wer_num
+                        tensorboard_logs['val_wer_denom'] = wer_denom
+                        tensorboard_logs['val_wer'] = wer
+                        has_unlimited_wer = True
+                    else:
+                        # Streaming context: log as streaming_val_wer_{chunk}
+                        tensorboard_logs[f'streaming_val_wer_{chunk_size}'] = wer
+                        # Track best streaming for fallback
+                        if chunk_size > best_streaming_chunk_size:
+                            best_streaming_chunk_size = chunk_size
+                            best_streaming_wer = (wer, wer_num, wer_denom)
+                
+                # If no unlimited context, use largest streaming chunk for val_wer
+                if not has_unlimited_wer and best_streaming_wer is not None:
+                    wer, wer_num, wer_denom = best_streaming_wer
+                    tensorboard_logs['val_wer_num'] = wer_num
+                    tensorboard_logs['val_wer_denom'] = wer_denom
+                    tensorboard_logs['val_wer'] = wer
+                
+                # Clean up signal after all encoder passes
+                del signal
+                
+                # Restore original encoder context
+                if original_context is not None:
+                    self.encoder.set_default_att_context_size(original_context)
+                
+                # Average loss across all contexts
+                if self.compute_eval_loss and all_losses:
+                    tensorboard_logs['val_loss'] = sum(all_losses) / len(all_losses)
+            
+            # Single context CHAT mode or explicit chunk_size
+            elif self.chat_chunk_size is not None:
+                # Perform encoder forward
+                if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
+                    encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
+                else:
+                    encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
+                del signal
+                
+                # Prepare decoder for CHAT mode (override max_symbols)
+                self._prepare_chat_decoding()
+                chunked, chunk_lengths = chunk_concat_audio(
+                    encoded.transpose(1, 2), encoded_len, self.chat_chunk_size
+                )
+                wer_encoded = chunked.transpose(1, 2)
+                wer_lengths = (chunk_lengths != 0).sum(dim=1)
+                
+                if self.compute_eval_loss:
+                    decoder, target_length, states = self.decoder(targets=transcript, target_length=transcript_len)
                     joint = self.joint(
                         encoder_outputs=wer_encoded,
                         decoder_outputs=decoder,
@@ -1060,7 +1286,32 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                         input_lengths=wer_lengths,
                         target_lengths=target_length,
                     )
+                    tensorboard_logs['val_loss'] = loss_value
+
+                self.wer.update(
+                    predictions=wer_encoded,
+                    predictions_lengths=wer_lengths,
+                    targets=transcript,
+                    targets_lengths=transcript_len,
+                )
+                wer, wer_num, wer_denom = self.wer.compute()
+                self.wer.reset()
+
+                tensorboard_logs['val_wer_num'] = wer_num
+                tensorboard_logs['val_wer_denom'] = wer_denom
+                tensorboard_logs['val_wer'] = wer
+            
+            # Standard RNNT mode (no CHAT)
+            else:
+                # Perform encoder forward
+                if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
+                    encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
                 else:
+                    encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
+                del signal
+                
+                if self.compute_eval_loss:
+                    decoder, target_length, states = self.decoder(targets=transcript, target_length=transcript_len)
                     joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder)
                     loss_value = self.loss(
                         log_probs=joint,
@@ -1068,24 +1319,30 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                         input_lengths=encoded_len,
                         target_lengths=target_length,
                     )
+                    tensorboard_logs['val_loss'] = loss_value
 
-                tensorboard_logs['val_loss'] = loss_value
+                self.wer.update(
+                    predictions=encoded,
+                    predictions_lengths=encoded_len,
+                    targets=transcript,
+                    targets_lengths=transcript_len,
+                )
+                wer, wer_num, wer_denom = self.wer.compute()
+                self.wer.reset()
 
-            self.wer.update(
-                predictions=wer_encoded,
-                predictions_lengths=wer_lengths,
-                targets=transcript,
-                targets_lengths=transcript_len,
-            )
-            wer, wer_num, wer_denom = self.wer.compute()
-            self.wer.reset()
-
-            tensorboard_logs['val_wer_num'] = wer_num
-            tensorboard_logs['val_wer_denom'] = wer_denom
-            tensorboard_logs['val_wer'] = wer
+                tensorboard_logs['val_wer_num'] = wer_num
+                tensorboard_logs['val_wer_denom'] = wer_denom
+                tensorboard_logs['val_wer'] = wer
 
         else:
             # If experimental fused Joint-Loss-WER is used
+            # Perform encoder forward
+            if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
+                encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
+            else:
+                encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
+            del signal
+            
             compute_wer = True
 
             if self.compute_eval_loss:
@@ -1171,12 +1428,17 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         encoded = outputs.pop('encoded')
         encoded_len = outputs.pop('encoded_len')
 
+        # Determine chunk size for CHAT mode (use largest for multi-lookahead inference)
+        chunk_size = self.chat_chunk_size
+        if chunk_size is None and self.chat_multi_lookahead and self.chat_chunk_sizes:
+            chunk_size = self.chat_chunk_sizes[0]  # Largest chunk size
+        
         # CHAT mode: chunk the encoder output for decoding
-        if self.chat_chunk_size is not None:
+        if chunk_size is not None:
             # Prepare decoder for CHAT mode (override max_symbols)
-            self._prepare_chat_decoding()
+            self._prepare_chat_decoding(chunk_size)
             chunked, chunk_lengths = chunk_concat_audio(
-                encoded.transpose(1, 2), encoded_len, self.chat_chunk_size
+                encoded.transpose(1, 2), encoded_len, chunk_size
             )
             # Number of valid chunks per utterance
             num_valid_chunks = (chunk_lengths != 0).sum(dim=1)

@@ -624,6 +624,9 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             cur_att_context_size = random.choices(self.att_context_size_all, weights=self.att_context_probs)[0]
         else:
             cur_att_context_size = self.att_context_size
+        
+        # Store current context for CHAT models to access
+        self._current_att_context_size = cur_att_context_size
 
         if not bypass_pre_encode:
             audio_signal = torch.transpose(audio_signal, 1, 2)
