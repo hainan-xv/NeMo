@@ -179,7 +179,10 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             att_context_size = encoder_cfg.get('att_context_size', None)
             
             if att_context_style == 'chunked_limited' and att_context_size is not None:
-                # Convert to list if needed
+                # Convert OmegaConf ListConfig to Python list if needed
+                if hasattr(att_context_size, '__iter__') and not isinstance(att_context_size, str):
+                    att_context_size = list(att_context_size)
+                
                 if isinstance(att_context_size, (list, tuple)):
                     if len(att_context_size) == 2 and isinstance(att_context_size[0], int):
                         # Single context: [left, right]
@@ -204,7 +207,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                         )
                 else:
                     raise ValueError(
-                        f"Could not infer chunk size from encoder config. "
+                        f"Could not infer chunk size from encoder config (got type {type(att_context_size)}). "
                         f"Please set 'chat_chunk_size' explicitly in the model config."
                     )
             else:
@@ -220,9 +223,10 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
     def _prepare_chat_decoding(self):
         """
-        Prepare the decoder for CHAT mode by overriding max_symbols_per_step.
+        Prepare the decoder for CHAT mode by overriding max_symbols_per_step
+        and disabling CUDA graphs (not yet supported for CHAT).
         
-        For CHAT models, the max_symbols_per_step should be set to chunk_size // 2
+        For CHAT models, the max_symbols_per_step should be set to chunk_size
         to ensure enough tokens can be emitted per chunk. This method overrides
         the configured value and prints a warning once.
         """
@@ -238,7 +242,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         if decoder is None:
             return
         
-        # Warn once about the override
+        # Warn once about the overrides
         if not getattr(self, '_chat_decoding_warned', False):
             current_max_symbols = getattr(decoder, 'max_symbols', None)
             logging.warning(
@@ -246,15 +250,34 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 f"(= chunk_size = {self.chat_chunk_size}). "
                 f"The configured value will not be used for CHAT decoding."
             )
+            
+            # Check if CUDA graphs are enabled and warn
+            use_cuda_graphs = getattr(decoder, 'use_cuda_graph_decoder', False)
+            if use_cuda_graphs:
+                logging.warning(
+                    "CHAT mode: CUDA graphs are not yet supported for CHAT decoding. "
+                    "Disabling CUDA graphs automatically."
+                )
+            
             self._chat_decoding_warned = True
         
         # Always set the correct value
         decoder.max_symbols = chat_max_symbols
         
+        # Disable CUDA graphs for CHAT mode (not yet supported)
+        if hasattr(decoder, 'use_cuda_graph_decoder'):
+            decoder.use_cuda_graph_decoder = False
+        
         # Also update the decoding_computer if it exists (for batched decoding)
         decoding_computer = getattr(decoder, 'decoding_computer', None)
         if decoding_computer is not None:
             decoding_computer.max_symbols = chat_max_symbols
+            # Disable CUDA graphs in the decoding computer (not supported for CHAT)
+            # Setting cuda_graphs_mode to None forces the torch_impl path
+            if hasattr(decoding_computer, 'cuda_graphs_mode'):
+                decoding_computer.cuda_graphs_mode = None
+            if hasattr(decoding_computer, 'allow_cuda_graphs'):
+                decoding_computer.allow_cuda_graphs = False
 
     def setup_optim_normalization(self):
         """
