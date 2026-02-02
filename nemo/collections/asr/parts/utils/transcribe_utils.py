@@ -21,7 +21,7 @@ from tempfile import NamedTemporaryFile
 from typing import List, Optional, Tuple, Union
 
 import torch
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from tqdm.auto import tqdm
 
 import nemo.collections.asr as nemo_asr
@@ -268,9 +268,18 @@ def setup_model(cfg: DictConfig, map_location: torch.device) -> Tuple[ASRModel, 
         classpath = model_cfg.target  # original class path
         imported_class = model_utils.import_class_by_path(classpath)  # type: ASRModel
         logging.info(f"Restoring model : {imported_class.__name__}")
+        
+        # Check if model config overrides are provided (e.g., ++model.chat_chunk_size=24)
+        # Merge overrides into the model config from checkpoint rather than replacing it
+        override_config = None
+        if hasattr(cfg, 'model') and cfg.model is not None and len(cfg.model) > 0:
+            logging.info(f"Applying model config overrides: {OmegaConf.to_yaml(cfg.model)}")
+            override_config = OmegaConf.merge(model_cfg, cfg.model)
+        
         asr_model = imported_class.restore_from(
             restore_path=cfg.model_path,
             map_location=map_location,
+            override_config_path=override_config,
         )  # type: ASRModel
         model_name = os.path.splitext(os.path.basename(cfg.model_path))[0]
     else:

@@ -218,6 +218,44 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             # Standard RNNT mode - no chunking
             self.chat_chunk_size = None
 
+    def _prepare_chat_decoding(self):
+        """
+        Prepare the decoder for CHAT mode by overriding max_symbols_per_step.
+        
+        For CHAT models, the max_symbols_per_step should be set to chunk_size // 2
+        to ensure enough tokens can be emitted per chunk. This method overrides
+        the configured value and prints a warning once.
+        """
+        if self.chat_chunk_size is None:
+            return
+        
+        # Calculate the appropriate max_symbols for CHAT mode
+        # Match the non-batched _greedy_decode() which uses chunk_size
+        chat_max_symbols = self.chat_chunk_size
+        
+        # Get the decoder from the decoding module
+        decoder = getattr(self.decoding, 'decoding', None)
+        if decoder is None:
+            return
+        
+        # Warn once about the override
+        if not getattr(self, '_chat_decoding_warned', False):
+            current_max_symbols = getattr(decoder, 'max_symbols', None)
+            logging.warning(
+                f"CHAT mode: Overriding max_symbols_per_step from {current_max_symbols} to {chat_max_symbols} "
+                f"(= chunk_size = {self.chat_chunk_size}). "
+                f"The configured value will not be used for CHAT decoding."
+            )
+            self._chat_decoding_warned = True
+        
+        # Always set the correct value
+        decoder.max_symbols = chat_max_symbols
+        
+        # Also update the decoding_computer if it exists (for batched decoding)
+        decoding_computer = getattr(decoder, 'decoding_computer', None)
+        if decoding_computer is not None:
+            decoding_computer.max_symbols = chat_max_symbols
+
     def setup_optim_normalization(self):
         """
         Helper method to setup normalization of certain parts of the model prior to the optimization step.
@@ -861,6 +899,8 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             if (sample_id + 1) % log_every_n_steps == 0:
                 # For WER calculation, use chunked outputs in CHAT mode
                 if self.chat_chunk_size is not None:
+                    # Prepare decoder for CHAT mode (override max_symbols)
+                    self._prepare_chat_decoding()
                     wer_encoded = chunked.transpose(1, 2)
                     # Number of valid chunks per utterance (for sequence length)
                     wer_lengths = (chunk_lengths != 0).sum(dim=1)
@@ -932,6 +972,8 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
         # CHAT mode: chunk the encoder output for decoding
         if self.chat_chunk_size is not None:
+            # Prepare decoder for CHAT mode (override max_symbols)
+            self._prepare_chat_decoding()
             chunked, chunk_lengths = chunk_concat_audio(
                 encoded.transpose(1, 2), encoded_len, self.chat_chunk_size
             )
@@ -966,6 +1008,8 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
         # CHAT mode: chunk the encoder output
         if self.chat_chunk_size is not None:
+            # Prepare decoder for CHAT mode (override max_symbols)
+            self._prepare_chat_decoding()
             chunked, chunk_lengths = chunk_concat_audio(
                 encoded.transpose(1, 2), encoded_len, self.chat_chunk_size
             )
@@ -1106,6 +1150,8 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
         # CHAT mode: chunk the encoder output for decoding
         if self.chat_chunk_size is not None:
+            # Prepare decoder for CHAT mode (override max_symbols)
+            self._prepare_chat_decoding()
             chunked, chunk_lengths = chunk_concat_audio(
                 encoded.transpose(1, 2), encoded_len, self.chat_chunk_size
             )
