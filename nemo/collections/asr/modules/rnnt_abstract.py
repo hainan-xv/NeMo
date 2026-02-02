@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -28,12 +28,16 @@ class AbstractRNNTJoint(NeuralModule, ABC):
     """
 
     @abstractmethod
-    def joint_after_projection(self, f: torch.Tensor, g: torch.Tensor, f_len: torch.Tensor) -> Any:
+    def joint_after_projection(
+        self, f: torch.Tensor, g: torch.Tensor, f_len: Optional[torch.Tensor] = None
+    ) -> Any:
         """
         Compute the joint step of the network after the projection step.
         Args:
             f: Output of the Encoder model after projection. A torch.Tensor of shape [B, T, H]
             g: Output of the Decoder model (Prediction Network) after projection. A torch.Tensor of shape [B, U, H]
+            f_len: Optional tensor of encoder output lengths. Required for CHAT models with
+                cross-attention, ignored for standard RNNT models.
 
         Returns:
             Logits / log softmaxed tensor of shape (B, T, U, V + 1).
@@ -67,7 +71,9 @@ class AbstractRNNTJoint(NeuralModule, ABC):
         """
         raise NotImplementedError()
 
-    def joint(self, f: torch.Tensor, g: torch.Tensor, f_len: torch.Tensor) -> torch.Tensor:
+    def joint(
+        self, f: torch.Tensor, g: torch.Tensor, f_len: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """
         Compute the joint step of the network.
 
@@ -93,6 +99,8 @@ class AbstractRNNTJoint(NeuralModule, ABC):
         Args:
             f: Output of the Encoder model. A torch.Tensor of shape [B, T, H1]
             g: Output of the Decoder model. A torch.Tensor of shape [B, U, H2]
+            f_len: Optional tensor of encoder output lengths. Required for CHAT models with
+                cross-attention, ignored for standard RNNT models.
 
         Returns:
             Logits / log softmaxed tensor of shape (B, T, U, V + 1).

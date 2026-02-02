@@ -702,6 +702,7 @@ class AbstractRNNTDecoding(ConfidenceMixin):
         encoded_lengths: torch.Tensor,
         return_hypotheses: bool = False,
         partial_hypotheses: Optional[List[Hypothesis]] = None,
+        chunk_frame_lengths: Optional[torch.Tensor] = None,
     ) -> Union[List[Hypothesis], List[List[Hypothesis]]]:
         """
         Decode an encoder output by autoregressive decoding of the Decoder+Joint networks.
@@ -710,6 +711,8 @@ class AbstractRNNTDecoding(ConfidenceMixin):
             encoder_output: torch.Tensor of shape [B, D, T].
             encoded_lengths: torch.Tensor containing lengths of the padded encoder outputs. Shape [B].
             return_hypotheses: bool. If set to True it will return list of Hypothesis or NBestHypotheses
+            chunk_frame_lengths: Optional tensor of shape [B, T] containing the number of valid
+                frames in each chunk. Required for CHAT models with cross-attention in the joint.
 
         Returns:
             If `return_all_hypothesis` is set:
@@ -724,7 +727,10 @@ class AbstractRNNTDecoding(ConfidenceMixin):
         # Compute hypotheses
         with torch.inference_mode():
             hypotheses_list = self.decoding(
-                encoder_output=encoder_output, encoded_lengths=encoded_lengths, partial_hypotheses=partial_hypotheses
+                encoder_output=encoder_output,
+                encoded_lengths=encoded_lengths,
+                partial_hypotheses=partial_hypotheses,
+                chunk_frame_lengths=chunk_frame_lengths,
             )  # type: [List[Hypothesis]]
 
             # extract the hypotheses

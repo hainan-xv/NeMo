@@ -130,6 +130,7 @@ class GreedyBatchedLabelLoopingComputerBase(WithOptionalCudaGraphs, ABC):
         encoder_output: torch.Tensor,
         encoder_output_length: torch.Tensor,
         prev_batched_state: Optional[BatchedLabelLoopingState] = None,
+        chunk_frame_lengths: Optional[torch.Tensor] = None,
     ) -> tuple[rnnt_utils.BatchedHyps, Optional[rnnt_utils.BatchedAlignments], BatchedLabelLoopingState]:
         """
         Pure PyTorch implementation
@@ -138,6 +139,8 @@ class GreedyBatchedLabelLoopingComputerBase(WithOptionalCudaGraphs, ABC):
             encoder_output: output from the encoder
             encoder_output_length: lengths of the utterances in `encoder_output`
             prev_batched_state: previous batched decoding state
+            chunk_frame_lengths: Optional tensor of shape [B, T] containing the number of valid
+                frames in each chunk. Required for CHAT models with cross-attention in the joint.
         """
         raise NotImplementedError
 
@@ -147,6 +150,7 @@ class GreedyBatchedLabelLoopingComputerBase(WithOptionalCudaGraphs, ABC):
         encoder_output: torch.Tensor,
         encoder_output_length: torch.Tensor,
         prev_batched_state: Optional[BatchedLabelLoopingState] = None,
+        chunk_frame_lengths: Optional[torch.Tensor] = None,
     ) -> tuple[rnnt_utils.BatchedHyps, Optional[rnnt_utils.BatchedAlignments], BatchedLabelLoopingState]:
         """
         Implementation with CUDA graphs.
@@ -155,6 +159,8 @@ class GreedyBatchedLabelLoopingComputerBase(WithOptionalCudaGraphs, ABC):
             encoder_output: output from the encoder
             encoder_output_length: lengths of the utterances in `encoder_output`
             prev_batched_state: previous batched decoding state
+            chunk_frame_lengths: Optional tensor of shape [B, T] containing the number of valid
+                frames in each chunk. Required for CHAT models with cross-attention in the joint.
         """
         raise NotImplementedError
 
@@ -201,6 +207,7 @@ class GreedyBatchedLabelLoopingComputerBase(WithOptionalCudaGraphs, ABC):
         x: torch.Tensor,
         out_len: torch.Tensor,
         prev_batched_state: Optional[BatchedLabelLoopingState] = None,
+        chunk_frame_lengths: Optional[torch.Tensor] = None,
     ) -> tuple[rnnt_utils.BatchedHyps, Optional[rnnt_utils.BatchedAlignments], BatchedLabelLoopingState]:
         """
         Entry point for the decoding algorithm
@@ -209,13 +216,23 @@ class GreedyBatchedLabelLoopingComputerBase(WithOptionalCudaGraphs, ABC):
             x: encoder output
             out_len: encoder output length
             prev_batched_state: previous batched decoding state
+            chunk_frame_lengths: Optional tensor of shape [B, T] containing the number of valid
+                frames in each chunk. Required for CHAT models with cross-attention in the joint.
         """
         if self.cuda_graphs_mode is not None and x.device.type == "cuda":
             # disable CUDA graphs if Mixed Precision is used due to incorrect behavior
             with torch.amp.autocast(device_type="cuda", enabled=False):
                 # TODO(vbataev): fix issue with mixed precision, remove this restriction
                 return self.cuda_graphs_impl(
-                    encoder_output=x, encoder_output_length=out_len, prev_batched_state=prev_batched_state
+                    encoder_output=x,
+                    encoder_output_length=out_len,
+                    prev_batched_state=prev_batched_state,
+                    chunk_frame_lengths=chunk_frame_lengths,
                 )
 
-        return self.torch_impl(encoder_output=x, encoder_output_length=out_len, prev_batched_state=prev_batched_state)
+        return self.torch_impl(
+            encoder_output=x,
+            encoder_output_length=out_len,
+            prev_batched_state=prev_batched_state,
+            chunk_frame_lengths=chunk_frame_lengths,
+        )

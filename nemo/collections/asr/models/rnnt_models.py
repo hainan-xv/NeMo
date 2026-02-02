@@ -47,10 +47,11 @@ from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_confi
 from nemo.collections.common.parts.preprocessing.parsers import make_parser
 from nemo.core.classes.common import PretrainedModelInfo, typecheck
 from nemo.core.classes.mixins import AccessMixin
-from nemo.core.neural_types import AcousticEncodedRepresentation, AudioSignal, LengthsType, NeuralType, SpectrogramType, IntType
+from nemo.core.neural_types import AcousticEncodedRepresentation, AudioSignal, LengthsType, NeuralType, SpectrogramType
 from nemo.utils import logging
 
-from nemo.collections.asr.modules.conformer_encoder import chunk_concat_audio
+from nemo.collections.asr.parts.utils.chunking_utils import chunk_concat_audio
+from nemo.collections.asr.modules.rnnt import RNNTAttJoint
 
 
 class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTranscriptionMixin):
@@ -69,17 +70,6 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         self.preprocessor = EncDecRNNTModel.from_config_dict(self.cfg.preprocessor)
         self.encoder = EncDecRNNTModel.from_config_dict(self.cfg.encoder)
 
-        try:
-            self.sample_sizes = self.cfg.sample_sizes
-        except:
-            try:
-                self.sample_sizes = [self.cfg.encoder.att_context_size[1] + 1]
-            except:
-                self.sample_sizes = [-1]
-
-        self.inference_chunk = self.sample_sizes[0]
-        print("HERE SAMPLESIZES", self.sample_sizes)
-
         # Update config values required by components dynamically
         with open_dict(self.cfg.decoder):
             self.cfg.decoder.vocab_size = len(self.cfg.labels)
@@ -92,6 +82,9 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
         self.decoder = EncDecRNNTModel.from_config_dict(self.cfg.decoder)
         self.joint = EncDecRNNTModel.from_config_dict(self.cfg.joint)
+
+        # Setup CHAT (Chunked Attention Transducer) mode if applicable
+        self._setup_chat_mode()
 
         # Setup RNNT Loss
         loss_name, loss_kwargs = self.extract_rnnt_loss_cfg(self.cfg.get("loss", None))
@@ -151,6 +144,79 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
         # Setup encoder adapters (from ASRAdapterModelMixin)
         self.setup_adapters()
+
+    def _setup_chat_mode(self):
+        """
+        Setup CHAT (Chunked Attention Transducer) mode.
+        
+        CHAT mode enables cross-attention in the joint network over chunks of encoder output.
+        This method determines the chunk size based on configuration and validates that the
+        joint network supports CHAT mode (i.e., is an instance of RNNTAttJoint).
+        
+        Chunk size determination logic:
+        1. If cfg.chat_chunk_size is explicitly set, use it
+        2. Else if encoder uses 'chunked_limited' attention with a single [left, right] context,
+           use right_context + 1 as the chunk size
+        3. Otherwise, CHAT mode is disabled (chat_chunk_size = None)
+        """
+        # Check if chat_chunk_size is explicitly set in config
+        explicit_chunk_size = self.cfg.get('chat_chunk_size', None)
+        
+        if explicit_chunk_size is not None:
+            # Explicit chunk size provided - validate joint type
+            if not isinstance(self.joint, RNNTAttJoint):
+                raise ValueError(
+                    f"chat_chunk_size is set to {explicit_chunk_size}, but the joint network is not "
+                    f"RNNTAttJoint (got {type(self.joint).__name__}). "
+                    f"CHAT mode requires RNNTAttJoint as the joint network."
+                )
+            self.chat_chunk_size = explicit_chunk_size
+            logging.info(f"CHAT mode enabled with explicit chunk_size={self.chat_chunk_size}")
+        elif isinstance(self.joint, RNNTAttJoint):
+            # Joint is RNNTAttJoint but no explicit chunk size - try to infer from encoder
+            encoder_cfg = self.cfg.get('encoder', {})
+            att_context_style = encoder_cfg.get('att_context_style', 'regular')
+            att_context_size = encoder_cfg.get('att_context_size', None)
+            
+            if att_context_style == 'chunked_limited' and att_context_size is not None:
+                # Convert to list if needed
+                if isinstance(att_context_size, (list, tuple)):
+                    if len(att_context_size) == 2 and isinstance(att_context_size[0], int):
+                        # Single context: [left, right]
+                        right_context = att_context_size[1]
+                        if right_context >= 0:
+                            self.chat_chunk_size = right_context + 1
+                            logging.info(
+                                f"CHAT mode enabled with inferred chunk_size={self.chat_chunk_size} "
+                                f"from encoder att_context_size={att_context_size}"
+                            )
+                        else:
+                            raise ValueError(
+                                f"RNNTAttJoint requires a valid chunk size, but encoder has unlimited "
+                                f"right context (att_context_size={att_context_size}). "
+                                f"Please set 'chat_chunk_size' explicitly in the model config."
+                            )
+                    else:
+                        raise ValueError(
+                            f"RNNTAttJoint requires a single [left, right] attention context size, "
+                            f"but found multiple context sizes: {att_context_size}. "
+                            f"Please set 'chat_chunk_size' explicitly in the model config."
+                        )
+                else:
+                    raise ValueError(
+                        f"Could not infer chunk size from encoder config. "
+                        f"Please set 'chat_chunk_size' explicitly in the model config."
+                    )
+            else:
+                raise ValueError(
+                    f"RNNTAttJoint requires chunk size, but encoder is not configured with "
+                    f"'chunked_limited' attention style (got '{att_context_style}'). "
+                    f"Please set 'chat_chunk_size' explicitly in the model config or configure "
+                    f"the encoder with att_context_style='chunked_limited'."
+                )
+        else:
+            # Standard RNNT mode - no chunking
+            self.chat_chunk_size = None
 
     def setup_optim_normalization(self):
         """
@@ -659,21 +725,20 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         return {
             "input_signal": NeuralType(('B', 'T'), input_signal_eltype, optional=True),
             "input_signal_length": NeuralType(tuple('B'), LengthsType(), optional=True),
-            "chunk_size": NeuralType(tuple(), IntType(), optional=True),
             "processed_signal": NeuralType(('B', 'D', 'T'), SpectrogramType(), optional=True),
             "processed_signal_length": NeuralType(tuple('B'), LengthsType(), optional=True),
         }
 
-#    @property
-#    def output_types(self) -> Optional[Dict[str, NeuralType]]:
-#        return {
-#            "outputs": NeuralType(('B', 'D', 'T'), AcousticEncodedRepresentation()),
-#            "encoded_lengths": NeuralType(('B', 'T'), LengthsType()),
-#        }
+    @property
+    def output_types(self) -> Optional[Dict[str, NeuralType]]:
+        return {
+            "outputs": NeuralType(('B', 'D', 'T'), AcousticEncodedRepresentation()),
+            "encoded_lengths": NeuralType(tuple('B'), LengthsType()),
+        }
 
     @typecheck()
     def forward(
-        self, input_signal=None, input_signal_length=None, chunk_size=None, processed_signal=None, processed_signal_length=None
+        self, input_signal=None, input_signal_length=None, processed_signal=None, processed_signal_length=None
     ):
         """
         Forward pass of the model. Note that for RNNT Models, the forward pass of the model is a 3 step process,
@@ -706,10 +771,6 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         has_input_signal = input_signal is not None and input_signal_length is not None
         has_processed_signal = processed_signal is not None and processed_signal_length is not None
 
-        if chunk_size is None:
-            chunk_size = self.inference_chunk
-            assert False
-
         if (has_input_signal ^ has_processed_signal) is False:
             raise ValueError(
                 f"{self} Arguments ``input_signal`` and ``input_signal_length`` are mutually exclusive "
@@ -726,7 +787,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         if self.spec_augmentation is not None and self.training:
             processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
 
-        encoded, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length, chunk_size=chunk_size)
+        encoded, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
         return encoded, encoded_len
 
     # PTL-specific methods
@@ -741,7 +802,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
             encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
         else:
-            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len, chunk_size=-1)
+            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
         del signal
 
         # During training, loss must be computed, so decoder forward is necessary
@@ -756,23 +817,39 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
         # If experimental fused Joint-Loss-WER is not used
         if not self.joint.fuse_loss_wer:
+            # CHAT mode: chunk the encoder output for cross-attention joint
+            if self.chat_chunk_size is not None:
+                chunked, chunk_lengths = chunk_concat_audio(
+                    encoded.transpose(1, 2), encoded_len, self.chat_chunk_size
+                )
+                # Compute full joint and loss with chunked encoder outputs
+                joint = self.joint(
+                    encoder_outputs=chunked.transpose(1, 2),
+                    decoder_outputs=decoder,
+                    encoder_lengths=chunk_lengths,
+                )
+                loss_value = self.loss(
+                    log_probs=joint,
+                    targets=transcript,
+                    input_lengths=(chunk_lengths != 0).sum(dim=1),
+                    target_lengths=target_length,
+                )
+            else:
+                # Standard RNNT mode
+                joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder)
+                loss_value = self.loss(
+                    log_probs=joint,
+                    targets=transcript,
+                    input_lengths=encoded_len,
+                    target_lengths=target_length,
+                )
 
-            loss_value = 0
-            for chunk_size in self.sample_sizes:
-                chunked, length = chunk_concat_audio(encoded, encoded_len, chunk_size)
-                # Compute full joint and loss
-                joint = self.joint(encoder_outputs=chunked.transpose(1,2), decoder_outputs=decoder, encoder_lengths=length)
-                loss_value += self.loss(
-                    log_probs=joint, targets=transcript, input_lengths=(length != 0).sum(dim=1), target_lengths=target_length
-                ) / len(self.sample_sizes)
-            
+            # Add auxiliary losses, if registered
+            loss_value = self.add_auxiliary_losses(loss_value)
 
-                # Add auxiliary losses, if registered
-                loss_value = self.add_auxiliary_losses(loss_value)
-
-                # Reset access registry
-                if AccessMixin.is_access_enabled(self.model_guid):
-                    AccessMixin.reset_registry(self)
+            # Reset access registry
+            if AccessMixin.is_access_enabled(self.model_guid):
+                AccessMixin.reset_registry(self)
 
 
             tensorboard_logs = {
@@ -782,9 +859,17 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             }
 
             if (sample_id + 1) % log_every_n_steps == 0:
+                # For WER calculation, use chunked outputs in CHAT mode
+                if self.chat_chunk_size is not None:
+                    wer_encoded = chunked.transpose(1, 2)
+                    # Number of valid chunks per utterance (for sequence length)
+                    wer_lengths = (chunk_lengths != 0).sum(dim=1)
+                else:
+                    wer_encoded = encoded
+                    wer_lengths = encoded_len
                 self.wer.update(
-                    predictions=chunked.transpose(1,2),
-                    predictions_lengths=length,
+                    predictions=wer_encoded,
+                    predictions_lengths=wer_lengths,
                     targets=transcript,
                     targets_lengths=transcript_len,
                 )
@@ -842,12 +927,26 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
             encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
         else:
-            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len, chunk_size=self.inference_chunk)
+            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
         del signal
 
-        best_hyp_text = self.decoding.rnnt_decoder_predictions_tensor(
-            encoder_output=encoded, encoded_lengths=encoded_len, return_hypotheses=True
-        )
+        # CHAT mode: chunk the encoder output for decoding
+        if self.chat_chunk_size is not None:
+            chunked, chunk_lengths = chunk_concat_audio(
+                encoded.transpose(1, 2), encoded_len, self.chat_chunk_size
+            )
+            # Number of valid chunks per utterance
+            num_valid_chunks = (chunk_lengths != 0).sum(dim=1)
+            best_hyp_text = self.decoding.rnnt_decoder_predictions_tensor(
+                encoder_output=chunked.transpose(1, 2),
+                encoded_lengths=num_valid_chunks,
+                return_hypotheses=True,
+                chunk_frame_lengths=chunk_lengths,
+            )
+        else:
+            best_hyp_text = self.decoding.rnnt_decoder_predictions_tensor(
+                encoder_output=encoded, encoded_lengths=encoded_len, return_hypotheses=True
+            )
 
         if isinstance(sample_id, torch.Tensor):
             sample_id = sample_id.cpu().detach().numpy()
@@ -860,26 +959,54 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
             encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
         else:
-            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len, chunk_size=self.inference_chunk)
+            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
         del signal
 
         tensorboard_logs = {}
+
+        # CHAT mode: chunk the encoder output
+        if self.chat_chunk_size is not None:
+            chunked, chunk_lengths = chunk_concat_audio(
+                encoded.transpose(1, 2), encoded_len, self.chat_chunk_size
+            )
+            wer_encoded = chunked.transpose(1, 2)
+            # Number of valid chunks per utterance (for sequence length)
+            wer_lengths = (chunk_lengths != 0).sum(dim=1)
+        else:
+            wer_encoded = encoded
+            wer_lengths = encoded_len
+            chunk_lengths = None
 
         # If experimental fused Joint-Loss-WER is not used
         if not self.joint.fuse_loss_wer:
             if self.compute_eval_loss:
                 decoder, target_length, states = self.decoder(targets=transcript, target_length=transcript_len)
-                joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder)
-
-                loss_value = self.loss(
-                    log_probs=joint, targets=transcript, input_lengths=encoded_len, target_lengths=target_length
-                )
+                if self.chat_chunk_size is not None:
+                    joint = self.joint(
+                        encoder_outputs=wer_encoded,
+                        decoder_outputs=decoder,
+                        encoder_lengths=chunk_lengths,
+                    )
+                    loss_value = self.loss(
+                        log_probs=joint,
+                        targets=transcript,
+                        input_lengths=wer_lengths,
+                        target_lengths=target_length,
+                    )
+                else:
+                    joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder)
+                    loss_value = self.loss(
+                        log_probs=joint,
+                        targets=transcript,
+                        input_lengths=encoded_len,
+                        target_lengths=target_length,
+                    )
 
                 tensorboard_logs['val_loss'] = loss_value
 
             self.wer.update(
-                predictions=encoded,
-                predictions_lengths=encoded_len,
+                predictions=wer_encoded,
+                predictions_lengths=wer_lengths,
                 targets=transcript,
                 targets_lengths=transcript_len,
             )
@@ -967,7 +1094,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
     """ Transcription related methods """
 
     def _transcribe_forward(self, batch: Any, trcfg: TranscribeConfig):
-        encoded, encoded_len = self.forward(input_signal=batch[0], input_signal_length=batch[1], chunk_size=-1)
+        encoded, encoded_len = self.forward(input_signal=batch[0], input_signal_length=batch[1])
         output = dict(encoded=encoded, encoded_len=encoded_len)
         return output
 
@@ -977,15 +1104,27 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         encoded = outputs.pop('encoded')
         encoded_len = outputs.pop('encoded_len')
 
-        chunked, length = chunk_concat_audio(encoded, encoded_len, self.inference_chunk)
-
-        hyp = self.decoding.rnnt_decoder_predictions_tensor(
-#            encoded,
-#            encoded_len,
-            chunked.transpose(1, 2), length,
-            return_hypotheses=trcfg.return_hypotheses,
-            partial_hypotheses=trcfg.partial_hypothesis,
-        )
+        # CHAT mode: chunk the encoder output for decoding
+        if self.chat_chunk_size is not None:
+            chunked, chunk_lengths = chunk_concat_audio(
+                encoded.transpose(1, 2), encoded_len, self.chat_chunk_size
+            )
+            # Number of valid chunks per utterance
+            num_valid_chunks = (chunk_lengths != 0).sum(dim=1)
+            hyp = self.decoding.rnnt_decoder_predictions_tensor(
+                chunked.transpose(1, 2),
+                num_valid_chunks,
+                return_hypotheses=trcfg.return_hypotheses,
+                partial_hypotheses=trcfg.partial_hypothesis,
+                chunk_frame_lengths=chunk_lengths,
+            )
+        else:
+            hyp = self.decoding.rnnt_decoder_predictions_tensor(
+                encoded,
+                encoded_len,
+                return_hypotheses=trcfg.return_hypotheses,
+                partial_hypotheses=trcfg.partial_hypothesis,
+            )
         # cleanup memory
         del encoded, encoded_len
 

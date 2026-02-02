@@ -1487,7 +1487,6 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         # decoder = (B, D, U) if passed, else None
         encoder_outputs = encoder_outputs.transpose(1, 2)  # (B, T, D)
 
-        assert encoder_lengths is not None
         if decoder_outputs is not None:
             decoder_outputs = decoder_outputs.transpose(1, 2)  # (B, U, D)
 
@@ -1657,7 +1656,9 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         """
         return self.pred(prednet_output)
 
-    def joint_after_projection(self, f: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
+    def joint_after_projection(
+        self, f: torch.Tensor, g: torch.Tensor, f_len: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         r"""
         Compute the joint step of the network after projection.
 
@@ -1683,6 +1684,8 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         Args:
             f: Output of the Encoder model. A torch.Tensor of shape [B, T, H1]
             g: Output of the Decoder model. A torch.Tensor of shape [B, U, H2]
+            f_len: Optional tensor of encoder output lengths. Not used in standard RNNT,
+                but required for CHAT models with cross-attention.
 
         Returns:
             Logits / log softmaxed tensor of shape (B, T, U, V + 1).
@@ -2014,18 +2017,19 @@ class RNNTAttJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMix
 
         B, T, H, U, C = attention_scores.shape
 
-        sizes_expanded = sizes.view(B, T, 1, 1, 1)
-      
-        # Create indices: [1, 1, 1, 1, C]
-        indices = torch.arange(C, device=attention_scores.device).view(1, 1, 1, 1, C)
-        
-        # Create mask
-        mask = torch.logical_and(indices >= (sizes_expanded), indices != C - 1)
-
-#        print("MASK IS", sizes, mask.shape, mask)
+        # Apply masking only if sizes is provided (CHAT mode with valid frame counts)
+        if sizes is not None:
+            sizes_expanded = sizes.view(B, T, 1, 1, 1)
           
-        # Apply mask
-        attention_scores = attention_scores.masked_fill(mask, -19999)
+            # Create indices: [1, 1, 1, 1, C]
+            indices = torch.arange(C, device=attention_scores.device).view(1, 1, 1, 1, C)
+            
+            # Create mask: mask out frames beyond valid size (except last zero frame)
+            mask = torch.logical_and(indices >= (sizes_expanded), indices != C - 1)
+              
+            # Apply mask
+            attention_scores = attention_scores.masked_fill(mask, -19999)
+        
         attention_scores = attention_scores.view(-1, C)
         
         # Apply softmax and dropout
