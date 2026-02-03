@@ -73,6 +73,8 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         # Update config values required by components dynamically
         with open_dict(self.cfg.decoder):
             self.cfg.decoder.vocab_size = len(self.cfg.labels)
+            # Pass labels for decoders that need vocabulary (e.g., RNNTTransformerDecoder with use_spelling=True)
+            self.cfg.decoder.labels = self.cfg.labels
 
         with open_dict(self.cfg.joint):
             self.cfg.joint.num_classes = len(self.cfg.labels)
@@ -619,6 +621,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             decoder_config = self.decoder.to_config_dict()
             new_decoder_config = copy.deepcopy(decoder_config)
             new_decoder_config.vocab_size = len(new_vocabulary)
+            new_decoder_config.labels = new_vocabulary
             del self.decoder
             self.decoder = EncDecRNNTModel.from_config_dict(new_decoder_config)
 

@@ -27,6 +27,7 @@
 # limitations under the License.
 
 from typing import Any, Dict, List, Optional, Tuple, Union
+import re
 
 import torch
 import torch.nn.functional as F
@@ -549,6 +550,684 @@ class StatelessTransducerDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable):
                     processed_idx += 1
 
         return [dec_out for dec_out, _ in final], [dec_states for _, dec_states in final]
+
+
+# ============================================================================
+# RoPE Helper Functions
+# ============================================================================
+
+def _rope_freqs(dim: int, max_seq_len: int, base: float = 10000.0, device: torch.device = None) -> torch.Tensor:
+    """Compute RoPE frequency tensor."""
+    inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, device=device).float() / dim))
+    positions = torch.arange(max_seq_len, device=device).float()
+    freqs = torch.einsum("i,j->ij", positions, inv_freq)  # [max_seq_len, dim/2]
+    return freqs
+
+
+def _apply_rope(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+    """
+    Apply rotary position embedding to input tensor.
+    
+    Args:
+        x: [batch, seq_len, num_heads, head_dim]
+        freqs: [seq_len, head_dim/2] frequency tensor
+        
+    Returns:
+        Tensor with RoPE applied, same shape as input
+    """
+    batch, seq_len, num_heads, head_dim = x.shape
+    
+    # freqs: [seq_len, head_dim/2]
+    freqs = freqs[:seq_len]
+    
+    # Split x into pairs for rotation
+    x_reshape = x.view(batch, seq_len, num_heads, head_dim // 2, 2)
+    x1, x2 = x_reshape[..., 0], x_reshape[..., 1]
+    
+    # Compute cos and sin
+    cos = freqs.cos().view(1, seq_len, 1, -1)  # [1, seq_len, 1, head_dim/2]
+    sin = freqs.sin().view(1, seq_len, 1, -1)
+    
+    # Apply rotation: (x1 * cos - x2 * sin, x1 * sin + x2 * cos)
+    out1 = x1 * cos - x2 * sin
+    out2 = x1 * sin + x2 * cos
+    
+    # Interleave back
+    out = torch.stack([out1, out2], dim=-1).view(batch, seq_len, num_heads, head_dim)
+    
+    return out
+
+
+# ============================================================================
+# Transformer Layer for RNNTTransformerDecoder
+# ============================================================================
+
+class _TransformerDecoderLayer(nn.Module):
+    """Single transformer layer with RoPE support."""
+    
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        ffn_hidden: int,
+        dropout: float = 0.0,
+        activation: str = "gelu",
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+        
+        # Self-attention
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)
+        self.k_proj = nn.Linear(d_model, d_model, bias=False)
+        self.v_proj = nn.Linear(d_model, d_model, bias=False)
+        self.o_proj = nn.Linear(d_model, d_model, bias=False)
+        
+        # FFN
+        self.ffn_norm = nn.LayerNorm(d_model, eps=1e-5)
+        self.ffn_up = nn.Linear(d_model, ffn_hidden, bias=False)
+        self.ffn_down = nn.Linear(ffn_hidden, d_model, bias=False)
+        
+        # Pre-norm
+        self.attn_norm = nn.LayerNorm(d_model, eps=1e-5)
+        
+        self.dropout = nn.Dropout(dropout)
+        
+        if activation == "gelu":
+            self.activation = F.gelu
+        elif activation == "relu":
+            self.activation = F.relu
+        elif activation == "silu" or activation == "swish":
+            self.activation = F.silu
+        else:
+            self.activation = F.gelu
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        pos_ids: torch.Tensor,
+        rope_freqs: torch.Tensor,
+        causal_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            x: [batch, seq_len, d_model]
+            pos_ids: [seq_len] position indices
+            rope_freqs: [max_seq, head_dim/2] RoPE frequencies
+            causal_mask: [seq_len, seq_len] attention mask
+        """
+        batch, seq_len, _ = x.shape
+        
+        # Pre-norm + attention
+        residual = x
+        x = self.attn_norm(x)
+        
+        # QKV projection
+        q = self.q_proj(x).view(batch, seq_len, self.num_heads, self.head_dim)
+        k = self.k_proj(x).view(batch, seq_len, self.num_heads, self.head_dim)
+        v = self.v_proj(x).view(batch, seq_len, self.num_heads, self.head_dim)
+        
+        # Apply RoPE to Q and K
+        freqs = rope_freqs[pos_ids]  # [seq_len, head_dim/2]
+        q = _apply_rope(q, freqs)
+        k = _apply_rope(k, freqs)
+        
+        # Scaled dot-product attention
+        q = q.transpose(1, 2)  # [batch, heads, seq, head_dim]
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        
+        scale = 1.0 / (self.head_dim ** 0.5)
+        attn = torch.matmul(q, k.transpose(-2, -1)) * scale  # [batch, heads, seq, seq]
+        
+        # Apply causal mask
+        attn = attn + causal_mask[:seq_len, :seq_len].unsqueeze(0).unsqueeze(0)
+        
+        attn = F.softmax(attn, dim=-1)
+        attn = self.dropout(attn)
+        
+        out = torch.matmul(attn, v)  # [batch, heads, seq, head_dim]
+        out = out.transpose(1, 2).reshape(batch, seq_len, self.d_model)
+        out = self.o_proj(out)
+        out = self.dropout(out)
+        
+        x = residual + out
+        
+        # Pre-norm + FFN
+        residual = x
+        x = self.ffn_norm(x)
+        x = self.ffn_up(x)
+        x = self.activation(x)
+        x = self.ffn_down(x)
+        x = self.dropout(x)
+        x = residual + x
+        
+        return x
+
+
+# ============================================================================
+# RNNTTransformerDecoder with RoPE (supports both BPE and character modes)
+# ============================================================================
+
+class RNNTTransformerDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMixin):
+    """RNN-T Decoder using Transformer with RoPE for efficient incremental decoding.
+
+    This decoder supports two modes:
+    - use_spelling=True: Expands subword tokens to character sequences internally
+    - use_spelling=False: Uses tokens directly (identity mapping)
+
+    Args:
+        prednet: A dict-like object containing:
+            pred_hidden: Hidden dimension of the prediction network
+            pred_num_layers: Number of transformer layers (default: 2)
+            pred_num_attention_heads: Number of attention heads (default: 4)
+            pred_ffn_hidden: FFN hidden dimension (default: 4 * pred_hidden)
+            dropout: Dropout rate (default: 0.0)
+            activation: Activation function (default: "gelu")
+        vocab_size: Vocabulary size (excluding blank token)
+        labels: List of token strings (required when use_spelling=True)
+        max_history_length: Maximum history length (default: 64)
+        rope_base: Base for RoPE frequency computation (default: 10000.0)
+        blank_as_pad: Whether to use blank as padding (default: True)
+        use_spelling: If True, expand tokens to characters; if False, use tokens directly (default: False)
+    """
+
+    _SPECIAL_TOKEN_RE = re.compile(r"^<[^<>]+>$")
+
+    @property
+    def input_types(self):
+        return {
+            "targets": NeuralType(('B', 'T'), LabelsType()),
+            "target_length": NeuralType(tuple('B'), LengthsType()),
+            "states": [NeuralType(('B', 'T'), LabelsType(), optional=True)],
+        }
+
+    @property
+    def output_types(self):
+        return {
+            "outputs": NeuralType(('B', 'D', 'T'), EmbeddedTextType()),
+            "prednet_lengths": NeuralType(tuple('B'), LengthsType()),
+            "states": [NeuralType(('B', 'T'), LabelsType(), optional=True)],
+        }
+
+    def __init__(
+        self,
+        prednet: Dict[str, Any],
+        vocab_size: int,
+        labels: List[str] = None,
+        max_history_length: int = 64,
+        rope_base: float = 10000.0,
+        blank_as_pad: bool = True,
+        use_spelling: bool = False,
+    ):
+        self.pred_hidden = prednet['pred_hidden']
+        self.blank_idx = vocab_size
+        self.use_spelling = use_spelling
+        
+        super().__init__(vocab_size=vocab_size, blank_idx=self.blank_idx, blank_as_pad=blank_as_pad)
+
+        if max_history_length <= 0:
+            raise ValueError("max_history_length must be a positive integer.")
+        
+        if use_spelling and labels is None:
+            raise ValueError("labels must be provided when use_spelling=True.")
+
+        self.max_history_length = int(max_history_length)
+        self.labels = list(labels) if labels is not None else None
+        self.rope_base = rope_base
+        
+        # Build vocabulary mapping
+        self._build_vocab()
+
+        # Transformer configuration
+        num_layers = prednet.get("pred_num_layers", prednet.get("pred_transformer_layers", 2))
+        num_heads = prednet.get("pred_num_attention_heads", prednet.get("pred_transformer_num_heads", 4))
+        ffn_hidden = prednet.get("pred_ffn_hidden", prednet.get("pred_ffn_dim", 4 * self.pred_hidden))
+        dropout = prednet.get("dropout", 0.0)
+        activation = prednet.get("activation", "gelu")
+
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.head_dim = self.pred_hidden // num_heads
+        assert self.pred_hidden % num_heads == 0, "pred_hidden must be divisible by num_heads"
+
+        # Embeddings (no position embedding - using RoPE)
+        self.unit_embedding = nn.Embedding(self.unit_vocab_size, self.pred_hidden, padding_idx=self.pad_id)
+        self.embed_dropout = nn.Dropout(dropout)
+
+        # Transformer layers
+        self.layers = nn.ModuleList([
+            _TransformerDecoderLayer(
+                d_model=self.pred_hidden,
+                num_heads=num_heads,
+                ffn_hidden=ffn_hidden,
+                dropout=dropout,
+                activation=activation,
+            )
+            for _ in range(num_layers)
+        ])
+        self.final_norm = nn.LayerNorm(self.pred_hidden, eps=1e-5)
+
+        # Precompute RoPE frequencies
+        rope_freqs = _rope_freqs(self.head_dim, max_history_length * 2, rope_base)
+        self.register_buffer("_rope_freqs", rope_freqs, persistent=False)
+
+        # Causal mask
+        causal_mask = torch.triu(
+            torch.full((max_history_length, max_history_length), float('-inf')), diagonal=1
+        )
+        self.register_buffer("_causal_mask", causal_mask, persistent=False)
+
+        self._rnnt_export = False
+
+    def _split_token_to_units(self, token: str) -> List[str]:
+        """Split a token into character units (for spelling mode)."""
+        if self._SPECIAL_TOKEN_RE.match(token):
+            return [token]  # Keep special tokens like <unk> as atomic
+        token = token.replace("▁", " ").replace("_", " ")
+        if token == "":
+            return []
+        return list(token)
+
+    def _build_vocab(self):
+        """Build unit vocabulary and token-to-unit mapping."""
+        if self.use_spelling:
+            self._build_spelling_vocab()
+        else:
+            self._build_bpe_vocab()
+
+    def _build_bpe_vocab(self):
+        """Build identity mapping for BPE mode (each token is its own unit)."""
+        # Unit vocabulary is just the BPE vocabulary + blank + pad + bos
+        # We use: 0 = pad, 1 = bos, 2..vocab_size+1 = tokens, vocab_size+2 = blank
+        self.pad_id = 0
+        self.bos_id = 1
+        self.unit_vocab_size = self.vocab_size + 3  # pad, bos, tokens, blank
+        
+        # Token to unit mapping: token_id -> [unit_id]
+        # Each token maps to a single unit (itself shifted by 2 for pad/bos)
+        max_token_units = 1
+        token_unit_padded = torch.zeros((self.vocab_size + 1, max_token_units), dtype=torch.long)
+        token_unit_lens = torch.ones(self.vocab_size + 1, dtype=torch.long)
+        
+        for i in range(self.vocab_size):
+            token_unit_padded[i, 0] = i + 2  # Shift by 2 for pad/bos
+        
+        # Blank token maps to empty (no units added)
+        token_unit_padded[self.blank_idx, 0] = self.pad_id
+        token_unit_lens[self.blank_idx] = 0
+        
+        self.max_token_units = max_token_units
+        self.register_buffer("_token_unit_padded", token_unit_padded, persistent=False)
+        self.register_buffer("_token_unit_lens", token_unit_lens, persistent=False)
+
+    def _build_spelling_vocab(self):
+        """Build character vocabulary from token labels (for spelling mode)."""
+        unit_to_id: Dict[str, int] = {}
+        id_to_unit: List[str] = []
+
+        def add_unit(unit: str):
+            if unit not in unit_to_id:
+                unit_to_id[unit] = len(id_to_unit)
+                id_to_unit.append(unit)
+
+        add_unit("<pad>")
+        add_unit("<bos>")
+
+        for token in self.labels:
+            for unit in self._split_token_to_units(str(token)):
+                add_unit(unit)
+
+        self.unit_to_id = unit_to_id
+        self.id_to_unit = id_to_unit
+        self.pad_id = unit_to_id["<pad>"]
+        self.bos_id = unit_to_id["<bos>"]
+        self.unit_vocab_size = len(id_to_unit)
+
+        # Build token -> unit mapping
+        token_to_unit_ids: List[List[int]] = []
+        for token in self.labels:
+            units = self._split_token_to_units(str(token))
+            if not units:
+                units = []
+            token_to_unit_ids.append([unit_to_id[u] for u in units])
+
+        # Blank token maps to empty
+        token_to_unit_ids.append([])
+
+        # Create padded lookup table
+        max_token_units = max(1, max(len(ids) for ids in token_to_unit_ids) if token_to_unit_ids else 1)
+        max_token_units = min(max_token_units, self.max_history_length)
+        
+        token_unit_padded = torch.full((len(token_to_unit_ids), max_token_units), self.pad_id, dtype=torch.long)
+        token_unit_lens = torch.zeros(len(token_to_unit_ids), dtype=torch.long)
+        
+        for i, ids in enumerate(token_to_unit_ids):
+            if ids:
+                ids = ids[-max_token_units:]  # Truncate if too long
+                token_unit_lens[i] = len(ids)
+                token_unit_padded[i, :len(ids)] = torch.tensor(ids, dtype=torch.long)
+
+        self.max_token_units = max_token_units
+        self.register_buffer("_token_unit_padded", token_unit_padded, persistent=False)
+        self.register_buffer("_token_unit_lens", token_unit_lens, persistent=False)
+
+    @typecheck()
+    def forward(self, targets, target_length, states=None):
+        """Training forward pass."""
+        y = rnn.label_collate(targets)
+        
+        if self._rnnt_export:
+            add_sos = False
+        else:
+            add_sos = True
+
+        g, state = self.predict(y, state=states, add_sos=add_sos)
+        g = g.transpose(1, 2)  # [B, D, U]
+
+        return g, target_length, state
+
+    def predict(
+        self,
+        y: Optional[torch.Tensor] = None,
+        state: Optional[List[torch.Tensor]] = None,
+        add_sos: bool = True,
+        batch_size: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        """
+        Fully vectorized prediction for training and inference.
+
+        State format: [unit_history]
+        - unit_history: [B, max_history_length] right-aligned unit IDs
+        
+        Args:
+            y: Input token IDs [B, U] or None
+            state: Previous state or None for initial
+            add_sos: Whether to include BOS output (for training)
+            batch_size: Batch size if y and state are None
+            
+        Returns:
+            g: Output representations [B, output_len, pred_hidden]
+            new_state: Updated state
+        """
+        device = next(self.parameters()).device
+        dtype = next(self.parameters()).dtype
+        L = self.max_history_length
+
+        # Determine batch size and sequence length
+        if y is not None:
+            if y.device != device:
+                y = y.to(device)
+            batch, seq_len = y.shape
+        else:
+            if state is not None:
+                batch = state[0].size(0)
+            elif batch_size is not None:
+                batch = batch_size
+            else:
+                raise ValueError("batch_size required if y and state are None")
+            seq_len = 0
+
+        # Initialize or unpack state
+        if state is None:
+            # Initial state: [pad, pad, ..., pad, <bos>] (right-aligned)
+            unit_history = torch.full((batch, L), self.pad_id, device=device, dtype=torch.long)
+            unit_history[:, -1] = self.bos_id
+        else:
+            unit_history = state[0].to(device) if state[0].device != device else state[0]
+
+        # Number of outputs
+        if add_sos:
+            num_outputs = seq_len + 1  # BOS + each token
+        else:
+            num_outputs = 1  # Just final position
+
+        # ========== VECTORIZED IMPLEMENTATION ==========
+        
+        if seq_len > 0:
+            # Get unit IDs and lengths for each token: [B, U, max_token_units]
+            token_units = self._token_unit_padded[y]  # [B, U, max_token_units]
+            token_lens = self._token_unit_lens[y]     # [B, U]
+            
+            # Cumulative unit count per token
+            cum_lens = token_lens.cumsum(dim=1)  # [B, U]
+            total_new_units = cum_lens[:, -1]    # [B]
+            max_total_new = int(total_new_units.max().item())
+            
+            # Build extended unit stream: [prefix (L units) | new units]
+            stream_len = L + max_total_new
+            unit_stream = torch.full((batch, stream_len), self.pad_id, device=device, dtype=torch.long)
+            unit_stream[:, :L] = unit_history
+            
+            # Scatter new token units into the stream (vectorized)
+            if max_total_new > 0:
+                max_tu = token_units.size(2)
+                
+                # prev_cum: cumulative length before each token [B, U]
+                prev_cum = torch.cat([
+                    torch.zeros(batch, 1, device=device, dtype=torch.long),
+                    cum_lens[:, :-1]
+                ], dim=1)
+                
+                # For each (batch, token, unit_idx), compute target position
+                unit_idx = torch.arange(max_tu, device=device)  # [max_tu]
+                target_pos = L + prev_cum.unsqueeze(-1) + unit_idx  # [B, U, max_tu]
+                
+                # Mask for valid units (unit_idx < token_lens)
+                valid_mask = unit_idx.unsqueeze(0).unsqueeze(0) < token_lens.unsqueeze(-1)  # [B, U, max_tu]
+                
+                # Flatten and scatter
+                batch_idx = torch.arange(batch, device=device).view(batch, 1, 1).expand_as(target_pos)
+                
+                valid_batch = batch_idx[valid_mask]
+                valid_pos = target_pos[valid_mask]
+                valid_units = token_units[valid_mask]
+                
+                unit_stream[valid_batch, valid_pos] = valid_units
+        else:
+            unit_stream = unit_history
+            cum_lens = None
+            total_new_units = torch.zeros(batch, device=device, dtype=torch.long)
+
+        # ========== EXTRACT SLIDING WINDOWS ==========
+        
+        if add_sos and seq_len > 0:
+            cum_with_zero = torch.cat([
+                torch.zeros(batch, 1, device=device, dtype=torch.long),
+                cum_lens
+            ], dim=1)  # [B, num_outputs]
+            
+            end_positions = (L - 1) + cum_with_zero  # [B, num_outputs]
+        elif add_sos:
+            end_positions = torch.full((batch, 1), L - 1, device=device, dtype=torch.long)
+        else:
+            if seq_len > 0:
+                end_positions = (L - 1 + cum_lens[:, -1:])  # [B, 1]
+            else:
+                end_positions = torch.full((batch, 1), L - 1, device=device, dtype=torch.long)
+
+        # Extract windows using gather
+        window_starts = end_positions - L + 1  # [B, num_outputs]
+        
+        idx_offset = torch.arange(L, device=device)  # [L]
+        gather_idx = window_starts.unsqueeze(-1) + idx_offset  # [B, num_outputs, L]
+        
+        stream_len = unit_stream.size(1)
+        gather_idx = gather_idx.clamp(0, stream_len - 1)
+        
+        unit_stream_exp = unit_stream.unsqueeze(1).expand(batch, num_outputs, -1)
+        
+        windows = torch.gather(unit_stream_exp, 2, gather_idx)
+
+        # ========== TRANSFORMER FORWARD ==========
+        
+        windows_flat = windows.view(batch * num_outputs, L)
+        
+        emb = self.unit_embedding(windows_flat)  # [B * num_outputs, L, D]
+        emb = self.embed_dropout(emb)
+        
+        pos_ids = torch.arange(L, device=device)
+        
+        x = emb
+        for layer in self.layers:
+            x = layer(x, pos_ids, self._rope_freqs, self._causal_mask)
+        
+        x = self.final_norm(x)
+        
+        out_flat = x[:, -1, :]
+        
+        g = out_flat.view(batch, num_outputs, self.pred_hidden)
+
+        # ========== UPDATE STATE ==========
+        
+        new_unit_history = windows[:, -1, :]  # [B, L]
+        new_state = [new_unit_history]
+
+        if self.is_adapter_available():
+            g = self.forward_enabled_adapters(g)
+
+        return g, new_state
+
+    def initialize_state(self, y: torch.Tensor) -> List[torch.Tensor]:
+        """Initialize decoder state."""
+        batch = y.size(0)
+        device = y.device
+        
+        unit_history = torch.full(
+            (batch, self.max_history_length),
+            self.pad_id,
+            dtype=torch.long,
+            device=device,
+        )
+        unit_history[:, -1] = self.bos_id
+        
+        return [unit_history]
+
+    def score_hypothesis(
+        self, hypothesis: rnnt_utils.Hypothesis, cache: Dict[Tuple[int], Any]
+    ) -> Tuple[torch.Tensor, List[torch.Tensor], torch.Tensor]:
+        """Score a hypothesis for beam search."""
+        if hypothesis.dec_state is not None:
+            device = hypothesis.dec_state[0].device
+        else:
+            device = next(self.parameters()).device
+
+        y_sequence = (
+            hypothesis.y_sequence.tolist() if torch.is_tensor(hypothesis.y_sequence) else hypothesis.y_sequence
+        )
+        
+        is_blank = len(y_sequence) > 0 and y_sequence[-1] == self.blank_idx
+
+        target = torch.tensor([[y_sequence[-1]]], device=device, dtype=torch.long) if y_sequence else None
+        lm_token = target[:, -1] if target is not None else torch.tensor([self.blank_idx], device=device)
+
+        sequence = tuple(t for t in y_sequence if t != self.blank_idx)
+
+        if sequence in cache:
+            y, new_state = cache[sequence]
+        else:
+            if is_blank:
+                y, new_state = self.predict(None, state=hypothesis.dec_state, add_sos=False, batch_size=1)
+            else:
+                y, new_state = self.predict(target, state=hypothesis.dec_state, add_sos=False, batch_size=1)
+            y = y[:, -1:, :]
+            cache[sequence] = (y, new_state)
+
+        return y, new_state, lm_token
+
+    def batch_initialize_states(self, decoder_states: List[List[torch.Tensor]]) -> List[torch.Tensor]:
+        """Stack individual states into batched state."""
+        unit_histories = torch.stack([s[0] for s in decoder_states])
+        return [unit_histories]
+
+    def batch_select_state(self, batch_states: List[torch.Tensor], idx: int) -> List[torch.Tensor]:
+        """Select single state from batch."""
+        if batch_states is None:
+            return None
+        unit_history = batch_states[0][idx]
+        return [unit_history]
+
+    def batch_concat_states(self, batch_states: List[List[torch.Tensor]]) -> List[torch.Tensor]:
+        """Concatenate list of states into batched state."""
+        unit_histories = torch.stack([s[0] for s in batch_states])
+        return [unit_histories]
+
+    @classmethod
+    def batch_replace_states_mask(
+        cls,
+        src_states: List[torch.Tensor],
+        dst_states: List[torch.Tensor],
+        mask: torch.Tensor,
+        other_src_states: Optional[List[torch.Tensor]] = None,
+    ):
+        """Replace states based on mask."""
+        other = other_src_states if other_src_states is not None else dst_states
+        torch.where(mask.unsqueeze(-1), src_states[0], other[0], out=dst_states[0])
+
+    @classmethod
+    def batch_replace_states_all(
+        cls,
+        src_states: List[torch.Tensor],
+        dst_states: List[torch.Tensor],
+        batch_size: Optional[int] = None,
+    ):
+        """Replace all states."""
+        if batch_size is None:
+            dst_states[0].copy_(src_states[0])
+        else:
+            dst_states[0][:batch_size].copy_(src_states[0][:batch_size])
+
+    @classmethod
+    def clone_state(cls, state: List[torch.Tensor]) -> List[torch.Tensor]:
+        """Clone state."""
+        return [s.clone() for s in state]
+
+    @classmethod
+    def batch_split_states(cls, batch_states: List[torch.Tensor]) -> List[List[torch.Tensor]]:
+        """Split batched state into list of individual states."""
+        batch_size = batch_states[0].size(0)
+        return [[batch_states[0][i]] for i in range(batch_size)]
+
+    @classmethod
+    def batch_unsplit_states(
+        cls, batch_states: List[List[torch.Tensor]], device=None, dtype=None
+    ) -> List[torch.Tensor]:
+        """Unsplit list of states into batched state."""
+        unit_histories = torch.stack([s[0] for s in batch_states]).to(device=device)
+        return [unit_histories]
+
+    def batch_copy_states(
+        self,
+        old_states: List[torch.Tensor],
+        new_states: Optional[List[torch.Tensor]],
+        ids: List[int],
+        value: Optional[float] = None,
+    ) -> List[torch.Tensor]:
+        """Copy states at specific indices."""
+        if value is None:
+            old_states[0][ids] = new_states[0][ids]
+        else:
+            old_states[0][ids] = self.pad_id
+            old_states[0][ids, -1] = self.bos_id
+        return old_states
+
+    def mask_select_states(
+        self, states: Optional[List[torch.Tensor]], mask: torch.Tensor
+    ) -> Optional[List[torch.Tensor]]:
+        """Select states by mask."""
+        if states is None:
+            return None
+        return [states[0][mask]]
+
+    # Adapter support
+    def add_adapter(self, name: str, cfg: DictConfig):
+        cfg = self._update_adapter_cfg_input_dim(cfg)
+        super().add_adapter(name=name, cfg=cfg)
+
+    def _update_adapter_cfg_input_dim(self, cfg: DictConfig):
+        cfg = adapter_utils.update_adapter_cfg_input_dim(self, cfg, module_dim=self.pred_hidden)
+        return cfg
 
 
 class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMixin):
