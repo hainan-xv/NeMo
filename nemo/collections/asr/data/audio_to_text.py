@@ -42,8 +42,10 @@ from nemo.utils.get_rank import is_global_rank_zero
 __all__ = [
     'AudioToCharDataset',
     'AudioToBPEDataset',
+    'AudioToRawTextDataset',
     'TarredAudioToCharDataset',
     'TarredAudioToBPEDataset',
+    'TarredAudioToRawTextDataset',
 ]
 
 VALID_FILE_FORMATS = ';'.join(['wav', 'mp3', 'flac', 'opus'] + [fmt.lower() for fmt in valid_sf_formats.keys()])
@@ -108,6 +110,65 @@ def _speech_collate_fn(batch, pad_id):
     else:
         sample_ids = torch.tensor(sample_ids, dtype=torch.int32)
         return audio_signal, audio_lengths, tokens, tokens_lengths, sample_ids
+
+
+def _raw_text_collate_fn(batch):
+    """Collate batch of audio sig, audio len, and raw text strings.
+    
+    This collate function is used for BPE-dropout training where tokenization
+    is performed on-the-fly during training_step rather than during data loading.
+    
+    Args:
+        batch: A list of tuples of (signal, signal_length, raw_text_string) or
+               (signal, signal_length, raw_text_string, sample_id).
+    
+    Returns:
+        audio_signal: Batched and padded audio signals tensor.
+        audio_lengths: Audio lengths tensor.
+        raw_texts: List of raw text strings.
+        sample_ids: Optional tensor of sample IDs.
+    """
+    packed_batch = list(zip(*batch))
+    if len(packed_batch) == 4:
+        _, audio_lengths, raw_texts, sample_ids = packed_batch
+    elif len(packed_batch) == 3:
+        sample_ids = None
+        _, audio_lengths, raw_texts = packed_batch
+    else:
+        raise ValueError("Expects 3 or 4 elements in the batch!")
+    
+    max_audio_len = 0
+    has_audio = audio_lengths[0] is not None
+    if has_audio:
+        max_audio_len = max(audio_lengths).item()
+    
+    audio_signal = []
+    for b in batch:
+        if len(b) == 4:
+            sig, sig_len, _, _ = b
+        else:
+            sig, sig_len, _ = b
+        if has_audio:
+            sig_len = sig_len.item()
+            if sig_len < max_audio_len:
+                pad = (0, max_audio_len - sig_len)
+                sig = torch.nn.functional.pad(sig, pad)
+            audio_signal.append(sig)
+    
+    if has_audio:
+        audio_signal = torch.stack(audio_signal)
+        audio_lengths = torch.stack(audio_lengths)
+    else:
+        audio_signal, audio_lengths = None, None
+    
+    # raw_texts remains as a list of strings
+    raw_texts = list(raw_texts)
+    
+    if sample_ids is None:
+        return audio_signal, audio_lengths, raw_texts
+    else:
+        sample_ids = torch.tensor(sample_ids, dtype=torch.int32)
+        return audio_signal, audio_lengths, raw_texts, sample_ids
 
 
 class ASRManifestProcessor:
@@ -730,6 +791,119 @@ class AudioToBPEDataset(_AudioTextDataset):
         )
 
 
+class AudioToRawTextDataset(Dataset):
+    """
+    Dataset that loads audio and returns raw text (not tokenized) for BPE-dropout training.
+    
+    This dataset is similar to AudioToBPEDataset but returns raw text strings instead of
+    tokenized IDs. Tokenization with BPE-dropout is performed during training_step.
+    
+    Args:
+        manifest_filepath: Path to manifest json. Can be comma-separated paths.
+        tokenizer: A subclass of TokenizerSpec. Used only for extracting BOS/EOS IDs.
+        sample_rate (int): Sample rate to resample loaded audio to
+        int_values (bool): If true, load samples as 32-bit integers. Defaults to False.
+        augmentor: An AudioAugmentor object used to augment loaded audio
+        max_duration: If audio exceeds this length, do not include in dataset
+        min_duration: If audio is less than this length, do not include in dataset
+        max_utts: Limit number of utterances
+        trim: Whether to trim silence segments
+        return_sample_id (bool): whether to return the sample_id as a part of each sample
+        channel_selector: select a single channel or a subset of channels from multi-channel audio.
+        manifest_parse_func: Optional function to parse manifest entries.
+    """
+
+    @property
+    def output_types(self) -> Optional[Dict[str, NeuralType]]:
+        """Returns definitions of module output ports."""
+        return {
+            'audio_signal': NeuralType(('B', 'T'), AudioSignal()),
+            'a_sig_length': NeuralType(tuple('B'), LengthsType()),
+            'raw_text': NeuralType(None, StringType(), optional=True),  # Raw text string
+            'sample_id': NeuralType(tuple('B'), LengthsType(), optional=True),
+        }
+
+    def __init__(
+        self,
+        manifest_filepath: str,
+        tokenizer: 'nemo.collections.common.tokenizers.TokenizerSpec',
+        sample_rate: int,
+        int_values: bool = False,
+        augmentor: 'nemo.collections.asr.parts.perturb.AudioAugmentor' = None,
+        max_duration: Optional[int] = None,
+        min_duration: Optional[int] = None,
+        max_utts: int = 0,
+        trim: bool = False,
+        return_sample_id: bool = False,
+        channel_selector: Optional[ChannelSelectorType] = None,
+        manifest_parse_func: Optional[Callable] = None,
+    ):
+        if type(manifest_filepath) == str:
+            manifest_filepath = manifest_filepath.split(",")
+
+        # Cache manifests and audio from object store if necessary
+        cache_datastore_manifests(manifest_filepaths=manifest_filepath, cache_audio=True)
+
+        # Use a dummy parser that just returns the raw text
+        class RawTextParser:
+            def __call__(self, text):
+                return text  # Return raw text, not tokenized
+
+        # We need to create a collection but we use a dummy parser that returns raw text
+        # The collection will store raw text in text_tokens field
+        self.collection = collections.ASRAudioText(
+            manifests_files=manifest_filepath,
+            parser=RawTextParser(),
+            min_duration=min_duration,
+            max_duration=max_duration,
+            max_number=max_utts,
+            parse_func=manifest_parse_func,
+        )
+
+        self.featurizer = WaveformFeaturizer(sample_rate=sample_rate, int_values=int_values, augmentor=augmentor)
+        self.trim = trim
+        self.return_sample_id = return_sample_id
+        self.channel_selector = channel_selector
+
+    def get_manifest_sample(self, sample_id):
+        return self.collection[sample_id]
+
+    def __getitem__(self, index):
+        sample = self.collection[index]
+        offset = sample.offset
+
+        if offset is None:
+            offset = 0
+
+        features = self.featurizer.process(
+            sample.audio_file,
+            offset=offset,
+            duration=sample.duration,
+            trim=self.trim,
+            orig_sr=sample.orig_sr,
+            channel_selector=self.channel_selector,
+        )
+        f, fl = features, torch.tensor(features.shape[0]).long()
+
+        # Return raw text string (stored in sample.text_raw field)
+        raw_text = sample.text_raw
+
+        if self.return_sample_id:
+            return f, fl, raw_text, index
+        else:
+            return f, fl, raw_text
+
+    def __len__(self):
+        return len(self.collection)
+
+    def _collate_fn(self, batch):
+        return _raw_text_collate_fn(batch)
+
+    @property
+    def collate_fn(self):
+        return self._collate_fn
+
+
 @deprecated(
     explanation='Webdataset support will be removed in v2.1.0 versions, please use LhotseSpeechToTextBpeDataset class instead'
 )
@@ -1341,6 +1515,226 @@ class TarredAudioToBPEDataset(_TarredAudioToTextDataset):
             return_sample_id=return_sample_id,
             manifest_parse_func=manifest_parse_func,
         )
+
+
+class TarredAudioToRawTextDataset(IterableDataset):
+    """
+    Tarred dataset that returns raw text (not tokenized) for BPE-dropout training.
+    
+    Similar to TarredAudioToBPEDataset but returns raw text strings instead of
+    tokenized IDs. Tokenization with BPE-dropout is performed during training_step.
+    
+    Args:
+        audio_tar_filepaths: Either a list of audio tarball filepaths, or a
+            string (can be brace-expandable).
+        manifest_filepath (str): Path to the manifest.
+        tokenizer: A subclass of TokenizerSpec. Used only for extracting BOS/EOS IDs.
+        sample_rate (int): Sample rate to resample loaded audio to
+        int_values (bool): If true, load samples as 32-bit integers. Defaults to False.
+        augmentor: An AudioAugmentor object used to augment loaded audio
+        shuffle_n (int): How many samples to look ahead and load to be shuffled.
+        min_duration (float): All training files which have a duration less than
+            min_duration are dropped.
+        max_duration (float): All training files which have a duration more than
+            max_duration are dropped.
+        trim (bool): Whether to use trim silence from beginning and end of audio.
+        shard_strategy (str): Tarred dataset shard distribution strategy.
+        shard_manifests (bool): Whether to shard manifests.
+        global_rank (int): Worker rank, used for partitioning shards.
+        world_size (int): Total number of processes, used for partitioning shards.
+        return_sample_id (bool): whether to return the sample_id as a part of each sample.
+        manifest_parse_func: Optional function to parse manifest entries.
+    """
+
+    def __init__(
+        self,
+        audio_tar_filepaths: Union[str, List[str]],
+        manifest_filepath: str,
+        tokenizer: 'nemo.collections.common.tokenizers.TokenizerSpec',
+        sample_rate: int,
+        int_values: bool = False,
+        augmentor: Optional['nemo.collections.asr.parts.perturb.AudioAugmentor'] = None,
+        shuffle_n: int = 0,
+        min_duration: Optional[float] = None,
+        max_duration: Optional[float] = None,
+        trim: bool = False,
+        shard_strategy: str = "scatter",
+        shard_manifests: bool = False,
+        global_rank: int = 0,
+        world_size: int = 0,
+        return_sample_id: bool = False,
+        manifest_parse_func: Optional[Callable] = None,
+    ):
+        self.shard_manifests = shard_manifests
+
+        # Shard manifests if necessary and possible and then expand the paths
+        manifest_filepath = shard_manifests_if_needed(
+            shard_manifests=shard_manifests,
+            shard_strategy=shard_strategy,
+            manifest_filepaths=manifest_filepath,
+            world_size=world_size,
+            global_rank=global_rank,
+        )
+
+        # Cache manifests from object store if necessary
+        cache_datastore_manifests(manifest_filepaths=manifest_filepath)
+
+        # Use a dummy parser that just returns the raw text
+        class RawTextParser:
+            def __call__(self, text):
+                return text  # Return raw text, not tokenized
+
+        self.manifest_processor = ASRManifestProcessor(
+            manifest_filepath=manifest_filepath,
+            parser=RawTextParser(),
+            max_duration=max_duration,
+            min_duration=min_duration,
+            max_utts=0,
+            bos_id=None,
+            eos_id=None,
+            pad_id=0,
+            index_by_file_id=True,  # Must set this so the manifest lines can be indexed by file ID
+            manifest_parse_func=manifest_parse_func,
+        )
+
+        self.len = self._compute_len()
+
+        self.featurizer = WaveformFeaturizer(sample_rate=sample_rate, int_values=int_values, augmentor=augmentor)
+        self.trim = trim
+        self.return_sample_id = return_sample_id
+
+        audio_tar_filepaths = expand_sharded_filepaths(
+            sharded_filepaths=audio_tar_filepaths,
+            shard_strategy=shard_strategy,
+            world_size=world_size,
+            global_rank=global_rank,
+        )
+
+        # Put together WebDataset pipeline
+        self._dataset = wds.DataPipeline(
+            wds.SimpleShardList(urls=audio_tar_filepaths),
+            webdataset_split_by_workers,
+            wds.shuffle(shuffle_n),
+            wds.tarfile_to_samples(),
+            wds.rename(audio=VALID_FILE_FORMATS, key='__key__'),
+            wds.to_tuple('audio', 'key'),
+            self._filter,
+            self._loop_offsets,
+            wds.map(self._build_sample),
+        )
+
+    def _filter(self, iterator):
+        """Filter out samples that have been filtered by manifest processor."""
+
+        class TarredAudioFilter:
+            def __init__(self, collection):
+                self.iterator = iterator
+                self.collection = collection
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                while True:
+                    audio_bytes, audio_filename = next(self.iterator)
+                    file_id, _ = os.path.splitext(os.path.basename(audio_filename))
+                    if file_id in self.collection.mapping:
+                        return audio_bytes, audio_filename
+
+        return TarredAudioFilter(self.manifest_processor.collection)
+
+    def _loop_offsets(self, iterator):
+        """Iterate through utterances with different offsets for each file."""
+
+        class TarredAudioLoopOffsets:
+            def __init__(self, collection):
+                self.iterator = iterator
+                self.collection = collection
+                self.current_fn = None
+                self.current_bytes = None
+                self.offset_id = 0
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                if self.current_fn is None:
+                    self.current_bytes, self.current_fn = next(self.iterator)
+                    self.offset_id = 0
+                else:
+                    offset_list = self.collection.mapping[self.current_fn]
+                    if len(offset_list) == self.offset_id + 1:
+                        self.current_bytes, self.current_fn = next(self.iterator)
+                        self.offset_id = 0
+                    else:
+                        self.offset_id += 1
+
+                return self.current_bytes, self.current_fn, self.offset_id
+
+        return TarredAudioLoopOffsets(self.manifest_processor.collection)
+
+    def _collate_fn(self, batch):
+        return _raw_text_collate_fn(batch)
+
+    @property
+    def collate_fn(self):
+        return self._collate_fn
+
+    def _build_sample(self, tup):
+        """Builds the training sample by combining the data from the WebDataset with the manifest info."""
+        audio_bytes, audio_filename, offset_id = tup
+
+        # Grab manifest entry from self.manifest_processor.collection
+        file_id, _ = os.path.splitext(os.path.basename(audio_filename))
+
+        manifest_idx = self.manifest_processor.collection.mapping[file_id][offset_id]
+        manifest_entry = self.manifest_processor.collection[manifest_idx]
+
+        offset = manifest_entry.offset
+        if offset is None:
+            offset = 0
+
+        # Convert audio bytes to IO stream for processing
+        audio_filestream = io.BytesIO(audio_bytes)
+        features = self.featurizer.process(
+            audio_filestream,
+            offset=offset,
+            duration=manifest_entry.duration,
+            trim=self.trim,
+            orig_sr=manifest_entry.orig_sr,
+        )
+        audio_filestream.close()
+
+        # Audio features
+        f, fl = features, torch.tensor(features.shape[0]).long()
+
+        # Raw text (stored in manifest_entry.text_raw)
+        raw_text = manifest_entry.text_raw
+
+        if self.return_sample_id:
+            return f, fl, raw_text, manifest_idx
+        else:
+            return f, fl, raw_text
+
+    def get_manifest_sample(self, sample_id):
+        return self.manifest_processor.collection[sample_id]
+
+    def __iter__(self):
+        return self._dataset.__iter__()
+
+    def _compute_len(self):
+        if self.shard_manifests and torch.distributed.is_available() and torch.distributed.is_initialized():
+            my_len = torch.tensor(len(self.manifest_processor.collection), dtype=torch.int32).cuda()
+            torch.distributed.all_reduce(my_len)
+            my_len = my_len.int()
+            logging.info(f'Sharded manifests: Total length: {my_len}')
+        else:
+            my_len = len(self.manifest_processor.collection)
+
+        return my_len
+
+    def __len__(self):
+        return self.len
 
 
 class BucketingDataset(IterableDataset):

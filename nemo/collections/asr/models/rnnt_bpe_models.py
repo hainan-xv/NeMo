@@ -23,7 +23,7 @@ from omegaconf import DictConfig, ListConfig, OmegaConf, open_dict
 from nemo.collections.asr.data import audio_to_text_dataset
 from nemo.collections.asr.data.audio_to_text import _AudioTextDataset
 from nemo.collections.asr.data.audio_to_text_dali import AudioToBPEDALIDataset
-from nemo.collections.asr.data.audio_to_text_lhotse import LhotseSpeechToTextBpeDataset
+from nemo.collections.asr.data.audio_to_text_lhotse import LhotseSpeechToTextBpeDataset, LhotseSpeechToRawTextDataset
 from nemo.collections.asr.losses.rnnt import RNNTLoss
 from nemo.collections.asr.metrics.wer import WER
 from nemo.collections.asr.models.rnnt_models import EncDecRNNTModel
@@ -337,6 +337,23 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
             self.joint.set_loss(self.loss)
             self.joint.set_wer(self.wer)
 
+        # Setup BPE-dropout parameters (training only)
+        self._bpe_dropout = cfg.get('train_ds', {}).get('bpe_dropout', 0.0)
+        self._bpe_dropout_debug_counter = 0  # Counter for debug printing
+        self._bpe_dropout_debug_interval = 100  # Print every N batches (set to 1 to print every batch)
+        if self._bpe_dropout and self._bpe_dropout > 0.0:
+            logging.info(f"BPE-dropout enabled with alpha={self._bpe_dropout}")
+            # Store BOS/EOS IDs for tokenization
+            self._use_start_end_token = cfg.get('train_ds', {}).get('use_start_end_token', True)
+            if self._use_start_end_token and hasattr(self.tokenizer, "bos_id") and self.tokenizer.bos_id > 0:
+                self._bpe_bos_id = self.tokenizer.bos_id
+            else:
+                self._bpe_bos_id = None
+            if self._use_start_end_token and hasattr(self.tokenizer, "eos_id") and self.tokenizer.eos_id > 0:
+                self._bpe_eos_id = self.tokenizer.eos_id
+            else:
+                self._bpe_eos_id = None
+
     def change_vocabulary(
         self,
         new_tokenizer_dir: Union[str, DictConfig],
@@ -507,6 +524,19 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
 
     def _setup_dataloader_from_config(self, config: Optional[Dict]):
         if config.get("use_lhotse"):
+            # Check if BPE-dropout is enabled - use raw text dataset for on-the-fly tokenization
+            bpe_dropout = config.get('bpe_dropout', 0.0)
+            if bpe_dropout and bpe_dropout > 0.0:
+                logging.info(f"Lhotse dataset with BPE-dropout enabled (alpha={bpe_dropout}). Using raw text dataset.")
+                lhotse_dataset = LhotseSpeechToRawTextDataset(
+                    return_cuts=config.get("do_transcribe", False),
+                )
+            else:
+                lhotse_dataset = LhotseSpeechToTextBpeDataset(
+                    tokenizer=self.tokenizer,
+                    return_cuts=config.get("do_transcribe", False),
+                )
+            
             return get_lhotse_dataloader_from_config(
                 config,
                 # During transcription, the model is initially loaded on the CPU.
@@ -514,10 +544,7 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
                 # these values must be passed from the configuration.
                 global_rank=self.global_rank if not config.get("do_transcribe", False) else config.get("global_rank"),
                 world_size=self.world_size if not config.get("do_transcribe", False) else config.get("world_size"),
-                dataset=LhotseSpeechToTextBpeDataset(
-                    tokenizer=self.tokenizer,
-                    return_cuts=config.get("do_transcribe", False),
-                ),
+                dataset=lhotse_dataset,
                 tokenizer=self.tokenizer,
             )
 
@@ -614,3 +641,111 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
 
         temporary_datalayer = self._setup_dataloader_from_config(config=DictConfig(dl_config))
         return temporary_datalayer
+
+    def _tokenize_batch_with_bpe_dropout(self, raw_texts: list, device: torch.device, debug_print: bool = True) -> tuple:
+        """
+        Tokenize a batch of raw text strings with BPE-dropout.
+        
+        Args:
+            raw_texts: List of raw text strings.
+            device: Device to place the tensors on.
+            debug_print: If True, print tokenization details for first sample.
+        
+        Returns:
+            Tuple of (transcript_tensor, transcript_lengths_tensor).
+        """
+        import re
+        debug_print = False
+        batch_tokens = []
+
+        for idx, text in enumerate(raw_texts):
+            # Preprocess text: strip whitespace and collapse multiple spaces
+            if isinstance(text, str):
+                text = text.strip()
+                text = re.sub(r' +', ' ', text)
+            
+            # Tokenize with BPE-dropout (sample_alpha)
+            tokens = self.tokenizer.text_to_ids(text, sample_alpha=self._bpe_dropout)
+            
+            # Debug print for the first sample in batch
+            if debug_print and idx == 0:
+                # Convert token IDs back to tokens (subwords) for visualization
+                if hasattr(self.tokenizer, 'ids_to_tokens'):
+                    subwords = self.tokenizer.ids_to_tokens(tokens)
+                elif hasattr(self.tokenizer, 'tokenizer') and hasattr(self.tokenizer.tokenizer, 'id_to_piece'):
+                    # SentencePiece tokenizer
+                    subwords = [self.tokenizer.tokenizer.id_to_piece(t) for t in tokens]
+                else:
+                    subwords = [f"<id:{t}>" for t in tokens]
+                
+                # Show tokenization with visible subword boundaries
+                # SentencePiece uses ▁ (U+2581) for word boundaries, we keep it visible
+                subwords_str = " | ".join(subwords)
+                
+                print(f"\n[BPE-Dropout Tokenization (alpha={self._bpe_dropout})]")
+                print(f"  Original text: '{text}'")
+                print(f"  Token IDs ({len(tokens)}): {tokens}")
+                print(f"  Subwords: {subwords_str}")
+                print(f"  Decoded back: '{self.tokenizer.ids_to_text(tokens)}'")
+            
+            # Add BOS/EOS tokens if configured
+            if self._bpe_bos_id is not None:
+                tokens = [self._bpe_bos_id] + tokens
+            if self._bpe_eos_id is not None:
+                tokens = tokens + [self._bpe_eos_id]
+            
+            batch_tokens.append(tokens)
+        
+        # Compute lengths
+        lengths = [len(t) for t in batch_tokens]
+        max_len = max(lengths)
+        
+        # Pad sequences
+        pad_id = self.tokenizer.pad_id if hasattr(self.tokenizer, 'pad_id') and self.tokenizer.pad_id > 0 else 0
+        padded_tokens = []
+        for tokens in batch_tokens:
+            if len(tokens) < max_len:
+                tokens = tokens + [pad_id] * (max_len - len(tokens))
+            padded_tokens.append(tokens)
+        
+        # Convert to tensors
+        transcript = torch.tensor(padded_tokens, dtype=torch.long, device=device)
+        transcript_len = torch.tensor(lengths, dtype=torch.long, device=device)
+        
+        return transcript, transcript_len
+
+    def training_step(self, batch, batch_nb):
+        """
+        Training step with BPE-dropout support.
+        
+        When BPE-dropout is enabled, the batch contains raw text strings instead of
+        tokenized IDs. This method tokenizes the text on-the-fly with BPE-dropout.
+        """
+        # Check if we have raw text (BPE-dropout mode) or tokenized data
+        if self._bpe_dropout and self._bpe_dropout > 0.0:
+            # Determine batch format by checking the third element
+            # Raw text dataset: (signal, signal_len, raw_texts) or (signal, signal_len, raw_texts, sample_ids)
+            # Tokenized dataset: (signal, signal_len, transcript, transcript_len) or with sample_ids
+            
+            third_element = batch[2]
+            
+            # Check if third element is a list of strings (raw text mode)
+            if isinstance(third_element, list) and len(third_element) > 0 and isinstance(third_element[0], str):
+                # Raw text mode
+                signal, signal_len = batch[0], batch[1]
+                raw_texts = third_element
+                
+                # Control debug printing frequency
+                self._bpe_dropout_debug_counter += 1
+                should_print = (self._bpe_dropout_debug_counter % self._bpe_dropout_debug_interval) == 1
+                
+                # Tokenize with BPE-dropout
+                transcript, transcript_len = self._tokenize_batch_with_bpe_dropout(
+                    raw_texts, signal.device, debug_print=should_print
+                )
+                # Reconstruct batch in the expected format (signal, signal_len, transcript, transcript_len)
+                batch = (signal, signal_len, transcript, transcript_len)
+            # else: batch is already in tokenized format, pass through as-is
+        
+        # Call parent training_step
+        return super().training_step(batch, batch_nb)

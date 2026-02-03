@@ -243,6 +243,117 @@ def get_bpe_dataset(
     return dataset
 
 
+def get_raw_text_dataset(
+    config: dict, tokenizer: 'TokenizerSpec', augmentor: Optional['AudioAugmentor'] = None
+) -> audio_to_text.AudioToRawTextDataset:
+    """
+    Instantiates an AudioToRawTextDataset for BPE-dropout training.
+    
+    This dataset returns raw text instead of tokenized IDs, allowing tokenization
+    with BPE-dropout to be performed during training_step.
+
+    Args:
+        config: Config of the AudioToRawTextDataset.
+        tokenizer: An instance of a TokenizerSpec object.
+        augmentor: Optional AudioAugmentor object for augmentations on audio data.
+
+    Returns:
+        An instance of AudioToRawTextDataset.
+    """
+    dataset = audio_to_text.AudioToRawTextDataset(
+        manifest_filepath=config['manifest_filepath'],
+        tokenizer=tokenizer,
+        sample_rate=config['sample_rate'],
+        int_values=config.get('int_values', False),
+        augmentor=augmentor,
+        max_duration=config.get('max_duration', None),
+        min_duration=config.get('min_duration', None),
+        max_utts=config.get('max_utts', 0),
+        trim=config.get('trim_silence', False),
+        return_sample_id=config.get('return_sample_id', False),
+        channel_selector=config.get('channel_selector', None),
+    )
+    return dataset
+
+
+def get_tarred_raw_text_dataset(
+    config: dict,
+    shuffle_n: int,
+    global_rank: int,
+    world_size: int,
+    tokenizer: 'TokenizerSpec',
+    augmentor: Optional['AudioAugmentor'] = None,
+) -> audio_to_text.TarredAudioToRawTextDataset:
+    """
+    Instantiates a TarredAudioToRawTextDataset for BPE-dropout training.
+    
+    This dataset returns raw text instead of tokenized IDs, allowing tokenization
+    with BPE-dropout to be performed during training_step.
+
+    Args:
+        config: Config of the TarredAudioToRawTextDataset.
+        shuffle_n: How many samples to look ahead and load to be shuffled.
+        global_rank: Global rank of this device.
+        world_size: Global world size in the training method.
+        tokenizer: An instance of a TokenizerSpec object.
+        augmentor: Optional AudioAugmentor object for augmentations on audio data.
+
+    Returns:
+        An instance of TarredAudioToRawTextDataset.
+    """
+    tarred_audio_filepaths = config['tarred_audio_filepaths']
+    manifest_filepaths = config['manifest_filepath']
+    datasets = []
+    tarred_audio_filepaths = convert_to_config_list(tarred_audio_filepaths)
+    manifest_filepaths = convert_to_config_list(manifest_filepaths)
+
+    bucketing_weights = config.get('bucketing_weights', None)
+    if bucketing_weights:
+        for idx, weight in enumerate(bucketing_weights):
+            if not isinstance(weight, int) or weight <= 0:
+                raise ValueError("bucket weights must be positive integers")
+
+    if len(manifest_filepaths) != len(tarred_audio_filepaths):
+        raise ValueError(
+            f"manifest_filepaths (length={len(manifest_filepaths)}) and tarred_audio_filepaths (length={len(tarred_audio_filepaths)}) need to have the same number of buckets."
+        )
+
+    for dataset_idx, (tarred_audio_filepath, manifest_filepath) in enumerate(
+        zip(tarred_audio_filepaths, manifest_filepaths)
+    ):
+        if len(tarred_audio_filepath) == 1:
+            tarred_audio_filepath = tarred_audio_filepath[0]
+        if len(manifest_filepath) == 1:
+            manifest_filepath = manifest_filepath[0]
+
+        dataset = audio_to_text.TarredAudioToRawTextDataset(
+            audio_tar_filepaths=tarred_audio_filepath,
+            manifest_filepath=manifest_filepath,
+            tokenizer=tokenizer,
+            sample_rate=config['sample_rate'],
+            int_values=config.get('int_values', False),
+            augmentor=augmentor,
+            shuffle_n=shuffle_n,
+            max_duration=config.get('max_duration', None),
+            min_duration=config.get('min_duration', None),
+            trim=config.get('trim_silence', False),
+            shard_strategy=config.get('tarred_shard_strategy', 'scatter'),
+            shard_manifests=config.get('shard_manifests', False),
+            global_rank=global_rank,
+            world_size=world_size,
+            return_sample_id=config.get('return_sample_id', False),
+        )
+        if bucketing_weights:
+            [datasets.append(dataset) for _ in range(bucketing_weights[dataset_idx])]
+        else:
+            datasets.append(dataset)
+
+    if len(datasets) == 1:
+        return datasets[0]
+
+    return ChainDataset(datasets)
+
+
 def get_concat_tarred_dataset(
     config: dict,
     shuffle_n: int,
@@ -798,7 +909,46 @@ def get_audio_to_text_bpe_dataset_from_config(
             tokenizer=tokenizer,
             augmentor=augmentor,
         )
-    # Instantiate tarred dataset loader or normal dataset loader
+    # Check if BPE-dropout is enabled (use raw text datasets for on-the-fly tokenization)
+    bpe_dropout = config.get('bpe_dropout', 0.0)
+    use_raw_text = bpe_dropout is not None and bpe_dropout > 0.0
+    
+    if use_raw_text:
+        logging.info(f"BPE-dropout enabled with alpha={bpe_dropout}. Using raw text datasets for on-the-fly tokenization.")
+        
+        # Handle BPE-dropout: use raw text datasets
+        if config.get('is_tarred', False):
+            if ('tarred_audio_filepaths' in config and config['tarred_audio_filepaths'] is None) or (
+                'manifest_filepath' in config and config['manifest_filepath'] is None
+            ):
+                logging.warning(
+                    "Could not load dataset as `manifest_filepath` was None or "
+                    f"`tarred_audio_filepaths` is None. Provided config : {config}"
+                )
+                return None
+            
+            shuffle_n = config.get('shuffle_n', 4 * config['batch_size']) if shuffle else 0
+            # Note: concat not supported for raw text datasets yet
+            if is_concat:
+                logging.warning("Concat datasets with BPE-dropout not yet supported. Using single dataset.")
+            dataset = get_tarred_raw_text_dataset(
+                config=config,
+                tokenizer=tokenizer,
+                shuffle_n=shuffle_n,
+                global_rank=global_rank,
+                world_size=world_size,
+                augmentor=augmentor,
+            )
+        else:
+            if 'manifest_filepath' in config and config['manifest_filepath'] is None:
+                logging.warning(f"Could not load dataset as `manifest_filepath` was None. Provided config : {config}")
+                return None
+            # Note: concat not supported for raw text datasets yet
+            if is_concat:
+                logging.warning("Concat datasets with BPE-dropout not yet supported. Using single dataset.")
+            dataset = get_raw_text_dataset(config=config, tokenizer=tokenizer, augmentor=augmentor)
+    
+    # Instantiate tarred dataset loader or normal dataset loader (standard tokenized datasets)
     elif config.get('is_tarred', False):
         if ('tarred_audio_filepaths' in config and config['tarred_audio_filepaths'] is None) or (
             'manifest_filepath' in config and config['manifest_filepath'] is None
@@ -842,6 +992,7 @@ def get_audio_to_text_bpe_dataset_from_config(
             )
         else:
             dataset = get_bpe_dataset(config=config, tokenizer=tokenizer, augmentor=augmentor)
+    
     return dataset
 
 

@@ -66,3 +66,38 @@ class LhotseSpeechToTextBpeDataset(torch.utils.data.Dataset):
         if self.return_cuts:
             return audio, audio_lens, tokens, token_lens, cuts.drop_in_memory_data()
         return audio, audio_lens, tokens, token_lens
+
+
+class LhotseSpeechToRawTextDataset(torch.utils.data.Dataset):
+    """
+    Lhotse dataset that returns raw text instead of tokenized IDs for BPE-dropout training.
+    
+    Tokenization with BPE-dropout is performed during training_step instead of during
+    data loading, allowing for different tokenizations each time the same text is seen.
+    """
+
+    @property
+    def output_types(self) -> Optional[Dict[str, NeuralType]]:
+        return {
+            'audio_signal': NeuralType(('B', 'T'), AudioSignal()),
+            'a_sig_length': NeuralType(tuple('B'), LengthsType()),
+            'raw_text': NeuralType(None, optional=True),  # Raw text strings
+        }
+
+    def __init__(self, return_cuts: bool = False):
+        super().__init__()
+        self.load_audio = AudioSamples(fault_tolerant=True)
+        self.return_cuts = return_cuts
+
+    def __getitem__(self, cuts) -> Tuple[torch.Tensor, ...]:
+        audio, audio_lens, cuts = self.load_audio(cuts)
+        
+        # Collect raw text from supervisions (concatenate if multiple supervisions per cut)
+        raw_texts = []
+        for c in cuts:
+            texts = [s.text or "" for s in c.supervisions]
+            raw_texts.append(" ".join(texts))
+        
+        if self.return_cuts:
+            return audio, audio_lens, raw_texts, cuts.drop_in_memory_data()
+        return audio, audio_lens, raw_texts
