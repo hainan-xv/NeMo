@@ -14,8 +14,12 @@
 import torch
 from omegaconf import DictConfig, open_dict
 from torch import nn
-from transformers import BertConfig
-from transformers.models.bert.modeling_bert import BertEncoder
+try:
+    from transformers import BertConfig
+    from transformers.models.bert.modeling_bert import BertEncoder
+except ImportError:
+    BertConfig = None
+    BertEncoder = None
 
 from nemo.collections.asr.models import ASRModel
 from nemo.collections.asr.modules.conformer_encoder import ConformerEncoder, ConformerMultiLayerFeatureExtractor

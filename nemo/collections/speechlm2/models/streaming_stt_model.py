@@ -24,7 +24,10 @@ from lightning import LightningModule
 from lightning.pytorch.utilities.model_summary import ModelSummary
 from omegaconf import DictConfig
 from torch import Tensor
-from torch.distributed.tensor.parallel import loss_parallel
+try:
+    from torch.distributed.tensor.parallel import loss_parallel
+except ImportError:
+    loss_parallel = None
 from transformers import GenerationConfig
 
 from nemo.collections.asr.inference.streaming.buffering.cache_feature_bufferer import BatchedCacheFeatureBufferer

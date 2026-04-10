@@ -19,6 +19,9 @@ from typing import Callable, cast
 import torch
 import torch.nn as nn
 
+if not hasattr(nn, 'Buffer'):
+    nn.Buffer = torch.Tensor
+
 from nemo.collections.asr.parts.context_biasing.boosting_graph_batched import (
     BoostingTreeModelConfig,
     GPUBoostingTreeModel,

@@ -24,16 +24,24 @@ import torch.nn.functional as F
 from lightning import LightningModule
 from omegaconf import DictConfig
 from peft import PeftModel
-from torch.distributed.fsdp import fully_shard
-from torch.distributed.tensor import Replicate, Shard
-from torch.distributed.tensor.parallel import (
-    ColwiseParallel,
-    PrepareModuleInput,
-    RowwiseParallel,
-    SequenceParallel,
-    loss_parallel,
-    parallelize_module,
-)
+try:
+    from torch.distributed.fsdp import fully_shard
+except ImportError:
+    fully_shard = None
+try:
+    from torch.distributed.tensor import Replicate, Shard
+    from torch.distributed.tensor.parallel import (
+        ColwiseParallel,
+        PrepareModuleInput,
+        RowwiseParallel,
+        SequenceParallel,
+        loss_parallel,
+        parallelize_module,
+    )
+except ImportError:
+    Replicate = Shard = None
+    ColwiseParallel = PrepareModuleInput = RowwiseParallel = None
+    SequenceParallel = loss_parallel = parallelize_module = None
 
 from nemo.collections.audio.parts.utils.transforms import resample
 from nemo.collections.common.tokenizers import AutoTokenizer

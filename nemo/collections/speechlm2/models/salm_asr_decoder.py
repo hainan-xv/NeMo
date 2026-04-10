@@ -24,16 +24,24 @@ from lightning import LightningModule
 from omegaconf import DictConfig, open_dict
 from peft import PeftModel
 from torch import Tensor
-from torch.distributed.fsdp import fully_shard, register_fsdp_forward_method
-from torch.distributed.tensor import Replicate, Shard
-from torch.distributed.tensor.parallel import (
-    ColwiseParallel,
-    PrepareModuleInput,
-    RowwiseParallel,
-    SequenceParallel,
-    loss_parallel,
-    parallelize_module,
-)
+try:
+    from torch.distributed.fsdp import fully_shard, register_fsdp_forward_method
+except ImportError:
+    fully_shard = register_fsdp_forward_method = None
+try:
+    from torch.distributed.tensor import Replicate, Shard
+    from torch.distributed.tensor.parallel import (
+        ColwiseParallel,
+        PrepareModuleInput,
+        RowwiseParallel,
+        SequenceParallel,
+        loss_parallel,
+        parallelize_module,
+    )
+except ImportError:
+    Replicate = Shard = None
+    ColwiseParallel = PrepareModuleInput = RowwiseParallel = None
+    SequenceParallel = loss_parallel = parallelize_module = None
 from transformers import GenerationConfig
 
 from nemo.collections.common.data.lhotse import NeMoMultimodalConversation

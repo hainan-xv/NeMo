@@ -11,14 +11,30 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from .duplex_ear_tts import DuplexEARTTS
-from .duplex_s2s_model import DuplexS2SModel
-from .duplex_s2s_speech_decoder_model import DuplexS2SSpeechDecoderModel
-from .duplex_stt_model import DuplexSTTModel
-from .nemotron_voicechat import NemotronVoiceChat
 from .salm import SALM
 from .salm_asr_decoder import SALMWithAsrDecoder
 from .streaming_stt_model import StreamingState, StreamingSTTModel
+
+try:
+    from .duplex_ear_tts import DuplexEARTTS
+except ImportError:
+    DuplexEARTTS = None
+try:
+    from .duplex_s2s_model import DuplexS2SModel
+except ImportError:
+    DuplexS2SModel = None
+try:
+    from .duplex_s2s_speech_decoder_model import DuplexS2SSpeechDecoderModel
+except ImportError:
+    DuplexS2SSpeechDecoderModel = None
+try:
+    from .duplex_stt_model import DuplexSTTModel
+except ImportError:
+    DuplexSTTModel = None
+try:
+    from .nemotron_voicechat import NemotronVoiceChat
+except ImportError:
+    NemotronVoiceChat = None
 
 __all__ = [
     'DuplexS2SModel',

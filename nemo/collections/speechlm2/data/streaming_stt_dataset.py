@@ -43,7 +43,7 @@ def right_collate_vectors(
 ) -> torch.Tensor:
     tensors = [torch.as_tensor(t) for t in tensors]
     assert all(len(t.shape) == 1 for t in tensors), "Expected only 1-D input tensors."
-    return pad_sequence(tensors, batch_first=True, padding_value=padding_value, padding_side="right")
+    return pad_sequence(tensors, batch_first=True, padding_value=padding_value)
 
 
 @dataclass

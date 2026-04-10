@@ -98,7 +98,11 @@ def left_collate_vectors(
 ) -> torch.Tensor:
     tensors = [torch.as_tensor(t) for t in tensors]
     assert all(len(t.shape) == 1 for t in tensors), "Expected only 1-D input tensors."
-    return pad_sequence(tensors, batch_first=True, padding_value=padding_value, padding_side="left")
+    max_len = max(t.size(0) for t in tensors)
+    padded = torch.full((len(tensors), max_len), padding_value, dtype=tensors[0].dtype, device=tensors[0].device)
+    for i, t in enumerate(tensors):
+        padded[i, max_len - t.size(0) :] = t
+    return padded
 
 
 def drop_in_memory_data(conversations: CutSet) -> CutSet:
