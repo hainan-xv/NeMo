@@ -29,6 +29,7 @@ from omegaconf import OmegaConf
 from torch.utils.data import DataLoader, IterableDataset
 
 from nemo.collections.speechlm2 import SALM, SALMWithAsrDecoder
+from nemo.collections.speechlm2.models import StreamingSTTModel
 from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, MaskType, NeuralType
 from nemo.utils import logging
 from nemo.utils.trainer_utils import resolve_trainer_cfg
@@ -390,6 +391,10 @@ def oomptimizer(
     if isinstance(model, (SALM, SALMWithAsrDecoder)):
         model.prepare_inputs = partial(_override_prepare_inputs, model)
 
+    if isinstance(model, StreamingSTTModel):
+        model._build_input_embeds = partial(_override_build_input_embeds, model, ratio=ratio)
+        model.forced_aligner = None  # skip forced alignment for synthetic batches
+
     if not hasattr(model, "oomptimizer_schema"):
         click.secho(
             f"We read model of type {type(model)} which doesn't seem to support OOMptimizer "
@@ -430,9 +435,35 @@ def oomptimizer(
             else:
                 input_len = bin
                 output_len = math.ceil(ratio * input_len)
-            sampling_rate = getattr(
-                model, "sample_rate", 16000
-            )  # TODO: may need to extend schema for broader model coverage
+            sampling_rate = getattr(model, "sample_rate", None) or getattr(model, "sampling_rate", 16000)
+
+            # For StreamingSTTModel, output_len must account for the streaming
+            # chat template overhead: each chunk adds ~10 template tokens + text.
+            if isinstance(model, StreamingSTTModel):
+                model._ensure_inference_cache()
+                chunk_size = model.core_cfg.chunk_size
+                frame_length = model.core_cfg.frame_length_in_secs
+                num_audio_frames = math.ceil(input_len / frame_length)
+                num_chunks = math.ceil(num_audio_frames / chunk_size)
+                turn_template_len = len(model._turn_template_ids)
+                asst_footer_len = len(model._asst_footer_ids)
+                chunk_duration = chunk_size * frame_length
+                avg_text_per_turn = max(1, math.ceil(ratio * chunk_duration))
+                hf_tok = model.tokenizer.tokenizer
+                system_prompt = (
+                    cfg.get("data", {}).get("dataset", {}).get("system_prompt", "Transcribe the audio into text.")
+                )
+                sys_len = len(
+                    hf_tok.apply_chat_template(
+                        [{"role": "system", "content": system_prompt}],
+                        tokenize=True,
+                        add_generation_prompt=False,
+                        enable_thinking=False,
+                    )
+                )
+                output_len = sys_len + num_chunks * (turn_template_len + avg_text_per_turn + asst_footer_len)
+                return (compute_num_samples(input_len, sampling_rate=sampling_rate), output_len)
+
             match modalities:
                 case "audio", "audio":
                     return (
@@ -481,6 +512,8 @@ def oomptimizer(
     # a tiny bit smaller batches, likely due to worse memory fragmentation.
     with torch.autocast("cuda", dtype=None, enabled=False):
         for bucket, (seq_len_in, seq_len_out) in reversed(list(zip(buckets, max_seq_lens))):
+            seq_len_in = math.ceil(seq_len_in)
+            seq_len_out = math.ceil(seq_len_out)
             click.echo(f"The current sequence lengths are: input={seq_len_in} output={seq_len_out}.")
             gen.reset()
             batch_idx = 0
@@ -584,6 +617,43 @@ def _override_prepare_inputs(self, batch: dict) -> dict:
         "attention_mask": attention_mask,
         "target_ids": target_ids,
     }
+
+
+def _override_build_input_embeds(self, input_tokens, audios, audio_lens, ratio=12):
+    """Override _build_input_embeds for oomptimizer profiling of StreamingSTTModel.
+
+    The schema now generates input_tokens at the correct length (including chat
+    template overhead). This override places AUDIO_TOKEN_IDX at the right positions
+    and runs the perception module on the synthetic audio.
+    """
+    from nemo.collections.speechlm2.models.streaming_stt_model import AUDIO_TOKEN_IDX, interleave_embeddings
+
+    # Run perception to get audio embeddings
+    audio_embs, audio_emb_lens = self.perception(
+        input_signal=audios,
+        input_signal_length=audio_lens,
+    )
+    n_audio_frames = audio_embs.shape[1]  # (B, T_enc, H)
+    B, L = input_tokens.shape
+
+    # Place AUDIO_TOKEN_IDX at the first n_audio positions
+    input_tokens = input_tokens.clone()
+    n_audio = min(n_audio_frames, L)
+    input_tokens[:, :n_audio] = AUDIO_TOKEN_IDX
+    # Ensure remaining tokens are valid vocab IDs
+    input_tokens[:, n_audio:] = torch.clamp(input_tokens[:, n_audio:].abs(), 0, self.text_vocab_size - 1)
+
+    audio_mask = input_tokens == AUDIO_TOKEN_IDX
+    text_tokens = input_tokens.where(~audio_mask, torch.zeros_like(input_tokens))
+    text_embeds = self.embed_tokens(text_tokens)
+
+    return interleave_embeddings(
+        input_tokens=input_tokens,
+        audio_mask=audio_mask,
+        text_embeds=text_embeds,
+        audio_embs=audio_embs,
+        pad_id=self.text_pad_id,
+    )
 
 
 if __name__ == "__main__":

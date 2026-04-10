@@ -108,6 +108,10 @@ class LhotseDataLoadingConfig:
     shard_seed: int | str = "trng"
     max_open_streams: int | None = None
     cuda_expandable_segments: bool = True
+    # Temperature for re-weighting datasets. 1 is a neutral value. Lower temperature over-samples smaller datasets, and vice versa.
+    # Can be a scalar (broadcast to all levels) or a list whose length must exactly match the input_cfg nesting depth.
+    # A list length mismatch raises ValueError.
+    reweight_temperature: Any = None  # float | int | list[float] | None = None
     # e. Multi-config related options.
     #    Setting multi_config=True will scan the config for keys with DictConfig values,
     #    create a separate sampler for each, and fuse the samplers according to sampler_fusion.
@@ -194,6 +198,10 @@ class LhotseDataLoadingConfig:
     #   f. Padding to a minimum duration. Examples shorter than this will be padded, others are unaffected.
     pad_min_duration: Optional[float] = None
     pad_direction: str = "right"  # "right" | "left" | "both" | "random"
+    #   f. Padding examples with an extra duration. If pad_extra_duration_prob is not None,
+    #      the sample will be padded with this probability, otherwise it is always padded with the extra duration.
+    pad_extra_duration: Optional[float] = None
+    pad_extra_duration_prob: Optional[float] = None
     #   g. Bandwidth limitation via back-and-forth resampling
     lowpass_enabled: bool = False
     lowpass_frequencies_interval: Tuple[float, float] = (3500.0, 8000.0)
@@ -597,6 +605,13 @@ def get_lhotse_sampler_from_config(config, global_rank, world_size, tokenizer=No
     if config.pad_min_duration is not None:
         cuts = cuts.pad(duration=config.pad_min_duration, direction=config.pad_direction, preserve_id=True)
 
+    if config.pad_extra_duration is not None:
+        cuts = cuts.map(
+            partial(
+                pad_extra_duration, extra_duration=config.pad_extra_duration, pad_prob=config.pad_extra_duration_prob
+            )
+        )
+
     # Duration filtering, same as native NeMo dataloaders.
     # We can filter after the augmentations because they are applied only when calling load_audio().
     cuts = cuts.filter(DurationFilter(config.min_duration, config.max_duration))
@@ -916,6 +931,15 @@ def tokenize_with_prompt(example, tokenizer, prompt_format: str | PromptFormatte
     for key, value in encoded.items():
         setattr(example, key, value)
     return example
+
+
+def pad_extra_duration(cut: Cut, extra_duration: float = 0.0, pad_prob: Optional[float] = None) -> Cut:
+    if extra_duration is None or extra_duration == 0.0:
+        return cut
+    curr_duration = cut.duration
+    if pad_prob is None or (pad_prob is not None and random.random() < pad_prob):
+        return cut.pad(duration=curr_duration + extra_duration, direction="right", preserve_id=True)
+    return cut
 
 
 # The helper callables below exist to avoid passing lambdas into lhotse CutSet map/filter methods.

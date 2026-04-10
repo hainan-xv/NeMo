@@ -16,6 +16,7 @@ from .duplex_ear_tts_dataset import DuplexEARTTSDataset
 from .duplex_stt_dataset import DuplexSTTDataset
 from .s2s_dataset import DuplexS2SDataset
 from .salm_dataset import SALMDataset
+from .streaming_stt_dataset import StreamingSTTDataset
 
 __all__ = [
     'DataModule',
@@ -23,4 +24,5 @@ __all__ = [
     'DuplexSTTDataset',
     'DuplexEARTTSDataset',
     'SALMDataset',
+    'StreamingSTTDataset',
 ]

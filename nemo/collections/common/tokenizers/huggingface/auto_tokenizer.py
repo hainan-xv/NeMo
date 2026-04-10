@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import List, Optional
 
 from transformers import AutoTokenizer as AUTOTOKENIZER
@@ -189,6 +190,23 @@ class AutoTokenizer(TokenizerSpec):
                 use_fast=use_fast,
                 trust_remote_code=trust_remote_code,
             )
+            # In transformers >= 5.0, from_pretrained may ignore the vocab_file kwarg
+            if vocab_file and os.path.isfile(vocab_file):
+                try:
+                    with open(vocab_file, 'r', encoding='utf-8') as f:
+                        expected_vocab_size = sum(1 for line in f if line.strip())
+                    if expected_vocab_size > 0 and len(self.tokenizer) != expected_vocab_size:
+                        tokenizer_class = type(self.tokenizer)
+                        self.tokenizer = tokenizer_class.from_pretrained(
+                            pretrained_model_name_or_path=vocab_file,
+                            use_fast=use_fast,
+                        )
+                        logging.info(
+                            f"Loaded tokenizer from custom vocab_file with {len(self.tokenizer)} tokens "
+                            f"(resolved class: {tokenizer_class.__name__})"
+                        )
+                except Exception:
+                    pass  # Keep the originally loaded tokenizer if fallback fails
         else:
             self.tokenizer = AUTOTOKENIZER.from_pretrained(
                 pretrained_model_name_or_path=pretrained_model_name,
@@ -259,17 +277,21 @@ class AutoTokenizer(TokenizerSpec):
         tokens = self.tokenizer.tokenize(text)
         return tokens
 
-    def tokens_to_text(self, tokens):
+    def tokens_to_text(self, tokens, remove_special_tokens=False):
         """
         Converts a list of tokens back into text.
 
         Args:
             tokens (List[str]): List of tokens to be converted.
-
+            remove_special_tokens (bool): Whether to remove special tokens (like [PAD], [CLS], etc.) from the output
         Returns:
             str: The reconstructed text.
         """
-        text = self.tokenizer.convert_tokens_to_string(tokens)
+        if remove_special_tokens:
+            tokens_clean = [t for t in tokens if t not in self.tokenizer.all_special_tokens]
+        else:
+            tokens_clean = tokens
+        text = self.tokenizer.convert_tokens_to_string(tokens_clean)
         return text
 
     def token_to_id(self, token):

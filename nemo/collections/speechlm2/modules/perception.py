@@ -18,7 +18,7 @@ from transformers import BertConfig
 from transformers.models.bert.modeling_bert import BertEncoder
 
 from nemo.collections.asr.models import ASRModel
-from nemo.collections.asr.modules.conformer_encoder import ConformerMultiLayerFeatureExtractor
+from nemo.collections.asr.modules.conformer_encoder import ConformerEncoder, ConformerMultiLayerFeatureExtractor
 from nemo.collections.asr.parts.mixins import TranscribeConfig
 from nemo.core import Exportable, NeuralModule, typecheck
 
@@ -42,15 +42,34 @@ class AudioPerceptionModule(NeuralModule, Exportable):
         # Initialize components
         self.cfg = cfg
         self.preprocessor = self.from_config_dict(cfg.preprocessor)
-        self.encoder = self.from_config_dict(cfg.encoder)
-
+        encoder = self.from_config_dict(cfg.encoder)
         if 'spec_augment' in cfg and cfg.spec_augment is not None:
             self.spec_augmentation = self.from_config_dict(cfg.spec_augment)
         else:
             self.spec_augmentation = None
         self.modality_adapter = self.from_config_dict(cfg.modality_adapter)
-        if 'output_dim' not in cfg.modality_adapter and "d_model" in cfg.modality_adapter:  # e.g., conformer encoder
-            self.proj = nn.Linear(cfg.modality_adapter.d_model, cfg.output_dim)
+
+        if isinstance(self.modality_adapter, (QformerConnector, MultiLayerProjectionConnector)):
+            self.encoder_multilayer = ConformerMultiLayerFeatureExtractor(
+                encoder,
+                layer_idx_list=cfg.modality_adapter.target_layer_ids,
+                detach=False,
+                convert_to_cpu=False,
+            )
+        else:
+            self.encoder = encoder
+
+        if 'output_dim' not in cfg.modality_adapter:  # e.g., conformer encoder
+            d_model = cfg.modality_adapter.get("d_model", cfg.encoder.get("d_model", None))
+            if d_model is None:
+                raise ValueError(
+                    "when `output_dim` is not set in cfg.modality_adapter, `d_model` is required in the `modality_adapter` or `encoder` to be used for projection."
+                )
+            if cfg.get("output_dim", None) is None:
+                raise ValueError(
+                    "when `output_dim` is not set in cfg.modality_adapter, `output_dim` is required in the cfg to be used for projection."
+                )
+            self.proj = nn.Linear(d_model, cfg.output_dim)
         else:
             self.proj = nn.Identity()
 
@@ -85,6 +104,10 @@ class AudioPerceptionModule(NeuralModule, Exportable):
         processed_signal=None,
         processed_signal_length=None,
         return_encoder_emb=False,
+        cache_last_channel=None,
+        cache_last_time=None,
+        cache_last_channel_len=None,
+        streaming=False,
     ):
         processed_signal, processed_signal_length = self.maybe_preprocess_audio(
             input_signal, input_signal_length, processed_signal, processed_signal_length
@@ -94,16 +117,62 @@ class AudioPerceptionModule(NeuralModule, Exportable):
         if self.spec_augmentation is not None and self.training:
             processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
 
-        encoder_emb, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
+        new_encoder_cache = None
+        if isinstance(self.modality_adapter, (QformerConnector, MultiLayerProjectionConnector)):
+            encoder_emb, encoded_len = self.encoder_multilayer(
+                audio_signal=processed_signal, length=processed_signal_length
+            )
+        elif isinstance(self.encoder, ConformerEncoder):
+            if streaming:
+                encoder_outputs = self.encoder.cache_aware_stream_step(
+                    processed_signal=processed_signal,
+                    processed_signal_length=processed_signal_length,
+                    cache_last_channel=cache_last_channel,
+                    cache_last_time=cache_last_time,
+                    cache_last_channel_len=cache_last_channel_len,
+                    keep_all_outputs=False,
+                )
+            else:
+                encoder_outputs = self.encoder(
+                    audio_signal=processed_signal,
+                    length=processed_signal_length,
+                )
+            if len(encoder_outputs) == 2:
+                encoder_emb, encoded_len = encoder_outputs
+            else:
+                encoder_emb, encoded_len, new_cache_last_channel, new_cache_last_time, new_cache_last_channel_len = (
+                    encoder_outputs
+                )
+                new_encoder_cache = {
+                    'cache_last_channel': new_cache_last_channel,
+                    'cache_last_time': new_cache_last_time,
+                    'cache_last_channel_len': new_cache_last_channel_len,
+                }
+        else:
+            encoder_emb, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
 
         encoded, encoded_len = self.modality_adapter(audio_signal=encoder_emb, length=encoded_len)
 
         # b, c, t -> b, t, c
         encoded = self.proj(encoded.transpose(1, 2))
+
+        # Return outputs
+        outputs = [encoded, encoded_len]
         if return_encoder_emb:
-            return encoded, encoded_len, encoder_emb.transpose(1, 2)
+            outputs.append(encoder_emb.transpose(1, 2))
+        if streaming:
+            outputs.append(new_encoder_cache)
+        return tuple(outputs)
+
+    def get_initial_cache_state(self, batch_size=1, dtype=torch.float32, device=None, **kwargs):
+        if isinstance(self.modality_adapter, (QformerConnector, MultiLayerProjectionConnector)):
+            return None  # not implemented yet
+        elif isinstance(self.encoder, ConformerEncoder):
+            return self.encoder.get_initial_cache_state(
+                batch_size=batch_size, dtype=dtype, device=device, max_dim=kwargs.get('max_dim', 0)
+            )
         else:
-            return encoded, encoded_len
+            raise ValueError(f"Unsupported encoder type: {type(self.encoder)}")
 
 
 class IdentityConnector(nn.Module):
@@ -158,7 +227,7 @@ class AudioTranscriptionPerceptionModule(NeuralModule, Exportable):
         self.modality_adapter = self.from_config_dict(cfg.modality_adapter)
         if isinstance(self.modality_adapter, (QformerConnector, MultiLayerProjectionConnector)):
             self.encoder_multilayer = ConformerMultiLayerFeatureExtractor(
-                self.encoder,
+                self.asr.encoder,
                 layer_idx_list=cfg.modality_adapter.target_layer_ids,
                 detach=False,
                 convert_to_cpu=False,
