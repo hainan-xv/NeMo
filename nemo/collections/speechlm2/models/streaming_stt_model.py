@@ -44,10 +44,16 @@ from nemo.collections.speechlm2.data.streaming_stt_dataset import (
     parse_chat_template_ids,
 )
 from nemo.collections.speechlm2.parts.alignments import ForcedAligner
+from nemo.collections.speechlm2.parts.chat_aligner import ChatAligner
 from nemo.collections.speechlm2.parts.hf_hub import HFHubMixin
 from nemo.collections.speechlm2.parts.lora import maybe_install_lora
 from nemo.collections.speechlm2.parts.optim_setup import configure_optimizers, is_frozen
-from nemo.collections.speechlm2.parts.pretrained import load_pretrained_hf, move_embedding, setup_perception
+from nemo.collections.speechlm2.parts.pretrained import (
+    load_chat_components,
+    load_pretrained_hf,
+    move_embedding,
+    setup_perception,
+)
 from nemo.collections.speechlm2.parts.utils import freeze_module, to_dataclass, unfreeze_module
 from nemo.utils import logging
 
@@ -147,6 +153,7 @@ class StreamingSTTModelConfig:
     frame_length_in_secs: float = 0.08
     log_every_n_steps: int = 10
     dtype: str = "bfloat16"
+    pretrained_chat: Optional[str] = None
 
 
 @dataclass
@@ -244,6 +251,35 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             self.forced_aligner = None
             self.dataset = None
 
+        # --- CHAT-based self-alignment ---
+        self.chat_aligner: Optional[ChatAligner] = None
+        if self.core_cfg.pretrained_chat is not None:
+            assert data_cfg is not None, "Dataset config is required for CHAT alignment"
+            assert dataset_cls is not None, "Dataset class is required for CHAT alignment"
+            chat = load_chat_components(self.core_cfg.pretrained_chat)
+
+            if self.core_cfg.chunk_size != chat['chunk_size']:
+                raise ValueError(
+                    f"CHAT model chunk_size ({chat['chunk_size']}) does not match "
+                    f"streaming STT chunk_size ({self.core_cfg.chunk_size}). "
+                    f"They must be identical."
+                )
+
+            self.chat_aligner = ChatAligner(
+                decoder=chat['decoder'],
+                joint=chat['joint'],
+                tokenizer=chat['tokenizer'],
+                blank_id=chat['blank_id'],
+                chunk_size=chat['chunk_size'],
+                frame_length_in_secs=self.core_cfg.frame_length_in_secs,
+            )
+            if self.dataset is None:
+                self.dataset = dataset_cls(cfg=data_cfg, tokenizer=self.tokenizer)
+            logging.info(
+                f"CHAT self-alignment enabled: chunk_size={chat['chunk_size']}, "
+                f"blank_id={chat['blank_id']}"
+            )
+
         logging.info("\n" + str(ModelSummary(self, max_depth=2)))
 
     def _apply_freeze_config(self) -> None:
@@ -335,6 +371,8 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         input_tokens: Tensor,
         audios: Tensor,
         audio_lens: Tensor,
+        encoder_emb: Optional[Tensor] = None,
+        encoder_emb_len: Optional[Tensor] = None,
     ) -> dict[str, Tensor]:
         """
         Encode audio, embed text tokens, then interleave them.
@@ -348,6 +386,11 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 positions and ``text_pad_id`` at left-padding positions.
             audios: (B, T_samples) raw waveforms.
             audio_lens: (B,) waveform lengths in samples.
+            encoder_emb: Optional pre-computed encoder output ``(B, D, T)`` in
+                channel-first format.  When provided, the encoder is skipped and
+                only the modality adapter + projection are applied.
+            encoder_emb_len: Encoder output lengths ``(B,)``, required when
+                ``encoder_emb`` is provided.
         Returns:
             dict with keys ``input_embeds`` (B, L, H), ``attention_mask`` (B, L).
         """
@@ -359,10 +402,16 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         text_embeds = self.embed_tokens(text_tokens)  # (B, L, H)
 
         # --- audio embeddings ---
-        audio_embs, _audio_emb_lens = self.perception(
-            input_signal=audios,
-            input_signal_length=audio_lens,
-        )  # audio_embs: (B, T_enc, H)
+        if encoder_emb is not None and encoder_emb_len is not None:
+            audio_embs, _audio_emb_lens = self.perception(
+                encoder_emb=encoder_emb,
+                encoded_len=encoder_emb_len,
+            )
+        else:
+            audio_embs, _audio_emb_lens = self.perception(
+                input_signal=audios,
+                input_signal_length=audio_lens,
+            )  # audio_embs: (B, T_enc, H)
 
         # --- interleave & build attention mask ---
         return interleave_embeddings(
@@ -408,7 +457,26 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             if is_frozen(m):
                 m.eval()
 
-        if self.forced_aligner is not None:
+        encoder_emb = None
+        encoder_emb_len = None
+
+        if self.chat_aligner is not None:
+            # CHAT-based self-alignment: run encoder once, use output for both
+            # alignment extraction and LLM perception.
+            encoder_emb, encoder_emb_len = self.perception.forward_encoder(
+                input_signal=batch.audios,
+                input_signal_length=batch.audio_lens,
+            )
+            alignments = self.chat_aligner.align(encoder_emb, encoder_emb_len, batch.text)
+            batch = self.dataset.get_batch_data(
+                cuts=batch.cuts,
+                audios=batch.audios,
+                audio_lens=batch.audio_lens,
+                alignments=alignments,
+                text=batch.text,
+            )
+            batch = move_data_to_device(batch, self.device)
+        elif self.forced_aligner is not None:
             alignments = self.forced_aligner.align(batch.audios, batch.audio_lens, batch.text)
             batch = self.dataset.get_batch_data(
                 cuts=batch.cuts,
@@ -419,7 +487,10 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             )
             batch = move_data_to_device(batch, self.device)
 
-        inputs = self._build_input_embeds(batch.input_tokens, batch.audios, batch.audio_lens)
+        inputs = self._build_input_embeds(
+            batch.input_tokens, batch.audios, batch.audio_lens,
+            encoder_emb=encoder_emb, encoder_emb_len=encoder_emb_len,
+        )
         outputs = self.forward(inputs["input_embeds"], attention_mask=inputs["attention_mask"])
 
         target_ids = batch.target_tokens

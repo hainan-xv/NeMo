@@ -101,6 +101,44 @@ class AudioPerceptionModule(NeuralModule, Exportable):
 
     # disable type checks to avoid type-check errors when using Conformer as modality adapter
     @typecheck.disable_checks()
+    def forward_encoder(
+        self,
+        input_signal=None,
+        input_signal_length=None,
+        processed_signal=None,
+        processed_signal_length=None,
+    ):
+        """Run preprocessing, spec augmentation, and encoder only.
+
+        Returns:
+            encoder_emb: Raw encoder output, shape ``(B, D, T)`` (channel-first).
+            encoded_len: Encoder output lengths, shape ``(B,)``.
+        """
+        processed_signal, processed_signal_length = self.maybe_preprocess_audio(
+            input_signal, input_signal_length, processed_signal, processed_signal_length
+        )
+
+        if self.spec_augmentation is not None and self.training:
+            processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
+
+        if isinstance(self.modality_adapter, (QformerConnector, MultiLayerProjectionConnector)):
+            encoder_emb, encoded_len = self.encoder_multilayer(
+                audio_signal=processed_signal, length=processed_signal_length
+            )
+        elif isinstance(self.encoder, ConformerEncoder):
+            encoder_outputs = self.encoder(
+                audio_signal=processed_signal,
+                length=processed_signal_length,
+            )
+            if len(encoder_outputs) == 2:
+                encoder_emb, encoded_len = encoder_outputs
+            else:
+                encoder_emb, encoded_len = encoder_outputs[0], encoder_outputs[1]
+        else:
+            encoder_emb, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
+
+        return encoder_emb, encoded_len
+
     def forward(
         self,
         input_signal=None,
@@ -112,48 +150,54 @@ class AudioPerceptionModule(NeuralModule, Exportable):
         cache_last_time=None,
         cache_last_channel_len=None,
         streaming=False,
+        encoder_emb=None,
+        encoded_len=None,
     ):
-        processed_signal, processed_signal_length = self.maybe_preprocess_audio(
-            input_signal, input_signal_length, processed_signal, processed_signal_length
-        )
-
-        # Spec augment is not applied during evaluation/testing
-        if self.spec_augmentation is not None and self.training:
-            processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
-
-        new_encoder_cache = None
-        if isinstance(self.modality_adapter, (QformerConnector, MultiLayerProjectionConnector)):
-            encoder_emb, encoded_len = self.encoder_multilayer(
-                audio_signal=processed_signal, length=processed_signal_length
-            )
-        elif isinstance(self.encoder, ConformerEncoder):
-            if streaming:
-                encoder_outputs = self.encoder.cache_aware_stream_step(
-                    processed_signal=processed_signal,
-                    processed_signal_length=processed_signal_length,
-                    cache_last_channel=cache_last_channel,
-                    cache_last_time=cache_last_time,
-                    cache_last_channel_len=cache_last_channel_len,
-                    keep_all_outputs=False,
-                )
-            else:
-                encoder_outputs = self.encoder(
-                    audio_signal=processed_signal,
-                    length=processed_signal_length,
-                )
-            if len(encoder_outputs) == 2:
-                encoder_emb, encoded_len = encoder_outputs
-            else:
-                encoder_emb, encoded_len, new_cache_last_channel, new_cache_last_time, new_cache_last_channel_len = (
-                    encoder_outputs
-                )
-                new_encoder_cache = {
-                    'cache_last_channel': new_cache_last_channel,
-                    'cache_last_time': new_cache_last_time,
-                    'cache_last_channel_len': new_cache_last_channel_len,
-                }
+        if encoder_emb is not None and encoded_len is not None:
+            # Use pre-computed encoder output, skip preprocessing and encoder.
+            new_encoder_cache = None
         else:
-            encoder_emb, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
+            processed_signal, processed_signal_length = self.maybe_preprocess_audio(
+                input_signal, input_signal_length, processed_signal, processed_signal_length
+            )
+
+            # Spec augment is not applied during evaluation/testing
+            if self.spec_augmentation is not None and self.training:
+                processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
+
+            new_encoder_cache = None
+            if isinstance(self.modality_adapter, (QformerConnector, MultiLayerProjectionConnector)):
+                encoder_emb, encoded_len = self.encoder_multilayer(
+                    audio_signal=processed_signal, length=processed_signal_length
+                )
+            elif isinstance(self.encoder, ConformerEncoder):
+                if streaming:
+                    encoder_outputs = self.encoder.cache_aware_stream_step(
+                        processed_signal=processed_signal,
+                        processed_signal_length=processed_signal_length,
+                        cache_last_channel=cache_last_channel,
+                        cache_last_time=cache_last_time,
+                        cache_last_channel_len=cache_last_channel_len,
+                        keep_all_outputs=False,
+                    )
+                else:
+                    encoder_outputs = self.encoder(
+                        audio_signal=processed_signal,
+                        length=processed_signal_length,
+                    )
+                if len(encoder_outputs) == 2:
+                    encoder_emb, encoded_len = encoder_outputs
+                else:
+                    encoder_emb, encoded_len, new_cache_last_channel, new_cache_last_time, new_cache_last_channel_len = (
+                        encoder_outputs
+                    )
+                    new_encoder_cache = {
+                        'cache_last_channel': new_cache_last_channel,
+                        'cache_last_time': new_cache_last_time,
+                        'cache_last_channel_len': new_cache_last_channel_len,
+                    }
+            else:
+                encoder_emb, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
 
         encoded, encoded_len = self.modality_adapter(audio_signal=encoder_emb, length=encoded_len)
 

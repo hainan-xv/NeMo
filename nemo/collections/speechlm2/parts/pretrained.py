@@ -356,6 +356,66 @@ def load_pretrained_model(model: torch.nn.Module, checkpoint_path: str):
         init_model_from_checkpoint(model, checkpoint_path)
 
 
+def load_chat_components(chat_model_path: str):
+    """Load CHAT model components needed for alignment extraction.
+
+    Loads the full CHAT (Chunk-wise Attention Transducer) model from a ``.nemo``
+    checkpoint and extracts the decoder (prediction network), joint network,
+    BPE tokenizer, blank token ID, and inferred chunk size.
+
+    Args:
+        chat_model_path: Path to the pretrained CHAT ``.nemo`` checkpoint.
+
+    Returns:
+        A dict with keys:
+            ``decoder``: the CHAT prediction network (``torch.nn.Module``)
+            ``joint``: the CHAT joint network (``RNNTAttJoint``)
+            ``tokenizer``: the CHAT BPE tokenizer
+            ``blank_id``: the RNNT blank token index
+            ``chunk_size``: inferred chunk size (``right_context + 1``)
+    """
+    chat_model = load_pretrained_nemo(ASRModel, chat_model_path)
+    chat_model.eval()
+
+    decoder = chat_model.decoder
+    joint = chat_model.joint
+    tokenizer = chat_model.tokenizer
+
+    # RNNT blank is typically at vocab_size (last index).
+    blank_id = joint._num_classes - 1
+
+    # Infer chunk size from the encoder's attention context.
+    encoder_cfg = chat_model.cfg.get('encoder', {})
+    att_context_size = encoder_cfg.get('att_context_size', None)
+    if att_context_size is not None:
+        ctx = list(att_context_size) if hasattr(att_context_size, '__iter__') else att_context_size
+        if isinstance(ctx, (list, tuple)) and len(ctx) == 2 and isinstance(ctx[0], int):
+            chunk_size = ctx[1] + 1
+        else:
+            chunk_size = joint.chunk_size
+    else:
+        chunk_size = joint.chunk_size
+
+    logging.info(
+        f"Loaded CHAT model from {chat_model_path}: "
+        f"blank_id={blank_id}, chunk_size={chunk_size}, "
+        f"vocab_size={joint._vocab_size}"
+    )
+
+    # Detach components from the full model so the rest can be garbage-collected.
+    decoder = decoder
+    joint = joint
+
+    del chat_model
+    return {
+        'decoder': decoder,
+        'joint': joint,
+        'tokenizer': tokenizer,
+        'blank_id': blank_id,
+        'chunk_size': chunk_size,
+    }
+
+
 def maybe_load_pretrained_models(model: torch.nn.Module):
     """
     Optionally load pretrained model weights based on configuration.
