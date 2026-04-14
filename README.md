@@ -41,8 +41,7 @@ weight checkpoints and demos!
 
 NVIDIA NeMo Speech is built for researchers and PyTorch developers working on Speech models including Automatic Speech
 Recognition (ASR), Text to Speech (TTS), and Speech LLMs. It is designed to help you efficiently create, customize, and
-deploy new It is designed to help you efficiently create, customize, and deploy new AI models by leveraging existing
-code and pre-trained model checkpoints.
+deploy new AI models by leveraging existing code and pre-trained model checkpoints.
 
 For technical documentation, please see the
 [NeMo Framework User Guide](https://docs.nvidia.com/nemo/speech/nightly/).
