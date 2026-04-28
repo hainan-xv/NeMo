@@ -21,11 +21,12 @@ model:
   freeze_embed_tokens: false
 
   # --- Aux chunk-boundary classifier ---
-  # K-layer transformer head (mirrors LLM architecture) trained with BCE at
-  # audio frame positions. When chunk_classifier_loss_weight > 0 the LM CE
-  # loss is masked to text positions only — the aux head owns the boundary
-  # decision. Set chunk_classifier_use_at_inference=true after training to
-  # decode with the aux head instead of the LM head.
+  # Master switch (must be true to build the head). Requires chunk_size=0
+  # (dynamic chunking). When true, the LM CE is masked to text positions only
+  # and the aux head is trained with BCE at audio decision frames. Flip
+  # chunk_classifier_use_at_inference to true post-training to decode with
+  # the aux head instead of the LM head.
+  use_chunk_classifier: true
   chunk_classifier_loss_weight: 0.5
   chunk_classifier_num_layers: 2
   chunk_classifier_init_from_llm: true
