@@ -445,7 +445,14 @@ def oomptimizer(
                 frame_length = model.core_cfg.frame_length_in_secs
                 num_audio_frames = math.ceil(input_len / frame_length)
                 num_chunks = math.ceil(num_audio_frames / chunk_size)
-                turn_template_len = len(model._turn_template_ids)
+                if model.core_cfg.chunk_size == 0:
+                    # Dynamic chunking: no fixed turn template. Audio frames are fed
+                    # incrementally; the user header/footer are appended on demand.
+                    # Use an upper bound estimation of the turn template length.
+                    turn_template_len = len(model._user_header_ids) + len(model._user_footer_and_asst_header_ids) + 1
+                else:
+                    # Fixed chunking: use the fixed turn template length.
+                    turn_template_len = len(model._turn_template_ids)
                 asst_footer_len = len(model._asst_footer_ids)
                 chunk_duration = chunk_size * frame_length
                 avg_text_per_turn = max(1, math.ceil(ratio * chunk_duration))
