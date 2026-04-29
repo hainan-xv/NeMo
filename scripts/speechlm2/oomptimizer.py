@@ -441,7 +441,7 @@ def oomptimizer(
             # chat template overhead: each chunk adds ~10 template tokens + text.
             if isinstance(model, StreamingSTTModel):
                 model._ensure_inference_cache()
-                chunk_size = model.core_cfg.chunk_size
+                chunk_size = max(model.core_cfg.chunk_size, 1)
                 frame_length = model.core_cfg.frame_length_in_secs
                 num_audio_frames = math.ceil(input_len / frame_length)
                 num_chunks = math.ceil(num_audio_frames / chunk_size)
