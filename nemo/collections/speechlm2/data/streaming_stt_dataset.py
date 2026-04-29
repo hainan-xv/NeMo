@@ -86,6 +86,12 @@ class StreamingSTTDataConfig:
     prompt_field: str = "system_prompt"
     compact_template: bool = False
     write_token: str = "<|im_start|>"
+    # K — only effective in dynamic chunking (chunk_size == 0). Each audio
+    # segment is rounded UP to a multiple of K frames (and total audio is
+    # padded to K-multiple). The model implicitly learns to emit only at
+    # K-aligned positions; deploy-time K' (any multiple of K_train) is set via
+    # dynamic_min_chunk_size / dynamic_max_chunk_size. Default 1 = no-op.
+    chunk_step: int = 1
 
 
 def decode_with_blank(
@@ -222,6 +228,7 @@ def get_llm_messages_for_sample(
     alignments: Optional[List[WordAlignment]] = None,
     transcript: Optional[str] = None,
     words_per_group: int = 1,
+    chunk_step: int = 1,
 ) -> List[dict]:
     """
     Get the LLM messages for a sample, using the alignments to determine the turns for the audio and text.
@@ -296,6 +303,9 @@ def get_llm_messages_for_sample(
     if chunk_size == 0:
         # Dynamic chunking: one user turn per word group, sized to word boundary.
         # The model learns to predict when to stop listening via audio-position targets.
+        # When chunk_step > 1, each segment's frame count is rounded UP to a
+        # multiple of K so the model only ever emits at K-aligned positions.
+        K = max(int(chunk_step), 1)
         prev_end_frame = 0
         word_buffer: list[int] = []  # indices of buffered words
 
@@ -306,9 +316,13 @@ def get_llm_messages_for_sample(
             if len(word_buffer) < words_per_group and word_idx < len(alignments) - 1:
                 continue
 
-            # Chunk boundary = end frame of the last word in this group
+            # Chunk boundary = end frame of the last word in this group, snapped
+            # UP to the next multiple of K. num_frames here is already K-padded
+            # (caller guarantees this), so the clamp keeps things K-aligned.
             last_word = alignments[word_buffer[-1]]
             group_end_frame = math.ceil(last_word.end_time / frame_length_in_secs) + num_delay_frames
+            if K > 1:
+                group_end_frame = ((group_end_frame + K - 1) // K) * K
             group_end_frame = min(group_end_frame, num_frames)
             n_frames_chunk = group_end_frame - prev_end_frame
 
@@ -413,6 +427,7 @@ def get_llm_messages_for_batch(
     alignments: Optional[List[List[WordAlignment]]] = None,
     transcripts: Optional[List[str]] = None,
     words_per_group: int = 1,
+    chunk_step: int = 1,
 ) -> List[List[dict]]:
     """
     Get the LLM messages for a batch of samples.
@@ -454,6 +469,7 @@ def get_llm_messages_for_batch(
                 alignments=sample_alignments,
                 transcript=transcript,
                 words_per_group=words_per_group,
+                chunk_step=chunk_step,
             )
         )
     return batch_messages
@@ -881,6 +897,24 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
     ) -> StreamingSTTBatch:
         audio_durations_secs = (audio_lens.float() / self.cfg.sample_rate).tolist()
 
+        # K-step alignment (dynamic chunking only): pad each waveform up to a
+        # multiple of K frames so the encoder produces exactly that many
+        # embeddings, matching the K-snapped segment lengths the dataset will
+        # construct below. K=1 → no-op.
+        K = max(int(getattr(self.cfg, "chunk_step", 1)), 1)
+        if K > 1 and self.cfg.chunk_size == 0:
+            new_lens = []
+            for dur in audio_durations_secs:
+                num_frames = math.ceil(dur / self.cfg.frame_length_in_secs)
+                num_frames_padded = math.ceil(num_frames / K) * K
+                samples_padded = math.ceil(num_frames_padded * self.cfg.frame_length_in_secs * self.cfg.sample_rate)
+                new_lens.append(samples_padded)
+            max_samples = max(new_lens) if new_lens else int(audio_lens.max().item())
+            if audios.shape[1] < max_samples:
+                audios = F.pad(audios, (0, max_samples - audios.shape[1]))
+            audio_lens = torch.tensor(new_lens, dtype=audio_lens.dtype, device=audio_lens.device)
+            audio_durations_secs = (audio_lens.float() / self.cfg.sample_rate).tolist()
+
         system_prompts = [cut.custom.get(self.cfg.prompt_field, self.cfg.system_prompt) for cut in cuts]
 
         batch_messages = get_llm_messages_for_batch(
@@ -895,6 +929,7 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             alignments=alignments,
             transcripts=text,
             words_per_group=self.cfg.words_per_group,
+            chunk_step=K,
         )
 
         all_input_ids = []

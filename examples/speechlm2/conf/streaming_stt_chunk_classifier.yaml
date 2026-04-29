@@ -75,6 +75,12 @@ data:
     sample_rate: ${model.sample_rate}
     frame_length_in_secs: ${model.frame_length_in_secs}
     chunk_size: ${model.chunk_size}
+    # K — segment lengths are snapped UP to multiples of this in dynamic
+    # chunking. Default 1 = current per-frame behavior. Set >1 (e.g., 4) so
+    # the model learns to emit only at K-aligned positions; at deploy time,
+    # use dynamic_min_chunk_size=dynamic_max_chunk_size=K' (multiple of K)
+    # to force K'-rate emit.
+    chunk_step: 1
     num_delay_frames: 0
     audio_tag: "<audio>"
     blank_token: ${model.blank_token}
