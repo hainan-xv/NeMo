@@ -104,6 +104,16 @@ class StreamingSTTEvalConfig:
     )
     dynamic_min_chunk_size: int = 0  # dynamic chunking: min frames before allowing generation
     dynamic_max_chunk_size: Optional[int] = None  # dynamic chunking: max frames before forcing generation
+    # When set, LM-head boundary decision uses a probability threshold:
+    # emit when p(user_footer_first_id) ≥ threshold (instead of argmax). Useful
+    # to recover boundaries where the LM is moderately confident but loses
+    # argmax to <blank>. Has no effect when use_chunk_classifier is True.
+    lm_head_emit_threshold: Optional[float] = None
+    # When True, dump per-LISTENING-frame diagnostics (LM head top-5, prob of
+    # user_footer_first / blank, aux head sigmoid, decision taken) to a
+    # sibling JSONL alongside output_manifest. Slows inference; use on
+    # small eval sets when debugging boundary-decision behavior.
+    debug_log_audio_frames: bool = False
     generation_config: StreamingSTTGenerationConfig = field(default_factory=StreamingSTTGenerationConfig)
 
 
@@ -152,10 +162,22 @@ def main(cfg: StreamingSTTEvalConfig):
     input_durations = []
     infer_durations = []
 
+    # Optional per-frame debug log file (one record per LISTENING frame per
+    # cut, keyed by cut id). Only opened when debug_log_audio_frames=True.
+    debug_log_writer = None
+    if cfg.debug_log_audio_frames and cfg.output_manifest is not None:
+        manifest_path = Path(cfg.output_manifest)
+        debug_log_path = manifest_path.with_name(
+            manifest_path.stem.replace("_generations", "") + "_audio_frame_log.jsonl"
+        )
+        debug_log_writer = SequentialJsonlWriter(str(debug_log_path))
+        logging.info(f"Audio frame debug log → {debug_log_path}")
+
     for batch_idx, batch in tqdm(enumerate(dloader), total=num_batches):
         ts = perf_counter()
         cfg.generation_config.max_new_tokens = cfg.max_new_tokens
         generation_config = GenerationConfig(**OmegaConf.to_container(cfg.generation_config))
+        batch_debug_logs: Optional[list] = [] if cfg.debug_log_audio_frames else None
         batch_hyps_raw = model.generate(
             audios=batch["audios"].to(model.device, non_blocking=True),
             audio_lens=batch["audio_lens"].to(model.device, non_blocking=True),
@@ -166,8 +188,15 @@ def main(cfg: StreamingSTTEvalConfig):
             use_state_machine_inference=cfg.use_state_machine_inference,
             dynamic_min_chunk_size=cfg.dynamic_min_chunk_size,
             dynamic_max_chunk_size=cfg.dynamic_max_chunk_size,
+            lm_head_emit_threshold=cfg.lm_head_emit_threshold,
+            debug_logs=batch_debug_logs,
         )
         batch_infer_duration = perf_counter() - ts
+
+        # Write per-frame debug records keyed by cut id.
+        if debug_log_writer is not None and batch_debug_logs is not None:
+            for cut, frames in zip(batch["cuts"], batch_debug_logs):
+                debug_log_writer.write({"id": cut.id, "duration": cut.duration, "frames": frames})
 
         batch_duration = sum(c.duration for c in batch["cuts"])
         batch_refs = [normalizer(cut.supervisions[0].text) for cut in batch["cuts"]]
@@ -190,6 +219,9 @@ def main(cfg: StreamingSTTEvalConfig):
         hyps.extend(batch_hyps)
         input_durations.append(batch_duration)
         infer_durations.append(batch_infer_duration)
+
+    if debug_log_writer is not None:
+        debug_log_writer.close()
 
     wer, _, nins, ndel, nsub = word_error_rate_detail(hypotheses=hyps, references=refs, use_cer=False)
     rtfx = sum(input_durations) / sum(infer_durations)
