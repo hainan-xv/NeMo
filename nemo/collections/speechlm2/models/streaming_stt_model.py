@@ -289,6 +289,14 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 data_cfg.supervise_im_end_in_loss = self.core_cfg.supervise_im_end_in_loss
                 data_cfg.project_unaligned_text_to_chunks = self.core_cfg.project_unaligned_text_to_chunks
                 data_cfg.max_audio_chunks_per_turn = self.core_cfg.max_audio_chunks_per_turn
+            logging.info(
+                "StreamingSTT data_cfg flags propagated from model: "
+                "supervise_im_end_in_loss=%s, project_unaligned_text_to_chunks=%s, "
+                "max_audio_chunks_per_turn=%s",
+                data_cfg.supervise_im_end_in_loss,
+                data_cfg.project_unaligned_text_to_chunks,
+                data_cfg.max_audio_chunks_per_turn,
+            )
         if self.core_cfg.use_modality_position_ids and not self.core_cfg.supervise_im_end_in_loss:
             raise ValueError("use_modality_position_ids=True requires supervise_im_end_in_loss=True")
         if self.core_cfg.use_modality_position_ids and int(self.core_cfg.modality_position_offset) <= 0:
