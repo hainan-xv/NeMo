@@ -15,7 +15,7 @@ import os
 
 import torch
 from lightning.pytorch import Trainer
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, open_dict
 
 from nemo.collections.speechlm2 import DataModule, StreamingSTTDataset, StreamingSTTModel
 from nemo.core.classes.common import Serialization
@@ -37,6 +37,10 @@ def train(cfg):
     OmegaConf.save(cfg, log_dir / "exp_config.yaml")
 
     dataset_cfg = cfg.data.dataset
+    with open_dict(dataset_cfg):
+        dataset_cfg.supervise_im_end_in_loss = cfg.model.get("supervise_im_end_in_loss", False)
+        dataset_cfg.project_unaligned_text_to_chunks = cfg.model.get("project_unaligned_text_to_chunks", False)
+        dataset_cfg.max_audio_chunks_per_turn = cfg.model.get("max_audio_chunks_per_turn", 1)
     forced_aligner_cfg = cfg.get("forced_aligner", None)
     if forced_aligner_cfg is not None:
         forced_aligner = Serialization.from_config_dict(forced_aligner_cfg)

@@ -110,6 +110,7 @@ class DataModule(LightningDataModule):
         return CombinedLoader(dloaders, mode="sequential")
 
     def _build_test_dataloader(self, cfg: DictConfig) -> torch.utils.data.DataLoader | CombinedLoader:
+        dataset = self.dataset.clone_for_eval() if hasattr(self.dataset, "clone_for_eval") else self.dataset
         # Single validation/test dataloader.
         # This is internal-only: the config has to specify multiple dataloaders via "datasets" key,
         # even for a single validation/test set.
@@ -121,7 +122,7 @@ class DataModule(LightningDataModule):
                 config=cfg,
                 global_rank=self._get_dp_rank(),
                 world_size=self._get_world_size(),
-                dataset=self.dataset,
+                dataset=dataset,
                 tokenizer=self.tokenizer,
             )
 

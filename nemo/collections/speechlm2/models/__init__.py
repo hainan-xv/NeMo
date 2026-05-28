@@ -11,14 +11,25 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from .duplex_ear_tts import DuplexEARTTS
-from .duplex_s2s_model import DuplexS2SModel
-from .duplex_s2s_speech_decoder_model import DuplexS2SSpeechDecoderModel
-from .duplex_stt_model import DuplexSTTModel
-from .nemotron_voicechat import NemotronVoiceChat
-from .salm import SALM
-from .salm_asr_decoder import SALMWithAsrDecoder
 from .streaming_stt_model import StreamingState, StreamingSTTModel
+
+# Keep Streaming STT importable even when optional TTS/FSDP-related deps are absent.
+try:
+    from .duplex_ear_tts import DuplexEARTTS
+    from .duplex_s2s_model import DuplexS2SModel
+    from .duplex_s2s_speech_decoder_model import DuplexS2SSpeechDecoderModel
+    from .duplex_stt_model import DuplexSTTModel
+    from .nemotron_voicechat import NemotronVoiceChat
+    from .salm import SALM
+    from .salm_asr_decoder import SALMWithAsrDecoder
+except (ImportError, AttributeError):
+    DuplexEARTTS = None
+    DuplexS2SModel = None
+    DuplexS2SSpeechDecoderModel = None
+    DuplexSTTModel = None
+    SALM = None
+    SALMWithAsrDecoder = None
+    NemotronVoiceChat = None
 
 __all__ = [
     'DuplexS2SModel',

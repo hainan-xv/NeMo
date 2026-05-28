@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import logging
 import math
 import re
@@ -43,7 +44,78 @@ def right_collate_vectors(
 ) -> torch.Tensor:
     tensors = [torch.as_tensor(t) for t in tensors]
     assert all(len(t.shape) == 1 for t in tensors), "Expected only 1-D input tensors."
-    return pad_sequence(tensors, batch_first=True, padding_value=padding_value, padding_side="right")
+    try:
+        return pad_sequence(tensors, batch_first=True, padding_value=padding_value, padding_side="right")
+    except TypeError:
+        # Backward compatibility for torch builds where `padding_side`
+        # is not supported in torch.nn.utils.rnn.pad_sequence.
+        return pad_sequence(tensors, batch_first=True, padding_value=padding_value)
+
+
+def build_chunk_word_alignment_debug(
+    messages: List[dict],
+    audio_tag: str,
+    blank_token: str,
+    tokenizer: AutoTokenizer,
+) -> List[str]:
+    """Build readable chunk→word assignment lines from LLM messages.
+
+    Returns one line per user audio chunk, in chronological order:
+    ``chunk 000 (frames=14): hello world``.
+    """
+    chunk_frames: list[int] = []
+    chunk_texts: list[Optional[str]] = []
+    aligned_texts: list[Optional[str]] = []
+    original_texts: list[Optional[str]] = []
+    pending_chunk_ids: list[int] = []
+
+    for msg in messages:
+        role = msg.get("role")
+        content = str(msg.get("content", ""))
+
+        if role == "user":
+            n_frames = content.count(audio_tag) if audio_tag else 0
+            chunk_frames.append(n_frames)
+            chunk_texts.append(None)
+            aligned_texts.append(None)
+            original_texts.append(None)
+            pending_chunk_ids.append(len(chunk_frames) - 1)
+        elif role == "assistant":
+            if pending_chunk_ids:
+                chunk_idx = pending_chunk_ids.pop(0)
+                chunk_texts[chunk_idx] = content
+                if "aligned_text" in msg:
+                    aligned_texts[chunk_idx] = str(msg.get("aligned_text", ""))
+                if "original_text" in msg:
+                    original_texts[chunk_idx] = str(msg.get("original_text", ""))
+
+    debug_lines = []
+    for idx, (n_frames, text) in enumerate(zip(chunk_frames, chunk_texts)):
+        if text is None:
+            text_repr = "<missing-assistant-turn>"
+        elif blank_token and text == blank_token:
+            text_repr = "<blank>"
+        elif text == "":
+            text_repr = "<empty>"
+        else:
+            text_repr = text
+        debug_lines.append(f"chunk {idx:03d} (frames={n_frames}): {text_repr}")
+
+        aligned = aligned_texts[idx]
+        original = original_texts[idx]
+        if aligned is not None and original is not None:
+            aligned_norm = re.sub(r"\s+", " ", aligned).strip()
+            original_norm = re.sub(r"\s+", " ", original).strip()
+            if aligned_norm != original_norm:
+                token_ids = tokenizer.tokenizer.encode(original, add_special_tokens=False)
+                token_pieces = tokenizer.tokenizer.convert_ids_to_tokens(token_ids)
+                token_pieces_repr = ", ".join(f'"{piece}"' for piece in token_pieces)
+                debug_lines.append("    chunk | aligned text | original text | token ids | token pieces")
+                debug_lines.append(
+                    f"    {idx:03d} | {aligned_norm} | {original_norm} | {token_ids} | {token_pieces_repr}"
+                )
+
+    return debug_lines
 
 
 @dataclass
@@ -59,6 +131,7 @@ class StreamingSTTBatch:
         target_tokens: (B, L) target token IDs for the LLM. Non-trainable positions are IGNORE_INDEX.
         target_token_lens: (B,) lengths of the target token sequences.
         text: list of ground-truth transcription strings.
+        chunk_word_alignment: optional per-sample chunk/word debug lines.
         cuts: Optional[CutSet] containing the cuts for the batch.
     """
 
@@ -69,6 +142,7 @@ class StreamingSTTBatch:
     target_tokens: Optional[torch.Tensor] = None
     target_token_lens: Optional[torch.Tensor] = None
     text: Optional[List[str]] = None
+    chunk_word_alignment: Optional[List[List[str]]] = None
     cuts: Optional[CutSet] = None
 
 
@@ -86,6 +160,9 @@ class StreamingSTTDataConfig:
     prompt_field: str = "system_prompt"
     compact_template: bool = False
     write_token: str = "<|im_start|>"
+    supervise_im_end_in_loss: bool = False
+    project_unaligned_text_to_chunks: bool = False
+    max_audio_chunks_per_turn: int = 1
     # K — only effective in dynamic chunking (chunk_size == 0). Each audio
     # segment is rounded UP to a multiple of K frames (and total audio is
     # padded to K-multiple). The model implicitly learns to emit only at
@@ -224,6 +301,166 @@ def compute_word_spans(
     return spans
 
 
+def compute_alignment_spans(
+    alignments: List[WordAlignment],
+    transcript: str,
+) -> List[tuple[int, int] | None]:
+    """Find exact alignment-word spans in the original transcript.
+
+    Unlike ``compute_word_spans``, this returns only the matched alignment word
+    span. Text between matched spans is handled separately as an unaligned gap.
+    """
+    spans: List[tuple[int, int] | None] = []
+    search_pos = 0
+    transcript_lower = transcript.lower()
+    for word in alignments:
+        needle = word.text
+        if not needle:
+            spans.append(None)
+            continue
+        idx = transcript_lower.find(needle.lower(), search_pos)
+        if idx == -1:
+            spans.append(None)
+            continue
+        end = idx + len(needle)
+        spans.append((idx, end))
+        search_pos = end
+    return spans
+
+
+def assign_fixed_chunk_ids(
+    alignments: List[WordAlignment],
+    num_chunks: int,
+    chunk_size: int,
+    frame_length_in_secs: float,
+    num_delay_frames: int,
+    words_per_group: int,
+) -> List[Optional[int]]:
+    """Return the fixed-chunk assistant turn index for each alignment word."""
+    chunk_ids: List[Optional[int]] = [None] * len(alignments)
+    if num_chunks <= 0:
+        return chunk_ids
+
+    word_idx = 0
+    word_buffer: list[int] = []
+    for chunk_i in range(num_chunks):
+        chunk_end_frame = (chunk_i + 1) * chunk_size
+        while word_idx < len(alignments):
+            word = alignments[word_idx]
+            word_end_frame = math.ceil(word.end_time / frame_length_in_secs)
+            ready_frame = word_end_frame + num_delay_frames
+            if ready_frame <= chunk_end_frame:
+                word_buffer.append(word_idx)
+                word_idx += 1
+            else:
+                break
+
+        is_last_chunk = chunk_i == num_chunks - 1
+        if word_buffer and (len(word_buffer) >= words_per_group or is_last_chunk):
+            for idx in word_buffer:
+                chunk_ids[idx] = chunk_i
+            word_buffer = []
+
+    # Preserve existing behavior: words delayed past the final chunk are emitted
+    # in the final assistant turn.
+    for idx in range(word_idx, len(alignments)):
+        chunk_ids[idx] = num_chunks - 1
+
+    return chunk_ids
+
+
+def project_transcript_to_chunks(
+    alignments: List[WordAlignment],
+    transcript: str,
+    alignment_chunk_ids: List[Optional[int]],
+    num_chunks: int,
+) -> tuple[List[str], List[str]]:
+    """Project original transcript text onto alignment-derived chunk IDs.
+
+    Alignment words provide timing. The original transcript provides training
+    text. Any original-text gap between two matched alignment anchors is assigned
+    to their shared chunk, or to the later chunk when the neighbors differ.
+    """
+    original_chunks = [""] * num_chunks
+    aligned_chunks: list[list[str]] = [[] for _ in range(num_chunks)]
+    if num_chunks <= 0:
+        return original_chunks, []
+
+    for word, chunk_id in zip(alignments, alignment_chunk_ids):
+        if chunk_id is not None and 0 <= chunk_id < num_chunks:
+            aligned_chunks[chunk_id].append(word.text)
+
+    spans = compute_alignment_spans(alignments, transcript)
+    matched = [
+        (idx, span, alignment_chunk_ids[idx])
+        for idx, span in enumerate(spans)
+        if span is not None and alignment_chunk_ids[idx] is not None and 0 <= alignment_chunk_ids[idx] < num_chunks
+    ]
+
+    if not matched:
+        return [" ".join(words) for words in aligned_chunks], [" ".join(words) for words in aligned_chunks]
+
+    prev_end = 0
+    prev_chunk: Optional[int] = None
+    for _, (start, end), chunk_id in matched:
+        gap = transcript[prev_end:start]
+        if gap:
+            gap_chunk = chunk_id if prev_chunk is None or prev_chunk != chunk_id else prev_chunk
+            original_chunks[gap_chunk] += gap
+        original_chunks[chunk_id] += transcript[start:end]
+        prev_end = end
+        prev_chunk = chunk_id
+
+    if prev_chunk is not None and prev_end < len(transcript):
+        original_chunks[prev_chunk] += transcript[prev_end:]
+
+    # If matching failed for a chunk, keep its aligned text rather than dropping it.
+    aligned_text_chunks = [" ".join(words) for words in aligned_chunks]
+    for idx, (original, aligned) in enumerate(zip(original_chunks, aligned_text_chunks)):
+        if not original.strip() and aligned.strip():
+            original_chunks[idx] = aligned
+
+    return original_chunks, aligned_text_chunks
+
+
+def sample_fixed_chunk_group_schedule(num_chunks: int, max_chunks_per_turn: int) -> List[int]:
+    """Sample batch-shared per-position group sizes for fixed chunking."""
+    if num_chunks <= 0:
+        return []
+
+    max_chunks_per_turn = max(int(max_chunks_per_turn), 1)
+    if max_chunks_per_turn == 1:
+        return [1] * num_chunks
+
+    schedule: List[int] = []
+    chunks_consumed = 0
+    while chunks_consumed < num_chunks:
+        group_size = int(torch.randint(1, max_chunks_per_turn + 1, (1,)).item())
+        schedule.append(group_size)
+        chunks_consumed += group_size
+    return schedule
+
+
+def iter_fixed_chunk_groups(num_chunks: int, schedule: Optional[List[int]]) -> Iterable[tuple[int, int, int]]:
+    """Yield ``(start_chunk, end_chunk, scheduled_group_size)`` for one sample."""
+    start = 0
+    schedule = schedule or [1] * num_chunks
+    for group_size in schedule:
+        if start >= num_chunks:
+            break
+        group_size = max(int(group_size), 1)
+        end = min(start + group_size, num_chunks)
+        yield start, end, group_size
+        start = end
+
+    # If the sample is longer than the batch schedule due to an edge case,
+    # fall back to one chunk per turn rather than dropping audio.
+    while start < num_chunks:
+        end = start + 1
+        yield start, end, 1
+        start = end
+
+
 def get_llm_messages_for_sample(
     system_role: str,
     system_prompt: str,
@@ -237,6 +474,8 @@ def get_llm_messages_for_sample(
     transcript: Optional[str] = None,
     words_per_group: int = 1,
     chunk_step: int = 1,
+    project_unaligned_text_to_chunks: bool = False,
+    fixed_chunk_group_schedule: Optional[List[int]] = None,
 ) -> List[dict]:
     """
     Get the LLM messages for a sample, using the alignments to determine the turns for the audio and text.
@@ -305,8 +544,13 @@ def get_llm_messages_for_sample(
         messages.append({"role": "assistant", "content": transcript if transcript is not None else blank_token})
         return messages
 
-    # Pre-compute word character spans if transcript is provided.
-    word_spans = compute_word_spans(alignments, transcript, preserve_leading_whitespace=True) if transcript else None
+    # Default behavior preserves the original span-slicing path.  The
+    # projection path below is opt-in via project_unaligned_text_to_chunks.
+    word_spans = (
+        compute_word_spans(alignments, transcript, preserve_leading_whitespace=True)
+        if transcript and (chunk_size == 0 or not project_unaligned_text_to_chunks)
+        else None
+    )
 
     if chunk_size == 0:
         # Dynamic chunking: one user turn per word group, sized to word boundary.
@@ -363,62 +607,106 @@ def get_llm_messages_for_sample(
     else:
         # Fixed chunking: split the audio into equal-sized chunks.
         num_chunks = math.ceil(num_frames / chunk_size) if num_frames > 0 else 0
+        if project_unaligned_text_to_chunks:
+            alignment_chunk_ids = assign_fixed_chunk_ids(
+                alignments=alignments,
+                num_chunks=num_chunks,
+                chunk_size=chunk_size,
+                frame_length_in_secs=frame_length_in_secs,
+                num_delay_frames=num_delay_frames,
+                words_per_group=words_per_group,
+            )
+            if transcript:
+                original_chunk_texts, aligned_chunk_texts = project_transcript_to_chunks(
+                    alignments=alignments,
+                    transcript=transcript,
+                    alignment_chunk_ids=alignment_chunk_ids,
+                    num_chunks=num_chunks,
+                )
+            else:
+                aligned_by_chunk: list[list[str]] = [[] for _ in range(num_chunks)]
+                for word, chunk_id in zip(alignments, alignment_chunk_ids):
+                    if chunk_id is not None and 0 <= chunk_id < num_chunks:
+                        aligned_by_chunk[chunk_id].append(word.text)
+                aligned_chunk_texts = [" ".join(words) for words in aligned_by_chunk]
+                original_chunk_texts = aligned_chunk_texts
 
-        word_idx = 0
-        word_buffer: list[int] = []  # indices of words buffered for words_per_group grouping
-        for chunk_i in range(num_chunks):
-            chunk_end_frame = (chunk_i + 1) * chunk_size
-
-            # User turn: one audio tag per frame in the chunk
-            messages.append({"role": "user", "content": audio_tag * chunk_size})
-
-            # Collect indices of words whose end_time (in frames) + delay <= chunk_end_frame
-            while word_idx < len(alignments):
-                word = alignments[word_idx]
-                word_end_frame = math.ceil(word.end_time / frame_length_in_secs)
-                ready_frame = word_end_frame + num_delay_frames
-                if ready_frame <= chunk_end_frame:
-                    word_buffer.append(word_idx)
-                    word_idx += 1
+            for start_chunk, end_chunk, group_size in iter_fixed_chunk_groups(
+                num_chunks, fixed_chunk_group_schedule
+            ):
+                messages.append({"role": "user", "content": audio_tag * (group_size * chunk_size)})
+                if transcript:
+                    content = "".join(original_chunk_texts[start_chunk:end_chunk])
                 else:
-                    break
+                    content = " ".join(
+                        text.strip() for text in original_chunk_texts[start_chunk:end_chunk] if text.strip()
+                    )
+                aligned_text = " ".join(
+                    text.strip() for text in aligned_chunk_texts[start_chunk:end_chunk] if text.strip()
+                )
+                if content.strip():
+                    messages.append(
+                        {
+                            "role": "assistant",
+                            "content": content,
+                            "aligned_text": aligned_text,
+                            "original_text": content,
+                        }
+                    )
+                else:
+                    messages.append({"role": "assistant", "content": blank_token})
+        else:
+            word_idx = 0
+            word_buffer: list[int] = []
+            for start_chunk, end_chunk, group_size in iter_fixed_chunk_groups(
+                num_chunks, fixed_chunk_group_schedule
+            ):
+                chunk_end_frame = end_chunk * chunk_size
+                messages.append({"role": "user", "content": audio_tag * (group_size * chunk_size)})
 
-            # Emit words when buffer reaches words_per_group, or at the last chunk
-            is_last_chunk = chunk_i == num_chunks - 1
-            if word_buffer and (len(word_buffer) >= words_per_group or is_last_chunk):
+                while word_idx < len(alignments):
+                    word = alignments[word_idx]
+                    word_end_frame = math.ceil(word.end_time / frame_length_in_secs)
+                    ready_frame = word_end_frame + num_delay_frames
+                    if ready_frame <= chunk_end_frame:
+                        word_buffer.append(word_idx)
+                        word_idx += 1
+                    else:
+                        break
+
+                is_last_chunk = end_chunk == num_chunks
+                if word_buffer and (len(word_buffer) >= words_per_group or is_last_chunk):
+                    if word_spans and transcript:
+                        first_span = word_spans[word_buffer[0]]
+                        last_span = word_spans[word_buffer[-1]]
+                        if first_span is not None and last_span is not None:
+                            content = transcript[first_span[0] : last_span[1]]
+                        else:
+                            content = " ".join(alignments[i].text for i in word_buffer)
+                    else:
+                        content = " ".join(alignments[i].text for i in word_buffer)
+                    messages.append({"role": "assistant", "content": content})
+                    word_buffer = []
+                else:
+                    messages.append({"role": "assistant", "content": blank_token})
+
+            if word_idx < len(alignments):
+                residual_indices = list(range(word_idx, len(alignments)))
                 if word_spans and transcript:
-                    first_span = word_spans[word_buffer[0]]
-                    last_span = word_spans[word_buffer[-1]]
+                    first_span = word_spans[residual_indices[0]]
+                    last_span = word_spans[residual_indices[-1]]
                     if first_span is not None and last_span is not None:
                         content = transcript[first_span[0] : last_span[1]]
                     else:
-                        content = " ".join(alignments[i].text for i in word_buffer)
-                else:
-                    content = " ".join(alignments[i].text for i in word_buffer)
-                messages.append({"role": "assistant", "content": content})
-                word_buffer = []
-            else:
-                messages.append({"role": "assistant", "content": blank_token})
-
-        # Append any residual words that weren't emitted (e.g., due to delay pushing
-        # them past the last chunk boundary, or alignment end_time > audio_duration).
-        if word_idx < len(alignments):
-            residual_indices = list(range(word_idx, len(alignments)))
-            if word_spans and transcript:
-                first_span = word_spans[residual_indices[0]]
-                last_span = word_spans[residual_indices[-1]]
-                if first_span is not None and last_span is not None:
-                    content = transcript[first_span[0] : last_span[1]]
+                        content = " ".join(alignments[i].text for i in residual_indices)
                 else:
                     content = " ".join(alignments[i].text for i in residual_indices)
-            else:
-                content = " ".join(alignments[i].text for i in residual_indices)
-            if messages[-1]["role"] == "assistant" and messages[-1]["content"] == blank_token:
-                messages[-1]["content"] = content
-            elif messages[-1]["role"] == "assistant":
-                messages[-1]["content"] += " " + content
-            else:
-                messages.append({"role": "assistant", "content": content})
+                if messages[-1]["role"] == "assistant" and messages[-1]["content"] == blank_token:
+                    messages[-1]["content"] = content
+                elif messages[-1]["role"] == "assistant":
+                    messages[-1]["content"] += " " + content
+                else:
+                    messages.append({"role": "assistant", "content": content})
 
     return messages
 
@@ -436,6 +724,8 @@ def get_llm_messages_for_batch(
     transcripts: Optional[List[str]] = None,
     words_per_group: int = 1,
     chunk_step: int = 1,
+    project_unaligned_text_to_chunks: bool = False,
+    fixed_chunk_group_schedule: Optional[List[int]] = None,
 ) -> List[List[dict]]:
     """
     Get the LLM messages for a batch of samples.
@@ -478,6 +768,8 @@ def get_llm_messages_for_batch(
                 transcript=transcript,
                 words_per_group=words_per_group,
                 chunk_step=chunk_step,
+                project_unaligned_text_to_chunks=project_unaligned_text_to_chunks,
+                fixed_chunk_group_schedule=fixed_chunk_group_schedule,
             )
         )
     return batch_messages
@@ -594,6 +886,7 @@ def _tokenize_compact_with_assistant_mask(
     tokenizer: AutoTokenizer,
     write_id: int,
     eos_id: int,
+    supervise_im_end_in_loss: bool = False,
 ) -> tuple[list[int], list[int]]:
     """Tokenize chat messages in compact format and return (input_ids, assistant_mask).
 
@@ -602,8 +895,8 @@ def _tokenize_compact_with_assistant_mask(
 
     The system prompt IS still wrapped via ``apply_chat_template`` (Qwen3 system
     block), only the per-turn scaffolding is compacted.  Loss is applied on
-    ``<write>``, assistant content, and ``<eos>`` — mirroring the HF path where
-    the ``<|im_end|>\\n`` footer is trainable.
+    ``<write>`` and assistant content.  When ``supervise_im_end_in_loss=True``,
+    the closing ``<eos>`` is also trainable.
     """
     hf_tok = tokenizer.tokenizer
 
@@ -645,7 +938,7 @@ def _tokenize_compact_with_assistant_mask(
                 assistant_mask.extend([1] * len(asst_ids))
                 # eos
                 input_ids.append(eos_id)
-                assistant_mask.append(1)
+                assistant_mask.append(int(supervise_im_end_in_loss))
                 i += 1
         else:
             # Orphan assistant (shouldn't normally occur) — treat as standalone asst segment.
@@ -655,7 +948,7 @@ def _tokenize_compact_with_assistant_mask(
             input_ids.extend(asst_ids)
             assistant_mask.extend([1] * len(asst_ids))
             input_ids.append(eos_id)
-            assistant_mask.append(1)
+            assistant_mask.append(int(supervise_im_end_in_loss))
             i += 1
 
     return input_ids, assistant_mask
@@ -664,6 +957,7 @@ def _tokenize_compact_with_assistant_mask(
 def _tokenize_with_assistant_mask(
     messages: List[dict],
     tokenizer: AutoTokenizer,
+    supervise_im_end_in_loss: bool = False,
 ) -> tuple[list[int], list[int]]:
     """
     Tokenize chat messages and return (input_ids, assistant_mask).
@@ -733,8 +1027,8 @@ def _tokenize_with_assistant_mask(
             while i < len(input_ids) and (j >= len(ids_sentinel) or input_ids[i] != ids_sentinel[j]):
                 assistant_mask[i] = 1
                 i += 1
-            # Include EOS token in the footer so the model learns to emit it.
-            if eos_id is not None and i < len(input_ids) and input_ids[i] == eos_id:
+            # Optionally include EOS token in the assistant footer.
+            if supervise_im_end_in_loss and eos_id is not None and i < len(input_ids) and input_ids[i] == eos_id:
                 assistant_mask[i] = 1
 
     # Any remaining tokens in input_ids are also content.
@@ -743,6 +1037,35 @@ def _tokenize_with_assistant_mask(
         i += 1
 
     return input_ids, assistant_mask
+
+
+def _mark_assistant_footer_for_loss(
+    input_ids: list[int],
+    assistant_mask: list[int],
+    assistant_footer_ids: list[int],
+) -> list[int]:
+    """Mark the first assistant-footer token after assistant content.
+
+    This intentionally uses the assistant content mask plus the full footer
+    sequence, not token ID alone, because the same token can also close user
+    turns in the chat template.
+    """
+    if not assistant_footer_ids:
+        return assistant_mask
+
+    flen = len(assistant_footer_ids)
+    for idx in range(1, len(input_ids) - flen + 1):
+        # Only assistant-mask 1->0 transitions can be assistant footers.
+        if not (assistant_mask[idx - 1] and not assistant_mask[idx]):
+            continue
+        matched = True
+        for offset, footer_id in enumerate(assistant_footer_ids):
+            if assistant_mask[idx + offset] or input_ids[idx + offset] != footer_id:
+                matched = False
+                break
+        if matched:
+            assistant_mask[idx] = 1
+    return assistant_mask
 
 
 def _replace_audio_chunks(
@@ -800,6 +1123,7 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
         """
         self.defer_get_batch = defer_get_batch
         self.tokenizer = tokenizer
+        self.randomize_fixed_chunk_groups = True
         self.cfg: StreamingSTTDataConfig = to_dataclass(StreamingSTTDataConfig, cfg)
         # Unescape Python escape sequences (e.g. "\\n" → "\n") because Hydra/OmegaConf
         # loads YAML strings literally without interpreting backslash escapes.
@@ -857,6 +1181,16 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             self._write_id = None
             self._compact_eos_id = None
 
+        if self.cfg.supervise_im_end_in_loss:
+            hf_tok = self.tokenizer.tokenizer
+            if self.cfg.compact_template:
+                self._assistant_footer_ids = [self._compact_eos_id]
+            else:
+                _, _, self._assistant_footer_ids = parse_chat_template_ids(hf_tok)
+            logging.info(f"Assistant footer supervision enabled: footer_ids={self._assistant_footer_ids}")
+        else:
+            self._assistant_footer_ids = []
+
         # For dynamic chunking (chunk_size=0): cache the first token of the
         # user footer sequence (e.g. <|im_end|>).  This is the target the model
         # predicts at the last audio frame of each chunk to signal "ready to transcribe".
@@ -870,6 +1204,11 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
                 self._user_footer_first_id = user_footer_and_asst_header_ids[0]
         else:
             self._user_footer_first_id = None
+
+    def clone_for_eval(self) -> "StreamingSTTDataset":
+        dataset = copy.copy(self)
+        dataset.randomize_fixed_chunk_groups = False
+        return dataset
 
     def __getitem__(self, cuts: CutSet) -> StreamingSTTBatch | None:
         try:
@@ -902,6 +1241,7 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
         audio_lens: torch.Tensor,
         alignments: List[List[WordAlignment]],
         text: List[str],
+        randomize_fixed_chunk_groups: Optional[bool] = None,
     ) -> StreamingSTTBatch:
         audio_durations_secs = (audio_lens.float() / self.cfg.sample_rate).tolist()
 
@@ -924,6 +1264,19 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             audio_durations_secs = (audio_lens.float() / self.cfg.sample_rate).tolist()
 
         system_prompts = [cut.custom.get(self.cfg.prompt_field, self.cfg.system_prompt) for cut in cuts]
+        if randomize_fixed_chunk_groups is None:
+            randomize_fixed_chunk_groups = self.randomize_fixed_chunk_groups
+        fixed_chunk_group_schedule: Optional[List[int]] = None
+        max_audio_chunks_per_turn = max(int(getattr(self.cfg, "max_audio_chunks_per_turn", 1)), 1)
+        if randomize_fixed_chunk_groups and self.cfg.chunk_size > 0 and max_audio_chunks_per_turn > 1:
+            max_num_chunks = max(
+                (
+                    math.ceil(math.ceil(duration / self.cfg.frame_length_in_secs) / self.cfg.chunk_size)
+                    for duration in audio_durations_secs
+                ),
+                default=0,
+            )
+            fixed_chunk_group_schedule = sample_fixed_chunk_group_schedule(max_num_chunks, max_audio_chunks_per_turn)
 
         batch_messages = get_llm_messages_for_batch(
             system_role=self.cfg.system_role,
@@ -938,24 +1291,44 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             transcripts=text,
             words_per_group=self.cfg.words_per_group,
             chunk_step=K,
+            project_unaligned_text_to_chunks=self.cfg.project_unaligned_text_to_chunks,
+            fixed_chunk_group_schedule=fixed_chunk_group_schedule,
         )
 
         all_input_ids = []
         all_target_ids = []
+        chunk_word_alignment = []
 
         for sample_idx, messages in enumerate(batch_messages):
+            chunk_word_alignment.append(
+                build_chunk_word_alignment_debug(
+                    messages,
+                    audio_tag=self.cfg.audio_tag,
+                    blank_token=self.cfg.blank_token,
+                    tokenizer=self.tokenizer,
+                )
+            )
             # Tokenize and compute assistant content mask.
             if self.cfg.compact_template:
                 input_ids, assistant_mask = _tokenize_compact_with_assistant_mask(
-                    messages, self.tokenizer, self._write_id, self._compact_eos_id
+                    messages,
+                    self.tokenizer,
+                    self._write_id,
+                    self._compact_eos_id,
+                    supervise_im_end_in_loss=self.cfg.supervise_im_end_in_loss,
                 )
             else:
-                input_ids, assistant_mask = _tokenize_with_assistant_mask(messages, self.tokenizer)
+                input_ids, assistant_mask = _tokenize_with_assistant_mask(
+                    messages,
+                    self.tokenizer,
+                    supervise_im_end_in_loss=self.cfg.supervise_im_end_in_loss,
+                )
 
-            # Replace each audio chunk token sequence with chunk_size AUDIO_TOKEN_IDX markers.
-            # We match the full chunk (audio_tag * chunk_size) as a unit because BPE
-            # may merge tokens across adjacent audio tags.
-            if self.audio_chunk_ids is not None:
+            # Replace audio tag sequences with AUDIO_TOKEN_IDX markers. In the
+            # default fixed path we can use one cached pattern; grouped turns
+            # need per-user matching because BPE can tokenize 14/28/42 adjacent
+            # audio tags differently.
+            if self.audio_chunk_ids is not None and fixed_chunk_group_schedule is None:
                 # Fixed chunking: single pre-computed pattern
                 input_ids, assistant_mask = _replace_audio_chunks(
                     input_ids, self.audio_chunk_ids, self.cfg.chunk_size, mask=assistant_mask
@@ -978,6 +1351,12 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             # Build targets: next-token prediction with loss only on assistant content.
             # target[i] corresponds to input[i] and holds the token at position i+1.
             # Loss is applied only where assistant_mask[i+1] is True.
+            if self._assistant_footer_ids:
+                assistant_mask = _mark_assistant_footer_for_loss(
+                    input_ids,
+                    assistant_mask,
+                    self._assistant_footer_ids,
+                )
             target_ids = input_ids[1:] + [IGNORE_INDEX]
             target_mask = assistant_mask[1:] + [0]
             target_ids = [tid if m else IGNORE_INDEX for tid, m in zip(target_ids, target_mask)]
@@ -1020,4 +1399,5 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             target_tokens=target_tokens,
             target_token_lens=target_token_lens,
             text=text,
+            chunk_word_alignment=chunk_word_alignment,
         )

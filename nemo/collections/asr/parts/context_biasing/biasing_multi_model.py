@@ -19,6 +19,19 @@ from typing import Callable, cast
 import torch
 import torch.nn as nn
 
+# Some torch builds (e.g., NGC torch 24.07) do not expose Buffer under
+# torch.nn. Keep this module importable across those versions by providing a
+# minimal compatibility type with Buffer-like construction semantics.
+if not hasattr(nn, "Buffer"):
+    class _CompatBuffer(nn.Parameter):
+        def __new__(cls, data=None, persistent: bool = True):
+            del persistent  # compatibility-only argument
+            if data is None:
+                data = torch.empty(())
+            return nn.Parameter.__new__(cls, data, requires_grad=False)
+
+    nn.Buffer = _CompatBuffer
+
 from nemo.collections.asr.parts.context_biasing.boosting_graph_batched import (
     BoostingTreeModelConfig,
     GPUBoostingTreeModel,
