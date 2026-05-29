@@ -1361,6 +1361,15 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 loss = loss + float(self.core_cfg.parallel_loss_weight) * par_loss
                 par_loss_log = par_loss.detach()
                 par_num_slots_log = par_num_slots.detach()
+        # DDP keep-alive: ensure every ParallelChunkHeads parameter appears in
+        # the backward graph on every step, even when this rank's batch has no
+        # valid anchors (or all chunks were skipped for N>K). Without this,
+        # ``find_unused_parameters=false`` trips when any rank's batch contains
+        # no anchors while another rank's does. The 0.0 multiplier makes this
+        # a true mathematical no-op (zero gradient contribution).
+        if self._parallel_heads_enabled and self.parallel_chunk_heads is not None:
+            params_touch = sum(p.sum() for p in self.parallel_chunk_heads.parameters())
+            loss = loss + params_touch * 0.0
 
         # --- Aux chunk-boundary classifier loss ---
         # BCE on the aux head's binary "ready to emit" prediction at audio frames.
