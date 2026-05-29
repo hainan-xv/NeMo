@@ -133,6 +133,18 @@ class StreamingSTTBatch:
         text: list of ground-truth transcription strings.
         chunk_word_alignment: optional per-sample chunk/word debug lines.
         cuts: Optional[CutSet] containing the cuts for the batch.
+        chunk_anchor_positions: (B, max_chunks) int64. Position in input_tokens of
+            each chunk's anchor (the <write> token in compact-template mode). Padded
+            with -1 for samples with fewer chunks. Only populated when the model
+            requests parallel-chunk-head supervision via compact_template=True.
+        chunk_target_tokens: (B, max_chunks, K) int64. Per-chunk K-slot target slate
+            for the parallel heads. Slot k holds the token to predict at slot k of
+            the K parallel heads anchored at chunk_anchor_positions. For a chunk
+            emitting N<K tokens, slots 0..N-1 hold the N tokens, slot N holds
+            <|im_end|> (the chunk-closer), and slots N+1..K-1 hold IGNORE_INDEX.
+            For N==K, all slots hold the N tokens (no closer slot). For N>K,
+            all slots hold IGNORE_INDEX (skipped from loss). Padded chunks
+            (anchor==-1) also hold all IGNORE_INDEX.
     """
 
     audios: Optional[torch.Tensor] = None
@@ -144,6 +156,8 @@ class StreamingSTTBatch:
     text: Optional[List[str]] = None
     chunk_word_alignment: Optional[List[List[str]]] = None
     cuts: Optional[CutSet] = None
+    chunk_anchor_positions: Optional[torch.Tensor] = None
+    chunk_target_tokens: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -169,6 +183,14 @@ class StreamingSTTDataConfig:
     # K-aligned positions; deploy-time K' (any multiple of K_train) is set via
     # dynamic_min_chunk_size / dynamic_max_chunk_size. Default 1 = no-op.
     chunk_step: int = 1
+    # --- Parallel chunk heads (multi-token-per-chunk prediction) ---
+    # When > 0, the dataset emits ``chunk_anchor_positions`` and
+    # ``chunk_target_tokens`` in each batch so the model can train K parallel
+    # next-token heads anchored at each chunk's <write> position. Only
+    # supported with compact_template=True (anchor = write_id). Chunks emitting
+    # more than parallel_chunk_slots tokens are skipped from the parallel loss
+    # (logged as a warning); the AR per-token loss still covers them.
+    parallel_chunk_slots: int = 0
 
 
 def decode_with_blank(
@@ -1391,6 +1413,11 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
                 [target_tokens.shape[1] for _ in range(len(all_target_ids))], dtype=torch.long
             )
 
+        # --- Parallel chunk heads: build anchor positions + K-slot target slates ---
+        chunk_anchor_positions, chunk_target_tokens = self._build_parallel_chunk_targets(
+            all_input_ids,
+        )
+
         return StreamingSTTBatch(
             audios=audios,
             audio_lens=audio_lens,
@@ -1400,4 +1427,103 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             target_token_lens=target_token_lens,
             text=text,
             chunk_word_alignment=chunk_word_alignment,
+            chunk_anchor_positions=chunk_anchor_positions,
+            chunk_target_tokens=chunk_target_tokens,
         )
+
+    # ------------------------------------------------------------------
+    # Parallel chunk heads (multi-token-per-chunk prediction)
+    # ------------------------------------------------------------------
+
+    def _build_parallel_chunk_targets(
+        self, all_input_ids: List[torch.Tensor]
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Build chunk_anchor_positions and chunk_target_tokens for parallel heads.
+
+        Returns (None, None) when parallel-chunk-head supervision is disabled
+        (parallel_chunk_slots <= 0) or unsupported (non-compact template).
+
+        Anchor detection (compact template only):
+            Each turn's anchor is the position of the write_id token (e.g.
+            ``<|im_start|>`` in Qwen3). At that position the LLM has just
+            consumed ``[...user audio frames, write_id]``; its hidden state
+            summarizes the chunk's content and is the input to the K parallel
+            heads.
+
+        K-slot target slate per chunk (N = number of real content tokens):
+            * N <  K:  [tok_1, ..., tok_N, <|im_end|>, IGNORE_INDEX * (K-N-1)]
+                       => min(N+1, K) supervised slots, only ONE <|im_end|>.
+            * N == K:  [tok_1, ..., tok_K]   (no closer slot, all real tokens)
+            * N >  K:  all IGNORE_INDEX      (chunk skipped, warning logged)
+
+        Padded chunks across the batch (fewer chunks than max_chunks) get
+        anchor=-1 and all IGNORE_INDEX targets.
+        """
+        K = int(getattr(self.cfg, "parallel_chunk_slots", 0) or 0)
+        if K <= 0:
+            return None, None
+        if not self.cfg.compact_template:
+            # Non-compact mode requires a different anchor scheme (last header
+            # token vs write_id). Skip silently for v1 — the model side will
+            # warn on init if this combination is requested.
+            return None, None
+        write_id = self._write_id
+        eos_id = self._compact_eos_id
+        if write_id is None or eos_id is None:
+            return None, None
+
+        per_sample_anchors: list[list[int]] = []
+        per_sample_targets: list[list[list[int]]] = []
+        for input_ids_t in all_input_ids:
+            ids = input_ids_t.tolist()
+            anchors: list[int] = []
+            targets: list[list[int]] = []
+            i = 0
+            n = len(ids)
+            while i < n:
+                if ids[i] != write_id:
+                    i += 1
+                    continue
+                # Found a chunk anchor. Collect content until the matching eos.
+                content: list[int] = []
+                j = i + 1
+                while j < n and ids[j] != eos_id:
+                    content.append(ids[j])
+                    j += 1
+                N = len(content)
+                if N > K:
+                    logging.warning(
+                        "Parallel chunk heads: chunk has %d tokens > K=%d; skipping "
+                        "this chunk from parallel loss (AR loss still covers it).",
+                        N,
+                        K,
+                    )
+                    slot_targets = [IGNORE_INDEX] * K
+                elif N == K:
+                    slot_targets = list(content)
+                else:
+                    slot_targets = list(content) + [eos_id] + [IGNORE_INDEX] * (K - N - 1)
+                anchors.append(i)
+                targets.append(slot_targets)
+                # Skip past this turn so write_id collisions inside content
+                # (defensive — write_id is a special token so this is rare)
+                # don't double-count.
+                i = j + 1
+            per_sample_anchors.append(anchors)
+            per_sample_targets.append(targets)
+
+        max_chunks = max((len(a) for a in per_sample_anchors), default=0)
+        B = len(all_input_ids)
+        if max_chunks == 0:
+            return (
+                torch.zeros((B, 0), dtype=torch.long),
+                torch.zeros((B, 0, K), dtype=torch.long),
+            )
+        anchor_tensor = torch.full((B, max_chunks), -1, dtype=torch.long)
+        target_tensor = torch.full((B, max_chunks, K), IGNORE_INDEX, dtype=torch.long)
+        for b, (anchors, targets) in enumerate(zip(per_sample_anchors, per_sample_targets)):
+            if not anchors:
+                continue
+            anchor_tensor[b, : len(anchors)] = torch.tensor(anchors, dtype=torch.long)
+            target_tensor[b, : len(targets), :] = torch.tensor(targets, dtype=torch.long)
+        return anchor_tensor, target_tensor

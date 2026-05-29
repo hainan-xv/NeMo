@@ -18,6 +18,18 @@ model:
   freeze_llm_head: false
   freeze_embed_tokens: false
 
+  # --- Parallel chunk heads (multi-token-per-chunk prediction) ---
+  # Set parallel_loss_weight > 0 to train K parallel next-token heads at every
+  # chunk's <write> anchor in addition to the standard AR per-token CE. Requires
+  # compact_template=True so anchors can be identified by write_id position.
+  # Inference uses the heads when parallel_chunk_decode=True (or via the
+  # ``parallel_chunk_decode`` kwarg on ``generate()``).
+  parallel_chunk_slots: 10
+  parallel_loss_weight: 0.0
+  parallel_chunk_decode: false
+  parallel_depth_layers: 1
+  parallel_depth_num_heads: 8
+
   # LoRA (uncomment to enable)
   # lora:
   #   task_type: CAUSAL_LM

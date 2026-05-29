@@ -49,6 +49,7 @@ from nemo.collections.speechlm2.parts.chunk_local_attn import (
     build_chunk_local_inference_bias,
     build_chunk_local_position_ids,
 )
+from nemo.collections.speechlm2.modules.parallel_chunk_heads import ParallelChunkHeads
 from nemo.collections.speechlm2.parts.hf_hub import HFHubMixin
 from nemo.collections.speechlm2.parts.lora import maybe_install_lora
 from nemo.collections.speechlm2.parts.optim_setup import configure_optimizers, is_frozen
@@ -219,6 +220,19 @@ class StreamingSTTModelConfig:
     # positions are masked to IGNORE_INDEX in the LM CE — the aux head owns
     # the boundary decision exclusively.
     chunk_classifier_keep_lm_supervision_at_audio: bool = False
+    # --- Parallel chunk heads (multi-token-per-chunk prediction) ---
+    # When parallel_loss_weight > 0 OR parallel_chunk_decode is True, build a
+    # ParallelChunkHeads module: K learned slot embeddings + a small depth
+    # transformer (causal over slots) + tied lm_head. Training adds an aux
+    # cross-entropy loss at chunk anchors (the <write> token positions);
+    # inference can optionally use the heads to emit up to K text tokens per
+    # chunk in a single LLM forward instead of K sequential autoregressive
+    # forwards. Requires compact_template=True (anchor = write_id).
+    parallel_chunk_slots: int = 10
+    parallel_loss_weight: float = 0.0
+    parallel_chunk_decode: bool = False
+    parallel_depth_layers: int = 1
+    parallel_depth_num_heads: int = 8
 
 
 @dataclass
@@ -282,6 +296,21 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         self.save_hyperparameters()
         self.cfg = DictConfig(cfg)
         self.core_cfg: StreamingSTTModelConfig = to_dataclass(StreamingSTTModelConfig, cfg)
+        # Decide whether to build / use the parallel chunk heads at all.
+        # Conservative: only enable when training requests it (weight > 0) or
+        # inference explicitly opts in. Otherwise the heads are not built and
+        # the dataset skips emitting the new tensors.
+        self._parallel_heads_enabled = bool(
+            self.core_cfg.parallel_loss_weight > 0 or self.core_cfg.parallel_chunk_decode
+        )
+        if self._parallel_heads_enabled and not self.core_cfg.compact_template:
+            logging.warning(
+                "Parallel chunk heads are only supported with compact_template=True; "
+                "disabling parallel heads (parallel_loss_weight=%s, parallel_chunk_decode=%s).",
+                self.core_cfg.parallel_loss_weight,
+                self.core_cfg.parallel_chunk_decode,
+            )
+            self._parallel_heads_enabled = False
         if data_cfg is not None:
             from omegaconf import open_dict
 
@@ -289,14 +318,26 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 data_cfg.supervise_im_end_in_loss = self.core_cfg.supervise_im_end_in_loss
                 data_cfg.project_unaligned_text_to_chunks = self.core_cfg.project_unaligned_text_to_chunks
                 data_cfg.max_audio_chunks_per_turn = self.core_cfg.max_audio_chunks_per_turn
-            logging.info(
+                # Only touch parallel_chunk_slots in data_cfg when the feature
+                # is actively requested — otherwise leave the dict identical to
+                # what existing runs produce (back-compat: no spurious key, no
+                # diff in config snapshots / hyperparameter logging).
+                if self._parallel_heads_enabled:
+                    data_cfg.parallel_chunk_slots = int(self.core_cfg.parallel_chunk_slots)
+            log_msg = (
                 "StreamingSTT data_cfg flags propagated from model: "
                 "supervise_im_end_in_loss=%s, project_unaligned_text_to_chunks=%s, "
-                "max_audio_chunks_per_turn=%s",
+                "max_audio_chunks_per_turn=%s"
+            )
+            log_args = [
                 data_cfg.supervise_im_end_in_loss,
                 data_cfg.project_unaligned_text_to_chunks,
                 data_cfg.max_audio_chunks_per_turn,
-            )
+            ]
+            if self._parallel_heads_enabled:
+                log_msg += ", parallel_chunk_slots=%s"
+                log_args.append(data_cfg.parallel_chunk_slots)
+            logging.info(log_msg, *log_args)
         if self.core_cfg.use_modality_position_ids and not self.core_cfg.supervise_im_end_in_loss:
             raise ValueError("use_modality_position_ids=True requires supervise_im_end_in_loss=True")
         if self.core_cfg.use_modality_position_ids and int(self.core_cfg.modality_position_offset) <= 0:
@@ -402,6 +443,26 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             self._ensure_inference_cache()
         elif self.core_cfg.chunk_classifier_use_at_inference:
             raise ValueError("chunk_classifier_use_at_inference=True requires use_chunk_classifier=True")
+
+        # --- Parallel chunk heads (multi-token-per-chunk prediction) ---
+        if self._parallel_heads_enabled:
+            self.parallel_chunk_heads = ParallelChunkHeads(
+                hidden_size=self.llm.config.hidden_size,
+                num_slots=int(self.core_cfg.parallel_chunk_slots),
+                depth_layers=int(self.core_cfg.parallel_depth_layers),
+                num_heads=int(self.core_cfg.parallel_depth_num_heads),
+            )
+            logging.info(
+                "ParallelChunkHeads enabled: K=%d slots, %d depth layers, %d attention heads "
+                "(parallel_loss_weight=%.3f, parallel_chunk_decode=%s).",
+                int(self.core_cfg.parallel_chunk_slots),
+                int(self.core_cfg.parallel_depth_layers),
+                int(self.core_cfg.parallel_depth_num_heads),
+                float(self.core_cfg.parallel_loss_weight),
+                self.core_cfg.parallel_chunk_decode,
+            )
+        else:
+            self.parallel_chunk_heads = None
 
         self._apply_freeze_config()
 
@@ -994,8 +1055,18 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         wer = float(total_err) / float(total_words) if total_words > 0 else 0.0
         return wer, total_err, total_words
 
-    def _generate_hypotheses_for_wer(self, batch: StreamingSTTBatch) -> List[str]:
-        """Run inference-time decoding (no teacher forcing) for WER."""
+    def _generate_hypotheses_for_wer(
+        self, batch: StreamingSTTBatch, parallel: bool = False
+    ) -> List[str]:
+        """Run inference-time decoding (no teacher forcing) for WER.
+
+        Args:
+            batch: Streaming batch to decode.
+            parallel: When True, use the parallel chunk heads to emit up to K
+                tokens per chunk in 1 prefill + 1 batched feed (vs the AR loop's
+                1 prefill + up to N sequential feeds). No-op when the parallel
+                heads aren't initialized; falls back to AR.
+        """
         max_new_tokens = DEFAULT_MAX_NEW_TOKENS_PER_CHUNK
         default_prompt = "Transcribe the audio into text."
         prompt_field = "system_prompt"
@@ -1018,6 +1089,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                     audio_lens=batch.audio_lens,
                     system_prompt=system_prompt,
                     max_new_tokens=max_new_tokens,
+                    parallel_chunk_decode=parallel,
                 )
         finally:
             if was_training:
@@ -1098,6 +1170,72 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             )
         return per_token_loss.sum() / num_targets, num_targets
 
+    # ------------------------------------------------------------------
+    # Parallel chunk heads helpers
+    # ------------------------------------------------------------------
+
+    def _compute_parallel_chunk_loss(
+        self,
+        hidden_states: Tensor,
+        anchor_positions: Tensor,
+        chunk_targets: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        """Compute the K-slot parallel-chunk-head cross-entropy.
+
+        Args:
+            hidden_states: (B, L, H) LLM last hidden states.
+            anchor_positions: (B, C) anchor token indices into the L axis;
+                values < 0 mark padded chunks (skipped).
+            chunk_targets: (B, C, K) per-slot targets with IGNORE_INDEX in
+                non-supervised slots.
+
+        Returns:
+            (loss, num_supervised_slots): scalar loss averaged over supervised
+            slots, and the int count of supervised slots in this batch.
+            Returns (zero, zero) if no supervised slot is present.
+        """
+        device = hidden_states.device
+        zero = torch.zeros((), device=device)
+        zero_long = torch.zeros((), dtype=torch.long, device=device)
+        if self.parallel_chunk_heads is None or anchor_positions is None or anchor_positions.numel() == 0:
+            return zero, zero_long
+
+        B, C = anchor_positions.shape
+        valid = anchor_positions >= 0  # (B, C)
+        if not valid.any():
+            return zero, zero_long
+
+        # Per-chunk supervised slot count.
+        slot_valid = chunk_targets != IGNORE_INDEX  # (B, C, K)
+        num_slots = int(slot_valid.sum().item())
+        if num_slots == 0:
+            return zero, zero_long
+
+        # Gather hidden states at anchors. Use gather along the L axis.
+        # Replace -1 indices with 0 for safety (we'll mask them out next).
+        safe_anchor = anchor_positions.clamp(min=0)  # (B, C)
+        # hidden_states: (B, L, H) → (B, C, H)
+        H = hidden_states.size(-1)
+        gather_idx = safe_anchor.unsqueeze(-1).expand(B, C, H)  # (B, C, H)
+        gathered = hidden_states.gather(1, gather_idx)  # (B, C, H)
+
+        # Flatten to (M, H) using only valid anchors, and (M, K) targets.
+        flat_hidden = gathered[valid]  # (M, H)
+        flat_targets = chunk_targets[valid]  # (M, K)
+
+        # Run parallel heads with the tied lm_head.
+        par_logits = self.parallel_chunk_heads(flat_hidden, self.llm.lm_head)  # (M, K, V)
+
+        with loss_parallel():
+            par_loss = F.cross_entropy(
+                par_logits.reshape(-1, par_logits.size(-1)),
+                flat_targets.reshape(-1),
+                ignore_index=IGNORE_INDEX,
+                reduction="mean",
+            )
+
+        return par_loss, torch.as_tensor(num_slots, dtype=torch.long, device=device)
+
     def training_step(self, batch: StreamingSTTBatch, batch_idx: int):
         # Keep frozen modules in eval mode (disables dropout / batch-norm updates).
         for m in (self.perception.preprocessor, self.perception.encoder, self.llm):
@@ -1117,6 +1255,12 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
 
         inputs = self._build_input_embeds(batch.input_tokens, batch.audios, batch.audio_lens)
         use_aux = self.core_cfg.use_chunk_classifier
+        use_parallel = (
+            self._parallel_heads_enabled
+            and self.core_cfg.parallel_loss_weight > 0
+            and batch.chunk_anchor_positions is not None
+            and batch.chunk_anchor_positions.numel() > 0
+        )
         # Chunk-local audio attention swaps the 2-D mask for a 4-D additive
         # bias on the LLM forward only; the aux head keeps consuming the
         # original 2-D ``inputs["attention_mask"]``.
@@ -1124,7 +1268,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         outputs = self.forward(
             inputs["input_embeds"],
             attention_mask=llm_attn_mask,
-            output_hidden_states=use_aux,
+            output_hidden_states=use_aux or use_parallel,
             position_ids=inputs.get("position_ids"),
         )
 
@@ -1201,6 +1345,23 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             text_only_lm_loss_log = text_only_lm_loss.detach()
             text_only_lm_num_targets_log = text_only_lm_num_targets.detach()
 
+        # --- Parallel chunk heads loss ---
+        # Gather hidden states at each chunk's anchor (write_id position) and
+        # supervise K parallel heads against the per-chunk target slate.
+        # Auxiliary loss; added on top of the standard AR per-token CE.
+        par_loss_log = torch.zeros((), device=loss.device)
+        par_num_slots_log = torch.zeros((), dtype=torch.long, device=loss.device)
+        if use_parallel:
+            par_loss, par_num_slots = self._compute_parallel_chunk_loss(
+                hidden_states=outputs["hidden_states"],
+                anchor_positions=batch.chunk_anchor_positions,
+                chunk_targets=batch.chunk_target_tokens,
+            )
+            if par_num_slots > 0:
+                loss = loss + float(self.core_cfg.parallel_loss_weight) * par_loss
+                par_loss_log = par_loss.detach()
+                par_num_slots_log = par_num_slots.detach()
+
         # --- Aux chunk-boundary classifier loss ---
         # BCE on the aux head's binary "ready to emit" prediction at audio frames.
         # Supervised positions: input is an audio frame AND original target was a
@@ -1244,25 +1405,28 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 )
 
         B, L = inputs["input_embeds"].shape[:2]
-        self.log_dict(
-            {
-                "loss": loss,
-                "loss_blank": loss_blank,
-                "loss_nonblank": loss_nonblank,
-                "loss_chunk_cls": cls_loss_log,
-                "loss_text_only_lm": text_only_lm_loss_log,
-                "text_only_lm_num_targets": text_only_lm_num_targets_log.float(),
-                "blank_ratio": num_blank.float() / num_targets,
-                "learning_rate": torch.as_tensor(
-                    self.trainer.optimizers[0].param_groups[0]["lr"] if self._trainer is not None else 0
-                ),
-                "batch_size": float(B),
-                "sequence_length": float(L),
-                "num_targets": num_targets.float(),
-                "target_to_input_ratio": num_targets / (B * L),
-            },
-            on_step=True,
-        )
+        log_payload = {
+            "loss": loss,
+            "loss_blank": loss_blank,
+            "loss_nonblank": loss_nonblank,
+            "loss_chunk_cls": cls_loss_log,
+            "loss_text_only_lm": text_only_lm_loss_log,
+            "text_only_lm_num_targets": text_only_lm_num_targets_log.float(),
+            "blank_ratio": num_blank.float() / num_targets,
+            "learning_rate": torch.as_tensor(
+                self.trainer.optimizers[0].param_groups[0]["lr"] if self._trainer is not None else 0
+            ),
+            "batch_size": float(B),
+            "sequence_length": float(L),
+            "num_targets": num_targets.float(),
+            "target_to_input_ratio": num_targets / (B * L),
+        }
+        # Only surface the parallel-head metrics when the feature is enabled,
+        # so existing runs emit the exact same metric keys as before.
+        if self._parallel_heads_enabled:
+            log_payload["loss_parallel_chunk"] = par_loss_log
+            log_payload["parallel_chunk_num_slots"] = par_num_slots_log.float()
+        self.log_dict(log_payload, on_step=True)
 
         should_log_debug = (
             self.core_cfg.log_every_n_steps > 0
@@ -1273,26 +1437,64 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             self._log_chunk_alignment_preview(batch, batch_idx=batch_idx, stage="train")
 
             # WER is computed from actual inference-time decoding (not teacher forcing).
-            hyps = self._generate_hypotheses_for_wer(batch)
-            refs = batch.text if batch.text is not None else [""] * len(hyps)
-            train_wer, _, _ = self._compute_wer_stats(refs, hyps)
+            # ``train_wer`` is the AR-decode WER — kept under that key to preserve
+            # back-compat for existing runs / dashboards. When parallel heads are
+            # active, additionally log ``train_wer_ar`` (alias) and ``train_wer_parallel``
+            # so we can track how the two decode paths diverge.
+            hyps_ar = self._generate_hypotheses_for_wer(batch, parallel=False)
+            refs = batch.text if batch.text is not None else [""] * len(hyps_ar)
+            train_wer_ar, _, _ = self._compute_wer_stats(refs, hyps_ar)
             self.log(
                 "train_wer",
-                torch.tensor(train_wer, device=loss.device),
+                torch.tensor(train_wer_ar, device=loss.device),
                 on_step=True,
                 on_epoch=False,
                 logger=True,
                 sync_dist=True,
             )
 
-            if refs and hyps:
-                logging.info(
-                    "[train] batch %d infer sample\n  ref: `%s`\n  hyp: `%s`\n  wer(batch)=%.4f",
-                    batch_idx,
-                    refs[0],
-                    hyps[0],
-                    train_wer,
+            hyps_par = None
+            train_wer_par = None
+            if self._parallel_heads_enabled:
+                self.log(
+                    "train_wer_ar",
+                    torch.tensor(train_wer_ar, device=loss.device),
+                    on_step=True,
+                    on_epoch=False,
+                    logger=True,
+                    sync_dist=True,
                 )
+                hyps_par = self._generate_hypotheses_for_wer(batch, parallel=True)
+                train_wer_par, _, _ = self._compute_wer_stats(refs, hyps_par)
+                self.log(
+                    "train_wer_parallel",
+                    torch.tensor(train_wer_par, device=loss.device),
+                    on_step=True,
+                    on_epoch=False,
+                    logger=True,
+                    sync_dist=True,
+                )
+
+            if refs and hyps_ar:
+                if hyps_par is not None:
+                    logging.info(
+                        "[train] batch %d infer sample\n  ref: `%s`\n  hyp_ar: `%s`\n  hyp_par: `%s`\n  "
+                        "wer_ar(batch)=%.4f  wer_par(batch)=%.4f",
+                        batch_idx,
+                        refs[0],
+                        hyps_ar[0],
+                        hyps_par[0] if hyps_par else "",
+                        train_wer_ar,
+                        train_wer_par if train_wer_par is not None else float("nan"),
+                    )
+                else:
+                    logging.info(
+                        "[train] batch %d infer sample\n  ref: `%s`\n  hyp: `%s`\n  wer(batch)=%.4f",
+                        batch_idx,
+                        refs[0],
+                        hyps_ar[0],
+                        train_wer_ar,
+                    )
         return {"loss": loss}
 
     def configure_optimizers(self):
@@ -1307,6 +1509,10 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         self._partial_accuracies: dict[str, list] = defaultdict(list)
         self._partial_wer_errors: dict[str, list] = defaultdict(list)
         self._partial_wer_words: dict[str, list] = defaultdict(list)
+        # Parallel-decode WER accumulators (only populated when parallel heads
+        # are enabled). Same shape semantics as the AR counterparts.
+        self._partial_wer_errors_parallel: dict[str, list] = defaultdict(list)
+        self._partial_wer_words_parallel: dict[str, list] = defaultdict(list)
         # Per-class TP/total counts for the aux chunk classifier. Aggregated
         # across the epoch so macro acc isn't biased by per-batch composition.
         self._partial_aux_pos_correct: dict[str, list] = defaultdict(list)
@@ -1338,9 +1544,31 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             total_words = torch.stack(words).sum().clamp(min=1)
             val_wer = total_err.float() / total_words.float()
             self.log(f"val_wer_{name}", val_wer, on_epoch=True, sync_dist=True)
+            if self._parallel_heads_enabled:
+                self.log(f"val_wer_ar_{name}", val_wer, on_epoch=True, sync_dist=True)
             wers.append(val_wer)
         if wers:
-            self.log("val_wer", torch.stack(wers).mean(), on_epoch=True, sync_dist=True)
+            mean_wer = torch.stack(wers).mean()
+            self.log("val_wer", mean_wer, on_epoch=True, sync_dist=True)
+            if self._parallel_heads_enabled:
+                self.log("val_wer_ar", mean_wer, on_epoch=True, sync_dist=True)
+
+        # Parallel-decode WER (only when parallel heads are active — for runs
+        # without parallel heads, ``_partial_wer_errors_parallel`` is empty and
+        # this block is a no-op, preserving the original metric set exactly).
+        if self._parallel_heads_enabled:
+            wers_par = []
+            for name, errs in self._partial_wer_errors_parallel.items():
+                words = self._partial_wer_words_parallel[name]
+                if not errs:
+                    continue
+                total_err = torch.stack(errs).sum()
+                total_words = torch.stack(words).sum().clamp(min=1)
+                val_wer_par = total_err.float() / total_words.float()
+                self.log(f"val_wer_parallel_{name}", val_wer_par, on_epoch=True, sync_dist=True)
+                wers_par.append(val_wer_par)
+            if wers_par:
+                self.log("val_wer_parallel", torch.stack(wers_par).mean(), on_epoch=True, sync_dist=True)
 
         # --- Aux chunk classifier: macro accuracy ---
         # Sum per-class counts across the epoch and compute pos/neg accuracy
@@ -1365,6 +1593,8 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         self._partial_accuracies.clear()
         self._partial_wer_errors.clear()
         self._partial_wer_words.clear()
+        self._partial_wer_errors_parallel.clear()
+        self._partial_wer_words_parallel.clear()
         self._partial_aux_pos_correct.clear()
         self._partial_aux_pos_total.clear()
         self._partial_aux_neg_correct.clear()
@@ -1434,7 +1664,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         self._partial_accuracies[name].append(accuracy)
 
         # WER from inference-time decoding (non-teacher-forced).
-        hyps = self._generate_hypotheses_for_wer(batch)
+        hyps = self._generate_hypotheses_for_wer(batch, parallel=False)
         refs = batch.text if batch.text is not None else [""] * len(hyps)
         batch_wer, num_err, num_words = self._compute_wer_stats(refs, hyps)
         self._partial_wer_errors[name].append(torch.tensor(float(num_err), device=loss.device))
@@ -1447,6 +1677,25 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             logger=True,
             sync_dist=True,
         )
+
+        # Parallel-decode WER from the same batch (only when heads are enabled).
+        if self._parallel_heads_enabled:
+            hyps_par = self._generate_hypotheses_for_wer(batch, parallel=True)
+            batch_wer_par, num_err_par, num_words_par = self._compute_wer_stats(refs, hyps_par)
+            self._partial_wer_errors_parallel[name].append(
+                torch.tensor(float(num_err_par), device=loss.device)
+            )
+            self._partial_wer_words_parallel[name].append(
+                torch.tensor(float(num_words_par), device=loss.device)
+            )
+            self.log(
+                f"val_wer_parallel_step_{name}",
+                torch.tensor(batch_wer_par, device=loss.device),
+                on_step=True,
+                on_epoch=False,
+                logger=True,
+                sync_dist=True,
+            )
 
         # --- Aux chunk classifier: per-class correct/total counts ---
         if aux_active:
@@ -1734,6 +1983,112 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         # 7. Sample
         probs = F.softmax(logits, dim=-1)
         return torch.multinomial(probs, num_samples=1).squeeze(-1)
+
+    @torch.no_grad()
+    def _parallel_chunk_step_decode(
+        self,
+        anchor_hidden: Tensor,
+        state: 'StreamingState',
+        max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS_PER_CHUNK,
+    ) -> tuple[list[list[int]], list[bool]]:
+        """Parallel-head per-chunk decoding (1 prefill is already done by caller; this
+        adds 1 batched feed to put the emitted tokens + closer into the KV cache).
+
+        Args:
+            anchor_hidden: (B, H) LLM hidden state at each stream's anchor position
+                (the write_id / asst-header token of the current chunk's prefill).
+            state: Mutable StreamingState (KV cache, attention_mask, seq_lens).
+            max_new_tokens: Truncate K-slot output at this many real tokens at most
+                (in addition to the natural <|im_end|> stop).
+
+        Returns:
+            (generated_per_stream, footer_consumed_per_stream).
+            ``generated_per_stream[b]`` is the list of emitted token IDs for stream
+            b (truncated at <|im_end|> or blank; never includes the closer itself).
+            ``footer_consumed[b]`` is True if the closer was emitted within the
+            K-slot window, mirroring AR's contract so the caller can skip the
+            explicit footer feed when not needed.
+        """
+        assert self.parallel_chunk_heads is not None, (
+            "_parallel_chunk_step_decode called but parallel_chunk_heads is not initialized"
+        )
+        device = anchor_hidden.device
+        B = anchor_hidden.shape[0]
+        K = self.parallel_chunk_heads.num_slots
+
+        # Stop tokens: <|im_end|> always; blank too if configured.
+        stop_ids = set()
+        if self._eos_id is not None:
+            stop_ids.add(int(self._eos_id))
+        if self.has_blank:
+            stop_ids.add(int(self.blank_token_id))
+
+        # (1) Sample greedy K tokens per stream from the parallel heads.
+        par_logits = self.parallel_chunk_heads(anchor_hidden, self.llm.lm_head)  # (B, K, V)
+        sampled = par_logits.argmax(dim=-1)  # (B, K)
+        K_cap = min(K, int(max_new_tokens))
+
+        # (2) Per-stream truncation at first stop token.
+        generated_per_stream: list[list[int]] = [[] for _ in range(B)]
+        footer_consumed: list[bool] = [False] * B
+        per_stream_feed_ids: list[list[int]] = [[] for _ in range(B)]
+        for b in range(B):
+            for k in range(K_cap):
+                tid = int(sampled[b, k].item())
+                if tid in stop_ids:
+                    footer_consumed[b] = True
+                    per_stream_feed_ids[b].append(tid)
+                    break
+                generated_per_stream[b].append(tid)
+                per_stream_feed_ids[b].append(tid)
+            else:
+                # No stop token in the K-slot window — synthesize the closer so
+                # the KV cache ends cleanly. The caller's step-7 footer block
+                # then becomes a no-op for this stream (footer_consumed=True).
+                if self._eos_id is not None:
+                    per_stream_feed_ids[b].append(int(self._eos_id))
+                    footer_consumed[b] = True
+
+        # (3) Batched feed of the per-stream emitted sequences into the KV cache.
+        # Pad to the max per-stream length with text_pad_id, mask out the padding.
+        max_len = max((len(seq) for seq in per_stream_feed_ids), default=0)
+        if max_len == 0:
+            return generated_per_stream, footer_consumed
+
+        pad_id = self.text_pad_id
+        feed_ids = torch.full((B, max_len), pad_id, dtype=torch.long, device=device)
+        feed_attn_add = torch.zeros((B, max_len), dtype=state.attention_mask.dtype, device=device)
+        for b in range(B):
+            n_b = len(per_stream_feed_ids[b])
+            if n_b == 0:
+                continue
+            feed_ids[b, :n_b] = torch.tensor(per_stream_feed_ids[b], dtype=torch.long, device=device)
+            feed_attn_add[b, :n_b] = 1
+        feed_embeds = self.embed_tokens(feed_ids)  # (B, max_len, H)
+
+        # Extend the running 2-D attention mask. (Chunk-local audio attn / sep-pos
+        # variants are not yet supported in the parallel decode path; we error in
+        # that case to avoid silently-wrong behavior — fall back to AR.)
+        if self.core_cfg.use_chunk_local_audio_attn or self.core_cfg.use_modality_position_ids:
+            raise NotImplementedError(
+                "parallel_chunk_decode is not yet wired through chunk-local audio attention or "
+                "separated modality position IDs. Set parallel_chunk_decode=False for those modes."
+            )
+        state.attention_mask = torch.cat([state.attention_mask, feed_attn_add], dim=1)
+        out = self.llm(
+            inputs_embeds=feed_embeds,
+            past_key_values=state.cache,
+            attention_mask=state.attention_mask,
+            use_cache=True,
+            return_dict=True,
+        )
+        state.cache = out.past_key_values
+        for b in range(B):
+            # Only the real-token positions grow the logical sequence; padded
+            # positions are masked out and shouldn't be counted as "seen text".
+            state.seq_lens[b] += len(per_stream_feed_ids[b])
+
+        return generated_per_stream, footer_consumed
 
     def _autoregressive_decode(
         self,
@@ -2191,6 +2546,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         generation_config: Optional[GenerationConfig] = None,
         _audio_embs: Optional[Tensor] = None,
         inference_chunk_size_frames: Optional[int] = None,
+        parallel_chunk_decode: Optional[bool] = None,
         **generation_kwargs,
     ) -> list[list[int]]:
         """
@@ -2265,6 +2621,11 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             ) = self._build_chunk_local_step_inputs(state, audio_mask)
 
         # 5. Forward through LLM with cache
+        # Resolve parallel-decode mode: explicit kwarg wins, else cfg default.
+        use_parallel_decode = bool(
+            self.parallel_chunk_heads is not None
+            and (parallel_chunk_decode if parallel_chunk_decode is not None else self.core_cfg.parallel_chunk_decode)
+        )
         input_len = input_embeds.shape[1]
         state.attention_mask = torch.cat(
             [state.attention_mask, torch.ones(B, input_len, dtype=state.attention_mask.dtype, device=device)],
@@ -2283,6 +2644,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             position_ids=position_ids,
             use_cache=True,
             return_dict=True,
+            output_hidden_states=use_parallel_decode,
         )
         if new_chunk_ids_for_history is not None:
             self._append_chunk_local_history(
@@ -2320,15 +2682,28 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                         audio_emb_stats,
                     )
 
-        # 6. Autoregressive generation loop
-        generated_per_stream, state.cache, footer_consumed, _, _, _ = self._autoregressive_decode(
-            out.logits,
-            state.cache,
-            state,
-            max_new_tokens,
-            generation_config,
-            **generation_kwargs,
-        )
+        # 6. Generation: parallel-head emission (1 prefill + 1 batched feed)
+        #    OR autoregressive decode (1 prefill + N sequential feeds).
+        if use_parallel_decode:
+            # Read hidden at the anchor (last position of the prefill, which is
+            # the write_id / asst-header in the turn template). For both compact
+            # and non-compact templates the last template token immediately
+            # precedes the assistant content positions whose tokens we predict.
+            hidden_anchor = out.hidden_states[-1][:, -1, :]  # (B, H)
+            generated_per_stream, footer_consumed = self._parallel_chunk_step_decode(
+                anchor_hidden=hidden_anchor,
+                state=state,
+                max_new_tokens=max_new_tokens,
+            )
+        else:
+            generated_per_stream, state.cache, footer_consumed, _, _, _ = self._autoregressive_decode(
+                out.logits,
+                state.cache,
+                state,
+                max_new_tokens,
+                generation_config,
+                **generation_kwargs,
+            )
 
         # 7. Finalize turn — ensure end-of-turn tokens are in the cache.
         needs_footer = [not fc for fc in footer_consumed]
@@ -3088,6 +3463,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         generation_config: Optional[GenerationConfig] = None,
         use_offline_embs: bool = False,
         inference_audio_chunks_per_turn: int = 1,
+        parallel_chunk_decode: Optional[bool] = None,
         **generation_kwargs,
     ) -> list[str]:
         """Chunk-by-chunk streaming generation for B samples in lockstep.
@@ -3210,6 +3586,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 generation_config,
                 **extra_kwargs,
                 inference_chunk_size_frames=turn_chunk_size,
+                parallel_chunk_decode=parallel_chunk_decode,
                 **generation_kwargs,
             )
             for b in range(B):
@@ -3234,6 +3611,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         dynamic_max_chunk_size: Optional[int] = None,
         lm_head_emit_threshold: Optional[float] = None,
         debug_logs: Optional[list] = None,
+        parallel_chunk_decode: Optional[bool] = None,
         **generation_kwargs,
     ) -> list[str]:
         """
@@ -3311,6 +3689,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                     generation_config,
                     use_offline_embs=use_offline_embs,
                     inference_audio_chunks_per_turn=inference_audio_chunks_per_turn,
+                    parallel_chunk_decode=parallel_chunk_decode,
                     **generation_kwargs,
                 )
 
