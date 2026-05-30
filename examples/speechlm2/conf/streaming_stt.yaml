@@ -29,6 +29,9 @@ model:
   parallel_chunk_decode: false
   parallel_depth_layers: 1
   parallel_depth_num_heads: 8
+  # Train on the parallel-chunk loss only (AR/aux terms kept at weight 0 for
+  # DDP keep-alive). Use with parallel_loss_weight=1.0.
+  parallel_only_loss: false
 
   # LoRA (uncomment to enable)
   # lora:

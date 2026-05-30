@@ -235,6 +235,13 @@ class StreamingSTTModelConfig:
     parallel_chunk_decode: bool = False
     parallel_depth_layers: int = 1
     parallel_depth_num_heads: int = 8
+    # When True, train on the parallel-chunk loss ONLY: the AR per-token CE (and
+    # the text-only-LM / chunk-classifier aux terms) are kept in the autograd
+    # graph multiplied by 0.0 so their parameters still receive a (zero)
+    # gradient — this keeps DDP find_unused_parameters=false from tripping —
+    # but they contribute nothing to the optimized objective. Use with
+    # parallel_loss_weight=1.0 for a pure multi-token-head training run.
+    parallel_only_loss: bool = False
 
 
 @dataclass
@@ -1390,6 +1397,10 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         # Gather hidden states at each chunk's anchor (write_id position) and
         # supervise K parallel heads against the per-chunk target slate.
         # Auxiliary loss; added on top of the standard AR per-token CE.
+        # Compute the parallel-chunk term *separately* from the AR/aux ``loss``
+        # accumulator so that, in parallel-only mode, we can drop the
+        # non-parallel terms while still keeping their params in the graph.
+        par_term = torch.zeros((), device=loss.device)
         par_loss_log = torch.zeros((), device=loss.device)
         par_num_slots_log = torch.zeros((), dtype=torch.long, device=loss.device)
         if use_parallel:
@@ -1399,18 +1410,9 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 chunk_targets=batch.chunk_target_tokens,
             )
             if par_num_slots > 0:
-                loss = loss + float(self.core_cfg.parallel_loss_weight) * par_loss
+                par_term = float(self.core_cfg.parallel_loss_weight) * par_loss
                 par_loss_log = par_loss.detach()
                 par_num_slots_log = par_num_slots.detach()
-        # DDP keep-alive: ensure every ParallelChunkHeads parameter appears in
-        # the backward graph on every step, even when this rank's batch has no
-        # valid anchors (or all chunks were skipped for N>K). Without this,
-        # ``find_unused_parameters=false`` trips when any rank's batch contains
-        # no anchors while another rank's does. The 0.0 multiplier makes this
-        # a true mathematical no-op (zero gradient contribution).
-        if self._parallel_heads_enabled and self.parallel_chunk_heads is not None:
-            params_touch = sum(p.sum() for p in self.parallel_chunk_heads.parameters())
-            loss = loss + params_touch * 0.0
 
         # --- Aux chunk-boundary classifier loss ---
         # BCE on the aux head's binary "ready to emit" prediction at audio frames.
@@ -1453,6 +1455,27 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                     {"loss_chunk_cls_pos_ratio": cls_pos_ratio},
                     on_step=True,
                 )
+
+        # --- Combine the optimized objective ---
+        # At this point ``loss`` holds the non-parallel terms (AR per-token CE +
+        # optional text-only-LM + optional chunk-classifier). ``par_term`` holds
+        # the (weighted) parallel-chunk loss.
+        if self.core_cfg.parallel_only_loss:
+            # Train on the parallel loss ONLY. Keep the non-parallel terms in
+            # the graph at weight 0 so every AR/aux parameter still receives a
+            # (zero) gradient and DDP find_unused_parameters=false does not trip
+            # when AR supervision is dropped (e.g. parallel_loss_weight=1.0).
+            loss = par_term + loss * 0.0
+        else:
+            loss = loss + par_term
+        # DDP keep-alive: ensure every ParallelChunkHeads parameter appears in
+        # the backward graph on every step, even when this rank's batch has no
+        # valid anchors. Without this, ``find_unused_parameters=false`` trips
+        # when one rank has anchors and another does not. The 0.0 multiplier
+        # makes this a true mathematical no-op (zero gradient contribution).
+        if self._parallel_heads_enabled and self.parallel_chunk_heads is not None:
+            params_touch = sum(p.sum() for p in self.parallel_chunk_heads.parameters())
+            loss = loss + params_touch * 0.0
 
         B, L = inputs["input_embeds"].shape[:2]
         log_payload = {
@@ -1587,25 +1610,34 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         if accuracies:
             self.log("val_acc", torch.stack(accuracies).mean(), on_epoch=True, sync_dist=True)
 
+        # In parallel-only training the AR decode path is not optimized, so the
+        # AR WER is meaningless as the primary monitor. Demote it to
+        # ``val_wer_ar`` and let the parallel WER own ``val_wer`` (below) so the
+        # checkpoint monitor (val_wer) tracks the actually-trained objective.
+        parallel_only = bool(self.core_cfg.parallel_only_loss) and self._parallel_heads_enabled
+
         wers = []
         for name, errs in self._partial_wer_errors.items():
             words = self._partial_wer_words[name]
             total_err = torch.stack(errs).sum()
             total_words = torch.stack(words).sum().clamp(min=1)
             val_wer = total_err.float() / total_words.float()
-            self.log(f"val_wer_{name}", val_wer, on_epoch=True, sync_dist=True)
+            if not parallel_only:
+                self.log(f"val_wer_{name}", val_wer, on_epoch=True, sync_dist=True)
             if self._parallel_heads_enabled:
                 self.log(f"val_wer_ar_{name}", val_wer, on_epoch=True, sync_dist=True)
             wers.append(val_wer)
         if wers:
             mean_wer = torch.stack(wers).mean()
-            self.log("val_wer", mean_wer, on_epoch=True, sync_dist=True)
+            if not parallel_only:
+                self.log("val_wer", mean_wer, on_epoch=True, sync_dist=True)
             if self._parallel_heads_enabled:
                 self.log("val_wer_ar", mean_wer, on_epoch=True, sync_dist=True)
 
         # Parallel-decode WER (only when parallel heads are active — for runs
         # without parallel heads, ``_partial_wer_errors_parallel`` is empty and
         # this block is a no-op, preserving the original metric set exactly).
+        # When parallel_only_loss is set, this WER also *is* ``val_wer``.
         if self._parallel_heads_enabled:
             wers_par = []
             for name, errs in self._partial_wer_errors_parallel.items():
@@ -1616,9 +1648,14 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 total_words = torch.stack(words).sum().clamp(min=1)
                 val_wer_par = total_err.float() / total_words.float()
                 self.log(f"val_wer_parallel_{name}", val_wer_par, on_epoch=True, sync_dist=True)
+                if parallel_only:
+                    self.log(f"val_wer_{name}", val_wer_par, on_epoch=True, sync_dist=True)
                 wers_par.append(val_wer_par)
             if wers_par:
-                self.log("val_wer_parallel", torch.stack(wers_par).mean(), on_epoch=True, sync_dist=True)
+                mean_par = torch.stack(wers_par).mean()
+                self.log("val_wer_parallel", mean_par, on_epoch=True, sync_dist=True)
+                if parallel_only:
+                    self.log("val_wer", mean_par, on_epoch=True, sync_dist=True)
 
         # --- Aux chunk classifier: macro accuracy ---
         # Sum per-class counts across the epoch and compute pos/neg accuracy
