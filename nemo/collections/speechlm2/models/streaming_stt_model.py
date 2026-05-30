@@ -318,6 +318,18 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 data_cfg.supervise_im_end_in_loss = self.core_cfg.supervise_im_end_in_loss
                 data_cfg.project_unaligned_text_to_chunks = self.core_cfg.project_unaligned_text_to_chunks
                 data_cfg.max_audio_chunks_per_turn = self.core_cfg.max_audio_chunks_per_turn
+                # compact_template / write_token: the dataset has its OWN copies
+                # of these keys (StreamingSTTDataConfig) and they must agree with
+                # the model's choice -- otherwise the dataset emits regular chat
+                # template tokens while the model trains / runs inference under
+                # compact-template assumptions, silently breaking both training
+                # (no <write> anchors -> parallel heads never fire, severe
+                # train/inference token mismatch) and decoding. Gate on
+                # compact_template=True to keep existing non-compact runs
+                # byte-identical (no new keys appear in their saved configs).
+                if bool(self.core_cfg.compact_template):
+                    data_cfg.compact_template = True
+                    data_cfg.write_token = str(self.core_cfg.write_token)
                 # Only touch parallel_chunk_slots in data_cfg when the feature
                 # is actively requested — otherwise leave the dict identical to
                 # what existing runs produce (back-compat: no spurious key, no
@@ -334,6 +346,9 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 data_cfg.project_unaligned_text_to_chunks,
                 data_cfg.max_audio_chunks_per_turn,
             ]
+            if bool(self.core_cfg.compact_template):
+                log_msg += ", compact_template=%s, write_token=%r"
+                log_args.extend([data_cfg.compact_template, data_cfg.write_token])
             if self._parallel_heads_enabled:
                 log_msg += ", parallel_chunk_slots=%s"
                 log_args.append(data_cfg.parallel_chunk_slots)
@@ -1261,6 +1276,30 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             and batch.chunk_anchor_positions is not None
             and batch.chunk_anchor_positions.numel() > 0
         )
+        # Loud one-shot diagnostic: catch the common misconfig where the
+        # parallel-heads module is built on the model side (so the metric
+        # appears in wandb) but the dataset never emits chunk_anchor_positions
+        # (e.g. because compact_template was not propagated to data_cfg). Left
+        # silent, this presents as ``loss_parallel_chunk=0`` for an entire run.
+        if (
+            self._parallel_heads_enabled
+            and self.core_cfg.parallel_loss_weight > 0
+            and not use_parallel
+            and not getattr(self, "_parallel_heads_disabled_warned", False)
+        ):
+            anchors = batch.chunk_anchor_positions
+            logging.warning(
+                "ParallelChunkHeads is ENABLED on the model (parallel_loss_weight=%.3f) "
+                "but batch %d has no chunk anchors (batch.chunk_anchor_positions=%s). "
+                "Most likely the dataset config does not have compact_template=True or "
+                "parallel_chunk_slots>0. Verify that the dataset logged "
+                "'compact_template enabled' and 'parallel_chunk_slots' at startup. "
+                "Until this is fixed loss_parallel_chunk will stay at 0.",
+                float(self.core_cfg.parallel_loss_weight),
+                batch_idx,
+                "None" if anchors is None else f"shape {tuple(anchors.shape)}",
+            )
+            self._parallel_heads_disabled_warned = True
         # Chunk-local audio attention swaps the 2-D mask for a 4-D additive
         # bias on the LLM forward only; the aux head keeps consuming the
         # original 2-D ``inputs["attention_mask"]``.
