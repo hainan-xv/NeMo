@@ -192,3 +192,13 @@ node_modules/
 bot_server.*
 audio_logs/
 eval_results/
+
+# Eval-side artifacts. Downloaded / averaged Lightning checkpoints can be
+# many GB each and must never be staged for commit (GitHub rejects >100MB
+# blobs anyway, and `git add -A` would spend minutes blob-hashing them).
+# Same for the per-run scratch dirs the eval driver and HF datasets produce.
+checkpoints/
+audio_cache/
+results/
+.tmp_cache/
+.mplconfig/
