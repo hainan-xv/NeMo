@@ -248,11 +248,21 @@ def decode_with_blank(
         segments.append(tokenizer.ids_to_tokens(current))
 
     text_segments = []
+    # Some NeMo tokenizer wrappers (notably older HF AutoTokenizer wrappers)
+    # don't accept ``remove_special_tokens`` on ``tokens_to_text``. Try the
+    # kwarg path first, fall back to filtering special tokens manually so
+    # this stays robust across NeMo versions installed on the eval side.
     for seg in segments:
         if isinstance(seg, str):
             text_segments.append(seg)
-        else:
+            continue
+        try:
             text_segments.append(tokenizer.tokens_to_text(seg, remove_special_tokens=True))
+        except TypeError:
+            hf_tok = getattr(tokenizer, "tokenizer", tokenizer)
+            special = set(getattr(hf_tok, "all_special_tokens", []) or [])
+            seg_clean = [t for t in seg if t not in special] if special else seg
+            text_segments.append(tokenizer.tokens_to_text(seg_clean))
     text = join_with.join(text_segments) if join_with else "".join(text_segments)
 
     if strip_whitespace:
