@@ -96,6 +96,18 @@ export PYTHONPATH="${NEMO_ROOT}:${PYTHONPATH}"
 EXP_NAME="${1:?Usage: $0 <EXP_NAME> [STEP] [DEVICE_ID]}"
 STEP="${2:-}"
 DEVICE_ID="${3:-0}"
+
+# Allow STEP="last" (or "LAST") as a friendly alias for USE_LAST=1. New
+# checkpoint filenames now embed val_wer (e.g. step=12000-val_wer=0.1787-last.ckpt),
+# so a literal STEP=last would otherwise try to scp ``step=last.ckpt`` and fail.
+if [ -n "$STEP" ]; then
+    _step_lc=$(echo "$STEP" | tr '[:upper:]' '[:lower:]')
+    if [ "$_step_lc" = "last" ]; then
+        echo "==> STEP='${STEP}' → routing through USE_LAST=1"
+        USE_LAST=1
+        STEP=""
+    fi
+fi
 BATCH_SIZE="${BATCH_SIZE:-128}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 # MAX_NEW_TOKENS is the *per-chunk* cap; the model's
@@ -108,6 +120,10 @@ USE_OFFLINE_EMBS="${USE_OFFLINE_EMBS:-0}"
 USE_GENERATION_HISTORY="${USE_GENERATION_HISTORY:-0}"
 INFERENCE_AUDIO_CHUNKS_PER_TURN="${INFERENCE_AUDIO_CHUNKS_PER_TURN:-1}"
 DISABLE_MODALITY_POSITION_IDS="${DISABLE_MODALITY_POSITION_IDS:-0}"
+# Cap the number of samples evaluated per dataset (forwarded to
+# run_eval_sslm.py as --max_eval_samples). Useful for fast iteration on a
+# subset, e.g. when isolating parallel-decode regressions. Unset / 0 = full.
+MAX_EVAL_SAMPLES="${MAX_EVAL_SAMPLES:-}"
 # Parallel multi-token chunk decoding via ParallelChunkHeads. Requires a ckpt
 # trained with parallel_loss_weight > 0. Tagged with _parDec in the results
 # dir so AR and parallel numbers don't clobber each other.
@@ -430,9 +446,31 @@ elif [ -z "$STEP" ]; then
     STEP="${STEP#step=}"
     # Drop any "-val_wer=..." suffix so we keep just the step number.
     STEP="${STEP%%-val_wer=*}"
+    # Drop trailing "-last" tag for display purposes.
+    STEP="${STEP%-last}"
     echo "    Found: ${CKPT_FILENAME} (step=${STEP})"
 else
-    CKPT_FILENAME="step=${STEP}.ckpt"
+    # Explicit STEP=NNNN. Try the legacy bare filename first; if it doesn't
+    # exist on the remote, glob for the val_wer-tagged variant
+    # (step=NNNN-val_wer=0.XXXX.ckpt). This makes the explicit-step path
+    # work for new-style checkpoints without forcing callers to type the
+    # full filename including the WER.
+    echo "==> Looking up STEP=${STEP} checkpoint on ORD..."
+    REMOTE_STEP_LOOKUP="\
+        if [ -f ${REMOTE_CKPT_DIR}/step=${STEP}.ckpt ]; then \
+            echo step=${STEP}.ckpt; \
+        else \
+            ls ${REMOTE_CKPT_DIR}/step=${STEP}-*.ckpt 2>/dev/null \
+                | grep -v -- '-last\\.ckpt$' \
+                | head -1 \
+                | xargs -r basename; \
+        fi"
+    CKPT_FILENAME=$(ssh $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}" "${REMOTE_STEP_LOOKUP}")
+    if [ -z "$CKPT_FILENAME" ]; then
+        echo "ERROR: No checkpoint matching step=${STEP}*.ckpt found in ${REMOTE_CKPT_DIR}" >&2
+        exit 1
+    fi
+    echo "    Found: ${CKPT_FILENAME}"
 fi
 
 # In RUN_AVERAGING mode LOCAL_CKPT_PATH was already set above and the
@@ -566,6 +604,10 @@ if [ "$QUICK_TEST" = "1" ]; then
     EXTRA_ARGS+=(--max_eval_samples 10 --verbose)
     echo ""
     echo "==> QUICK TEST: 10 samples from ami/test only"
+elif [ -n "$MAX_EVAL_SAMPLES" ] && [ "$MAX_EVAL_SAMPLES" != "0" ]; then
+    EXTRA_ARGS+=(--max_eval_samples "$MAX_EVAL_SAMPLES")
+    echo ""
+    echo "==> MAX_EVAL_SAMPLES=${MAX_EVAL_SAMPLES} per dataset"
 fi
 if [ -n "$SYSTEM_PROMPT" ]; then
     EXTRA_ARGS+=(--system_prompt "$SYSTEM_PROMPT")

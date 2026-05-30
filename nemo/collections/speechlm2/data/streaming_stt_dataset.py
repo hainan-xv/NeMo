@@ -186,10 +186,11 @@ class StreamingSTTDataConfig:
     # --- Parallel chunk heads (multi-token-per-chunk prediction) ---
     # When > 0, the dataset emits ``chunk_anchor_positions`` and
     # ``chunk_target_tokens`` in each batch so the model can train K parallel
-    # next-token heads anchored at each chunk's <write> position. Only
-    # supported with compact_template=True (anchor = write_id). Chunks emitting
-    # more than parallel_chunk_slots tokens are skipped from the parallel loss
-    # (logged as a warning); the AR per-token loss still covers them.
+    # next-token heads. K is the per-forward block size: a chunk's emit-stream
+    # (content + <|im_end|>) is split into ceil(S/K) K-token blocks, each
+    # anchored at write_id + g*K. Chunks longer than K are NOT skipped — they
+    # are supervised across multiple blocks. Only supported with
+    # compact_template=True (anchor = write_id).
     parallel_chunk_slots: int = 0
 
 
@@ -1223,13 +1224,13 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
         else:
             self._assistant_footer_ids = []
 
-        # Cumulative counters for parallel-chunk-heads N>K diagnostics. Per
-        # dataset instance, which under PyTorch DDP/DataLoader means per
-        # worker process — so the cumulative percentage emitted in the
-        # warning log is a per-worker estimate (good enough for the
-        # "rough idea of how much data is lost" signal we report).
+        # Cumulative counters for parallel-chunk-heads diagnostics. Per dataset
+        # instance, which under PyTorch DDP/DataLoader means per worker process
+        # — so the cumulative percentage emitted in the info log is a per-worker
+        # estimate (good enough for the "how often do chunks need >1 K-block"
+        # signal we report, which helps pick K).
         self._par_utts_seen = 0
-        self._par_utts_with_skipped_chunk = 0
+        self._par_utts_with_multiblock_chunk = 0
 
         # For dynamic chunking (chunk_size=0): cache the first token of the
         # user footer sequence (e.g. <|im_end|>).  This is the target the model
@@ -1461,34 +1462,41 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
         cuts: Optional[CutSet] = None,
         transcripts: Optional[List[str]] = None,
     ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """Build chunk_anchor_positions and chunk_target_tokens for parallel heads.
+        """Build anchor positions and K-slot targets for the parallel heads.
 
         Returns (None, None) when parallel-chunk-head supervision is disabled
         (parallel_chunk_slots <= 0) or unsupported (non-compact template).
 
-        Anchor detection (compact template only):
-            Each turn's anchor is the position of the write_id token (e.g.
-            ``<|im_start|>`` in Qwen3). At that position the LLM has just
-            consumed ``[...user audio frames, write_id]``; its hidden state
-            summarizes the chunk's content and is the input to the K parallel
-            heads.
+        Iterative K-block scheme (compact template only):
+            K is the number of tokens emitted per parallel forward (a *block*),
+            decoupled from the max tokens a chunk may contain. A chunk whose
+            emit-stream is ``content + [<|im_end|>]`` (length S = N+1) is split
+            into ``ceil(S / K)`` blocks of up to K tokens each. Block ``g`` is
+            anchored at position ``write_id_pos + g*K`` — the hidden state that,
+            under standard next-token semantics, predicts that block's first
+            token — and supervises the next K stream tokens:
 
-        K-slot target slate per chunk (N = number of real content tokens):
-            * N <  K:  [tok_1, ..., tok_N, <|im_end|>, IGNORE_INDEX * (K-N-1)]
-                       => min(N+1, K) supervised slots, only ONE <|im_end|>.
-            * N == K:  [tok_1, ..., tok_K]   (no closer slot, all real tokens)
-            * N >  K:  all IGNORE_INDEX      (chunk skipped, warning logged
-                                              with the offending chunk's text
-                                              for debugging).
+                stream = [tok_1, ..., tok_N, <|im_end|>]
+                block g targets = stream[g*K : (g+1)*K]   (IGNORE-padded to K)
 
-        Padded chunks across the batch (fewer chunks than max_chunks) get
+            Examples (K=4):
+                N=2 → 1 block:  [t1, t2, im_end, IGN]
+                N=4 → 2 blocks: [t1,t2,t3,t4], [im_end, IGN, IGN, IGN]
+                N=7 → 2 blocks: [t1,t2,t3,t4], [t5,t6,t7,im_end]
+
+            At inference the model emits one block per forward and iterates
+            within a chunk until <|im_end|> appears (or a max-iters cap). There
+            is therefore no N>K case to skip — long chunks simply use more
+            blocks, so every chunk is fully supervised.
+
+        Padded blocks across the batch (fewer blocks than the batch max) get
         anchor=-1 and all IGNORE_INDEX targets.
 
         Args:
             all_input_ids: per-sample input token id tensors.
-            cuts: optional CutSet for per-utterance identifiers in N>K warnings.
+            cuts: optional CutSet for per-utterance identifiers in diagnostics.
             transcripts: optional list of ground-truth transcripts (one per
-                sample) for context in N>K warnings.
+                sample), retained for diagnostic parity with prior versions.
         """
         K = int(getattr(self.cfg, "parallel_chunk_slots", 0) or 0)
         if K <= 0:
@@ -1503,31 +1511,14 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
         if write_id is None or eos_id is None:
             return None, None
 
-        # Pre-extract per-sample identifiers for N>K warnings. We tolerate
-        # missing cuts/transcripts since this function is also exercised from
-        # unit tests with bare token sequences.
-        sample_ids: list[str] = []
-        if cuts is not None:
-            for cut in cuts:
-                sample_ids.append(getattr(cut, "id", "?"))
-        else:
-            sample_ids = ["?"] * len(all_input_ids)
-        sample_texts: list[str] = list(transcripts) if transcripts is not None else [""] * len(all_input_ids)
-        # Pad in case lengths mismatch (defensive).
-        while len(sample_ids) < len(all_input_ids):
-            sample_ids.append("?")
-        while len(sample_texts) < len(all_input_ids):
-            sample_texts.append("")
-
         per_sample_anchors: list[list[int]] = []
         per_sample_targets: list[list[list[int]]] = []
-        batch_had_any_skip = False
-        for sample_idx, input_ids_t in enumerate(all_input_ids):
+        batch_had_any_multiblock = False
+        for input_ids_t in all_input_ids:
             ids = input_ids_t.tolist()
             anchors: list[int] = []
             targets: list[list[int]] = []
-            chunk_idx_in_sample = 0
-            sample_had_skipped_chunk = False
+            sample_had_multiblock_chunk = False
             i = 0
             n = len(ids)
             while i < n:
@@ -1540,46 +1531,26 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
                 while j < n and ids[j] != eos_id:
                     content.append(ids[j])
                     j += 1
-                N = len(content)
-                if N > K:
-                    # Decode the offending chunk's tokens so the log line
-                    # tells the user exactly *what text* exceeded K. Decoded
-                    # output keeps special tokens since the offending chunk
-                    # may legitimately end on a sub-word and showing the raw
-                    # piece helps diagnose tokenizer-specific blowups.
-                    try:
-                        chunk_text = self.tokenizer.tokenizer.decode(
-                            content, skip_special_tokens=False
-                        )
-                    except Exception:
-                        chunk_text = "<decode-failed>"
-                    # Truncate utterance transcript to avoid 10 KB log lines
-                    # while still showing enough context.
-                    utt_text = sample_texts[sample_idx] or ""
-                    if len(utt_text) > 160:
-                        utt_text = utt_text[:160] + "..."
-                    logging.warning(
-                        "Parallel chunk heads SKIPPED chunk: cut=%s "
-                        "sample_idx=%d chunk_idx_in_sample=%d N=%d > K=%d "
-                        "chunk_text=%r tokens=%s utterance=%r",
-                        sample_ids[sample_idx],
-                        sample_idx,
-                        chunk_idx_in_sample,
-                        N,
-                        K,
-                        chunk_text,
-                        content,
-                        utt_text,
-                    )
-                    sample_had_skipped_chunk = True
-                    slot_targets = [IGNORE_INDEX] * K
-                elif N == K:
-                    slot_targets = list(content)
-                else:
-                    slot_targets = list(content) + [eos_id] + [IGNORE_INDEX] * (K - N - 1)
-                anchors.append(i)
-                targets.append(slot_targets)
-                chunk_idx_in_sample += 1
+
+                # The stream the heads must emit for this chunk is the content
+                # tokens followed by exactly one <|im_end|>. Split it into
+                # K-sized blocks; block g is anchored at position i + g*K (the
+                # hidden state that predicts the block's first token under
+                # standard next-token semantics). Every anchor i + g*K is a
+                # real position in [i, j-1] (write_id or a content token), so
+                # the gathered hidden states always exist.
+                stream = content + [eos_id]
+                S = len(stream)
+                num_blocks = (S + K - 1) // K  # ceil(S / K), always >= 1
+                for g in range(num_blocks):
+                    block = stream[g * K : g * K + K]
+                    if len(block) < K:
+                        block = block + [IGNORE_INDEX] * (K - len(block))
+                    anchors.append(i + g * K)
+                    targets.append(block)
+                if num_blocks > 1:
+                    sample_had_multiblock_chunk = True
+
                 # Skip past this turn so write_id collisions inside content
                 # (defensive — write_id is a special token so this is rare)
                 # don't double-count.
@@ -1587,36 +1558,37 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             per_sample_anchors.append(anchors)
             per_sample_targets.append(targets)
 
-            # Cumulative N>K tracking: count this utterance, and flag it if
-            # any of its chunks blew through K.
+            # Cumulative multi-block tracking: count this utterance, and flag
+            # it if any of its chunks needed more than one K-block (i.e. emitted
+            # more than K tokens). Useful for choosing K — if most utterances
+            # are multi-block, K is too small; if ~none are, K could shrink.
             self._par_utts_seen += 1
-            if sample_had_skipped_chunk:
-                self._par_utts_with_skipped_chunk += 1
-                batch_had_any_skip = True
+            if sample_had_multiblock_chunk:
+                self._par_utts_with_multiblock_chunk += 1
+                batch_had_any_multiblock = True
 
-        # Emit a cumulative summary alongside the per-chunk warnings, once
-        # per batch (only when this batch actually contributed a skip — no
-        # log spam during clean phases).
-        if batch_had_any_skip:
-            pct = 100.0 * self._par_utts_with_skipped_chunk / max(self._par_utts_seen, 1)
-            logging.warning(
+        # Emit a cumulative summary once per batch (only when this batch
+        # actually contained a multi-block chunk — no log spam otherwise).
+        if batch_had_any_multiblock:
+            pct = 100.0 * self._par_utts_with_multiblock_chunk / max(self._par_utts_seen, 1)
+            logging.info(
                 "Parallel chunk heads: so far, %d / %d utterances (%.2f%%) "
-                "have at least one chunk exceeding K=%d (per-worker counter).",
-                self._par_utts_with_skipped_chunk,
+                "have at least one chunk needing >1 K-block (K=%d, per-worker counter).",
+                self._par_utts_with_multiblock_chunk,
                 self._par_utts_seen,
                 pct,
                 K,
             )
 
-        max_chunks = max((len(a) for a in per_sample_anchors), default=0)
+        max_blocks = max((len(a) for a in per_sample_anchors), default=0)
         B = len(all_input_ids)
-        if max_chunks == 0:
+        if max_blocks == 0:
             return (
                 torch.zeros((B, 0), dtype=torch.long),
                 torch.zeros((B, 0, K), dtype=torch.long),
             )
-        anchor_tensor = torch.full((B, max_chunks), -1, dtype=torch.long)
-        target_tensor = torch.full((B, max_chunks, K), IGNORE_INDEX, dtype=torch.long)
+        anchor_tensor = torch.full((B, max_blocks), -1, dtype=torch.long)
+        target_tensor = torch.full((B, max_blocks, K), IGNORE_INDEX, dtype=torch.long)
         for b, (anchors, targets) in enumerate(zip(per_sample_anchors, per_sample_targets)):
             if not anchors:
                 continue

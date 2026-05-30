@@ -223,12 +223,14 @@ class StreamingSTTModelConfig:
     # --- Parallel chunk heads (multi-token-per-chunk prediction) ---
     # When parallel_loss_weight > 0 OR parallel_chunk_decode is True, build a
     # ParallelChunkHeads module: K learned slot embeddings + a small depth
-    # transformer (causal over slots) + tied lm_head. Training adds an aux
-    # cross-entropy loss at chunk anchors (the <write> token positions);
-    # inference can optionally use the heads to emit up to K text tokens per
-    # chunk in a single LLM forward instead of K sequential autoregressive
-    # forwards. Requires compact_template=True (anchor = write_id).
-    parallel_chunk_slots: int = 10
+    # transformer (causal over slots) + tied lm_head. Training supervises the
+    # heads at per-block anchors; a chunk's emit-stream (content + <|im_end|>)
+    # is split into K-token blocks, so K is the per-forward parallelism factor,
+    # NOT a hard cap on chunk length. Inference emits one K-block per forward
+    # and iterates blocks within a chunk until <|im_end|> appears (decoupling K
+    # from the max tokens a chunk can emit). Requires compact_template=True
+    # (anchor = write_id).
+    parallel_chunk_slots: int = 4
     parallel_loss_weight: float = 0.0
     parallel_chunk_decode: bool = False
     parallel_depth_layers: int = 1
@@ -2039,30 +2041,53 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         state: 'StreamingState',
         max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS_PER_CHUNK,
     ) -> tuple[list[list[int]], list[bool]]:
-        """Parallel-head per-chunk decoding (1 prefill is already done by caller; this
-        adds 1 batched feed to put the emitted tokens + closer into the KV cache).
+        """Parallel-head per-chunk decoding with iterative K-token blocks.
+
+        ``K = parallel_chunk_heads.num_slots`` is the number of tokens emitted
+        per LLM forward (one *block*), decoupled from how many tokens a chunk
+        may contain. Each block:
+
+          1. runs the parallel heads on the current anchor hidden → K
+             next-token predictions,
+          2. truncates each stream at the first stop token (<|im_end|>/blank),
+          3. feeds the emitted tokens into the KV cache, and
+          4. re-anchors each still-open stream on the hidden state of its last
+             fed token (which, under next-token semantics, predicts the first
+             token of that stream's next block).
+
+        A chunk iterates blocks until every stream hits a stop token, or the
+        per-chunk budget of ``ceil(max_new_tokens / K)`` blocks is exhausted (at
+        which point a closing <|im_end|> is synthesized for any still-open
+        stream so the cache ends cleanly).
 
         Args:
-            anchor_hidden: (B, H) LLM hidden state at each stream's anchor position
-                (the write_id / asst-header token of the current chunk's prefill).
+            anchor_hidden: (B, H) hidden state at each stream's first-block
+                anchor (the write_id / asst-header token of the chunk prefill).
             state: Mutable StreamingState (KV cache, attention_mask, seq_lens).
-            max_new_tokens: Truncate K-slot output at this many real tokens at most
-                (in addition to the natural <|im_end|> stop).
+            max_new_tokens: Per-chunk cap on emitted real tokens; sets the max
+                number of K-blocks to ``ceil(max_new_tokens / K)``.
 
         Returns:
-            (generated_per_stream, footer_consumed_per_stream).
-            ``generated_per_stream[b]`` is the list of emitted token IDs for stream
-            b (truncated at <|im_end|> or blank; never includes the closer itself).
-            ``footer_consumed[b]`` is True if the closer was emitted within the
-            K-slot window, mirroring AR's contract so the caller can skip the
-            explicit footer feed when not needed.
+            (generated_per_stream, footer_consumed_per_stream). Same contract as
+            the single-block version: ``generated`` never includes the closer;
+            ``footer_consumed[b]`` is True when this routine already put the
+            chunk's closer into the cache (so the caller's footer step is a
+            no-op for that stream).
         """
         assert self.parallel_chunk_heads is not None, (
             "_parallel_chunk_step_decode called but parallel_chunk_heads is not initialized"
         )
+        # Chunk-local audio attn / sep-pos variants are not yet wired through
+        # the parallel decode path; error early instead of silently mis-decoding.
+        if self.core_cfg.use_chunk_local_audio_attn or self.core_cfg.use_modality_position_ids:
+            raise NotImplementedError(
+                "parallel_chunk_decode is not yet wired through chunk-local audio attention or "
+                "separated modality position IDs. Set parallel_chunk_decode=False for those modes."
+            )
         device = anchor_hidden.device
         B = anchor_hidden.shape[0]
         K = self.parallel_chunk_heads.num_slots
+        pad_id = self.text_pad_id
 
         # Stop tokens: <|im_end|> always; blank too if configured.
         stop_ids = set()
@@ -2071,70 +2096,92 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         if self.has_blank:
             stop_ids.add(int(self.blank_token_id))
 
-        # (1) Sample greedy K tokens per stream from the parallel heads.
-        par_logits = self.parallel_chunk_heads(anchor_hidden, self.llm.lm_head)  # (B, K, V)
-        sampled = par_logits.argmax(dim=-1)  # (B, K)
-        K_cap = min(K, int(max_new_tokens))
+        max_blocks = max(1, (int(max_new_tokens) + K - 1) // K)  # ceil(max_new_tokens / K)
 
-        # (2) Per-stream truncation at first stop token.
         generated_per_stream: list[list[int]] = [[] for _ in range(B)]
         footer_consumed: list[bool] = [False] * B
-        per_stream_feed_ids: list[list[int]] = [[] for _ in range(B)]
-        for b in range(B):
-            for k in range(K_cap):
-                tid = int(sampled[b, k].item())
-                if tid in stop_ids:
-                    footer_consumed[b] = True
+        finished: list[bool] = [False] * B
+        cur_anchor = anchor_hidden  # (B, H)
+
+        for block_idx in range(max_blocks):
+            is_last_block = block_idx == max_blocks - 1
+
+            # (1) K next-token predictions per stream from the parallel heads.
+            par_logits = self.parallel_chunk_heads(cur_anchor, self.llm.lm_head)  # (B, K, V)
+            sampled = par_logits.argmax(dim=-1)  # (B, K)
+
+            # (2) Per-stream truncation at the first stop token in this block.
+            per_stream_feed_ids: list[list[int]] = [[] for _ in range(B)]
+            for b in range(B):
+                if finished[b]:
+                    continue
+                hit_stop = False
+                for k in range(K):
+                    tid = int(sampled[b, k].item())
+                    if tid in stop_ids:
+                        footer_consumed[b] = True
+                        finished[b] = True
+                        per_stream_feed_ids[b].append(tid)
+                        hit_stop = True
+                        break
+                    generated_per_stream[b].append(tid)
                     per_stream_feed_ids[b].append(tid)
-                    break
-                generated_per_stream[b].append(tid)
-                per_stream_feed_ids[b].append(tid)
-            else:
-                # No stop token in the K-slot window — synthesize the closer so
-                # the KV cache ends cleanly. The caller's step-7 footer block
-                # then becomes a no-op for this stream (footer_consumed=True).
-                if self._eos_id is not None:
-                    per_stream_feed_ids[b].append(int(self._eos_id))
-                    footer_consumed[b] = True
+                if not hit_stop and is_last_block:
+                    # Out of block budget without a natural stop — synthesize
+                    # the closer so the KV cache ends cleanly and the caller's
+                    # footer step is a no-op for this stream.
+                    finished[b] = True
+                    if self._eos_id is not None:
+                        per_stream_feed_ids[b].append(int(self._eos_id))
+                        footer_consumed[b] = True
 
-        # (3) Batched feed of the per-stream emitted sequences into the KV cache.
-        # Pad to the max per-stream length with text_pad_id, mask out the padding.
-        max_len = max((len(seq) for seq in per_stream_feed_ids), default=0)
-        if max_len == 0:
-            return generated_per_stream, footer_consumed
+            # (3) Batched feed of this block's emitted tokens into the KV cache.
+            # Pad to the max per-stream length; padded positions are masked out.
+            max_len = max((len(seq) for seq in per_stream_feed_ids), default=0)
+            if max_len == 0:
+                break  # all streams already finished — nothing left to feed
 
-        pad_id = self.text_pad_id
-        feed_ids = torch.full((B, max_len), pad_id, dtype=torch.long, device=device)
-        feed_attn_add = torch.zeros((B, max_len), dtype=state.attention_mask.dtype, device=device)
-        for b in range(B):
-            n_b = len(per_stream_feed_ids[b])
-            if n_b == 0:
-                continue
-            feed_ids[b, :n_b] = torch.tensor(per_stream_feed_ids[b], dtype=torch.long, device=device)
-            feed_attn_add[b, :n_b] = 1
-        feed_embeds = self.embed_tokens(feed_ids)  # (B, max_len, H)
+            feed_ids = torch.full((B, max_len), pad_id, dtype=torch.long, device=device)
+            feed_attn_add = torch.zeros((B, max_len), dtype=state.attention_mask.dtype, device=device)
+            last_real_idx = [-1] * B
+            for b in range(B):
+                n_b = len(per_stream_feed_ids[b])
+                if n_b == 0:
+                    continue
+                feed_ids[b, :n_b] = torch.tensor(per_stream_feed_ids[b], dtype=torch.long, device=device)
+                feed_attn_add[b, :n_b] = 1
+                last_real_idx[b] = n_b - 1
+            feed_embeds = self.embed_tokens(feed_ids)  # (B, max_len, H)
 
-        # Extend the running 2-D attention mask. (Chunk-local audio attn / sep-pos
-        # variants are not yet supported in the parallel decode path; we error in
-        # that case to avoid silently-wrong behavior — fall back to AR.)
-        if self.core_cfg.use_chunk_local_audio_attn or self.core_cfg.use_modality_position_ids:
-            raise NotImplementedError(
-                "parallel_chunk_decode is not yet wired through chunk-local audio attention or "
-                "separated modality position IDs. Set parallel_chunk_decode=False for those modes."
+            # Only need last-layer hidden states if a stream will continue to
+            # another block (for re-anchoring).
+            need_hidden = not all(finished)
+            state.attention_mask = torch.cat([state.attention_mask, feed_attn_add], dim=1)
+            out = self.llm(
+                inputs_embeds=feed_embeds,
+                past_key_values=state.cache,
+                attention_mask=state.attention_mask,
+                use_cache=True,
+                return_dict=True,
+                output_hidden_states=need_hidden,
             )
-        state.attention_mask = torch.cat([state.attention_mask, feed_attn_add], dim=1)
-        out = self.llm(
-            inputs_embeds=feed_embeds,
-            past_key_values=state.cache,
-            attention_mask=state.attention_mask,
-            use_cache=True,
-            return_dict=True,
-        )
-        state.cache = out.past_key_values
-        for b in range(B):
-            # Only the real-token positions grow the logical sequence; padded
-            # positions are masked out and shouldn't be counted as "seen text".
-            state.seq_lens[b] += len(per_stream_feed_ids[b])
+            state.cache = out.past_key_values
+            for b in range(B):
+                # Only real-token positions grow the logical sequence; padded
+                # positions are masked out and shouldn't count as "seen text".
+                state.seq_lens[b] += len(per_stream_feed_ids[b])
+
+            if all(finished):
+                break
+
+            # (4) Re-anchor each still-open stream on the hidden state of its
+            # last fed token (predicts the first token of its next block).
+            last_hidden = out.hidden_states[-1]  # (B, max_len, H)
+            next_anchor = cur_anchor.clone()
+            for b in range(B):
+                if not finished[b] and last_real_idx[b] >= 0:
+                    next_anchor[b] = last_hidden[b, last_real_idx[b], :]
+            cur_anchor = next_anchor
 
         return generated_per_stream, footer_consumed
 

@@ -24,7 +24,7 @@ model:
   # compact_template=True so anchors can be identified by write_id position.
   # Inference uses the heads when parallel_chunk_decode=True (or via the
   # ``parallel_chunk_decode`` kwarg on ``generate()``).
-  parallel_chunk_slots: 10
+  parallel_chunk_slots: 4
   parallel_loss_weight: 0.0
   parallel_chunk_decode: false
   parallel_depth_layers: 1
