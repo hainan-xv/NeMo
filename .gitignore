@@ -202,3 +202,8 @@ audio_cache/
 results/
 .tmp_cache/
 .mplconfig/
+
+# Launch scripts that embed personal secrets (HF/WANDB tokens) and per-user
+# cluster paths. Kept locally only; rsync to the cluster via ord2/sync.sh
+# instead of git.
+ord2/
