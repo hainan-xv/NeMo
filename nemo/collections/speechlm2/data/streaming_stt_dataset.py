@@ -1416,6 +1416,8 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
         # --- Parallel chunk heads: build anchor positions + K-slot target slates ---
         chunk_anchor_positions, chunk_target_tokens = self._build_parallel_chunk_targets(
             all_input_ids,
+            cuts=cuts,
+            transcripts=text,
         )
 
         return StreamingSTTBatch(
@@ -1436,7 +1438,10 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
     # ------------------------------------------------------------------
 
     def _build_parallel_chunk_targets(
-        self, all_input_ids: List[torch.Tensor]
+        self,
+        all_input_ids: List[torch.Tensor],
+        cuts: Optional[CutSet] = None,
+        transcripts: Optional[List[str]] = None,
     ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Build chunk_anchor_positions and chunk_target_tokens for parallel heads.
 
@@ -1454,10 +1459,18 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             * N <  K:  [tok_1, ..., tok_N, <|im_end|>, IGNORE_INDEX * (K-N-1)]
                        => min(N+1, K) supervised slots, only ONE <|im_end|>.
             * N == K:  [tok_1, ..., tok_K]   (no closer slot, all real tokens)
-            * N >  K:  all IGNORE_INDEX      (chunk skipped, warning logged)
+            * N >  K:  all IGNORE_INDEX      (chunk skipped, warning logged
+                                              with the offending chunk's text
+                                              for debugging).
 
         Padded chunks across the batch (fewer chunks than max_chunks) get
         anchor=-1 and all IGNORE_INDEX targets.
+
+        Args:
+            all_input_ids: per-sample input token id tensors.
+            cuts: optional CutSet for per-utterance identifiers in N>K warnings.
+            transcripts: optional list of ground-truth transcripts (one per
+                sample) for context in N>K warnings.
         """
         K = int(getattr(self.cfg, "parallel_chunk_slots", 0) or 0)
         if K <= 0:
@@ -1472,12 +1485,29 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
         if write_id is None or eos_id is None:
             return None, None
 
+        # Pre-extract per-sample identifiers for N>K warnings. We tolerate
+        # missing cuts/transcripts since this function is also exercised from
+        # unit tests with bare token sequences.
+        sample_ids: list[str] = []
+        if cuts is not None:
+            for cut in cuts:
+                sample_ids.append(getattr(cut, "id", "?"))
+        else:
+            sample_ids = ["?"] * len(all_input_ids)
+        sample_texts: list[str] = list(transcripts) if transcripts is not None else [""] * len(all_input_ids)
+        # Pad in case lengths mismatch (defensive).
+        while len(sample_ids) < len(all_input_ids):
+            sample_ids.append("?")
+        while len(sample_texts) < len(all_input_ids):
+            sample_texts.append("")
+
         per_sample_anchors: list[list[int]] = []
         per_sample_targets: list[list[list[int]]] = []
-        for input_ids_t in all_input_ids:
+        for sample_idx, input_ids_t in enumerate(all_input_ids):
             ids = input_ids_t.tolist()
             anchors: list[int] = []
             targets: list[list[int]] = []
+            chunk_idx_in_sample = 0
             i = 0
             n = len(ids)
             while i < n:
@@ -1492,11 +1522,34 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
                     j += 1
                 N = len(content)
                 if N > K:
+                    # Decode the offending chunk's tokens so the log line
+                    # tells the user exactly *what text* exceeded K. Decoded
+                    # output keeps special tokens since the offending chunk
+                    # may legitimately end on a sub-word and showing the raw
+                    # piece helps diagnose tokenizer-specific blowups.
+                    try:
+                        chunk_text = self.tokenizer.tokenizer.decode(
+                            content, skip_special_tokens=False
+                        )
+                    except Exception:
+                        chunk_text = "<decode-failed>"
+                    # Truncate utterance transcript to avoid 10 KB log lines
+                    # while still showing enough context.
+                    utt_text = sample_texts[sample_idx] or ""
+                    if len(utt_text) > 160:
+                        utt_text = utt_text[:160] + "..."
                     logging.warning(
-                        "Parallel chunk heads: chunk has %d tokens > K=%d; skipping "
-                        "this chunk from parallel loss (AR loss still covers it).",
+                        "Parallel chunk heads SKIPPED chunk: cut=%s "
+                        "sample_idx=%d chunk_idx_in_sample=%d N=%d > K=%d "
+                        "chunk_text=%r tokens=%s utterance=%r",
+                        sample_ids[sample_idx],
+                        sample_idx,
+                        chunk_idx_in_sample,
                         N,
                         K,
+                        chunk_text,
+                        content,
+                        utt_text,
                     )
                     slot_targets = [IGNORE_INDEX] * K
                 elif N == K:
@@ -1505,6 +1558,7 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
                     slot_targets = list(content) + [eos_id] + [IGNORE_INDEX] * (K - N - 1)
                 anchors.append(i)
                 targets.append(slot_targets)
+                chunk_idx_in_sample += 1
                 # Skip past this turn so write_id collisions inside content
                 # (defensive — write_id is a special token so this is rare)
                 # don't double-count.
