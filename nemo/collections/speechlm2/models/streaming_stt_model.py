@@ -1873,16 +1873,25 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 self._partial_aux_neg_total[name].append(neg_mask.sum().detach())
 
         # Log inference-time decoded predictions vs references periodically.
+        # In parallel-only mode the AR branch above is skipped, so ``hyps`` /
+        # ``batch_wer`` don't exist — fall back to the parallel-decode results
+        # (which own ``val_wer`` in that mode).
         if batch_idx % self.core_cfg.log_every_n_steps == 0:
             ref_text = refs[0] if refs else ""
-            hyp_text = hyps[0] if hyps else ""
+            if parallel_only and self._parallel_heads_enabled:
+                log_hyps = hyps_par
+                log_wer = batch_wer_par
+            else:
+                log_hyps = hyps
+                log_wer = batch_wer
+            hyp_text = log_hyps[0] if log_hyps else ""
             logging.info(
                 "[%s] batch %d infer sample\n  ref: `%s`\n  hyp: `%s`\n  wer(batch)=%.4f",
                 name,
                 batch_idx,
                 ref_text,
                 hyp_text,
-                batch_wer,
+                log_wer,
             )
 
     # ------------------------------------------------------------------
