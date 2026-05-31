@@ -1224,14 +1224,6 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
         else:
             self._assistant_footer_ids = []
 
-        # Cumulative counters for parallel-chunk-heads diagnostics. Per dataset
-        # instance, which under PyTorch DDP/DataLoader means per worker process
-        # — so the cumulative percentage emitted in the info log is a per-worker
-        # estimate (good enough for the "how often do chunks need >1 K-block"
-        # signal we report, which helps pick K).
-        self._par_utts_seen = 0
-        self._par_utts_with_multiblock_chunk = 0
-
         # For dynamic chunking (chunk_size=0): cache the first token of the
         # user footer sequence (e.g. <|im_end|>).  This is the target the model
         # predicts at the last audio frame of each chunk to signal "ready to transcribe".
@@ -1513,12 +1505,10 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
 
         per_sample_anchors: list[list[int]] = []
         per_sample_targets: list[list[list[int]]] = []
-        batch_had_any_multiblock = False
         for input_ids_t in all_input_ids:
             ids = input_ids_t.tolist()
             anchors: list[int] = []
             targets: list[list[int]] = []
-            sample_had_multiblock_chunk = False
             i = 0
             n = len(ids)
             while i < n:
@@ -1548,8 +1538,6 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
                         block = block + [IGNORE_INDEX] * (K - len(block))
                     anchors.append(i + g * K)
                     targets.append(block)
-                if num_blocks > 1:
-                    sample_had_multiblock_chunk = True
 
                 # Skip past this turn so write_id collisions inside content
                 # (defensive — write_id is a special token so this is rare)
@@ -1557,28 +1545,6 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
                 i = j + 1
             per_sample_anchors.append(anchors)
             per_sample_targets.append(targets)
-
-            # Cumulative multi-block tracking: count this utterance, and flag
-            # it if any of its chunks needed more than one K-block (i.e. emitted
-            # more than K tokens). Useful for choosing K — if most utterances
-            # are multi-block, K is too small; if ~none are, K could shrink.
-            self._par_utts_seen += 1
-            if sample_had_multiblock_chunk:
-                self._par_utts_with_multiblock_chunk += 1
-                batch_had_any_multiblock = True
-
-        # Emit a cumulative summary once per batch (only when this batch
-        # actually contained a multi-block chunk — no log spam otherwise).
-        if batch_had_any_multiblock:
-            pct = 100.0 * self._par_utts_with_multiblock_chunk / max(self._par_utts_seen, 1)
-            logging.info(
-                "Parallel chunk heads: so far, %d / %d utterances (%.2f%%) "
-                "have at least one chunk needing >1 K-block (K=%d, per-worker counter).",
-                self._par_utts_with_multiblock_chunk,
-                self._par_utts_seen,
-                pct,
-                K,
-            )
 
         max_blocks = max((len(a) for a in per_sample_anchors), default=0)
         B = len(all_input_ids)

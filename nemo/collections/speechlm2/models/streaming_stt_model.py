@@ -1509,36 +1509,47 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         if should_log_debug:
             self._log_chunk_alignment_preview(batch, batch_idx=batch_idx, stage="train")
 
-            # WER is computed from actual inference-time decoding (not teacher forcing).
-            # ``train_wer`` is the AR-decode WER — kept under that key to preserve
-            # back-compat for existing runs / dashboards. When parallel heads are
-            # active, additionally log ``train_wer_ar`` (alias) and ``train_wer_parallel``
-            # so we can track how the two decode paths diverge.
-            hyps_ar = self._generate_hypotheses_for_wer(batch, parallel=False)
-            refs = batch.text if batch.text is not None else [""] * len(hyps_ar)
-            train_wer_ar, _, _ = self._compute_wer_stats(refs, hyps_ar)
-            self.log(
-                "train_wer",
-                torch.tensor(train_wer_ar, device=loss.device),
-                on_step=True,
-                on_epoch=False,
-                logger=True,
-                sync_dist=True,
-            )
+            # WER from actual inference-time decoding (not teacher forcing).
+            # Normally ``train_wer`` is the AR-decode WER (back-compat). In
+            # parallel-only training the AR path is not optimized, so we SKIP
+            # the AR decode entirely (it's wasteful + its WER is meaningless)
+            # and let the parallel decode own ``train_wer`` — mirroring how
+            # ``val_wer`` is handled. When both paths are trained we log
+            # ``train_wer`` (=AR), ``train_wer_ar`` (alias) and
+            # ``train_wer_parallel`` so their divergence is visible.
+            parallel_only = bool(self.core_cfg.parallel_only_loss) and self._parallel_heads_enabled
+            refs = batch.text if batch.text is not None else None
 
-            hyps_par = None
-            train_wer_par = None
-            if self._parallel_heads_enabled:
+            hyps_ar = None
+            train_wer_ar = None
+            if not parallel_only:
+                hyps_ar = self._generate_hypotheses_for_wer(batch, parallel=False)
+                ar_refs = refs if refs is not None else [""] * len(hyps_ar)
+                train_wer_ar, _, _ = self._compute_wer_stats(ar_refs, hyps_ar)
                 self.log(
-                    "train_wer_ar",
+                    "train_wer",
                     torch.tensor(train_wer_ar, device=loss.device),
                     on_step=True,
                     on_epoch=False,
                     logger=True,
                     sync_dist=True,
                 )
+                if self._parallel_heads_enabled:
+                    self.log(
+                        "train_wer_ar",
+                        torch.tensor(train_wer_ar, device=loss.device),
+                        on_step=True,
+                        on_epoch=False,
+                        logger=True,
+                        sync_dist=True,
+                    )
+
+            hyps_par = None
+            train_wer_par = None
+            if self._parallel_heads_enabled:
                 hyps_par = self._generate_hypotheses_for_wer(batch, parallel=True)
-                train_wer_par, _, _ = self._compute_wer_stats(refs, hyps_par)
+                par_refs = refs if refs is not None else [""] * len(hyps_par)
+                train_wer_par, _, _ = self._compute_wer_stats(par_refs, hyps_par)
                 self.log(
                     "train_wer_parallel",
                     torch.tensor(train_wer_par, device=loss.device),
@@ -1547,20 +1558,62 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                     logger=True,
                     sync_dist=True,
                 )
+                if parallel_only:
+                    # Parallel decode IS the primary metric in parallel-only mode.
+                    self.log(
+                        "train_wer",
+                        torch.tensor(train_wer_par, device=loss.device),
+                        on_step=True,
+                        on_epoch=False,
+                        logger=True,
+                        sync_dist=True,
+                    )
 
-            if refs and hyps_ar:
-                if hyps_par is not None:
+            if refs:
+                if parallel_only and hyps_par is not None:
+                    # Per-utterance breakdown so a single runaway (over-emission)
+                    # decode that dominates this small batch's micro-averaged WER
+                    # is visible. ``val_wer`` dilutes such utterances over the
+                    # whole val set; a single training batch cannot — which is the
+                    # usual reason ``train_wer`` >> ``val_wer`` here. If you see
+                    # one utterance with hyp_w >> ref_w (wer >> 1), that's a
+                    # degenerate parallel decode, NOT a metric bug.
+                    per_utt = []
+                    for r, h in zip(par_refs, hyps_par):
+                        rw = self._normalize_for_wer(r).split()
+                        hw = self._normalize_for_wer(h).split()
+                        w = (self._word_edit_distance(rw, hw) / len(rw)) if len(rw) > 0 else float("nan")
+                        per_utt.append((len(rw), len(hw), w))
+                    worst_i = 0
+                    worst_w = -1.0
+                    for i, (_, _, w) in enumerate(per_utt):
+                        if w == w and w > worst_w:  # skip NaN (empty ref)
+                            worst_w, worst_i = w, i
+                    logging.info(
+                        "[train] batch %d parallel WER breakdown: batch_wer=%.4f n_utt=%d\n"
+                        "  per_utt(ref_w,hyp_w,wer)=%s\n"
+                        "  worst utt #%d (wer=%.3f)\n    ref: `%s`\n    hyp: `%s`",
+                        batch_idx,
+                        train_wer_par if train_wer_par is not None else float("nan"),
+                        len(per_utt),
+                        [(rw, hw, round(w, 3) if w == w else None) for rw, hw, w in per_utt],
+                        worst_i,
+                        worst_w if worst_w >= 0 else float("nan"),
+                        par_refs[worst_i],
+                        hyps_par[worst_i],
+                    )
+                elif hyps_ar and hyps_par is not None:
                     logging.info(
                         "[train] batch %d infer sample\n  ref: `%s`\n  hyp_ar: `%s`\n  hyp_par: `%s`\n  "
                         "wer_ar(batch)=%.4f  wer_par(batch)=%.4f",
                         batch_idx,
                         refs[0],
                         hyps_ar[0],
-                        hyps_par[0] if hyps_par else "",
+                        hyps_par[0],
                         train_wer_ar,
                         train_wer_par if train_wer_par is not None else float("nan"),
                     )
-                else:
+                elif hyps_ar:
                     logging.info(
                         "[train] batch %d infer sample\n  ref: `%s`\n  hyp: `%s`\n  wer(batch)=%.4f",
                         batch_idx,
@@ -1750,25 +1803,33 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         self._partial_val_losses[name].append(loss)
         self._partial_accuracies[name].append(accuracy)
 
-        # WER from inference-time decoding (non-teacher-forced).
-        hyps = self._generate_hypotheses_for_wer(batch, parallel=False)
-        refs = batch.text if batch.text is not None else [""] * len(hyps)
-        batch_wer, num_err, num_words = self._compute_wer_stats(refs, hyps)
-        self._partial_wer_errors[name].append(torch.tensor(float(num_err), device=loss.device))
-        self._partial_wer_words[name].append(torch.tensor(float(num_words), device=loss.device))
-        self.log(
-            f"val_wer_step_{name}",
-            torch.tensor(batch_wer, device=loss.device),
-            on_step=True,
-            on_epoch=False,
-            logger=True,
-            sync_dist=True,
-        )
+        # WER from inference-time decoding (non-teacher-forced). In
+        # parallel-only training the AR path is not optimized, so skip the AR
+        # decode entirely (wasteful + its WER is meaningless); the parallel
+        # decode below then owns ``val_wer``.
+        parallel_only = bool(self.core_cfg.parallel_only_loss) and self._parallel_heads_enabled
+        refs = batch.text if batch.text is not None else None
+
+        if not parallel_only:
+            hyps = self._generate_hypotheses_for_wer(batch, parallel=False)
+            ar_refs = refs if refs is not None else [""] * len(hyps)
+            batch_wer, num_err, num_words = self._compute_wer_stats(ar_refs, hyps)
+            self._partial_wer_errors[name].append(torch.tensor(float(num_err), device=loss.device))
+            self._partial_wer_words[name].append(torch.tensor(float(num_words), device=loss.device))
+            self.log(
+                f"val_wer_step_{name}",
+                torch.tensor(batch_wer, device=loss.device),
+                on_step=True,
+                on_epoch=False,
+                logger=True,
+                sync_dist=True,
+            )
 
         # Parallel-decode WER from the same batch (only when heads are enabled).
         if self._parallel_heads_enabled:
             hyps_par = self._generate_hypotheses_for_wer(batch, parallel=True)
-            batch_wer_par, num_err_par, num_words_par = self._compute_wer_stats(refs, hyps_par)
+            par_refs = refs if refs is not None else [""] * len(hyps_par)
+            batch_wer_par, num_err_par, num_words_par = self._compute_wer_stats(par_refs, hyps_par)
             self._partial_wer_errors_parallel[name].append(
                 torch.tensor(float(num_err_par), device=loss.device)
             )
