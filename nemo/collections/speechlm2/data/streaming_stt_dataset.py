@@ -192,6 +192,12 @@ class StreamingSTTDataConfig:
     # are supervised across multiple blocks. Only supported with
     # compact_template=True (anchor = write_id).
     parallel_chunk_slots: int = 0
+    # When True, audio chunks with no text emit a bare <|im_end|> (chunk-end)
+    # instead of the explicit <blank> token: the per-chunk emit-stream becomes
+    # ``write_id -> <eos>`` rather than ``write_id -> <blank> -> <eos>``. Only
+    # effective with compact_template=True. Default False keeps the legacy
+    # <blank> scheme. Propagated from the model's empty_chunk_eos_only flag.
+    empty_chunk_eos_only: bool = False
 
 
 def decode_with_blank(
@@ -920,6 +926,8 @@ def _tokenize_compact_with_assistant_mask(
     write_id: int,
     eos_id: int,
     supervise_im_end_in_loss: bool = False,
+    empty_chunk_eos_only: bool = False,
+    blank_token: Optional[str] = None,
 ) -> tuple[list[int], list[int]]:
     """Tokenize chat messages in compact format and return (input_ids, assistant_mask).
 
@@ -930,6 +938,13 @@ def _tokenize_compact_with_assistant_mask(
     block), only the per-turn scaffolding is compacted.  Loss is applied on
     ``<write>`` and assistant content.  When ``supervise_im_end_in_loss=True``,
     the closing ``<eos>`` is also trainable.
+
+    When ``empty_chunk_eos_only=True`` (and ``blank_token`` is given), an empty
+    chunk — whose assistant content is exactly ``blank_token`` — is encoded as
+    ``<write> <eos>`` with NO ``<blank>`` token in between, and its ``<eos>`` is
+    always supervised (mask=1) since it is that chunk's sole target. This keeps
+    train/inference consistent: the model never sees/predicts a <blank> for
+    empty chunks, it predicts <eos> directly.
     """
     hf_tok = tokenizer.tokenizer
 
@@ -962,26 +977,40 @@ def _tokenize_compact_with_assistant_mask(
             # Pair with following assistant turn if present.
             if i < len(turn_msgs) and turn_msgs[i]["role"] == "assistant":
                 asst = turn_msgs[i]
-                asst_ids = hf_tok.encode(asst["content"], add_special_tokens=False) if asst["content"] else []
-                # write_id
-                input_ids.append(write_id)
-                assistant_mask.append(1)
-                # assistant content
-                input_ids.extend(asst_ids)
-                assistant_mask.extend([1] * len(asst_ids))
-                # eos
-                input_ids.append(eos_id)
-                assistant_mask.append(int(supervise_im_end_in_loss))
+                if empty_chunk_eos_only and blank_token is not None and asst["content"] == blank_token:
+                    # Empty chunk → bare <eos> (no <blank>). <eos> is always
+                    # supervised here: it is the chunk's only target.
+                    input_ids.append(write_id)
+                    assistant_mask.append(1)
+                    input_ids.append(eos_id)
+                    assistant_mask.append(1)
+                else:
+                    asst_ids = hf_tok.encode(asst["content"], add_special_tokens=False) if asst["content"] else []
+                    # write_id
+                    input_ids.append(write_id)
+                    assistant_mask.append(1)
+                    # assistant content
+                    input_ids.extend(asst_ids)
+                    assistant_mask.extend([1] * len(asst_ids))
+                    # eos
+                    input_ids.append(eos_id)
+                    assistant_mask.append(int(supervise_im_end_in_loss))
                 i += 1
         else:
             # Orphan assistant (shouldn't normally occur) — treat as standalone asst segment.
-            asst_ids = hf_tok.encode(msg["content"], add_special_tokens=False) if msg["content"] else []
-            input_ids.append(write_id)
-            assistant_mask.append(1)
-            input_ids.extend(asst_ids)
-            assistant_mask.extend([1] * len(asst_ids))
-            input_ids.append(eos_id)
-            assistant_mask.append(int(supervise_im_end_in_loss))
+            if empty_chunk_eos_only and blank_token is not None and msg["content"] == blank_token:
+                input_ids.append(write_id)
+                assistant_mask.append(1)
+                input_ids.append(eos_id)
+                assistant_mask.append(1)
+            else:
+                asst_ids = hf_tok.encode(msg["content"], add_special_tokens=False) if msg["content"] else []
+                input_ids.append(write_id)
+                assistant_mask.append(1)
+                input_ids.extend(asst_ids)
+                assistant_mask.extend([1] * len(asst_ids))
+                input_ids.append(eos_id)
+                assistant_mask.append(int(supervise_im_end_in_loss))
             i += 1
 
     return input_ids, assistant_mask
@@ -1349,6 +1378,8 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
                     self._write_id,
                     self._compact_eos_id,
                     supervise_im_end_in_loss=self.cfg.supervise_im_end_in_loss,
+                    empty_chunk_eos_only=bool(getattr(self.cfg, "empty_chunk_eos_only", False)),
+                    blank_token=self.cfg.blank_token,
                 )
             else:
                 input_ids, assistant_mask = _tokenize_with_assistant_mask(

@@ -32,6 +32,10 @@ model:
   # Train on the parallel-chunk loss only (AR/aux terms kept at weight 0 for
   # DDP keep-alive). Use with parallel_loss_weight=1.0.
   parallel_only_loss: false
+  # When true, empty chunks emit a bare <|im_end|> instead of a <blank> token
+  # (emit-stream becomes ``write_id -> <|im_end|>``). More compact and avoids a
+  # redundant no-emission token. Only effective with compact_template=true.
+  empty_chunk_eos_only: false
 
   # LoRA (uncomment to enable)
   # lora:

@@ -242,6 +242,15 @@ class StreamingSTTModelConfig:
     # but they contribute nothing to the optimized objective. Use with
     # parallel_loss_weight=1.0 for a pure multi-token-head training run.
     parallel_only_loss: bool = False
+    # When True, an audio chunk that emits no text is supervised/decoded as a
+    # bare <|im_end|> (chunk-end) instead of the explicit <blank> token. This
+    # drops one token per empty chunk: the emit-stream becomes ``write_id ->
+    # <|im_end|>`` rather than ``write_id -> <blank> -> <|im_end|>``. It is both
+    # more compact and mathematically cleaner (every chunk's emission ends with
+    # <|im_end|>; "empty" simply means <|im_end|> fires immediately). Only
+    # affects the compact template (parallel scheme); requires
+    # compact_template=True. Default False preserves the legacy <blank> scheme.
+    empty_chunk_eos_only: bool = False
 
 
 @dataclass
@@ -339,6 +348,11 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 if bool(self.core_cfg.compact_template):
                     data_cfg.compact_template = True
                     data_cfg.write_token = str(self.core_cfg.write_token)
+                    # Empty-chunk-as-<eos> only makes sense for the compact
+                    # template (the dataset's <blank> insertion path); gate it
+                    # together with compact_template so non-compact configs are
+                    # untouched.
+                    data_cfg.empty_chunk_eos_only = bool(self.core_cfg.empty_chunk_eos_only)
                 # Only touch parallel_chunk_slots in data_cfg when the feature
                 # is actively requested — otherwise leave the dict identical to
                 # what existing runs produce (back-compat: no spurious key, no
@@ -356,8 +370,10 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 data_cfg.max_audio_chunks_per_turn,
             ]
             if bool(self.core_cfg.compact_template):
-                log_msg += ", compact_template=%s, write_token=%r"
-                log_args.extend([data_cfg.compact_template, data_cfg.write_token])
+                log_msg += ", compact_template=%s, write_token=%r, empty_chunk_eos_only=%s"
+                log_args.extend(
+                    [data_cfg.compact_template, data_cfg.write_token, data_cfg.empty_chunk_eos_only]
+                )
             if self._parallel_heads_enabled:
                 log_msg += ", parallel_chunk_slots=%s"
                 log_args.append(data_cfg.parallel_chunk_slots)

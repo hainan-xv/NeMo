@@ -91,6 +91,13 @@ if [ ! -f "$RUN_EVAL_PY" ]; then
 fi
 
 export PYTHONPATH="${NEMO_ROOT}:${PYTHONPATH}"
+# run_eval_sslm.py is symlinked from a sibling repo and resolves which `nemo`
+# to import by scanning candidate roots, with $STREAMING_STT_MODEL_ROOT taking
+# top priority. Pin it to THIS repo so eval always runs the code that lives
+# next to this script (and not whichever repo the symlink physically resides
+# in). Honor an explicit caller override.
+export STREAMING_STT_MODEL_ROOT="${STREAMING_STT_MODEL_ROOT:-${NEMO_ROOT}}"
+echo "==> STREAMING_STT_MODEL_ROOT=${STREAMING_STT_MODEL_ROOT}"
 
 # ---------- Arguments ----------
 EXP_NAME="${1:?Usage: $0 <EXP_NAME> [STEP] [DEVICE_ID]}"
@@ -200,6 +207,26 @@ if [ "$RUN_AVERAGING" = "1" ]; then
         echo "WARNING: RUN_AVERAGING=1 ignores explicit STEP=$STEP" >&2
         STEP=""
     fi
+    # REUSE_AVG=1: if a previously-built avg<N>.ckpt already exists locally,
+    # reuse it and skip the remote listing + download + re-averaging entirely
+    # (fully offline). FORCE_AVERAGE=1 / FORCE_DOWNLOAD=1 override this.
+    if [ "${REUSE_AVG:-0}" = "1" ] && [ "${FORCE_AVERAGE:-0}" != "1" ] && [ "${FORCE_DOWNLOAD:-0}" != "1" ]; then
+        existing_avg=$(ls -t "${LOCAL_CKPT_DIR}/${EXP_NAME}"/avg*.ckpt 2>/dev/null | head -1)
+        if [ -n "$existing_avg" ]; then
+            LOCAL_CKPT_PATH="$existing_avg"
+            CKPT_FILENAME="$(basename "$existing_avg")"
+            STEP="${CKPT_FILENAME%.ckpt}"
+            echo "==> REUSE_AVG=1: reusing existing averaged checkpoint (no list/download/average):"
+            echo "    $LOCAL_CKPT_PATH"
+        else
+            echo "ERROR: REUSE_AVG=1 but no avg*.ckpt found in ${LOCAL_CKPT_DIR}/${EXP_NAME}" >&2
+            echo "       Run once without REUSE_AVG to build it." >&2
+            exit 1
+        fi
+    fi
+fi
+
+if [ "$RUN_AVERAGING" = "1" ] && [ -z "$LOCAL_CKPT_PATH" ]; then
     echo "==> RUN_AVERAGING=1: listing non '-last' checkpoints on ORD..."
     REMOTE_AVG_LIST_CMD="ls ${REMOTE_CKPT_DIR}/*.ckpt 2>/dev/null | grep -v -- '-last\\.ckpt$' | xargs -r -n1 basename"
     REMOTE_CKPT_FILES=$(ssh $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}" "$REMOTE_AVG_LIST_CMD")
@@ -408,6 +435,8 @@ print(f"  wrote {out_path}", flush=True)
 PYEOF
         echo "==> Average complete ($(du -h "$LOCAL_CKPT_PATH" | cut -f1))"
     fi
+elif [ -n "$LOCAL_CKPT_PATH" ]; then
+    : # Checkpoint already resolved (REUSE_AVG=1); skip all remote selection.
 elif [ -z "$STEP" ]; then
     if [ "${USE_LAST:-0}" = "1" ]; then
         echo "==> No step specified (USE_LAST=1), finding most recent -last.ckpt on ORD..."
