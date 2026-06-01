@@ -251,6 +251,28 @@ class StreamingSTTModelConfig:
     # affects the compact template (parallel scheme); requires
     # compact_template=True. Default False preserves the legacy <blank> scheme.
     empty_chunk_eos_only: bool = False
+    # --- Blank-continuation parallel scheme (strict <|im_end|> placement) ---
+    # When True, the parallel-chunk targets use the "blank-continuation" scheme:
+    #   * <|im_end|> may appear ONLY in slot 0 of a block — a chunk always closes
+    #     with a terminator block ``[<|im_end|>, IGNORE...]``;
+    #   * a partial / cut block ends with a single <blank> marker meaning "more
+    #     tokens follow in the next block" (continue), e.g. ``[t1, t2, <blank>, IGN]``;
+    #   * a full K-token block carries no marker (fullness itself means continue).
+    # Decoding mirrors this: <blank> => cut & continue (NOT a chunk stop); only a
+    # slot-0 <|im_end|> ends the chunk; the trunk is fed real tokens only (blanks
+    # are synthetic head targets, never entered into the KV cache). Requires
+    # compact_template=True and a valid <blank> token. Default False keeps the
+    # legacy fixed-K scheme (block g = stream[g*K:(g+1)*K], blank/im_end inline).
+    parallel_blank_continuation: bool = False
+    # Training-only augmentation for the blank-continuation scheme. With this
+    # per-block probability a block randomly "cuts": a cut point is chosen
+    # uniformly among the block's non-first real positions, a <blank> is placed
+    # there, and the remaining tokens are pushed to the next block. Applied
+    # independently to each block (so a chunk may be cut multiple times),
+    # teaching the model flexible block boundaries. 0.0 disables augmentation
+    # (blocks are greedily packed to K). Only effective when
+    # parallel_blank_continuation=True.
+    parallel_cut_prob: float = 0.0
 
 
 @dataclass
@@ -361,6 +383,13 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 # diff in config snapshots / hyperparameter logging).
                 if self._parallel_heads_enabled:
                     data_cfg.parallel_chunk_slots = int(self.core_cfg.parallel_chunk_slots)
+                    # Blank-continuation scheme + its training-only cut
+                    # augmentation. Only set when the new scheme is actually
+                    # requested so legacy parallel runs keep byte-identical
+                    # data_cfg snapshots.
+                    if bool(self.core_cfg.parallel_blank_continuation):
+                        data_cfg.parallel_blank_continuation = True
+                        data_cfg.parallel_cut_prob = float(self.core_cfg.parallel_cut_prob)
             log_msg = (
                 "StreamingSTT data_cfg flags propagated from model: "
                 "supervise_im_end_in_loss=%s, project_unaligned_text_to_chunks=%s, "
@@ -380,6 +409,9 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             if self._parallel_heads_enabled:
                 log_msg += ", parallel_chunk_slots=%s"
                 log_args.append(data_cfg.parallel_chunk_slots)
+                if bool(self.core_cfg.parallel_blank_continuation):
+                    log_msg += ", parallel_blank_continuation=%s, parallel_cut_prob=%s"
+                    log_args.extend([True, data_cfg.parallel_cut_prob])
             logging.info(log_msg, *log_args)
         if self.core_cfg.use_modality_position_ids and not self.core_cfg.supervise_im_end_in_loss:
             raise ValueError("use_modality_position_ids=True requires supervise_im_end_in_loss=True")
@@ -504,6 +536,24 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 float(self.core_cfg.parallel_loss_weight),
                 self.core_cfg.parallel_chunk_decode,
             )
+            if bool(self.core_cfg.parallel_blank_continuation):
+                if not self.core_cfg.compact_template:
+                    raise ValueError(
+                        "parallel_blank_continuation=True requires compact_template=True "
+                        "(anchors are write_id-relative)."
+                    )
+                if not self.has_blank:
+                    raise ValueError(
+                        "parallel_blank_continuation=True requires a non-empty blank_token "
+                        "(the <blank> marker signals block continuation)."
+                    )
+                logging.info(
+                    "Parallel blank-continuation scheme ENABLED: <|im_end|> only in slot 0; "
+                    "partial/cut blocks end with <blank> (id=%d); decode feeds real tokens only. "
+                    "Training cut augmentation prob=%.3f.",
+                    int(self.blank_token_id),
+                    float(self.core_cfg.parallel_cut_prob),
+                )
         else:
             self.parallel_chunk_heads = None
 
@@ -2175,16 +2225,27 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
 
           1. runs the parallel heads on the current anchor hidden → K
              next-token predictions,
-          2. truncates each stream at the first stop token (<|im_end|>/blank),
-          3. feeds the emitted tokens into the KV cache, and
+          2. truncates each stream at its stop signal (see schemes below),
+          3. feeds the emitted real tokens into the KV cache, and
           4. re-anchors each still-open stream on the hidden state of its last
              fed token (which, under next-token semantics, predicts the first
              token of that stream's next block).
 
-        A chunk iterates blocks until every stream hits a stop token, or the
-        per-chunk budget of ``ceil(max_new_tokens / K)`` blocks is exhausted (at
-        which point a closing <|im_end|> is synthesized for any still-open
-        stream so the cache ends cleanly).
+        Two stop schemes are supported:
+
+          * **Legacy fixed-K** (``parallel_blank_continuation=False``): both
+            <|im_end|> and <blank> are chunk stops; the first one seen in a
+            block ends the chunk. Budget = ``ceil(max_new_tokens / K)`` blocks.
+          * **Blank-continuation** (``parallel_blank_continuation=True``): only
+            <|im_end|> ends the chunk (slot 0 in the clean case). <blank> is a
+            "cut & continue" marker — emit the real tokens before it, do NOT
+            feed the blank, re-anchor, and continue. A full K-token block also
+            continues. Budget = ``max_new_tokens + 1`` blocks (a block may emit
+            as few as one real token).
+
+        A chunk iterates blocks until a stream hits <|im_end|> (or its
+        per-chunk real-token budget / block cap is exhausted, at which point a
+        closing <|im_end|> is synthesized so the cache ends cleanly).
 
         Args:
             anchor_hidden: (B, H) hidden state at each stream's first-block
@@ -2215,14 +2276,26 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         K = self.parallel_chunk_heads.num_slots
         pad_id = self.text_pad_id
 
-        # Stop tokens: <|im_end|> always; blank too if configured.
+        # Decode scheme. In the legacy fixed-K scheme both <|im_end|> and <blank>
+        # are chunk stops. In the blank-continuation scheme only <|im_end|> ends
+        # the chunk; <blank> is a "cut & continue" marker (emit the real tokens
+        # before it, do NOT feed the blank into the cache, re-anchor, continue).
+        blank_continuation = bool(self.core_cfg.parallel_blank_continuation)
+        blank_id = int(self.blank_token_id) if self.has_blank else None
+
+        # Legacy stop tokens: <|im_end|> always; blank too if configured.
         stop_ids = set()
         if self._eos_id is not None:
             stop_ids.add(int(self._eos_id))
         if self.has_blank:
             stop_ids.add(int(self.blank_token_id))
 
-        max_blocks = max(1, (int(max_new_tokens) + K - 1) // K)  # ceil(max_new_tokens / K)
+        if blank_continuation:
+            # A block may emit as few as 1 real token (a cut at slot 1), so the
+            # loop is budgeted by real-token count (+1 for the terminator).
+            max_blocks = max(1, int(max_new_tokens) + 1)
+        else:
+            max_blocks = max(1, (int(max_new_tokens) + K - 1) // K)  # ceil(max_new_tokens / K)
 
         generated_per_stream: list[list[int]] = [[] for _ in range(B)]
         footer_consumed: list[bool] = [False] * B
@@ -2236,11 +2309,46 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             par_logits = self.parallel_chunk_heads(cur_anchor, self.llm.lm_head)  # (B, K, V)
             sampled = par_logits.argmax(dim=-1)  # (B, K)
 
-            # (2) Per-stream truncation at the first stop token in this block.
+            # (2) Per-stream decode of this block.
             per_stream_feed_ids: list[list[int]] = [[] for _ in range(B)]
             for b in range(B):
                 if finished[b]:
                     continue
+                if blank_continuation:
+                    # <|im_end|> ends the chunk (slot 0 in the clean case;
+                    # treated as a stop at any slot defensively). <blank> cuts:
+                    # stop scanning, keep the chunk open, and re-anchor on the
+                    # last real token. A full K-token block (no blank/eos)
+                    # likewise continues.
+                    stopped = False
+                    for k in range(K):
+                        tid = int(sampled[b, k].item())
+                        if self._eos_id is not None and tid == int(self._eos_id):
+                            per_stream_feed_ids[b].append(tid)
+                            footer_consumed[b] = True
+                            finished[b] = True
+                            stopped = True
+                            break
+                        if blank_id is not None and tid == blank_id:
+                            break  # cut: continue to next block (blank not fed)
+                        generated_per_stream[b].append(tid)
+                        per_stream_feed_ids[b].append(tid)
+                        if len(generated_per_stream[b]) >= int(max_new_tokens):
+                            break  # budget reached mid-block
+                    if not stopped:
+                        budget_done = len(generated_per_stream[b]) >= int(max_new_tokens)
+                        no_progress = len(per_stream_feed_ids[b]) == 0  # degenerate blank@slot0
+                        if budget_done or is_last_block or no_progress:
+                            # Close cleanly: synthesize the <|im_end|> so the KV
+                            # cache ends correctly and the caller's footer step
+                            # is a no-op for this stream.
+                            finished[b] = True
+                            if self._eos_id is not None:
+                                per_stream_feed_ids[b].append(int(self._eos_id))
+                                footer_consumed[b] = True
+                    continue
+
+                # ---- legacy fixed-K scheme: stop on <|im_end|> OR <blank> ----
                 hit_stop = False
                 for k in range(K):
                     tid = int(sampled[b, k].item())

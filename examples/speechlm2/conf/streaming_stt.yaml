@@ -36,6 +36,16 @@ model:
   # (emit-stream becomes ``write_id -> <|im_end|>``). More compact and avoids a
   # redundant no-emission token. Only effective with compact_template=true.
   empty_chunk_eos_only: false
+  # Blank-continuation parallel scheme (strict <|im_end|> placement). When true,
+  # <|im_end|> may appear only in slot 0 (terminator block); partial/cut blocks
+  # end with a single <blank> "continue" marker; decode feeds real tokens only.
+  # Requires compact_template=true and a non-empty blank_token.
+  parallel_blank_continuation: false
+  # Training-only augmentation: per-block probability that a block "cuts" (a
+  # <blank> is inserted at a uniformly-chosen non-first position, pushing the
+  # rest to the next block). 0.0 disables. Only used when
+  # parallel_blank_continuation=true.
+  parallel_cut_prob: 0.0
 
   # LoRA (uncomment to enable)
   # lora:

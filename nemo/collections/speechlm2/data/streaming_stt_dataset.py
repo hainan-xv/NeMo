@@ -15,6 +15,7 @@
 import copy
 import logging
 import math
+import random
 import re
 from dataclasses import dataclass
 from typing import Iterable, List, Optional, Union
@@ -198,6 +199,17 @@ class StreamingSTTDataConfig:
     # effective with compact_template=True. Default False keeps the legacy
     # <blank> scheme. Propagated from the model's empty_chunk_eos_only flag.
     empty_chunk_eos_only: bool = False
+    # --- Blank-continuation parallel scheme (strict <|im_end|> placement) ---
+    # When True, ``_build_parallel_chunk_targets`` emits variable-length blocks:
+    # <|im_end|> only ever appears in slot 0 of a terminator block, partial/cut
+    # blocks end with a single <blank> "continue" marker, and anchors advance by
+    # the number of *real* content tokens consumed (blanks are synthetic head
+    # targets, not sequence positions). Propagated from the model's
+    # parallel_blank_continuation flag.
+    parallel_blank_continuation: bool = False
+    # Per-block "cut" probability for the blank-continuation augmentation (see
+    # the model config). 0.0 disables it. Propagated from the model.
+    parallel_cut_prob: float = 0.0
 
 
 def decode_with_blank(
@@ -1583,6 +1595,21 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
         if write_id is None or eos_id is None:
             return None, None
 
+        blank_continuation = bool(getattr(self.cfg, "parallel_blank_continuation", False))
+        blank_id = int(getattr(self, "blank_id", -1) or -1)
+        if blank_continuation and blank_id < 0:
+            # The blank-continuation scheme needs a real <blank> id to mark
+            # partial/cut blocks. Without one, fall back to the legacy scheme.
+            logging.warning(
+                "parallel_blank_continuation=True but blank token is disabled (blank_id<0); "
+                "falling back to the legacy fixed-K parallel scheme."
+            )
+            blank_continuation = False
+        cut_prob = float(getattr(self.cfg, "parallel_cut_prob", 0.0) or 0.0)
+        # Fresh per-call RNG so cut augmentation is independent across workers /
+        # processes without relying on global numpy/torch seeding.
+        rng = random.Random() if (blank_continuation and cut_prob > 0.0) else None
+
         per_sample_anchors: list[list[int]] = []
         per_sample_targets: list[list[list[int]]] = []
         for input_ids_t in all_input_ids:
@@ -1602,22 +1629,45 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
                     content.append(ids[j])
                     j += 1
 
-                # The stream the heads must emit for this chunk is the content
-                # tokens followed by exactly one <|im_end|>. Split it into
-                # K-sized blocks; block g is anchored at position i + g*K (the
-                # hidden state that predicts the block's first token under
-                # standard next-token semantics). Every anchor i + g*K is a
-                # real position in [i, j-1] (write_id or a content token), so
-                # the gathered hidden states always exist.
-                stream = content + [eos_id]
-                S = len(stream)
-                num_blocks = (S + K - 1) // K  # ceil(S / K), always >= 1
-                for g in range(num_blocks):
-                    block = stream[g * K : g * K + K]
-                    if len(block) < K:
-                        block = block + [IGNORE_INDEX] * (K - len(block))
-                    anchors.append(i + g * K)
-                    targets.append(block)
+                if blank_continuation:
+                    # Blank-continuation scheme: split the *content* tokens into
+                    # variable-length blocks; <|im_end|> never appears inside a
+                    # content block — the chunk always closes with a terminator
+                    # block [<|im_end|>, IGNORE...]. Partial / randomly-cut
+                    # blocks end with a single <blank> "continue" marker, which
+                    # is a synthetic head target only (NOT a sequence position),
+                    # so anchors advance by the number of *real* content tokens
+                    # consumed. Anchor of a block whose first real target is
+                    # content[m] is position i + m (i for m=0 → write_id).
+                    chunk_anchors, chunk_targets = self._segment_chunk_blocks_blank_continuation(
+                        anchor_base=i,
+                        n_content=len(content),
+                        content=content,
+                        K=K,
+                        eos_id=eos_id,
+                        blank_id=blank_id,
+                        cut_prob=cut_prob,
+                        rng=rng,
+                    )
+                    anchors.extend(chunk_anchors)
+                    targets.extend(chunk_targets)
+                else:
+                    # Legacy fixed-K scheme. The stream the heads emit is the
+                    # content tokens followed by exactly one <|im_end|>, split
+                    # into K-sized blocks; block g is anchored at position
+                    # i + g*K (the hidden state that predicts the block's first
+                    # token under standard next-token semantics). Every anchor
+                    # i + g*K is a real position in [i, j-1] (write_id or a
+                    # content token), so the gathered hidden states always exist.
+                    stream = content + [eos_id]
+                    S = len(stream)
+                    num_blocks = (S + K - 1) // K  # ceil(S / K), always >= 1
+                    for g in range(num_blocks):
+                        block = stream[g * K : g * K + K]
+                        if len(block) < K:
+                            block = block + [IGNORE_INDEX] * (K - len(block))
+                        anchors.append(i + g * K)
+                        targets.append(block)
 
                 # Skip past this turn so write_id collisions inside content
                 # (defensive — write_id is a special token so this is rare)
@@ -1641,3 +1691,77 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             anchor_tensor[b, : len(anchors)] = torch.tensor(anchors, dtype=torch.long)
             target_tensor[b, : len(targets), :] = torch.tensor(targets, dtype=torch.long)
         return anchor_tensor, target_tensor
+
+    @staticmethod
+    def _segment_chunk_blocks_blank_continuation(
+        anchor_base: int,
+        n_content: int,
+        content: List[int],
+        K: int,
+        eos_id: int,
+        blank_id: int,
+        cut_prob: float = 0.0,
+        rng: Optional[random.Random] = None,
+    ) -> tuple[list[int], list[list[int]]]:
+        """Segment one chunk's content into blank-continuation blocks.
+
+        Builds (anchors, targets) for a single chunk under the strict-<|im_end|>
+        blank-continuation scheme:
+
+          * each content block holds up to K *real* tokens;
+          * a *full* K-token block carries no marker (fullness == continue);
+          * a *partial* block (fewer than K real tokens — the natural last
+            block) ends with a single ``blank_id`` "continue" marker;
+          * with probability ``cut_prob`` a block instead *cuts*: a cut point is
+            drawn uniformly from the block's non-first real positions
+            (``1..take-1``), a ``blank_id`` is placed there, and the remaining
+            tokens are pushed to the next block (re-checked independently, so a
+            chunk may be cut multiple times);
+          * the chunk always closes with a terminator block
+            ``[eos_id, IGNORE...]`` whose slot 0 is <|im_end|>.
+
+        Anchors advance by *real* tokens consumed: a block whose first real
+        target is ``content[m]`` is anchored at ``anchor_base + m`` (so the
+        terminator is anchored at ``anchor_base + n_content`` — the last real
+        content token, or write_id when the chunk is empty). The blank marker is
+        a synthetic head target only and never consumes a sequence position.
+
+        Returns ``(anchors, targets)`` with each target block length-K,
+        IGNORE-padded. Stripping the blank markers / terminator and concatenating
+        the real tokens across blocks reconstructs ``content`` exactly,
+        regardless of how the random cuts fall.
+        """
+
+        def _pad(block: list[int]) -> list[int]:
+            if len(block) < K:
+                return block + [IGNORE_INDEX] * (K - len(block))
+            return block
+
+        anchors: list[int] = []
+        targets: list[list[int]] = []
+        N = int(n_content)
+        pos = 0
+        while pos < N:
+            take = min(K, N - pos)
+            cut_j = None
+            if rng is not None and cut_prob > 0.0 and take >= 2 and rng.random() < cut_prob:
+                # Cut point uniform among the block's non-first positions.
+                cut_j = rng.randint(1, take - 1)
+            if cut_j is not None:
+                anchors.append(anchor_base + pos)
+                targets.append(_pad(content[pos : pos + cut_j] + [blank_id]))
+                pos += cut_j
+            elif take < K:
+                # Natural partial (last) block → blank continuation marker.
+                anchors.append(anchor_base + pos)
+                targets.append(_pad(content[pos : pos + take] + [blank_id]))
+                pos += take
+            else:
+                # Full K-token block → no marker.
+                anchors.append(anchor_base + pos)
+                targets.append(content[pos : pos + K])
+                pos += K
+        # Terminator block: slot-0 <|im_end|>, anchored at anchor_base + N.
+        anchors.append(anchor_base + N)
+        targets.append(_pad([eos_id]))
+        return anchors, targets
