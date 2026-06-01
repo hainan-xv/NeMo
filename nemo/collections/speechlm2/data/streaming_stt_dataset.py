@@ -1101,6 +1101,45 @@ def _tokenize_with_assistant_mask(
     return input_ids, assistant_mask
 
 
+def _strip_blank_for_empty_chunks(
+    input_ids: list[int],
+    assistant_mask: list[int],
+    blank_id: int,
+    eos_id: Optional[int],
+) -> tuple[list[int], list[int]]:
+    """Drop the <blank> token from empty chunks (standard chat template).
+
+    For ``empty_chunk_eos_only=True`` with the non-compact chat template, an
+    empty chunk is tokenized as ``... assistant_header <blank> <eos> ...``. This
+    removes every ``blank_id`` token so the empty chunk becomes
+    ``... assistant_header <eos> ...`` (the model emits <eos>/<|im_end|> directly),
+    and forces the immediately-following ``<eos>`` (the turn end) to be
+    supervised (mask=1) since it is that chunk's sole target — mirroring the
+    fact that ``<blank>`` was previously the supervised target.
+
+    ``<blank>`` is only ever used as empty-chunk content, so removing all
+    occurrences is safe. No-op when ``blank_id < 0`` (blank disabled).
+    """
+    if blank_id is None or blank_id < 0:
+        return input_ids, assistant_mask
+    new_ids: list[int] = []
+    new_mask: list[int] = []
+    supervise_next_eos = False
+    for tid, m in zip(input_ids, assistant_mask):
+        if tid == blank_id:
+            # Drop the blank; the <eos> that follows closes this empty chunk and
+            # must be supervised so the chunk-end is learned.
+            supervise_next_eos = True
+            continue
+        if supervise_next_eos:
+            if eos_id is not None and tid == eos_id:
+                m = 1
+            supervise_next_eos = False
+        new_ids.append(tid)
+        new_mask.append(m)
+    return new_ids, new_mask
+
+
 def _mark_assistant_footer_for_loss(
     input_ids: list[int],
     assistant_mask: list[int],
@@ -1387,6 +1426,16 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
                     self.tokenizer,
                     supervise_im_end_in_loss=self.cfg.supervise_im_end_in_loss,
                 )
+                # Standard chat template: empty chunks are tokenized with a
+                # <blank> content token. When empty_chunk_eos_only is set, strip
+                # those blanks so empty chunks emit <|im_end|> directly.
+                if bool(getattr(self.cfg, "empty_chunk_eos_only", False)):
+                    input_ids, assistant_mask = _strip_blank_for_empty_chunks(
+                        input_ids,
+                        assistant_mask,
+                        self.blank_id,
+                        self.tokenizer.tokenizer.eos_token_id,
+                    )
 
             # Replace audio tag sequences with AUDIO_TOKEN_IDX markers. In the
             # default fixed path we can use one cached pattern; grouped turns

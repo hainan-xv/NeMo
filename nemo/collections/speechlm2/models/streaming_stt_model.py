@@ -348,11 +348,13 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 if bool(self.core_cfg.compact_template):
                     data_cfg.compact_template = True
                     data_cfg.write_token = str(self.core_cfg.write_token)
-                    # Empty-chunk-as-<eos> only makes sense for the compact
-                    # template (the dataset's <blank> insertion path); gate it
-                    # together with compact_template so non-compact configs are
-                    # untouched.
-                    data_cfg.empty_chunk_eos_only = bool(self.core_cfg.empty_chunk_eos_only)
+                # Empty-chunk-as-<eos> is supported for BOTH the compact template
+                # (handled in the compact tokenizer) and the standard non-compact
+                # chat template (handled by post-hoc <blank>-stripping). Only set
+                # the key when actually enabled so existing runs that never touch
+                # this flag keep byte-identical saved configs.
+                if bool(self.core_cfg.empty_chunk_eos_only):
+                    data_cfg.empty_chunk_eos_only = True
                 # Only touch parallel_chunk_slots in data_cfg when the feature
                 # is actively requested — otherwise leave the dict identical to
                 # what existing runs produce (back-compat: no spurious key, no
@@ -370,10 +372,11 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 data_cfg.max_audio_chunks_per_turn,
             ]
             if bool(self.core_cfg.compact_template):
-                log_msg += ", compact_template=%s, write_token=%r, empty_chunk_eos_only=%s"
-                log_args.extend(
-                    [data_cfg.compact_template, data_cfg.write_token, data_cfg.empty_chunk_eos_only]
-                )
+                log_msg += ", compact_template=%s, write_token=%r"
+                log_args.extend([data_cfg.compact_template, data_cfg.write_token])
+            if bool(self.core_cfg.empty_chunk_eos_only):
+                log_msg += ", empty_chunk_eos_only=%s"
+                log_args.append(True)
             if self._parallel_heads_enabled:
                 log_msg += ", parallel_chunk_slots=%s"
                 log_args.append(data_cfg.parallel_chunk_slots)
