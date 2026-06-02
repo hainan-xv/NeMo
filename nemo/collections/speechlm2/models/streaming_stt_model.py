@@ -159,6 +159,14 @@ class StreamingSTTModelConfig:
     project_unaligned_text_to_chunks: bool = False
     max_audio_chunks_per_turn: int = 1
     use_modality_position_ids: bool = False
+    # Additive constant applied to every text/template RoPE position so that the
+    # text stream occupies ``[offset, offset + num_text)`` while audio occupies
+    # ``[0, num_audio)``. With ``offset > 0`` the two modalities live in disjoint
+    # RoPE ranges. With ``offset == 0`` audio and text both count from 0 and share
+    # the SAME range (the "both from 0" design); modality is then distinguished by
+    # the embeddings rather than by position. The offset is a pure additive
+    # constant applied identically at train and inference, so it never changes
+    # relative (RoPE) geometry within the text stream.
     modality_position_offset: int = 32768
     # --- Chunk-local audio attention ---
     # When True, applies a chunk-local attention mask: a query token may attend
@@ -415,14 +423,19 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             logging.info(log_msg, *log_args)
         if self.core_cfg.use_modality_position_ids and not self.core_cfg.supervise_im_end_in_loss:
             raise ValueError("use_modality_position_ids=True requires supervise_im_end_in_loss=True")
-        if self.core_cfg.use_modality_position_ids and int(self.core_cfg.modality_position_offset) <= 0:
-            raise ValueError("use_modality_position_ids=True requires modality_position_offset > 0")
+        if self.core_cfg.use_modality_position_ids and int(self.core_cfg.modality_position_offset) < 0:
+            raise ValueError("use_modality_position_ids=True requires modality_position_offset >= 0")
         if self.core_cfg.use_modality_position_ids:
+            _off = int(self.core_cfg.modality_position_offset)
             logging.info(
-                "Separated audio/text RoPE position IDs ENABLED: "
-                "audio positions start at 0, text/template positions start at %d. "
-                "Assistant <|im_end|> supervision is required and enabled.",
-                int(self.core_cfg.modality_position_offset),
+                "Separated audio/text RoPE position IDs ENABLED: audio positions start at 0, "
+                "text/template positions start at %d%s. Assistant <|im_end|> supervision is "
+                "required and enabled.",
+                _off,
+                " (offset=0: audio and text share the same RoPE range, both starting from 0 — "
+                "no disjoint-range offset; modality is distinguished by the embeddings)"
+                if _off == 0
+                else "",
             )
         if self.core_cfg.use_chunk_local_audio_attn:
             if self.core_cfg.use_modality_position_ids:
@@ -788,7 +801,16 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
     # ------------------------------------------------------------------
 
     def _build_modality_position_ids(self, input_tokens: Tensor, attention_mask: Tensor) -> Tensor:
-        """Build separated RoPE positions for audio and text/template tokens."""
+        """Build separated RoPE positions for audio and text/template tokens.
+
+        Audio tokens are numbered ``0, 1, 2, ...`` (contiguous over all audio
+        frames in the sequence); text/template tokens are numbered
+        ``offset, offset+1, ...`` (contiguous over all non-audio tokens). Each
+        stream skips the other modality. ``offset == 0`` makes the two streams
+        share the same numeric range, both starting from 0. This builder is the
+        single source of truth for training; every inference path advances the
+        same two running counters in the same order.
+        """
         audio_mask = (input_tokens == AUDIO_TOKEN_IDX) & attention_mask.to(torch.bool)
         text_mask = (input_tokens != AUDIO_TOKEN_IDX) & attention_mask.to(torch.bool)
         offset = int(self.core_cfg.modality_position_offset)
@@ -796,7 +818,11 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         # Avoid per-step tensor.item() here because it synchronizes GPU->CPU and
         # slows the training loop.  Only do the exact check for pathological
         # sequences that are long enough to possibly overlap.
-        if input_tokens.shape[1] >= offset:
+        #
+        # offset == 0 is the "shared range" design: audio and text both count
+        # from 0 and intentionally share the same RoPE positions, so there is no
+        # overlap to guard against.
+        if offset > 0 and input_tokens.shape[1] >= offset:
             max_num_audio = int(audio_mask.long().sum(dim=1).max().item()) if audio_mask.numel() > 0 else 0
             if max_num_audio >= offset:
                 raise ValueError(
@@ -826,7 +852,9 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         audio_counts = audio_mask.long().sum(dim=1)
         text_counts = text_mask.long().sum(dim=1)
         offset = int(self.core_cfg.modality_position_offset)
-        if os.environ.get("STREAMING_STT_CHECK_POSITION_OVERLAP") == "1":
+        # offset == 0 is the intentional "shared range" design (audio and text both
+        # count from 0), so the non-overlap check does not apply there.
+        if offset > 0 and os.environ.get("STREAMING_STT_CHECK_POSITION_OVERLAP") == "1":
             if bool((state.audio_position_counter + audio_counts > offset).any().item()):
                 raise ValueError("Separated audio/text position ids would overlap in streaming inference")
 
