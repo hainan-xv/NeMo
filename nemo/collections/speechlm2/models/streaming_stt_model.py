@@ -188,6 +188,18 @@ class StreamingSTTModelConfig:
     # Inference is unchanged.
     text_only_lm_loss_weight: float = 0.0
     use_text_only_lm_score_at_inference: bool = True
+    # --- Encoder reuse (Tier-1 amortization) ---
+    # When > 1, each training step encodes the audio with the perception
+    # encoder ONCE and then reuses that encoder output across ``encoder_reuse_k``
+    # independently-resampled chunk/turn partitions of the SAME utterances,
+    # running ``encoder_reuse_k`` LLM forwards and averaging their losses. This
+    # amortizes the (expensive) speech encoder over K diverse "completion"
+    # views per utterance. ``encoder_reuse_k=1`` (default) is the legacy path
+    # and is byte-for-byte unchanged. Only active when an online forced aligner
+    # is configured (the model needs ``dataset.get_batch_data`` + alignments to
+    # resample partitions on the fly); otherwise it transparently falls back to
+    # K=1 with a one-time warning.
+    encoder_reuse_k: int = 1
     log_every_n_steps: int = 10
     dtype: str = "bfloat16"
     # --- Compact template ---
@@ -740,6 +752,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         input_tokens: Tensor,
         audios: Tensor,
         audio_lens: Tensor,
+        audio_embs: Optional[Tensor] = None,
     ) -> dict[str, Tensor]:
         """
         Encode audio, embed text tokens, then interleave them.
@@ -753,6 +766,14 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 positions and ``text_pad_id`` at left-padding positions.
             audios: (B, T_samples) raw waveforms.
             audio_lens: (B,) waveform lengths in samples.
+            audio_embs: optional precomputed perception encoder output
+                (B, T_enc, H). When provided, the (expensive) encoder forward is
+                skipped and these embeddings are reused as-is. This is what
+                enables ``encoder_reuse_k`` to amortize one encoder pass across
+                several resampled partitions of the same audio. The caller is
+                responsible for ensuring ``audio_embs`` was produced from the
+                exact same ``audios`` (same content + padding) so the audio-slot
+                count in ``input_tokens`` matches ``T_enc``.
         Returns:
             dict with keys ``input_embeds`` (B, L, H), ``attention_mask`` (B, L).
         """
@@ -764,10 +785,11 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         text_embeds = self.embed_tokens(text_tokens)  # (B, L, H)
 
         # --- audio embeddings ---
-        audio_embs, _audio_emb_lens = self.perception(
-            input_signal=audios,
-            input_signal_length=audio_lens,
-        )  # audio_embs: (B, T_enc, H)
+        if audio_embs is None:
+            audio_embs, _audio_emb_lens = self.perception(
+                input_signal=audios,
+                input_signal_length=audio_lens,
+            )  # audio_embs: (B, T_enc, H)
 
         # --- interleave & build attention mask ---
         inputs = interleave_embeddings(
@@ -1363,18 +1385,114 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             if is_frozen(m):
                 m.eval()
 
-        if self.forced_aligner is not None:
-            alignments = self.forced_aligner.align(batch.audios, batch.audio_lens, batch.text)
-            batch = self.dataset.get_batch_data(
-                cuts=batch.cuts,
-                audios=batch.audios,
-                audio_lens=batch.audio_lens,
-                alignments=alignments,
-                text=batch.text,
+        # ----- Encoder-reuse (Tier-1) orchestration --------------------------
+        # K=1 (default) is the legacy single-partition path and is byte-for-byte
+        # unchanged. K>1 encodes the audio with the perception encoder ONCE and
+        # reuses that encoder output across K independently-resampled chunk/turn
+        # partitions of the SAME utterances, averaging their LM losses. This
+        # amortizes the expensive speech encoder over K diverse "completion"
+        # views per utterance. It requires the online forced aligner (so we can
+        # call ``dataset.get_batch_data`` to resample partitions on the fly);
+        # otherwise it transparently falls back to K=1.
+        K = max(int(getattr(self.core_cfg, "encoder_reuse_k", 1) or 1), 1)
+        can_reuse = K > 1 and self.forced_aligner is not None and self.dataset is not None
+        if K > 1 and not can_reuse and not getattr(self, "_encoder_reuse_disabled_warned", False):
+            logging.warning(
+                "encoder_reuse_k=%d requested but no online forced aligner is configured; "
+                "falling back to encoder_reuse_k=1 (no reuse).",
+                K,
             )
-            batch = move_data_to_device(batch, self.device)
+            self._encoder_reuse_disabled_warned = True
 
-        inputs = self._build_input_embeds(batch.input_tokens, batch.audios, batch.audio_lens)
+        if not can_reuse:
+            # --- Legacy single-partition path (unchanged) --------------------
+            if self.forced_aligner is not None:
+                alignments = self.forced_aligner.align(batch.audios, batch.audio_lens, batch.text)
+                batch = self.dataset.get_batch_data(
+                    cuts=batch.cuts,
+                    audios=batch.audios,
+                    audio_lens=batch.audio_lens,
+                    alignments=alignments,
+                    text=batch.text,
+                )
+                batch = move_data_to_device(batch, self.device)
+            metrics = self._partition_forward_loss(batch, batch_idx, audio_embs=None)
+            if metrics.get("skip"):
+                return {"loss": metrics["loss"]}
+            self._log_train_step(metrics, batch, batch_idx)
+            return {"loss": metrics["loss"]}
+
+        # --- K>1: encode once, reuse across K resampled partitions -----------
+        orig = batch
+        alignments = self.forced_aligner.align(orig.audios, orig.audio_lens, orig.text)
+        audio_embs = None
+        part_metrics = []
+        last_batch = None
+        for _k in range(K):
+            bk = self.dataset.get_batch_data(
+                cuts=orig.cuts,
+                audios=orig.audios,
+                audio_lens=orig.audio_lens,
+                alignments=alignments,
+                text=orig.text,
+            )
+            bk = move_data_to_device(bk, self.device)
+            if audio_embs is None:
+                # Encode ONCE and share. ``get_batch_data`` pads audio
+                # deterministically from (audio_lens, chunk_step), so every
+                # resampled partition has identical ``bk.audios`` and therefore
+                # the exact same encoder output and audio-slot count.
+                audio_embs, _ = self.perception(
+                    input_signal=bk.audios,
+                    input_signal_length=bk.audio_lens,
+                )
+            mk = self._partition_forward_loss(bk, batch_idx, audio_embs=audio_embs)
+            if mk.get("skip"):
+                continue
+            part_metrics.append(mk)
+            last_batch = bk
+
+        if not part_metrics:
+            return {"loss": torch.tensor(0.0, device=self.device, requires_grad=True)}
+
+        # Optimized objective = mean over the K partition losses. The shared
+        # ``audio_embs`` tensor lives in all K graphs, so a single backward
+        # accumulates the encoder gradient from every partition.
+        loss = torch.stack([m["loss"] for m in part_metrics]).mean()
+        agg = {"loss": loss, "inputs": part_metrics[-1]["inputs"]}
+        for key in (
+            "loss_blank",
+            "loss_nonblank",
+            "cls_loss_log",
+            "text_only_lm_loss_log",
+            "text_only_lm_num_targets_log",
+            "num_blank",
+            "num_targets",
+            "par_loss_log",
+            "par_num_slots_log",
+        ):
+            agg[key] = torch.stack([m[key].float() for m in part_metrics]).mean()
+        self._log_train_step(agg, last_batch, batch_idx)
+        return {"loss": loss}
+
+    def _partition_forward_loss(
+        self,
+        batch: StreamingSTTBatch,
+        batch_idx: int,
+        audio_embs: Optional[Tensor] = None,
+    ) -> dict:
+        """Forward + full training loss for ONE chunk/turn partition.
+
+        Pure compute, no logging side effects: returns the optimized ``loss``
+        plus the scalar diagnostics + ``inputs`` needed by
+        :meth:`_log_train_step`. When ``audio_embs`` is provided the perception
+        encoder forward is skipped and those embeddings are reused (this is what
+        makes ``encoder_reuse_k`` amortize one encoder pass over K partitions).
+        Returns ``{"skip": True, ...}`` for an empty-target batch.
+        """
+        inputs = self._build_input_embeds(
+            batch.input_tokens, batch.audios, batch.audio_lens, audio_embs=audio_embs
+        )
         use_aux = self.core_cfg.use_chunk_classifier
         use_parallel = (
             self._parallel_heads_enabled
@@ -1437,7 +1555,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
 
         if num_targets == 0:
             logging.warning("Batch %d: num_targets is 0 — skipping (returning zero loss).", batch_idx)
-            return {"loss": torch.tensor(0.0, device=target_ids.device, requires_grad=True)}
+            return {"skip": True, "loss": torch.tensor(0.0, device=target_ids.device, requires_grad=True)}
 
         logits = outputs["logits"]
 
@@ -1573,6 +1691,39 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         if self._parallel_heads_enabled and self.parallel_chunk_heads is not None:
             params_touch = sum(p.sum() for p in self.parallel_chunk_heads.parameters())
             loss = loss + params_touch * 0.0
+
+        return {
+            "loss": loss,
+            "loss_blank": loss_blank,
+            "loss_nonblank": loss_nonblank,
+            "cls_loss_log": cls_loss_log,
+            "text_only_lm_loss_log": text_only_lm_loss_log,
+            "text_only_lm_num_targets_log": text_only_lm_num_targets_log,
+            "num_blank": num_blank,
+            "num_targets": num_targets,
+            "par_loss_log": par_loss_log,
+            "par_num_slots_log": par_num_slots_log,
+            "inputs": inputs,
+        }
+
+    def _log_train_step(self, metrics: dict, batch: StreamingSTTBatch, batch_idx: int) -> None:
+        """Log per-step training metrics and periodic WER/decoding previews.
+
+        Split out of ``training_step`` so the encoder-reuse (K>1) path can log a
+        single aggregated payload. For K=1 the inputs are exactly the values the
+        inline code used, so logging is unchanged.
+        """
+        loss = metrics["loss"]
+        loss_blank = metrics["loss_blank"]
+        loss_nonblank = metrics["loss_nonblank"]
+        cls_loss_log = metrics["cls_loss_log"]
+        text_only_lm_loss_log = metrics["text_only_lm_loss_log"]
+        text_only_lm_num_targets_log = metrics["text_only_lm_num_targets_log"]
+        num_blank = metrics["num_blank"]
+        num_targets = metrics["num_targets"]
+        par_loss_log = metrics["par_loss_log"]
+        par_num_slots_log = metrics["par_num_slots_log"]
+        inputs = metrics["inputs"]
 
         B, L = inputs["input_embeds"].shape[:2]
         log_payload = {
@@ -1718,7 +1869,6 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                         hyps_ar[0],
                         train_wer_ar,
                     )
-        return {"loss": loss}
 
     def configure_optimizers(self):
         return configure_optimizers(self)
