@@ -2597,11 +2597,20 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                     new_is_audio_for_history,
                 ) = self._build_chunk_local_step_inputs(state, new_is_audio, active_mask=active_t)
 
+            # Only streams that are actually fed a real token this step (active
+            # streams, ``feed_mask=True``) get an attendable KV slot. Finished
+            # streams are fed a filler ``<blank>`` purely to keep the batched
+            # cache rectangular; marking those slots attendable (``ones``) lets
+            # them accumulate extra blank tokens at frozen/duplicated positions,
+            # which corrupts that stream's context in *later* turns and silently
+            # truncates long utterances in batched decode (the single-stream
+            # path never sees them because the loop breaks on finish). Mask them
+            # out so batched decode matches batch=1 exactly.
+            new_attn_col = torch.tensor(
+                feed_mask, dtype=state.attention_mask.dtype, device=state.attention_mask.device
+            ).unsqueeze(1)  # (B, 1): 1 for active/fed streams, 0 for finished streams' filler
             state.attention_mask = torch.cat(
-                [
-                    state.attention_mask,
-                    torch.ones(B, 1, dtype=state.attention_mask.dtype, device=state.attention_mask.device),
-                ],
+                [state.attention_mask, new_attn_col],
                 dim=1,
             )
             llm_attn = attn_bias_4d if attn_bias_4d is not None else state.attention_mask

@@ -489,10 +489,14 @@ else
         if [ -f ${REMOTE_CKPT_DIR}/step=${STEP}.ckpt ]; then \
             echo step=${STEP}.ckpt; \
         else \
-            ls ${REMOTE_CKPT_DIR}/step=${STEP}-*.ckpt 2>/dev/null \
-                | grep -v -- '-last\\.ckpt$' \
-                | head -1 \
-                | xargs -r basename; \
+            match=\$(ls ${REMOTE_CKPT_DIR}/step=${STEP}-*.ckpt 2>/dev/null \
+                | grep -v -- '-last\\.ckpt\$' \
+                | head -1); \
+            if [ -z \"\$match\" ]; then \
+                match=\$(ls ${REMOTE_CKPT_DIR}/step=${STEP}-*.ckpt 2>/dev/null \
+                    | head -1); \
+            fi; \
+            printf '%s\\n' \"\$match\" | xargs -r basename; \
         fi"
     CKPT_FILENAME=$(ssh $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}" "${REMOTE_STEP_LOOKUP}")
     if [ -z "$CKPT_FILENAME" ]; then
