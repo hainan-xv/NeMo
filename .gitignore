@@ -204,6 +204,6 @@ results/
 .mplconfig/
 
 # Launch scripts that embed personal secrets (HF/WANDB tokens) and per-user
-# cluster paths. Kept locally only; rsync to the cluster via ord2/sync.sh
-# instead of git.
-ord2/
+# cluster paths. Kept locally only; rsync to the cluster via the per-dir sync.sh
+# instead of git. Covers ord/, ord2/, ord3/, ... so secrets never get committed.
+ord*/

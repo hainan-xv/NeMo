@@ -28,6 +28,66 @@ from nemo.collections.tts.models import AudioCodecModel
 from nemo.utils import logging
 
 
+def _report_perception_weight_load(perception: torch.nn.Module, asr_state_dict: Dict[str, torch.Tensor], result) -> None:
+    """Log how the pretrained ASR weights mapped onto the perception module.
+
+    ``load_state_dict(..., strict=False)`` silently ignores name mismatches, so
+    swapping in a new speech encoder whose key names differ from the perception
+    module's would leave the encoder (near-)randomly initialized with NO error.
+    That presents downstream as a model that drives loss down on the easy
+    control tokens (<blank>/<|im_end|>) while transcription quality collapses
+    (deletions / rising WER). This makes the mismatch loud instead.
+
+    Args:
+        perception: the constructed AudioPerceptionModule (target of the load).
+        asr_state_dict: the pretrained ASR model's state_dict (the source).
+        result: the ``_IncompatibleKeys`` returned by ``load_state_dict``.
+    """
+    missing = set(getattr(result, "missing_keys", []) or [])
+    unexpected = set(getattr(result, "unexpected_keys", []) or [])
+    module_keys = list(perception.state_dict().keys())
+
+    def _stats(prefix: str):
+        mod = [k for k in module_keys if k.startswith(prefix)]
+        miss = [k for k in mod if k in missing]
+        loaded = len(mod) - len(miss)
+        return loaded, len(mod), len(miss)
+
+    enc_loaded, enc_total, enc_miss = _stats("encoder.")
+    pre_loaded, pre_total, _ = _stats("preprocessor.")
+
+    logging.info(
+        "Perception weight load: matched %d/%d module params "
+        "(encoder %d/%d, preprocessor %d/%d). "
+        "missing(in module, NOT loaded)=%d, unexpected(in ckpt, unused)=%d",
+        len(module_keys) - len(missing),
+        len(module_keys),
+        enc_loaded,
+        enc_total,
+        pre_loaded,
+        pre_total,
+        len(missing),
+        len(unexpected),
+    )
+    # The encoder is the whole point of the pretrained ASR init. If most of its
+    # weights did not load, the key names almost certainly don't match (e.g. a
+    # different encoder architecture / wrapper) and the encoder is effectively
+    # random — fail loud rather than waste a training run.
+    if enc_total > 0 and enc_miss > 0.5 * enc_total:
+        logging.warning(
+            "Perception ENCODER weights mostly did NOT load: only %d/%d encoder "
+            "params matched the pretrained ASR state_dict (%d missing). The "
+            "encoder is (near-)randomly initialized -- check that pretrained_asr "
+            "matches the expected encoder architecture / key names. Example "
+            "missing encoder keys: %s | example unexpected ckpt keys: %s",
+            enc_loaded,
+            enc_total,
+            enc_miss,
+            [k for k in module_keys if k.startswith("encoder.") and k in missing][:5],
+            [k for k in unexpected if k.startswith("encoder.")][:5] or list(unexpected)[:5],
+        )
+
+
 def load_pretrained_nemo(cls, model_path_or_name: str):
     """
     Load pretrained NeMo 1.0 model (inheriting from ModelPT). Works with ASR, TTS, codec models.
@@ -121,7 +181,9 @@ def setup_speech_encoder(model: torch.nn.Module, pretrained_weights: bool = True
                     if value is not None:  # Only override if user explicitly set a value
                         model.cfg.perception.encoder[key] = value
         model.perception = AudioPerceptionModule(model.cfg.perception).train()
-        model.perception.load_state_dict(asr.state_dict(), strict=False)
+        _asr_sd = asr.state_dict()
+        _load_result = model.perception.load_state_dict(_asr_sd, strict=False)
+        _report_perception_weight_load(model.perception, _asr_sd, _load_result)
     else:
         model.perception = AudioPerceptionModule(model.cfg.perception).train()
 
@@ -169,7 +231,9 @@ def setup_perception(
                     if value is not None:  # Only override if user explicitly set a value
                         cfg.perception.encoder[key] = value
         perception = AudioPerceptionModule(cfg.perception).train()
-        perception.load_state_dict(asr.state_dict(), strict=False)
+        _asr_sd = asr.state_dict()
+        _load_result = perception.load_state_dict(_asr_sd, strict=False)
+        _report_perception_weight_load(perception, _asr_sd, _load_result)
     else:
         perception = AudioPerceptionModule(cfg.perception).train()
 

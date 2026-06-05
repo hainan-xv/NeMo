@@ -158,6 +158,13 @@ class StreamingSTTModelConfig:
     supervise_im_end_in_loss: bool = False
     project_unaligned_text_to_chunks: bool = False
     max_audio_chunks_per_turn: int = 1
+    # Max new text tokens the AR decode may emit per chunk before being force-
+    # stopped. This is a decode-time cap only (training is teacher-forced and
+    # uncapped). It drives the in-training WER preview and is persisted in the
+    # model config so downstream eval can read the intended value. The default
+    # matches the historical hardcoded constant, so existing models are
+    # unchanged.
+    max_new_tokens_per_chunk: int = DEFAULT_MAX_NEW_TOKENS_PER_CHUNK
     use_modality_position_ids: bool = False
     # Additive constant applied to every text/template RoPE position so that the
     # text stream occupies ``[offset, offset + num_text)`` while audio occupies
@@ -1210,7 +1217,9 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 1 prefill + up to N sequential feeds). No-op when the parallel
                 heads aren't initialized; falls back to AR.
         """
-        max_new_tokens = DEFAULT_MAX_NEW_TOKENS_PER_CHUNK
+        max_new_tokens = int(
+            getattr(self.core_cfg, "max_new_tokens_per_chunk", DEFAULT_MAX_NEW_TOKENS_PER_CHUNK)
+        )
         default_prompt = "Transcribe the audio into text."
         prompt_field = "system_prompt"
         if self.dataset is not None and hasattr(self.dataset, "cfg"):
