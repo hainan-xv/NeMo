@@ -74,7 +74,7 @@ REMOTE_RESULTS_ROOT="/lustre/fsw/portfolios/llmservice/users/hainanx/results"
 # scripts use different project names (e.g. Streaming_SLM_chunk14 for the
 # chunk-14 experiments).  We try them in order and pick the first one that
 # actually contains the experiment.  Override with PROJECT=foo to force one.
-PROJECT_CANDIDATES_DEFAULT=("Streaming_SLM_ord2")
+PROJECT_CANDIDATES_DEFAULT=("Streaming_SLM_ord2", "Streaming_SLM_ORD3")
 SSH_OPTS="-i $SSH_KEY -o StrictHostKeyChecking=no"
 
 # ---------- Local paths ----------

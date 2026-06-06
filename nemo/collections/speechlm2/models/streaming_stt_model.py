@@ -158,6 +158,12 @@ class StreamingSTTModelConfig:
     supervise_im_end_in_loss: bool = False
     project_unaligned_text_to_chunks: bool = False
     max_audio_chunks_per_turn: int = 1
+    # Optional discrete set of chunks-per-turn group sizes for fixed-chunk
+    # multi-chunk training. Comma-separated string (e.g. "1,2,7"). When set, each
+    # turn's group size is sampled uniformly from EXACTLY these values instead of
+    # uniformly over [1, max_audio_chunks_per_turn]. None (default) preserves the
+    # legacy uniform-range behavior. Propagated to the dataset config.
+    audio_chunks_per_turn_choices: Optional[str] = None
     # Max new text tokens the AR decode may emit per chunk before being force-
     # stopped. This is a decode-time cap only (training is teacher-forced and
     # uncapped). It drives the in-training WER preview and is persisted in the
@@ -385,6 +391,11 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 data_cfg.supervise_im_end_in_loss = self.core_cfg.supervise_im_end_in_loss
                 data_cfg.project_unaligned_text_to_chunks = self.core_cfg.project_unaligned_text_to_chunks
                 data_cfg.max_audio_chunks_per_turn = self.core_cfg.max_audio_chunks_per_turn
+                # Only set the discrete-choices key when the model actually
+                # requests it, so existing runs keep byte-identical data_cfg
+                # snapshots (no spurious key in saved configs / hparam logs).
+                if getattr(self.core_cfg, "audio_chunks_per_turn_choices", None) is not None:
+                    data_cfg.audio_chunks_per_turn_choices = self.core_cfg.audio_chunks_per_turn_choices
                 # compact_template / write_token: the dataset has its OWN copies
                 # of these keys (StreamingSTTDataConfig) and they must agree with
                 # the model's choice -- otherwise the dataset emits regular chat
@@ -433,6 +444,9 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             if bool(self.core_cfg.empty_chunk_eos_only):
                 log_msg += ", empty_chunk_eos_only=%s"
                 log_args.append(True)
+            if getattr(self.core_cfg, "audio_chunks_per_turn_choices", None) is not None:
+                log_msg += ", audio_chunks_per_turn_choices=%r"
+                log_args.append(self.core_cfg.audio_chunks_per_turn_choices)
             if self._parallel_heads_enabled:
                 log_msg += ", parallel_chunk_slots=%s"
                 log_args.append(data_cfg.parallel_chunk_slots)

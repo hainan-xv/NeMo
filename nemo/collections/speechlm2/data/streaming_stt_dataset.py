@@ -178,6 +178,13 @@ class StreamingSTTDataConfig:
     supervise_im_end_in_loss: bool = False
     project_unaligned_text_to_chunks: bool = False
     max_audio_chunks_per_turn: int = 1
+    # Optional discrete set of chunks-per-turn group sizes for fixed-chunk
+    # multi-chunk training. Comma-separated string (e.g. "1,2,7") or list of
+    # ints. When set, each turn's group size is sampled uniformly from EXACTLY
+    # these values instead of uniformly over [1, max_audio_chunks_per_turn].
+    # None (default) keeps the legacy uniform-range behavior. Propagated from
+    # the model's audio_chunks_per_turn_choices flag.
+    audio_chunks_per_turn_choices: Optional[str] = None
     # K — only effective in dynamic chunking (chunk_size == 0). Each audio
     # segment is rounded UP to a multiple of K frames (and total audio is
     # padded to K-multiple). The model implicitly learns to emit only at
@@ -474,16 +481,77 @@ def project_transcript_to_chunks(
     return original_chunks, aligned_text_chunks
 
 
-def sample_fixed_chunk_group_schedule(num_chunks: int, max_chunks_per_turn: int) -> List[int]:
-    """Sample batch-shared per-position group sizes for fixed chunking."""
+def parse_chunk_group_choices(choices) -> Optional[List[int]]:
+    """Parse a discrete chunk-group-size spec into a sorted list of unique ints.
+
+    Accepts a comma-separated string (e.g. ``"1,2,7"``), an iterable of ints, or
+    None/empty. Returns a de-duplicated, ascending list of positive ints, or
+    None when nothing valid is given (caller then falls back to the uniform
+    ``[1, max_chunks_per_turn]`` sampling).
+    """
+    if choices is None:
+        return None
+    if isinstance(choices, str):
+        tokens = [tok.strip() for tok in choices.split(",")]
+    else:
+        # Iterable of values (list/tuple/OmegaConf ListConfig).
+        tokens = [str(tok).strip() for tok in choices]
+    values: List[int] = []
+    for tok in tokens:
+        if tok == "":
+            continue
+        v = int(tok)
+        if v < 1:
+            raise ValueError(f"chunk-group choice must be a positive int, got {v} (from {choices!r})")
+        values.append(v)
+    if not values:
+        return None
+    return sorted(set(values))
+
+
+def sample_fixed_chunk_group_schedule(
+    num_chunks: int,
+    max_chunks_per_turn: int,
+    allowed_group_sizes: Optional[List[int]] = None,
+) -> List[int]:
+    """Sample batch-shared per-position group sizes for fixed chunking.
+
+    When ``allowed_group_sizes`` is given (a non-empty list of positive ints),
+    each group size is drawn uniformly from exactly those discrete values
+    (e.g. ``[1, 2, 7]`` => only 1-, 2-, or 7-chunk turns). Otherwise the legacy
+    behavior applies: group sizes are drawn uniformly from ``[1, max_chunks_per_turn]``.
+    """
     if num_chunks <= 0:
         return []
+
+    if allowed_group_sizes:
+        sizes = [s for s in allowed_group_sizes if s >= 1]
+        if not sizes:
+            return [1] * num_chunks
+        if len(sizes) == 1:
+            # Single allowed size: deterministic tiling (still randomized batch
+            # to batch only in the trivial sense; nothing to sample).
+            only = int(sizes[0])
+            schedule: List[int] = []
+            chunks_consumed = 0
+            while chunks_consumed < num_chunks:
+                schedule.append(only)
+                chunks_consumed += only
+            return schedule
+        schedule = []
+        chunks_consumed = 0
+        while chunks_consumed < num_chunks:
+            pick = int(torch.randint(0, len(sizes), (1,)).item())
+            group_size = int(sizes[pick])
+            schedule.append(group_size)
+            chunks_consumed += group_size
+        return schedule
 
     max_chunks_per_turn = max(int(max_chunks_per_turn), 1)
     if max_chunks_per_turn == 1:
         return [1] * num_chunks
 
-    schedule: List[int] = []
+    schedule = []
     chunks_consumed = 0
     while chunks_consumed < num_chunks:
         group_size = int(torch.randint(1, max_chunks_per_turn + 1, (1,)).item())
@@ -1381,7 +1449,14 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             randomize_fixed_chunk_groups = self.randomize_fixed_chunk_groups
         fixed_chunk_group_schedule: Optional[List[int]] = None
         max_audio_chunks_per_turn = max(int(getattr(self.cfg, "max_audio_chunks_per_turn", 1)), 1)
-        if randomize_fixed_chunk_groups and self.cfg.chunk_size > 0 and max_audio_chunks_per_turn > 1:
+        chunk_group_choices = parse_chunk_group_choices(
+            getattr(self.cfg, "audio_chunks_per_turn_choices", None)
+        )
+        # The largest group we can produce: from the discrete choices when given,
+        # else the uniform-range upper bound. Randomization is only meaningful
+        # when this exceeds 1 (otherwise every turn is a single chunk).
+        effective_max_chunks = max(chunk_group_choices) if chunk_group_choices else max_audio_chunks_per_turn
+        if randomize_fixed_chunk_groups and self.cfg.chunk_size > 0 and effective_max_chunks > 1:
             max_num_chunks = max(
                 (
                     math.ceil(math.ceil(duration / self.cfg.frame_length_in_secs) / self.cfg.chunk_size)
@@ -1389,7 +1464,11 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
                 ),
                 default=0,
             )
-            fixed_chunk_group_schedule = sample_fixed_chunk_group_schedule(max_num_chunks, max_audio_chunks_per_turn)
+            fixed_chunk_group_schedule = sample_fixed_chunk_group_schedule(
+                max_num_chunks,
+                max_audio_chunks_per_turn,
+                allowed_group_sizes=chunk_group_choices,
+            )
 
         batch_messages = get_llm_messages_for_batch(
             system_role=self.cfg.system_role,
