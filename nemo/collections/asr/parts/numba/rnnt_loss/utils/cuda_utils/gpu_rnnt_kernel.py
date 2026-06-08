@@ -1437,3 +1437,382 @@ def compute_tdt_grad_kernel(
             # update internal index through the thread_buffer;
             # until idx < V + 1, such that entire vocabulary has been updated.
             idx += GPU_RNNT_THREAD_SIZE
+
+
+# --------------------------------------------------------------------------- #
+# Multistream TDT kernels
+#
+# These mirror the standard TDT kernels above, with two differences:
+#   1) The activation tensors are assumed to be ALREADY normalized log-probs
+#      (per-stream log_softmax for `acts`, log_softmax for `duration_acts`), so
+#      no `denom`/`sigma` term is applied inside the kernel. This makes the
+#      implementation much simpler at the cost of a little speed -- the per-stream
+#      log_softmax (and its backward) is handled in PyTorch, see
+#      `MultistreamTDTLossNumba`.
+#   2) A non-blank emission factorizes into `maxK` parallel streams: its log-prob
+#      is the SUM of the per-stream target log-probs, and its gradient is
+#      distributed to all `maxK` target indices. `mlabels` therefore has shape
+#      [B, U, K] (absolute indices into the joint label part).
+# --------------------------------------------------------------------------- #
+
+
+@cuda.jit(device=True, inline=True)
+def logp_ms(acts: torch.Tensor, maxT: int, maxU: int, alphabet_size: int, mb: int, t: int, u: int, v: int):
+    """Read an already-normalized log-prob from a flattened [B, T, U, V] tensor."""
+    col = (mb * maxT + t) * maxU + u
+    return acts[col * alphabet_size + v]
+
+
+@cuda.jit(device=True, inline=True)
+def emit_logp_ms(
+    acts: torch.Tensor, labels, maxT: int, maxU: int, maxK: int, alphabet_size: int, mb: int, t: int, u: int
+):
+    """Total non-blank emission log-prob at (t, u): sum over the K stream targets at label position u."""
+    s = logp_ms(acts, maxT, maxU, alphabet_size, mb, t, u, labels[u, 0])
+    for k in range(1, maxK):
+        s += logp_ms(acts, maxT, maxU, alphabet_size, mb, t, u, labels[u, k])
+    return s
+
+
+@cuda.jit()
+def multistream_tdt_compute_alphas_kernel(
+    acts: torch.Tensor,
+    duration_acts: torch.Tensor,
+    alphas: torch.Tensor,
+    llForward: torch.Tensor,
+    xlen: torch.Tensor,
+    ylen: torch.Tensor,
+    mlabels: torch.Tensor,  # [B, U, K]
+    minibatch: int,
+    maxT: int,
+    maxU: int,
+    maxK: int,
+    alphabet_size: int,
+    blank_: int,
+    durations: torch.Tensor,
+    num_durations: int,
+):
+    """Forward (alpha) recursion for multistream TDT. See module note above."""
+    b = cuda.blockIdx.x  # batch id
+    u = cuda.threadIdx.x  # label id, u
+    T = xlen[b]
+    U = ylen[b] + 1
+
+    labels = mlabels[b]  # [U, K]
+    offset = b * maxT * maxU
+
+    if u == 0:
+        alphas[offset] = 0
+
+    cuda.syncthreads()
+
+    for n in range(1, T + U - 1):
+        t = n - u
+
+        if u == 0:
+            # only blank emissions when u == 0
+            if t > 0 and t < T:
+                alphas[offset + t * maxU + u] = -INF
+                for i in range(num_durations):
+                    if durations[i] == 0:
+                        continue
+                    if t >= durations[i]:
+                        alphas[offset + t * maxU + u] = rnnt_helper.log_sum_exp(
+                            alphas[offset + t * maxU + u],
+                            alphas[offset + (t - durations[i]) * maxU + u]
+                            + logp_ms(acts, maxT, maxU, alphabet_size, b, t - durations[i], u, blank_)
+                            + logp_duration(duration_acts, maxT, maxU, num_durations, b, t - durations[i], u, i),
+                        )
+                    else:
+                        break
+
+        elif u < U:
+            # when t == 0, only the duration-0 non-blank emission is possible.
+            if t == 0:
+                if durations[0] == 0:
+                    alphas[offset + u] = (
+                        alphas[offset + u - 1]
+                        + emit_logp_ms(acts, labels, maxT, maxU, maxK, alphabet_size, b, 0, u - 1)
+                        + logp_duration(duration_acts, maxT, maxU, num_durations, b, 0, u - 1, 0)
+                    )
+                else:
+                    alphas[offset + u] = -INF
+
+            elif t > 0 and t < T:
+                no_emit = -INF
+                for i in range(num_durations):
+                    if durations[i] == 0:
+                        continue
+                    if t >= durations[i]:
+                        no_emit = rnnt_helper.log_sum_exp(
+                            no_emit,
+                            alphas[offset + (t - durations[i]) * maxU + u]
+                            + logp_ms(acts, maxT, maxU, alphabet_size, b, t - durations[i], u, blank_)
+                            + logp_duration(duration_acts, maxT, maxU, num_durations, b, t - durations[i], u, i),
+                        )
+                    else:
+                        break
+
+                emit = -INF
+                for i in range(num_durations):
+                    if t >= durations[i]:
+                        emit = rnnt_helper.log_sum_exp(
+                            emit,
+                            alphas[offset + (t - durations[i]) * maxU + u - 1]
+                            + emit_logp_ms(acts, labels, maxT, maxU, maxK, alphabet_size, b, t - durations[i], u - 1)
+                            + logp_duration(duration_acts, maxT, maxU, num_durations, b, t - durations[i], u - 1, i),
+                        )
+                    else:
+                        break
+
+                alphas[offset + t * maxU + u] = rnnt_helper.log_sum_exp(emit, no_emit)
+
+        cuda.syncthreads()
+
+    if u == 0:
+        loglike = -INF
+        for i in range(num_durations):
+            if durations[i] == 0:
+                continue
+            if durations[i] == 1:
+                loglike = (
+                    alphas[offset + (T - 1) * maxU + U - 1]
+                    + logp_ms(acts, maxT, maxU, alphabet_size, b, T - 1, U - 1, blank_)
+                    + logp_duration(duration_acts, maxT, maxU, num_durations, b, T - 1, U - 1, i)
+                )
+                continue
+            if T >= durations[i]:
+                big_blank_loglike = (
+                    alphas[offset + (T - durations[i]) * maxU + U - 1]
+                    + logp_ms(acts, maxT, maxU, alphabet_size, b, T - durations[i], U - 1, blank_)
+                    + logp_duration(duration_acts, maxT, maxU, num_durations, b, T - durations[i], U - 1, i)
+                )
+                loglike = rnnt_helper.log_sum_exp(loglike, big_blank_loglike)
+            else:
+                break
+
+        llForward[b] = loglike
+
+
+@cuda.jit()
+def multistream_tdt_compute_betas_kernel(
+    acts: torch.Tensor,
+    duration_acts: torch.Tensor,
+    betas: torch.Tensor,
+    llBackward: torch.Tensor,
+    xlen: torch.Tensor,
+    ylen: torch.Tensor,
+    mlabels: torch.Tensor,  # [B, U, K]
+    minibatch: int,
+    maxT: int,
+    maxU: int,
+    maxK: int,
+    alphabet_size: int,
+    blank_: int,
+    durations: torch.Tensor,
+    num_durations: int,
+):
+    """Backward (beta) recursion for multistream TDT. See module note above."""
+    b = cuda.blockIdx.x
+    u = cuda.threadIdx.x
+    T = xlen[b]
+    U = ylen[b] + 1
+
+    labels = mlabels[b]  # [U, K]
+    offset = b * maxT * maxU
+
+    if u == 0:
+        if durations[0] == 1:
+            betas[offset + (T - 1) * maxU + U - 1] = logp_ms(
+                acts, maxT, maxU, alphabet_size, b, T - 1, U - 1, blank_
+            ) + logp_duration(duration_acts, maxT, maxU, num_durations, b, T - 1, U - 1, 0)
+        elif durations[1] == 1:
+            betas[offset + (T - 1) * maxU + U - 1] = logp_ms(
+                acts, maxT, maxU, alphabet_size, b, T - 1, U - 1, blank_
+            ) + logp_duration(duration_acts, maxT, maxU, num_durations, b, T - 1, U - 1, 1)
+
+    cuda.syncthreads()
+
+    for n in range(T + U - 2, -1, -1):
+        t = n - u
+
+        if u == U - 1:
+            # only blank emissions when u == U - 1
+            if t >= 0 and t + 1 < T:
+                betas[offset + t * maxU + U - 1] = -INF
+                for i in range(num_durations):
+                    if durations[i] == 0:
+                        continue
+                    if t + durations[i] < T:
+                        betas[offset + t * maxU + U - 1] = rnnt_helper.log_sum_exp(
+                            betas[offset + t * maxU + U - 1],
+                            betas[offset + (t + durations[i]) * maxU + U - 1]
+                            + logp_ms(acts, maxT, maxU, alphabet_size, b, t, U - 1, blank_)
+                            + logp_duration(duration_acts, maxT, maxU, num_durations, b, t, U - 1, i),
+                        )
+                    elif t + durations[i] == T:
+                        betas[offset + t * maxU + U - 1] = rnnt_helper.log_sum_exp(
+                            betas[offset + t * maxU + U - 1],
+                            logp_ms(acts, maxT, maxU, alphabet_size, b, t, U - 1, blank_)
+                            + logp_duration(duration_acts, maxT, maxU, num_durations, b, t, U - 1, i),
+                        )
+
+        elif u < U - 1:
+            if t == T - 1:
+                # only the duration-0 non-blank emission is possible at t == T - 1
+                if durations[0] == 0:
+                    betas[offset + (T - 1) * maxU + u] = (
+                        betas[offset + (T - 1) * maxU + u + 1]
+                        + emit_logp_ms(acts, labels, maxT, maxU, maxK, alphabet_size, b, T - 1, u)
+                        + logp_duration(duration_acts, maxT, maxU, num_durations, b, T - 1, u, 0)
+                    )
+                else:
+                    betas[offset + (T - 1) * maxU + u] = -INF
+
+            elif t >= 0 and t < T - 1:
+                no_emit = -INF
+                for i in range(num_durations):
+                    if durations[i] == 0:
+                        continue
+                    if t + durations[i] < T:
+                        no_emit = rnnt_helper.log_sum_exp(
+                            no_emit,
+                            betas[offset + (t + durations[i]) * maxU + u]
+                            + logp_ms(acts, maxT, maxU, alphabet_size, b, t, u, blank_)
+                            + logp_duration(duration_acts, maxT, maxU, num_durations, b, t, u, i),
+                        )
+
+                emit = -INF
+                for i in range(num_durations):
+                    if t + durations[i] < T:
+                        emit = rnnt_helper.log_sum_exp(
+                            emit,
+                            betas[offset + (t + durations[i]) * maxU + u + 1]
+                            + emit_logp_ms(acts, labels, maxT, maxU, maxK, alphabet_size, b, t, u)
+                            + logp_duration(duration_acts, maxT, maxU, num_durations, b, t, u, i),
+                        )
+
+                betas[offset + t * maxU + u] = rnnt_helper.log_sum_exp(emit, no_emit)
+
+        cuda.syncthreads()
+
+    if u == 0:
+        llBackward[b] = betas[offset]
+
+
+@cuda.jit()
+def multistream_tdt_compute_grad_kernel(
+    label_grads: torch.Tensor,
+    duration_grads: torch.Tensor,
+    acts: torch.Tensor,
+    duration_acts: torch.Tensor,
+    alphas: torch.Tensor,
+    betas: torch.Tensor,
+    logll: torch.Tensor,
+    xlen: torch.Tensor,
+    ylen: torch.Tensor,
+    mlabels: torch.Tensor,  # [B, U, K]
+    minibatch: int,
+    maxT: int,
+    maxU: int,
+    maxK: int,
+    alphabet_size: int,
+    blank_: int,
+    durations: torch.Tensor,
+    num_durations: int,
+    clamp: float,
+):
+    """Gradient of the multistream-TDT loss w.r.t. the (already log-softmaxed) log-probs.
+
+    Because the inputs are log-probs, the gradient w.r.t. each entry is simply the
+    negative expected count of the arcs that consume it (no softmax-baseline term).
+    The per-stream / per-duration log_softmax Jacobian is applied in PyTorch.
+    """
+    tid = cuda.threadIdx.x
+    idx = tid
+    col = cuda.blockIdx.x
+
+    u = col % maxU
+    bt = (col - u) // maxU
+    t = bt % maxT
+    mb = (bt - t) // maxT
+
+    T = xlen[mb]
+    U = ylen[mb] + 1
+    labels = mlabels[mb]  # [U, K]
+
+    if t < T and u < U:
+        # ----- duration gradients (one thread per duration) -----
+        if idx < num_durations:
+            l = durations[idx]
+            grad = 0.0
+            d_lp = duration_acts[col * num_durations + idx]
+
+            # non-blank (label) arc: (t, u) -> (t + l, u + 1)
+            if u < U - 1 and t + l <= T - 1:
+                emit = emit_logp_ms(acts, labels, maxT, maxU, maxK, alphabet_size, mb, t, u)
+                grad -= math.exp(alphas[col] + emit + d_lp + betas[col + 1 + durations[idx] * maxU] - logll[mb])
+
+            # blank arc: (t, u) -> (t + l, u), only for l > 0
+            if l > 0:
+                blank_lp = acts[col * alphabet_size + blank_]
+                if t + l == T and u == U - 1:
+                    grad -= math.exp(alphas[col] + blank_lp + d_lp - logll[mb])
+                elif t + l <= T - 1:
+                    grad -= math.exp(alphas[col] + blank_lp + d_lp + betas[col + durations[idx] * maxU] - logll[mb])
+
+            duration_grads[col * num_durations + idx] = grad
+
+        # ----- label gradients (thread buffer strided over vocab) -----
+        while idx < alphabet_size:
+            grad = 0.0
+
+            if idx == blank_:
+                blank_lp = acts[col * alphabet_size + blank_]
+                for i in range(num_durations):
+                    if durations[i] == 0:
+                        continue
+                    if t + durations[i] == T and u == U - 1:
+                        grad -= math.exp(
+                            alphas[col]
+                            + blank_lp
+                            + logp_duration(duration_acts, maxT, maxU, num_durations, mb, t, u, i)
+                            - logll[mb]
+                        )
+                    elif t + durations[i] <= T - 1:
+                        grad -= math.exp(
+                            alphas[col]
+                            + blank_lp
+                            + logp_duration(duration_acts, maxT, maxU, num_durations, mb, t, u, i)
+                            + betas[col + durations[i] * maxU]
+                            - logll[mb]
+                        )
+            elif u < U - 1:
+                # count how many of the K stream targets at position u equal idx.
+                # With disjoint stream ranges this is 0 or 1, but counting keeps the
+                # gradient identical to the reference even if ranges were to overlap.
+                n_match = 0
+                for k in range(maxK):
+                    if idx == labels[u, k]:
+                        n_match += 1
+                if n_match > 0:
+                    emit = emit_logp_ms(acts, labels, maxT, maxU, maxK, alphabet_size, mb, t, u)
+                    for i in range(num_durations):
+                        if t + durations[i] <= T - 1:
+                            grad -= n_match * math.exp(
+                                alphas[col]
+                                + emit
+                                + logp_duration(duration_acts, maxT, maxU, num_durations, mb, t, u, i)
+                                + betas[col + 1 + durations[i] * maxU]
+                                - logll[mb]
+                            )
+
+            label_grads[col * alphabet_size + idx] = grad
+
+            if clamp > 0.0:
+                g = label_grads[col * alphabet_size + idx]
+                g = min(g, clamp)
+                g = max(g, -clamp)
+                label_grads[col * alphabet_size + idx] = g
+
+            idx += GPU_RNNT_THREAD_SIZE

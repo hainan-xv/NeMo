@@ -714,12 +714,14 @@ class _MultistreamTDTLossFunction(torch.autograd.Function):
 
 
 class MultistreamTDTLoss(Loss):
-    """Multistream TDT loss with an analytic (custom) gradient.
+    """Multistream TDT loss.
 
-    Same math as :class:`MultistreamTDTLossPytorch`, but the gradient is computed
-    by an explicit forward-backward instead of autograd. This is the reference
-    for a future fused/CUDA implementation and is what gets validated against the
-    differentiable reference / autograd.
+    On CUDA this dispatches to the fast fused Numba kernels
+    (:class:`~nemo.collections.asr.parts.numba.rnnt_loss.rnnt_pytorch.MultistreamTDTLossNumba`),
+    which consume already-normalized per-stream log-probs and let autograd chain
+    the log_softmax Jacobian. On CPU (and for gradient validation) it falls back to
+    the analytic forward-backward in :class:`_MultistreamTDTLossFunction`, whose
+    math is identical to the differentiable reference :class:`MultistreamTDTLossPytorch`.
     """
 
     @property
@@ -742,6 +744,7 @@ class MultistreamTDTLoss(Loss):
         dividers: Optional[List[int]] = None,
         reduction: str = 'sum',
         sigma: float = 0.0,
+        clamp: float = -1.0,
     ):
         super().__init__()
         if dividers is None or len(dividers) < 2:
@@ -753,14 +756,35 @@ class MultistreamTDTLoss(Loss):
         self.dividers = tuple(dividers)
         self.reduction = reduction
         self.sigma = float(sigma)
+        self.clamp = float(clamp) if clamp and clamp > 0 else 0.0
+        self._numba_loss = None
+
+    def _get_numba_loss(self):
+        if self._numba_loss is None:
+            from nemo.collections.asr.parts.numba.rnnt_loss.rnnt_pytorch import MultistreamTDTLossNumba
+
+            # The Numba kernels reduce per-sample; mirror our reduction by reducing
+            # 'none' here and applying the same reduction below.
+            self._numba_loss = MultistreamTDTLossNumba(
+                blank=self.blank,
+                durations=list(self.durations),
+                dividers=list(self.dividers),
+                reduction='none',
+                sigma=self.sigma,
+                clamp=self.clamp,
+            )
+        return self._numba_loss
 
     def forward(self, acts, labels, act_lens, label_lens):
         if not acts.is_cuda and acts.dtype == torch.float16:
             acts = acts.float()
 
-        losses = _MultistreamTDTLossFunction.apply(
-            acts, labels, act_lens, label_lens, self.blank, self.durations, self.dividers, self.sigma
-        )
+        if acts.is_cuda:
+            losses = self._get_numba_loss()(acts, labels, act_lens, label_lens)
+        else:
+            losses = _MultistreamTDTLossFunction.apply(
+                acts, labels, act_lens, label_lens, self.blank, self.durations, self.dividers, self.sigma
+            )
 
         if self.reduction == 'mean_batch':
             return losses.mean()

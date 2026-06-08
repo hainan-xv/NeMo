@@ -34,7 +34,7 @@ from torch.nn import Module
 from nemo.collections.asr.parts.numba.rnnt_loss import rnnt
 from nemo.collections.asr.parts.numba.rnnt_loss.utils.cpu_utils import cpu_rnnt
 
-__all__ = ['rnnt_loss', 'RNNTLossNumba', 'MultiblankRNNTLossNumba', 'TDTLossNumba']
+__all__ = ['rnnt_loss', 'RNNTLossNumba', 'MultiblankRNNTLossNumba', 'TDTLossNumba', 'MultistreamTDTLossNumba']
 
 
 class _RNNTNumba(Function):
@@ -580,6 +580,150 @@ class TDTLossNumba(Module):
             self.clamp,
             self.sigma,
             self.omega,
+        )
+
+
+class _MultistreamTDTNumba(Function):
+    """Numba autograd Function for the multistream TDT loss.
+
+    Inputs ``label_logp`` and ``dur_logp`` are expected to be already-normalized
+    log-probs (per-stream log_softmax / log_softmax). The CUDA kernels compute the
+    loss and the gradient w.r.t. these log-probs; the surrounding log_softmax
+    Jacobian is handled by autograd in :class:`MultistreamTDTLossNumba.forward`.
+    """
+
+    @staticmethod
+    def forward(ctx, label_logp, dur_logp, labels, act_lens, label_lens, blank, durations, maxK, reduction, clamp):
+        is_cuda = label_logp.is_cuda
+        if not is_cuda:
+            raise ValueError("MultistreamTDTLossNumba is only implemented for CUDA tensors.")
+        if clamp < 0:
+            raise ValueError("`clamp` must be 0.0 or positive float value.")
+
+        label_grads = torch.zeros_like(label_logp) if label_logp.requires_grad else None
+        duration_grads = torch.zeros_like(dur_logp) if dur_logp.requires_grad else None
+        minibatch_size = label_logp.size(0)
+        costs = torch.zeros(minibatch_size, device=label_logp.device, dtype=label_logp.dtype)
+
+        rnnt.multistream_tdt_loss_gpu(
+            label_logp,
+            dur_logp,
+            labels=labels,
+            input_lengths=act_lens,
+            label_lengths=label_lens,
+            costs=costs,
+            label_grads=label_grads,
+            duration_grads=duration_grads,
+            blank_label=blank,
+            durations=durations,
+            maxK=maxK,
+            clamp=clamp,
+            num_threads=0,
+        )
+
+        if reduction in ['sum', 'mean']:
+            costs = costs.sum().unsqueeze_(-1)
+            if reduction == 'mean':
+                costs /= minibatch_size
+                if label_grads is not None:
+                    label_grads /= minibatch_size
+                    duration_grads /= minibatch_size
+
+        ctx.save_for_backward(label_grads, duration_grads)
+        return costs
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        label_grads, duration_grads = ctx.saved_tensors
+        if grad_output is not None and label_grads is not None:
+            grad_output = grad_output.view(-1, 1, 1, 1).to(label_grads)
+            # Out-of-place to keep the saved tensors immutable (safe under
+            # gradcheck's double-backward, gradient checkpointing, etc.).
+            return (
+                label_grads * grad_output,
+                duration_grads * grad_output,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        return (None,) * 10
+
+
+class MultistreamTDTLossNumba(Module):
+    """Multistream TDT loss (CUDA / Numba).
+
+    The label part of the joint output is partitioned into ``len(dividers) - 1``
+    streams (by ``dividers``); a non-blank emission is the product (sum in log
+    space) of one target per stream. The last stream owns the shared blank
+    (``dividers[-1] == blank + 1``). Durations occupy the trailing ``len(durations)``
+    columns of ``acts``.
+
+    Parameters:
+        blank: blank index inside the label part.
+        durations: list of TDT durations (must include 0 and 1).
+        dividers: stream boundaries within the label part (e.g. ``[0, num_cap,
+            num_cap + num_spell + 1]`` for a cap+spelling 2-stream model).
+        reduction: 'none' | 'sum' | 'mean'.
+        sigma: logit under-normalization subtracted from the label log-probs.
+        clamp: gradient clamp; <= 0 disables.
+    """
+
+    def __init__(self, blank, durations=None, dividers=None, reduction='sum', sigma: float = 0.0, clamp: float = -1):
+        super(MultistreamTDTLossNumba, self).__init__()
+        if dividers is None or len(dividers) < 2:
+            raise ValueError("`dividers` must be a list with at least 2 entries marking the stream boundaries.")
+        if dividers[-1] != blank + 1:
+            raise ValueError(f"Expected dividers[-1] ({dividers[-1]}) == blank + 1 ({blank + 1}).")
+        self.blank = blank
+        self.durations = durations if durations is not None else []
+        self.dividers = list(dividers)
+        self.reduction = reduction
+        self.sigma = float(sigma)
+        self.clamp = float(clamp) if clamp > 0 else 0.0
+        self.loss = _MultistreamTDTNumba.apply
+
+    def forward(self, acts, labels, act_lens, label_lens):
+        """
+        acts: [B, T, U, V + D] raw joint output (label part then durations).
+        labels: [B, U, K] target indices (K stream targets per label position).
+        act_lens: [B] acoustic lengths.
+        label_lens: [B] label lengths.
+        """
+        n_dur = len(self.durations)
+        label_acts = acts[..., :-n_dur]
+        dur_acts = acts[..., -n_dur:]
+
+        # per-stream log_softmax (- sigma) on the label part; log_softmax on durations.
+        # These ops are differentiable, so autograd chains the softmax Jacobian onto
+        # the gradients returned by the kernel.
+        parts = []
+        for i in range(len(self.dividers) - 1):
+            parts.append(
+                torch.log_softmax(label_acts[..., self.dividers[i] : self.dividers[i + 1]], dim=-1) - self.sigma
+            )
+        label_logp = torch.cat(parts, dim=-1).contiguous()
+        dur_logp = torch.log_softmax(dur_acts, dim=-1).contiguous()
+
+        labels = labels.to(torch.int64).contiguous()
+        act_lens = act_lens.to(torch.int64).contiguous()
+        label_lens = label_lens.to(torch.int64).contiguous()
+
+        return self.loss(
+            label_logp,
+            dur_logp,
+            labels,
+            act_lens,
+            label_lens,
+            self.blank,
+            list(self.durations),
+            labels.shape[-1],
+            self.reduction,
+            self.clamp,
         )
 
 

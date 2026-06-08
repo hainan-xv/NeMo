@@ -805,3 +805,144 @@ class GPUTDT(GPURNNT):
         durations = self.tdt_workspace[: self.num_durations]
 
         return used_offset, (denom, alphas, betas, llForward, llBackward, durations)
+
+
+class GPUMultistreamTDT(GPUTDT):
+    """Launch CUDA kernels for the multistream TDT loss.
+
+    Unlike :class:`GPUTDT`, the activation tensors handed to this wrapper are
+    expected to be ALREADY normalized log-probs (per-stream log_softmax for the
+    label part, log_softmax for durations). No `denom`/`sigma` is applied inside
+    the kernels; the log_softmax Jacobian is handled in PyTorch (see
+    `MultistreamTDTLossNumba`). A non-blank emission factorizes into ``maxK``
+    parallel streams whose target log-probs are summed, so ``labels`` is a 3D
+    tensor of shape ``[B, U, K]`` of absolute indices into the label part.
+    """
+
+    def __init__(
+        self,
+        num_durations: int,
+        maxK: int,
+        minibatch: int,
+        maxT: int,
+        maxU: int,
+        alphabet_size: int,
+        workspace,
+        tdt_workspace,
+        blank: int,
+        clamp: float,
+        num_threads: int,
+        stream,
+    ):
+        super().__init__(
+            sigma=0.0,
+            omega=0.0,
+            num_durations=num_durations,
+            minibatch=minibatch,
+            maxT=maxT,
+            maxU=maxU,
+            alphabet_size=alphabet_size,
+            workspace=workspace,
+            tdt_workspace=tdt_workspace,
+            blank=blank,
+            fastemit_lambda=0.0,
+            clamp=clamp,
+            num_threads=num_threads,
+            stream=stream,
+        )
+        self.maxK_ = maxK
+
+    def compute_cost_and_score(
+        self,
+        label_acts: torch.Tensor,
+        duration_acts: torch.Tensor,
+        label_grads: Optional[torch.Tensor],
+        duration_grads: Optional[torch.Tensor],
+        costs: torch.Tensor,
+        labels: torch.Tensor,
+        label_lengths: torch.Tensor,
+        input_lengths: torch.Tensor,
+    ) -> global_constants.RNNTStatus:
+        training = label_grads is not None
+
+        if training:
+            label_grads *= 0.0
+            duration_grads *= 0.0
+
+        _, (denom, alphas, betas, llForward, llBackward, durations) = self._prepare_workspace()
+
+        # `label_acts` are already per-stream log-probs, so the multistream kernels
+        # never read `denom` (no internal log_softmax). The workspace is allocated
+        # with torch.zeros, so no explicit zeroing is required.
+
+        gpu_rnnt_kernel.multistream_tdt_compute_alphas_kernel[self.minibatch_, self.maxU_, self.stream_, 0](
+            label_acts,
+            duration_acts,
+            alphas,
+            llForward,
+            input_lengths,
+            label_lengths,
+            labels,
+            self.minibatch_,
+            self.maxT_,
+            self.maxU_,
+            self.maxK_,
+            self.alphabet_size_,
+            self.blank_,
+            durations,
+            self.num_durations,
+        )
+
+        if training:
+            gpu_rnnt_kernel.multistream_tdt_compute_betas_kernel[self.minibatch_, self.maxU_, self.stream_, 0](
+                label_acts,
+                duration_acts,
+                betas,
+                llBackward,
+                input_lengths,
+                label_lengths,
+                labels,
+                self.minibatch_,
+                self.maxT_,
+                self.maxU_,
+                self.maxK_,
+                self.alphabet_size_,
+                self.blank_,
+                durations,
+                self.num_durations,
+            )
+
+            grad_blocks_per_grid = self.minibatch_ * self.maxT_ * self.maxU_
+            grad_threads_per_block = gpu_rnnt_kernel.GPU_RNNT_THREAD_SIZE
+            gpu_rnnt_kernel.multistream_tdt_compute_grad_kernel[
+                grad_blocks_per_grid, grad_threads_per_block, self.stream_, 0
+            ](
+                label_grads,
+                duration_grads,
+                label_acts,
+                duration_acts,
+                alphas,
+                betas,
+                llForward,
+                input_lengths,
+                label_lengths,
+                labels,
+                self.minibatch_,
+                self.maxT_,
+                self.maxU_,
+                self.maxK_,
+                self.alphabet_size_,
+                self.blank_,
+                durations,
+                self.num_durations,
+                self.clamp_,
+            )
+
+        threadsperblock = min(costs.shape[0], 32)
+        blockspergrid = (costs.shape[0] + (threadsperblock - 1)) // threadsperblock
+        rnnt_helper.compute_costs_data[blockspergrid, threadsperblock, self.stream_, 0](
+            llForward, costs, self.fastemit_lambda_
+        )
+        self.stream_.synchronize()
+
+        return global_constants.RNNTStatus.RNNT_STATUS_SUCCESS

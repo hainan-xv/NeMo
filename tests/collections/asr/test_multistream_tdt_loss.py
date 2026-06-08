@@ -14,17 +14,19 @@
 
 """Gradient-correctness tests for the multistream TDT loss.
 
-The multistream TDT loss has two implementations:
+The multistream TDT loss has three implementations:
 
 * :class:`MultistreamTDTLossPytorch` - fully differentiable; its gradient comes
   from autograd. Used here as the ground truth.
-* :class:`MultistreamTDTLoss` - same math but with an explicit analytic
-  forward-backward (custom ``autograd.Function``). This is what we validate.
+* :class:`MultistreamTDTLoss` - on CPU uses an explicit analytic forward-backward
+  (custom ``autograd.Function``); on CUDA it dispatches to the fused Numba kernels
+  (:class:`MultistreamTDTLossNumba`). Both consume already-normalized log-probs.
+* :class:`MultistreamTDTLossNumba` - the CUDA/Numba kernels (tested directly on GPU).
 
-These tests assert that (a) the analytic loss values match the differentiable
-reference, (b) the analytic gradient matches the autograd gradient of the
-reference, and (c) the custom backward passes ``torch.autograd.gradcheck``
-(i.e. matches numerical finite differences).
+These tests assert that (a) the loss values match the differentiable reference,
+(b) the gradient matches the autograd gradient of the reference, (c) the CPU
+custom backward passes ``torch.autograd.gradcheck``, and (d) on GPU the Numba
+kernels match the reference for both loss and gradient (float64 and float32).
 """
 
 import numpy as np
@@ -146,6 +148,46 @@ class TestMultistreamTDTLoss:
             return analytic(a, labels, act_lens, label_lens)
 
         assert torch.autograd.gradcheck(fn, (acts,), eps=1e-6, atol=1e-4, rtol=1e-3, raise_exception=True)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Numba multistream-TDT kernels require CUDA.")
+class TestMultistreamTDTLossNumba:
+    """Validate the fused Numba CUDA kernels against the differentiable reference."""
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("sigma", [0.0, 0.05])
+    @pytest.mark.parametrize("dtype", [torch.float64, torch.float32])
+    def test_numba_matches_reference(self, sigma, dtype):
+        from nemo.collections.asr.parts.numba.rnnt_loss.rnnt_pytorch import MultistreamTDTLossNumba
+
+        acts, labels, act_lens, label_lens, durations, dividers, blank = _build_inputs('cuda', dtype=dtype)
+
+        atol = 1e-5 if dtype == torch.float64 else 2e-3
+        rtol = 1e-5 if dtype == torch.float64 else 2e-3
+
+        # reference (autograd) gradient
+        acts_ref = acts.clone().detach().requires_grad_(True)
+        ref = MultistreamTDTLossPytorch(
+            blank=blank, durations=durations, dividers=dividers, reduction='sum', sigma=sigma
+        )
+        loss_ref = ref(acts_ref, labels, act_lens, label_lens)
+        loss_ref.backward()
+
+        # numba kernel gradient
+        acts_nb = acts.clone().detach().requires_grad_(True)
+        numba_loss = MultistreamTDTLossNumba(
+            blank=blank, durations=durations, dividers=dividers, reduction='sum', sigma=sigma
+        )
+        loss_nb = numba_loss(acts_nb, labels, act_lens, label_lens)
+        loss_nb.backward()
+
+        assert torch.allclose(loss_ref.float(), loss_nb.float().view_as(loss_ref), atol=atol, rtol=rtol), (
+            loss_ref.item(),
+            loss_nb.item(),
+        )
+        assert torch.allclose(acts_ref.grad.float(), acts_nb.grad.float(), atol=atol, rtol=rtol), (
+            (acts_ref.grad - acts_nb.grad).abs().max().item()
+        )
 
 
 if __name__ == "__main__":
