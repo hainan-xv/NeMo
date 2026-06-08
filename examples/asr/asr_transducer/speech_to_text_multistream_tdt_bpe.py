@@ -45,8 +45,10 @@ from nemo.utils import logging
 from nemo.utils.exp_manager import exp_manager
 from nemo.utils.trainer_utils import resolve_trainer_cfg
 
-# architecture sub-configs copied verbatim from the base model
-_ARCH_KEYS = ["preprocessor", "encoder", "decoder", "joint", "spec_augment", "model_defaults"]
+# architecture sub-configs copied verbatim from the base model. `decoding` is
+# also copied so the base RNN-T __init__ can build its (unused) decoding object;
+# our model drives WER via its own greedy multistream decoder instead.
+_ARCH_KEYS = ["preprocessor", "encoder", "decoder", "joint", "spec_augment", "model_defaults", "decoding"]
 
 
 def _load_base_model(cfg):
