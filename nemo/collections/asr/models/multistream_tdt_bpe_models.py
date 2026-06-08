@@ -210,7 +210,8 @@ class EncDecMultiStreamTDTBPEModel(EncDecRNNTBPEModel):
         if (self.trainer.global_step + 1) % log_every_n_steps == 0:
             hyps = self._decode_hyp_texts(encoded, encoded_len)
             refs = self._ref_texts(transcript, transcript_len)
-            tensorboard_logs['training_batch_wer'] = word_error_rate(hyps, refs, use_cer=self.use_cer)
+            wer = word_error_rate(hyps, refs, use_cer=self.use_cer)
+            tensorboard_logs['training_batch_wer'] = torch.tensor(wer, device=self.device, dtype=torch.float32)
 
         self.log_dict(tensorboard_logs)
         return {'loss': loss_value}
@@ -248,7 +249,10 @@ class EncDecMultiStreamTDTBPEModel(EncDecRNNTBPEModel):
             hyps.extend(x.get(f'{prefix}_hyps', []))
             refs.extend(x.get(f'{prefix}_refs', []))
         if refs:
-            logs[f'{prefix}_wer'] = torch.tensor(word_error_rate(hyps, refs, use_cer=self.use_cer))
+            # Must be on the model device: logged metrics are DDP all-reduced over
+            # the NCCL (GPU) backend, which cannot sync CPU tensors.
+            wer = word_error_rate(hyps, refs, use_cer=self.use_cer)
+            logs[f'{prefix}_wer'] = torch.tensor(wer, device=self.device, dtype=torch.float32)
         return logs
 
     def multi_validation_epoch_end(self, outputs, dataloader_idx: int = 0):
