@@ -13,7 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List
+import math
+from typing import List, Optional, Sequence
 
 import torch
 
@@ -372,3 +373,401 @@ class MultiblankRNNTLossPytorch(Loss):
         log_prob = torch.stack(log_probs)
 
         return log_prob, log_alpha
+
+
+# ============================================================================
+# Multistream TDT loss
+# ============================================================================
+#
+# This combines two ideas:
+#   1. TDT (Token-and-Duration Transducer, https://arxiv.org/pdf/2304.06795.pdf),
+#      which augments the transducer with an explicit duration distribution so a
+#      single step may advance the acoustic frame index by one of several
+#      durations.
+#   2. The "multistream" transducer factorization, in which a single emitted
+#      token is decomposed into K parallel sub-labels (streams). Typical use:
+#      treat punctuation / capitalization as independent "modifier" streams on
+#      top of a canonical (lowercased, de-punctuated) sub-word stream. The joint
+#      output vocabulary is partitioned into contiguous stream slices via
+#      `dividers`, each slice is independently log-softmaxed, and the probability
+#      of emitting a token factorizes as the product of the per-stream
+#      probabilities (sum of per-stream log-probs).
+#
+# Layout of the joint activation tensor `acts` (shape [B, T, U, D]):
+#   * label part : acts[..., : dividers[-1]]  (= acts[..., : -n_durations])
+#       - partitioned into streams [dividers[i] : dividers[i+1])
+#       - `blank` is the very last label index, i.e. dividers[-1] == blank + 1
+#   * duration part : acts[..., -n_durations:]  (one logit per duration)
+#
+# Targets `labels` have shape [B, U, K] (K = number of streams): for each label
+# position u, the K absolute vocabulary indices (one per stream) that are emitted
+# jointly at that step.
+#
+# The transducer lattice is the ordinary TDT lattice over (t, u); only the
+# non-blank emission score changes from a single log-prob lookup to the sum of
+# the K stream log-probs.
+
+NEG_INF = -1e30
+
+
+def _lse(terms: List[float]) -> float:
+    """logsumexp over a python list of floats, computed in float64 for accuracy."""
+    if len(terms) == 0:
+        return NEG_INF
+    return float(torch.logsumexp(torch.tensor(terms, dtype=torch.float64), dim=0))
+
+
+@torch.no_grad()
+def multistream_tdt_alpha_beta_grad(
+    label_logp: torch.Tensor,
+    dur_logp: torch.Tensor,
+    labels: torch.Tensor,
+    act_lens: torch.Tensor,
+    label_lens: torch.Tensor,
+    durations: Sequence[int],
+    blank: int,
+):
+    """Reference forward-backward for the multistream TDT loss.
+
+    Operates on already-normalized log-probabilities and returns the per-sample
+    negative log-likelihood together with the analytic gradients w.r.t. the
+    log-prob tensors (i.e. ``d(-logP)/d(label_logp)`` and
+    ``d(-logP)/d(dur_logp)``). This is the algorithmic reference a CUDA kernel
+    would mirror, and is used to validate gradients against autograd.
+
+    Args:
+        label_logp: [B, T, U, V] per-stream log-softmaxed label log-probs
+            (blank is index ``blank``).
+        dur_logp: [B, T, U, n_durations] log-softmaxed duration log-probs.
+        labels: [B, U, K] target indices (K parallel stream labels per position).
+        act_lens: [B] acoustic lengths.
+        label_lens: [B] label lengths.
+        durations: list of integer durations (may include 0 for label emission).
+        blank: blank index inside the label part.
+
+    Returns:
+        costs: [B] tensor of ``-logP`` (same dtype/device as ``label_logp``).
+        grad_label_logp: [B, T, U, V] gradient of ``-logP`` w.r.t. ``label_logp``.
+        grad_dur_logp: [B, T, U, n_durations] gradient w.r.t. ``dur_logp``.
+    """
+    B = label_logp.shape[0]
+    K = labels.shape[-1]
+    device = label_logp.device
+    dtype = label_logp.dtype
+
+    grad_label = torch.zeros_like(label_logp)
+    grad_dur = torch.zeros_like(dur_logp)
+    costs = torch.zeros(B, device=device, dtype=dtype)
+
+    for b in range(B):
+        Tb = int(act_lens[b])
+        L = int(label_lens[b])
+
+        def emis(t, u):
+            s = 0.0
+            for k in range(K):
+                s += float(label_logp[b, t, u, int(labels[b, u, k])])
+            return s
+
+        def lblank(t, u):
+            return float(label_logp[b, t, u, blank])
+
+        def dlp(t, u, n):
+            return float(dur_logp[b, t, u, n])
+
+        # ---------------- alpha (forward) ----------------
+        alpha = [[NEG_INF] * (L + 1) for _ in range(Tb)]
+        alpha[0][0] = 0.0
+        for t in range(Tb):
+            for u in range(L + 1):
+                if t == 0 and u == 0:
+                    continue
+                terms = []
+                for n, l in enumerate(durations):
+                    # blank arc into (t, u): from (t - l, u), only for l > 0
+                    if l > 0 and t - l >= 0:
+                        terms.append(alpha[t - l][u] + lblank(t - l, u) + dlp(t - l, u, n))
+                    # label arc into (t, u): from (t - l, u - 1), any duration
+                    if u > 0 and t - l >= 0:
+                        terms.append(alpha[t - l][u - 1] + emis(t - l, u - 1) + dlp(t - l, u - 1, n))
+                alpha[t][u] = _lse(terms)
+
+        fin = []
+        for n, l in enumerate(durations):
+            if l > 0 and Tb - l >= 0:
+                fin.append(alpha[Tb - l][L] + lblank(Tb - l, L) + dlp(Tb - l, L, n))
+        logP = _lse(fin)
+        costs[b] = -logP
+
+        # ---------------- beta (backward) ----------------
+        beta = [[NEG_INF] * (L + 1) for _ in range(Tb)]
+        for t in range(Tb - 1, -1, -1):
+            for u in range(L, -1, -1):
+                terms = []
+                for n, l in enumerate(durations):
+                    if l > 0:
+                        if t + l == Tb and u == L:
+                            # terminal blank arc reaching exactly T at u == L
+                            terms.append(lblank(t, L) + dlp(t, L, n))
+                        elif t + l <= Tb - 1 and beta[t + l][u] > NEG_INF:
+                            terms.append(lblank(t, u) + dlp(t, u, n) + beta[t + l][u])
+                    if u < L and t + l <= Tb - 1 and beta[t + l][u + 1] > NEG_INF:
+                        terms.append(emis(t, u) + dlp(t, u, n) + beta[t + l][u + 1])
+                beta[t][u] = _lse(terms)
+
+        # ---------------- gradients (arc posteriors) ----------------
+        # d(-logP)/d(score of arc) = -exp(alpha[src] + score + beta[dst] - logP)
+        for t in range(Tb):
+            for u in range(L + 1):
+                a_src = alpha[t][u]
+                if a_src <= NEG_INF:
+                    continue
+                for n, l in enumerate(durations):
+                    # blank arc
+                    if l > 0:
+                        valid = False
+                        if t + l == Tb and u == L:
+                            score = lblank(t, L) + dlp(t, L, n)
+                            bdst = 0.0
+                            valid = True
+                        elif t + l <= Tb - 1 and beta[t + l][u] > NEG_INF:
+                            score = lblank(t, u) + dlp(t, u, n)
+                            bdst = beta[t + l][u]
+                            valid = True
+                        if valid:
+                            post = math.exp(a_src + score + bdst - logP)
+                            grad_label[b, t, u, blank] -= post
+                            grad_dur[b, t, u, n] -= post
+                    # label arc
+                    if u < L and t + l <= Tb - 1 and beta[t + l][u + 1] > NEG_INF:
+                        score = emis(t, u) + dlp(t, u, n)
+                        bdst = beta[t + l][u + 1]
+                        post = math.exp(a_src + score + bdst - logP)
+                        for k in range(K):
+                            grad_label[b, t, u, int(labels[b, u, k])] -= post
+                        grad_dur[b, t, u, n] -= post
+
+    return costs, grad_label, grad_dur
+
+
+def _split_multistream_tdt_acts(acts, dividers, sigma, durations):
+    """Split raw joint acts into per-stream label log-probs and duration log-probs.
+
+    Returns (label_logp, dur_logp, label_softmax, dur_softmax) where the softmax
+    tensors are kept so the analytic path can backprop through the log-softmax.
+    """
+    n_dur = len(durations)
+    label_acts = acts[..., :-n_dur]
+    dur_acts = acts[..., -n_dur:]
+
+    label_logp = torch.empty_like(label_acts)
+    label_p = torch.empty_like(label_acts)
+    for i in range(len(dividers) - 1):
+        sl = slice(dividers[i], dividers[i + 1])
+        lp = torch.log_softmax(label_acts[..., sl], dim=-1)
+        label_logp[..., sl] = lp - sigma
+        label_p[..., sl] = lp.exp()
+
+    dur_logp = torch.log_softmax(dur_acts, dim=-1)
+    dur_p = dur_logp.exp()
+    return label_logp, dur_logp, label_p, dur_p
+
+
+class MultistreamTDTLossPytorch(Loss):
+    """Pure-PyTorch, fully differentiable reference for the multistream TDT loss.
+
+    The forward pass is written entirely with autograd-friendly ops, so the
+    gradient is obtained by autograd. This serves both as a usable (slow)
+    reference loss and as the ground truth in the gradient correctness test.
+    """
+
+    @property
+    def input_types(self):
+        return {
+            "acts": NeuralType(('B', 'T', 'T', 'D'), LogprobsType()),
+            "labels": NeuralType(('B', 'T', 'D'), LabelsType()),
+            "act_lens": NeuralType(tuple('B'), LengthsType()),
+            "label_lens": NeuralType(tuple('B'), LengthsType()),
+        }
+
+    @property
+    def output_types(self):
+        return {"loss": NeuralType(elements_type=LossType())}
+
+    def __init__(
+        self,
+        blank: int,
+        durations: List[int] = [],
+        dividers: Optional[List[int]] = None,
+        reduction: str = 'sum',
+        sigma: float = 0.0,
+    ):
+        super().__init__()
+        if dividers is None or len(dividers) < 2:
+            raise ValueError("`dividers` must be a list with at least 2 entries marking the stream boundaries.")
+        if dividers[-1] != blank + 1:
+            raise ValueError(f"Expected dividers[-1] ({dividers[-1]}) == blank + 1 ({blank + 1}).")
+        self.blank = blank
+        self.durations = list(durations)
+        self.n_durations = len(durations)
+        self.dividers = list(dividers)
+        self.reduction = reduction
+        self.sigma = sigma
+
+    def _reduce(self, losses, label_lens):
+        if self.reduction == 'mean_batch':
+            return losses.mean()
+        elif self.reduction == 'mean':
+            return torch.div(losses, label_lens).mean()
+        elif self.reduction == 'sum':
+            return losses.sum()
+        elif self.reduction == 'mean_volume':
+            return losses.sum() / label_lens.sum()
+        return losses  # 'none'
+
+    def forward(self, acts, labels, act_lens, label_lens):
+        if not acts.is_cuda and acts.dtype == torch.float16:
+            acts = acts.float()
+
+        n_dur = self.n_durations
+        label_acts = acts[..., :-n_dur]
+        dur_acts = acts[..., -n_dur:]
+
+        parts = []
+        for i in range(len(self.dividers) - 1):
+            parts.append(torch.log_softmax(label_acts[..., self.dividers[i] : self.dividers[i + 1]], dim=-1) - self.sigma)
+        label_logp = torch.cat(parts, dim=-1)
+        dur_logp = torch.log_softmax(dur_acts, dim=-1)
+
+        forward_logprob = self.compute_forward_prob(label_logp, dur_logp, labels, act_lens, label_lens)
+        losses = -forward_logprob
+        return self._reduce(losses, label_lens)
+
+    def compute_forward_prob(self, label_logp, dur_logp, labels, act_lens, label_lens):
+        """Differentiable forward (alpha) recursion returning [B] log-probabilities."""
+        B = label_logp.shape[0]
+        device = label_logp.device
+        dtype = label_logp.dtype
+        neg = torch.tensor(NEG_INF, device=device, dtype=dtype)
+
+        out = []
+        for b in range(B):
+            Tb = int(act_lens[b])
+            L = int(label_lens[b])
+            alpha = [[neg for _ in range(L + 1)] for _ in range(Tb)]
+            alpha[0][0] = torch.zeros((), device=device, dtype=dtype)
+            for t in range(Tb):
+                for u in range(L + 1):
+                    if t == 0 and u == 0:
+                        continue
+                    terms = []
+                    for n, l in enumerate(self.durations):
+                        if l > 0 and t - l >= 0:
+                            terms.append(alpha[t - l][u] + label_logp[b, t - l, u, self.blank] + dur_logp[b, t - l, u, n])
+                        if u > 0 and t - l >= 0:
+                            emis = label_logp[b, t - l, u - 1, labels[b, u - 1]].sum()
+                            terms.append(alpha[t - l][u - 1] + emis + dur_logp[b, t - l, u - 1, n])
+                    if terms:
+                        alpha[t][u] = torch.logsumexp(torch.stack(terms), dim=0)
+            fin = []
+            for n, l in enumerate(self.durations):
+                if l > 0 and Tb - l >= 0:
+                    fin.append(alpha[Tb - l][L] + label_logp[b, Tb - l, L, self.blank] + dur_logp[b, Tb - l, L, n])
+            out.append(torch.logsumexp(torch.stack(fin), dim=0))
+        return torch.stack(out)
+
+
+class _MultistreamTDTLossFunction(torch.autograd.Function):
+    """autograd.Function with an explicit (analytic) backward for multistream TDT.
+
+    Computes the loss and the analytic gradient w.r.t. the raw joint `acts` via
+    the alpha/beta forward-backward plus the log-softmax Jacobian. The custom
+    backward exists precisely so it can be validated against autograd.
+    """
+
+    @staticmethod
+    def forward(ctx, acts, labels, act_lens, label_lens, blank, durations, dividers, sigma):
+        label_logp, dur_logp, label_p, dur_p = _split_multistream_tdt_acts(acts, dividers, sigma, durations)
+
+        costs, g_label_logp, g_dur_logp = multistream_tdt_alpha_beta_grad(
+            label_logp, dur_logp, labels, act_lens, label_lens, durations, blank
+        )
+
+        # Backprop through per-stream log-softmax (label) and duration log-softmax.
+        # For y = log_softmax(x): dL/dx = dL/dy - softmax(x) * sum(dL/dy).
+        g_label_acts = torch.empty_like(label_p)
+        for i in range(len(dividers) - 1):
+            sl = slice(dividers[i], dividers[i + 1])
+            g = g_label_logp[..., sl]
+            g_label_acts[..., sl] = g - label_p[..., sl] * g.sum(dim=-1, keepdim=True)
+        g_dur_acts = g_dur_logp - dur_p * g_dur_logp.sum(dim=-1, keepdim=True)
+
+        grad_acts = torch.cat([g_label_acts, g_dur_acts], dim=-1)
+        ctx.save_for_backward(grad_acts)
+        return costs
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (grad_acts,) = ctx.saved_tensors
+        grad = grad_acts * grad_output.view(-1, 1, 1, 1).to(grad_acts)
+        return grad, None, None, None, None, None, None, None
+
+
+class MultistreamTDTLoss(Loss):
+    """Multistream TDT loss with an analytic (custom) gradient.
+
+    Same math as :class:`MultistreamTDTLossPytorch`, but the gradient is computed
+    by an explicit forward-backward instead of autograd. This is the reference
+    for a future fused/CUDA implementation and is what gets validated against the
+    differentiable reference / autograd.
+    """
+
+    @property
+    def input_types(self):
+        return {
+            "acts": NeuralType(('B', 'T', 'T', 'D'), LogprobsType()),
+            "labels": NeuralType(('B', 'T', 'D'), LabelsType()),
+            "act_lens": NeuralType(tuple('B'), LengthsType()),
+            "label_lens": NeuralType(tuple('B'), LengthsType()),
+        }
+
+    @property
+    def output_types(self):
+        return {"loss": NeuralType(elements_type=LossType())}
+
+    def __init__(
+        self,
+        blank: int,
+        durations: List[int] = [],
+        dividers: Optional[List[int]] = None,
+        reduction: str = 'sum',
+        sigma: float = 0.0,
+    ):
+        super().__init__()
+        if dividers is None or len(dividers) < 2:
+            raise ValueError("`dividers` must be a list with at least 2 entries marking the stream boundaries.")
+        if dividers[-1] != blank + 1:
+            raise ValueError(f"Expected dividers[-1] ({dividers[-1]}) == blank + 1 ({blank + 1}).")
+        self.blank = blank
+        self.durations = tuple(durations)
+        self.dividers = tuple(dividers)
+        self.reduction = reduction
+        self.sigma = float(sigma)
+
+    def forward(self, acts, labels, act_lens, label_lens):
+        if not acts.is_cuda and acts.dtype == torch.float16:
+            acts = acts.float()
+
+        losses = _MultistreamTDTLossFunction.apply(
+            acts, labels, act_lens, label_lens, self.blank, self.durations, self.dividers, self.sigma
+        )
+
+        if self.reduction == 'mean_batch':
+            return losses.mean()
+        elif self.reduction == 'mean':
+            return torch.div(losses, label_lens).mean()
+        elif self.reduction == 'sum':
+            return losses.sum()
+        elif self.reduction == 'mean_volume':
+            return losses.sum() / label_lens.sum()
+        return losses  # 'none'

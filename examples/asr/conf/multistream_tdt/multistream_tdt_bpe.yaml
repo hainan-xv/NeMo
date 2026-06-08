@@ -1,0 +1,94 @@
+# 2-stream (spelling + capitalization) TDT BPE model.
+#
+# Architecture (preprocessor/encoder/decoder/joint/spec_augment/model_defaults/
+# loss) and the BPE tokenizer are derived AT RUNTIME from a base TDT model
+# (base_model_path / base_model_name) by the entrypoint
+# examples/asr/asr_transducer/speech_to_text_multistream_tdt_bpe.py.
+# This file therefore only specifies data, optimization, trainer and exp_manager.
+
+name: "MultiStreamTDT-BPE"
+
+# Base TDT model to derive architecture + tokenizer from, and to warm-start the
+# encoder from. Provide a local .nemo (preferred on clusters) or a pretrained name.
+base_model_path: null            # e.g. /pretrained/parakeet-tdt-0.6b-v2.nemo
+base_model_name: "nvidia/parakeet-tdt-0.6b-v2"
+init_encoder_from_base: true     # encoder-only warm start
+tokenizer_out_dir: null          # where to export the base tokenizer (default: temp dir)
+
+model:
+  sample_rate: 16000
+  log_prediction: false
+  compute_eval_loss: true
+  rnnt_reduction: mean_batch
+  use_cer: false
+  max_symbols_per_step: 10       # greedy (non-batched) decoding symbol cap per frame
+
+  # multistream knobs (architecture comes from the base model at runtime)
+  model_defaults:
+    num_cap: 4                   # ALL_LOWER / ALL_UPPER / FIRST_UPPER / OTHER
+    tdt_durations: null          # null => inherit base model's TDT durations
+
+  train_ds:
+    manifest_filepath: null
+    sample_rate: ${model.sample_rate}
+    batch_size: 16
+    shuffle: true
+    num_workers: 8
+    pin_memory: true
+    max_duration: 40.0
+    min_duration: 0.1
+    # lhotse fields are typically set from the launch script (use_lhotse, input_cfg, bucketing)
+
+  validation_ds:
+    manifest_filepath: null
+    sample_rate: ${model.sample_rate}
+    batch_size: 16
+    shuffle: false
+    num_workers: 4
+    pin_memory: true
+
+  test_ds:
+    manifest_filepath: null
+    sample_rate: ${model.sample_rate}
+    batch_size: 16
+    shuffle: false
+    num_workers: 4
+
+  optim:
+    name: adamw
+    lr: 1e-4
+    betas: [0.9, 0.98]
+    weight_decay: 1e-3
+    sched:
+      name: CosineAnnealing
+      warmup_steps: 5000
+      min_lr: 1e-6
+
+trainer:
+  devices: -1
+  num_nodes: 1
+  max_steps: 100000
+  max_epochs: -1
+  accelerator: gpu
+  strategy: ddp
+  precision: bf16
+  log_every_n_steps: 10
+  val_check_interval: 2000
+  enable_checkpointing: false
+  logger: false
+  benchmark: false
+  use_distributed_sampler: false
+
+exp_manager:
+  exp_dir: null
+  name: ${name}
+  create_tensorboard_logger: true
+  create_checkpoint_callback: true
+  checkpoint_callback_params:
+    monitor: "val_wer"
+    mode: "min"
+    save_top_k: 3
+    always_save_nemo: true
+  resume_if_exists: true
+  resume_ignore_no_checkpoint: true
+  create_wandb_logger: false

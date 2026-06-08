@@ -1,0 +1,268 @@
+# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""2-stream (spelling + capitalization) TDT BPE model.
+
+This model factorizes the transducer output into two label streams that are
+emitted jointly at every step, on top of the standard TDT duration stream:
+
+* **spelling**       - a lowercased BPE sub-word (this stream owns the blank).
+* **capitalization** - a per-token casing class (see
+  :mod:`nemo.collections.asr.parts.utils.multistream_factorization`).
+
+Design (see the linked module for details):
+
+* The data pipeline carries a single *product-space* id ``cap*V_spell + spell``
+  via :class:`MultiStreamCapTokenizer`; no dataset changes are required.
+* The **prediction network is standard** and consumes only the spelling id
+  (``combined % V_spell``). The capitalization label is a side output predicted
+  by the joint and is *not* fed back to the prediction network.
+* The **joint** output is laid out (sum space) as
+  ``[ cap(V_cap) | spell(V_spell) | blank | durations ]`` so that
+  ``MultistreamTDTLoss`` sees the canonical layout (contiguous label streams,
+  shared blank as the last label index, durations last).
+
+Initialization: the encoder is intended to be warm-started from a pretrained
+TDT model (e.g. ``nvidia/parakeet-tdt-0.6b-v2``) via ``init_from_pretrained_model``
+with an ``include: ['encoder.']`` filter; the prediction network, joint and the
+capitalization stream are trained from scratch.
+
+NOTE: greedy decoding / WER for the factorized output is not wired yet - this
+first cut focuses on a correct training (forward + loss) path. Validation
+therefore monitors ``val_loss`` (configure ``exp_manager`` accordingly).
+"""
+
+import copy
+from typing import Optional
+
+import torch
+from omegaconf import DictConfig, ListConfig, open_dict
+from pytorch_lightning import Trainer
+
+from nemo.collections.asr.losses.rnnt_pytorch import MultistreamTDTLoss
+from nemo.collections.asr.metrics.wer import word_error_rate
+from nemo.collections.asr.models.rnnt_bpe_models import EncDecRNNTBPEModel
+from nemo.collections.asr.parts.submodules.multistream_tdt_greedy_decoding import GreedyMultiStreamTDTInfer
+from nemo.collections.asr.parts.utils.multistream_cap_tokenizer import MultiStreamCapTokenizer
+from nemo.collections.asr.parts.utils.multistream_factorization import NUM_CAP, multistream_tdt_dividers
+from nemo.core.classes.common import PretrainedModelInfo
+from nemo.utils import logging
+
+try:
+    from nemo.collections.asr.data.audio_to_text_dali import DALIOutputs
+
+    HAVE_DALI = True
+except (ImportError, ModuleNotFoundError):
+    HAVE_DALI = False
+
+
+class EncDecMultiStreamTDTBPEModel(EncDecRNNTBPEModel):
+    """Encoder-Decoder 2-stream (spelling + capitalization) TDT model with BPE tokenization."""
+
+    def _setup_tokenizer(self, tokenizer_cfg: DictConfig):
+        # Build the standard BPE tokenizer first, then wrap it so the data
+        # pipeline emits product-space (spelling x capitalization) ids.
+        super()._setup_tokenizer(tokenizer_cfg)
+        # `_setup_tokenizer` runs inside super().__init__ before self._cfg exists,
+        # so read num_cap from the value stashed at the top of __init__.
+        num_cap = getattr(self, '_ms_num_cap', NUM_CAP)
+        self.tokenizer = MultiStreamCapTokenizer(self.tokenizer, num_cap=num_cap)
+
+    def __init__(self, cfg: DictConfig, trainer: Trainer = None):
+        # Stash multistream settings before super() (which calls _setup_tokenizer).
+        self._ms_num_cap = int(cfg.model_defaults.get('num_cap', NUM_CAP))
+        self._ms_durations = list(cfg.model_defaults.tdt_durations)
+
+        # super() builds: encoder, prediction net (vocab = V_spell, correct),
+        # joint (num_classes = V_spell, to be rebuilt), and a placeholder loss.
+        super().__init__(cfg=cfg, trainer=trainer)
+
+        self.num_spell = self.tokenizer.num_spell
+        self.num_cap = self.tokenizer.num_cap
+        self.durations = self._ms_durations
+        n_dur = len(self.durations)
+
+        self.dividers, self.ms_blank = multistream_tdt_dividers(self.num_spell, self.num_cap)
+
+        # ----- rebuild the joint with the sum-space layout -----
+        # [ cap(V_cap) | spell(V_spell) | blank | durations(n_dur) ]
+        joint_cfg = copy.deepcopy(self.joint.to_config_dict())
+        spell_vocab = [self.tokenizer.base.ids_to_tokens([i])[0] for i in range(self.num_spell)]
+        cap_vocab = [f'<cap{i}>' for i in range(self.num_cap)]
+        joint_cfg['num_classes'] = self.num_cap + self.num_spell
+        joint_cfg['num_extra_outputs'] = n_dur
+        joint_cfg['vocabulary'] = ListConfig(cap_vocab + spell_vocab)
+        del self.joint
+        self.joint = EncDecMultiStreamTDTBPEModel.from_config_dict(joint_cfg)
+        self.joint._fuse_loss_wer = False  # we drive loss explicitly
+
+        # ----- multistream TDT loss -----
+        del self.loss
+        self.loss = MultistreamTDTLoss(
+            blank=self.ms_blank,
+            durations=self.durations,
+            dividers=self.dividers,
+            reduction=self.cfg.get("rnnt_reduction", "mean_batch"),
+            sigma=float(self.cfg.get("model_defaults", {}).get("tdt_sigma", 0.0)),
+        )
+
+        # keep cfg in sync
+        with open_dict(self.cfg.joint):
+            self.cfg.joint = joint_cfg
+
+        self.compute_eval_loss = self.cfg.get('compute_eval_loss', True)
+
+        # ----- greedy (non-batched) decoder for train/val WER -----
+        self.max_symbols_per_step = int(self.cfg.get('max_symbols_per_step', 10))
+        self.ms_greedy = GreedyMultiStreamTDTInfer(
+            decoder_model=self.decoder,
+            joint_model=self.joint,
+            blank_index=self.ms_blank,
+            durations=self.durations,
+            num_cap=self.num_cap,
+            num_spell=self.num_spell,
+            max_symbols_per_step=self.max_symbols_per_step,
+        )
+        self.use_cer = self.cfg.get('use_cer', False)
+
+        logging.info(
+            "Initialized EncDecMultiStreamTDTBPEModel: "
+            f"V_spell={self.num_spell}, V_cap={self.num_cap}, durations={self.durations}, "
+            f"joint dim={self.joint.num_classes_with_blank} (blank={self.ms_blank}), dividers={self.dividers}"
+        )
+
+    # ------------------------------------------------------------------ #
+    # factorization helpers
+    # ------------------------------------------------------------------ #
+    def _split_combined(self, transcript: torch.Tensor):
+        """[B, U] product ids -> (spell_ids [B, U], cap_ids [B, U])."""
+        spell = transcript % self.num_spell
+        cap = transcript // self.num_spell
+        return spell, cap
+
+    def _factorized_targets(self, spell: torch.Tensor, cap: torch.Tensor) -> torch.Tensor:
+        """-> [B, U, 2] absolute indices into the joint label part: [cap, spell+V_cap]."""
+        return torch.stack([cap, spell + self.num_cap], dim=-1)
+
+    # ------------------------------------------------------------------ #
+    # decoding -> text (for WER)
+    # ------------------------------------------------------------------ #
+    @torch.no_grad()
+    def _decode_hyp_texts(self, encoded: torch.Tensor, encoded_len: torch.Tensor):
+        """Greedy-decode an encoder batch into a list of cased hypothesis strings."""
+        hypotheses = self.ms_greedy(encoder_output=encoded, encoded_lengths=encoded_len)[0]
+        texts = []
+        for hyp in hypotheses:
+            seq = hyp.y_sequence
+            if isinstance(seq, torch.Tensor):
+                seq = seq.tolist()
+            texts.append(self.tokenizer.ids_to_text([int(x) for x in seq]))
+        return texts
+
+    def _ref_texts(self, transcript: torch.Tensor, transcript_len: torch.Tensor):
+        """Convert (padded) product-id targets into cased reference strings."""
+        refs = []
+        for b in range(transcript.size(0)):
+            n = int(transcript_len[b])
+            seq = transcript[b, :n].tolist()
+            refs.append(self.tokenizer.ids_to_text([int(x) for x in seq]))
+        return refs
+
+    # ------------------------------------------------------------------ #
+    # PTL steps
+    # ------------------------------------------------------------------ #
+    def training_step(self, batch, batch_nb):
+        signal, signal_len, transcript, transcript_len = batch
+
+        if HAVE_DALI and isinstance(batch, DALIOutputs) and batch.has_processed_signal:
+            encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
+        else:
+            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
+        del signal
+
+        spell, cap = self._split_combined(transcript)
+        # Prediction network sees the spelling stream only.
+        decoder, target_length, states = self.decoder(targets=spell, target_length=transcript_len)
+        joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder)
+
+        targets = self._factorized_targets(spell, cap)
+        loss_value = self.loss(acts=joint, labels=targets, act_lens=encoded_len, label_lens=target_length)
+        loss_value = self.add_auxiliary_losses(loss_value)
+
+        tensorboard_logs = {
+            'train_loss': loss_value,
+            'learning_rate': self._optimizer.param_groups[0]['lr'],
+            'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
+        }
+
+        log_every_n_steps = self._trainer.log_every_n_steps if getattr(self, '_trainer', None) is not None else 1
+        if (self.trainer.global_step + 1) % log_every_n_steps == 0:
+            hyps = self._decode_hyp_texts(encoded, encoded_len)
+            refs = self._ref_texts(transcript, transcript_len)
+            tensorboard_logs['training_batch_wer'] = word_error_rate(hyps, refs, use_cer=self.use_cer)
+
+        self.log_dict(tensorboard_logs)
+        return {'loss': loss_value}
+
+    def validation_pass(self, batch, batch_idx, dataloader_idx=0):
+        signal, signal_len, transcript, transcript_len = batch
+
+        if HAVE_DALI and isinstance(batch, DALIOutputs) and batch.has_processed_signal:
+            encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
+        else:
+            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
+        del signal
+
+        tensorboard_logs = {}
+        if self.compute_eval_loss:
+            spell, cap = self._split_combined(transcript)
+            decoder, target_length, states = self.decoder(targets=spell, target_length=transcript_len)
+            joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder)
+            targets = self._factorized_targets(spell, cap)
+            loss_value = self.loss(acts=joint, labels=targets, act_lens=encoded_len, label_lens=target_length)
+            tensorboard_logs['val_loss'] = loss_value
+
+        # Greedy decode for corpus-level WER (aggregated at epoch end).
+        tensorboard_logs['val_hyps'] = self._decode_hyp_texts(encoded, encoded_len)
+        tensorboard_logs['val_refs'] = self._ref_texts(transcript, transcript_len)
+        return tensorboard_logs
+
+    def _aggregate_epoch(self, outputs, prefix: str):
+        logs = {}
+        losses = [x[f'{prefix}_loss'] for x in outputs if f'{prefix}_loss' in x]
+        if losses:
+            logs[f'{prefix}_loss'] = torch.stack(losses).mean()
+        hyps, refs = [], []
+        for x in outputs:
+            hyps.extend(x.get(f'{prefix}_hyps', []))
+            refs.extend(x.get(f'{prefix}_refs', []))
+        if refs:
+            logs[f'{prefix}_wer'] = torch.tensor(word_error_rate(hyps, refs, use_cer=self.use_cer))
+        return logs
+
+    def multi_validation_epoch_end(self, outputs, dataloader_idx: int = 0):
+        if not outputs:
+            return {}
+        logs = self._aggregate_epoch(outputs, 'val')
+        return {**logs, 'log': logs}
+
+    def multi_test_epoch_end(self, outputs, dataloader_idx: int = 0):
+        if not outputs:
+            return {}
+        logs = self._aggregate_epoch(outputs, 'test')
+        return {**logs, 'log': logs}
+
+    @classmethod
+    def list_available_models(cls) -> Optional[PretrainedModelInfo]:
+        return []

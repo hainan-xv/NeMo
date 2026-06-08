@@ -35,7 +35,13 @@ from typing import Any, Callable, Dict, List, Optional, Set
 import torch
 from omegaconf import DictConfig, OmegaConf
 
-from nemo.collections.asr.losses.rnnt_pytorch import MultiblankRNNTLossPytorch, RNNTLossPytorch, TDTLossPytorch
+from nemo.collections.asr.losses.rnnt_pytorch import (
+    MultiblankRNNTLossPytorch,
+    MultistreamTDTLoss,
+    MultistreamTDTLossPytorch,
+    RNNTLossPytorch,
+    TDTLossPytorch,
+)
 from nemo.core.classes import Loss, typecheck
 from nemo.core.neural_types import LabelsType, LengthsType, LogprobsType, LossType, NeuralType
 from nemo.core.utils import numba_utils
@@ -152,6 +158,20 @@ RNNT_LOSS_RESOLVER = {
         min_version='0.0',
         is_available=True,
         installation_msg="Pure Pytorch implementation of TDT loss. Slow and for debugging purposes only.",
+    ),
+    "multistream_tdt": RNNTLossConfig(
+        loss_name="multistream_tdt",
+        lib_name="torch",
+        min_version='0.0',
+        is_available=True,
+        installation_msg="PyTorch multistream TDT loss with analytic gradient. Slow; reference for a fused kernel.",
+    ),
+    "multistream_tdt_pytorch": RNNTLossConfig(
+        loss_name="multistream_tdt_pytorch",
+        lib_name="torch",
+        min_version='0.0',
+        is_available=True,
+        installation_msg="Pure Pytorch (autograd) multistream TDT loss. Slow and for debugging purposes only.",
     ),
 }
 
@@ -314,6 +334,24 @@ def resolve_rnnt_loss(loss_name: str, blank_idx: int, loss_kwargs: dict = None) 
         durations = loss_kwargs.pop('durations', None)
         sigma = loss_kwargs.pop('sigma', 0.0)
         loss_func = TDTLossPytorch(blank=blank_idx, durations=durations, reduction='none', sigma=sigma)
+        _warn_unused_additional_kwargs(loss_name, loss_kwargs)
+
+    elif loss_name == 'multistream_tdt':
+        durations = loss_kwargs.pop('durations', None)
+        dividers = loss_kwargs.pop('dividers', None)
+        sigma = loss_kwargs.pop('sigma', 0.0)
+        loss_func = MultistreamTDTLoss(
+            blank=blank_idx, durations=durations, dividers=dividers, reduction='none', sigma=sigma
+        )
+        _warn_unused_additional_kwargs(loss_name, loss_kwargs)
+
+    elif loss_name == 'multistream_tdt_pytorch':
+        durations = loss_kwargs.pop('durations', None)
+        dividers = loss_kwargs.pop('dividers', None)
+        sigma = loss_kwargs.pop('sigma', 0.0)
+        loss_func = MultistreamTDTLossPytorch(
+            blank=blank_idx, durations=durations, dividers=dividers, reduction='none', sigma=sigma
+        )
         _warn_unused_additional_kwargs(loss_name, loss_kwargs)
 
     elif loss_name == "graph_rnnt":
