@@ -34,6 +34,7 @@ Example:
 import os
 import tempfile
 
+import lightning.pytorch as pl
 import torch
 from omegaconf import OmegaConf, open_dict
 
@@ -42,6 +43,7 @@ from nemo.collections.asr.models.multistream_tdt_bpe_models import EncDecMultiSt
 from nemo.core.config import hydra_runner
 from nemo.utils import logging
 from nemo.utils.exp_manager import exp_manager
+from nemo.utils.trainer_utils import resolve_trainer_cfg
 
 # architecture sub-configs copied verbatim from the base model
 _ARCH_KEYS = ["preprocessor", "encoder", "decoder", "joint", "spec_augment", "model_defaults"]
@@ -129,9 +131,7 @@ def main(cfg):
         cfg.model.tokenizer = {"dir": tok_dir, "type": "bpe"}
 
     # 3) Build trainer / exp_manager.
-    from pytorch_lightning import Trainer
-
-    trainer = Trainer(**cfg.trainer)
+    trainer = pl.Trainer(**resolve_trainer_cfg(cfg.trainer))
     exp_manager(trainer, cfg.get("exp_manager", None))
 
     # 4) Instantiate our model.
