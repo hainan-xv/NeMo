@@ -61,13 +61,32 @@ def _load_base_model(cfg):
 
 
 def _export_tokenizer(base_model, out_dir: str) -> str:
-    """Write the base model's SentencePiece model to `out_dir` and return that dir."""
+    """Export the base model's SentencePiece tokenizer to `out_dir`.
+
+    The NeMo BPE tokenizer setup requires (at least) ``tokenizer.model`` and
+    ``vocab.txt``; ``tokenizer.vocab`` is optional but written for completeness.
+    """
     os.makedirs(out_dir, exist_ok=True)
+    sp = base_model.tokenizer.tokenizer  # underlying SentencePieceProcessor
+
     model_file = os.path.join(out_dir, "tokenizer.model")
-    proto = base_model.tokenizer.tokenizer.serialized_model_proto()
     with open(model_file, "wb") as f:
-        f.write(proto)
-    logging.info(f"Exported base tokenizer to {model_file}")
+        f.write(sp.serialized_model_proto())
+
+    n = sp.get_piece_size()
+    with open(os.path.join(out_dir, "vocab.txt"), "w", encoding="utf-8") as fv, open(
+        os.path.join(out_dir, "tokenizer.vocab"), "w", encoding="utf-8"
+    ) as fsv:
+        for i in range(n):
+            piece = sp.id_to_piece(i)
+            fv.write(piece + "\n")
+            try:
+                score = sp.get_score(i)
+            except Exception:
+                score = 0.0
+            fsv.write(f"{piece}\t{score}\n")
+
+    logging.info(f"Exported base tokenizer ({n} pieces) to {out_dir}")
     return out_dir
 
 
