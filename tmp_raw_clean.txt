@@ -11,7 +11,7 @@
       "audio_filepath": "/home/hainanx/Workplace/NeMo_ord_sync_d146_current/audio_cache/librispeech/test.clean/4507-16021-0047.wav",
       "duration": 34.955,
       "ref": "yesterday you were trembling for a health that is dear to you to day you fear for your own to morrow it will be anxiety about money the day after to morrow the diatribe of a slanderer the day after that the misfortune of some friend then the prevailing weather then something that has been broken or lost then a pleasure with which your conscience and your vertebral column reproach you again the course of public affairs",
-      "hyp": "Yesterday you were trembling for a health that is dear to you to day you fear for your own to morrow it will be anxiety about money the day after to morrow the diatribe of a slanderer the day after that the misfortune of some friend then the prevailing weather then something that has been broken or lost then a pleasure with which your conscience and your vertebral column reproach you. Again the course OF PUBLIC AFFAIRs"
+      "hyp": "Yesterday you were trembling for a health that is dear to you to day you fear for your own to morrow it will be anxiety about money the day after to morrow the diatribe of a slanderer the day after that the misfortune of some friend then the prevailing weather then something that has been broken or lost then a pleasure with which your conscience and your vertebral column reproach you. Again THE COURSE OF PUBLIC AFFAIRS"
     },
     {
       "id": "1995-1836-0004",
@@ -25,7 +25,7 @@
       "audio_filepath": "/home/hainanx/Workplace/NeMo_ord_sync_d146_current/audio_cache/librispeech/test.clean/7021-79730-0003.wav",
       "duration": 32.88,
       "ref": "as the chaise drives away mary stands bewildered and perplexed on the door step her mind in a tumult of excitement in which hatred of the doctor distrust and suspicion of her mother disappointment vexation and ill humor surge and swell among those delicate organizations on which the structure and development of the soul so closely depend doing perhaps an irreparable injury",
-      "hyp": "As the chase drives away, Mary stands bewildered and perplexed on the doorstep, her mind in a tumult of excitement, in which hatred of the doctor, distrust, and suspicion of her mother, disappointment, vexation, and ill humor surge and swell among those delicate organizations on which the structure and development of the soul so closely depend, doing perhaps an irreparable injury"
+      "hyp": "As the Chaise drives away, Mary stands bewildered and perplexed on the doorftep, her mind in a tumult of excitement, in which hatred of the Doctor, difrust, and suspicion of her mother, difappointment, Vexation, and ill humour surge and swell among thofe delicate organizations on which the structure and development of the soul fo clofely depend, doing perhaps an irreparable injury"
     },
     {
       "id": "908-157963-0007",
@@ -39,7 +39,7 @@
       "audio_filepath": "/home/hainanx/Workplace/NeMo_ord_sync_d146_current/audio_cache/librispeech/test.clean/2094-142345-0008.wav",
       "duration": 31.65,
       "ref": "but there is always a stronger sense of life when the sun is brilliant after rain and now he is pouring down his beams and making sparkles among the wet straw and lighting up every patch of vivid green moss on the red tiles of the cow shed and turning even the muddy water that is hurrying along the channel to the drain into a mirror for the yellow billed ducks who are seizing the opportunity of getting a drink with as much body in it as possible",
-      "hyp": "But there is always a stronger sense of life when the sun is brilliant after rain. And now he is pouring down his beams, and making sparkles among the wet straw, and lighting up every patch of vivid green moss on the red tiles of the cowshed, and turning even the muddy water that is hurrying along the channel to the drain into a mirror for the yellow billed ducks who are seizing the opportunity of getting a drink with as much body in it as possible."
+      "hyp": "But there is always a stronger sense of life when the sun is brilliant after rain and now he is pouring down his beams, and making sparkles among the wet straw, and lighting up every patch of vivid green moss on the red tiles of the cowshed, and turning even the muddy water that is hurrying along the channel to the drain into a mirror for the yellow billed ducks who are seizing the opportunity of getting a drink with as much body in it as possible."
     },
     {
       "id": "4507-16021-0026",
@@ -53,7 +53,7 @@
       "audio_filepath": "/home/hainanx/Workplace/NeMo_ord_sync_d146_current/audio_cache/librispeech/test.clean/672-122797-0008.wav",
       "duration": 30.81,
       "ref": "this happened every year and the young fir tree that had now grown to a very comely size trembled at the sight for the magnificent great trees fell to the earth with noise and cracking the branches were lopped off and the trees looked long and bare they were hardly to be recognised and then they were laid in carts and the horses dragged them out of the wood",
-      "hyp": "This happened every year, and the young fir tree, that had now grown to a very comely size, trembled at the sight for the magnificent great trees fell to the earth with noise and cracking, the branches were lopped off, and the trees looked long and bare. They were hardly to be recognised and then they were laid in carts, and the horses dragged them out of the wood."
+      "hyp": "This happened every year, and the young fir tree, that had now grown to a very comely size, trembled at the sight for the magnificent great trees fell to the earth with noise and cracking, the branches were lopped off, and the trees looked long and bare. They were hardly to be recognised. And then they were laid in carts, and the horses dragged them out of the wood."
     },
     {
       "id": "2094-142345-0010",

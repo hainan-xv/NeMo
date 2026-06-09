@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from nemo.collections.asr.models.aed_multitask_models import EncDecMultiTaskModel  # noqa: F401
+from nemo.collections.asr.models.aligner_models import EncDecAlignerBPEModel, EncDecAlignerModel  # noqa: F401
 from nemo.collections.asr.models.asr_model import ASRModel  # noqa: F401
 from nemo.collections.asr.models.classification_models import (  # noqa: F401
     ClassificationInferConfig,
@@ -41,6 +42,8 @@ from nemo.collections.asr.models.transformer_bpe_models import EncDecTransfModel
 
 __all__ = [
     'ASRModel',
+    'EncDecAlignerModel',
+    'EncDecAlignerBPEModel',
     'ClassificationInferConfig',
     'ClusteringDiarizer',
     'EncDecCTCModel',

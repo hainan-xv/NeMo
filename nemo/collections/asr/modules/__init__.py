@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from nemo.collections.asr.modules.aligner import AlignerCTCHead, AlignerJoint  # noqa: F401
 from nemo.collections.asr.modules.audio_preprocessing import (  # noqa: F401
     AudioToMelSpectrogramPreprocessor,
     AudioToMFCCPreprocessor,
@@ -54,6 +55,8 @@ from nemo.collections.asr.modules.ssl_modules import (
 )
 
 __all__ = [
+    'AlignerCTCHead',
+    'AlignerJoint',
     'AudioToMelSpectrogramPreprocessor',
     'AudioToMFCCPreprocessor',
     'CropOrPadSpectrogramAugmentation',

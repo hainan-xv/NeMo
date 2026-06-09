@@ -171,7 +171,15 @@ def get_text(sample):
 
 
 def write_manifest(references, predictions, model_id, dataset_path, dataset_name, split,
-                   audio_length=None, transcription_time=None):
+                   audio_length=None, transcription_time=None,
+                   references_formatted=None, predictions_formatted=None):
+    """Write a results manifest.
+
+    ``text`` / ``pred_text`` hold the *verbatim* reference and the *formatted* decode output
+    (capitalization + punctuation preserved). ``text_normalized`` / ``pred_text_normalized`` hold
+    the normalized versions actually used for the (leaderboard-comparable) WER. Decoding always
+    keeps casing+punctuation; normalization happens only for scoring.
+    """
     model_id_safe = model_id.replace("/", "-")
     dataset_path_safe = dataset_path.replace("/", "-")
     dataset_name_safe = dataset_name.replace("/", "-")
@@ -182,12 +190,16 @@ def write_manifest(references, predictions, model_id, dataset_path, dataset_name
     )
     with open(manifest_path, "w", encoding="utf-8") as f:
         for idx in range(len(references)):
+            ref_fmt = references_formatted[idx] if references_formatted is not None else references[idx]
+            pred_fmt = predictions_formatted[idx] if predictions_formatted is not None else predictions[idx]
             datum = {
                 "audio_filepath": f"sample_{idx}",
                 "duration": audio_length[idx] if audio_length else None,
                 "time": transcription_time[idx] if transcription_time else None,
-                "text": references[idx],
-                "pred_text": predictions[idx],
+                "text": ref_fmt,
+                "pred_text": pred_fmt,
+                "text_normalized": references[idx],
+                "pred_text_normalized": predictions[idx],
             }
             f.write(json.dumps(datum, ensure_ascii=False) + "\n")
     return manifest_path
@@ -227,9 +239,10 @@ def main(args):
         dataset = dataset.take(args.max_eval_samples)
 
     print("Downloading and caching audio samples...")
-    all_data = {"audio_filepaths": [], "durations": [], "references": []}
+    all_data = {"audio_filepaths": [], "durations": [], "references": [], "references_raw": []}
     for sample in tqdm(dataset, desc="Processing samples"):
-        ref = text_normalizer(get_text(sample))
+        ref_raw = get_text(sample)
+        ref = text_normalizer(ref_raw)
         if not ref.strip() or ref.strip() == "ignore time segment in scoring":
             continue
         raw_audio = sample["audio"]
@@ -263,6 +276,7 @@ def main(args):
         all_data["audio_filepaths"].append(audio_path)
         all_data["durations"].append(info.duration)
         all_data["references"].append(ref)
+        all_data["references_raw"].append(ref_raw)
 
     # Sort by duration (desc) for efficient batching; both decode paths preserve order.
     sorted_idx = sorted(range(len(all_data["durations"])), key=lambda k: all_data["durations"][k], reverse=True)
@@ -283,12 +297,16 @@ def main(args):
         transcriptions = transcribe_tdt(model, all_data["audio_filepaths"], args.batch_size)
     total_time = time.time() - start
 
-    predictions = [text_normalizer(pred.strip()) for pred in transcriptions]
+    # Decoding always keeps casing + punctuation; normalize only for (leaderboard) scoring.
+    predictions_formatted = [pred.strip() for pred in transcriptions]
+    predictions = [text_normalizer(pred) for pred in predictions_formatted]
 
     if args.verbose:
-        print("\n" + "=" * 70 + "\nREF / HYP pairs:\n" + "=" * 70)
-        for i, (ref, hyp) in enumerate(zip(all_data["references"], predictions)):
-            print(f"[{i}] REF: {ref}\n[{i}] HYP: {hyp}\n")
+        print("\n" + "=" * 70 + "\nREF / HYP pairs (formatted | normalized):\n" + "=" * 70)
+        for i in range(len(predictions)):
+            print(f"[{i}] REF : {all_data['references_raw'][i]}")
+            print(f"[{i}] HYP : {predictions_formatted[i]}")
+            print(f"[{i}] HYP*: {predictions[i]}\n")
         print("=" * 70)
 
     avg_time = total_time / n_samples
@@ -296,6 +314,7 @@ def main(args):
     manifest_path = write_manifest(
         all_data["references"], predictions, model_label, args.dataset_path, args.dataset, args.split,
         audio_length=all_data["durations"], transcription_time=[avg_time] * n_samples,
+        references_formatted=all_data["references_raw"], predictions_formatted=predictions_formatted,
     )
     print("Results saved at:", os.path.abspath(manifest_path))
 
