@@ -30,7 +30,8 @@ model:
     num_cap: 4                   # ALL_LOWER / ALL_UPPER / FIRST_UPPER / OTHER
     # word-ending punctuation modelled as a stream; anything else stays in the spelling stream.
     # class 0 is implicit "no punctuation"; these marks take classes 1..N (order matters).
-    punct_marks: [",", ".", "?", "!", ";", ":"]
+    # marks may be multi-character (e.g. the ellipsis "..."); longest match wins at a position.
+    punct_marks: [",", ".", "?", "!", ";", ":", "..."]
     tdt_durations: null          # null => inherit base model's TDT durations
 
   train_ds:

@@ -62,14 +62,16 @@ class TestSplitWordPunct:
         [
             ("Hello,", "Hello", 1, False),  # "," -> class 1
             ("world.", "world", 2, False),  # "." -> class 2
-            ("wait...", "wait", 2, True),  # keep first ".", discard ".."
-            ("really?!", "really", 3, True),  # keep "?", discard "!"
+            ("i.e.,", "i.e.", 1, False),  # last mark "," wins; "i.e." kept as normal tokens
+            ("co.,", "co.", 1, False),  # abbreviation period kept; comma is the punct
+            ("wait...", "wait", 7, False),  # "..." matches as one mark (class 7), not a lone "."
+            ("really?!", "really?", 4, False),  # last "!" (class 4) is punct; "?" kept
             ("end).", "end)", 2, False),  # ")" kept (before "."), "." is the punct
-            ("end.)", "end", 2, True),  # "." is the punct, ")" after it -> discarded
+            ("end.)", "end", 2, True),  # last in-set mark is "."; ")" after it -> discarded
             ("100%", "100%", PUNCT_NONE, False),  # "%" not in set -> normal token
             ("well-known", "well-known", PUNCT_NONE, False),  # within-word hyphen -> normal
             (".", "", 2, False),  # standalone period
-            ("?!", "", 3, True),  # standalone, keep "?", discard "!"
+            (".,", ".", 1, False),  # last "," is punct; "." kept as a normal token
             (")", ")", PUNCT_NONE, False),  # non-set punct -> normal token (not standalone)
         ],
     )
@@ -91,6 +93,12 @@ class TestCapPunctCodec:
             ("well-known fact", "well-known fact"),  # within-word hyphen stays normal
             ("end). go", "end). go"),  # ")" normal, "." punct
             ("Hello .", "Hello."),  # standalone punct attaches to previous word
+            ("i.e., this", "i.e., this"),  # abbreviation period kept; comma is the punct
+            ("the co., ltd", "the co., ltd"),  # last mark wins
+            ("wait...", "wait..."),  # "..." is a single punctuation mark
+            ("Hmm... yes", "Hmm... yes"),  # ellipsis as one mark, mid-utterance
+            ("well ...", "well..."),  # standalone "..." attaches to the previous word
+            ("really?!", "really?!"),  # "?" normal token, "!" is punct
         ],
     )
     def test_roundtrip_exact(self, text, expected):
@@ -102,12 +110,11 @@ class TestCapPunctCodec:
     @pytest.mark.parametrize(
         "text,expected",
         [
-            ("wait...", "wait."),  # extra trailing punct discarded (lossy)
-            ("really?!", "really?"),
-            ("end.) now", "end. now"),  # ")" after the "." is discarded
+            ("end.) now", "end. now"),  # ")" after the last in-set "." is discarded
+            ("stop!) go", "stop! go"),  # ")" after the "!" is discarded
         ],
     )
-    def test_roundtrip_lossy_keeps_first(self, text, expected):
+    def test_roundtrip_lossy_keeps_last(self, text, expected):
         tok = _MockSP()
         spell, cap, punct = encode_cap_punct(text, tok, DEFAULT_PUNCT_MARKS)
         assert decode_cap_punct(spell, cap, punct, tok, DEFAULT_PUNCT_MARKS) == expected

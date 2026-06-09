@@ -25,16 +25,20 @@ parallel labels:
 Punctuation handling
 --------------------
 Only a configurable set of *word-ending* punctuation marks is modelled as a stream
-(default: ``, . ? ! ; :``). Everything else - including within-word punctuation such as
-hyphens/apostrophes and any mark not in the set - stays in the spelling stream as ordinary
-sub-word tokens.
+(default: ``, . ? ! ; :`` and the ellipsis ``...``). Marks may be multi-character. Everything
+else - including within-word punctuation such as hyphens/apostrophes and any mark not in the
+set - stays in the spelling stream as ordinary sub-word tokens.
 
 For each whitespace-delimited word we look at its maximal trailing run of non-alphanumeric
-characters and find the **first** character in that run that belongs to the configured set:
+characters and find the **last** character in that run that belongs to the configured set:
 
 * that character becomes the word's punctuation class,
 * any characters *before* it (if any) are kept as ordinary spelling tokens, and
 * any characters *after* it are **discarded** (a warning with the full utterance is logged).
+
+Choosing the *last* in-set mark keeps abbreviation periods in the spelling stream and lets the
+true sentence-final mark win, e.g. ``"i.e.,"`` -> ``"i.e."`` + ``","`` and ``"co.,"`` ->
+``"co."`` + ``","``.
 
 A "word" that is entirely punctuation (e.g. a standalone ``.``) attaches its punctuation to
 the **previous** word's last sub-word; if there is no previous word (or it is already
@@ -62,8 +66,10 @@ from nemo.collections.asr.parts.utils.multistream_factorization import (
 from nemo.utils import logging
 
 # Punctuation classes: 0 is reserved for "no punctuation"; the configured marks take 1..N.
+# Marks may be multi-character (e.g. the ellipsis "..."); when several marks match at the same
+# position the longest one wins, so "..." is preferred over a lone ".".
 PUNCT_NONE = 0
-DEFAULT_PUNCT_MARKS: Tuple[str, ...] = (",", ".", "?", "!", ";", ":")
+DEFAULT_PUNCT_MARKS: Tuple[str, ...] = (",", ".", "?", "!", ";", ":", "...")
 
 
 def num_punct_classes(punct_marks: Sequence[str] = DEFAULT_PUNCT_MARKS) -> int:
@@ -75,25 +81,39 @@ def split_word_punct(word: str, punct_marks: Sequence[str] = DEFAULT_PUNCT_MARKS
     """Split a single word into ``(core, punct_class, discarded)``.
 
     ``core`` is the spelling part (original casing, with the chosen trailing punctuation removed
-    but any punctuation *before* it kept). ``punct_class`` is the 1-based class of the first
+    but any punctuation *before* it kept). ``punct_class`` is the 1-based class of the **last**
     in-set trailing punctuation (``PUNCT_NONE`` if none). ``discarded`` is True if any trailing
     punctuation *after* the chosen mark was dropped.
+
+    We pick the *last* in-set mark so abbreviation periods stay in the spelling stream and the
+    true sentence-final mark wins, e.g. ``"i.e.,"`` -> core ``"i.e."`` + punct ``","`` and
+    ``"co.,"`` -> core ``"co."`` + punct ``","``. Marks may be multi-character (e.g. ``"..."``);
+    among matches ending at the same position the longest mark wins, so ``"wait..."`` ->
+    core ``"wait"`` + punct ``"..."`` (not a lone ``"."``).
     """
-    punct_set = set(punct_marks)
     # maximal trailing run of non-alphanumeric characters
     i = len(word)
     while i > 0 and not word[i - 1].isalnum():
         i -= 1
     head, trail = word[:i], word[i:]
 
-    punct_class = PUNCT_NONE
-    keep_before, discard_after = trail, ""
-    for j, ch in enumerate(trail):
-        if ch in punct_set:
-            punct_class = punct_marks.index(ch) + 1
-            keep_before, discard_after = trail[:j], trail[j + 1 :]
-            break
+    # Find the in-set mark that ends rightmost (ties broken by longest), i.e. the *last* mark;
+    # everything before it is kept, everything after it is discarded.
+    best = None  # (end, length, start, class)
+    for start in range(len(trail)):
+        for mi, mark in enumerate(punct_marks):
+            length = len(mark)
+            if length == 0 or trail[start : start + length] != mark:
+                continue
+            cand = (start + length, length, start, mi + 1)
+            if best is None or cand[:2] > best[:2]:
+                best = cand
 
+    if best is None:
+        return head + trail, PUNCT_NONE, False
+
+    end, _length, start, punct_class = best
+    keep_before, discard_after = trail[:start], trail[end:]
     core = head + keep_before
     return core, punct_class, len(discard_after) > 0
 
@@ -145,7 +165,7 @@ def encode_cap_punct(
     if lossy:
         logging.warning(
             "multistream cap+punct: dropped or could not place word-ending punctuation; "
-            "kept the first in-set mark per word. utterance: %r",
+            "kept the last in-set mark per word. utterance: %r",
             text,
         )
     return spell_ids, cap_ids, punct_ids
