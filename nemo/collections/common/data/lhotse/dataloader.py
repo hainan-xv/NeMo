@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import logging as pylogging
 import os
 import random
 import warnings
@@ -260,6 +261,56 @@ class LhotseDataLoadingConfig:
     slice_length: Optional[int] = None
 
 
+class _LhotseAudioWarnFilter(pylogging.Filter):
+    """Drop lhotse's extremely verbose fault-tolerant audio-load warnings.
+
+    When a cut fails to load, ``AudioSamples(fault_tolerant=True)`` skips it and
+    lhotse logs ``[Suppressed AudioLoadingError] ...`` on the root logger; that
+    message embeds the full ``MonoCut``/``MixedCut`` repr (every token + the raw
+    recording) which floods training logs. We drop only those records. Set the
+    env var ``NEMO_KEEP_LHOTSE_AUDIO_LOAD_WARNINGS=1`` to keep them.
+    """
+
+    _NEEDLES = (
+        "[Suppressed AudioLoadingError]",
+        "[Suppressed DurationMismatchError]",
+        "[Suppressed NonPositiveEnergyError]",
+        "[Suppressed ConnectionResetError]",
+        "[extra info] When calling:",
+        "When calling: MonoCut.load_audio",
+        "When calling: MixedCut.load_audio",
+    )
+
+    def filter(self, record: pylogging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+        return not any(needle in msg for needle in self._NEEDLES)
+
+
+_AUDIO_WARN_FILTER_INSTALLED = False
+
+
+def _maybe_silence_lhotse_audio_load_warnings() -> None:
+    """Install the audio-load warning filter on the root logger (once).
+
+    lhotse emits these via the module-level ``logging.warning`` (root logger).
+    A logger-level filter is evaluated before handlers, so this suppresses the
+    records regardless of which handlers are attached. Installed when the
+    dataloader is built (before training), so forked dataloader workers inherit it.
+    """
+    global _AUDIO_WARN_FILTER_INSTALLED
+    if _AUDIO_WARN_FILTER_INSTALLED or os.environ.get("NEMO_KEEP_LHOTSE_AUDIO_LOAD_WARNINGS", "0") == "1":
+        return
+    warn_filter = _LhotseAudioWarnFilter()
+    root = pylogging.getLogger()
+    root.addFilter(warn_filter)
+    for handler in root.handlers:
+        handler.addFilter(warn_filter)
+    _AUDIO_WARN_FILTER_INSTALLED = True
+
+
 def determine_use_iterable_dataset(use_iterable_dataset: bool, config: DictConfig) -> bool:
     """Determine whether to use iterable dataset for a given configuration."""
     assert not (
@@ -297,6 +348,9 @@ def get_lhotse_dataloader_from_config(
     """
     if not isinstance(config, DictConfig):
         config = OmegaConf.create(config)
+
+    # Silence lhotse's verbose fault-tolerant audio-load warnings (full cut repr).
+    _maybe_silence_lhotse_audio_load_warnings()
 
     # Providing default value because we haven't filled the config defaults yet.
     maybe_set_cuda_expandable_segments(enabled=config.get("cuda_expandable_segments", True))

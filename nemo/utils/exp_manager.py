@@ -292,6 +292,89 @@ class ExpManagerConfig:
     fault_tolerance: Optional[FaultToleranceParams] = field(default_factory=FaultToleranceParams)
     # logs TFLOPs per sec per gpu
     log_tflops_per_sec_per_gpu: Optional[bool] = True
+    # logs a compact one-line train summary (loss/lr/throughput/bs) to stdout every N steps.
+    # Useful when the tqdm progress bar is not rendered (e.g. SLURM logs). Rank 0 only.
+    log_step_stats: Optional[bool] = True
+    log_step_stats_every_n_steps: Optional[int] = 100
+
+
+class StepStatsCallback(Callback):
+    """Print a compact one-line training summary to stdout every N steps.
+
+    The Lightning tqdm progress bar does not render in non-interactive (e.g.
+    SLURM) logs, so this gives a reliable periodic readout of loss / lr /
+    throughput that works for any model (it reads ``outputs['loss']`` and the
+    metrics the model logs into ``trainer.callback_metrics``). Only rank 0 prints.
+    """
+
+    def __init__(self, every_n_steps: int = 100):
+        self.every_n_steps = int(every_n_steps)
+        self._last_time = None
+        self._last_step = None
+
+    @staticmethod
+    def _infer_batch_size(batch) -> Optional[int]:
+        try:
+            if isinstance(batch, (list, tuple)) and len(batch) > 0 and hasattr(batch[0], "shape"):
+                return int(batch[0].shape[0])
+            if isinstance(batch, dict):
+                for v in batch.values():
+                    if hasattr(v, "shape") and getattr(v, "ndim", 0) >= 1:
+                        return int(v.shape[0])
+        except Exception:
+            return None
+        return None
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        """Emit the periodic summary line."""
+        if self.every_n_steps <= 0 or not trainer.is_global_zero:
+            return
+        step = trainer.global_step
+        if step % self.every_n_steps != 0:
+            return
+
+        import time
+
+        now = time.monotonic()
+        parts = [f"step {step}", f"epoch {trainer.current_epoch}"]
+
+        loss = None
+        if isinstance(outputs, dict) and outputs.get("loss", None) is not None:
+            loss = outputs["loss"]
+        metrics = dict(trainer.callback_metrics)
+        if loss is None and "train_loss" in metrics:
+            loss = metrics["train_loss"]
+        if loss is not None:
+            try:
+                parts.append(f"loss {float(loss):.4f}")
+            except (TypeError, ValueError):
+                pass
+
+        # Any additional per-step loss components the model logged (e.g. ar_loss).
+        for key in sorted(metrics):
+            if key == "train_loss" or not key.startswith("train_") or not key.endswith("_loss"):
+                continue
+            try:
+                parts.append(f"{key[len('train_'):]} {float(metrics[key]):.4f}")
+            except (TypeError, ValueError):
+                continue
+
+        if "learning_rate" in metrics:
+            try:
+                parts.append(f"lr {float(metrics['learning_rate']):.3e}")
+            except (TypeError, ValueError):
+                pass
+
+        if self._last_time is not None and self._last_step is not None and step > self._last_step:
+            it_s = (step - self._last_step) / max(now - self._last_time, 1e-6)
+            parts.append(f"{it_s:.2f} it/s")
+        self._last_time, self._last_step = now, step
+
+        bs = self._infer_batch_size(batch)
+        if bs is not None:
+            parts.append(f"bs {bs}")
+
+        logging.info("[train-stats] " + " | ".join(parts))
 
 
 class TimingCallback(Callback):
@@ -718,6 +801,10 @@ def exp_manager(trainer: 'lightning.pytorch.Trainer', cfg: Optional[Union[DictCo
     elif cfg.log_step_timing:
         timing_callback = TimingCallback(timer_kwargs=cfg.step_timing_kwargs or {})
         trainer.callbacks.insert(0, timing_callback)
+
+    # add a compact periodic stdout train-stats line (handy when no tqdm bar shows)
+    if cfg.get("log_step_stats", True):
+        trainer.callbacks.append(StepStatsCallback(every_n_steps=cfg.get("log_step_stats_every_n_steps", 100)))
 
     if cfg.ema.enable:
         ema_callback = EMA(
