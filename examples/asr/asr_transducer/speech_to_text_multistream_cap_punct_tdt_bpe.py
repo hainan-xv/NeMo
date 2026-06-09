@@ -117,9 +117,18 @@ def main(cfg):
     md["num_cap"] = int(cli_num_cap) if cli_num_cap is not None else 4
     md["punct_marks"] = list(cli_punct_marks) if cli_punct_marks is not None else list(DEFAULT_PUNCT_MARKS)
 
+    # Capture any CLI/yaml overrides under model.joint (e.g. masking_prob) BEFORE we overwrite
+    # cfg.model.joint wholesale with the base model's joint config below, then re-apply them.
+    cli_joint = cfg.model.get("joint", None)
+    cli_joint = OmegaConf.to_container(cli_joint, resolve=True) if cli_joint is not None else None
+
     with open_dict(cfg.model):
         for key, val in arch.items():
             cfg.model[key] = val
+        # re-apply CLI joint overrides on top of the base joint config
+        if cli_joint:
+            for k, v in cli_joint.items():
+                cfg.model.joint[k] = v
 
     # 2) Export + point at the base tokenizer.
     tok_dir = _export_tokenizer(base_model, cfg.get("tokenizer_out_dir", tempfile.mkdtemp(prefix="ms_cp_tdt_tok_")))
