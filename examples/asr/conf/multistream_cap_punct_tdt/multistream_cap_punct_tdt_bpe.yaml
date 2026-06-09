@@ -1,12 +1,12 @@
-# 2-stream (spelling + capitalization) TDT BPE model.
+# 3-stream (spelling + capitalization + punctuation) TDT BPE model.
 #
 # Architecture (preprocessor/encoder/decoder/joint/spec_augment/model_defaults/
 # loss) and the BPE tokenizer are derived AT RUNTIME from a base TDT model
 # (base_model_path / base_model_name) by the entrypoint
-# examples/asr/asr_transducer/speech_to_text_multistream_tdt_bpe.py.
+# examples/asr/asr_transducer/speech_to_text_multistream_cap_punct_tdt_bpe.py.
 # This file therefore only specifies data, optimization, trainer and exp_manager.
 
-name: "MultiStreamTDT-BPE"
+name: "MultiStreamCapPunctTDT-BPE"
 
 # Base TDT model to derive architecture + tokenizer from, and to warm-start the
 # encoder from. Provide a local .nemo (preferred on clusters) or a pretrained name.
@@ -28,6 +28,9 @@ model:
   # multistream knobs (architecture comes from the base model at runtime)
   model_defaults:
     num_cap: 4                   # ALL_LOWER / ALL_UPPER / FIRST_UPPER / OTHER
+    # word-ending punctuation modelled as a stream; anything else stays in the spelling stream.
+    # class 0 is implicit "no punctuation"; these marks take classes 1..N (order matters).
+    punct_marks: [",", ".", "?", "!", ";", ":"]
     tdt_durations: null          # null => inherit base model's TDT durations
 
   train_ds:

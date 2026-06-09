@@ -12,20 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Non-batched greedy decoding for the 2-stream (spelling + capitalization) TDT model.
+"""Greedy decoding for the 3-stream (spelling + capitalization + punctuation) TDT model.
 
-This mirrors :class:`GreedyTDTInfer` exactly, except the label part of the joint
-output is laid out as ``[ cap(num_cap) | spell(num_spell) | blank ]`` (followed by
-the duration logits). At each step we therefore:
-
-* pick the spelling token (incl. blank) by argmax over the spelling slice
-  (blank is the last index of that slice), and
-* pick the capitalization class by argmax over the capitalization slice.
+The label part of the joint output is laid out as
+``[ punct(num_punct) | cap(num_cap) | spell(num_spell) | blank ]`` (followed by the duration
+logits). At each step we pick the spelling token (incl. blank) by argmax over the spelling
+slice, and the capitalization / punctuation classes by argmax over their own slices.
 
 The emitted token stored in the hypothesis is the *product* id
-``cap * num_spell + spell`` (so ``tokenizer.ids_to_text`` reconstructs cased
-text), while the token fed back to the prediction network is the spelling id only
-(the prediction network is trained on the spelling stream).
+``(punct * num_cap + cap) * num_spell + spell`` (so ``tokenizer.ids_to_text`` reconstructs cased,
+punctuated text), while the token fed back to the prediction network is the spelling id only.
+
+This module provides both the per-utterance :class:`GreedyMultiStreamCapPunctTDTInfer` and the
+batched :class:`GreedyBatchedMultiStreamCapPunctTDTInfer` (label-looping) decoders.
 """
 
 from typing import List, Optional
@@ -33,8 +32,8 @@ from typing import List, Optional
 import torch
 
 from nemo.collections.asr.parts.submodules.rnnt_greedy_decoding import GreedyTDTInfer, pack_hypotheses
-from nemo.collections.asr.parts.submodules.transducer_decoding.multistream_tdt_label_looping import (
-    GreedyBatchedMultiStreamTDTLabelLoopingComputer,
+from nemo.collections.asr.parts.submodules.transducer_decoding.multistream_cap_punct_tdt_label_looping import (
+    GreedyBatchedMultiStreamCapPunctTDTLabelLoopingComputer,
 )
 from nemo.collections.asr.parts.utils import rnnt_utils
 from nemo.collections.common.parts.rnn import label_collate
@@ -42,8 +41,8 @@ from nemo.core.classes.common import typecheck
 from nemo.utils import logging
 
 
-class GreedyMultiStreamTDTInfer(GreedyTDTInfer):
-    """Greedy (non-batched) decoder for spelling + capitalization TDT."""
+class GreedyMultiStreamCapPunctTDTInfer(GreedyTDTInfer):
+    """Greedy (non-batched) decoder for spelling + capitalization + punctuation TDT."""
 
     def __init__(
         self,
@@ -51,6 +50,7 @@ class GreedyMultiStreamTDTInfer(GreedyTDTInfer):
         joint_model,
         blank_index: int,
         durations: list,
+        num_punct: int,
         num_cap: int,
         num_spell: int,
         max_symbols_per_step: Optional[int] = 10,
@@ -72,10 +72,11 @@ class GreedyMultiStreamTDTInfer(GreedyTDTInfer):
             include_duration_confidence=include_duration_confidence,
             confidence_method_cfg=confidence_method_cfg,
         )
+        self.num_punct = num_punct
         self.num_cap = num_cap
         self.num_spell = num_spell
-        # The prediction network operates on the spelling vocabulary, whose
-        # SOS/blank index is num_spell (NOT the joint blank index).
+        # The prediction network operates on the spelling vocabulary, whose SOS/blank index is
+        # num_spell (NOT the joint blank index).
         self._SOS = num_spell
 
     @torch.no_grad()
@@ -83,7 +84,7 @@ class GreedyMultiStreamTDTInfer(GreedyTDTInfer):
         self, x: torch.Tensor, out_len: torch.Tensor, partial_hypotheses: Optional[rnnt_utils.Hypothesis] = None
     ):
         if partial_hypotheses is not None:
-            raise NotImplementedError("`partial_hypotheses` is not supported for multistream TDT greedy decoding.")
+            raise NotImplementedError("`partial_hypotheses` is not supported for cap+punct TDT greedy decoding.")
 
         hypothesis = rnnt_utils.Hypothesis(
             score=0.0, y_sequence=[], dec_state=None, timestamp=[], token_duration=[], last_token=None
@@ -91,6 +92,8 @@ class GreedyMultiStreamTDTInfer(GreedyTDTInfer):
 
         n_dur = len(self.durations)
         spell_blank = self.num_spell  # blank index within the spelling slice
+        cap_start = self.num_punct
+        spell_start = self.num_punct + self.num_cap
 
         time_idx = 0
         while time_idx < out_len:
@@ -108,24 +111,27 @@ class GreedyMultiStreamTDTInfer(GreedyTDTInfer):
                 logits = self._joint_step(f, g, log_normalize=False)[0, 0, 0]
                 del g
 
-                label_logp = logits[:-n_dur]  # [cap | spell | blank]
+                label_logp = logits[:-n_dur]  # [punct | cap | spell | blank]
                 if label_logp.dtype != torch.float32:
                     label_logp = label_logp.float()
 
-                cap_logp = label_logp[: self.num_cap]
-                spell_logp = label_logp[self.num_cap :]  # [spell..., blank] (blank at index num_spell)
+                punct_logp = label_logp[:cap_start]
+                cap_logp = label_logp[cap_start:spell_start]
+                spell_logp = label_logp[spell_start:]  # [spell..., blank] (blank at index num_spell)
 
                 v, spell_k = spell_logp.max(0)
                 spell_k = spell_k.item()
                 _, cap_k = cap_logp.max(0)
                 cap_k = cap_k.item()
+                _, punct_k = punct_logp.max(0)
+                punct_k = punct_k.item()
 
                 duration_logp = torch.log_softmax(logits[-n_dur:].float(), dim=-1)
                 _, d_k = duration_logp.max(0)
                 skip = self.durations[d_k.item()]
 
                 if spell_k != spell_blank:
-                    combined = cap_k * self.num_spell + spell_k
+                    combined = (punct_k * self.num_cap + cap_k) * self.num_spell + spell_k
                     hypothesis.y_sequence.append(combined)
                     hypothesis.score += float(v)
                     hypothesis.timestamp.append(time_idx)
@@ -148,16 +154,13 @@ class GreedyMultiStreamTDTInfer(GreedyTDTInfer):
         return hypothesis
 
 
-class GreedyBatchedMultiStreamTDTInfer(GreedyTDTInfer):
-    """Batched greedy (label-looping) decoder for spelling + capitalization TDT.
+class GreedyBatchedMultiStreamCapPunctTDTInfer(GreedyTDTInfer):
+    """Batched greedy (label-looping) decoder for spelling + capitalization + punctuation TDT.
 
     Decodes a whole batch in lockstep using
-    :class:`GreedyBatchedMultiStreamTDTLabelLoopingComputer`, evaluating the prediction network
-    once per label-looping step with the maximum possible batch size. This is the batched
-    counterpart of :class:`GreedyMultiStreamTDTInfer` (which decodes one utterance at a time).
-
-    CUDA graphs are not supported yet: if ``use_cuda_graph_decoder`` is set, a warning is logged
-    and decoding proceeds with CUDA graphs disabled.
+    :class:`GreedyBatchedMultiStreamCapPunctTDTLabelLoopingComputer`. CUDA graphs are not supported
+    yet: if ``use_cuda_graph_decoder`` is set, a warning is logged and decoding proceeds with CUDA
+    graphs disabled.
     """
 
     def __init__(
@@ -166,6 +169,7 @@ class GreedyBatchedMultiStreamTDTInfer(GreedyTDTInfer):
         joint_model,
         blank_index: int,
         durations: list,
+        num_punct: int,
         num_cap: int,
         num_spell: int,
         max_symbols_per_step: Optional[int] = 10,
@@ -180,22 +184,23 @@ class GreedyBatchedMultiStreamTDTInfer(GreedyTDTInfer):
             max_symbols_per_step=max_symbols_per_step,
             include_duration=include_duration,
         )
+        self.num_punct = num_punct
         self.num_cap = num_cap
         self.num_spell = num_spell
-        # The prediction network operates on the spelling vocabulary (SOS/blank index = num_spell).
         self._SOS = num_spell
 
         if use_cuda_graph_decoder:
             logging.warning(
-                "CUDA graph decoding is not supported yet for the multistream TDT batched decoder; "
+                "CUDA graph decoding is not supported yet for the multistream cap+punct TDT batched decoder; "
                 "running with CUDA graphs disabled."
             )
 
-        self.decoding_computer = GreedyBatchedMultiStreamTDTLabelLoopingComputer(
+        self.decoding_computer = GreedyBatchedMultiStreamCapPunctTDTLabelLoopingComputer(
             decoder=decoder_model,
             joint=joint_model,
             blank_index=blank_index,
             durations=durations,
+            num_punct=num_punct,
             num_cap=num_cap,
             num_spell=num_spell,
             max_symbols_per_step=max_symbols_per_step,
@@ -209,7 +214,6 @@ class GreedyBatchedMultiStreamTDTInfer(GreedyTDTInfer):
     @max_symbols.setter
     def max_symbols(self, value):
         self._max_symbols = value
-        # keep the label-looping computer in sync (e.g. when overridden after construction)
         computer = self.__dict__.get("decoding_computer", None)
         if computer is not None:
             computer.max_symbols = value
@@ -224,15 +228,14 @@ class GreedyBatchedMultiStreamTDTInfer(GreedyTDTInfer):
         """Greedy-decode an encoder batch into a list of (packed) Hypotheses with product ids."""
         if partial_hypotheses is not None:
             raise NotImplementedError(
-                "`partial_hypotheses` is not supported for batched multistream TDT greedy decoding."
+                "`partial_hypotheses` is not supported for batched cap+punct TDT greedy decoding."
             )
 
         decoder_training_state = self.decoder.training
         joint_training_state = self.joint.training
 
         with torch.inference_mode():
-            # (B, D, T) -> (B, T, D)
-            encoder_output = encoder_output.transpose(1, 2)
+            encoder_output = encoder_output.transpose(1, 2)  # (B, D, T) -> (B, T, D)
             self.decoder.eval()
             self.joint.eval()
 

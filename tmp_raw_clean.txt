@@ -1,0 +1,80 @@
+{
+  "model": "/home/hainanx/Workplace/NeMo_ord_sync_d146_current/checkpoints/ord_mstdt_msTdtSpellCap_parakeet0p6b_granary1p1_lr1e-4_warmup5000_cap4_n1/avg_inputs/ord_mstdt_msTdtSpellCap_parakeet0p6b_granary1p1_lr1e-4_warmup5000_cap4_n1-averaged.nemo",
+  "dataset_path": "hf-audio/esb-datasets-test-only-sorted",
+  "dataset": "librispeech",
+  "split": "test.clean",
+  "num_samples": 10,
+  "normalized": false,
+  "results": [
+    {
+      "id": "4507-16021-0047",
+      "audio_filepath": "/home/hainanx/Workplace/NeMo_ord_sync_d146_current/audio_cache/librispeech/test.clean/4507-16021-0047.wav",
+      "duration": 34.955,
+      "ref": "yesterday you were trembling for a health that is dear to you to day you fear for your own to morrow it will be anxiety about money the day after to morrow the diatribe of a slanderer the day after that the misfortune of some friend then the prevailing weather then something that has been broken or lost then a pleasure with which your conscience and your vertebral column reproach you again the course of public affairs",
+      "hyp": "Yesterday you were trembling for a health that is dear to you to day you fear for your own to morrow it will be anxiety about money the day after to morrow the diatribe of a slanderer the day after that the misfortune of some friend then the prevailing weather then something that has been broken or lost then a pleasure with which your conscience and your vertebral column reproach you. Again the course OF PUBLIC AFFAIRs"
+    },
+    {
+      "id": "1995-1836-0004",
+      "audio_filepath": "/home/hainanx/Workplace/NeMo_ord_sync_d146_current/audio_cache/librispeech/test.clean/1995-1836-0004.wav",
+      "duration": 33.91,
+      "ref": "as she awaited her guests she surveyed the table with both satisfaction and disquietude for her social functions were few tonight there were she checked them off on her fingers sir james creighton the rich english manufacturer and lady creighton mister and missus vanderpool mister harry cresswell and his sister john taylor and his sister and mister charles smith whom the evening papers mentioned as likely to be united states senator from new jersey a selection of guests that had been determined unknown to the hostess by the meeting of cotton interests earlier in the day",
+      "hyp": "As she awaited her guests she surveyed the table with both satisfaction and disquietude, for her social functions were few. To night there were, she checked them off on her fingers, Sir James Crichton, the rich English manufacturer and Lady Crichton, mister and misses Vanderpoole, mister Harry Cresswell and his sister, John Taylor and his sister, and mister Charles Smith, whom the evening papers mentioned as likely to be United States Senator from New Jersey, a selection of guests that had been determined unknown to the hostess by the meeting of cotton interests earlier in the day."
+    },
+    {
+      "id": "7021-79730-0003",
+      "audio_filepath": "/home/hainanx/Workplace/NeMo_ord_sync_d146_current/audio_cache/librispeech/test.clean/7021-79730-0003.wav",
+      "duration": 32.88,
+      "ref": "as the chaise drives away mary stands bewildered and perplexed on the door step her mind in a tumult of excitement in which hatred of the doctor distrust and suspicion of her mother disappointment vexation and ill humor surge and swell among those delicate organizations on which the structure and development of the soul so closely depend doing perhaps an irreparable injury",
+      "hyp": "As the chase drives away, Mary stands bewildered and perplexed on the doorstep, her mind in a tumult of excitement, in which hatred of the doctor, distrust, and suspicion of her mother, disappointment, vexation, and ill humor surge and swell among those delicate organizations on which the structure and development of the soul so closely depend, doing perhaps an irreparable injury"
+    },
+    {
+      "id": "908-157963-0007",
+      "audio_filepath": "/home/hainanx/Workplace/NeMo_ord_sync_d146_current/audio_cache/librispeech/test.clean/908-157963-0007.wav",
+      "duration": 32.77,
+      "ref": "the lilly of the valley breathing in the humble grass answerd the lovely maid and said i am a watry weed and i am very small and love to dwell in lowly vales so weak the gilded butterfly scarce perches on my head yet i am visited from heaven and he that smiles on all walks in the valley and each morn over me spreads his hand saying rejoice thou humble grass thou new born lily flower",
+      "hyp": "The lily of the valley, breathing in the humble grass, answered the lovely maid and said, I am a watery weed, and I am very small, and love to dwell in lowly vales. So weak, the gilded butterfly scarce perches on my head, yet I am visited from heaven, and he that smiles on all walks in the valley, and each morn over me spreads his hand, saying, Rejoice, thou humble grass, thou newborn lily flower."
+    },
+    {
+      "id": "2094-142345-0008",
+      "audio_filepath": "/home/hainanx/Workplace/NeMo_ord_sync_d146_current/audio_cache/librispeech/test.clean/2094-142345-0008.wav",
+      "duration": 31.65,
+      "ref": "but there is always a stronger sense of life when the sun is brilliant after rain and now he is pouring down his beams and making sparkles among the wet straw and lighting up every patch of vivid green moss on the red tiles of the cow shed and turning even the muddy water that is hurrying along the channel to the drain into a mirror for the yellow billed ducks who are seizing the opportunity of getting a drink with as much body in it as possible",
+      "hyp": "But there is always a stronger sense of life when the sun is brilliant after rain. And now he is pouring down his beams, and making sparkles among the wet straw, and lighting up every patch of vivid green moss on the red tiles of the cowshed, and turning even the muddy water that is hurrying along the channel to the drain into a mirror for the yellow billed ducks who are seizing the opportunity of getting a drink with as much body in it as possible."
+    },
+    {
+      "id": "4507-16021-0026",
+      "audio_filepath": "/home/hainanx/Workplace/NeMo_ord_sync_d146_current/audio_cache/librispeech/test.clean/4507-16021-0026.wav",
+      "duration": 31.615,
+      "ref": "to keep afloat and to rescue from oblivion to hold above the gulf were it but a fragment of some language which man has spoken and which would otherwise be lost that is to say one of the elements good or bad of which civilization is composed or by which it is complicated to extend the records of social observation is to serve civilization itself",
+      "hyp": "To keep afloat and to rescue from oblivion, to hold above the gulf were it but a fragment of some language which man has spoken and which would otherwise be lost that is to say, one of the elements, good or bad, of which civilization is composed, or by which it is complicated to extend the records of social observation, is to serve civilization itself."
+    },
+    {
+      "id": "672-122797-0008",
+      "audio_filepath": "/home/hainanx/Workplace/NeMo_ord_sync_d146_current/audio_cache/librispeech/test.clean/672-122797-0008.wav",
+      "duration": 30.81,
+      "ref": "this happened every year and the young fir tree that had now grown to a very comely size trembled at the sight for the magnificent great trees fell to the earth with noise and cracking the branches were lopped off and the trees looked long and bare they were hardly to be recognised and then they were laid in carts and the horses dragged them out of the wood",
+      "hyp": "This happened every year, and the young fir tree, that had now grown to a very comely size, trembled at the sight for the magnificent great trees fell to the earth with noise and cracking, the branches were lopped off, and the trees looked long and bare. They were hardly to be recognised and then they were laid in carts, and the horses dragged them out of the wood."
+    },
+    {
+      "id": "2094-142345-0010",
+      "audio_filepath": "/home/hainanx/Workplace/NeMo_ord_sync_d146_current/audio_cache/librispeech/test.clean/2094-142345-0010.wav",
+      "duration": 30.615,
+      "ref": "hetty sorrel often took the opportunity when her aunt's back was turned of looking at the pleasing reflection of herself in those polished surfaces for the oak table was usually turned up like a screen and was more for ornament than for use and she could see herself sometimes in the great round pewter dishes that were ranged on the shelves above the long deal dinner table or in the hobs of the grate which always shone like jasper",
+      "hyp": "Hetty Searrele often took the opportunity, when her aunt's back was turned, of looking at the pleasing reflection of herself in those polished services for the oak table was usually turned up like a screen, and was more for ornament than for use and she could see herself, sometimes, in the great round pewter dishes that were ranged on the shelves above the long deal dinner table, or in the hobs of the grate which always shone like Jasper."
+    },
+    {
+      "id": "121-123859-0002",
+      "audio_filepath": "/home/hainanx/Workplace/NeMo_ord_sync_d146_current/audio_cache/librispeech/test.clean/121-123859-0002.wav",
+      "duration": 30.04,
+      "ref": "but reckoning time whose million'd accidents creep in twixt vows and change decrees of kings tan sacred beauty blunt the sharp'st intents divert strong minds to the course of altering things alas why fearing of time's tyranny might i not then say now i love you best when i was certain o'er incertainty crowning the present doubting of the rest",
+      "hyp": "But reckoning Time, whose millioned accidents Creep in'twixt vows, and change decrees of kings, Tan's sacred beauty, blunt the sharpest intents, Diverts strong minds to the course of altering things. Alas why fearing of Time's tyranny? Might I not then say, Now I love you best, When I was certain o'er in certainty, Crowning the present, doubting of the rest?"
+    },
+    {
+      "id": "4970-29093-0006",
+      "audio_filepath": "/home/hainanx/Workplace/NeMo_ord_sync_d146_current/audio_cache/librispeech/test.clean/4970-29093-0006.wav",
+      "duration": 29.6,
+      "ref": "law seemed to him well enough as a science but he never could discover a practical case where it appeared to him worth while to go to law and all the clients who stopped with this new clerk in the ante room of the law office where he was writing philip invariably advised to settle no matter how but settle greatly to the disgust of his employer who knew that justice between man and man could only be attained by the recognized processes with the attendant fees",
+      "hyp": "Law seemed to him well enough as a science, but he never could discover a practical case where it appeared to him worthwhile to go to law, and all the clients who stopped with this new clerk in the ante-room of the law office where he was writing, Philip invariably advised to settle, no matter how, but settle, greatly to the disgust of his employer, who knew that justice between man and man could only be attained by the recognized processes with the attendant fees."
+    }
+  ]
+}
