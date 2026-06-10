@@ -50,7 +50,6 @@ import lightning.pytorch as pl
 import torch
 from omegaconf import OmegaConf, open_dict
 
-from nemo.collections.asr.models import ASRModel
 from nemo.collections.asr.models import EncDecRNNTBPEModel
 from nemo.core.config import hydra_runner
 from nemo.utils import logging
@@ -69,10 +68,10 @@ def _load_base_model(cfg):
     base_name = cfg.get("base_model_name", None)
     if base_path:
         logging.info(f"Restoring base model from local file: {base_path}")
-        return ASRModel.restore_from(restore_path=base_path, map_location="cpu")
+        return EncDecRNNTBPEModel.restore_from(restore_path=base_path, map_location="cpu")
     if base_name:
         logging.info(f"Restoring base model from pretrained name: {base_name}")
-        return ASRModel.from_pretrained(model_name=base_name, map_location="cpu")
+        return EncDecRNNTBPEModel.from_pretrained(model_name=base_name, map_location="cpu")
     return None
 
 

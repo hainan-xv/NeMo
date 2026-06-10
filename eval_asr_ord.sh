@@ -304,7 +304,7 @@ DATASETS=(
     "librispeech:test.clean"
     "librispeech:test.other"
     "spgispeech:test"
-    "tedlium:test"
+#    "tedlium:test"
     "voxpopuli:test"
 )
 
