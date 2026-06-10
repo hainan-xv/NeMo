@@ -1,0 +1,13 @@
+{
+	"folders": [
+		{
+			"path": "../../../../../NeMo"
+		},
+		{
+			"path": "../../../.."
+		}
+	],
+	"settings": {
+		"git.ignoreLimitWarning": true
+	}
+}

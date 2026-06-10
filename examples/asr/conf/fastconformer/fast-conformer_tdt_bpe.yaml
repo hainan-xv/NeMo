@@ -1,50 +1,30 @@
-# Configuration for the Aligner-Encoder ASR model (sub-word / BPE), based on:
-#   Stooke et al., "Aligner-Encoders: Self-Attention Transformers Can Be Self-Transducers"
-#   https://arxiv.org/abs/2502.05232
+# FastConformer-TDT-BPE, large (~110M), full-context / offline.
 #
-# The Aligner-Encoder reuses a Conformer encoder and an RNN-T prediction network, but:
-#   * the joint network pairs encoder frame i with prediction-net step i one-to-one
-#     (the diagonal of the RNN-T lattice) -- there is no blank token;
-#   * training uses a frame-wise label-smoothed cross-entropy loss (no dynamic programming);
-#   * an EOS token is appended to every target and predicted to terminate decoding.
-#
-# Set `model.aligner_type` to:
-#   * "ar"    -> autoregressive decoder (prediction net + one-to-one joint). [default]
-#   * "nonar" -> non-autoregressive per-frame head f_ind(h_i) (CTC-like, no prediction net).
-#
-# For the autoregressive model you may also set `model.aux_nonar_loss_weight > 0` to add an
-# auxiliary non-autoregressive cross-entropy loss (analogous to a CTC auxiliary loss).
+# This config is the TDT counterpart to the Aligner-Encoder recipe in
+#   examples/asr/conf/aligner/aligner_encoder_bpe.yaml
+# The encoder (FastConformer-large, 8x dw_striding, full context), preprocessor,
+# spec_augment, tokenizer, data layout and optimizer are intentionally IDENTICAL
+# to that config so the two models can be compared apples-to-apples and differ
+# only in the decoder + loss (TDT here vs. the Aligner one-to-one CE loss there).
+# Both are trained from scratch (no pretrained warm start), since the available
+# pretrained checkpoints are TDT models and would unfairly advantage the TDT side.
 
-name: "Aligner-Encoder-BPE"
-
-# Optional warm-start from a base TDT/RNN-T model. When set, the entrypoint
-# derives the preprocessor / encoder / spec_augment sub-configs and the BPE
-# tokenizer from this model and warm-starts the encoder weights from it. The
-# Aligner prediction net / one-to-one joint / loss are always trained from scratch.
-base_model_path: null            # e.g. /pretrained/parakeet-tdt-0.6b-v2.nemo
-base_model_name: null            # e.g. nvidia/parakeet-tdt-0.6b-v2
-init_encoder_from_base: true     # encoder-only warm start (only if a base model is given)
-tokenizer_out_dir: null          # where to export the base tokenizer (default: temp dir)
+name: "FastConformer-TDT-BPE"
 
 model:
   sample_rate: 16000
-  compute_eval_loss: true
-  log_prediction: true
+  compute_eval_loss: false  # TDT loss on long eval utterances can exhaust memory; WER is still computed.
+  log_prediction: true      # log sample hyp/ref during training (standard NeMo WER metric behavior)
+  rnnt_reduction: 'mean_volume'
   skip_nan_grad: false
-
-  # Aligner-Encoder specific options
-  loss_type: "aligner"        # default RNNT path remains "rnnt"; this enables Aligner loss/decoding in RNNT model
-  aligner_type: "ar"          # "ar" or "nonar"
-  label_smoothing: 0.1        # label smoothing weight for the cross-entropy loss
-  aux_nonar_loss_weight: 0.0  # >0 adds an auxiliary non-AR loss to the AR model
-  log_stats_every_n_steps: 20 # rank-0 stdout [aligner-train] summary (<=0 disables)
-  log_prediction_every_n_steps: 100 # rank-0 stdout hyp/ref samples (<=0 disables)
-  log_prediction_num_samples: 2
 
   model_defaults:
     enc_hidden: ${model.encoder.d_model}
     pred_hidden: 640
     joint_hidden: 640
+    # TDT-specific: duration outputs predicted by the joiner.
+    tdt_durations: [0, 1, 2, 3, 4]
+    num_tdt_durations: 5
 
   train_ds:
     manifest_filepath: ???
@@ -53,7 +33,7 @@ model:
     shuffle: true
     num_workers: 8
     pin_memory: true
-    max_duration: 16.7
+    max_duration: 20.0
     min_duration: 0.1
     is_tarred: false
     tarred_audio_filepaths: null
@@ -79,7 +59,6 @@ model:
     num_workers: 8
     pin_memory: true
 
-  # recommend to use SPE Unigram tokenizer with vocab size of 1K to 4k when using 4x sub-sampling
   tokenizer:
     dir: ???  # path to directory which contains either tokenizer.model (bpe) or vocab.txt (for wpe)
     type: bpe  # Can be either bpe (SentencePiece tokenizer) or wpe (WordPiece tokenizer)
@@ -104,13 +83,8 @@ model:
     freq_width: 27
     time_width: 0.05
 
-  # FastConformer-large (~110M params, full-context / offline). Identical to the
-  # encoder used by the comparable TDT recipe (fast-conformer_tdt_bpe.yaml) so the
-  # two models differ only in the decoder/loss. NOTE: the Aligner one-to-one joint
-  # needs roughly T >= U (encoder frames >= target tokens, +1 for EOS); with 8x
-  # sub-sampling (80ms frames) this holds comfortably for <=20s utterances, but if
-  # you train on long, token-dense audio consider 4x sub-sampling or a lower
-  # max_duration.
+  # FastConformer-large (~110M params, full-context / offline). MUST stay identical
+  # to the encoder block in aligner_encoder_bpe.yaml for a fair comparison.
   encoder:
     _target_: nemo.collections.asr.modules.ConformerEncoder
     feat_in: ${model.preprocessor.features}
@@ -151,7 +125,6 @@ model:
     stochastic_depth_mode: linear
     stochastic_depth_start_layer: 1
 
-  # Prediction network (text-only recurrence). Used by the autoregressive variant.
   decoder:
     _target_: nemo.collections.asr.modules.RNNTDecoder
     normalization_mode: null
@@ -164,30 +137,52 @@ model:
       t_max: null
       dropout: 0.2
 
-  # One-to-one joint network. NOTE: this is the Aligner joint, not the RNN-T joint.
   joint:
-    _target_: nemo.collections.asr.modules.AlignerJoint
+    _target_: nemo.collections.asr.modules.RNNTJoint
     log_softmax: null
+    preserve_memory: false
+
+    fuse_loss_wer: true
+    fused_batch_size: 4
 
     jointnet:
       joint_hidden: ${model.model_defaults.joint_hidden}
       activation: "relu"
       dropout: 0.2
 
-  # Per-frame head for the non-autoregressive variant (also used when aux_nonar_loss_weight > 0).
-  ctc_head:
-    hidden: null       # null -> single linear projection; set an int for a 2-layer MLP
-    activation: "relu"
-    dropout: 0.0
+    num_extra_outputs: ${model.model_defaults.num_tdt_durations}
 
   decoding:
-    aligner_type: ${model.aligner_type}
-    max_symbols: null  # null -> bounded by the number of encoder frames
+    # Greedy is highly recommended for TDT models.
+    strategy: "greedy"
+    model_type: "tdt"
+    durations: ${model.model_defaults.tdt_durations}
+
+    greedy:
+      max_symbols: 10
+
+    beam:
+      beam_size: 2
+      return_best_hypothesis: False
+      score_norm: true
+      tsd_max_sym_exp: 50
+      alsd_max_target_len: 2.0
+
+  loss:
+    loss_name: "tdt"
+
+    tdt_kwargs:
+      fastemit_lambda: 0.0
+      clamp: -1.0
+      durations: ${model.model_defaults.tdt_durations}
+      sigma: 0.05   # under-normalization hyper-param (see https://arxiv.org/abs/2304.06795)
+      omega: 0.1    # weight for the auxiliary regular RNN-T loss
 
   optim:
+    # Kept identical to aligner_encoder_bpe.yaml (AdamW + CosineAnnealing) so both
+    # models train under the same optimization budget. lr / warmup are typically
+    # overridden from the launch script.
     name: adamw
-    # NOTE: with CosineAnnealing, `lr` is the actual peak LR (unlike NoamAnnealing,
-    # whose `lr` is a base multiplier scaled by d_model^-0.5 -> ~1e-8 effective).
     lr: 1e-4
     betas: [0.9, 0.98]
     weight_decay: 1e-3

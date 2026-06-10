@@ -219,6 +219,26 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         transcript_len: torch.Tensor,
     ) -> torch.Tensor:
         targets_eos, target_eos_len = self._append_aligner_eos(transcript, transcript_len)
+
+        # The one-to-one joint needs at least one encoder frame per target token,
+        # plus one for the appended EOS (i.e. T >= U + 1). In the very rare case
+        # that an utterance has too few frames (T < U + 1), there are not enough
+        # acoustic frames to supervise every token, so we drop it from the loss
+        # (mask its target length to 0 so it contributes nothing) and warn.
+        insufficient_frames = encoded_len < target_eos_len.to(encoded_len.device)
+        if torch.any(insufficient_frames):
+            bad_idx = torch.nonzero(insufficient_frames, as_tuple=False).flatten().tolist()
+            details = ", ".join(
+                f"(batch_idx={i}, T={int(encoded_len[i])}, U+1={int(target_eos_len[i])})" for i in bad_idx
+            )
+            logging.warning(
+                f"[aligner] Skipping {len(bad_idx)}/{int(encoded_len.size(0))} utterance(s) with too few "
+                f"encoder frames for the one-to-one joint (T < U+1): {details}. If this is not rare, lower "
+                f"model.train_ds.max_duration or the encoder subsampling_factor."
+            )
+            target_eos_len = target_eos_len.clone()
+            target_eos_len[insufficient_frames] = 0
+
         total_loss = encoded.new_zeros(())
 
         if self.aligner_type == 'ar' or self.aux_nonar_loss_weight > 0:
@@ -864,26 +884,41 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
             }
 
+            # All periodic logging keys off the trainer ``global_step`` so that the
+            # batch-WER computation, the stats summary and the hyp/ref sample logging
+            # stay in sync. (Previously the WER/decoding gate used ``batch_nb``, which
+            # resets every epoch and so almost never lined up with the
+            # ``global_step``-based stats/prediction gates -- the sampled hyp/ref
+            # comparison was therefore effectively never printed.)
+            global_step = self.trainer.global_step if self.trainer is not None else batch_nb
+            is_global_zero = self.trainer is not None and self.trainer.is_global_zero
+
             log_every_n_steps = self._trainer.log_every_n_steps if self._trainer is not None else 1
-            compute_train_wer = log_every_n_steps > 0 and (batch_nb + 1) % log_every_n_steps == 0
+            log_stats_every_n_steps = int(self.cfg.get('log_stats_every_n_steps', 10))
+            log_prediction_every_n_steps = int(self.cfg.get('log_prediction_every_n_steps', 100))
+
+            log_train_wer = log_every_n_steps > 0 and global_step % log_every_n_steps == 0
+            log_stats = log_stats_every_n_steps > 0 and is_global_zero and global_step % log_stats_every_n_steps == 0
+            log_prediction = (
+                log_prediction_every_n_steps > 0
+                and is_global_zero
+                and global_step % log_prediction_every_n_steps == 0
+            )
+
+            # Decode once if either the batch-WER value or the hyp/ref samples are needed this step.
             train_wer = None
             hypotheses = None
             references = None
-            if compute_train_wer:
+            if log_train_wer or log_prediction:
                 with torch.no_grad():
                     hypotheses, _ = self.decoding.decode_encoder_output(encoded.detach(), encoded_len)
                     references = self._references_from_targets(transcript, transcript_len)
                     scores, words = self._wer_counts(hypotheses, references)
                     train_wer = torch.tensor(scores / max(words, 1), dtype=torch.float32, device=encoded.device)
+                if log_train_wer:
                     tensorboard_logs['training_batch_wer'] = train_wer
 
-            log_stats_every_n_steps = int(self.cfg.get('log_stats_every_n_steps', 10))
-            if (
-                log_stats_every_n_steps > 0
-                and self.trainer is not None
-                and self.trainer.is_global_zero
-                and self.trainer.global_step % log_stats_every_n_steps == 0
-            ):
+            if log_stats:
                 logging.info(
                     "[aligner-train] "
                     f"step={self.trainer.global_step} "
@@ -898,25 +933,12 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                     + (f" training_batch_wer={float(train_wer.detach().cpu()):.4f}" if train_wer is not None else "")
                 )
 
-            log_prediction_every_n_steps = int(self.cfg.get('log_prediction_every_n_steps', 100))
-            if (
-                compute_train_wer
-                and log_prediction_every_n_steps > 0
-                and hypotheses is not None
-                and references is not None
-                and self.trainer is not None
-                and self.trainer.is_global_zero
-                and self.trainer.global_step % log_prediction_every_n_steps == 0
-            ):
+            if log_prediction and hypotheses is not None and references is not None:
                 max_samples = min(int(self.cfg.get('log_prediction_num_samples', 2)), len(hypotheses))
                 for sample_idx in range(max_samples):
-                    logging.info(
-                        "[aligner-train-sample] "
-                        f"step={self.trainer.global_step} "
-                        f"sample={sample_idx} "
-                        f'hyp="{hypotheses[sample_idx]}" '
-                        f'ref="{references[sample_idx]}"'
-                    )
+                    logging.info("\n")
+                    logging.info(f"WER reference:{references[sample_idx]}")
+                    logging.info(f"WER predicted:{hypotheses[sample_idx]}")
 
             self.log_dict(tensorboard_logs)
             return {'loss': loss_value}
@@ -1139,6 +1161,18 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         wer_num = torch.stack([x['val_wer_num'] for x in outputs]).sum()
         wer_denom = torch.stack([x['val_wer_denom'] for x in outputs]).sum()
         tensorboard_logs = {**val_loss_log, 'val_wer': wer_num.float() / wer_denom}
+        if self.loss_type == 'aligner' and self.trainer is not None and self.trainer.is_global_zero:
+            val_loss_msg = (
+                f" val_loss={float(val_loss_mean.detach().float().cpu()):.4f}" if self.compute_eval_loss else ""
+            )
+            logging.info(
+                "[aligner-val] "
+                f"step={self.trainer.global_step} "
+                f"epoch={self.trainer.current_epoch}"
+                f"{val_loss_msg} "
+                f"val_wer={float(tensorboard_logs['val_wer'].detach().float().cpu()):.4f} "
+                f"words={int(wer_denom.detach().cpu())}"
+            )
         return {**val_loss_log, 'log': tensorboard_logs}
 
     def multi_test_epoch_end(self, outputs, dataloader_idx: int = 0):
