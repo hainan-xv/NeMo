@@ -830,6 +830,12 @@ class ChunkedAlignerLossNumba(Module):
         act_lens: [B] acoustic lengths.
         label_lens: [B] label lengths.
         """
+        # The Numba CUDA kernels support float32 / float16 but not bfloat16 (and
+        # under bf16/fp16 autocast the joint emits a reduced-precision tensor).
+        # Cast bf16 -> fp32 so the kernel always sees a supported dtype; autograd
+        # chains the cast + log_softmax Jacobian back to the original dtype.
+        if acts.dtype not in (torch.float32, torch.float16):
+            acts = acts.float()
         # log_softmax is differentiable, so autograd chains its Jacobian onto the
         # gradients returned by the kernel (which are w.r.t. the log-probs).
         log_probs = torch.log_softmax(acts, dim=-1).contiguous()

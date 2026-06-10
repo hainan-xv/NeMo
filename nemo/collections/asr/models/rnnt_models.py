@@ -40,8 +40,10 @@ from nemo.collections.asr.parts.mixins import (
     TranscribeConfig,
     TranscriptionReturnType,
 )
+from nemo.collections.asr.parts.numba.rnnt_loss.rnnt_pytorch import ChunkedAlignerLossNumba
 from nemo.collections.asr.parts.preprocessing.segment import ChannelSelectorType
 from nemo.collections.asr.parts.submodules.aligner_decoding import AlignerDecoding
+from nemo.collections.asr.parts.submodules.chunked_aligner_decoding import ChunkedAlignerDecoding
 from nemo.collections.asr.parts.submodules.rnnt_decoding import RNNTDecoding, RNNTDecodingConfig
 from nemo.collections.asr.parts.utils.asr_batching import get_semi_sorted_batch_sampler
 from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
@@ -66,8 +68,10 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
         super().__init__(cfg=cfg, trainer=trainer)
         self.loss_type = str(self.cfg.get('loss_type', 'rnnt')).lower()
-        if self.loss_type not in ('rnnt', 'aligner'):
-            raise ValueError(f"model.loss_type must be one of ['rnnt', 'aligner'], got '{self.loss_type}'.")
+        if self.loss_type not in ('rnnt', 'aligner', 'chunked_aligner'):
+            raise ValueError(
+                f"model.loss_type must be one of ['rnnt', 'aligner', 'chunked_aligner'], got '{self.loss_type}'."
+            )
 
         # Initialize components
         self.preprocessor = EncDecRNNTModel.from_config_dict(self.cfg.preprocessor)
@@ -76,6 +80,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         if self.loss_type == 'aligner':
             self._setup_aligner_model_components()
         else:
+            # Standard RNN-T decoder + joint (shared by 'rnnt' and 'chunked_aligner').
             # Update config values required by components dynamically
             with open_dict(self.cfg.decoder):
                 self.cfg.decoder.vocab_size = len(self.cfg.labels)
@@ -89,27 +94,33 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             self.decoder = EncDecRNNTModel.from_config_dict(self.cfg.decoder)
             self.joint = EncDecRNNTModel.from_config_dict(self.cfg.joint)
 
-            # Setup RNNT Loss
-            loss_name, loss_kwargs = self.extract_rnnt_loss_cfg(self.cfg.get("loss", None))
+            if self.loss_type == 'chunked_aligner':
+                self._setup_chunked_aligner_loss_and_decoding()
+            else:
+                # Setup RNNT Loss
+                loss_name, loss_kwargs = self.extract_rnnt_loss_cfg(self.cfg.get("loss", None))
 
-            num_classes = self.joint.num_classes_with_blank - 1  # for standard RNNT and multi-blank
+                num_classes = self.joint.num_classes_with_blank - 1  # for standard RNNT and multi-blank
 
-            if loss_name == 'tdt':
-                num_classes = num_classes - self.joint.num_extra_outputs
+                if loss_name == 'tdt':
+                    num_classes = num_classes - self.joint.num_extra_outputs
 
-            self.loss = RNNTLoss(
-                num_classes=num_classes,
-                loss_name=loss_name,
-                loss_kwargs=loss_kwargs,
-                reduction=self.cfg.get("rnnt_reduction", "mean_batch"),
-            )
+                self.loss = RNNTLoss(
+                    num_classes=num_classes,
+                    loss_name=loss_name,
+                    loss_kwargs=loss_kwargs,
+                    reduction=self.cfg.get("rnnt_reduction", "mean_batch"),
+                )
 
         if hasattr(self.cfg, 'spec_augment') and self._cfg.spec_augment is not None:
             self.spec_augmentation = EncDecRNNTModel.from_config_dict(self.cfg.spec_augment)
         else:
             self.spec_augmentation = None
 
-        if self.loss_type != 'aligner':
+        # 'aligner' and 'chunked_aligner' use their own decoding objects (set up
+        # above) plus a manual edit-distance WER; only standard RNN-T uses the
+        # RNNTDecoding + WER metric objects here.
+        if self.loss_type == 'rnnt':
             self.cfg.decoding = self.set_decoding_type_according_to_loss(self.cfg.decoding)
             # Setup decoding objects
             self.decoding = RNNTDecoding(
@@ -134,7 +145,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             self.compute_eval_loss = True
 
         # Setup fused Joint step if flag is set
-        if self.loss_type != 'aligner' and (self.joint.fuse_loss_wer or (
+        if self.loss_type == 'rnnt' and (self.joint.fuse_loss_wer or (
             self.decoding.joint_fused_batch_size is not None and self.decoding.joint_fused_batch_size > 0
         )):
             self.joint.set_loss(self.loss)
@@ -257,6 +268,89 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 total_loss = total_loss + self.aux_nonar_loss_weight * nonar_loss
 
         return total_loss
+
+    def _setup_chunked_aligner_loss_and_decoding(self):
+        """Set up the streaming Chunked-Aligner loss + greedy decoding.
+
+        The Chunked Aligner reuses the standard RNN-T prediction net and joint
+        (built by the caller). Compared to RNN-T it only swaps in the full-sum
+        chunked-aligner loss and a chunked greedy decoder; the blank symbol
+        doubles as the end-of-chunk (EOC) signal.
+        """
+        ca_cfg = self.cfg.get('chunked_aligner', None)
+        self.chunk_size = int(ca_cfg.get('chunk_size', 12)) if ca_cfg is not None else 12
+        if self.chunk_size < 1:
+            raise ValueError(f"model.chunked_aligner.chunk_size must be >= 1, got {self.chunk_size}.")
+
+        blank_id = self.joint.num_classes_with_blank - 1
+
+        self.loss = ChunkedAlignerLossNumba(
+            blank=blank_id,
+            chunk_size=self.chunk_size,
+            reduction='mean',
+            clamp=float(ca_cfg.get('clamp', -1.0)) if ca_cfg is not None else -1.0,
+        )
+
+        self.decoding = ChunkedAlignerDecoding(
+            decoding_cfg=self.cfg.get('decoding', None),
+            decoder=self.decoder,
+            joint=self.joint,
+            blank_id=blank_id,
+            chunk_size=self.chunk_size,
+            vocabulary=self.joint.vocabulary,
+            tokenizer=getattr(self, 'tokenizer', None),
+        )
+
+    def _chunked_aligner_loss(
+        self,
+        encoded: torch.Tensor,
+        encoded_len: torch.Tensor,
+        transcript: torch.Tensor,
+        transcript_len: torch.Tensor,
+    ) -> torch.Tensor:
+        # The chunked lattice needs at least one encoder frame per target token
+        # (T >= U). Utterances with too few frames cannot host all tokens, so we
+        # drop them from the loss (mask label length to 0) and warn -- mirroring
+        # the offline Aligner's feasibility guard.
+        transcript_len = transcript_len.to(encoded_len.device)
+        insufficient_frames = encoded_len < transcript_len
+        if torch.any(insufficient_frames):
+            bad_idx = torch.nonzero(insufficient_frames, as_tuple=False).flatten().tolist()
+            details = ", ".join(
+                f"(batch_idx={i}, T={int(encoded_len[i])}, U={int(transcript_len[i])})" for i in bad_idx
+            )
+            logging.warning(
+                f"[chunked-aligner] Skipping {len(bad_idx)}/{int(encoded_len.size(0))} utterance(s) with too "
+                f"few encoder frames for the chunked lattice (T < U): {details}. If this is not rare, lower "
+                f"model.train_ds.max_duration or the encoder subsampling_factor."
+            )
+            transcript_len = transcript_len.clone()
+            transcript_len[insufficient_frames] = 0
+
+        # The encoder / decoder may emit a few extra padding steps relative to the
+        # valid lengths. The kernel requires acts to be exactly [B, max_T, max_U+1, V],
+        # so trim the transcript (-> U) before the joint and the joint (-> T) after,
+        # mirroring the standard RNNTLoss wrapper.
+        max_logit_len = int(encoded_len.max().item())
+        max_targets_len = int(transcript_len.max().item())
+        if transcript.shape[1] != max_targets_len:
+            transcript = transcript.narrow(dim=1, start=0, length=max_targets_len).contiguous()
+
+        decoder_outputs, _, _ = self.decoder(targets=transcript, target_length=transcript_len)
+        # Raw joint logits [B, T, U, V]; the loss applies log_softmax internally.
+        joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder_outputs)
+        if joint.shape[1] != max_logit_len:
+            joint = joint.narrow(dim=1, start=0, length=max_logit_len).contiguous()
+
+        loss_value = self.loss(
+            acts=joint,
+            labels=transcript,
+            act_lens=encoded_len,
+            label_lens=transcript_len,
+        )
+        if loss_value.dim() > 0:
+            loss_value = loss_value.squeeze()
+        return loss_value
 
     def _references_from_targets(self, transcript: torch.Tensor, transcript_len: torch.Tensor) -> List[str]:
         transcript = transcript.long().cpu()
@@ -871,8 +965,11 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
         del signal
 
-        if self.loss_type == 'aligner':
-            loss_value = self._aligner_loss(encoded, encoded_len, transcript, transcript_len)
+        if self.loss_type in ('aligner', 'chunked_aligner'):
+            if self.loss_type == 'aligner':
+                loss_value = self._aligner_loss(encoded, encoded_len, transcript, transcript_len)
+            else:
+                loss_value = self._chunked_aligner_loss(encoded, encoded_len, transcript, transcript_len)
             loss_value = self.add_auxiliary_losses(loss_value)
 
             if AccessMixin.is_access_enabled(self.model_guid):
@@ -920,7 +1017,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
             if log_stats:
                 logging.info(
-                    "[aligner-train] "
+                    f"[{self.loss_type}-train] "
                     f"step={self.trainer.global_step} "
                     f"epoch={self.trainer.current_epoch} "
                     f"loss={float(loss_value.detach().float().cpu()):.4f} "
@@ -1037,7 +1134,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
         del signal
 
-        if self.loss_type == 'aligner':
+        if self.loss_type in ('aligner', 'chunked_aligner'):
             texts, _ = self.decoding.decode_encoder_output(encoded, encoded_len)
             if isinstance(sample_id, torch.Tensor):
                 sample_id = sample_id.cpu().detach().numpy()
@@ -1063,9 +1160,16 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
         tensorboard_logs = {}
 
-        if self.loss_type == 'aligner':
+        if self.loss_type in ('aligner', 'chunked_aligner'):
             if self.compute_eval_loss:
-                tensorboard_logs['val_loss'] = self._aligner_loss(encoded, encoded_len, transcript, transcript_len)
+                if self.loss_type == 'aligner':
+                    tensorboard_logs['val_loss'] = self._aligner_loss(
+                        encoded, encoded_len, transcript, transcript_len
+                    )
+                else:
+                    tensorboard_logs['val_loss'] = self._chunked_aligner_loss(
+                        encoded, encoded_len, transcript, transcript_len
+                    )
 
             hypotheses, _ = self.decoding.decode_encoder_output(encoded, encoded_len)
             references = self._references_from_targets(transcript, transcript_len)
@@ -1161,12 +1265,16 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         wer_num = torch.stack([x['val_wer_num'] for x in outputs]).sum()
         wer_denom = torch.stack([x['val_wer_denom'] for x in outputs]).sum()
         tensorboard_logs = {**val_loss_log, 'val_wer': wer_num.float() / wer_denom}
-        if self.loss_type == 'aligner' and self.trainer is not None and self.trainer.is_global_zero:
+        if (
+            self.loss_type in ('aligner', 'chunked_aligner')
+            and self.trainer is not None
+            and self.trainer.is_global_zero
+        ):
             val_loss_msg = (
                 f" val_loss={float(val_loss_mean.detach().float().cpu()):.4f}" if self.compute_eval_loss else ""
             )
             logging.info(
-                "[aligner-val] "
+                f"[{self.loss_type}-val] "
                 f"step={self.trainer.global_step} "
                 f"epoch={self.trainer.current_epoch}"
                 f"{val_loss_msg} "
@@ -1199,7 +1307,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         encoded = outputs.pop('encoded')
         encoded_len = outputs.pop('encoded_len')
 
-        if self.loss_type == 'aligner':
+        if self.loss_type in ('aligner', 'chunked_aligner'):
             texts, token_ids = self.decoding.decode_encoder_output(encoded, encoded_len)
             del encoded, encoded_len
             return [

@@ -244,7 +244,10 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
 
         super().__init__(cfg=cfg, trainer=trainer)
 
-        if getattr(self, 'loss_type', 'rnnt') == 'aligner':
+        # The Aligner / Chunked-Aligner variants build their own decoding objects
+        # (and a manual WER) inside the base __init__, so skip the RNNT-BPE
+        # decoding / WER / fused-joint setup below.
+        if getattr(self, 'loss_type', 'rnnt') in ('aligner', 'chunked_aligner'):
             return
 
         self.cfg.decoding = self.set_decoding_type_according_to_loss(self.cfg.decoding)
@@ -333,6 +336,34 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
 
             self._setup_aligner_model_components()
             logging.info(f"Changed tokenizer/vocabulary to {len(vocabulary)} tokens (+EOS) for Aligner mode.")
+            return
+
+        if getattr(self, 'loss_type', 'rnnt') == 'chunked_aligner':
+            vocabulary = self.tokenizer.tokenizer.get_vocab()
+            if isinstance(vocabulary, dict):
+                vocabulary = list(vocabulary.keys())
+            else:
+                vocabulary = list(vocabulary)
+
+            with open_dict(self.cfg):
+                self.cfg.tokenizer = tokenizer_cfg
+                self.cfg.labels = ListConfig(vocabulary)
+
+            with open_dict(self.cfg.decoder):
+                self.cfg.decoder.vocab_size = len(vocabulary)
+            with open_dict(self.cfg.joint):
+                self.cfg.joint.num_classes = len(vocabulary)
+                self.cfg.joint.vocabulary = ListConfig(vocabulary)
+                self.cfg.joint.jointnet.encoder_hidden = self.cfg.model_defaults.enc_hidden
+                self.cfg.joint.jointnet.pred_hidden = self.cfg.model_defaults.pred_hidden
+
+            del self.decoder, self.joint, self.loss
+            self.decoder = EncDecRNNTBPEModel.from_config_dict(self.cfg.decoder)
+            self.joint = EncDecRNNTBPEModel.from_config_dict(self.cfg.joint)
+            self._setup_chunked_aligner_loss_and_decoding()
+            logging.info(
+                f"Changed tokenizer/vocabulary to {len(vocabulary)} tokens for Chunked-Aligner mode."
+            )
             return
 
         # Initialize a dummy vocabulary
