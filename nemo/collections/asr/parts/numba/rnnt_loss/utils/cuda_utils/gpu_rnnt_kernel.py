@@ -1816,3 +1816,317 @@ def multistream_tdt_compute_grad_kernel(
                 label_grads[col * alphabet_size + idx] = g
 
             idx += GPU_RNNT_THREAD_SIZE
+
+
+# --------------------------------------------------------------------------- #
+# Chunked-Aligner kernels
+#
+# Alignment-free, full-sum training objective for the streaming "Chunked
+# Aligner" (the chunked generalization of the offline Aligner-Encoder). See the
+# loop-based reference `nemo/collections/asr/losses/chunked_aligner_pytorch.py`
+# for the full derivation; the kernels below implement the exact same lattice.
+#
+# Differences from the RNN-T / TDT kernels above:
+#   1) The activation tensor handed to these kernels is ALREADY a normalized
+#      log-prob (a single `log_softmax(acts, dim=-1)` done in PyTorch), so there
+#      is no `denom`/`sigma` term and no internal log_softmax. The log_softmax
+#      Jacobian is handled by autograd (see `ChunkedAlignerLossNumba`). The
+#      gradient w.r.t. each log-prob entry is therefore simply the negative
+#      expected count of the (single) arc that consumes it.
+#   2) The lattice has only two arc types and they are deterministic given the
+#      state (t, u): a *token* arc emits `labels[u]` and advances one frame
+#      (t -> t + 1, u -> u + 1, the within-chunk diagonal), and a *blank*/EOC arc
+#      emits the blank and jumps to the start of the next chunk
+#      (t -> ((t // C) + 1) * C, u unchanged). Both consume exactly one frame's
+#      activation. Because dependencies always move to a strictly larger `t`, the
+#      kernels iterate over `t` directly (one thread per `u`) instead of the
+#      RNN-T anti-diagonal wavefront.
+#
+# Layout (matching the RNN-T kernels): `acts` is [B, T, U, V] flattened, where
+# U = maxU = max_label_len + 1 indexes the predictor state (number of tokens
+# emitted so far) and the blank lives at index `blank_`. For sample b, the valid
+# region is t in [0, T_b) and u in [0, U_b] with U_b = ylen[b] (so U := U_b + 1).
+# --------------------------------------------------------------------------- #
+
+
+@cuda.jit()
+def chunked_aligner_compute_alphas_kernel(
+    acts: torch.Tensor,
+    alphas: torch.Tensor,
+    llForward: torch.Tensor,
+    xlen: torch.Tensor,
+    ylen: torch.Tensor,
+    mlabels: torch.Tensor,  # [B, U]
+    minibatch: int,
+    maxT: int,
+    maxU: int,
+    alphabet_size: int,
+    blank_: int,
+    chunk_size: int,
+):
+    """Forward (alpha) recursion for the Chunked-Aligner lattice.
+
+    ``alphas[b, t, u]`` = log-prob of arriving at frame ``t`` having emitted ``u``
+    tokens. Two incoming arcs feed each state:
+
+    * token arc ``(t-1, u-1) -> (t, u)``: ``alpha[t-1, u-1] + logp(t-1, u-1, y_u)``;
+    * blank/EOC arcs: when ``t`` is a chunk start (``t % C == 0``, ``t >= C``), a
+      blank emitted at *any* frame ``t'`` of the previous chunk lands here:
+      ``sum_{t'} alpha[t', u] + logp(t', u, blank)``.
+
+    The forward log-likelihood sums the two terminal cases (a blank at any frame
+    of the last chunk with all tokens emitted, or the last token emitted exactly
+    on the final audio frame).
+
+    Args:
+        acts: already log_softmaxed activations [B, T, U, V] (flattened).
+        alphas: [B, T, U] scratch buffer, updated in-place with forward scores.
+        llForward: [B] buffer for the per-sample forward log-likelihood.
+        xlen / ylen: acoustic / label lengths [B].
+        mlabels: target labels [B, U].
+        chunk_size: number of encoder frames per chunk ``C``.
+    """
+    b = cuda.blockIdx.x  # batch id
+    u = cuda.threadIdx.x  # predictor state id (number of tokens emitted)
+    T = xlen[b]
+    U = ylen[b] + 1
+
+    labels = mlabels[b]
+    offset = b * maxT * maxU
+
+    # Base case alpha[b, 0, 0] = 0.
+    if u == 0:
+        alphas[offset] = 0.0
+
+    cuda.syncthreads()
+
+    # Iterate frames left-to-right; every dependency is at a strictly smaller t.
+    for t in range(0, T):
+        if u < U and not (t == 0 and u == 0):
+            n = t // chunk_size
+            val = -INF
+
+            # token arc: (t-1, u-1) -> (t, u)
+            if t >= 1 and u >= 1:
+                val = rnnt_helper.log_sum_exp(
+                    val,
+                    alphas[offset + (t - 1) * maxU + (u - 1)]
+                    + logp_ms(acts, maxT, maxU, alphabet_size, b, t - 1, u - 1, labels[u - 1]),
+                )
+
+            # blank/EOC arcs: any frame of the previous chunk -> this chunk start
+            if (t - n * chunk_size) == 0 and n >= 1:
+                for t_prev in range((n - 1) * chunk_size, n * chunk_size):
+                    val = rnnt_helper.log_sum_exp(
+                        val,
+                        alphas[offset + t_prev * maxU + u]
+                        + logp_ms(acts, maxT, maxU, alphabet_size, b, t_prev, u, blank_),
+                    )
+
+            alphas[offset + t * maxU + u] = val
+
+        cuda.syncthreads()
+
+    # Termination: combine the blank-EOC and the trailing-token completions.
+    if u == 0:
+        n_chunks = (T + chunk_size - 1) // chunk_size
+        last_chunk_start = (n_chunks - 1) * chunk_size
+        loglike = -INF
+
+        # (a) blank/EOC at any frame of the last chunk, with all tokens emitted.
+        for t_prev in range(last_chunk_start, T):
+            loglike = rnnt_helper.log_sum_exp(
+                loglike,
+                alphas[offset + t_prev * maxU + (U - 1)]
+                + logp_ms(acts, maxT, maxU, alphabet_size, b, t_prev, U - 1, blank_),
+            )
+
+        # (b) last token emitted exactly on the final audio frame (full last chunk).
+        if U - 1 >= 1:
+            loglike = rnnt_helper.log_sum_exp(
+                loglike,
+                alphas[offset + (T - 1) * maxU + (U - 2)]
+                + logp_ms(acts, maxT, maxU, alphabet_size, b, T - 1, U - 2, labels[U - 2]),
+            )
+
+        llForward[b] = loglike
+
+
+@cuda.jit()
+def chunked_aligner_compute_betas_kernel(
+    acts: torch.Tensor,
+    betas: torch.Tensor,
+    llBackward: torch.Tensor,
+    xlen: torch.Tensor,
+    ylen: torch.Tensor,
+    mlabels: torch.Tensor,  # [B, U]
+    minibatch: int,
+    maxT: int,
+    maxU: int,
+    alphabet_size: int,
+    blank_: int,
+    chunk_size: int,
+):
+    """Backward (beta) recursion for the Chunked-Aligner lattice.
+
+    ``betas[b, t, u]`` = log-prob of completing the utterance starting from state
+    ``(t, u)``. Each state has (up to) two outgoing arcs, the reverse of the alpha
+    arcs:
+
+    * token arc ``(t, u) -> (t+1, u+1)``: valid while ``u < U - 1``. When the
+      destination falls off the last frame it is a terminal completion (the last
+      token landed on the final audio frame).
+    * blank/EOC arc ``(t, u) -> ((t//C + 1)*C, u)``: when the destination chunk
+      start is past the audio it is a terminal completion (only if all tokens are
+      already emitted, ``u == U - 1``).
+
+    ``betas[b, 0, 0]`` equals the forward log-likelihood and is returned via
+    ``llBackward`` (used only as a numerical cross-check).
+    """
+    b = cuda.blockIdx.x
+    u = cuda.threadIdx.x
+    T = xlen[b]
+    U = ylen[b] + 1
+
+    labels = mlabels[b]
+    offset = b * maxT * maxU
+
+    # Iterate frames right-to-left; every dependency is at a strictly larger t.
+    for t in range(T - 1, -1, -1):
+        if u < U:
+            n = t // chunk_size
+            val = -INF
+
+            # token arc out: (t, u) -> (t+1, u+1), emitting labels[u]
+            if u < U - 1:
+                if t + 1 < T:
+                    val = rnnt_helper.log_sum_exp(
+                        val,
+                        logp_ms(acts, maxT, maxU, alphabet_size, b, t, u, labels[u])
+                        + betas[offset + (t + 1) * maxU + (u + 1)],
+                    )
+                elif u == U - 2:
+                    # token lands on the final frame and completes the transcript.
+                    val = rnnt_helper.log_sum_exp(
+                        val, logp_ms(acts, maxT, maxU, alphabet_size, b, t, u, labels[u])
+                    )
+
+            # blank/EOC arc out: (t, u) -> (next chunk start, u)
+            dest_t = (n + 1) * chunk_size
+            if dest_t < T:
+                val = rnnt_helper.log_sum_exp(
+                    val,
+                    logp_ms(acts, maxT, maxU, alphabet_size, b, t, u, blank_)
+                    + betas[offset + dest_t * maxU + u],
+                )
+            elif u == U - 1:
+                # blank in the last chunk, with all tokens emitted -> completion.
+                val = rnnt_helper.log_sum_exp(val, logp_ms(acts, maxT, maxU, alphabet_size, b, t, u, blank_))
+
+            betas[offset + t * maxU + u] = val
+
+        cuda.syncthreads()
+
+    if u == 0:
+        llBackward[b] = betas[offset]
+
+
+@cuda.jit()
+def chunked_aligner_compute_grad_kernel(
+    grads: torch.Tensor,
+    acts: torch.Tensor,
+    alphas: torch.Tensor,
+    betas: torch.Tensor,
+    logll: torch.Tensor,
+    xlen: torch.Tensor,
+    ylen: torch.Tensor,
+    mlabels: torch.Tensor,  # [B, U]
+    minibatch: int,
+    maxT: int,
+    maxU: int,
+    alphabet_size: int,
+    blank_: int,
+    chunk_size: int,
+    clamp: float,
+):
+    """Gradient of the Chunked-Aligner loss w.r.t. the (already log-softmaxed) log-probs.
+
+    Because the inputs are log-probs, ``d(-logL)/d logp[t, u, v]`` is just the
+    negative posterior probability of the single arc that consumes ``logp[t, u, v]``.
+    Only two columns are ever non-zero at a state ``(t, u)``: the token column
+    ``labels[u]`` (token arc) and the blank column (blank/EOC arc). The remaining
+    per-stream log_softmax Jacobian is applied in PyTorch by autograd.
+    """
+    tid = cuda.threadIdx.x
+    idx = tid
+    col = cuda.blockIdx.x  # fused (b, t, u)
+
+    u = col % maxU
+    bt = (col - u) // maxU
+    t = bt % maxT
+    mb = (bt - t) // maxT
+
+    T = xlen[mb]
+    U = ylen[mb] + 1
+    labels = mlabels[mb]
+    offset = (mb * maxT) * maxU
+
+    if t < T and u < U:
+        n = t // chunk_size
+
+        # ----- token arc posterior P(token arc at (t, u)) -----
+        token_arc = False
+        p_token = 0.0
+        if u < U - 1:
+            if t + 1 < T:
+                token_arc = True
+                p_token = math.exp(
+                    alphas[col]
+                    + logp_ms(acts, maxT, maxU, alphabet_size, mb, t, u, labels[u])
+                    + betas[offset + (t + 1) * maxU + (u + 1)]
+                    - logll[mb]
+                )
+            elif u == U - 2:
+                token_arc = True
+                p_token = math.exp(
+                    alphas[col] + logp_ms(acts, maxT, maxU, alphabet_size, mb, t, u, labels[u]) - logll[mb]
+                )
+
+        # ----- blank/EOC arc posterior P(blank arc at (t, u)) -----
+        blank_arc = False
+        p_blank = 0.0
+        dest_t = (n + 1) * chunk_size
+        if dest_t < T:
+            blank_arc = True
+            p_blank = math.exp(
+                alphas[col]
+                + logp_ms(acts, maxT, maxU, alphabet_size, mb, t, u, blank_)
+                + betas[offset + dest_t * maxU + u]
+                - logll[mb]
+            )
+        elif u == U - 1:
+            blank_arc = True
+            p_blank = math.exp(
+                alphas[col] + logp_ms(acts, maxT, maxU, alphabet_size, mb, t, u, blank_) - logll[mb]
+            )
+
+        token_label = labels[u] if u < U - 1 else -1
+
+        # Scatter the negative arc posteriors over the vocabulary (sparse: only the
+        # token column and the blank column are non-zero).
+        while idx < alphabet_size:
+            grad = 0.0
+            if blank_arc and idx == blank_:
+                grad -= p_blank
+            if token_arc and idx == token_label:
+                grad -= p_token
+
+            grads[col * alphabet_size + idx] = grad
+
+            if clamp > 0.0:
+                g = grads[col * alphabet_size + idx]
+                g = min(g, clamp)
+                g = max(g, -clamp)
+                grads[col * alphabet_size + idx] = g
+
+            idx += GPU_RNNT_THREAD_SIZE

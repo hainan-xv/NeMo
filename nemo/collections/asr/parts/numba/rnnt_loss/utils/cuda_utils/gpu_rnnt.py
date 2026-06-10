@@ -946,3 +946,186 @@ class GPUMultistreamTDT(GPUTDT):
         self.stream_.synchronize()
 
         return global_constants.RNNTStatus.RNNT_STATUS_SUCCESS
+
+
+class GPUChunkedAligner:
+    """Launch CUDA kernels for the Chunked-Aligner loss.
+
+    Unlike :class:`GPURNNT`, the activation tensor handed to this wrapper is
+    expected to be ALREADY normalized log-probs (a single ``log_softmax`` done in
+    PyTorch). No ``denom`` is computed inside the kernels; the log_softmax
+    Jacobian is handled in PyTorch by autograd (see ``ChunkedAlignerLossNumba``).
+    The kernels therefore compute the gradient w.r.t. the log-probs directly,
+    which is just the negative expected count of the arcs consuming each entry.
+    """
+
+    def __init__(
+        self,
+        minibatch: int,
+        maxT: int,
+        maxU: int,
+        alphabet_size: int,
+        workspace,
+        blank: int,
+        chunk_size: int,
+        clamp: float,
+        num_threads: int,
+        stream,
+    ):
+        """
+        Args:
+            minibatch: batch size.
+            maxT: maximum acoustic length (T in the log-probs tensor).
+            maxU: maximum predictor length (max_label_len + 1).
+            alphabet_size: vocabulary size V (blank included).
+            workspace: flat float buffer used for alphas/betas/log-likelihoods.
+            blank: index of the blank / end-of-chunk symbol.
+            chunk_size: number of encoder frames per chunk.
+            clamp: gradient clamp value; <= 0 disables clamping.
+            num_threads: number of OMP threads (numba).
+            stream: numba CUDA stream.
+        """
+        self.minibatch_ = minibatch
+        self.maxT_ = maxT
+        self.maxU_ = maxU
+        self.alphabet_size_ = alphabet_size
+        self.gpu_workspace = cuda.as_cuda_array(workspace)
+        self.blank_ = blank
+        self.chunk_size_ = chunk_size
+        self.clamp_ = abs(clamp)
+        self.num_threads_ = num_threads
+        self.stream_ = stream
+
+        if num_threads > 0:
+            numba.set_num_threads(min(multiprocessing.cpu_count(), num_threads))
+            self.num_threads_ = numba.get_num_threads()
+        else:
+            self.num_threads_ = numba.get_num_threads()
+
+    def compute_cost_and_score(
+        self,
+        acts: torch.Tensor,
+        grads: Optional[torch.Tensor],
+        costs: torch.Tensor,
+        labels: torch.Tensor,
+        label_lengths: torch.Tensor,
+        input_lengths: torch.Tensor,
+    ) -> global_constants.RNNTStatus:
+        training = grads is not None
+
+        if training:
+            grads *= 0.0  # zero grads
+
+        _, (alphas, betas, llForward, llBackward) = self._prepare_workspace()
+
+        # `acts` are already log-probs, so no log_softmax / denom is needed.
+        gpu_rnnt_kernel.chunked_aligner_compute_alphas_kernel[self.minibatch_, self.maxU_, self.stream_, 0](
+            acts,
+            alphas,
+            llForward,
+            input_lengths,
+            label_lengths,
+            labels,
+            self.minibatch_,
+            self.maxT_,
+            self.maxU_,
+            self.alphabet_size_,
+            self.blank_,
+            self.chunk_size_,
+        )
+
+        if training:
+            gpu_rnnt_kernel.chunked_aligner_compute_betas_kernel[self.minibatch_, self.maxU_, self.stream_, 0](
+                acts,
+                betas,
+                llBackward,
+                input_lengths,
+                label_lengths,
+                labels,
+                self.minibatch_,
+                self.maxT_,
+                self.maxU_,
+                self.alphabet_size_,
+                self.blank_,
+                self.chunk_size_,
+            )
+
+            grad_blocks_per_grid = self.minibatch_ * self.maxT_ * self.maxU_
+            grad_threads_per_block = gpu_rnnt_kernel.GPU_RNNT_THREAD_SIZE
+            gpu_rnnt_kernel.chunked_aligner_compute_grad_kernel[
+                grad_blocks_per_grid, grad_threads_per_block, self.stream_, 0
+            ](
+                grads,
+                acts,
+                alphas,
+                betas,
+                llForward,
+                input_lengths,
+                label_lengths,
+                labels,
+                self.minibatch_,
+                self.maxT_,
+                self.maxU_,
+                self.alphabet_size_,
+                self.blank_,
+                self.chunk_size_,
+                self.clamp_,
+            )
+
+        # Copy negated log-likelihood into the costs vector (fastemit_lambda = 0).
+        threadsperblock = min(costs.shape[0], 32)
+        blockspergrid = (costs.shape[0] + (threadsperblock - 1)) // threadsperblock
+        rnnt_helper.compute_costs_data[blockspergrid, threadsperblock, self.stream_, 0](llForward, costs, 0.0)
+        self.stream_.synchronize()
+
+        return global_constants.RNNTStatus.RNNT_STATUS_SUCCESS
+
+    def cost_and_grad(
+        self,
+        acts: torch.Tensor,
+        grads: torch.Tensor,
+        costs: torch.Tensor,
+        pad_labels: torch.Tensor,
+        label_lengths: torch.Tensor,
+        input_lengths: torch.Tensor,
+    ):
+        if (
+            acts is None
+            or grads is None
+            or costs is None
+            or pad_labels is None
+            or label_lengths is None
+            or input_lengths is None
+        ):
+            return global_constants.RNNTStatus.RNNT_STATUS_INVALID_VALUE
+
+        return self.compute_cost_and_score(acts, grads, costs, pad_labels, label_lengths, input_lengths)
+
+    def score_forward(
+        self,
+        acts: torch.Tensor,
+        costs: torch.Tensor,
+        pad_labels: torch.Tensor,
+        label_lengths: torch.Tensor,
+        input_lengths: torch.Tensor,
+    ):
+        if acts is None or costs is None or pad_labels is None or label_lengths is None or input_lengths is None:
+            return global_constants.RNNTStatus.RNNT_STATUS_INVALID_VALUE
+
+        return self.compute_cost_and_score(acts, None, costs, pad_labels, label_lengths, input_lengths)
+
+    def _prepare_workspace(self) -> Tuple[int, Tuple[torch.Tensor, ...]]:
+        """Slice the flat workspace into alphas, betas and log-likelihood buffers."""
+        used_offset = 0
+
+        alphas = self.gpu_workspace[used_offset : used_offset + self.maxT_ * self.maxU_ * self.minibatch_]
+        used_offset += self.maxT_ * self.maxU_ * self.minibatch_
+        betas = self.gpu_workspace[used_offset : used_offset + self.maxT_ * self.maxU_ * self.minibatch_]
+        used_offset += self.maxT_ * self.maxU_ * self.minibatch_
+
+        llForward = self.gpu_workspace[used_offset : used_offset + self.minibatch_]
+        used_offset += self.minibatch_
+        llBackward = self.gpu_workspace[used_offset : used_offset + self.minibatch_]
+        used_offset += self.minibatch_
+
+        return used_offset, (alphas, betas, llForward, llBackward)
