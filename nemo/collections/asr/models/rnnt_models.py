@@ -867,6 +867,8 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             log_every_n_steps = self._trainer.log_every_n_steps if self._trainer is not None else 1
             compute_train_wer = log_every_n_steps > 0 and (batch_nb + 1) % log_every_n_steps == 0
             train_wer = None
+            hypotheses = None
+            references = None
             if compute_train_wer:
                 with torch.no_grad():
                     hypotheses, _ = self.decoding.decode_encoder_output(encoded.detach(), encoded_len)
@@ -895,6 +897,26 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                     f"tgt_len_max={int(transcript_len.max().detach().cpu())}"
                     + (f" training_batch_wer={float(train_wer.detach().cpu()):.4f}" if train_wer is not None else "")
                 )
+
+            log_prediction_every_n_steps = int(self.cfg.get('log_prediction_every_n_steps', 100))
+            if (
+                compute_train_wer
+                and log_prediction_every_n_steps > 0
+                and hypotheses is not None
+                and references is not None
+                and self.trainer is not None
+                and self.trainer.is_global_zero
+                and self.trainer.global_step % log_prediction_every_n_steps == 0
+            ):
+                max_samples = min(int(self.cfg.get('log_prediction_num_samples', 2)), len(hypotheses))
+                for sample_idx in range(max_samples):
+                    logging.info(
+                        "[aligner-train-sample] "
+                        f"step={self.trainer.global_step} "
+                        f"sample={sample_idx} "
+                        f'hyp="{hypotheses[sample_idx]}" '
+                        f'ref="{references[sample_idx]}"'
+                    )
 
             self.log_dict(tensorboard_logs)
             return {'loss': loss_value}

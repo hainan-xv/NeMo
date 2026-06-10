@@ -27,6 +27,8 @@ model:
   label_smoothing: 0.1
   aux_nonar_loss_weight: 0.0
   log_stats_every_n_steps: 10  # rank-0 stdout summary for W&B-delay debugging (<=0 disables)
+  log_prediction_every_n_steps: 100  # rank-0 stdout hyp/ref samples (<=0 disables)
+  log_prediction_num_samples: 2
 
   model_defaults:
     enc_hidden: ${model.encoder.d_model}

@@ -38,6 +38,8 @@ model:
   label_smoothing: 0.1        # label smoothing weight for the cross-entropy loss
   aux_nonar_loss_weight: 0.0  # >0 adds an auxiliary non-AR loss to the AR model
   log_stats_every_n_steps: 20 # rank-0 stdout [aligner-train] summary (<=0 disables)
+  log_prediction_every_n_steps: 100 # rank-0 stdout hyp/ref samples (<=0 disables)
+  log_prediction_num_samples: 2
 
   model_defaults:
     enc_hidden: ${model.encoder.d_model}
