@@ -864,6 +864,17 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
             }
 
+            log_every_n_steps = self._trainer.log_every_n_steps if self._trainer is not None else 1
+            compute_train_wer = log_every_n_steps > 0 and (batch_nb + 1) % log_every_n_steps == 0
+            train_wer = None
+            if compute_train_wer:
+                with torch.no_grad():
+                    hypotheses, _ = self.decoding.decode_encoder_output(encoded.detach(), encoded_len)
+                    references = self._references_from_targets(transcript, transcript_len)
+                    scores, words = self._wer_counts(hypotheses, references)
+                    train_wer = torch.tensor(scores / max(words, 1), dtype=torch.float32, device=encoded.device)
+                    tensorboard_logs['training_batch_wer'] = train_wer
+
             log_stats_every_n_steps = int(self.cfg.get('log_stats_every_n_steps', 10))
             if (
                 log_stats_every_n_steps > 0
@@ -882,6 +893,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                     f"enc_frames_max={int(encoded_len.max().detach().cpu())} "
                     f"tgt_len_mean={float(transcript_len.float().mean().detach().cpu()):.1f} "
                     f"tgt_len_max={int(transcript_len.max().detach().cpu())}"
+                    + (f" training_batch_wer={float(train_wer.detach().cpu()):.4f}" if train_wer is not None else "")
                 )
 
             self.log_dict(tensorboard_logs)
