@@ -16,7 +16,11 @@ import os
 from typing import List, Union
 
 import numpy as np
-from kaldialign import align
+
+try:
+    from kaldialign import align
+except ModuleNotFoundError:
+    align = None
 
 from nemo.collections.asr.parts.context_biasing.ctc_based_word_spotter import WSHyp
 from nemo.collections.asr.parts.utils import rnnt_utils
@@ -167,6 +171,9 @@ def compute_fscore(
     Returns:
         Returns tuple of precision, recall and fscore.
     """
+
+    if align is None:
+        raise ModuleNotFoundError("compute_fscore() requires the optional dependency `kaldialign`.")
 
     assert key_words_list, "key_words_list is empty"
 
