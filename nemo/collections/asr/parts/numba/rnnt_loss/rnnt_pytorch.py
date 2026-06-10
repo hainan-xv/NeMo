@@ -770,12 +770,20 @@ class _ChunkedAlignerNumba(Function):
             num_threads=0,
         )
 
-        if reduction in ['sum', 'mean']:
+        if reduction in ['sum', 'mean', 'mean_volume']:
             costs = costs.sum().unsqueeze_(-1)
+            denom = 1.0
             if reduction == 'mean':
-                costs /= minibatch_size
+                # mean over the batch (total sequence NLL averaged over utterances).
+                denom = float(minibatch_size)
+            elif reduction == 'mean_volume':
+                # per-token: batch-summed NLL divided by the total number of labels,
+                # so the value is comparable to a per-token cross-entropy (~ln V).
+                denom = float(label_lens.sum().clamp(min=1).item())
+            if denom != 1.0:
+                costs /= denom
                 if grads is not None:
-                    grads /= minibatch_size
+                    grads /= denom
 
         ctx.save_for_backward(grads)
         return costs
@@ -807,7 +815,10 @@ class ChunkedAlignerLossNumba(Module):
         blank: index of the blank / end-of-chunk symbol within ``V``.
         chunk_size: number of encoder frames per chunk ``C`` (also the maximum
             number of tokens a chunk can emit in this variant).
-        reduction: one of ``'none'``, ``'sum'``, ``'mean'``.
+        reduction: one of ``'none'``, ``'sum'``, ``'mean'`` (total sequence NLL
+            averaged over the batch) or ``'mean_volume'`` (batch-summed NLL divided
+            by the total number of labels -> a per-token value comparable to a
+            cross-entropy loss, ~ln V at init).
         clamp: gradient clamp; <= 0 disables.
     """
 
@@ -815,8 +826,10 @@ class ChunkedAlignerLossNumba(Module):
         super(ChunkedAlignerLossNumba, self).__init__()
         if chunk_size < 1:
             raise ValueError(f"chunk_size must be >= 1, got {chunk_size}.")
-        if reduction not in ('none', 'sum', 'mean'):
-            raise ValueError(f"reduction must be one of ['none', 'sum', 'mean'], got '{reduction}'.")
+        if reduction not in ('none', 'sum', 'mean', 'mean_volume'):
+            raise ValueError(
+                f"reduction must be one of ['none', 'sum', 'mean', 'mean_volume'], got '{reduction}'."
+            )
         self.blank = blank
         self.chunk_size = chunk_size
         self.reduction = reduction

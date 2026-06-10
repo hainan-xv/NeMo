@@ -284,10 +284,16 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
         blank_id = self.joint.num_classes_with_blank - 1
 
+        # Default to per-token normalization ('mean_volume') so the loss reads like
+        # a cross-entropy (~ln V at init) and is comparable in scale to the aligner
+        # / TDT recipes -- this keeps a shared learning rate transferable. Use
+        # 'mean' for the (length-scaled) total-sequence NLL averaged over the batch.
+        reduction = str(ca_cfg.get('reduction', 'mean_volume')) if ca_cfg is not None else 'mean_volume'
+
         self.loss = ChunkedAlignerLossNumba(
             blank=blank_id,
             chunk_size=self.chunk_size,
-            reduction='mean',
+            reduction=reduction,
             clamp=float(ca_cfg.get('clamp', -1.0)) if ca_cfg is not None else -1.0,
         )
 

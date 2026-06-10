@@ -39,6 +39,9 @@ model:
   chunked_aligner:
     chunk_size: 12              # number of encoder frames per chunk
     clamp: -1.0                 # >=0 clamps loss grads to [-clamp, clamp]
+    # 'mean_volume' = per-token NLL (~ln V at init, comparable to CE / TDT scale, so
+    # the shared LR transfers). 'mean' = total-sequence NLL averaged over the batch.
+    reduction: mean_volume
   log_stats_every_n_steps: 20        # rank-0 stdout [chunked_aligner-train] summary (<=0 disables)
   log_prediction_every_n_steps: 100  # rank-0 stdout hyp/ref samples (<=0 disables)
   log_prediction_num_samples: 2
