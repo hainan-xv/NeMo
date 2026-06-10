@@ -1,0 +1,377 @@
+[NeMo I 2026-06-09 20:36:41 utils:186] Hydra config:
+    name: rnnt_local
+    base_model_path: null
+    base_model_name: null
+    init_encoder_from_base: false
+    tokenizer_out_dir: null
+    model:
+      sample_rate: 16000
+      compute_eval_loss: true
+      log_prediction: true
+      skip_nan_grad: true
+      loss_type: rnnt
+      model_defaults:
+        enc_hidden: ${model.encoder.d_model}
+        pred_hidden: 320
+        joint_hidden: 320
+      train_ds:
+        manifest_filepath: /home/hainanx/Workplace/data/librispeech/train_clean_360.json
+        sample_rate: ${model.sample_rate}
+        batch_size: 8
+        shuffle: true
+        num_workers: 4
+        pin_memory: true
+        max_duration: 20.0
+        min_duration: 0.1
+        is_tarred: false
+        tarred_audio_filepaths: null
+      validation_ds:
+        manifest_filepath: /home/hainanx/Workplace/data/librispeech/dev_clean.json
+        sample_rate: ${model.sample_rate}
+        batch_size: 8
+        shuffle: false
+        use_start_end_token: false
+        num_workers: 4
+        pin_memory: true
+      test_ds:
+        manifest_filepath: null
+        sample_rate: ${model.sample_rate}
+        batch_size: 8
+        shuffle: false
+        use_start_end_token: false
+        num_workers: 4
+        pin_memory: true
+      tokenizer:
+        dir: /home/hainanx/Workplace/NeMo_ord_sync_d146_current/local_tokenizers/tokenizer_spe_bpe_v128
+        type: bpe
+      preprocessor:
+        _target_: nemo.collections.asr.modules.AudioToMelSpectrogramPreprocessor
+        sample_rate: ${model.sample_rate}
+        normalize: per_feature
+        window_size: 0.025
+        window_stride: 0.01
+        window: hann
+        features: 80
+        n_fft: 512
+        frame_splicing: 1
+        dither: 1.0e-05
+        pad_to: 0
+      spec_augment:
+        _target_: nemo.collections.asr.modules.SpectrogramAugmentation
+        freq_masks: 2
+        time_masks: 5
+        freq_width: 27
+        time_width: 0.05
+      encoder:
+        _target_: nemo.collections.asr.modules.ConformerEncoder
+        feat_in: ${model.preprocessor.features}
+        feat_out: -1
+        n_layers: 8
+        d_model: 256
+        subsampling: striding
+        subsampling_factor: 4
+        subsampling_conv_channels: -1
+        causal_downsampling: false
+        reduction: null
+        reduction_position: null
+        reduction_factor: 1
+        ff_expansion_factor: 4
+        self_attention_model: rel_pos
+        n_heads: 4
+        att_context_size:
+        - -1
+        - -1
+        att_context_style: regular
+        xscaling: true
+        untie_biases: true
+        pos_emb_max_len: 5000
+        conv_kernel_size: 31
+        conv_norm_type: batch_norm
+        conv_context_size: null
+        dropout: 0.1
+        dropout_pre_encoder: 0.1
+        dropout_emb: 0.0
+        dropout_att: 0.1
+        stochastic_depth_drop_prob: 0.0
+        stochastic_depth_mode: linear
+        stochastic_depth_start_layer: 1
+      decoder:
+        _target_: nemo.collections.asr.modules.RNNTDecoder
+        normalization_mode: null
+        random_state_sampling: false
+        blank_as_pad: true
+        prednet:
+          pred_hidden: ${model.model_defaults.pred_hidden}
+          pred_rnn_layers: 1
+          t_max: null
+          dropout: 0.2
+      joint:
+        _target_: nemo.collections.asr.modules.RNNTJoint
+        log_softmax: null
+        preserve_memory: false
+        fuse_loss_wer: false
+        fused_batch_size: null
+        jointnet:
+          joint_hidden: ${model.model_defaults.joint_hidden}
+          activation: relu
+          dropout: 0.2
+      decoding:
+        strategy: greedy_batch
+        greedy:
+          max_symbols: 10
+        beam:
+          beam_size: 2
+          return_best_hypothesis: false
+          score_norm: true
+          tsd_max_sym_exp: 50
+          alsd_max_target_len: 2.0
+      loss:
+        loss_name: default
+        warprnnt_numba_kwargs:
+          fastemit_lambda: 0.0
+          clamp: -1.0
+      optim:
+        name: adamw
+        lr: 0.0003
+        betas:
+        - 0.9
+        - 0.98
+        weight_decay: 0.001
+        sched:
+          name: CosineAnnealing
+          warmup_steps: 200
+          warmup_ratio: null
+          min_lr: 1.0e-06
+    trainer:
+      devices: 2
+      num_nodes: 1
+      max_steps: 2000
+      max_epochs: -1
+      val_check_interval: 200
+      limit_val_batches: 20
+      accelerator: gpu
+      strategy: ddp_find_unused_parameters_true
+      accumulate_grad_batches: 1
+      gradient_clip_val: 1.0
+      precision: 32
+      log_every_n_steps: 5
+      enable_progress_bar: true
+      num_sanity_val_steps: 0
+      check_val_every_n_epoch: null
+      sync_batchnorm: true
+      benchmark: false
+      logger: false
+      enable_checkpointing: false
+    exp_manager:
+      exp_dir: /home/hainanx/Workplace/NeMo_ord_sync_d146_current/nemo_experiments_rnnt_local
+      name: ${name}
+      create_tensorboard_logger: true
+      create_checkpoint_callback: true
+      checkpoint_callback_params:
+        monitor: val_wer
+        mode: min
+        save_top_k: 1
+        always_save_nemo: false
+      resume_if_exists: false
+      resume_ignore_no_checkpoint: true
+      create_wandb_logger: true
+      wandb_logger_kwargs:
+        name: rnnt_local
+        project: rnnt_local
+    
+[NeMo I 2026-06-09 20:36:41 speech_to_text_aligner_bpe:136] Experiments will be logged at /home/hainanx/Workplace/NeMo_ord_sync_d146_current/nemo_experiments_rnnt_local/rnnt_local/2026-06-09_20-36-24
+[NeMo I 2026-06-09 20:36:41 exp_manager:691] TensorboardLogger has been set up
+[NeMo I 2026-06-09 20:36:41 exp_manager:691] WandBLogger has been set up
+[NeMo W 2026-06-09 20:36:41 exp_manager:738] The checkpoint callback was told to monitor a validation value and trainer's max_steps was set to 2000. Please ensure that max_steps will run for at least None epochs to ensure that checkpointing will not error out.
+[NeMo I 2026-06-09 20:36:41 speech_to_text_aligner_bpe:136] TFLOPs per sec per GPU will be calculated, conditioned on supported models. Defaults to -1 upon failure.
+[NeMo I 2026-06-09 20:36:46 mixins:69] Tokenizer SentencePieceTokenizer initialized with 128 tokens
+[NeMo I 2026-06-09 20:36:54 collections:354] Dataset loaded with 103997 files totalling 363.50 hours
+[NeMo I 2026-06-09 20:36:54 collections:354] 17 files were filtered totalling 0.11 hours
+[NeMo I 2026-06-09 20:36:54 collections:354] Dataset loaded with 2703 files totalling 5.39 hours
+[NeMo I 2026-06-09 20:36:54 collections:354] 0 files were filtered totalling 0.00 hours
+[NeMo W 2026-06-09 20:36:54 rnnt_bpe_models:472] Could not load dataset as `manifest_filepath` was None. Provided config : {'manifest_filepath': None, 'sample_rate': 16000, 'batch_size': 8, 'shuffle': False, 'use_start_end_token': False, 'num_workers': 4, 'pin_memory': True}
+[NeMo I 2026-06-09 20:36:54 rnnt_models:93] Using RNNT Loss : warprnnt_numba
+    Loss warprnnt_numba_kwargs: {'fastemit_lambda': 0.0, 'clamp': -1.0}
+[NeMo I 2026-06-09 20:36:54 rnnt_models:351] Using RNNT Loss : warprnnt_numba
+    Loss warprnnt_numba_kwargs: {'fastemit_lambda': 0.0, 'clamp': -1.0}
+[NeMo W 2026-06-09 20:36:54 rnnt_label_looping:259] No conditional node support for Cuda.
+    Cuda graphs with while loops are disabled, decoding speed will be slower
+    Reason: Driver supports cuda toolkit version 12.5, but the driver needs to support at least 12,6. Please update your cuda driver.
+[NeMo I 2026-06-09 20:36:54 rnnt_models:351] Using RNNT Loss : warprnnt_numba
+    Loss warprnnt_numba_kwargs: {'fastemit_lambda': 0.0, 'clamp': -1.0}
+[NeMo W 2026-06-09 20:36:54 rnnt_label_looping:259] No conditional node support for Cuda.
+    Cuda graphs with while loops are disabled, decoding speed will be slower
+    Reason: Driver supports cuda toolkit version 12.5, but the driver needs to support at least 12,6. Please update your cuda driver.
+[NeMo I 2026-06-09 20:36:56 modelPT:864] Optimizer config = AdamW (
+    Parameter Group 0
+        amsgrad: False
+        betas: [0.9, 0.98]
+        capturable: False
+        differentiable: False
+        eps: 1e-08
+        foreach: None
+        fused: None
+        lr: 0.0003
+        maximize: False
+        weight_decay: 0.001
+    )
+[NeMo I 2026-06-09 20:36:56 modelPT:786] Scheduler "<nemo.core.optim.lr_scheduler.CosineAnnealing object at 0x7f5025838ac0>" 
+    will be used during training (effective maximum steps = 2000) - 
+    Parameters : 
+    (warmup_steps: 200
+    warmup_ratio: null
+    min_lr: 1.0e-06
+    max_steps: 2000
+    )
+[NeMo I 2026-06-09 20:36:57 asr_model:209] CUDA graphs disabled for EncDecRNNTBPEModel::RNNTBPEDecoding::GreedyBatchedRNNTInfer
+[NeMo W 2026-06-09 20:36:58 warnings:109] /home/hainanx/anaconda3/lib/python3.10/site-packages/numba_cuda/numba/cuda/dispatcher.py:685: NumbaPerformanceWarning: [1mGrid size 8 will likely result in GPU under-utilization due to low occupancy.[0m
+      warn(NumbaPerformanceWarning(msg))
+    
+[NeMo W 2026-06-09 20:36:59 warnings:109] /home/hainanx/anaconda3/lib/python3.10/site-packages/numba_cuda/numba/cuda/dispatcher.py:685: NumbaPerformanceWarning: [1mGrid size 8 will likely result in GPU under-utilization due to low occupancy.[0m
+      warn(NumbaPerformanceWarning(msg))
+    
+[NeMo W 2026-06-09 20:36:59 warnings:109] /home/hainanx/anaconda3/lib/python3.10/site-packages/numba_cuda/numba/cuda/dispatcher.py:685: NumbaPerformanceWarning: [1mGrid size 1 will likely result in GPU under-utilization due to low occupancy.[0m
+      warn(NumbaPerformanceWarning(msg))
+    
+[NeMo W 2026-06-09 20:37:00 warnings:109] /home/hainanx/anaconda3/lib/python3.10/site-packages/numba_cuda/numba/cuda/dispatcher.py:685: NumbaPerformanceWarning: [1mGrid size 8 will likely result in GPU under-utilization due to low occupancy.[0m
+      warn(NumbaPerformanceWarning(msg))
+    
+[NeMo W 2026-06-09 20:37:00 warnings:109] /home/hainanx/anaconda3/lib/python3.10/site-packages/numba_cuda/numba/cuda/dispatcher.py:685: NumbaPerformanceWarning: [1mGrid size 1 will likely result in GPU under-utilization due to low occupancy.[0m
+      warn(NumbaPerformanceWarning(msg))
+    
+[NeMo I 2026-06-09 20:37:03 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:03 metric:482] WER reference:she is not at any rate a fit companion for you it was you who introduced me to her hold your tongue about her
+[NeMo I 2026-06-09 20:37:03 metric:482] WER predicted:c c c c c c c c c c lcez be      incececececececececece be l be be be be be be be be be be be be be be be be be be be be be be be be be be be becececececececececececececececececececececececececececececece c c c c c c c c c c l ⁇  l ⁇  l ⁇  l ⁇  ⁇  ⁇  l l l l l l l l l lcetetetetetetetetet l becececececece becece be be be be be be be be be beimim ha ha ha ha ha ha ha hacececececececececece s s s be be be be be be becece bece bece bece bece ereimcececececececeetetetetetetetetetet se se se se seetetetet se e e e e e e e e e emmmurururur mmmcecececececececececececececececececececeyimimimimimimimimim lcececececececeurce be be be be be be be be be bececececececececececeesesesesesesesesesesurururururururururur c c c c c c c c c c in in in in in in in in in in ⁇  ⁇  ⁇  ⁇  ⁇  ⁇  ⁇  ⁇  ⁇  ⁇  e l e lm l em l emmmmmmmmmmmmmmmmmmmmmurururururcececececeurururururururururur s s s sur sur sur s lan l l l l lan l lmm ⁇ m ⁇ m ⁇  ⁇  ⁇  ⁇ urceurceurceurce surcecececececececececeurururururururururur s scecececececececeurceur s s sur s suradadadadadadadadadadurururururururururur l l l l l l l l l ledededed leded led lzllzllz c c c c l c l c l c be be be be be be be be be be l l l l l l l l l lanan lan lan l lan lururururururururururadadadadadadadadadad c c c c c c c c c c c c c c c c c c c c be be be be be be be be be be be be be be be be be be be bemmmmmmmmmmcececececececececece be in in in in in in in in in se se se se se se seetetetmmmllllllllllllllllllll ece s s s s s s s surururururururururur l l l l l l l l l lanananururcecececece e e e e e e e e e e w l w w l w w w l wimimimimimimimimimimrerererellrerererereetetetetetetetetetet be be be be be be be be be be sem semmmmmmm s s s s s s s s s smmmmmmmllmllururururururururururururururururururururreurreurururreurururcececececececececece e e e e e e ecece e se se se se on th th th th th th th th th th l l lcececece l lcececececececececececemmmmmmmmmmcecececece an ancece ancececececezcezururururururururururcececececececececece lllcecececece lllcey be be be be be be be be be be laaaaaaaaaa l l ⁇  ⁇  ⁇  ⁇  ⁇  ⁇  ⁇  ⁇  l l l l l l l l l la la l la l la lcecececececece l l l l l l l l l l l l l l l l l l l lcecececece c c c c c l l laaaceacece be be be be be be be se be be seininin onuredetetetmmmmmmmmmm l lcecece be bece bece hec hec here herererece lcecece be be bece be c c c c c c c c c ccececececececececececececececececececece be be be bece bece bece be be be be be be be be be be becececececececececece be be be be be be be be be be n n n n n n n n n m l l l l l l l l l lcececececececececece l l l l l be be be be l l l l l l l l l l laaaaaa l be bea l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l laaaaaace maaiiiiiiiiii s s s s s s n s n he l l be be be be be se be be be be be be be be be be be be be be be be be be be be be bellllllllll ⁇  ⁇  ⁇  ⁇  ⁇ cececececececececece he he l he l he l he l hececececececececececeetetetetetetetetetetetetetetetetetetetet be be be be be be be be be bere n n nan nanrerean be be be be be be be be be be be be be be be be be be be be e e e e e e e e e ererecececececececece m m m m m m m m m m c c c c cz c cz cadadadadadadadadadad be be be be be be be be be be h h h h s s h s s hururururururururururcececececeadadadadad m m m m m m m m m m m m m m m m m m m mmmmmmcecececececececececelyly bean be be be be be be se s ha s s ha s s ha scezcezcezcezyyyyyyyyyy s s s s s s s s s srererererererererereurcecececececececececececececececececece l l l l l l l l l l h h h h h h h h h hcececeghtceesghtceesght c c s c s c s c s sururururururururururmmmmmmmmmmcececececececececececececececececececece m m m m m m m m m m m m m m m m m m m mcecececeooceooceoocececececececececececececececececececececey ⁇  ⁇  ⁇  ⁇  ⁇  ⁇  ⁇  ⁇  ⁇ urururceurururceururcecececececececececeurururururururururur ⁇  ⁇  ⁇  ⁇  ⁇  ⁇  ⁇  ⁇  ⁇  ⁇ cececececececececece e e e e e e e e e e n n n n nurcece th thcecececececececececeyomyyyyyyyy se se se secececececece c curceurcecececececeur be be be be be be be be be bececececececececececeadadadadadadadadadad l l l lxxxxxx se se se se se se se se se seororor lor l l l l l l l l l l l l l l lcecececece l l lcece be l be be l be be l be be l l l l l l l l l lcecececececece lcece l l l l l l l l l laaaaaceaaceacez be be be be be be be be l c c c c c c c c c be be be be be be be be be be be be be be be be be be be bece bece bece bece bece beururururururururururrere be be be be be be be be be be be be be be be be be be be be be be be be be be be be se be be be l be be l be be l be be l be be l be be l be be be be be be be be be be be be be be be be be be be be l be be l be be be l be be sem sem sem sem sem l l l l l l l l l lur s s sur s s sur szz l l l l l l l l l l l l l l l l l l be be be be be be be be be be be be be be be be be be be bere be be bere be be bere be be be be be be be be be be be l be be be be be be be be be bece becececececececece be be be be be be be be be be l l l l l l l l l l be be be be be be be be be be l l l l lre lreurur be be be be be l be be be l be be be be be be be be be be be be be be be be be be be be be be be be be be be be be beininllinllinurururur in inm in in inm in inmadadadadadadadadadad l l l l be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be beadadadadadadadadadadllllcececececececece be be be be be be be be be beinininininllininllinaaaesaesaes be be th th th th th th th th th th be be be be be be be be be be be be be be be be be be be bein s s s s s s s s syy h h h h h h h h h h h h h h h h h h th e h h h h h h h h hcecececececececececececececececececece m m m m m m m mmm in in in inm in in in in inururururururururururcececececececececece ha ha ha ha ha ha ha ha ha ha ha ha ha ha ha ha ha ha ha haururururururururururururururururururururcececececececececece ⁇  se se h h h h h h h ⁇  n ⁇ cecece  ce cececececececececece s s s s s s s s s srererererererererereur e e e i e e i e e hacececececeurceurce e e e e e e e e e ereyy iyyy iyyyan on  on an on  on urururururururururan ⁇  ⁇  ⁇  ⁇  ⁇  l ⁇  l ⁇  l l l l l l l l l l lururururururururururcececececececececece l l l l l l l l l l l l l l l l l l l l l l l l l l l l l lllllllllllllllllinll l l l l l l l l l l l l lededed l l leded l lllllllllininininininld lst lst lst lst lallllllaaaesllaaa laa laa laininetetetetetetinin
+[NeMo I 2026-06-09 20:37:05 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:05 metric:482] WER reference:milon observed him curiously the lad struck so heavily he thrust home so shrewdly that milon's hatred changed to envy as he watched very comely showed the varlet and much to milon's mind
+[NeMo I 2026-06-09 20:37:05 metric:482] WER predicted:cececeaetetetetetetetet seh l l l l l l l l l ladaaadadadadadadadad headadadadadadadadadad
+[NeMo I 2026-06-09 20:37:07 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:07 metric:482] WER reference:they immediately proceeded to first attack all spanish vessels that could be found their quickness and knowledge of the coasts gave them the opportunity of reprisals for which they longed probably this got monotonous in course of time
+[NeMo I 2026-06-09 20:37:07 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:09 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:09 metric:482] WER reference:the proximate cause was one of especial singularity in an excursion to the ragged mountains a few days since a slight cold and fever were contracted
+[NeMo I 2026-06-09 20:37:09 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:10 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:10 metric:482] WER reference:he is twin brother to my own horse and can fly as high as the clouds themselves but no one can ever get this horse without first serving the old woman for three whole days and besides the horses she has a foal and its mother
+[NeMo I 2026-06-09 20:37:10 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:12 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:12 metric:482] WER reference:of a great people have been sufficiently exemplified by experience and by history
+[NeMo I 2026-06-09 20:37:12 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:14 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:14 metric:482] WER reference:breakfast over he concluded to leave the yellow mule with the red fox to be taken back to the county town and to walk down the mountain but before he got away the landlord's son turned up with his own horse still lame
+[NeMo I 2026-06-09 20:37:14 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:15 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:15 metric:482] WER reference:which commander bougainville explored in seventeen sixty eight and to which captain cook gave its current name in seventeen seventy three this group is chiefly made up of nine large islands
+[NeMo I 2026-06-09 20:37:15 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:17 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:17 metric:482] WER reference:calvin you know how many years i have been doing the work of my position and you know something of the responsibility and care of it i do not mean to say that my life has been free from burden bearing or sorrow
+[NeMo I 2026-06-09 20:37:17 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:19 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:19 metric:482] WER reference:which was not in that subject before we call it alteration thus a man is generated a picture made and either of them altered when any new sensible quality or simple idea is produced in either of them
+[NeMo I 2026-06-09 20:37:19 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:20 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:20 metric:482] WER reference:one day as he was thus occupied his wife emerged from the house dressed in a dark brown gingham and bearing in her hand some muslins which she began to spread upon the gooseberry bushes to whiten
+[NeMo I 2026-06-09 20:37:20 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:22 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:22 metric:482] WER reference:but the magic looking glass was best of all for in it she could see whatever she wished as the days went by and her slightest wish was granted almost before she knew what she wanted she began to feel that the beast must love her very dearly
+[NeMo I 2026-06-09 20:37:22 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:24 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:24 metric:482] WER reference:wishes and phantasies are not infrequently employed in the erection of this facade which were already fashioned in the dream thoughts
+[NeMo I 2026-06-09 20:37:24 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:25 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:25 metric:482] WER reference:and amongst them was a princess who was troubled with seeing too well and that was so alarming she directly observed that the stranger who had just come was quite a different sort of person to all the others
+[NeMo I 2026-06-09 20:37:25 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:27 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:27 metric:482] WER reference:he says that he swam many and watched them for four nights together keeping them standing or walking till their feet were blistered the reason as he says was to prevent their couching down for indeed when they be suffered to couch
+[NeMo I 2026-06-09 20:37:27 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:29 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:29 metric:482] WER reference:to mock at my weariness i tracked it up where the mountains hunch like the vertebrae of the world i tracked it down to the death still pits where the avalanche is hurled
+[NeMo I 2026-06-09 20:37:29 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:30 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:30 metric:482] WER reference:life giving love rots to devouring fire justice corrupts to despicable revenge motherhood chokes in the dam's jealous mire hunger for growth turns fluctuating change love's anger grand grows spiteful human wrath
+[NeMo I 2026-06-09 20:37:30 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:32 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:32 metric:482] WER reference:repositioned itself on its belly and headed swiftly toward him i can see captain nemo's bearing to this day bracing himself he waited for the fearsome man eater
+[NeMo I 2026-06-09 20:37:32 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:34 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:34 metric:482] WER reference:the nature of the metal was not easily perceptible for it was coated with slime and covered over about half its surface with barnacles and sea weed
+[NeMo I 2026-06-09 20:37:34 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:35 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:35 metric:482] WER reference:i feel very unhappy about your sister's fortune said the earl so do i very unhappy we can raise the money between us and pay her to morrow if you please it
+[NeMo I 2026-06-09 20:37:35 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:37 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:37 metric:482] WER reference:and then he took the crown and went his way and sir melias lay still and had no power to stir in the meanwhile by fortune there came sir galahad and found him there in peril of death and then he said ah melias who hath wounded you
+[NeMo I 2026-06-09 20:37:37 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:39 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:39 metric:482] WER reference:mister rabbit sneezed and this made him wake up he yawned and blinked and then his eyes suddenly flew wide open with fright he had discovered old mother nature frowning at him she pointed a long forefinger at him and said
+[NeMo I 2026-06-09 20:37:39 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:40 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:40 metric:482] WER reference:and the hall was brilliant with youth and beauty when the door was flung wide and dotterine entered making all the other maidens look pale and dim beside her their hopes faded as they gazed but their mothers whispered together saying
+[NeMo I 2026-06-09 20:37:40 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:42 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:42 metric:482] WER reference:there's no time to bother with him he went on and reaching out he caught travers gladwin by the shoulder and whirled him half way across the room the young man spun half a dozen times as he reeled across the carpet
+[NeMo I 2026-06-09 20:37:42 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:44 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:44 metric:482] WER reference:and the grooms busy in dressing them from thence they went to the storehouses which were filled with all things necessary both for food and ornament when aladdin had examined every portion of the palace
+[NeMo I 2026-06-09 20:37:44 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:45 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:45 metric:482] WER reference:according to the natural course of things therefore the greater part of the capital of every growing society is first directed to agriculture afterwards to manufactures and last of all to foreign commerce
+[NeMo I 2026-06-09 20:37:45 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:47 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:47 metric:482] WER reference:the giving up of what is wrong i will try to show at least probable in the first place the user of the phrase either defines the change of mind he means as one that has for its object the pardon of god
+[NeMo I 2026-06-09 20:37:47 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:49 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:49 metric:482] WER reference:answered the fat boy sharply isn't it about time that lazy indian were back professor asked walter
+[NeMo I 2026-06-09 20:37:49 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:50 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:50 metric:482] WER reference:just as chance led me during the night many thoughts that i had banished for the last week had returned those thoughts of evil omen under which the mind seems to ache just as the body aches under a dull heavy pain
+[NeMo I 2026-06-09 20:37:50 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:52 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:52 metric:482] WER reference:or strange coin from far cathay one of the packages was very much larger than the other it was enclosed in wrappers made of some coarse kind of felt bound tight with strong cords
+[NeMo I 2026-06-09 20:37:52 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:54 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:54 metric:482] WER reference:and hellas began to fit out fleets and apply herself more closely to the sea it is said that the corinthians were the first to approach the modern style of naval architecture and that corinth was the first place in hellas where galleys were built
+[NeMo I 2026-06-09 20:37:54 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:55 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:55 metric:482] WER reference:it seemed to him that at last the gulf between them had been bridged it was this that made him exclaim in a moment how unhappy you must be he had no sooner spoken than she recovered her self possession
+[NeMo I 2026-06-09 20:37:55 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:57 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:57 metric:482] WER reference:irritated him he answered therefore i think monsieur le comte that you had something to communicate to me at your chateau of bragelonne and that gentleman
+[NeMo I 2026-06-09 20:37:57 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:59 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:59 metric:482] WER reference:why he was there and how he had learnt the way and he was not allowed to enter unless the empress herself came and gave him leave a message was sent to her and when she stood at the gate the prince thought
+[NeMo I 2026-06-09 20:37:59 metric:482] WER predicted:

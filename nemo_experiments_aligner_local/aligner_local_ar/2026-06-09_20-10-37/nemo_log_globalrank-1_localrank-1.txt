@@ -1,0 +1,209 @@
+[NeMo I 2026-06-09 20:10:54 utils:186] Hydra config:
+    name: aligner_local_ar
+    base_model_path: null
+    base_model_name: null
+    init_encoder_from_base: false
+    tokenizer_out_dir: null
+    model:
+      sample_rate: 16000
+      compute_eval_loss: true
+      log_prediction: true
+      skip_nan_grad: true
+      aligner_type: ar
+      label_smoothing: 0.1
+      aux_nonar_loss_weight: 0.0
+      model_defaults:
+        enc_hidden: ${model.encoder.d_model}
+        pred_hidden: 320
+        joint_hidden: 320
+      train_ds:
+        manifest_filepath: /home/hainanx/Workplace/data/librispeech/train_clean_360.json
+        sample_rate: ${model.sample_rate}
+        batch_size: 8
+        shuffle: true
+        num_workers: 4
+        pin_memory: true
+        max_duration: 20.0
+        min_duration: 0.1
+        is_tarred: false
+        tarred_audio_filepaths: null
+      validation_ds:
+        manifest_filepath: /home/hainanx/Workplace/data/librispeech/dev_clean.json
+        sample_rate: ${model.sample_rate}
+        batch_size: 8
+        shuffle: false
+        use_start_end_token: false
+        num_workers: 4
+        pin_memory: true
+      test_ds:
+        manifest_filepath: null
+        sample_rate: ${model.sample_rate}
+        batch_size: 8
+        shuffle: false
+        use_start_end_token: false
+        num_workers: 4
+        pin_memory: true
+      tokenizer:
+        dir: /home/hainanx/Workplace/NeMo_ord_sync_d146_current/local_tokenizers/tokenizer_spe_bpe_v128
+        type: bpe
+      preprocessor:
+        _target_: nemo.collections.asr.modules.AudioToMelSpectrogramPreprocessor
+        sample_rate: ${model.sample_rate}
+        normalize: per_feature
+        window_size: 0.025
+        window_stride: 0.01
+        window: hann
+        features: 80
+        n_fft: 512
+        frame_splicing: 1
+        dither: 1.0e-05
+        pad_to: 0
+      spec_augment:
+        _target_: nemo.collections.asr.modules.SpectrogramAugmentation
+        freq_masks: 2
+        time_masks: 5
+        freq_width: 27
+        time_width: 0.05
+      encoder:
+        _target_: nemo.collections.asr.modules.ConformerEncoder
+        feat_in: ${model.preprocessor.features}
+        feat_out: -1
+        n_layers: 8
+        d_model: 256
+        subsampling: striding
+        subsampling_factor: 4
+        subsampling_conv_channels: -1
+        causal_downsampling: false
+        reduction: null
+        reduction_position: null
+        reduction_factor: 1
+        ff_expansion_factor: 4
+        self_attention_model: rel_pos
+        n_heads: 4
+        att_context_size:
+        - -1
+        - -1
+        att_context_style: regular
+        xscaling: true
+        untie_biases: true
+        pos_emb_max_len: 5000
+        conv_kernel_size: 31
+        conv_norm_type: batch_norm
+        conv_context_size: null
+        dropout: 0.1
+        dropout_pre_encoder: 0.1
+        dropout_emb: 0.0
+        dropout_att: 0.1
+        stochastic_depth_drop_prob: 0.0
+        stochastic_depth_mode: linear
+        stochastic_depth_start_layer: 1
+      decoder:
+        _target_: nemo.collections.asr.modules.RNNTDecoder
+        normalization_mode: null
+        random_state_sampling: false
+        blank_as_pad: true
+        prednet:
+          pred_hidden: ${model.model_defaults.pred_hidden}
+          pred_rnn_layers: 1
+          t_max: null
+          dropout: 0.2
+      joint:
+        _target_: nemo.collections.asr.modules.AlignerJoint
+        log_softmax: null
+        jointnet:
+          joint_hidden: ${model.model_defaults.joint_hidden}
+          activation: relu
+          dropout: 0.2
+      ctc_head:
+        hidden: null
+        activation: relu
+        dropout: 0.0
+      decoding:
+        aligner_type: ${model.aligner_type}
+        max_symbols: null
+      optim:
+        name: adamw
+        lr: 0.0003
+        betas:
+        - 0.9
+        - 0.98
+        weight_decay: 0.001
+        sched:
+          name: CosineAnnealing
+          warmup_steps: 200
+          warmup_ratio: null
+          min_lr: 1.0e-06
+    trainer:
+      devices: 2
+      num_nodes: 1
+      max_steps: 2000
+      max_epochs: -1
+      val_check_interval: 200
+      limit_val_batches: 20
+      accelerator: gpu
+      strategy: ddp_find_unused_parameters_true
+      accumulate_grad_batches: 1
+      gradient_clip_val: 1.0
+      precision: 32
+      log_every_n_steps: 5
+      enable_progress_bar: true
+      num_sanity_val_steps: 0
+      check_val_every_n_epoch: null
+      sync_batchnorm: true
+      benchmark: false
+      logger: false
+      enable_checkpointing: false
+    exp_manager:
+      exp_dir: /home/hainanx/Workplace/NeMo_ord_sync_d146_current/nemo_experiments_aligner_local
+      name: ${name}
+      create_tensorboard_logger: true
+      create_checkpoint_callback: true
+      checkpoint_callback_params:
+        monitor: val_wer
+        mode: min
+        save_top_k: 1
+        always_save_nemo: false
+      resume_if_exists: false
+      resume_ignore_no_checkpoint: true
+      create_wandb_logger: true
+      wandb_logger_kwargs:
+        name: aligner_local_ar
+        project: aligner_local
+    
+[NeMo I 2026-06-09 20:10:54 speech_to_text_aligner_bpe:136] Experiments will be logged at /home/hainanx/Workplace/NeMo_ord_sync_d146_current/nemo_experiments_aligner_local/aligner_local_ar/2026-06-09_20-10-37
+[NeMo I 2026-06-09 20:10:54 exp_manager:691] TensorboardLogger has been set up
+[NeMo I 2026-06-09 20:10:54 exp_manager:691] WandBLogger has been set up
+[NeMo W 2026-06-09 20:10:54 exp_manager:738] The checkpoint callback was told to monitor a validation value and trainer's max_steps was set to 2000. Please ensure that max_steps will run for at least None epochs to ensure that checkpointing will not error out.
+[NeMo I 2026-06-09 20:10:54 speech_to_text_aligner_bpe:136] TFLOPs per sec per GPU will be calculated, conditioned on supported models. Defaults to -1 upon failure.
+[NeMo I 2026-06-09 20:10:59 mixins:69] Tokenizer SentencePieceTokenizer initialized with 128 tokens
+[NeMo I 2026-06-09 20:11:07 collections:354] Dataset loaded with 103997 files totalling 363.50 hours
+[NeMo I 2026-06-09 20:11:07 collections:354] 17 files were filtered totalling 0.11 hours
+[NeMo I 2026-06-09 20:11:08 collections:354] Dataset loaded with 2703 files totalling 5.39 hours
+[NeMo I 2026-06-09 20:11:08 collections:354] 0 files were filtered totalling 0.00 hours
+[NeMo W 2026-06-09 20:11:08 rnnt_bpe_models:454] Could not load dataset as `manifest_filepath` was None. Provided config : {'manifest_filepath': None, 'sample_rate': 16000, 'batch_size': 8, 'shuffle': False, 'use_start_end_token': False, 'num_workers': 4, 'pin_memory': True}
+[NeMo I 2026-06-09 20:11:10 modelPT:864] Optimizer config = AdamW (
+    Parameter Group 0
+        amsgrad: False
+        betas: [0.9, 0.98]
+        capturable: False
+        differentiable: False
+        eps: 1e-08
+        foreach: None
+        fused: None
+        lr: 0.0003
+        maximize: False
+        weight_decay: 0.001
+    )
+[NeMo I 2026-06-09 20:11:10 modelPT:786] Scheduler "<nemo.core.optim.lr_scheduler.CosineAnnealing object at 0x7f5b27f737c0>" 
+    will be used during training (effective maximum steps = 2000) - 
+    Parameters : 
+    (warmup_steps: 200
+    warmup_ratio: null
+    min_lr: 1.0e-06
+    max_steps: 2000
+    )
+[NeMo I 2026-06-09 20:12:16 model_checkpoint:757] Checkpoint save for step 200 started at 2026-06-09T20:12:16.417343.
+[NeMo I 2026-06-09 20:12:17 model_checkpoint:696] Checkpoint save for step 200 started at 2026-06-09T20:12:17.272626.
+[NeMo I 2026-06-09 20:13:19 model_checkpoint:757] Checkpoint save for step 400 started at 2026-06-09T20:13:19.108167.
+[NeMo I 2026-06-09 20:13:20 model_checkpoint:696] Checkpoint save for step 400 started at 2026-06-09T20:13:20.021025.
+[NeMo I 2026-06-09 20:14:21 model_checkpoint:696] Checkpoint save for step 600 started at 2026-06-09T20:14:21.819554.

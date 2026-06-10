@@ -1,0 +1,352 @@
+[NeMo I 2026-06-09 19:48:29 utils:186] Hydra config:
+    name: aligner_local_ar
+    base_model_path: null
+    base_model_name: null
+    init_encoder_from_base: false
+    tokenizer_out_dir: null
+    model:
+      sample_rate: 16000
+      compute_eval_loss: true
+      log_prediction: true
+      skip_nan_grad: true
+      aligner_type: ar
+      label_smoothing: 0.1
+      aux_nonar_loss_weight: 0.0
+      debug_wandb_logging: true
+      model_defaults:
+        enc_hidden: ${model.encoder.d_model}
+        pred_hidden: 320
+        joint_hidden: 320
+      train_ds:
+        manifest_filepath: /home/hainanx/Workplace/data/librispeech/train_clean_360.json
+        sample_rate: ${model.sample_rate}
+        batch_size: 8
+        shuffle: true
+        num_workers: 4
+        pin_memory: true
+        max_duration: 20.0
+        min_duration: 0.1
+        is_tarred: false
+        tarred_audio_filepaths: null
+      validation_ds:
+        manifest_filepath: /home/hainanx/Workplace/data/librispeech/dev_clean.json
+        sample_rate: ${model.sample_rate}
+        batch_size: 8
+        shuffle: false
+        use_start_end_token: false
+        num_workers: 4
+        pin_memory: true
+      test_ds:
+        manifest_filepath: null
+        sample_rate: ${model.sample_rate}
+        batch_size: 8
+        shuffle: false
+        use_start_end_token: false
+        num_workers: 4
+        pin_memory: true
+      tokenizer:
+        dir: /home/hainanx/Workplace/NeMo_ord_sync_d146_current/local_tokenizers/tokenizer_spe_bpe_v128
+        type: bpe
+      preprocessor:
+        _target_: nemo.collections.asr.modules.AudioToMelSpectrogramPreprocessor
+        sample_rate: ${model.sample_rate}
+        normalize: per_feature
+        window_size: 0.025
+        window_stride: 0.01
+        window: hann
+        features: 80
+        n_fft: 512
+        frame_splicing: 1
+        dither: 1.0e-05
+        pad_to: 0
+      spec_augment:
+        _target_: nemo.collections.asr.modules.SpectrogramAugmentation
+        freq_masks: 2
+        time_masks: 5
+        freq_width: 27
+        time_width: 0.05
+      encoder:
+        _target_: nemo.collections.asr.modules.ConformerEncoder
+        feat_in: ${model.preprocessor.features}
+        feat_out: -1
+        n_layers: 8
+        d_model: 256
+        subsampling: striding
+        subsampling_factor: 4
+        subsampling_conv_channels: -1
+        causal_downsampling: false
+        reduction: null
+        reduction_position: null
+        reduction_factor: 1
+        ff_expansion_factor: 4
+        self_attention_model: rel_pos
+        n_heads: 4
+        att_context_size:
+        - -1
+        - -1
+        att_context_style: regular
+        xscaling: true
+        untie_biases: true
+        pos_emb_max_len: 5000
+        conv_kernel_size: 31
+        conv_norm_type: batch_norm
+        conv_context_size: null
+        dropout: 0.1
+        dropout_pre_encoder: 0.1
+        dropout_emb: 0.0
+        dropout_att: 0.1
+        stochastic_depth_drop_prob: 0.0
+        stochastic_depth_mode: linear
+        stochastic_depth_start_layer: 1
+      decoder:
+        _target_: nemo.collections.asr.modules.RNNTDecoder
+        normalization_mode: null
+        random_state_sampling: false
+        blank_as_pad: true
+        prednet:
+          pred_hidden: ${model.model_defaults.pred_hidden}
+          pred_rnn_layers: 1
+          t_max: null
+          dropout: 0.2
+      joint:
+        _target_: nemo.collections.asr.modules.AlignerJoint
+        log_softmax: null
+        jointnet:
+          joint_hidden: ${model.model_defaults.joint_hidden}
+          activation: relu
+          dropout: 0.2
+      ctc_head:
+        hidden: null
+        activation: relu
+        dropout: 0.0
+      decoding:
+        aligner_type: ${model.aligner_type}
+        max_symbols: null
+      optim:
+        name: adamw
+        lr: 0.0003
+        betas:
+        - 0.9
+        - 0.98
+        weight_decay: 0.001
+        sched:
+          name: CosineAnnealing
+          warmup_steps: 200
+          warmup_ratio: null
+          min_lr: 1.0e-06
+    trainer:
+      devices: 2
+      num_nodes: 1
+      max_steps: 2000
+      max_epochs: -1
+      val_check_interval: 200
+      limit_val_batches: 20
+      accelerator: gpu
+      strategy: ddp_find_unused_parameters_true
+      accumulate_grad_batches: 1
+      gradient_clip_val: 1.0
+      precision: 32
+      log_every_n_steps: 5
+      enable_progress_bar: true
+      num_sanity_val_steps: 0
+      check_val_every_n_epoch: null
+      sync_batchnorm: true
+      benchmark: false
+      logger: false
+      enable_checkpointing: false
+    exp_manager:
+      exp_dir: /home/hainanx/Workplace/NeMo_ord_sync_d146_current/nemo_experiments_aligner_local
+      name: ${name}
+      create_tensorboard_logger: true
+      create_checkpoint_callback: true
+      checkpoint_callback_params:
+        monitor: val_wer
+        mode: min
+        save_top_k: 1
+        always_save_nemo: false
+      resume_if_exists: false
+      resume_ignore_no_checkpoint: true
+      log_step_stats: true
+      log_step_stats_every_n_steps: 5
+      create_wandb_logger: true
+      wandb_logger_kwargs:
+        name: aligner_local_ar
+        project: aligner_local
+    
+[NeMo I 2026-06-09 19:48:29 speech_to_text_aligner_bpe:136] ExpManager schema
+[NeMo I 2026-06-09 19:48:29 speech_to_text_aligner_bpe:136] {'explicit_log_dir': None, 'exp_dir': None, 'name': None, 'version': None, 'use_datetime_version': True, 'resume_if_exists': False, 'resume_past_end': False, 'resume_ignore_no_checkpoint': False, 'resume_from_checkpoint': None, 'create_tensorboard_logger': True, 'summary_writer_kwargs': None, 'create_wandb_logger': False, 'wandb_logger_kwargs': None, 'create_mlflow_logger': False, 'mlflow_logger_kwargs': {'experiment_name': None, 'run_name': None, 'tracking_uri': None, 'tags': None, 'save_dir': './mlruns', 'prefix': '', 'artifact_location': None, 'run_id': None, 'log_model': False}, 'create_dllogger_logger': False, 'dllogger_logger_kwargs': {'verbose': False, 'stdout': False, 'json_file': './dllogger.json'}, 'create_clearml_logger': False, 'clearml_logger_kwargs': {'project': None, 'task': None, 'connect_pytorch': False, 'model_name': None, 'tags': None, 'log_model': False, 'log_cfg': False, 'log_metrics': False}, 'create_neptune_logger': False, 'neptune_logger_kwargs': None, 'create_checkpoint_callback': True, 'checkpoint_callback_params': {'filepath': None, 'dirpath': None, 'filename': None, 'monitor': 'val_loss', 'verbose': True, 'save_last': True, 'save_top_k': 3, 'save_weights_only': False, 'mode': 'min', 'auto_insert_metric_name': True, 'every_n_epochs': 1, 'every_n_train_steps': None, 'train_time_interval': None, 'prefix': None, 'postfix': '.nemo', 'save_best_model': False, 'always_save_nemo': False, 'save_nemo_on_train_end': True, 'model_parallel_size': None, 'save_on_train_epoch_end': False, 'async_save': False, 'save_last_n_optim_states': -1}, 'create_early_stopping_callback': False, 'create_ipl_epoch_stopper_callback': False, 'early_stopping_callback_params': {'monitor': 'val_loss', 'mode': 'min', 'min_delta': 0.001, 'patience': 10, 'verbose': True, 'strict': True, 'check_finite': True, 'stopping_threshold': None, 'divergence_threshold': None, 'check_on_train_epoch_end': None, 'log_rank_zero_only': False}, 'ipl_epoch_stopper_callback_params': {'enable_stop': True, 'stop_every_n_epochs': 1}, 'create_preemption_callback': True, 'files_to_copy': None, 'log_step_timing': True, 'log_delta_step_timing': False, 'step_timing_kwargs': {'reduction': 'mean', 'sync_cuda': False, 'buffer_size': 1}, 'log_local_rank_0_only': False, 'log_global_rank_0_only': False, 'disable_validation_on_resume': True, 'ema': {'enable': False, 'decay': 0.999, 'cpu_offload': False, 'validate_original_weights': False, 'every_n_steps': 1}, 'max_time_per_run': None, 'seconds_to_sleep': 5.0, 'create_straggler_detection_callback': False, 'straggler_detection_params': {'report_time_interval': 300.0, 'calc_relative_gpu_perf': True, 'calc_individual_gpu_perf': True, 'num_gpu_perf_scores_to_log': 5, 'gpu_relative_perf_threshold': 0.7, 'gpu_individual_perf_threshold': 0.7, 'stop_if_detected': False}, 'create_fault_tolerance_callback': False, 'fault_tolerance': {'workload_check_interval': 5.0, 'initial_rank_heartbeat_timeout': 3600.0, 'rank_heartbeat_timeout': 2700.0, 'calculate_timeouts': True, 'safety_factor': 5.0, 'rank_termination_signal': <Signals.SIGKILL: 9>, 'log_level': 'INFO', 'max_rank_restarts': 0, 'max_subsequent_job_failures': 0, 'additional_ft_launcher_args': '', 'simulated_fault': None}, 'log_tflops_per_sec_per_gpu': True, 'log_step_stats': True, 'log_step_stats_every_n_steps': 100}
+[NeMo I 2026-06-09 19:48:29 speech_to_text_aligner_bpe:136] Experiments will be logged at /home/hainanx/Workplace/NeMo_ord_sync_d146_current/nemo_experiments_aligner_local/aligner_local_ar/2026-06-09_19-48-29
+[NeMo I 2026-06-09 19:48:29 exp_manager:776] TensorboardLogger has been set up
+[NeMo I 2026-06-09 19:48:29 exp_manager:776] WandBLogger has been set up
+[NeMo W 2026-06-09 19:48:29 exp_manager:827] The checkpoint callback was told to monitor a validation value and trainer's max_steps was set to 2000. Please ensure that max_steps will run for at least None epochs to ensure that checkpointing will not error out.
+[NeMo I 2026-06-09 19:48:29 speech_to_text_aligner_bpe:136] TFLOPs per sec per GPU will be calculated, conditioned on supported models. Defaults to -1 upon failure.
+[NeMo I 2026-06-09 19:48:29 mixins:69] Tokenizer SentencePieceTokenizer initialized with 128 tokens
+[NeMo I 2026-06-09 19:48:37 collections:354] Dataset loaded with 103997 files totalling 363.50 hours
+[NeMo I 2026-06-09 19:48:37 collections:354] 17 files were filtered totalling 0.11 hours
+[NeMo I 2026-06-09 19:48:37 collections:354] Dataset loaded with 2703 files totalling 5.39 hours
+[NeMo I 2026-06-09 19:48:37 collections:354] 0 files were filtered totalling 0.00 hours
+[NeMo W 2026-06-09 19:48:37 rnnt_bpe_models:454] Could not load dataset as `manifest_filepath` was None. Provided config : {'manifest_filepath': None, 'sample_rate': 16000, 'batch_size': 8, 'shuffle': False, 'use_start_end_token': False, 'num_workers': 4, 'pin_memory': True}
+[NeMo I 2026-06-09 19:49:02 modelPT:864] Optimizer config = AdamW (
+    Parameter Group 0
+        amsgrad: False
+        betas: [0.9, 0.98]
+        capturable: False
+        differentiable: False
+        eps: 1e-08
+        foreach: None
+        fused: None
+        lr: 0.0003
+        maximize: False
+        weight_decay: 0.001
+    )
+[NeMo I 2026-06-09 19:49:02 modelPT:786] Scheduler "<nemo.core.optim.lr_scheduler.CosineAnnealing object at 0x7f453026bc10>" 
+    will be used during training (effective maximum steps = 2000) - 
+    Parameters : 
+    (warmup_steps: 200
+    warmup_ratio: null
+    min_lr: 1.0e-06
+    max_steps: 2000
+    )
+[NeMo I 2026-06-09 19:49:03 aligner_models:246] [wandb-debug] attached loggers: ['TensorBoardLogger', 'WandbLogger(id=2026-06-09_19-48-29, mode=?, url=https://wandb.ai/hainan/aligner_local/runs/2026-06-09_19-48-29)']
+[NeMo I 2026-06-09 19:49:03 aligner_models:246] [wandb-debug:train] step=0 | train_loss=4.87486 | learning_rate=0.00000 | global_step=0.00000 | train_ar_loss=4.87486
+[NeMo I 2026-06-09 19:49:04 call:218] [train-stats] step 5 | epoch 0 | loss 4.8751 | ar_loss 4.8751 | lr 7.463e-06 | bs 8
+[NeMo I 2026-06-09 19:49:04 aligner_models:246] [wandb-debug:train] step=5 | train_loss=4.85625 | learning_rate=0.00001 | global_step=5.00000 | train_ar_loss=4.85625
+[NeMo I 2026-06-09 19:49:06 call:218] [train-stats] step 10 | epoch 0 | loss 4.8220 | ar_loss 4.8220 | lr 1.493e-05 | 3.47 it/s | bs 8
+[NeMo I 2026-06-09 19:49:06 aligner_models:246] [wandb-debug:train] step=10 | train_loss=4.81250 | learning_rate=0.00002 | global_step=10.00000 | train_ar_loss=4.81250
+[NeMo I 2026-06-09 19:49:07 call:218] [train-stats] step 15 | epoch 0 | loss 4.7820 | ar_loss 4.7820 | lr 2.239e-05 | 3.36 it/s | bs 8
+[NeMo I 2026-06-09 19:49:07 aligner_models:246] [wandb-debug:train] step=15 | train_loss=4.79701 | learning_rate=0.00002 | global_step=15.00000 | train_ar_loss=4.79701
+[NeMo I 2026-06-09 19:49:09 call:218] [train-stats] step 20 | epoch 0 | loss 4.7412 | ar_loss 4.7412 | lr 2.985e-05 | 3.41 it/s | bs 8
+[NeMo I 2026-06-09 19:49:09 aligner_models:246] [wandb-debug:train] step=20 | train_loss=4.78490 | learning_rate=0.00003 | global_step=20.00000 | train_ar_loss=4.78490
+[NeMo I 2026-06-09 19:49:10 call:218] [train-stats] step 25 | epoch 0 | loss 4.7399 | ar_loss 4.7399 | lr 3.731e-05 | 3.39 it/s | bs 8
+[NeMo I 2026-06-09 19:49:10 aligner_models:246] [wandb-debug:train] step=25 | train_loss=4.73097 | learning_rate=0.00004 | global_step=25.00000 | train_ar_loss=4.73097
+[NeMo I 2026-06-09 19:49:12 call:218] [train-stats] step 30 | epoch 0 | loss 4.7263 | ar_loss 4.7263 | lr 4.478e-05 | 3.41 it/s | bs 8
+[NeMo I 2026-06-09 19:49:12 aligner_models:246] [wandb-debug:train] step=30 | train_loss=4.71693 | learning_rate=0.00005 | global_step=30.00000 | train_ar_loss=4.71693
+[NeMo I 2026-06-09 19:49:13 call:218] [train-stats] step 35 | epoch 0 | loss 4.7138 | ar_loss 4.7138 | lr 5.224e-05 | 3.42 it/s | bs 8
+[NeMo I 2026-06-09 19:49:13 aligner_models:246] [wandb-debug:train] step=35 | train_loss=4.69541 | learning_rate=0.00005 | global_step=35.00000 | train_ar_loss=4.69541
+[NeMo I 2026-06-09 19:49:14 call:218] [train-stats] step 40 | epoch 0 | loss 4.6938 | ar_loss 4.6938 | lr 5.970e-05 | 3.41 it/s | bs 8
+[NeMo I 2026-06-09 19:49:15 aligner_models:246] [wandb-debug:train] step=40 | train_loss=4.68674 | learning_rate=0.00006 | global_step=40.00000 | train_ar_loss=4.68674
+[NeMo I 2026-06-09 19:49:16 call:218] [train-stats] step 45 | epoch 0 | loss 4.6631 | ar_loss 4.6631 | lr 6.716e-05 | 3.44 it/s | bs 8
+[NeMo I 2026-06-09 19:49:16 aligner_models:246] [wandb-debug:train] step=45 | train_loss=4.64277 | learning_rate=0.00007 | global_step=45.00000 | train_ar_loss=4.64277
+[NeMo I 2026-06-09 19:49:17 call:218] [train-stats] step 50 | epoch 0 | loss 4.6846 | ar_loss 4.6846 | lr 7.463e-05 | 3.46 it/s | bs 8
+[NeMo I 2026-06-09 19:49:17 aligner_models:246] [wandb-debug:train] step=50 | train_loss=4.70271 | learning_rate=0.00008 | global_step=50.00000 | train_ar_loss=4.70271
+[NeMo I 2026-06-09 19:49:19 call:218] [train-stats] step 55 | epoch 0 | loss 4.6585 | ar_loss 4.6585 | lr 8.209e-05 | 3.50 it/s | bs 8
+[NeMo I 2026-06-09 19:49:19 aligner_models:246] [wandb-debug:train] step=55 | train_loss=4.65365 | learning_rate=0.00008 | global_step=55.00000 | train_ar_loss=4.65365
+[NeMo I 2026-06-09 19:49:20 call:218] [train-stats] step 60 | epoch 0 | loss 4.6494 | ar_loss 4.6494 | lr 8.955e-05 | 3.36 it/s | bs 8
+[NeMo I 2026-06-09 19:49:20 aligner_models:246] [wandb-debug:train] step=60 | train_loss=4.64187 | learning_rate=0.00009 | global_step=60.00000 | train_ar_loss=4.64187
+[NeMo I 2026-06-09 19:49:22 call:218] [train-stats] step 65 | epoch 0 | loss 4.6579 | ar_loss 4.6579 | lr 9.701e-05 | 3.38 it/s | bs 8
+[NeMo I 2026-06-09 19:49:22 aligner_models:246] [wandb-debug:train] step=65 | train_loss=4.65995 | learning_rate=0.00010 | global_step=65.00000 | train_ar_loss=4.65995
+[NeMo I 2026-06-09 19:49:23 call:218] [train-stats] step 70 | epoch 0 | loss 4.6199 | ar_loss 4.6199 | lr 1.045e-04 | 3.41 it/s | bs 8
+[NeMo I 2026-06-09 19:49:23 aligner_models:246] [wandb-debug:train] step=70 | train_loss=4.63620 | learning_rate=0.00011 | global_step=70.00000 | train_ar_loss=4.63620
+[NeMo I 2026-06-09 19:49:25 call:218] [train-stats] step 75 | epoch 0 | loss 4.6690 | ar_loss 4.6690 | lr 1.119e-04 | 3.45 it/s | bs 8
+[NeMo I 2026-06-09 19:49:25 aligner_models:246] [wandb-debug:train] step=75 | train_loss=4.64454 | learning_rate=0.00011 | global_step=75.00000 | train_ar_loss=4.64454
+[NeMo I 2026-06-09 19:49:26 call:218] [train-stats] step 80 | epoch 0 | loss 4.6325 | ar_loss 4.6325 | lr 1.194e-04 | 3.43 it/s | bs 8
+[NeMo I 2026-06-09 19:49:26 aligner_models:246] [wandb-debug:train] step=80 | train_loss=4.62189 | learning_rate=0.00012 | global_step=80.00000 | train_ar_loss=4.62189
+[NeMo I 2026-06-09 19:49:28 call:218] [train-stats] step 85 | epoch 0 | loss 4.6323 | ar_loss 4.6323 | lr 1.269e-04 | 3.25 it/s | bs 8
+[NeMo I 2026-06-09 19:49:28 aligner_models:246] [wandb-debug:train] step=85 | train_loss=4.67478 | learning_rate=0.00013 | global_step=85.00000 | train_ar_loss=4.67478
+[NeMo I 2026-06-09 19:49:29 call:218] [train-stats] step 90 | epoch 0 | loss 4.6222 | ar_loss 4.6222 | lr 1.343e-04 | 3.37 it/s | bs 8
+[NeMo I 2026-06-09 19:49:29 aligner_models:246] [wandb-debug:train] step=90 | train_loss=4.59382 | learning_rate=0.00014 | global_step=90.00000 | train_ar_loss=4.59382
+[NeMo I 2026-06-09 19:49:31 call:218] [train-stats] step 95 | epoch 0 | loss 4.6107 | ar_loss 4.6107 | lr 1.418e-04 | 3.46 it/s | bs 8
+[NeMo I 2026-06-09 19:49:31 aligner_models:246] [wandb-debug:train] step=95 | train_loss=4.64045 | learning_rate=0.00014 | global_step=95.00000 | train_ar_loss=4.64045
+[NeMo I 2026-06-09 19:49:32 call:218] [train-stats] step 100 | epoch 0 | loss 4.6294 | ar_loss 4.6294 | lr 1.493e-04 | 3.40 it/s | bs 8
+[NeMo I 2026-06-09 19:49:32 aligner_models:246] [wandb-debug:train] step=100 | train_loss=4.57722 | learning_rate=0.00015 | global_step=100.00000 | train_ar_loss=4.57722
+[NeMo I 2026-06-09 19:49:34 call:218] [train-stats] step 105 | epoch 0 | loss 4.5609 | ar_loss 4.5609 | lr 1.567e-04 | 3.31 it/s | bs 8
+[NeMo I 2026-06-09 19:49:34 aligner_models:246] [wandb-debug:train] step=105 | train_loss=4.60646 | learning_rate=0.00016 | global_step=105.00000 | train_ar_loss=4.60646
+[NeMo I 2026-06-09 19:49:35 call:218] [train-stats] step 110 | epoch 0 | loss 4.6350 | ar_loss 4.6350 | lr 1.642e-04 | 3.46 it/s | bs 8
+[NeMo I 2026-06-09 19:49:35 aligner_models:246] [wandb-debug:train] step=110 | train_loss=4.56767 | learning_rate=0.00017 | global_step=110.00000 | train_ar_loss=4.56767
+[NeMo I 2026-06-09 19:49:36 call:218] [train-stats] step 115 | epoch 0 | loss 4.6049 | ar_loss 4.6049 | lr 1.716e-04 | 3.46 it/s | bs 8
+[NeMo I 2026-06-09 19:49:37 aligner_models:246] [wandb-debug:train] step=115 | train_loss=4.58341 | learning_rate=0.00017 | global_step=115.00000 | train_ar_loss=4.58341
+[NeMo I 2026-06-09 19:49:38 call:218] [train-stats] step 120 | epoch 0 | loss 4.5505 | ar_loss 4.5505 | lr 1.791e-04 | 3.46 it/s | bs 8
+[NeMo I 2026-06-09 19:49:38 aligner_models:246] [wandb-debug:train] step=120 | train_loss=4.59051 | learning_rate=0.00018 | global_step=120.00000 | train_ar_loss=4.59051
+[NeMo I 2026-06-09 19:49:39 call:218] [train-stats] step 125 | epoch 0 | loss 4.5690 | ar_loss 4.5690 | lr 1.866e-04 | 3.40 it/s | bs 8
+[NeMo I 2026-06-09 19:49:39 aligner_models:246] [wandb-debug:train] step=125 | train_loss=4.60975 | learning_rate=0.00019 | global_step=125.00000 | train_ar_loss=4.60975
+[NeMo I 2026-06-09 19:49:41 call:218] [train-stats] step 130 | epoch 0 | loss 4.5804 | ar_loss 4.5804 | lr 1.940e-04 | 3.40 it/s | bs 8
+[NeMo I 2026-06-09 19:49:41 aligner_models:246] [wandb-debug:train] step=130 | train_loss=4.54343 | learning_rate=0.00020 | global_step=130.00000 | train_ar_loss=4.54343
+[NeMo I 2026-06-09 19:49:42 call:218] [train-stats] step 135 | epoch 0 | loss 4.5902 | ar_loss 4.5902 | lr 2.015e-04 | 3.41 it/s | bs 8
+[NeMo I 2026-06-09 19:49:42 aligner_models:246] [wandb-debug:train] step=135 | train_loss=4.55809 | learning_rate=0.00020 | global_step=135.00000 | train_ar_loss=4.55809
+[NeMo I 2026-06-09 19:49:44 call:218] [train-stats] step 140 | epoch 0 | loss 4.5391 | ar_loss 4.5391 | lr 2.090e-04 | 3.39 it/s | bs 8
+[NeMo I 2026-06-09 19:49:44 aligner_models:246] [wandb-debug:train] step=140 | train_loss=4.55432 | learning_rate=0.00021 | global_step=140.00000 | train_ar_loss=4.55432
+[NeMo I 2026-06-09 19:49:45 call:218] [train-stats] step 145 | epoch 0 | loss 4.4958 | ar_loss 4.4958 | lr 2.164e-04 | 3.42 it/s | bs 8
+[NeMo I 2026-06-09 19:49:45 aligner_models:246] [wandb-debug:train] step=145 | train_loss=4.56475 | learning_rate=0.00022 | global_step=145.00000 | train_ar_loss=4.56475
+[NeMo I 2026-06-09 19:49:47 call:218] [train-stats] step 150 | epoch 0 | loss 4.4753 | ar_loss 4.4753 | lr 2.239e-04 | 3.42 it/s | bs 8
+[NeMo I 2026-06-09 19:49:47 aligner_models:246] [wandb-debug:train] step=150 | train_loss=4.53764 | learning_rate=0.00023 | global_step=150.00000 | train_ar_loss=4.53764
+[NeMo I 2026-06-09 19:49:48 call:218] [train-stats] step 155 | epoch 0 | loss 4.5325 | ar_loss 4.5325 | lr 2.313e-04 | 3.48 it/s | bs 8
+[NeMo I 2026-06-09 19:49:48 aligner_models:246] [wandb-debug:train] step=155 | train_loss=4.50732 | learning_rate=0.00023 | global_step=155.00000 | train_ar_loss=4.50732
+[NeMo I 2026-06-09 19:49:50 call:218] [train-stats] step 160 | epoch 0 | loss 4.4900 | ar_loss 4.4900 | lr 2.388e-04 | 3.38 it/s | bs 8
+[NeMo I 2026-06-09 19:49:50 aligner_models:246] [wandb-debug:train] step=160 | train_loss=4.51519 | learning_rate=0.00024 | global_step=160.00000 | train_ar_loss=4.51519
+[NeMo I 2026-06-09 19:49:51 call:218] [train-stats] step 165 | epoch 0 | loss 4.4596 | ar_loss 4.4596 | lr 2.463e-04 | 3.41 it/s | bs 8
+[NeMo I 2026-06-09 19:49:51 aligner_models:246] [wandb-debug:train] step=165 | train_loss=4.46577 | learning_rate=0.00025 | global_step=165.00000 | train_ar_loss=4.46577
+[NeMo I 2026-06-09 19:49:53 call:218] [train-stats] step 170 | epoch 0 | loss 4.4394 | ar_loss 4.4394 | lr 2.537e-04 | 3.41 it/s | bs 8
+[NeMo I 2026-06-09 19:49:53 aligner_models:246] [wandb-debug:train] step=170 | train_loss=4.39479 | learning_rate=0.00026 | global_step=170.00000 | train_ar_loss=4.39479
+[NeMo I 2026-06-09 19:49:54 call:218] [train-stats] step 175 | epoch 0 | loss 4.4152 | ar_loss 4.4152 | lr 2.612e-04 | 3.41 it/s | bs 8
+[NeMo I 2026-06-09 19:49:54 aligner_models:246] [wandb-debug:train] step=175 | train_loss=4.34062 | learning_rate=0.00026 | global_step=175.00000 | train_ar_loss=4.34062
+[NeMo I 2026-06-09 19:49:56 call:218] [train-stats] step 180 | epoch 0 | loss 4.3234 | ar_loss 4.3234 | lr 2.687e-04 | 3.32 it/s | bs 8
+[NeMo I 2026-06-09 19:49:56 aligner_models:246] [wandb-debug:train] step=180 | train_loss=4.31064 | learning_rate=0.00027 | global_step=180.00000 | train_ar_loss=4.31064
+[NeMo I 2026-06-09 19:49:57 call:218] [train-stats] step 185 | epoch 0 | loss 4.2818 | ar_loss 4.2818 | lr 2.761e-04 | 3.39 it/s | bs 8
+[NeMo I 2026-06-09 19:49:57 aligner_models:246] [wandb-debug:train] step=185 | train_loss=4.24219 | learning_rate=0.00028 | global_step=185.00000 | train_ar_loss=4.24219
+[NeMo I 2026-06-09 19:49:58 call:218] [train-stats] step 190 | epoch 0 | loss 4.2398 | ar_loss 4.2398 | lr 2.836e-04 | 3.43 it/s | bs 8
+[NeMo I 2026-06-09 19:49:59 aligner_models:246] [wandb-debug:train] step=190 | train_loss=4.23348 | learning_rate=0.00029 | global_step=190.00000 | train_ar_loss=4.23348
+[NeMo I 2026-06-09 19:50:00 call:218] [train-stats] step 195 | epoch 0 | loss 4.2113 | ar_loss 4.2113 | lr 2.910e-04 | 3.44 it/s | bs 8
+[NeMo I 2026-06-09 19:50:00 aligner_models:246] [wandb-debug:train] step=195 | train_loss=4.22686 | learning_rate=0.00029 | global_step=195.00000 | train_ar_loss=4.22686
+[NeMo I 2026-06-09 19:50:01 call:218] [train-stats] step 200 | epoch 0 | loss 4.1524 | ar_loss 4.1524 | lr 2.985e-04 | 3.34 it/s | bs 8
+[NeMo W 2026-06-09 19:50:08 warnings:109] /home/hainanx/anaconda3/lib/python3.10/site-packages/lightning/pytorch/trainer/connectors/logger_connector/result.py:431: It is recommended to use `self.log('global_step', ..., sync_dist=True)` when logging on epoch level in distributed setting to accumulate the metric across devices.
+    
+[NeMo I 2026-06-09 19:50:08 aligner_models:308] [wandb-debug:val] step=200 | val_loss=4.15934 | val_wer=1.20699
+[NeMo I 2026-06-09 19:50:08 model_checkpoint:757] Checkpoint save for step 200 started at 2026-06-09T19:50:08.948149.
+[NeMo I 2026-06-09 19:50:09 model_checkpoint:696] Checkpoint save for step 200 started at 2026-06-09T19:50:09.866975.
+[NeMo I 2026-06-09 19:50:10 aligner_models:246] [wandb-debug:train] step=200 | train_loss=4.20700 | learning_rate=0.00030 | global_step=200.00000 | train_ar_loss=4.20700
+[NeMo I 2026-06-09 19:50:12 call:218] [train-stats] step 205 | epoch 0 | loss 4.0633 | ar_loss 4.0633 | lr 3.000e-04 | 0.49 it/s | bs 8
+[NeMo I 2026-06-09 19:50:12 aligner_models:246] [wandb-debug:train] step=205 | train_loss=4.14673 | learning_rate=0.00030 | global_step=205.00000 | train_ar_loss=4.14673
+[NeMo I 2026-06-09 19:50:13 call:218] [train-stats] step 210 | epoch 0 | loss 4.1318 | ar_loss 4.1318 | lr 3.000e-04 | 3.41 it/s | bs 8
+[NeMo I 2026-06-09 19:50:13 aligner_models:246] [wandb-debug:train] step=210 | train_loss=4.09264 | learning_rate=0.00030 | global_step=210.00000 | train_ar_loss=4.09264
+[NeMo I 2026-06-09 19:50:15 call:218] [train-stats] step 215 | epoch 0 | loss 4.0718 | ar_loss 4.0718 | lr 3.000e-04 | 3.38 it/s | bs 8
+[NeMo I 2026-06-09 19:50:15 aligner_models:246] [wandb-debug:train] step=215 | train_loss=4.08795 | learning_rate=0.00030 | global_step=215.00000 | train_ar_loss=4.08795
+[NeMo I 2026-06-09 19:50:16 call:218] [train-stats] step 220 | epoch 0 | loss 4.0823 | ar_loss 4.0823 | lr 2.999e-04 | 3.38 it/s | bs 8
+[NeMo I 2026-06-09 19:50:16 aligner_models:246] [wandb-debug:train] step=220 | train_loss=4.11933 | learning_rate=0.00030 | global_step=220.00000 | train_ar_loss=4.11933
+[NeMo I 2026-06-09 19:50:18 call:218] [train-stats] step 225 | epoch 0 | loss 4.0206 | ar_loss 4.0206 | lr 2.999e-04 | 3.44 it/s | bs 8
+[NeMo I 2026-06-09 19:50:18 aligner_models:246] [wandb-debug:train] step=225 | train_loss=4.08741 | learning_rate=0.00030 | global_step=225.00000 | train_ar_loss=4.08741
+[NeMo I 2026-06-09 19:50:19 call:218] [train-stats] step 230 | epoch 0 | loss 4.0826 | ar_loss 4.0826 | lr 2.998e-04 | 3.42 it/s | bs 8
+[NeMo I 2026-06-09 19:50:19 aligner_models:246] [wandb-debug:train] step=230 | train_loss=3.98165 | learning_rate=0.00030 | global_step=230.00000 | train_ar_loss=3.98165
+[NeMo I 2026-06-09 19:50:21 call:218] [train-stats] step 235 | epoch 0 | loss 3.9498 | ar_loss 3.9498 | lr 2.997e-04 | 3.36 it/s | bs 8
+[NeMo I 2026-06-09 19:50:21 aligner_models:246] [wandb-debug:train] step=235 | train_loss=3.96274 | learning_rate=0.00030 | global_step=235.00000 | train_ar_loss=3.96274
+[NeMo I 2026-06-09 19:50:22 call:218] [train-stats] step 240 | epoch 0 | loss 3.9326 | ar_loss 3.9326 | lr 2.997e-04 | 3.28 it/s | bs 8
+[NeMo I 2026-06-09 19:50:22 aligner_models:246] [wandb-debug:train] step=240 | train_loss=3.90455 | learning_rate=0.00030 | global_step=240.00000 | train_ar_loss=3.90455
+[NeMo I 2026-06-09 19:50:23 call:218] [train-stats] step 245 | epoch 0 | loss 3.9359 | ar_loss 3.9359 | lr 2.996e-04 | 3.43 it/s | bs 8
+[NeMo I 2026-06-09 19:50:24 aligner_models:246] [wandb-debug:train] step=245 | train_loss=3.99868 | learning_rate=0.00030 | global_step=245.00000 | train_ar_loss=3.99868
+[NeMo I 2026-06-09 19:50:25 call:218] [train-stats] step 250 | epoch 0 | loss 3.9408 | ar_loss 3.9408 | lr 2.995e-04 | 3.40 it/s | bs 8
+[NeMo I 2026-06-09 19:50:25 aligner_models:246] [wandb-debug:train] step=250 | train_loss=4.01767 | learning_rate=0.00030 | global_step=250.00000 | train_ar_loss=4.01767
+[NeMo I 2026-06-09 19:50:26 call:218] [train-stats] step 255 | epoch 0 | loss 3.9439 | ar_loss 3.9439 | lr 2.993e-04 | 3.41 it/s | bs 8
+[NeMo I 2026-06-09 19:50:26 aligner_models:246] [wandb-debug:train] step=255 | train_loss=3.99748 | learning_rate=0.00030 | global_step=255.00000 | train_ar_loss=3.99748
+[NeMo I 2026-06-09 19:50:28 call:218] [train-stats] step 260 | epoch 0 | loss 3.8502 | ar_loss 3.8502 | lr 2.992e-04 | 3.40 it/s | bs 8
+[NeMo I 2026-06-09 19:50:28 aligner_models:246] [wandb-debug:train] step=260 | train_loss=3.88847 | learning_rate=0.00030 | global_step=260.00000 | train_ar_loss=3.88847
+[NeMo I 2026-06-09 19:50:29 call:218] [train-stats] step 265 | epoch 0 | loss 3.8929 | ar_loss 3.8929 | lr 2.991e-04 | 3.36 it/s | bs 8
+[NeMo I 2026-06-09 19:50:29 aligner_models:246] [wandb-debug:train] step=265 | train_loss=3.92673 | learning_rate=0.00030 | global_step=265.00000 | train_ar_loss=3.92673
+[NeMo I 2026-06-09 19:50:31 call:218] [train-stats] step 270 | epoch 0 | loss 3.8776 | ar_loss 3.8776 | lr 2.989e-04 | 3.46 it/s | bs 8
+[NeMo I 2026-06-09 19:50:31 aligner_models:246] [wandb-debug:train] step=270 | train_loss=3.83003 | learning_rate=0.00030 | global_step=270.00000 | train_ar_loss=3.83003
+[NeMo I 2026-06-09 19:50:32 call:218] [train-stats] step 275 | epoch 0 | loss 3.8876 | ar_loss 3.8876 | lr 2.988e-04 | 3.37 it/s | bs 8
+[NeMo I 2026-06-09 19:50:32 aligner_models:246] [wandb-debug:train] step=275 | train_loss=3.92790 | learning_rate=0.00030 | global_step=275.00000 | train_ar_loss=3.92790
+[NeMo I 2026-06-09 19:50:34 call:218] [train-stats] step 280 | epoch 0 | loss 3.8947 | ar_loss 3.8947 | lr 2.986e-04 | 3.36 it/s | bs 8
+[NeMo I 2026-06-09 19:50:34 aligner_models:246] [wandb-debug:train] step=280 | train_loss=3.86134 | learning_rate=0.00030 | global_step=280.00000 | train_ar_loss=3.86134
+[NeMo I 2026-06-09 19:50:35 call:218] [train-stats] step 285 | epoch 0 | loss 3.8893 | ar_loss 3.8893 | lr 2.984e-04 | 3.43 it/s | bs 8
+[NeMo I 2026-06-09 19:50:35 aligner_models:246] [wandb-debug:train] step=285 | train_loss=3.87871 | learning_rate=0.00030 | global_step=285.00000 | train_ar_loss=3.87871
+[NeMo I 2026-06-09 19:50:37 call:218] [train-stats] step 290 | epoch 0 | loss 3.8522 | ar_loss 3.8522 | lr 2.982e-04 | 3.30 it/s | bs 8
+[NeMo I 2026-06-09 19:50:37 aligner_models:246] [wandb-debug:train] step=290 | train_loss=3.84870 | learning_rate=0.00030 | global_step=290.00000 | train_ar_loss=3.84870
+[NeMo I 2026-06-09 19:50:38 call:218] [train-stats] step 295 | epoch 0 | loss 3.8855 | ar_loss 3.8855 | lr 2.980e-04 | 3.40 it/s | bs 8
+[NeMo I 2026-06-09 19:50:38 aligner_models:246] [wandb-debug:train] step=295 | train_loss=3.92559 | learning_rate=0.00030 | global_step=295.00000 | train_ar_loss=3.92559
+[NeMo I 2026-06-09 19:50:40 call:218] [train-stats] step 300 | epoch 0 | loss 3.9559 | ar_loss 3.9559 | lr 2.978e-04 | 3.45 it/s | bs 8
+[NeMo I 2026-06-09 19:50:40 aligner_models:246] [wandb-debug:train] step=300 | train_loss=3.79047 | learning_rate=0.00030 | global_step=300.00000 | train_ar_loss=3.79047
+[NeMo I 2026-06-09 19:50:41 call:218] [train-stats] step 305 | epoch 0 | loss 3.8592 | ar_loss 3.8592 | lr 2.975e-04 | 3.41 it/s | bs 8
+[NeMo I 2026-06-09 19:50:41 aligner_models:246] [wandb-debug:train] step=305 | train_loss=3.78357 | learning_rate=0.00030 | global_step=305.00000 | train_ar_loss=3.78357
+[NeMo I 2026-06-09 19:50:43 call:218] [train-stats] step 310 | epoch 0 | loss 3.7714 | ar_loss 3.7714 | lr 2.973e-04 | 3.40 it/s | bs 8
+[NeMo I 2026-06-09 19:50:43 aligner_models:246] [wandb-debug:train] step=310 | train_loss=3.76242 | learning_rate=0.00030 | global_step=310.00000 | train_ar_loss=3.76242
+[NeMo I 2026-06-09 19:50:44 call:218] [train-stats] step 315 | epoch 0 | loss 3.8078 | ar_loss 3.8078 | lr 2.971e-04 | 3.44 it/s | bs 8
+[NeMo I 2026-06-09 19:50:44 aligner_models:246] [wandb-debug:train] step=315 | train_loss=3.75470 | learning_rate=0.00030 | global_step=315.00000 | train_ar_loss=3.75470
+[NeMo I 2026-06-09 19:50:46 call:218] [train-stats] step 320 | epoch 0 | loss 3.8002 | ar_loss 3.8002 | lr 2.968e-04 | 3.41 it/s | bs 8
+[NeMo I 2026-06-09 19:50:46 aligner_models:246] [wandb-debug:train] step=320 | train_loss=3.77245 | learning_rate=0.00030 | global_step=320.00000 | train_ar_loss=3.77245
+[NeMo I 2026-06-09 19:50:47 call:218] [train-stats] step 325 | epoch 0 | loss 3.7712 | ar_loss 3.7712 | lr 2.965e-04 | 3.43 it/s | bs 8
+[NeMo I 2026-06-09 19:50:47 aligner_models:246] [wandb-debug:train] step=325 | train_loss=3.76142 | learning_rate=0.00030 | global_step=325.00000 | train_ar_loss=3.76142
+[NeMo I 2026-06-09 19:50:48 call:218] [train-stats] step 330 | epoch 0 | loss 3.7897 | ar_loss 3.7897 | lr 2.962e-04 | 3.43 it/s | bs 8
+[NeMo I 2026-06-09 19:50:49 aligner_models:246] [wandb-debug:train] step=330 | train_loss=3.79637 | learning_rate=0.00030 | global_step=330.00000 | train_ar_loss=3.79637
+[NeMo I 2026-06-09 19:50:50 call:218] [train-stats] step 335 | epoch 0 | loss 3.7754 | ar_loss 3.7754 | lr 2.959e-04 | 3.39 it/s | bs 8
+[NeMo I 2026-06-09 19:50:50 aligner_models:246] [wandb-debug:train] step=335 | train_loss=3.81109 | learning_rate=0.00030 | global_step=335.00000 | train_ar_loss=3.81109
+[NeMo I 2026-06-09 19:50:51 call:218] [train-stats] step 340 | epoch 0 | loss 3.6877 | ar_loss 3.6877 | lr 2.956e-04 | 3.34 it/s | bs 8
+[NeMo I 2026-06-09 19:50:51 aligner_models:246] [wandb-debug:train] step=340 | train_loss=3.76340 | learning_rate=0.00030 | global_step=340.00000 | train_ar_loss=3.76340

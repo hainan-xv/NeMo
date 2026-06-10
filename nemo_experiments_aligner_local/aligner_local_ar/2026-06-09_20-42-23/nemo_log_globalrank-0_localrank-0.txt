@@ -1,0 +1,261 @@
+[NeMo I 2026-06-09 20:42:23 utils:186] Hydra config:
+    name: aligner_local_ar
+    base_model_path: null
+    base_model_name: null
+    init_encoder_from_base: false
+    tokenizer_out_dir: null
+    model:
+      sample_rate: 16000
+      compute_eval_loss: true
+      log_prediction: true
+      skip_nan_grad: true
+      loss_type: aligner
+      aligner_type: ar
+      label_smoothing: 0.1
+      aux_nonar_loss_weight: 0.0
+      log_stats_every_n_steps: 10
+      model_defaults:
+        enc_hidden: ${model.encoder.d_model}
+        pred_hidden: 320
+        joint_hidden: 320
+      train_ds:
+        manifest_filepath: /home/hainanx/Workplace/data/librispeech/train_clean_360.json
+        sample_rate: ${model.sample_rate}
+        batch_size: 8
+        shuffle: true
+        num_workers: 4
+        pin_memory: true
+        max_duration: 20.0
+        min_duration: 0.1
+        is_tarred: false
+        tarred_audio_filepaths: null
+      validation_ds:
+        manifest_filepath: /home/hainanx/Workplace/data/librispeech/dev_clean.json
+        sample_rate: ${model.sample_rate}
+        batch_size: 8
+        shuffle: false
+        use_start_end_token: false
+        num_workers: 4
+        pin_memory: true
+      test_ds:
+        manifest_filepath: null
+        sample_rate: ${model.sample_rate}
+        batch_size: 8
+        shuffle: false
+        use_start_end_token: false
+        num_workers: 4
+        pin_memory: true
+      tokenizer:
+        dir: /home/hainanx/Workplace/NeMo_ord_sync_d146_current/local_tokenizers/tokenizer_spe_bpe_v128
+        type: bpe
+      preprocessor:
+        _target_: nemo.collections.asr.modules.AudioToMelSpectrogramPreprocessor
+        sample_rate: ${model.sample_rate}
+        normalize: per_feature
+        window_size: 0.025
+        window_stride: 0.01
+        window: hann
+        features: 80
+        n_fft: 512
+        frame_splicing: 1
+        dither: 1.0e-05
+        pad_to: 0
+      spec_augment:
+        _target_: nemo.collections.asr.modules.SpectrogramAugmentation
+        freq_masks: 2
+        time_masks: 5
+        freq_width: 27
+        time_width: 0.05
+      encoder:
+        _target_: nemo.collections.asr.modules.ConformerEncoder
+        feat_in: ${model.preprocessor.features}
+        feat_out: -1
+        n_layers: 8
+        d_model: 256
+        subsampling: striding
+        subsampling_factor: 4
+        subsampling_conv_channels: -1
+        causal_downsampling: false
+        reduction: null
+        reduction_position: null
+        reduction_factor: 1
+        ff_expansion_factor: 4
+        self_attention_model: rel_pos
+        n_heads: 4
+        att_context_size:
+        - -1
+        - -1
+        att_context_style: regular
+        xscaling: true
+        untie_biases: true
+        pos_emb_max_len: 5000
+        conv_kernel_size: 31
+        conv_norm_type: batch_norm
+        conv_context_size: null
+        dropout: 0.1
+        dropout_pre_encoder: 0.1
+        dropout_emb: 0.0
+        dropout_att: 0.1
+        stochastic_depth_drop_prob: 0.0
+        stochastic_depth_mode: linear
+        stochastic_depth_start_layer: 1
+      decoder:
+        _target_: nemo.collections.asr.modules.RNNTDecoder
+        normalization_mode: null
+        random_state_sampling: false
+        blank_as_pad: true
+        prednet:
+          pred_hidden: ${model.model_defaults.pred_hidden}
+          pred_rnn_layers: 1
+          t_max: null
+          dropout: 0.2
+      joint:
+        _target_: nemo.collections.asr.modules.AlignerJoint
+        log_softmax: null
+        jointnet:
+          joint_hidden: ${model.model_defaults.joint_hidden}
+          activation: relu
+          dropout: 0.2
+      ctc_head:
+        hidden: null
+        activation: relu
+        dropout: 0.0
+      decoding:
+        aligner_type: ${model.aligner_type}
+        max_symbols: null
+      optim:
+        name: adamw
+        lr: 0.0003
+        betas:
+        - 0.9
+        - 0.98
+        weight_decay: 0.001
+        sched:
+          name: CosineAnnealing
+          warmup_steps: 200
+          warmup_ratio: null
+          min_lr: 1.0e-06
+    trainer:
+      devices: 2
+      num_nodes: 1
+      max_steps: 2000
+      max_epochs: -1
+      val_check_interval: 200
+      limit_val_batches: 20
+      accelerator: gpu
+      strategy: ddp_find_unused_parameters_true
+      accumulate_grad_batches: 1
+      gradient_clip_val: 1.0
+      precision: 32
+      log_every_n_steps: 5
+      enable_progress_bar: true
+      num_sanity_val_steps: 0
+      check_val_every_n_epoch: null
+      sync_batchnorm: true
+      benchmark: false
+      logger: false
+      enable_checkpointing: false
+    exp_manager:
+      exp_dir: /home/hainanx/Workplace/NeMo_ord_sync_d146_current/nemo_experiments_aligner_local
+      name: ${name}
+      create_tensorboard_logger: true
+      create_checkpoint_callback: true
+      checkpoint_callback_params:
+        monitor: val_wer
+        mode: min
+        save_top_k: 1
+        always_save_nemo: false
+      resume_if_exists: false
+      resume_ignore_no_checkpoint: true
+      create_wandb_logger: true
+      wandb_logger_kwargs:
+        name: aligner_local_ar
+        project: aligner_local
+    
+[NeMo I 2026-06-09 20:42:23 speech_to_text_aligner_bpe:136] ExpManager schema
+[NeMo I 2026-06-09 20:42:23 speech_to_text_aligner_bpe:136] {'explicit_log_dir': None, 'exp_dir': None, 'name': None, 'version': None, 'use_datetime_version': True, 'resume_if_exists': False, 'resume_past_end': False, 'resume_ignore_no_checkpoint': False, 'resume_from_checkpoint': None, 'create_tensorboard_logger': True, 'summary_writer_kwargs': None, 'create_wandb_logger': False, 'wandb_logger_kwargs': None, 'create_mlflow_logger': False, 'mlflow_logger_kwargs': {'experiment_name': None, 'run_name': None, 'tracking_uri': None, 'tags': None, 'save_dir': './mlruns', 'prefix': '', 'artifact_location': None, 'run_id': None, 'log_model': False}, 'create_dllogger_logger': False, 'dllogger_logger_kwargs': {'verbose': False, 'stdout': False, 'json_file': './dllogger.json'}, 'create_clearml_logger': False, 'clearml_logger_kwargs': {'project': None, 'task': None, 'connect_pytorch': False, 'model_name': None, 'tags': None, 'log_model': False, 'log_cfg': False, 'log_metrics': False}, 'create_neptune_logger': False, 'neptune_logger_kwargs': None, 'create_checkpoint_callback': True, 'checkpoint_callback_params': {'filepath': None, 'dirpath': None, 'filename': None, 'monitor': 'val_loss', 'verbose': True, 'save_last': True, 'save_top_k': 3, 'save_weights_only': False, 'mode': 'min', 'auto_insert_metric_name': True, 'every_n_epochs': 1, 'every_n_train_steps': None, 'train_time_interval': None, 'prefix': None, 'postfix': '.nemo', 'save_best_model': False, 'always_save_nemo': False, 'save_nemo_on_train_end': True, 'model_parallel_size': None, 'save_on_train_epoch_end': False, 'async_save': False, 'save_last_n_optim_states': -1}, 'create_early_stopping_callback': False, 'create_ipl_epoch_stopper_callback': False, 'early_stopping_callback_params': {'monitor': 'val_loss', 'mode': 'min', 'min_delta': 0.001, 'patience': 10, 'verbose': True, 'strict': True, 'check_finite': True, 'stopping_threshold': None, 'divergence_threshold': None, 'check_on_train_epoch_end': None, 'log_rank_zero_only': False}, 'ipl_epoch_stopper_callback_params': {'enable_stop': True, 'stop_every_n_epochs': 1}, 'create_preemption_callback': True, 'files_to_copy': None, 'log_step_timing': True, 'log_delta_step_timing': False, 'step_timing_kwargs': {'reduction': 'mean', 'sync_cuda': False, 'buffer_size': 1}, 'log_local_rank_0_only': False, 'log_global_rank_0_only': False, 'disable_validation_on_resume': True, 'ema': {'enable': False, 'decay': 0.999, 'cpu_offload': False, 'validate_original_weights': False, 'every_n_steps': 1}, 'max_time_per_run': None, 'seconds_to_sleep': 5.0, 'create_straggler_detection_callback': False, 'straggler_detection_params': {'report_time_interval': 300.0, 'calc_relative_gpu_perf': True, 'calc_individual_gpu_perf': True, 'num_gpu_perf_scores_to_log': 5, 'gpu_relative_perf_threshold': 0.7, 'gpu_individual_perf_threshold': 0.7, 'stop_if_detected': False}, 'create_fault_tolerance_callback': False, 'fault_tolerance': {'workload_check_interval': 5.0, 'initial_rank_heartbeat_timeout': 3600.0, 'rank_heartbeat_timeout': 2700.0, 'calculate_timeouts': True, 'safety_factor': 5.0, 'rank_termination_signal': <Signals.SIGKILL: 9>, 'log_level': 'INFO', 'max_rank_restarts': 0, 'max_subsequent_job_failures': 0, 'additional_ft_launcher_args': '', 'simulated_fault': None}, 'log_tflops_per_sec_per_gpu': True}
+[NeMo I 2026-06-09 20:42:23 speech_to_text_aligner_bpe:136] Experiments will be logged at /home/hainanx/Workplace/NeMo_ord_sync_d146_current/nemo_experiments_aligner_local/aligner_local_ar/2026-06-09_20-42-23
+[NeMo I 2026-06-09 20:42:23 exp_manager:691] TensorboardLogger has been set up
+[NeMo I 2026-06-09 20:42:23 exp_manager:691] WandBLogger has been set up
+[NeMo W 2026-06-09 20:42:23 exp_manager:738] The checkpoint callback was told to monitor a validation value and trainer's max_steps was set to 2000. Please ensure that max_steps will run for at least None epochs to ensure that checkpointing will not error out.
+[NeMo I 2026-06-09 20:42:23 speech_to_text_aligner_bpe:136] TFLOPs per sec per GPU will be calculated, conditioned on supported models. Defaults to -1 upon failure.
+[NeMo I 2026-06-09 20:42:23 mixins:69] Tokenizer SentencePieceTokenizer initialized with 128 tokens
+[NeMo I 2026-06-09 20:42:31 collections:354] Dataset loaded with 103997 files totalling 363.50 hours
+[NeMo I 2026-06-09 20:42:31 collections:354] 17 files were filtered totalling 0.11 hours
+[NeMo I 2026-06-09 20:42:31 collections:354] Dataset loaded with 2703 files totalling 5.39 hours
+[NeMo I 2026-06-09 20:42:31 collections:354] 0 files were filtered totalling 0.00 hours
+[NeMo W 2026-06-09 20:42:31 rnnt_bpe_models:472] Could not load dataset as `manifest_filepath` was None. Provided config : {'manifest_filepath': None, 'sample_rate': 16000, 'batch_size': 8, 'shuffle': False, 'use_start_end_token': False, 'num_workers': 4, 'pin_memory': True}
+[NeMo I 2026-06-09 20:42:56 modelPT:864] Optimizer config = AdamW (
+    Parameter Group 0
+        amsgrad: False
+        betas: [0.9, 0.98]
+        capturable: False
+        differentiable: False
+        eps: 1e-08
+        foreach: None
+        fused: None
+        lr: 0.0003
+        maximize: False
+        weight_decay: 0.001
+    )
+[NeMo I 2026-06-09 20:42:56 modelPT:786] Scheduler "<nemo.core.optim.lr_scheduler.CosineAnnealing object at 0x7f345c3ffbb0>" 
+    will be used during training (effective maximum steps = 2000) - 
+    Parameters : 
+    (warmup_steps: 200
+    warmup_ratio: null
+    min_lr: 1.0e-06
+    max_steps: 2000
+    )
+[NeMo I 2026-06-09 20:42:56 model_utils:463] [aligner-train] step=0 epoch=0 loss=4.8990 lr=1.493e-06 bs=8 enc_frames_mean=313.8 enc_frames_max=396 tgt_len_mean=89.0 tgt_len_max=142
+[NeMo I 2026-06-09 20:42:59 model_utils:463] [aligner-train] step=10 epoch=0 loss=4.8563 lr=1.642e-05 bs=8 enc_frames_mean=271.5 enc_frames_max=384 tgt_len_mean=90.6 tgt_len_max=148
+[NeMo I 2026-06-09 20:43:02 model_utils:463] [aligner-train] step=20 epoch=0 loss=4.7874 lr=3.134e-05 bs=8 enc_frames_mean=365.0 enc_frames_max=404 tgt_len_mean=114.2 tgt_len_max=143
+[NeMo I 2026-06-09 20:43:05 model_utils:463] [aligner-train] step=30 epoch=0 loss=4.7366 lr=4.627e-05 bs=8 enc_frames_mean=348.1 enc_frames_max=382 tgt_len_mean=110.0 tgt_len_max=134
+[NeMo I 2026-06-09 20:43:08 model_utils:463] [aligner-train] step=40 epoch=0 loss=4.7178 lr=6.119e-05 bs=8 enc_frames_mean=340.2 enc_frames_max=398 tgt_len_mean=96.8 tgt_len_max=131
+[NeMo I 2026-06-09 20:43:11 model_utils:463] [aligner-train] step=50 epoch=0 loss=4.6907 lr=7.612e-05 bs=8 enc_frames_mean=322.0 enc_frames_max=401 tgt_len_mean=96.1 tgt_len_max=147
+[NeMo I 2026-06-09 20:43:14 model_utils:463] [aligner-train] step=60 epoch=0 loss=4.6334 lr=9.104e-05 bs=8 enc_frames_mean=318.8 enc_frames_max=392 tgt_len_mean=102.5 tgt_len_max=138
+[NeMo I 2026-06-09 20:43:17 model_utils:463] [aligner-train] step=70 epoch=0 loss=4.6442 lr=1.060e-04 bs=8 enc_frames_mean=333.5 enc_frames_max=412 tgt_len_mean=111.2 tgt_len_max=139
+[NeMo I 2026-06-09 20:43:20 model_utils:463] [aligner-train] step=80 epoch=0 loss=4.6246 lr=1.209e-04 bs=8 enc_frames_mean=333.8 enc_frames_max=372 tgt_len_mean=96.0 tgt_len_max=112
+[NeMo I 2026-06-09 20:43:23 model_utils:463] [aligner-train] step=90 epoch=0 loss=4.5951 lr=1.358e-04 bs=8 enc_frames_mean=326.2 enc_frames_max=415 tgt_len_mean=106.0 tgt_len_max=137
+[NeMo I 2026-06-09 20:43:26 model_utils:463] [aligner-train] step=100 epoch=0 loss=4.5794 lr=1.507e-04 bs=8 enc_frames_mean=265.9 enc_frames_max=336 tgt_len_mean=92.8 tgt_len_max=133
+[NeMo I 2026-06-09 20:43:29 model_utils:463] [aligner-train] step=110 epoch=0 loss=4.5700 lr=1.657e-04 bs=8 enc_frames_mean=327.4 enc_frames_max=394 tgt_len_mean=107.4 tgt_len_max=153
+[NeMo I 2026-06-09 20:43:31 model_utils:463] [aligner-train] step=120 epoch=0 loss=4.5942 lr=1.806e-04 bs=8 enc_frames_mean=354.4 enc_frames_max=410 tgt_len_mean=116.6 tgt_len_max=149
+[NeMo I 2026-06-09 20:43:34 model_utils:463] [aligner-train] step=130 epoch=0 loss=4.5234 lr=1.955e-04 bs=8 enc_frames_mean=301.0 enc_frames_max=399 tgt_len_mean=96.6 tgt_len_max=158
+[NeMo I 2026-06-09 20:43:37 model_utils:463] [aligner-train] step=140 epoch=0 loss=4.5507 lr=2.104e-04 bs=8 enc_frames_mean=293.1 enc_frames_max=397 tgt_len_mean=86.4 tgt_len_max=143
+[NeMo I 2026-06-09 20:43:40 model_utils:463] [aligner-train] step=150 epoch=0 loss=4.5018 lr=2.254e-04 bs=8 enc_frames_mean=317.0 enc_frames_max=388 tgt_len_mean=96.6 tgt_len_max=127
+[NeMo I 2026-06-09 20:43:43 model_utils:463] [aligner-train] step=160 epoch=0 loss=4.4696 lr=2.403e-04 bs=8 enc_frames_mean=345.0 enc_frames_max=394 tgt_len_mean=107.0 tgt_len_max=136
+[NeMo I 2026-06-09 20:43:46 model_utils:463] [aligner-train] step=170 epoch=0 loss=4.3733 lr=2.552e-04 bs=8 enc_frames_mean=237.0 enc_frames_max=382 tgt_len_mean=72.2 tgt_len_max=136
+[NeMo I 2026-06-09 20:43:49 model_utils:463] [aligner-train] step=180 epoch=0 loss=4.2565 lr=2.701e-04 bs=8 enc_frames_mean=307.4 enc_frames_max=398 tgt_len_mean=85.6 tgt_len_max=117
+[NeMo I 2026-06-09 20:43:52 model_utils:463] [aligner-train] step=190 epoch=0 loss=4.2160 lr=2.851e-04 bs=8 enc_frames_mean=282.5 enc_frames_max=397 tgt_len_mean=88.1 tgt_len_max=143
+[NeMo W 2026-06-09 20:44:02 warnings:109] /home/hainanx/anaconda3/lib/python3.10/site-packages/lightning/pytorch/trainer/connectors/logger_connector/result.py:431: It is recommended to use `self.log('global_step', ..., sync_dist=True)` when logging on epoch level in distributed setting to accumulate the metric across devices.
+    
+[NeMo I 2026-06-09 20:44:02 model_checkpoint:757] Checkpoint save for step 200 started at 2026-06-09T20:44:02.144141.
+[NeMo I 2026-06-09 20:44:03 model_checkpoint:696] Checkpoint save for step 200 started at 2026-06-09T20:44:03.117716.
+[NeMo I 2026-06-09 20:44:04 model_utils:463] [aligner-train] step=200 epoch=0 loss=4.1823 lr=3.000e-04 bs=8 enc_frames_mean=298.5 enc_frames_max=399 tgt_len_mean=84.6 tgt_len_max=122
+[NeMo I 2026-06-09 20:44:06 model_utils:463] [aligner-train] step=210 epoch=0 loss=4.0785 lr=3.000e-04 bs=8 enc_frames_mean=317.8 enc_frames_max=385 tgt_len_mean=98.1 tgt_len_max=131
+[NeMo I 2026-06-09 20:44:09 model_utils:463] [aligner-train] step=220 epoch=0 loss=4.1179 lr=2.999e-04 bs=8 enc_frames_mean=316.9 enc_frames_max=379 tgt_len_mean=100.0 tgt_len_max=127
+[NeMo I 2026-06-09 20:44:12 model_utils:463] [aligner-train] step=230 epoch=0 loss=3.9813 lr=2.998e-04 bs=8 enc_frames_mean=326.4 enc_frames_max=415 tgt_len_mean=91.5 tgt_len_max=134
+[NeMo I 2026-06-09 20:44:15 model_utils:463] [aligner-train] step=240 epoch=0 loss=3.9169 lr=2.996e-04 bs=8 enc_frames_mean=321.2 enc_frames_max=385 tgt_len_mean=94.6 tgt_len_max=127
+[NeMo I 2026-06-09 20:44:18 model_utils:463] [aligner-train] step=250 epoch=0 loss=4.0248 lr=2.994e-04 bs=8 enc_frames_mean=316.5 enc_frames_max=405 tgt_len_mean=95.8 tgt_len_max=132
+[NeMo I 2026-06-09 20:44:21 model_utils:463] [aligner-train] step=260 epoch=0 loss=3.8955 lr=2.992e-04 bs=8 enc_frames_mean=264.4 enc_frames_max=392 tgt_len_mean=83.6 tgt_len_max=126
+[NeMo I 2026-06-09 20:44:24 model_utils:463] [aligner-train] step=270 epoch=0 loss=3.8664 lr=2.989e-04 bs=8 enc_frames_mean=277.4 enc_frames_max=404 tgt_len_mean=93.8 tgt_len_max=134
+[NeMo I 2026-06-09 20:44:27 model_utils:463] [aligner-train] step=280 epoch=0 loss=3.8519 lr=2.985e-04 bs=8 enc_frames_mean=353.5 enc_frames_max=400 tgt_len_mean=115.0 tgt_len_max=143
+[NeMo I 2026-06-09 20:44:30 model_utils:463] [aligner-train] step=290 epoch=0 loss=3.8677 lr=2.982e-04 bs=8 enc_frames_mean=302.9 enc_frames_max=379 tgt_len_mean=88.6 tgt_len_max=146
+[NeMo I 2026-06-09 20:44:33 model_utils:463] [aligner-train] step=300 epoch=0 loss=3.7905 lr=2.977e-04 bs=8 enc_frames_mean=333.0 enc_frames_max=390 tgt_len_mean=106.0 tgt_len_max=136
+[NeMo I 2026-06-09 20:44:35 model_utils:463] [aligner-train] step=310 epoch=0 loss=3.7433 lr=2.973e-04 bs=8 enc_frames_mean=275.4 enc_frames_max=388 tgt_len_mean=86.0 tgt_len_max=127
+[NeMo I 2026-06-09 20:44:38 model_utils:463] [aligner-train] step=320 epoch=0 loss=3.7968 lr=2.967e-04 bs=8 enc_frames_mean=311.2 enc_frames_max=393 tgt_len_mean=98.2 tgt_len_max=133
+[NeMo I 2026-06-09 20:44:41 model_utils:463] [aligner-train] step=330 epoch=0 loss=3.7775 lr=2.962e-04 bs=8 enc_frames_mean=288.5 enc_frames_max=390 tgt_len_mean=85.2 tgt_len_max=133
+[NeMo I 2026-06-09 20:44:44 model_utils:463] [aligner-train] step=340 epoch=0 loss=3.7879 lr=2.956e-04 bs=8 enc_frames_mean=329.5 enc_frames_max=418 tgt_len_mean=104.9 tgt_len_max=140
+[NeMo I 2026-06-09 20:44:47 model_utils:463] [aligner-train] step=350 epoch=0 loss=3.7218 lr=2.949e-04 bs=8 enc_frames_mean=274.4 enc_frames_max=409 tgt_len_mean=87.1 tgt_len_max=153
+[NeMo I 2026-06-09 20:44:50 model_utils:463] [aligner-train] step=360 epoch=0 loss=3.7248 lr=2.942e-04 bs=8 enc_frames_mean=323.4 enc_frames_max=371 tgt_len_mean=98.4 tgt_len_max=117
+[NeMo I 2026-06-09 20:44:53 model_utils:463] [aligner-train] step=370 epoch=0 loss=3.6903 lr=2.935e-04 bs=8 enc_frames_mean=321.5 enc_frames_max=390 tgt_len_mean=100.1 tgt_len_max=130
+[NeMo I 2026-06-09 20:44:56 model_utils:463] [aligner-train] step=380 epoch=0 loss=3.7544 lr=2.927e-04 bs=8 enc_frames_mean=335.8 enc_frames_max=415 tgt_len_mean=108.0 tgt_len_max=160
+[NeMo I 2026-06-09 20:44:59 model_utils:463] [aligner-train] step=390 epoch=0 loss=3.7325 lr=2.919e-04 bs=8 enc_frames_mean=331.5 enc_frames_max=406 tgt_len_mean=97.9 tgt_len_max=144
+[NeMo I 2026-06-09 20:45:05 model_checkpoint:757] Checkpoint save for step 400 started at 2026-06-09T20:45:05.064801.
+[NeMo I 2026-06-09 20:45:06 model_checkpoint:696] Checkpoint save for step 400 started at 2026-06-09T20:45:06.035647.
+[NeMo I 2026-06-09 20:45:07 model_utils:463] [aligner-train] step=400 epoch=0 loss=3.6649 lr=2.910e-04 bs=8 enc_frames_mean=346.0 enc_frames_max=383 tgt_len_mean=102.6 tgt_len_max=148
+[NeMo I 2026-06-09 20:45:09 model_utils:463] [aligner-train] step=410 epoch=0 loss=3.7246 lr=2.901e-04 bs=8 enc_frames_mean=337.6 enc_frames_max=394 tgt_len_mean=101.5 tgt_len_max=132
+[NeMo I 2026-06-09 20:45:12 model_utils:463] [aligner-train] step=420 epoch=0 loss=3.6930 lr=2.891e-04 bs=8 enc_frames_mean=285.9 enc_frames_max=394 tgt_len_mean=88.9 tgt_len_max=141
+[NeMo I 2026-06-09 20:45:15 model_utils:463] [aligner-train] step=430 epoch=0 loss=3.6861 lr=2.881e-04 bs=8 enc_frames_mean=350.5 enc_frames_max=389 tgt_len_mean=109.1 tgt_len_max=134
+[NeMo I 2026-06-09 20:45:18 model_utils:463] [aligner-train] step=440 epoch=0 loss=3.6165 lr=2.871e-04 bs=8 enc_frames_mean=303.4 enc_frames_max=400 tgt_len_mean=87.8 tgt_len_max=133
+[NeMo I 2026-06-09 20:45:21 model_utils:463] [aligner-train] step=450 epoch=0 loss=3.7678 lr=2.860e-04 bs=8 enc_frames_mean=282.4 enc_frames_max=378 tgt_len_mean=84.6 tgt_len_max=126
+[NeMo I 2026-06-09 20:45:24 model_utils:463] [aligner-train] step=460 epoch=0 loss=3.6311 lr=2.849e-04 bs=8 enc_frames_mean=253.8 enc_frames_max=376 tgt_len_mean=69.2 tgt_len_max=142

@@ -1,0 +1,379 @@
+[NeMo I 2026-06-09 20:36:24 utils:186] Hydra config:
+    name: rnnt_local
+    base_model_path: null
+    base_model_name: null
+    init_encoder_from_base: false
+    tokenizer_out_dir: null
+    model:
+      sample_rate: 16000
+      compute_eval_loss: true
+      log_prediction: true
+      skip_nan_grad: true
+      loss_type: rnnt
+      model_defaults:
+        enc_hidden: ${model.encoder.d_model}
+        pred_hidden: 320
+        joint_hidden: 320
+      train_ds:
+        manifest_filepath: /home/hainanx/Workplace/data/librispeech/train_clean_360.json
+        sample_rate: ${model.sample_rate}
+        batch_size: 8
+        shuffle: true
+        num_workers: 4
+        pin_memory: true
+        max_duration: 20.0
+        min_duration: 0.1
+        is_tarred: false
+        tarred_audio_filepaths: null
+      validation_ds:
+        manifest_filepath: /home/hainanx/Workplace/data/librispeech/dev_clean.json
+        sample_rate: ${model.sample_rate}
+        batch_size: 8
+        shuffle: false
+        use_start_end_token: false
+        num_workers: 4
+        pin_memory: true
+      test_ds:
+        manifest_filepath: null
+        sample_rate: ${model.sample_rate}
+        batch_size: 8
+        shuffle: false
+        use_start_end_token: false
+        num_workers: 4
+        pin_memory: true
+      tokenizer:
+        dir: /home/hainanx/Workplace/NeMo_ord_sync_d146_current/local_tokenizers/tokenizer_spe_bpe_v128
+        type: bpe
+      preprocessor:
+        _target_: nemo.collections.asr.modules.AudioToMelSpectrogramPreprocessor
+        sample_rate: ${model.sample_rate}
+        normalize: per_feature
+        window_size: 0.025
+        window_stride: 0.01
+        window: hann
+        features: 80
+        n_fft: 512
+        frame_splicing: 1
+        dither: 1.0e-05
+        pad_to: 0
+      spec_augment:
+        _target_: nemo.collections.asr.modules.SpectrogramAugmentation
+        freq_masks: 2
+        time_masks: 5
+        freq_width: 27
+        time_width: 0.05
+      encoder:
+        _target_: nemo.collections.asr.modules.ConformerEncoder
+        feat_in: ${model.preprocessor.features}
+        feat_out: -1
+        n_layers: 8
+        d_model: 256
+        subsampling: striding
+        subsampling_factor: 4
+        subsampling_conv_channels: -1
+        causal_downsampling: false
+        reduction: null
+        reduction_position: null
+        reduction_factor: 1
+        ff_expansion_factor: 4
+        self_attention_model: rel_pos
+        n_heads: 4
+        att_context_size:
+        - -1
+        - -1
+        att_context_style: regular
+        xscaling: true
+        untie_biases: true
+        pos_emb_max_len: 5000
+        conv_kernel_size: 31
+        conv_norm_type: batch_norm
+        conv_context_size: null
+        dropout: 0.1
+        dropout_pre_encoder: 0.1
+        dropout_emb: 0.0
+        dropout_att: 0.1
+        stochastic_depth_drop_prob: 0.0
+        stochastic_depth_mode: linear
+        stochastic_depth_start_layer: 1
+      decoder:
+        _target_: nemo.collections.asr.modules.RNNTDecoder
+        normalization_mode: null
+        random_state_sampling: false
+        blank_as_pad: true
+        prednet:
+          pred_hidden: ${model.model_defaults.pred_hidden}
+          pred_rnn_layers: 1
+          t_max: null
+          dropout: 0.2
+      joint:
+        _target_: nemo.collections.asr.modules.RNNTJoint
+        log_softmax: null
+        preserve_memory: false
+        fuse_loss_wer: false
+        fused_batch_size: null
+        jointnet:
+          joint_hidden: ${model.model_defaults.joint_hidden}
+          activation: relu
+          dropout: 0.2
+      decoding:
+        strategy: greedy_batch
+        greedy:
+          max_symbols: 10
+        beam:
+          beam_size: 2
+          return_best_hypothesis: false
+          score_norm: true
+          tsd_max_sym_exp: 50
+          alsd_max_target_len: 2.0
+      loss:
+        loss_name: default
+        warprnnt_numba_kwargs:
+          fastemit_lambda: 0.0
+          clamp: -1.0
+      optim:
+        name: adamw
+        lr: 0.0003
+        betas:
+        - 0.9
+        - 0.98
+        weight_decay: 0.001
+        sched:
+          name: CosineAnnealing
+          warmup_steps: 200
+          warmup_ratio: null
+          min_lr: 1.0e-06
+    trainer:
+      devices: 2
+      num_nodes: 1
+      max_steps: 2000
+      max_epochs: -1
+      val_check_interval: 200
+      limit_val_batches: 20
+      accelerator: gpu
+      strategy: ddp_find_unused_parameters_true
+      accumulate_grad_batches: 1
+      gradient_clip_val: 1.0
+      precision: 32
+      log_every_n_steps: 5
+      enable_progress_bar: true
+      num_sanity_val_steps: 0
+      check_val_every_n_epoch: null
+      sync_batchnorm: true
+      benchmark: false
+      logger: false
+      enable_checkpointing: false
+    exp_manager:
+      exp_dir: /home/hainanx/Workplace/NeMo_ord_sync_d146_current/nemo_experiments_rnnt_local
+      name: ${name}
+      create_tensorboard_logger: true
+      create_checkpoint_callback: true
+      checkpoint_callback_params:
+        monitor: val_wer
+        mode: min
+        save_top_k: 1
+        always_save_nemo: false
+      resume_if_exists: false
+      resume_ignore_no_checkpoint: true
+      create_wandb_logger: true
+      wandb_logger_kwargs:
+        name: rnnt_local
+        project: rnnt_local
+    
+[NeMo I 2026-06-09 20:36:24 speech_to_text_aligner_bpe:136] ExpManager schema
+[NeMo I 2026-06-09 20:36:24 speech_to_text_aligner_bpe:136] {'explicit_log_dir': None, 'exp_dir': None, 'name': None, 'version': None, 'use_datetime_version': True, 'resume_if_exists': False, 'resume_past_end': False, 'resume_ignore_no_checkpoint': False, 'resume_from_checkpoint': None, 'create_tensorboard_logger': True, 'summary_writer_kwargs': None, 'create_wandb_logger': False, 'wandb_logger_kwargs': None, 'create_mlflow_logger': False, 'mlflow_logger_kwargs': {'experiment_name': None, 'run_name': None, 'tracking_uri': None, 'tags': None, 'save_dir': './mlruns', 'prefix': '', 'artifact_location': None, 'run_id': None, 'log_model': False}, 'create_dllogger_logger': False, 'dllogger_logger_kwargs': {'verbose': False, 'stdout': False, 'json_file': './dllogger.json'}, 'create_clearml_logger': False, 'clearml_logger_kwargs': {'project': None, 'task': None, 'connect_pytorch': False, 'model_name': None, 'tags': None, 'log_model': False, 'log_cfg': False, 'log_metrics': False}, 'create_neptune_logger': False, 'neptune_logger_kwargs': None, 'create_checkpoint_callback': True, 'checkpoint_callback_params': {'filepath': None, 'dirpath': None, 'filename': None, 'monitor': 'val_loss', 'verbose': True, 'save_last': True, 'save_top_k': 3, 'save_weights_only': False, 'mode': 'min', 'auto_insert_metric_name': True, 'every_n_epochs': 1, 'every_n_train_steps': None, 'train_time_interval': None, 'prefix': None, 'postfix': '.nemo', 'save_best_model': False, 'always_save_nemo': False, 'save_nemo_on_train_end': True, 'model_parallel_size': None, 'save_on_train_epoch_end': False, 'async_save': False, 'save_last_n_optim_states': -1}, 'create_early_stopping_callback': False, 'create_ipl_epoch_stopper_callback': False, 'early_stopping_callback_params': {'monitor': 'val_loss', 'mode': 'min', 'min_delta': 0.001, 'patience': 10, 'verbose': True, 'strict': True, 'check_finite': True, 'stopping_threshold': None, 'divergence_threshold': None, 'check_on_train_epoch_end': None, 'log_rank_zero_only': False}, 'ipl_epoch_stopper_callback_params': {'enable_stop': True, 'stop_every_n_epochs': 1}, 'create_preemption_callback': True, 'files_to_copy': None, 'log_step_timing': True, 'log_delta_step_timing': False, 'step_timing_kwargs': {'reduction': 'mean', 'sync_cuda': False, 'buffer_size': 1}, 'log_local_rank_0_only': False, 'log_global_rank_0_only': False, 'disable_validation_on_resume': True, 'ema': {'enable': False, 'decay': 0.999, 'cpu_offload': False, 'validate_original_weights': False, 'every_n_steps': 1}, 'max_time_per_run': None, 'seconds_to_sleep': 5.0, 'create_straggler_detection_callback': False, 'straggler_detection_params': {'report_time_interval': 300.0, 'calc_relative_gpu_perf': True, 'calc_individual_gpu_perf': True, 'num_gpu_perf_scores_to_log': 5, 'gpu_relative_perf_threshold': 0.7, 'gpu_individual_perf_threshold': 0.7, 'stop_if_detected': False}, 'create_fault_tolerance_callback': False, 'fault_tolerance': {'workload_check_interval': 5.0, 'initial_rank_heartbeat_timeout': 3600.0, 'rank_heartbeat_timeout': 2700.0, 'calculate_timeouts': True, 'safety_factor': 5.0, 'rank_termination_signal': <Signals.SIGKILL: 9>, 'log_level': 'INFO', 'max_rank_restarts': 0, 'max_subsequent_job_failures': 0, 'additional_ft_launcher_args': '', 'simulated_fault': None}, 'log_tflops_per_sec_per_gpu': True}
+[NeMo I 2026-06-09 20:36:24 speech_to_text_aligner_bpe:136] Experiments will be logged at /home/hainanx/Workplace/NeMo_ord_sync_d146_current/nemo_experiments_rnnt_local/rnnt_local/2026-06-09_20-36-24
+[NeMo I 2026-06-09 20:36:24 exp_manager:691] TensorboardLogger has been set up
+[NeMo I 2026-06-09 20:36:24 exp_manager:691] WandBLogger has been set up
+[NeMo W 2026-06-09 20:36:24 exp_manager:738] The checkpoint callback was told to monitor a validation value and trainer's max_steps was set to 2000. Please ensure that max_steps will run for at least None epochs to ensure that checkpointing will not error out.
+[NeMo I 2026-06-09 20:36:24 speech_to_text_aligner_bpe:136] TFLOPs per sec per GPU will be calculated, conditioned on supported models. Defaults to -1 upon failure.
+[NeMo I 2026-06-09 20:36:24 mixins:69] Tokenizer SentencePieceTokenizer initialized with 128 tokens
+[NeMo I 2026-06-09 20:36:32 collections:354] Dataset loaded with 103997 files totalling 363.50 hours
+[NeMo I 2026-06-09 20:36:32 collections:354] 17 files were filtered totalling 0.11 hours
+[NeMo I 2026-06-09 20:36:32 collections:354] Dataset loaded with 2703 files totalling 5.39 hours
+[NeMo I 2026-06-09 20:36:32 collections:354] 0 files were filtered totalling 0.00 hours
+[NeMo W 2026-06-09 20:36:32 rnnt_bpe_models:472] Could not load dataset as `manifest_filepath` was None. Provided config : {'manifest_filepath': None, 'sample_rate': 16000, 'batch_size': 8, 'shuffle': False, 'use_start_end_token': False, 'num_workers': 4, 'pin_memory': True}
+[NeMo I 2026-06-09 20:36:32 rnnt_models:93] Using RNNT Loss : warprnnt_numba
+    Loss warprnnt_numba_kwargs: {'fastemit_lambda': 0.0, 'clamp': -1.0}
+[NeMo I 2026-06-09 20:36:32 rnnt_models:351] Using RNNT Loss : warprnnt_numba
+    Loss warprnnt_numba_kwargs: {'fastemit_lambda': 0.0, 'clamp': -1.0}
+[NeMo W 2026-06-09 20:36:32 rnnt_label_looping:259] No conditional node support for Cuda.
+    Cuda graphs with while loops are disabled, decoding speed will be slower
+    Reason: Driver supports cuda toolkit version 12.5, but the driver needs to support at least 12,6. Please update your cuda driver.
+[NeMo I 2026-06-09 20:36:32 rnnt_models:351] Using RNNT Loss : warprnnt_numba
+    Loss warprnnt_numba_kwargs: {'fastemit_lambda': 0.0, 'clamp': -1.0}
+[NeMo W 2026-06-09 20:36:32 rnnt_label_looping:259] No conditional node support for Cuda.
+    Cuda graphs with while loops are disabled, decoding speed will be slower
+    Reason: Driver supports cuda toolkit version 12.5, but the driver needs to support at least 12,6. Please update your cuda driver.
+[NeMo I 2026-06-09 20:36:56 modelPT:864] Optimizer config = AdamW (
+    Parameter Group 0
+        amsgrad: False
+        betas: [0.9, 0.98]
+        capturable: False
+        differentiable: False
+        eps: 1e-08
+        foreach: None
+        fused: None
+        lr: 0.0003
+        maximize: False
+        weight_decay: 0.001
+    )
+[NeMo I 2026-06-09 20:36:56 modelPT:786] Scheduler "<nemo.core.optim.lr_scheduler.CosineAnnealing object at 0x7f302ed950c0>" 
+    will be used during training (effective maximum steps = 2000) - 
+    Parameters : 
+    (warmup_steps: 200
+    warmup_ratio: null
+    min_lr: 1.0e-06
+    max_steps: 2000
+    )
+[NeMo I 2026-06-09 20:36:57 asr_model:209] CUDA graphs disabled for EncDecRNNTBPEModel::RNNTBPEDecoding::GreedyBatchedRNNTInfer
+[NeMo W 2026-06-09 20:36:58 warnings:109] /home/hainanx/anaconda3/lib/python3.10/site-packages/numba_cuda/numba/cuda/dispatcher.py:685: NumbaPerformanceWarning: [1mGrid size 8 will likely result in GPU under-utilization due to low occupancy.[0m
+      warn(NumbaPerformanceWarning(msg))
+    
+[NeMo W 2026-06-09 20:36:59 warnings:109] /home/hainanx/anaconda3/lib/python3.10/site-packages/numba_cuda/numba/cuda/dispatcher.py:685: NumbaPerformanceWarning: [1mGrid size 8 will likely result in GPU under-utilization due to low occupancy.[0m
+      warn(NumbaPerformanceWarning(msg))
+    
+[NeMo W 2026-06-09 20:36:59 warnings:109] /home/hainanx/anaconda3/lib/python3.10/site-packages/numba_cuda/numba/cuda/dispatcher.py:685: NumbaPerformanceWarning: [1mGrid size 1 will likely result in GPU under-utilization due to low occupancy.[0m
+      warn(NumbaPerformanceWarning(msg))
+    
+[NeMo W 2026-06-09 20:37:00 warnings:109] /home/hainanx/anaconda3/lib/python3.10/site-packages/numba_cuda/numba/cuda/dispatcher.py:685: NumbaPerformanceWarning: [1mGrid size 8 will likely result in GPU under-utilization due to low occupancy.[0m
+      warn(NumbaPerformanceWarning(msg))
+    
+[NeMo W 2026-06-09 20:37:00 warnings:109] /home/hainanx/anaconda3/lib/python3.10/site-packages/numba_cuda/numba/cuda/dispatcher.py:685: NumbaPerformanceWarning: [1mGrid size 1 will likely result in GPU under-utilization due to low occupancy.[0m
+      warn(NumbaPerformanceWarning(msg))
+    
+[NeMo I 2026-06-09 20:37:03 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:03 metric:482] WER reference:in the instances in which they acted upon the question but for what reasons they so voted is not known
+[NeMo I 2026-06-09 20:37:03 metric:482] WER predicted:i i i i i i i i i i l l l l l l l l l l be be be be be be be be be be be be be be be be be be be be be be be be be be be be be becececececececececece l l l l l l l l l l be be be be be be be be be becece bece bece bece beceadadadadadadadadadad e e e ell e e e e eom the the the the the re the re th be be be be be be be be be bececececeyyyyyy l l l l l l l l l l l l l l l l l l l l''''''''''et i ietetetetetetet be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be t t tllimimimimimimatatat be be be be be be beaedaedent ⁇ er ⁇ ered be be be be be be be be be bececececececececececeetetetetetetetetetet be be be be be be be be be be s s s s he he he he he he be be be se be be be be be be be be be be be be be be be beurururururururururur n n n n n n n n nur be be be n be be n be be na be be be be be be be be bellll'll'llarere be be be be be be bece be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be h h het het h h h hururururururururururad be be be be be be be be be be be be be be be be be be beimimimimimimimimimimeradadadadadadadadadadad as th th th th th th th be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be beomlyly h h h hceceometetetetetetetetetet be be be be be be be be be beururururururur nurur s e e e e e e e e e e e e e e e e e e e e e e e e e e e e e ladadadadadadadadad he heimimimimimimimim lententententetetetetetetetet netetetet netet i i iyyyy i i ierurerurercecececece ⁇  ⁇  ⁇  ⁇  ⁇  ⁇  ⁇  ⁇  ⁇  ⁇ imimimimimimimimimim leradadadadadadadad be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be l l l l l l l l l l be be be be be be be be be be l be l be l be be l be be be be be be be be be be be bellllllllllllllllllll l l l l l l led l l l l l l l l l l l l be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be l l l l l l l l l l be be be be be be be be be be l l be l be l l l l llyim llyim l llyim l l l l l l l l l l l l l l l l l l l l l be you you l be l be l be l be be be be be l be be be l be be be be l be be be be ladadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadad be be be be be be be be be be be be be be be be be be be beininininininadinadadadadadadadadadadadadadadadadadadadadadad be be be be be be be be be be in sece be be be sece be be l be be be l be be be be l l l be l be l l be l l be be be be l be be l be be be be be be be be be be be bec e e e e e e e e e bem be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be s s s soror sor sor s s s s s s s s s s th se se se se se se se se sece bece bece bece bece be be be be be be be be be be be be be be be be be be be be beetetetetetetetetetet i icecececececeyietetetetetetetetetetetetetetetetetetetetmmmmmmmmmmurururur surur sur s be be be be be be be be be be be be be be be be be be be be be be be be be be be be be beurururururururururur be be be be be be be be be becececececececececece be be be be be be be be be be be be be be be be be be be be be be be re be re re re be re be be be be be be be be be be be be be be be be be be be bececececececececececellllaaaaaaaayyyyyyyyorystststststststyyst ⁇  ⁇  ⁇  ⁇  ⁇  ⁇  ⁇  ⁇  ⁇  ⁇ cece th th th th th th th th e e e e e e e e e eetetetetetetetetetetetetetetetetetetetetetetetetetetetetetetetetetetetetetetetetetetetetetetetetetetllllllxllxllxllxreadadadadadadadadad be be be be be be be be be be be be be be be be be be be be be be be be be be be be be be ineseseseseseseseses be be be beurururururur th l thetetetetetetetetetetcececececececececece be be be be be be be be be beadadadadadadadadadadyyyyyyyyyy l l l l l l l l l lmmm emlymlymlyurururururururururururururururururururur s s s s s s s s s scececececececececece be be be be be be be be be bececececececececececead sur surur s sururim be be be be be be be be be l l l l l l l l l l l l l l l l l l l l l l l l l l l l l l be be be be be be be be be bellllllllllll lll l onll s bell s bell s bell l linininld lininldinininetininetininetetetetetetetetetetet l l la laa la l
+[NeMo I 2026-06-09 20:37:05 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:05 metric:482] WER reference:it was full of little brown chips that looked like the shavings of some root they were as light as feathers and the most noticeable thing about them was their penetrating earthy odor we could not determine whether they were animal or vegetable they might be dried meat from some queer beast jim
+[NeMo I 2026-06-09 20:37:05 metric:482] WER predicted:l l l l l l l l l laaaa l l l l l l l l l l
+[NeMo I 2026-06-09 20:37:07 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:07 metric:482] WER reference:would be baptized with a fire that should burn them up when a man breaks with his sins then the wind of the lord's fan will blow them away the fire of the lord's heart will consume them i think then
+[NeMo I 2026-06-09 20:37:07 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:09 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:09 metric:482] WER reference:in tranquil richly embowered reaches beyond this little yosemite in the main canyon there are three other little yosemites the highest situated a few miles below the base of mount lyell
+[NeMo I 2026-06-09 20:37:09 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:10 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:10 metric:482] WER reference:romance is a shortening and sharpening of the human difficulty where you and i have to vote against a man or write rather feebly against a man or sign illegible petitions against a man romance does for him
+[NeMo I 2026-06-09 20:37:10 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:12 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:12 metric:482] WER reference:we cannot say that death is not good we do not know whether the grave is the end of this life or the door of another or whether the night here is not somewhere else a dawn
+[NeMo I 2026-06-09 20:37:12 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:14 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:14 metric:482] WER reference:what life and action and heroism there was to him in the multitudinous roar of the forest and what an eternity of existence in the monologue of the river which brawled far far below him over its wide stony bed how the river sparkled and danced and went on
+[NeMo I 2026-06-09 20:37:14 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:15 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:15 metric:482] WER reference:he felt with a sort of half witted lucidity that the cross was there and the ball was there and the dome was there that he was going to climb down from them and that he did not mind in the least whether he was killed or not
+[NeMo I 2026-06-09 20:37:15 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:17 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:17 metric:482] WER reference:whatever happens whatever you hear about me whatever you are told about me will you always love me as you do now
+[NeMo I 2026-06-09 20:37:17 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:19 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:19 metric:482] WER reference:for it was long or he might be whole of his great hurts and so when it drew nigh the term day that sir gawaine sir marhaus and sir uwaine should meet at the cross way then every knight drew him thither
+[NeMo I 2026-06-09 20:37:19 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:20 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:20 metric:482] WER reference:the amphitheatre melted away walls and roof overhead were the moon and stars and proud atlantis was sinking into the depths of the sea not as a ship sinks but piecemeal
+[NeMo I 2026-06-09 20:37:20 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:22 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:22 metric:482] WER reference:every autumn for the last fifty years his exhibitions attracted attention and they led at length to the crystal palace exhibition of eighteen fifty one the merit of that scheme
+[NeMo I 2026-06-09 20:37:22 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:24 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:24 metric:482] WER reference:the perpetrator would never be discovered do you not think my postulation justified by precedent
+[NeMo I 2026-06-09 20:37:24 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:25 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:25 metric:482] WER reference:under the shadow of which his existence could only become the most grotesques of failures he had been far from holding it a failure long as he had waited for the appearance that was to make it a success he had waited for quite another thing
+[NeMo I 2026-06-09 20:37:25 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:27 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:27 metric:482] WER reference:what fate might they have in reserve for us of what avail was all this profound respect this incessant desire to please this attention to our slightest wish this comfort and luxury and splendor
+[NeMo I 2026-06-09 20:37:27 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:29 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:29 metric:482] WER reference:then you lend me another thousand of your three and we have enough for a start so we'll go into partnership and what are we going to do then razumihin began to unfold his project
+[NeMo I 2026-06-09 20:37:29 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:30 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:30 metric:482] WER reference:the whites are planted at the lower and more shady end of the group next come the pale yellows and pale pinks and these are followed at a little distance by kinds whose flowers are of orange copper flame
+[NeMo I 2026-06-09 20:37:30 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:32 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:32 metric:482] WER reference:here wuz where the cheers for grant were vociferous with nary a snort for his eggslency
+[NeMo I 2026-06-09 20:37:32 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:34 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:34 metric:482] WER reference:i shall live here in my own house i shall take my food from the earth by the toil of my own hands i shall learn many secrets from my books through the years ahead i shall rebuild the achievements of the past
+[NeMo I 2026-06-09 20:37:34 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:35 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:35 metric:482] WER reference:you do not answer me rejoined the woman but if you think i don't say true lord soulis himself will assure you of the fact alas no returned helen profoundly sighing i believe it too well
+[NeMo I 2026-06-09 20:37:35 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:37 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:37 metric:482] WER reference:i'm jolly hungry good night kids good night i hope the castle won't come creeping back in the night said jane of course it won't said anthea briskly
+[NeMo I 2026-06-09 20:37:37 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:39 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:39 metric:482] WER reference:this brings us to the third mode of distinguishing images from sensations namely by their causes and effects i believe this to be the only valid ground of distinction james in the passage about the mental fire which won't burn real sticks
+[NeMo I 2026-06-09 20:37:39 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:40 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:40 metric:482] WER reference:had his object and reward but poor mousqueton whose only wish was to be called mouston was it not cruel to snatch him from the delightful state of peace and plenty in which he was he was thinking of these matters when porthos summoned him to dinner what
+[NeMo I 2026-06-09 20:37:40 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:42 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:42 metric:482] WER reference:gross disgusting what do protestants think of these perfectly sincere feelings and of the attempt to enforce them against non catholics
+[NeMo I 2026-06-09 20:37:42 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:44 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:44 metric:482] WER reference:little florence all the boys and very likely some of the girls who have got as far as this second chapter will glance down the page and exclaim dolls then they will add whatever is their favorite expression of scorn
+[NeMo I 2026-06-09 20:37:44 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:45 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:45 metric:482] WER reference:it might be supposed that the murderer was working for the other no no replied rouletabille with a strange smile i have expected to find these footmarks from the very beginning these are not the footmarks of the murderer then there were two
+[NeMo I 2026-06-09 20:37:45 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:47 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:47 metric:482] WER reference:turned roseate and began to tremble then up far as the men could see there was flashing of white wings and coming and going of radiant forms and voices as of a multitude chanting in unison
+[NeMo I 2026-06-09 20:37:47 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:49 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:49 metric:482] WER reference:they have no right within their municipal power to attempt to decide the rights of the people of the states they have no right to exclude any citizen of the united states from owning and equally enjoying this common possession
+[NeMo I 2026-06-09 20:37:49 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:50 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:50 metric:482] WER reference:it is clear that new mexico is wide awake to the dangers of the wild life situation on two counts her laws are not quite perfect there is no law prohibiting spring shooting and there is no model law protecting the non game birds
+[NeMo I 2026-06-09 20:37:50 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:52 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:52 metric:482] WER reference:it is a curious fact that often there will be a heavier dew under the blaze of a full moon on a clear night than at any other time the moon has no screens about it of any kind to obstruct the free radiation of heat
+[NeMo I 2026-06-09 20:37:52 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:54 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:54 metric:482] WER reference:said cap'n bill they're called parashoots mate but why i can't say did you drop down in that way my lad he asked the boy
+[NeMo I 2026-06-09 20:37:54 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:55 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:55 metric:482] WER reference:we were so weary of our old king
+[NeMo I 2026-06-09 20:37:55 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:57 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:57 metric:482] WER reference:she spoke now in reply to madam page in one of those rare moments of unreserve that added to the attractiveness of her whole character
+[NeMo I 2026-06-09 20:37:57 metric:482] WER predicted:
+[NeMo I 2026-06-09 20:37:59 metric:482] 
+    
+[NeMo I 2026-06-09 20:37:59 metric:482] WER reference:we were now down in westminster
+[NeMo I 2026-06-09 20:37:59 metric:482] WER predicted:

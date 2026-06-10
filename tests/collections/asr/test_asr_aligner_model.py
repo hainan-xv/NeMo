@@ -16,7 +16,7 @@ import pytest
 import torch
 from omegaconf import DictConfig, ListConfig
 
-from nemo.collections.asr.models import EncDecAlignerModel
+from nemo.collections.asr.models import EncDecRNNTModel
 from nemo.collections.asr.modules import AlignerCTCHead, AlignerJoint
 
 # fmt: off
@@ -25,7 +25,7 @@ LABELS = [' ', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm',
 # fmt: on
 
 
-def _build_model(aligner_type: str, aux_nonar_loss_weight: float = 0.0) -> EncDecAlignerModel:
+def _build_model(aligner_type: str, aux_nonar_loss_weight: float = 0.0) -> EncDecRNNTModel:
     model_defaults = {'enc_hidden': 128, 'pred_hidden': 64, 'joint_hidden': 64}
 
     preprocessor = {'_target_': 'nemo.collections.asr.modules.AudioToMelSpectrogramPreprocessor', 'features': 64}
@@ -66,6 +66,7 @@ def _build_model(aligner_type: str, aux_nonar_loss_weight: float = 0.0) -> EncDe
     cfg = DictConfig(
         {
             'labels': ListConfig(LABELS),
+            'loss_type': 'aligner',
             'aligner_type': aligner_type,
             'label_smoothing': 0.1,
             'aux_nonar_loss_weight': aux_nonar_loss_weight,
@@ -79,10 +80,10 @@ def _build_model(aligner_type: str, aux_nonar_loss_weight: float = 0.0) -> EncDe
             'decoding': DictConfig(decoding),
         }
     )
-    return EncDecAlignerModel(cfg=cfg)
+    return EncDecRNNTModel(cfg=cfg)
 
 
-class TestEncDecAlignerModel:
+class TestEncDecRNNTAlignerMode:
     @pytest.mark.unit
     def test_constructor_ar(self):
         model = _build_model('ar')
@@ -103,7 +104,7 @@ class TestEncDecAlignerModel:
         model = _build_model('ar')
         transcript = torch.tensor([[1, 2, 3, 0], [4, 5, 0, 0]])
         transcript_len = torch.tensor([3, 2])
-        targets, target_len = model._append_eos(transcript, transcript_len)
+        targets, target_len = model._append_aligner_eos(transcript, transcript_len)
         assert torch.equal(target_len, torch.tensor([4, 3]))
         assert targets[0, 3].item() == model.eos_id
         assert targets[1, 2].item() == model.eos_id
@@ -120,7 +121,7 @@ class TestEncDecAlignerModel:
         transcript_len = torch.tensor([8, 7, 6, 5])
 
         encoded, encoded_len = model.forward(input_signal=signal, input_signal_length=signal_len)
-        loss, logs = model._aligner_loss(encoded, encoded_len, transcript, transcript_len)
+        loss = model._aligner_loss(encoded, encoded_len, transcript, transcript_len)
         assert torch.isfinite(loss)
         assert loss.item() > 0.0
         loss.backward()
@@ -159,6 +160,5 @@ class TestEncDecAlignerModel:
         transcript = torch.randint(0, len(LABELS), (2, 6))
         transcript_len = torch.tensor([6, 5])
         encoded, encoded_len = model.forward(input_signal=signal, input_signal_length=signal_len)
-        loss, logs = model._aligner_loss(encoded, encoded_len, transcript, transcript_len)
-        assert 'ar_loss' in logs and 'nonar_loss' in logs
+        loss = model._aligner_loss(encoded, encoded_len, transcript, transcript_len)
         assert torch.isfinite(loss)

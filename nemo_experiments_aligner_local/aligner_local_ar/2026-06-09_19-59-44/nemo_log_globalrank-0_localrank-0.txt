@@ -1,0 +1,291 @@
+[NeMo I 2026-06-09 19:59:44 utils:186] Hydra config:
+    name: aligner_local_ar
+    base_model_path: null
+    base_model_name: null
+    init_encoder_from_base: false
+    tokenizer_out_dir: null
+    model:
+      sample_rate: 16000
+      compute_eval_loss: true
+      log_prediction: true
+      skip_nan_grad: true
+      aligner_type: ar
+      label_smoothing: 0.1
+      aux_nonar_loss_weight: 0.0
+      model_defaults:
+        enc_hidden: ${model.encoder.d_model}
+        pred_hidden: 320
+        joint_hidden: 320
+      train_ds:
+        manifest_filepath: /home/hainanx/Workplace/data/librispeech/train_clean_360.json
+        sample_rate: ${model.sample_rate}
+        batch_size: 8
+        shuffle: true
+        num_workers: 4
+        pin_memory: true
+        max_duration: 20.0
+        min_duration: 0.1
+        is_tarred: false
+        tarred_audio_filepaths: null
+      validation_ds:
+        manifest_filepath: /home/hainanx/Workplace/data/librispeech/dev_clean.json
+        sample_rate: ${model.sample_rate}
+        batch_size: 8
+        shuffle: false
+        use_start_end_token: false
+        num_workers: 4
+        pin_memory: true
+      test_ds:
+        manifest_filepath: null
+        sample_rate: ${model.sample_rate}
+        batch_size: 8
+        shuffle: false
+        use_start_end_token: false
+        num_workers: 4
+        pin_memory: true
+      tokenizer:
+        dir: /home/hainanx/Workplace/NeMo_ord_sync_d146_current/local_tokenizers/tokenizer_spe_bpe_v128
+        type: bpe
+      preprocessor:
+        _target_: nemo.collections.asr.modules.AudioToMelSpectrogramPreprocessor
+        sample_rate: ${model.sample_rate}
+        normalize: per_feature
+        window_size: 0.025
+        window_stride: 0.01
+        window: hann
+        features: 80
+        n_fft: 512
+        frame_splicing: 1
+        dither: 1.0e-05
+        pad_to: 0
+      spec_augment:
+        _target_: nemo.collections.asr.modules.SpectrogramAugmentation
+        freq_masks: 2
+        time_masks: 5
+        freq_width: 27
+        time_width: 0.05
+      encoder:
+        _target_: nemo.collections.asr.modules.ConformerEncoder
+        feat_in: ${model.preprocessor.features}
+        feat_out: -1
+        n_layers: 8
+        d_model: 256
+        subsampling: striding
+        subsampling_factor: 4
+        subsampling_conv_channels: -1
+        causal_downsampling: false
+        reduction: null
+        reduction_position: null
+        reduction_factor: 1
+        ff_expansion_factor: 4
+        self_attention_model: rel_pos
+        n_heads: 4
+        att_context_size:
+        - -1
+        - -1
+        att_context_style: regular
+        xscaling: true
+        untie_biases: true
+        pos_emb_max_len: 5000
+        conv_kernel_size: 31
+        conv_norm_type: batch_norm
+        conv_context_size: null
+        dropout: 0.1
+        dropout_pre_encoder: 0.1
+        dropout_emb: 0.0
+        dropout_att: 0.1
+        stochastic_depth_drop_prob: 0.0
+        stochastic_depth_mode: linear
+        stochastic_depth_start_layer: 1
+      decoder:
+        _target_: nemo.collections.asr.modules.RNNTDecoder
+        normalization_mode: null
+        random_state_sampling: false
+        blank_as_pad: true
+        prednet:
+          pred_hidden: ${model.model_defaults.pred_hidden}
+          pred_rnn_layers: 1
+          t_max: null
+          dropout: 0.2
+      joint:
+        _target_: nemo.collections.asr.modules.AlignerJoint
+        log_softmax: null
+        jointnet:
+          joint_hidden: ${model.model_defaults.joint_hidden}
+          activation: relu
+          dropout: 0.2
+      ctc_head:
+        hidden: null
+        activation: relu
+        dropout: 0.0
+      decoding:
+        aligner_type: ${model.aligner_type}
+        max_symbols: null
+      optim:
+        name: adamw
+        lr: 0.0003
+        betas:
+        - 0.9
+        - 0.98
+        weight_decay: 0.001
+        sched:
+          name: CosineAnnealing
+          warmup_steps: 200
+          warmup_ratio: null
+          min_lr: 1.0e-06
+    trainer:
+      devices: 2
+      num_nodes: 1
+      max_steps: 2000
+      max_epochs: -1
+      val_check_interval: 200
+      limit_val_batches: 20
+      accelerator: gpu
+      strategy: ddp_find_unused_parameters_true
+      accumulate_grad_batches: 1
+      gradient_clip_val: 1.0
+      precision: 32
+      log_every_n_steps: 5
+      enable_progress_bar: true
+      num_sanity_val_steps: 0
+      check_val_every_n_epoch: null
+      sync_batchnorm: true
+      benchmark: false
+      logger: false
+      enable_checkpointing: false
+    exp_manager:
+      exp_dir: /home/hainanx/Workplace/NeMo_ord_sync_d146_current/nemo_experiments_aligner_local
+      name: ${name}
+      create_tensorboard_logger: true
+      create_checkpoint_callback: true
+      checkpoint_callback_params:
+        monitor: val_wer
+        mode: min
+        save_top_k: 1
+        always_save_nemo: false
+      resume_if_exists: false
+      resume_ignore_no_checkpoint: true
+      log_step_stats: true
+      log_step_stats_every_n_steps: 5
+      create_wandb_logger: true
+      wandb_logger_kwargs:
+        name: aligner_local_ar
+        project: aligner_local
+    
+[NeMo I 2026-06-09 19:59:44 speech_to_text_aligner_bpe:136] ExpManager schema
+[NeMo I 2026-06-09 19:59:44 speech_to_text_aligner_bpe:136] {'explicit_log_dir': None, 'exp_dir': None, 'name': None, 'version': None, 'use_datetime_version': True, 'resume_if_exists': False, 'resume_past_end': False, 'resume_ignore_no_checkpoint': False, 'resume_from_checkpoint': None, 'create_tensorboard_logger': True, 'summary_writer_kwargs': None, 'create_wandb_logger': False, 'wandb_logger_kwargs': None, 'create_mlflow_logger': False, 'mlflow_logger_kwargs': {'experiment_name': None, 'run_name': None, 'tracking_uri': None, 'tags': None, 'save_dir': './mlruns', 'prefix': '', 'artifact_location': None, 'run_id': None, 'log_model': False}, 'create_dllogger_logger': False, 'dllogger_logger_kwargs': {'verbose': False, 'stdout': False, 'json_file': './dllogger.json'}, 'create_clearml_logger': False, 'clearml_logger_kwargs': {'project': None, 'task': None, 'connect_pytorch': False, 'model_name': None, 'tags': None, 'log_model': False, 'log_cfg': False, 'log_metrics': False}, 'create_neptune_logger': False, 'neptune_logger_kwargs': None, 'create_checkpoint_callback': True, 'checkpoint_callback_params': {'filepath': None, 'dirpath': None, 'filename': None, 'monitor': 'val_loss', 'verbose': True, 'save_last': True, 'save_top_k': 3, 'save_weights_only': False, 'mode': 'min', 'auto_insert_metric_name': True, 'every_n_epochs': 1, 'every_n_train_steps': None, 'train_time_interval': None, 'prefix': None, 'postfix': '.nemo', 'save_best_model': False, 'always_save_nemo': False, 'save_nemo_on_train_end': True, 'model_parallel_size': None, 'save_on_train_epoch_end': False, 'async_save': False, 'save_last_n_optim_states': -1}, 'create_early_stopping_callback': False, 'create_ipl_epoch_stopper_callback': False, 'early_stopping_callback_params': {'monitor': 'val_loss', 'mode': 'min', 'min_delta': 0.001, 'patience': 10, 'verbose': True, 'strict': True, 'check_finite': True, 'stopping_threshold': None, 'divergence_threshold': None, 'check_on_train_epoch_end': None, 'log_rank_zero_only': False}, 'ipl_epoch_stopper_callback_params': {'enable_stop': True, 'stop_every_n_epochs': 1}, 'create_preemption_callback': True, 'files_to_copy': None, 'log_step_timing': True, 'log_delta_step_timing': False, 'step_timing_kwargs': {'reduction': 'mean', 'sync_cuda': False, 'buffer_size': 1}, 'log_local_rank_0_only': False, 'log_global_rank_0_only': False, 'disable_validation_on_resume': True, 'ema': {'enable': False, 'decay': 0.999, 'cpu_offload': False, 'validate_original_weights': False, 'every_n_steps': 1}, 'max_time_per_run': None, 'seconds_to_sleep': 5.0, 'create_straggler_detection_callback': False, 'straggler_detection_params': {'report_time_interval': 300.0, 'calc_relative_gpu_perf': True, 'calc_individual_gpu_perf': True, 'num_gpu_perf_scores_to_log': 5, 'gpu_relative_perf_threshold': 0.7, 'gpu_individual_perf_threshold': 0.7, 'stop_if_detected': False}, 'create_fault_tolerance_callback': False, 'fault_tolerance': {'workload_check_interval': 5.0, 'initial_rank_heartbeat_timeout': 3600.0, 'rank_heartbeat_timeout': 2700.0, 'calculate_timeouts': True, 'safety_factor': 5.0, 'rank_termination_signal': <Signals.SIGKILL: 9>, 'log_level': 'INFO', 'max_rank_restarts': 0, 'max_subsequent_job_failures': 0, 'additional_ft_launcher_args': '', 'simulated_fault': None}, 'log_tflops_per_sec_per_gpu': True, 'log_step_stats': True, 'log_step_stats_every_n_steps': 100}
+[NeMo I 2026-06-09 19:59:44 speech_to_text_aligner_bpe:136] Experiments will be logged at /home/hainanx/Workplace/NeMo_ord_sync_d146_current/nemo_experiments_aligner_local/aligner_local_ar/2026-06-09_19-59-44
+[NeMo I 2026-06-09 19:59:44 exp_manager:779] TensorboardLogger has been set up
+[NeMo I 2026-06-09 19:59:44 exp_manager:779] WandBLogger has been set up
+[NeMo W 2026-06-09 19:59:44 exp_manager:830] The checkpoint callback was told to monitor a validation value and trainer's max_steps was set to 2000. Please ensure that max_steps will run for at least None epochs to ensure that checkpointing will not error out.
+[NeMo I 2026-06-09 19:59:44 speech_to_text_aligner_bpe:136] TFLOPs per sec per GPU will be calculated, conditioned on supported models. Defaults to -1 upon failure.
+[NeMo I 2026-06-09 19:59:45 mixins:69] Tokenizer SentencePieceTokenizer initialized with 128 tokens
+[NeMo I 2026-06-09 19:59:52 collections:354] Dataset loaded with 103997 files totalling 363.50 hours
+[NeMo I 2026-06-09 19:59:52 collections:354] 17 files were filtered totalling 0.11 hours
+[NeMo I 2026-06-09 19:59:53 collections:354] Dataset loaded with 2703 files totalling 5.39 hours
+[NeMo I 2026-06-09 19:59:53 collections:354] 0 files were filtered totalling 0.00 hours
+[NeMo W 2026-06-09 19:59:53 rnnt_bpe_models:454] Could not load dataset as `manifest_filepath` was None. Provided config : {'manifest_filepath': None, 'sample_rate': 16000, 'batch_size': 8, 'shuffle': False, 'use_start_end_token': False, 'num_workers': 4, 'pin_memory': True}
+[NeMo I 2026-06-09 20:00:17 modelPT:864] Optimizer config = AdamW (
+    Parameter Group 0
+        amsgrad: False
+        betas: [0.9, 0.98]
+        capturable: False
+        differentiable: False
+        eps: 1e-08
+        foreach: None
+        fused: None
+        lr: 0.0003
+        maximize: False
+        weight_decay: 0.001
+    )
+[NeMo I 2026-06-09 20:00:17 modelPT:786] Scheduler "<nemo.core.optim.lr_scheduler.CosineAnnealing object at 0x7fa2ac4474f0>" 
+    will be used during training (effective maximum steps = 2000) - 
+    Parameters : 
+    (warmup_steps: 200
+    warmup_ratio: null
+    min_lr: 1.0e-06
+    max_steps: 2000
+    )
+[NeMo I 2026-06-09 20:00:20 call:218] [train-stats] step 5 | epoch 0 | loss 4.8590 | ar_loss 4.8590 | lr 7.463e-06 | bs 8
+[NeMo I 2026-06-09 20:00:21 call:218] [train-stats] step 10 | epoch 0 | loss 4.8238 | ar_loss 4.8238 | lr 1.493e-05 | 3.39 it/s | bs 8
+[NeMo I 2026-06-09 20:00:23 call:218] [train-stats] step 15 | epoch 0 | loss 4.7815 | ar_loss 4.7815 | lr 2.239e-05 | 3.45 it/s | bs 8
+[NeMo I 2026-06-09 20:00:24 call:218] [train-stats] step 20 | epoch 0 | loss 4.7581 | ar_loss 4.7581 | lr 2.985e-05 | 3.45 it/s | bs 8
+[NeMo I 2026-06-09 20:00:25 call:218] [train-stats] step 25 | epoch 0 | loss 4.7303 | ar_loss 4.7303 | lr 3.731e-05 | 3.50 it/s | bs 8
+[NeMo I 2026-06-09 20:00:27 call:218] [train-stats] step 30 | epoch 0 | loss 4.7394 | ar_loss 4.7394 | lr 4.478e-05 | 3.37 it/s | bs 8
+[NeMo I 2026-06-09 20:00:28 call:218] [train-stats] step 35 | epoch 0 | loss 4.7168 | ar_loss 4.7168 | lr 5.224e-05 | 3.44 it/s | bs 8
+[NeMo I 2026-06-09 20:00:30 call:218] [train-stats] step 40 | epoch 0 | loss 4.6987 | ar_loss 4.6987 | lr 5.970e-05 | 3.41 it/s | bs 8
+[NeMo I 2026-06-09 20:00:31 call:218] [train-stats] step 45 | epoch 0 | loss 4.6482 | ar_loss 4.6482 | lr 6.716e-05 | 3.40 it/s | bs 8
+[NeMo I 2026-06-09 20:00:33 call:218] [train-stats] step 50 | epoch 0 | loss 4.6737 | ar_loss 4.6737 | lr 7.463e-05 | 3.45 it/s | bs 8
+[NeMo I 2026-06-09 20:00:34 call:218] [train-stats] step 55 | epoch 0 | loss 4.6421 | ar_loss 4.6421 | lr 8.209e-05 | 3.44 it/s | bs 8
+[NeMo I 2026-06-09 20:00:36 call:218] [train-stats] step 60 | epoch 0 | loss 4.6325 | ar_loss 4.6325 | lr 8.955e-05 | 3.44 it/s | bs 8
+[NeMo I 2026-06-09 20:00:37 call:218] [train-stats] step 65 | epoch 0 | loss 4.6550 | ar_loss 4.6550 | lr 9.701e-05 | 3.50 it/s | bs 8
+[NeMo I 2026-06-09 20:00:39 call:218] [train-stats] step 70 | epoch 0 | loss 4.6152 | ar_loss 4.6152 | lr 1.045e-04 | 3.37 it/s | bs 8
+[NeMo I 2026-06-09 20:00:40 call:218] [train-stats] step 75 | epoch 0 | loss 4.6625 | ar_loss 4.6625 | lr 1.119e-04 | 3.31 it/s | bs 8
+[NeMo I 2026-06-09 20:00:42 call:218] [train-stats] step 80 | epoch 0 | loss 4.6364 | ar_loss 4.6364 | lr 1.194e-04 | 3.38 it/s | bs 8
+[NeMo I 2026-06-09 20:00:43 call:218] [train-stats] step 85 | epoch 0 | loss 4.6257 | ar_loss 4.6257 | lr 1.269e-04 | 3.39 it/s | bs 8
+[NeMo I 2026-06-09 20:00:44 call:218] [train-stats] step 90 | epoch 0 | loss 4.6263 | ar_loss 4.6263 | lr 1.343e-04 | 3.47 it/s | bs 8
+[NeMo I 2026-06-09 20:00:46 call:218] [train-stats] step 95 | epoch 0 | loss 4.5974 | ar_loss 4.5974 | lr 1.418e-04 | 3.44 it/s | bs 8
+[NeMo I 2026-06-09 20:00:47 call:218] [train-stats] step 100 | epoch 0 | loss 4.6351 | ar_loss 4.6351 | lr 1.493e-04 | 3.39 it/s | bs 8
+[NeMo I 2026-06-09 20:00:49 call:218] [train-stats] step 105 | epoch 0 | loss 4.5785 | ar_loss 4.5785 | lr 1.567e-04 | 3.43 it/s | bs 8
+[NeMo I 2026-06-09 20:00:50 call:218] [train-stats] step 110 | epoch 0 | loss 4.6184 | ar_loss 4.6184 | lr 1.642e-04 | 3.46 it/s | bs 8
+[NeMo I 2026-06-09 20:00:52 call:218] [train-stats] step 115 | epoch 0 | loss 4.6008 | ar_loss 4.6008 | lr 1.716e-04 | 3.48 it/s | bs 8
+[NeMo I 2026-06-09 20:00:53 call:218] [train-stats] step 120 | epoch 0 | loss 4.5415 | ar_loss 4.5415 | lr 1.791e-04 | 3.48 it/s | bs 8
+[NeMo I 2026-06-09 20:00:55 call:218] [train-stats] step 125 | epoch 0 | loss 4.5546 | ar_loss 4.5546 | lr 1.866e-04 | 3.43 it/s | bs 8
+[NeMo I 2026-06-09 20:00:56 call:218] [train-stats] step 130 | epoch 0 | loss 4.5701 | ar_loss 4.5701 | lr 1.940e-04 | 3.35 it/s | bs 8
+[NeMo I 2026-06-09 20:00:58 call:218] [train-stats] step 135 | epoch 0 | loss 4.5699 | ar_loss 4.5699 | lr 2.015e-04 | 3.41 it/s | bs 8
+[NeMo I 2026-06-09 20:00:59 call:218] [train-stats] step 140 | epoch 0 | loss 4.5251 | ar_loss 4.5251 | lr 2.090e-04 | 3.43 it/s | bs 8
+[NeMo I 2026-06-09 20:01:00 call:218] [train-stats] step 145 | epoch 0 | loss 4.4556 | ar_loss 4.4556 | lr 2.164e-04 | 3.45 it/s | bs 8
+[NeMo I 2026-06-09 20:01:02 call:218] [train-stats] step 150 | epoch 0 | loss 4.4311 | ar_loss 4.4311 | lr 2.239e-04 | 3.45 it/s | bs 8
+[NeMo I 2026-06-09 20:01:03 call:218] [train-stats] step 155 | epoch 0 | loss 4.4542 | ar_loss 4.4542 | lr 2.313e-04 | 3.45 it/s | bs 8
+[NeMo I 2026-06-09 20:01:05 call:218] [train-stats] step 160 | epoch 0 | loss 4.4481 | ar_loss 4.4481 | lr 2.388e-04 | 3.48 it/s | bs 8
+[NeMo I 2026-06-09 20:01:06 call:218] [train-stats] step 165 | epoch 0 | loss 4.3954 | ar_loss 4.3954 | lr 2.463e-04 | 3.44 it/s | bs 8
+[NeMo I 2026-06-09 20:01:08 call:218] [train-stats] step 170 | epoch 0 | loss 4.3806 | ar_loss 4.3806 | lr 2.537e-04 | 3.43 it/s | bs 8
+[NeMo I 2026-06-09 20:01:09 call:218] [train-stats] step 175 | epoch 0 | loss 4.3486 | ar_loss 4.3486 | lr 2.612e-04 | 3.43 it/s | bs 8
+[NeMo I 2026-06-09 20:01:11 call:218] [train-stats] step 180 | epoch 0 | loss 4.2734 | ar_loss 4.2734 | lr 2.687e-04 | 3.46 it/s | bs 8
+[NeMo I 2026-06-09 20:01:12 call:218] [train-stats] step 185 | epoch 0 | loss 4.2514 | ar_loss 4.2514 | lr 2.761e-04 | 3.42 it/s | bs 8
+[NeMo I 2026-06-09 20:01:14 call:218] [train-stats] step 190 | epoch 0 | loss 4.1673 | ar_loss 4.1673 | lr 2.836e-04 | 3.22 it/s | bs 8
+[NeMo I 2026-06-09 20:01:15 call:218] [train-stats] step 195 | epoch 0 | loss 4.1531 | ar_loss 4.1531 | lr 2.910e-04 | 3.45 it/s | bs 8
+[NeMo I 2026-06-09 20:01:17 call:218] [train-stats] step 200 | epoch 0 | loss 4.1466 | ar_loss 4.1466 | lr 2.985e-04 | 3.39 it/s | bs 8
+[NeMo W 2026-06-09 20:01:23 warnings:109] /home/hainanx/anaconda3/lib/python3.10/site-packages/lightning/pytorch/trainer/connectors/logger_connector/result.py:431: It is recommended to use `self.log('global_step', ..., sync_dist=True)` when logging on epoch level in distributed setting to accumulate the metric across devices.
+    
+[NeMo I 2026-06-09 20:01:23 model_checkpoint:757] Checkpoint save for step 200 started at 2026-06-09T20:01:23.989528.
+[NeMo I 2026-06-09 20:01:24 model_checkpoint:696] Checkpoint save for step 200 started at 2026-06-09T20:01:24.953016.
+[NeMo I 2026-06-09 20:01:27 call:218] [train-stats] step 205 | epoch 0 | loss 4.0401 | ar_loss 4.0401 | lr 3.000e-04 | 0.49 it/s | bs 8
+[NeMo I 2026-06-09 20:01:28 call:218] [train-stats] step 210 | epoch 0 | loss 4.1149 | ar_loss 4.1149 | lr 3.000e-04 | 3.41 it/s | bs 8
+[NeMo I 2026-06-09 20:01:30 call:218] [train-stats] step 215 | epoch 0 | loss 4.0661 | ar_loss 4.0661 | lr 3.000e-04 | 3.45 it/s | bs 8
+[NeMo I 2026-06-09 20:01:31 call:218] [train-stats] step 220 | epoch 0 | loss 4.0657 | ar_loss 4.0657 | lr 2.999e-04 | 3.42 it/s | bs 8
+[NeMo I 2026-06-09 20:01:33 call:218] [train-stats] step 225 | epoch 0 | loss 4.0331 | ar_loss 4.0331 | lr 2.999e-04 | 3.43 it/s | bs 8
+[NeMo I 2026-06-09 20:01:34 call:218] [train-stats] step 230 | epoch 0 | loss 4.0693 | ar_loss 4.0693 | lr 2.998e-04 | 3.44 it/s | bs 8
+[NeMo I 2026-06-09 20:01:35 call:218] [train-stats] step 235 | epoch 0 | loss 3.9208 | ar_loss 3.9208 | lr 2.997e-04 | 3.43 it/s | bs 8
+[NeMo I 2026-06-09 20:01:37 call:218] [train-stats] step 240 | epoch 0 | loss 3.9070 | ar_loss 3.9070 | lr 2.997e-04 | 3.50 it/s | bs 8
+[NeMo I 2026-06-09 20:01:38 call:218] [train-stats] step 245 | epoch 0 | loss 3.9573 | ar_loss 3.9573 | lr 2.996e-04 | 3.41 it/s | bs 8
+[NeMo I 2026-06-09 20:01:40 call:218] [train-stats] step 250 | epoch 0 | loss 3.9399 | ar_loss 3.9399 | lr 2.995e-04 | 3.48 it/s | bs 8
+[NeMo I 2026-06-09 20:01:41 call:218] [train-stats] step 255 | epoch 0 | loss 3.9511 | ar_loss 3.9511 | lr 2.993e-04 | 3.48 it/s | bs 8
+[NeMo I 2026-06-09 20:01:43 call:218] [train-stats] step 260 | epoch 0 | loss 3.8754 | ar_loss 3.8754 | lr 2.992e-04 | 3.49 it/s | bs 8
+[NeMo I 2026-06-09 20:01:44 call:218] [train-stats] step 265 | epoch 0 | loss 3.9101 | ar_loss 3.9101 | lr 2.991e-04 | 3.48 it/s | bs 8
+[NeMo I 2026-06-09 20:01:46 call:218] [train-stats] step 270 | epoch 0 | loss 3.8575 | ar_loss 3.8575 | lr 2.989e-04 | 3.49 it/s | bs 8
+[NeMo I 2026-06-09 20:01:47 call:218] [train-stats] step 275 | epoch 0 | loss 3.8625 | ar_loss 3.8625 | lr 2.988e-04 | 3.25 it/s | bs 8
+[NeMo I 2026-06-09 20:01:49 call:218] [train-stats] step 280 | epoch 0 | loss 3.9010 | ar_loss 3.9010 | lr 2.986e-04 | 3.45 it/s | bs 8
+[NeMo I 2026-06-09 20:01:50 call:218] [train-stats] step 285 | epoch 0 | loss 3.8828 | ar_loss 3.8828 | lr 2.984e-04 | 3.46 it/s | bs 8
+[NeMo I 2026-06-09 20:01:51 call:218] [train-stats] step 290 | epoch 0 | loss 3.8359 | ar_loss 3.8359 | lr 2.982e-04 | 3.48 it/s | bs 8
+[NeMo I 2026-06-09 20:01:53 call:218] [train-stats] step 295 | epoch 0 | loss 3.8939 | ar_loss 3.8939 | lr 2.980e-04 | 3.46 it/s | bs 8
+[NeMo I 2026-06-09 20:01:54 call:218] [train-stats] step 300 | epoch 0 | loss 3.9198 | ar_loss 3.9198 | lr 2.978e-04 | 3.48 it/s | bs 8
+[NeMo I 2026-06-09 20:01:56 call:218] [train-stats] step 305 | epoch 0 | loss 3.8770 | ar_loss 3.8770 | lr 2.975e-04 | 3.44 it/s | bs 8
+[NeMo I 2026-06-09 20:01:57 call:218] [train-stats] step 310 | epoch 0 | loss 3.7767 | ar_loss 3.7767 | lr 2.973e-04 | 3.40 it/s | bs 8
+[NeMo I 2026-06-09 20:01:59 call:218] [train-stats] step 315 | epoch 0 | loss 3.8403 | ar_loss 3.8403 | lr 2.971e-04 | 3.42 it/s | bs 8
+[NeMo I 2026-06-09 20:02:00 call:218] [train-stats] step 320 | epoch 0 | loss 3.8036 | ar_loss 3.8036 | lr 2.968e-04 | 3.34 it/s | bs 8
+[NeMo I 2026-06-09 20:02:02 call:218] [train-stats] step 325 | epoch 0 | loss 3.7823 | ar_loss 3.7823 | lr 2.965e-04 | 3.43 it/s | bs 8
+[NeMo I 2026-06-09 20:02:03 call:218] [train-stats] step 330 | epoch 0 | loss 3.7766 | ar_loss 3.7766 | lr 2.962e-04 | 3.41 it/s | bs 8
+[NeMo I 2026-06-09 20:02:05 call:218] [train-stats] step 335 | epoch 0 | loss 3.7724 | ar_loss 3.7724 | lr 2.959e-04 | 3.40 it/s | bs 8
+[NeMo I 2026-06-09 20:02:06 call:218] [train-stats] step 340 | epoch 0 | loss 3.7115 | ar_loss 3.7115 | lr 2.956e-04 | 3.42 it/s | bs 8
+[NeMo I 2026-06-09 20:02:08 call:218] [train-stats] step 345 | epoch 0 | loss 3.7855 | ar_loss 3.7855 | lr 2.953e-04 | 3.38 it/s | bs 8
+[NeMo I 2026-06-09 20:02:09 call:218] [train-stats] step 350 | epoch 0 | loss 3.7780 | ar_loss 3.7780 | lr 2.950e-04 | 3.43 it/s | bs 8
+[NeMo I 2026-06-09 20:02:10 call:218] [train-stats] step 355 | epoch 0 | loss 3.7934 | ar_loss 3.7934 | lr 2.946e-04 | 3.40 it/s | bs 8
+[NeMo I 2026-06-09 20:02:12 call:218] [train-stats] step 360 | epoch 0 | loss 3.6865 | ar_loss 3.6865 | lr 2.943e-04 | 3.40 it/s | bs 8
+[NeMo I 2026-06-09 20:02:13 call:218] [train-stats] step 365 | epoch 0 | loss 3.6817 | ar_loss 3.6817 | lr 2.939e-04 | 3.44 it/s | bs 8
+[NeMo I 2026-06-09 20:02:15 call:218] [train-stats] step 370 | epoch 0 | loss 3.7347 | ar_loss 3.7347 | lr 2.935e-04 | 3.42 it/s | bs 8
+[NeMo I 2026-06-09 20:02:16 call:218] [train-stats] step 375 | epoch 0 | loss 3.7557 | ar_loss 3.7557 | lr 2.932e-04 | 3.44 it/s | bs 8
+[NeMo I 2026-06-09 20:02:18 call:218] [train-stats] step 380 | epoch 0 | loss 3.6484 | ar_loss 3.6484 | lr 2.928e-04 | 3.40 it/s | bs 8
+[NeMo I 2026-06-09 20:02:19 call:218] [train-stats] step 385 | epoch 0 | loss 3.7010 | ar_loss 3.7010 | lr 2.924e-04 | 3.38 it/s | bs 8
+[NeMo I 2026-06-09 20:02:21 call:218] [train-stats] step 390 | epoch 0 | loss 3.7740 | ar_loss 3.7740 | lr 2.919e-04 | 3.42 it/s | bs 8
+[NeMo I 2026-06-09 20:02:22 call:218] [train-stats] step 395 | epoch 0 | loss 3.7064 | ar_loss 3.7064 | lr 2.915e-04 | 3.25 it/s | bs 8

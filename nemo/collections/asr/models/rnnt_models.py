@@ -15,21 +15,24 @@
 import copy
 import os
 from math import ceil
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
+import editdistance
 import numpy as np
 import torch
 from lightning.pytorch import Trainer
-from omegaconf import DictConfig, OmegaConf, open_dict
+from omegaconf import DictConfig, ListConfig, OmegaConf, open_dict
 from torch.utils.data import DataLoader
 
 from nemo.collections.asr.data import audio_to_text_dataset
 from nemo.collections.asr.data.audio_to_text import _AudioTextDataset
 from nemo.collections.asr.data.audio_to_text_dali import AudioToCharDALIDataset, DALIOutputs
 from nemo.collections.asr.data.audio_to_text_lhotse import LhotseSpeechToTextBpeDataset
+from nemo.collections.asr.losses.aligner_loss import AlignerCrossEntropyLoss
 from nemo.collections.asr.losses.rnnt import RNNTLoss, resolve_rnnt_default_loss_name
 from nemo.collections.asr.metrics.wer import WER
 from nemo.collections.asr.models.asr_model import ASRModel, ExportableEncDecModel
+from nemo.collections.asr.modules.aligner import AlignerCTCHead, AlignerJoint
 from nemo.collections.asr.modules.rnnt import RNNTDecoderJoint
 from nemo.collections.asr.parts.mixins import (
     ASRModuleMixin,
@@ -38,6 +41,7 @@ from nemo.collections.asr.parts.mixins import (
     TranscriptionReturnType,
 )
 from nemo.collections.asr.parts.preprocessing.segment import ChannelSelectorType
+from nemo.collections.asr.parts.submodules.aligner_decoding import AlignerDecoding
 from nemo.collections.asr.parts.submodules.rnnt_decoding import RNNTDecoding, RNNTDecodingConfig
 from nemo.collections.asr.parts.utils.asr_batching import get_semi_sorted_batch_sampler
 from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
@@ -61,60 +65,67 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             self.world_size = trainer.world_size
 
         super().__init__(cfg=cfg, trainer=trainer)
+        self.loss_type = str(self.cfg.get('loss_type', 'rnnt')).lower()
+        if self.loss_type not in ('rnnt', 'aligner'):
+            raise ValueError(f"model.loss_type must be one of ['rnnt', 'aligner'], got '{self.loss_type}'.")
 
         # Initialize components
         self.preprocessor = EncDecRNNTModel.from_config_dict(self.cfg.preprocessor)
         self.encoder = EncDecRNNTModel.from_config_dict(self.cfg.encoder)
 
-        # Update config values required by components dynamically
-        with open_dict(self.cfg.decoder):
-            self.cfg.decoder.vocab_size = len(self.cfg.labels)
+        if self.loss_type == 'aligner':
+            self._setup_aligner_model_components()
+        else:
+            # Update config values required by components dynamically
+            with open_dict(self.cfg.decoder):
+                self.cfg.decoder.vocab_size = len(self.cfg.labels)
 
-        with open_dict(self.cfg.joint):
-            self.cfg.joint.num_classes = len(self.cfg.labels)
-            self.cfg.joint.vocabulary = self.cfg.labels
-            self.cfg.joint.jointnet.encoder_hidden = self.cfg.model_defaults.enc_hidden
-            self.cfg.joint.jointnet.pred_hidden = self.cfg.model_defaults.pred_hidden
+            with open_dict(self.cfg.joint):
+                self.cfg.joint.num_classes = len(self.cfg.labels)
+                self.cfg.joint.vocabulary = self.cfg.labels
+                self.cfg.joint.jointnet.encoder_hidden = self.cfg.model_defaults.enc_hidden
+                self.cfg.joint.jointnet.pred_hidden = self.cfg.model_defaults.pred_hidden
 
-        self.decoder = EncDecRNNTModel.from_config_dict(self.cfg.decoder)
-        self.joint = EncDecRNNTModel.from_config_dict(self.cfg.joint)
+            self.decoder = EncDecRNNTModel.from_config_dict(self.cfg.decoder)
+            self.joint = EncDecRNNTModel.from_config_dict(self.cfg.joint)
 
-        # Setup RNNT Loss
-        loss_name, loss_kwargs = self.extract_rnnt_loss_cfg(self.cfg.get("loss", None))
+            # Setup RNNT Loss
+            loss_name, loss_kwargs = self.extract_rnnt_loss_cfg(self.cfg.get("loss", None))
 
-        num_classes = self.joint.num_classes_with_blank - 1  # for standard RNNT and multi-blank
+            num_classes = self.joint.num_classes_with_blank - 1  # for standard RNNT and multi-blank
 
-        if loss_name == 'tdt':
-            num_classes = num_classes - self.joint.num_extra_outputs
+            if loss_name == 'tdt':
+                num_classes = num_classes - self.joint.num_extra_outputs
 
-        self.loss = RNNTLoss(
-            num_classes=num_classes,
-            loss_name=loss_name,
-            loss_kwargs=loss_kwargs,
-            reduction=self.cfg.get("rnnt_reduction", "mean_batch"),
-        )
+            self.loss = RNNTLoss(
+                num_classes=num_classes,
+                loss_name=loss_name,
+                loss_kwargs=loss_kwargs,
+                reduction=self.cfg.get("rnnt_reduction", "mean_batch"),
+            )
 
         if hasattr(self.cfg, 'spec_augment') and self._cfg.spec_augment is not None:
             self.spec_augmentation = EncDecRNNTModel.from_config_dict(self.cfg.spec_augment)
         else:
             self.spec_augmentation = None
 
-        self.cfg.decoding = self.set_decoding_type_according_to_loss(self.cfg.decoding)
-        # Setup decoding objects
-        self.decoding = RNNTDecoding(
-            decoding_cfg=self.cfg.decoding,
-            decoder=self.decoder,
-            joint=self.joint,
-            vocabulary=self.joint.vocabulary,
-        )
-        # Setup WER calculation
-        self.wer = WER(
-            decoding=self.decoding,
-            batch_dim_index=0,
-            use_cer=self._cfg.get('use_cer', False),
-            log_prediction=self._cfg.get('log_prediction', True),
-            dist_sync_on_step=True,
-        )
+        if self.loss_type != 'aligner':
+            self.cfg.decoding = self.set_decoding_type_according_to_loss(self.cfg.decoding)
+            # Setup decoding objects
+            self.decoding = RNNTDecoding(
+                decoding_cfg=self.cfg.decoding,
+                decoder=self.decoder,
+                joint=self.joint,
+                vocabulary=self.joint.vocabulary,
+            )
+            # Setup WER calculation
+            self.wer = WER(
+                decoding=self.decoding,
+                batch_dim_index=0,
+                use_cer=self._cfg.get('use_cer', False),
+                log_prediction=self._cfg.get('log_prediction', True),
+                dist_sync_on_step=True,
+            )
 
         # Whether to compute loss during evaluation
         if 'compute_eval_loss' in self.cfg:
@@ -123,9 +134,9 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             self.compute_eval_loss = True
 
         # Setup fused Joint step if flag is set
-        if self.joint.fuse_loss_wer or (
+        if self.loss_type != 'aligner' and (self.joint.fuse_loss_wer or (
             self.decoding.joint_fused_batch_size is not None and self.decoding.joint_fused_batch_size > 0
-        ):
+        )):
             self.joint.set_loss(self.loss)
             self.joint.set_wer(self.wer)
 
@@ -137,6 +148,115 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
         # Setup encoder adapters (from ASRAdapterModelMixin)
         self.setup_adapters()
+
+    def _setup_aligner_model_components(self):
+        """Set up Aligner-Encoder components inside the RNNT model lifecycle."""
+        vocabulary = list(self.cfg.labels)
+        self.eos_id = len(vocabulary)
+        num_classes = self.eos_id + 1  # real tokens + EOS, no blank
+
+        self.aligner_type = self.cfg.get('aligner_type', 'ar')
+        if self.aligner_type not in ('ar', 'nonar'):
+            raise ValueError(f"model.aligner_type must be 'ar' or 'nonar', got '{self.aligner_type}'.")
+
+        with open_dict(self.cfg.decoder):
+            self.cfg.decoder.vocab_size = num_classes
+
+        with open_dict(self.cfg.joint):
+            self.cfg.joint.num_classes = num_classes
+            self.cfg.joint.vocabulary = ListConfig(vocabulary)
+            self.cfg.joint.jointnet.encoder_hidden = self.cfg.model_defaults.enc_hidden
+            self.cfg.joint.jointnet.pred_hidden = self.cfg.model_defaults.pred_hidden
+
+        self.decoder = EncDecRNNTModel.from_config_dict(self.cfg.decoder)
+        self.joint = AlignerJoint(
+            jointnet=self.cfg.joint.jointnet,
+            num_classes=num_classes,
+            vocabulary=vocabulary,
+            log_softmax=self.cfg.joint.get('log_softmax', None),
+        )
+
+        self.aux_nonar_loss_weight = float(self.cfg.get('aux_nonar_loss_weight', 0.0))
+        self.ctc_head = None
+        if self.aligner_type == 'nonar' or self.aux_nonar_loss_weight > 0:
+            head_cfg = self.cfg.get('ctc_head', {}) or {}
+            self.ctc_head = AlignerCTCHead(
+                feat_in=self.cfg.model_defaults.enc_hidden,
+                num_classes=num_classes,
+                hidden=head_cfg.get('hidden', None),
+                activation=head_cfg.get('activation', 'relu'),
+                dropout=head_cfg.get('dropout', 0.0),
+            )
+
+        self.loss = AlignerCrossEntropyLoss(
+            num_classes=num_classes,
+            label_smoothing=self.cfg.get('label_smoothing', 0.1),
+        )
+
+        self.decoding = AlignerDecoding(
+            decoding_cfg=self.cfg.get('decoding', None),
+            decoder=self.decoder,
+            joint=self.joint,
+            eos_id=self.eos_id,
+            vocabulary=vocabulary,
+            tokenizer=getattr(self, 'tokenizer', None),
+            ctc_head=self.ctc_head,
+        )
+
+    def _append_aligner_eos(
+        self, transcript: torch.Tensor, transcript_len: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        targets = torch.nn.functional.pad(transcript, (0, 1), value=0)
+        batch_idx = torch.arange(transcript.size(0), device=transcript.device)
+        targets[batch_idx, transcript_len.long()] = self.eos_id
+        return targets, transcript_len + 1
+
+    def _aligner_loss(
+        self,
+        encoded: torch.Tensor,
+        encoded_len: torch.Tensor,
+        transcript: torch.Tensor,
+        transcript_len: torch.Tensor,
+    ) -> torch.Tensor:
+        targets_eos, target_eos_len = self._append_aligner_eos(transcript, transcript_len)
+        total_loss = encoded.new_zeros(())
+
+        if self.aligner_type == 'ar' or self.aux_nonar_loss_weight > 0:
+            decoder_outputs, _, _ = self.decoder(targets=transcript, target_length=transcript_len)
+            ar_logits = self.joint(encoder_outputs=encoded, decoder_outputs=decoder_outputs)
+            ar_loss = self.loss(log_probs=ar_logits, targets=targets_eos, target_lengths=target_eos_len)
+            if self.aligner_type == 'ar':
+                total_loss = total_loss + ar_loss
+
+        if self.ctc_head is not None:
+            nonar_logits = self.ctc_head(encoder_output=encoded)
+            nonar_loss = self.loss(log_probs=nonar_logits, targets=targets_eos, target_lengths=target_eos_len)
+            if self.aligner_type == 'nonar':
+                total_loss = total_loss + nonar_loss
+            elif self.aux_nonar_loss_weight > 0:
+                total_loss = total_loss + self.aux_nonar_loss_weight * nonar_loss
+
+        return total_loss
+
+    def _references_from_targets(self, transcript: torch.Tensor, transcript_len: torch.Tensor) -> List[str]:
+        transcript = transcript.long().cpu()
+        transcript_len = transcript_len.long().cpu()
+        refs = []
+        for b in range(transcript.size(0)):
+            ids = transcript[b, : int(transcript_len[b].item())].tolist()
+            refs.append(self.decoding.decode_ids_to_str(ids))
+        return refs
+
+    @staticmethod
+    def _wer_counts(hypotheses: List[str], references: List[str]) -> Tuple[int, int]:
+        scores = 0
+        words = 0
+        for hyp, ref in zip(hypotheses, references):
+            hyp_words = hyp.split()
+            ref_words = ref.split()
+            scores += editdistance.eval(hyp_words, ref_words)
+            words += len(ref_words)
+        return scores, words
 
     def setup_optim_normalization(self):
         """
@@ -731,6 +851,42 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
         del signal
 
+        if self.loss_type == 'aligner':
+            loss_value = self._aligner_loss(encoded, encoded_len, transcript, transcript_len)
+            loss_value = self.add_auxiliary_losses(loss_value)
+
+            if AccessMixin.is_access_enabled(self.model_guid):
+                AccessMixin.reset_registry(self)
+
+            tensorboard_logs = {
+                'train_loss': loss_value,
+                'learning_rate': self._optimizer.param_groups[0]['lr'],
+                'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
+            }
+
+            log_stats_every_n_steps = int(self.cfg.get('log_stats_every_n_steps', 10))
+            if (
+                log_stats_every_n_steps > 0
+                and self.trainer is not None
+                and self.trainer.is_global_zero
+                and self.trainer.global_step % log_stats_every_n_steps == 0
+            ):
+                logging.info(
+                    "[aligner-train] "
+                    f"step={self.trainer.global_step} "
+                    f"epoch={self.trainer.current_epoch} "
+                    f"loss={float(loss_value.detach().float().cpu()):.4f} "
+                    f"lr={self._optimizer.param_groups[0]['lr']:.3e} "
+                    f"bs={encoded.size(0)} "
+                    f"enc_frames_mean={float(encoded_len.float().mean().detach().cpu()):.1f} "
+                    f"enc_frames_max={int(encoded_len.max().detach().cpu())} "
+                    f"tgt_len_mean={float(transcript_len.float().mean().detach().cpu()):.1f} "
+                    f"tgt_len_max={int(transcript_len.max().detach().cpu())}"
+                )
+
+            self.log_dict(tensorboard_logs)
+            return {'loss': loss_value}
+
         # During training, loss must be computed, so decoder forward is necessary
         decoder, target_length, states = self.decoder(targets=transcript, target_length=transcript_len)
 
@@ -825,6 +981,12 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
         del signal
 
+        if self.loss_type == 'aligner':
+            texts, _ = self.decoding.decode_encoder_output(encoded, encoded_len)
+            if isinstance(sample_id, torch.Tensor):
+                sample_id = sample_id.cpu().detach().numpy()
+            return list(zip(sample_id, texts))
+
         best_hyp_text = self.decoding.rnnt_decoder_predictions_tensor(
             encoder_output=encoded, encoded_lengths=encoded_len, return_hypotheses=True
         )
@@ -844,6 +1006,22 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         del signal
 
         tensorboard_logs = {}
+
+        if self.loss_type == 'aligner':
+            if self.compute_eval_loss:
+                tensorboard_logs['val_loss'] = self._aligner_loss(encoded, encoded_len, transcript, transcript_len)
+
+            hypotheses, _ = self.decoding.decode_encoder_output(encoded, encoded_len)
+            references = self._references_from_targets(transcript, transcript_len)
+            scores, words = self._wer_counts(hypotheses, references)
+
+            tensorboard_logs['val_wer_num'] = torch.tensor(scores, dtype=torch.float32, device=encoded.device)
+            tensorboard_logs['val_wer_denom'] = torch.tensor(words, dtype=torch.float32, device=encoded.device)
+            tensorboard_logs['val_wer'] = torch.tensor(
+                scores / max(words, 1), dtype=torch.float32, device=encoded.device
+            )
+            self.log('global_step', torch.tensor(self.trainer.global_step, dtype=torch.float32))
+            return tensorboard_logs
 
         # If experimental fused Joint-Loss-WER is not used
         if not self.joint.fuse_loss_wer:
@@ -952,6 +1130,14 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
     ) -> Union[List['Hypothesis'], List[List['Hypothesis']]]:
         encoded = outputs.pop('encoded')
         encoded_len = outputs.pop('encoded_len')
+
+        if self.loss_type == 'aligner':
+            texts, token_ids = self.decoding.decode_encoder_output(encoded, encoded_len)
+            del encoded, encoded_len
+            return [
+                Hypothesis(score=0.0, y_sequence=torch.tensor(ids, dtype=torch.long), text=text)
+                for text, ids in zip(texts, token_ids)
+            ]
 
         hyp = self.decoding.rnnt_decoder_predictions_tensor(
             encoded,

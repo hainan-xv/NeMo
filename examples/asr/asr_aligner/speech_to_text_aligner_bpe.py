@@ -51,7 +51,7 @@ import torch
 from omegaconf import OmegaConf, open_dict
 
 from nemo.collections.asr.models import ASRModel
-from nemo.collections.asr.models.aligner_models import EncDecAlignerBPEModel
+from nemo.collections.asr.models import EncDecRNNTBPEModel
 from nemo.core.config import hydra_runner
 from nemo.utils import logging
 from nemo.utils.exp_manager import exp_manager
@@ -135,8 +135,8 @@ def main(cfg):
     trainer = pl.Trainer(**resolve_trainer_cfg(cfg.trainer))
     exp_manager(trainer, cfg.get("exp_manager", None))
 
-    # 4) Instantiate the Aligner-Encoder model.
-    asr_model = EncDecAlignerBPEModel(cfg=cfg.model, trainer=trainer)
+    # 4) Instantiate the standard RNNT-BPE model with the Aligner loss/decoding mode enabled.
+    asr_model = EncDecRNNTBPEModel(cfg=cfg.model, trainer=trainer)
 
     # 5) Optional encoder-only warm start from the base model.
     if base_model is not None and cfg.get("init_encoder_from_base", True):

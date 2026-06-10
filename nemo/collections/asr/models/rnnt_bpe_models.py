@@ -244,6 +244,9 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
 
         super().__init__(cfg=cfg, trainer=trainer)
 
+        if getattr(self, 'loss_type', 'rnnt') == 'aligner':
+            return
+
         self.cfg.decoding = self.set_decoding_type_according_to_loss(self.cfg.decoding)
         # Setup decoding object
         self.decoding = RNNTBPEDecoding(
@@ -316,6 +319,21 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
 
         # Setup the tokenizer
         self._setup_tokenizer(tokenizer_cfg)
+
+        if getattr(self, 'loss_type', 'rnnt') == 'aligner':
+            vocabulary = self.tokenizer.tokenizer.get_vocab()
+            if isinstance(vocabulary, dict):
+                vocabulary = list(vocabulary.keys())
+            else:
+                vocabulary = list(vocabulary)
+
+            with open_dict(self.cfg):
+                self.cfg.tokenizer = tokenizer_cfg
+                self.cfg.labels = ListConfig(vocabulary)
+
+            self._setup_aligner_model_components()
+            logging.info(f"Changed tokenizer/vocabulary to {len(vocabulary)} tokens (+EOS) for Aligner mode.")
+            return
 
         # Initialize a dummy vocabulary
         vocabulary = self.tokenizer.tokenizer.get_vocab()

@@ -33,9 +33,11 @@ model:
   skip_nan_grad: false
 
   # Aligner-Encoder specific options
+  loss_type: "aligner"        # default RNNT path remains "rnnt"; this enables Aligner loss/decoding in RNNT model
   aligner_type: "ar"          # "ar" or "nonar"
   label_smoothing: 0.1        # label smoothing weight for the cross-entropy loss
   aux_nonar_loss_weight: 0.0  # >0 adds an auxiliary non-AR loss to the AR model
+  debug_wandb_logging: true   # print (rank0) the exact stats handed to the loggers + the wandb run identity
 
   model_defaults:
     enc_hidden: ${model.encoder.d_model}
@@ -175,13 +177,14 @@ model:
 
   optim:
     name: adamw
-    lr: 5.0
+    # NOTE: with CosineAnnealing, `lr` is the actual peak LR (unlike NoamAnnealing,
+    # whose `lr` is a base multiplier scaled by d_model^-0.5 -> ~1e-8 effective).
+    lr: 1e-4
     betas: [0.9, 0.98]
     weight_decay: 1e-3
 
     sched:
-      name: NoamAnnealing
-      d_model: ${model.encoder.d_model}
+      name: CosineAnnealing
       warmup_steps: 10000
       warmup_ratio: null
       min_lr: 1e-6
