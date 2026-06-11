@@ -160,6 +160,69 @@ def transcribe_tdt(model, audio_files, batch_size):
     return texts
 
 
+class AudioFileDataset(torch.utils.data.Dataset):
+    """Simple soundfile-backed dataset for eval-only transcription.
+
+    This avoids NeMo/Lhotse ``model.transcribe`` dataloader construction for
+    aligner / chunked-aligner checkpoints. Some ESB samples are cached as mono
+    arrays that hit a Lhotse collation path expecting an explicit channel
+    dimension; for these models we only need padded waveforms + lengths.
+    """
+
+    def __init__(self, audio_files):
+        self.audio_files = audio_files
+
+    def __len__(self):
+        return len(self.audio_files)
+
+    def __getitem__(self, idx):
+        audio, sr = soundfile.read(self.audio_files[idx], dtype="float32", always_2d=False)
+        if sr != 16000:
+            raise ValueError(f"Expected cached 16 kHz audio, got sr={sr} for {self.audio_files[idx]}")
+        if audio.ndim == 2:
+            audio = audio.mean(axis=1)
+        audio = torch.from_numpy(np.ascontiguousarray(audio, dtype=np.float32))
+        return audio, torch.tensor(audio.numel(), dtype=torch.long)
+
+
+def _collate_audio(batch):
+    audios, audio_lens = zip(*batch)
+    audio_lens = torch.stack(audio_lens)
+    max_len = int(audio_lens.max().item())
+    padded = torch.zeros(len(audios), max_len, dtype=torch.float32)
+    for i, audio in enumerate(audios):
+        padded[i, : audio.numel()] = audio
+    return padded, audio_lens
+
+
+@torch.inference_mode()
+def transcribe_aligner_like(model, audio_files, batch_size):
+    """Decode aligner / chunked-aligner models without ``model.transcribe``.
+
+    The model's transcribe dataloader can inherit Lhotse settings from training
+    configs and fail on mono cached ESB wavs. This direct path preserves the
+    model's own encoder and ``_transcribe_output_processing`` logic, including
+    chunked-aligner greedy decoding, but uses a minimal soundfile dataloader.
+    """
+
+    dloader = torch.utils.data.DataLoader(
+        AudioFileDataset(audio_files),
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+        collate_fn=_collate_audio,
+    )
+    hyps = []
+    for signal, signal_len in tqdm(dloader, desc="Transcribing (aligner/chunked)"):
+        signal = signal.to(model.device, non_blocking=True)
+        signal_len = signal_len.to(model.device, non_blocking=True)
+        outputs = model._transcribe_forward((signal, signal_len), trcfg=None)
+        out = model._transcribe_output_processing(outputs, trcfg=None)
+        for h in out:
+            hyps.append(h.text if hasattr(h, "text") else str(h))
+    return hyps
+
+
 # --------------------------------------------------------------------------- #
 # Dataset handling -- mirrors run_eval_sslm.py
 # --------------------------------------------------------------------------- #
@@ -289,10 +352,15 @@ def main(args):
         print("ERROR: No samples to evaluate!")
         return
 
-    print(f"Transcribing {n_samples} samples ({'multistream' if is_multistream else 'tdt'})...")
+    loss_type = getattr(model, "loss_type", None)
+    is_aligner_like = loss_type in ("aligner", "chunked_aligner")
+    decode_kind = "multistream" if is_multistream else ("aligner/chunked" if is_aligner_like else "tdt")
+    print(f"Transcribing {n_samples} samples ({decode_kind})...")
     start = time.time()
     if is_multistream:
         transcriptions = transcribe_multistream(model, all_data["audio_filepaths"], args.batch_size)
+    elif is_aligner_like:
+        transcriptions = transcribe_aligner_like(model, all_data["audio_filepaths"], args.batch_size)
     else:
         transcriptions = transcribe_tdt(model, all_data["audio_filepaths"], args.batch_size)
     total_time = time.time() - start

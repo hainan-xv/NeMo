@@ -81,10 +81,10 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         self.preprocessor = EncDecRNNTModel.from_config_dict(self.cfg.preprocessor)
         self.encoder = EncDecRNNTModel.from_config_dict(self.cfg.encoder)
 
-        # Optional learned token-extraction layer at the end of the encoder
-        # (only used by the Chunked-Aligner; set up in the chunked-aligner setup
-        # methods when enabled).
+        # Optional chunked frame reduction at the end of the encoder (only used
+        # by the Chunked-Aligner; set up in the chunked-aligner setup methods).
         self.token_extractor = None
+        self.first_k_frames_per_chunk = -1
         # Non-autoregressive (NAR) Chunked-Aligner flag (no prediction net / joint).
         self.nar = False
 
@@ -292,13 +292,15 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         return bool(ca_cfg.get('nar', False)) if ca_cfg is not None else False
 
     def _setup_chunked_token_extractor(self, ca_cfg):
-        """Set ``frames_per_chunk`` / ``chunk_size`` and build the optional learned
-        token-extraction layer (shared by the AR and NAR Chunked-Aligner setups).
+        """Set chunk geometry and optional chunk-level frame reduction.
 
-        ``token_extraction_size`` (-1 disables) is the single knob: when >=1 each
-        acoustic chunk of ``chunk_size`` encoder frames is compressed into that many
-        learned tokens via cross-attention, and the lattice then runs over the
-        extracted tokens (so the effective ``chunk_size`` becomes that value).
+        ``token_extraction_size`` (-1 disables) compresses each acoustic chunk of
+        ``chunk_size`` encoder frames into that many learned tokens via
+        cross-attention. ``first_k_frames_per_chunk`` (-1 disables) is a cheaper
+        alternative that simply keeps the left-most ``k`` encoder frames from each
+        chunk and drops the rest. In either case the downstream lattice runs over
+        the reduced sequence, so the effective ``chunk_size`` becomes the reduced
+        number of frames/tokens per chunk.
         """
         # Acoustic chunk: number of encoder frames covered by one chunk.
         self.frames_per_chunk = int(ca_cfg.get('chunk_size', 12)) if ca_cfg is not None else 12
@@ -306,6 +308,14 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             raise ValueError(f"model.chunked_aligner.chunk_size must be >= 1, got {self.frames_per_chunk}.")
 
         token_extraction_size = int(ca_cfg.get('token_extraction_size', -1)) if ca_cfg is not None else -1
+        first_k_frames_per_chunk = (
+            int(ca_cfg.get('first_k_frames_per_chunk', -1)) if ca_cfg is not None else -1
+        )
+        if token_extraction_size >= 1 and first_k_frames_per_chunk >= 1:
+            raise ValueError(
+                "model.chunked_aligner.token_extraction_size and "
+                "model.chunked_aligner.first_k_frames_per_chunk are mutually exclusive."
+            )
         if token_extraction_size >= 1:
             self.token_extractor = ChunkTokenExtractor(
                 d_model=int(self.cfg.model_defaults.enc_hidden),
@@ -318,8 +328,56 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 f"[chunked-aligner] Token-extraction enabled: {self.frames_per_chunk} encoder frames/chunk -> "
                 f"{token_extraction_size} tokens/chunk (effective chunk_size={self.chunk_size})."
             )
+        elif first_k_frames_per_chunk >= 1:
+            if first_k_frames_per_chunk > self.frames_per_chunk:
+                raise ValueError(
+                    "model.chunked_aligner.first_k_frames_per_chunk must be <= "
+                    f"model.chunked_aligner.chunk_size ({self.frames_per_chunk}), got {first_k_frames_per_chunk}."
+                )
+            self.first_k_frames_per_chunk = first_k_frames_per_chunk
+            self.chunk_size = first_k_frames_per_chunk
+            logging.info(
+                f"[chunked-aligner] First-k frame selection enabled: keeping first {first_k_frames_per_chunk}/"
+                f"{self.frames_per_chunk} encoder frames per chunk (effective chunk_size={self.chunk_size})."
+            )
         else:
             self.chunk_size = self.frames_per_chunk
+
+    def _select_first_k_frames_per_chunk(
+        self, encoded: torch.Tensor, encoded_len: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Keep the left-most ``k`` frames from every fixed-size encoder chunk.
+
+        Args:
+            encoded: Encoder output ``[B, D, T]``.
+            encoded_len: Valid encoder lengths ``[B]``.
+
+        Returns:
+            The compacted encoder sequence and updated lengths. The frame order is
+            preserved chunk-by-chunk, e.g. for ``chunk_size=12, k=4`` we keep
+            offsets ``0..3, 12..15, 24..27, ...`` and remove the remaining offsets.
+        """
+        k = int(self.first_k_frames_per_chunk)
+        if k < 1:
+            return encoded, encoded_len
+
+        C = int(self.frames_per_chunk)
+        if k == C:
+            return encoded, encoded_len
+
+        B, D, T = encoded.shape
+        n_chunks = (T + C - 1) // C
+        padded_T = n_chunks * C
+        if padded_T != T:
+            encoded = torch.nn.functional.pad(encoded, (0, padded_T - T))
+
+        encoded = encoded.view(B, D, n_chunks, C)[:, :, :, :k].contiguous().view(B, D, n_chunks * k)
+
+        encoded_len = encoded_len.to(device=encoded.device, dtype=torch.long)
+        full_chunks = encoded_len // C
+        remainder = encoded_len % C
+        selected_len = full_chunks * k + torch.minimum(remainder, remainder.new_full(remainder.shape, k))
+        return encoded, selected_len
 
     def _setup_chunked_aligner_nar_components(self):
         """Set up the non-autoregressive (NAR) Chunked-Aligner.
@@ -1100,10 +1158,12 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
         encoded, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
 
-        # Optional learned token-extraction layer (Chunked-Aligner): compress each
-        # acoustic chunk of encoder frames into a smaller set of learned tokens.
+        # Optional chunked frame reduction (Chunked-Aligner): either compress each
+        # acoustic chunk into learned tokens, or keep the left-most k frames.
         if self.token_extractor is not None:
             encoded, encoded_len = self.token_extractor(encoded, encoded_len)
+        elif self.first_k_frames_per_chunk >= 1:
+            encoded, encoded_len = self._select_first_k_frames_per_chunk(encoded, encoded_len)
 
         return encoded, encoded_len
 

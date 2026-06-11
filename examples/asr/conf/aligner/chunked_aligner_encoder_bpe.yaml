@@ -52,6 +52,11 @@ model:
     # + Q/K/V/output projections), and the Chunked-Aligner lattice runs over those
     # tokens (effective chunk_size = token_extraction_size, the max #tokens/chunk).
     token_extraction_size: -1
+    # Cheap alternative to token_extraction_size. -1 = off. When >=1, keep only
+    # the first k encoder frames in each acoustic chunk before the joint/loss, so
+    # each chunk can emit at most k tokens without adding a learned extractor.
+    # Mutually exclusive with token_extraction_size.
+    first_k_frames_per_chunk: -1
   log_stats_every_n_steps: 20        # rank-0 stdout [chunked_aligner-train] summary (<=0 disables)
   log_prediction_every_n_steps: 100  # rank-0 stdout hyp/ref samples (<=0 disables)
   log_prediction_num_samples: 2
