@@ -570,15 +570,25 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             refs.append(self.decoding.decode_ids_to_str(ids))
         return refs
 
-    @staticmethod
-    def _wer_counts(hypotheses: List[str], references: List[str]) -> Tuple[int, int]:
+    def _wer_counts(self, hypotheses: List[str], references: List[str]) -> Tuple[int, int]:
+        # Honor ``use_cer``: character-level edit distance for character/CER models
+        # (e.g. Mandarin), word-level (whitespace split) otherwise. This mirrors
+        # NeMo's ``word_error_rate`` so the aligner / chunked-aligner WER is
+        # comparable to the standard ``WER`` metric used by the RNN-T / TDT recipes.
+        # Without this, character models (no word spaces) treat the whole utterance
+        # as a single "word", so any imperfect utterance counts as 100% error.
+        use_cer = self._cfg.get('use_cer', False)
         scores = 0
         words = 0
         for hyp, ref in zip(hypotheses, references):
-            hyp_words = hyp.split()
-            ref_words = ref.split()
-            scores += editdistance.eval(hyp_words, ref_words)
-            words += len(ref_words)
+            if use_cer:
+                hyp_tokens = list(hyp)
+                ref_tokens = list(ref)
+            else:
+                hyp_tokens = hyp.split()
+                ref_tokens = ref.split()
+            scores += editdistance.eval(hyp_tokens, ref_tokens)
+            words += len(ref_tokens)
         return scores, words
 
     def setup_optim_normalization(self):
