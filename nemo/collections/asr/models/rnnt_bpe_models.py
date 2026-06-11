@@ -349,6 +349,15 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
                 self.cfg.tokenizer = tokenizer_cfg
                 self.cfg.labels = ListConfig(vocabulary)
 
+            # Non-autoregressive variant: no prediction net / joint, just rebuild the
+            # per-frame projection head (+ optional token extractor) for the new vocab.
+            if self._is_chunked_aligner_nar():
+                self._setup_chunked_aligner_nar_components()
+                logging.info(
+                    f"Changed tokenizer/vocabulary to {len(vocabulary)} tokens for NAR Chunked-Aligner mode."
+                )
+                return
+
             with open_dict(self.cfg.decoder):
                 self.cfg.decoder.vocab_size = len(vocabulary)
             with open_dict(self.cfg.joint):

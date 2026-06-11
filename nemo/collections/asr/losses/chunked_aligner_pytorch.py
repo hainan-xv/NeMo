@@ -83,7 +83,12 @@ import torch
 from nemo.core.classes import Loss
 from nemo.core.neural_types import LabelsType, LengthsType, LogprobsType, LossType, NeuralType
 
-__all__ = ['ChunkedAlignerLossPytorch', 'chunked_aligner_loss_bruteforce']
+__all__ = [
+    'ChunkedAlignerLossPytorch',
+    'chunked_aligner_loss_bruteforce',
+    'ChunkedAlignerNarLossPytorch',
+    'chunked_aligner_nar_loss_bruteforce',
+]
 
 # Large finite stand-in for log(0); mirrors the other PyTorch loss references
 # which avoid -inf so that logsumexp never produces NaNs.
@@ -262,6 +267,202 @@ def chunked_aligner_loss_bruteforce(
                 else:
                     # full chunk: no blank, fall through to the next chunk (or to
                     # the end of audio if this was the last chunk).
+                    recurse(chunk_idx + 1, uu, score)
+
+        recurse(0, 0, 0.0)
+
+        if path_logprobs:
+            out.append(torch.logsumexp(torch.tensor(path_logprobs), dim=0))
+        else:
+            out.append(torch.tensor(NEG_INF))
+
+    return torch.stack(out)
+
+
+# ============================================================================
+# Non-autoregressive (NAR) variant
+# ============================================================================
+# Identical lattice / topology to the AR Chunked-Aligner above, but the per-frame
+# token distribution does NOT depend on the predictor state ``u`` (there is no
+# prediction network / joint). The activations are therefore ``acts: (B, T, V)``
+# -- a per-frame projection head output -- instead of the AR ``(B, T, U+1, V)``
+# joint tensor. This removes the ``U`` axis entirely (no joint step), which is a
+# large training-memory win. Every arc score simply reads ``acts[b, t, x]``
+# (``x`` = a target token id, or ``blank``) with no ``u`` index.
+
+
+class ChunkedAlignerNarLossPytorch(Loss):
+    """Loop-based forward-algorithm NAR Chunked-Aligner loss (autograd backward).
+
+    Same chunked full-sum objective as :class:`ChunkedAlignerLossPytorch`, but the
+    activations are per-frame logits ``(B, T, V)`` (no ``U`` axis / no joint). The
+    forward is composed of differentiable ops, so the backward is provided by
+    autograd.
+
+    Args:
+        blank: index of the blank / end-of-chunk (EOC) symbol within ``V``.
+        chunk_size: number of frames per chunk ``C`` (also the maximum number of
+            tokens a chunk can emit in this variant).
+        reduction: one of ``'none'``, ``'sum'``, ``'mean'`` (per-sample loss
+            divided by label length, then averaged over the batch), ``'mean_batch'``
+            (mean over the batch) or ``'mean_volume'`` (batch sum divided by the
+            total number of labels).
+    """
+
+    @property
+    def input_types(self):
+        return {
+            "acts": NeuralType(('B', 'T', 'D'), LogprobsType()),
+            "labels": NeuralType(('B', 'T'), LabelsType()),
+            "act_lens": NeuralType(tuple('B'), LengthsType()),
+            "label_lens": NeuralType(tuple('B'), LengthsType()),
+        }
+
+    @property
+    def output_types(self):
+        return {"loss": NeuralType(elements_type=LossType())}
+
+    def __init__(self, blank: int, chunk_size: int, reduction: str = 'mean_batch'):
+        super().__init__()
+        if chunk_size < 1:
+            raise ValueError(f"chunk_size must be >= 1, got {chunk_size}.")
+        if reduction not in ('none', 'sum', 'mean', 'mean_batch', 'mean_volume'):
+            raise ValueError(
+                "reduction must be one of "
+                "['none', 'sum', 'mean', 'mean_batch', 'mean_volume'], "
+                f"got '{reduction}'."
+            )
+        self.blank = blank
+        self.chunk_size = chunk_size
+        self.reduction = reduction
+
+    def forward(self, acts, labels, act_lens, label_lens):
+        # CPU patch for FP16 (log_softmax on CPU is not implemented for half).
+        if not acts.is_cuda and acts.dtype == torch.float16:
+            acts = acts.float()
+
+        acts = torch.log_softmax(acts, dim=-1)
+
+        forward_logprob = self.compute_forward_prob(acts, labels, act_lens, label_lens)
+        losses = -forward_logprob
+
+        if self.reduction == 'none':
+            return losses
+        if self.reduction == 'sum':
+            return losses.sum()
+        if self.reduction == 'mean':
+            return torch.div(losses, label_lens.clamp(min=1)).mean()
+        if self.reduction == 'mean_batch':
+            return losses.mean()
+        if self.reduction == 'mean_volume':
+            return losses.sum() / label_lens.sum().clamp(min=1)
+        return losses
+
+    def compute_forward_prob(self, acts, labels, act_lens, label_lens):
+        """Forward algorithm; returns per-sample log P(labels | acts), shape (B,).
+
+        ``acts`` are per-frame log-probs of shape ``(B, T, V)``.
+        """
+        B, T, _ = acts.shape
+        C = self.chunk_size
+        blank = self.blank
+
+        log_probs = []
+        for b in range(B):
+            T_b = int(act_lens[b])
+            U_b = int(label_lens[b])
+
+            log_alpha = torch.full((T_b, U_b + 1), NEG_INF, device=acts.device, dtype=acts.dtype)
+
+            for t in range(T_b):
+                n = t // C  # current chunk index
+                j = t % C  # slot within the chunk == #tokens emitted so far in this chunk
+                for u in range(U_b + 1):
+                    if t == 0 and u == 0:
+                        log_alpha[t, u] = 0.0
+                        continue
+
+                    contribs: List[torch.Tensor] = []
+
+                    # token arc: emit y_u at frame (t-1) -- per-frame, no u index.
+                    if t >= 1 and u >= 1:
+                        contribs.append(log_alpha[t - 1, u - 1] + acts[b, t - 1, labels[b, u - 1]])
+
+                    # blank/EOC arc: a blank anywhere in the previous chunk lands here
+                    # (only possible on a chunk-start frame).
+                    if j == 0 and n >= 1:
+                        for t_prev in range((n - 1) * C, n * C):
+                            contribs.append(log_alpha[t_prev, u] + acts[b, t_prev, blank])
+
+                    if contribs:
+                        log_alpha[t, u] = torch.logsumexp(torch.stack(contribs), dim=0)
+                    # else: unreachable, stays NEG_INF
+
+            # ---- termination ----
+            n_chunks = (T_b + C - 1) // C
+            last_chunk_start = (n_chunks - 1) * C
+
+            terms: List[torch.Tensor] = []
+            # (a) blank/EOC at any frame of the last chunk, with all tokens emitted.
+            for t_prev in range(last_chunk_start, T_b):
+                terms.append(log_alpha[t_prev, U_b] + acts[b, t_prev, blank])
+            # (b) last token emitted exactly on the final audio frame (full last chunk).
+            if U_b >= 1:
+                terms.append(log_alpha[T_b - 1, U_b - 1] + acts[b, T_b - 1, labels[b, U_b - 1]])
+
+            log_probs.append(torch.logsumexp(torch.stack(terms), dim=0))
+
+        return torch.stack(log_probs)
+
+
+def chunked_aligner_nar_loss_bruteforce(
+    acts: torch.Tensor,
+    labels: torch.Tensor,
+    act_lens: torch.Tensor,
+    label_lens: torch.Tensor,
+    blank: int,
+    chunk_size: int,
+) -> torch.Tensor:
+    """Brute-force path enumeration of the NAR Chunked-Aligner log-prob (validation).
+
+    Same enumeration as :func:`chunked_aligner_loss_bruteforce` but with per-frame
+    activations ``(B, T, V)`` (no ``u`` index). Exponential in the number of
+    chunks -- use only for tiny correctness checks.
+    """
+    acts = torch.log_softmax(acts.float(), dim=-1)
+    B = acts.shape[0]
+    C = chunk_size
+
+    out = []
+    for b in range(B):
+        T_b = int(act_lens[b])
+        U_b = int(label_lens[b])
+        n_chunks = (T_b + C - 1) // C
+        chunk_frames = [min(C, T_b - n * C) for n in range(n_chunks)]
+
+        path_logprobs: List[float] = []
+
+        def recurse(chunk_idx: int, u: int, acc: float):
+            if chunk_idx == n_chunks:
+                if u == U_b:
+                    path_logprobs.append(acc)
+                return
+            frames_here = chunk_frames[chunk_idx]
+            base = chunk_idx * C
+            for k in range(0, frames_here + 1):
+                if u + k > U_b:
+                    break
+                score = acc
+                uu = u
+                for i in range(k):
+                    frame = base + i
+                    score = score + float(acts[b, frame, labels[b, uu]])
+                    uu += 1
+                if k < frames_here:
+                    blank_frame = base + k
+                    score_blank = score + float(acts[b, blank_frame, blank])
+                    recurse(chunk_idx + 1, uu, score_blank)
+                else:
                     recurse(chunk_idx + 1, uu, score)
 
         recurse(0, 0, 0.0)

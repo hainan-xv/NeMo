@@ -39,6 +39,10 @@ model:
   chunked_aligner:
     chunk_size: 12              # number of encoder frames per chunk
     clamp: -1.0                 # >=0 clamps loss grads to [-clamp, clamp]
+    # Non-autoregressive mode: drop the prediction net + joint and replace them with
+    # a single per-frame projection head (applied after token extraction). Removes
+    # the U-axis from the activations -> large training-memory win. (Loss WIP.)
+    nar: false
     # 'mean_volume' = per-token NLL (~ln V at init, comparable to CE / TDT scale, so
     # the shared LR transfers). 'mean' = total-sequence NLL averaged over the batch.
     reduction: mean_volume

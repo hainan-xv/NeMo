@@ -41,10 +41,13 @@ from nemo.collections.asr.parts.mixins import (
     TranscribeConfig,
     TranscriptionReturnType,
 )
-from nemo.collections.asr.parts.numba.rnnt_loss.rnnt_pytorch import ChunkedAlignerLossNumba
+from nemo.collections.asr.parts.numba.rnnt_loss.rnnt_pytorch import ChunkedAlignerLossNumba, ChunkedAlignerNarLossNumba
 from nemo.collections.asr.parts.preprocessing.segment import ChannelSelectorType
 from nemo.collections.asr.parts.submodules.aligner_decoding import AlignerDecoding
-from nemo.collections.asr.parts.submodules.chunked_aligner_decoding import ChunkedAlignerDecoding
+from nemo.collections.asr.parts.submodules.chunked_aligner_decoding import (
+    ChunkedAlignerDecoding,
+    ChunkedAlignerNarDecoding,
+)
 from nemo.collections.asr.parts.submodules.rnnt_decoding import RNNTDecoding, RNNTDecodingConfig
 from nemo.collections.asr.parts.utils.asr_batching import get_semi_sorted_batch_sampler
 from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
@@ -79,14 +82,22 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         self.encoder = EncDecRNNTModel.from_config_dict(self.cfg.encoder)
 
         # Optional learned token-extraction layer at the end of the encoder
-        # (only used by the Chunked-Aligner; set up in
-        # ``_setup_chunked_aligner_loss_and_decoding`` when enabled).
+        # (only used by the Chunked-Aligner; set up in the chunked-aligner setup
+        # methods when enabled).
         self.token_extractor = None
+        # Non-autoregressive (NAR) Chunked-Aligner flag (no prediction net / joint).
+        self.nar = False
 
         if self.loss_type == 'aligner':
             self._setup_aligner_model_components()
+        elif self.loss_type == 'chunked_aligner' and self._is_chunked_aligner_nar():
+            # Non-autoregressive Chunked-Aligner: NO prediction net and NO joint.
+            # A single per-frame projection head replaces the joint (computed after
+            # token extraction), which removes the U-axis from the activations and
+            # is a large training-memory win. Built with no unused modules.
+            self._setup_chunked_aligner_nar_components()
         else:
-            # Standard RNN-T decoder + joint (shared by 'rnnt' and 'chunked_aligner').
+            # Standard RNN-T decoder + joint (shared by 'rnnt' and AR 'chunked_aligner').
             # Update config values required by components dynamically
             with open_dict(self.cfg.decoder):
                 self.cfg.decoder.vocab_size = len(self.cfg.labels)
@@ -275,25 +286,25 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
         return total_loss
 
-    def _setup_chunked_aligner_loss_and_decoding(self):
-        """Set up the streaming Chunked-Aligner loss + greedy decoding.
-
-        The Chunked Aligner reuses the standard RNN-T prediction net and joint
-        (built by the caller). Compared to RNN-T it only swaps in the full-sum
-        chunked-aligner loss and a chunked greedy decoder; the blank symbol
-        doubles as the end-of-chunk (EOC) signal.
-        """
+    def _is_chunked_aligner_nar(self) -> bool:
+        """Whether the Chunked-Aligner is configured in non-autoregressive mode."""
         ca_cfg = self.cfg.get('chunked_aligner', None)
+        return bool(ca_cfg.get('nar', False)) if ca_cfg is not None else False
+
+    def _setup_chunked_token_extractor(self, ca_cfg):
+        """Set ``frames_per_chunk`` / ``chunk_size`` and build the optional learned
+        token-extraction layer (shared by the AR and NAR Chunked-Aligner setups).
+
+        ``token_extraction_size`` (-1 disables) is the single knob: when >=1 each
+        acoustic chunk of ``chunk_size`` encoder frames is compressed into that many
+        learned tokens via cross-attention, and the lattice then runs over the
+        extracted tokens (so the effective ``chunk_size`` becomes that value).
+        """
         # Acoustic chunk: number of encoder frames covered by one chunk.
         self.frames_per_chunk = int(ca_cfg.get('chunk_size', 12)) if ca_cfg is not None else 12
         if self.frames_per_chunk < 1:
             raise ValueError(f"model.chunked_aligner.chunk_size must be >= 1, got {self.frames_per_chunk}.")
 
-        # Optional learned token-extraction layer, controlled by a single knob:
-        # ``token_extraction_size`` = #tokens each acoustic chunk is compressed into
-        # via cross-attention (-1 disables it). When enabled, the loss / decoder
-        # operate on the extracted tokens, so the effective chunk_size becomes
-        # ``token_extraction_size``.
         token_extraction_size = int(ca_cfg.get('token_extraction_size', -1)) if ca_cfg is not None else -1
         if token_extraction_size >= 1:
             self.token_extractor = ChunkTokenExtractor(
@@ -309,6 +320,67 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             )
         else:
             self.chunk_size = self.frames_per_chunk
+
+    def _setup_chunked_aligner_nar_components(self):
+        """Set up the non-autoregressive (NAR) Chunked-Aligner.
+
+        NAR drops the prediction net and the joint entirely. After (optional) token
+        extraction, a single per-frame projection head maps each encoder frame to a
+        distribution over the vocabulary (blank/EOC included): ``[B, T, D] -> [B, T, V]``.
+        Because there is no dependency on previously emitted tokens, the activations
+        have no U-axis, which is a large training-memory win versus the AR joint.
+
+        The loss is intentionally left for a later step; only the architecture and
+        the (cheap) greedy decoder are set up here.
+        """
+        self.nar = True
+        ca_cfg = self.cfg.get('chunked_aligner', None)
+        self._setup_chunked_token_extractor(ca_cfg)
+
+        vocabulary = list(self.cfg.labels)
+        # Output space = real tokens + a single blank / end-of-chunk (EOC) symbol.
+        self.num_classes_with_blank = len(vocabulary) + 1
+        self.blank_id = self.num_classes_with_blank - 1
+
+        # The "joiner" is just a projection + softmax (softmax applied in loss /
+        # decoding). Operates on the (token-extracted) encoder frames of dim enc_hidden.
+        enc_hidden = int(self.cfg.model_defaults.enc_hidden)
+        self.nar_head = torch.nn.Linear(enc_hidden, self.num_classes_with_blank)
+
+        # NAR full-sum loss over the per-frame head logits (no joint, no U axis):
+        # the CUDA/Numba kernel (acts [B, T, V]). See ChunkedAlignerNarLossPytorch
+        # for the reference / cross-checked implementation.
+        reduction = str(ca_cfg.get('reduction', 'mean_volume')) if ca_cfg is not None else 'mean_volume'
+        self.loss = ChunkedAlignerNarLossNumba(
+            blank=self.blank_id,
+            chunk_size=self.chunk_size,
+            reduction=reduction,
+            clamp=float(ca_cfg.get('clamp', -1.0)) if ca_cfg is not None else -1.0,
+        )
+
+        self.decoding = ChunkedAlignerNarDecoding(
+            decoding_cfg=self.cfg.get('decoding', None),
+            head=self.nar_head,
+            blank_id=self.blank_id,
+            chunk_size=self.chunk_size,
+            vocabulary=vocabulary,
+            tokenizer=getattr(self, 'tokenizer', None),
+        )
+
+    def _nar_logits(self, encoded: torch.Tensor) -> torch.Tensor:
+        """Per-frame NAR projection head: ``[B, D, T] -> [B, T, V]`` (raw logits)."""
+        return self.nar_head(encoded.transpose(1, 2))
+
+    def _setup_chunked_aligner_loss_and_decoding(self):
+        """Set up the streaming Chunked-Aligner loss + greedy decoding.
+
+        The Chunked Aligner reuses the standard RNN-T prediction net and joint
+        (built by the caller). Compared to RNN-T it only swaps in the full-sum
+        chunked-aligner loss and a chunked greedy decoder; the blank symbol
+        doubles as the end-of-chunk (EOC) signal.
+        """
+        ca_cfg = self.cfg.get('chunked_aligner', None)
+        self._setup_chunked_token_extractor(ca_cfg)
 
         blank_id = self.joint.num_classes_with_blank - 1
 
@@ -335,6 +407,49 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             tokenizer=getattr(self, 'tokenizer', None),
         )
 
+    def _chunked_aligner_nar_loss(
+        self,
+        encoded: torch.Tensor,
+        encoded_len: torch.Tensor,
+        transcript: torch.Tensor,
+        transcript_len: torch.Tensor,
+    ) -> torch.Tensor:
+        # Feasibility: the chunked lattice needs at least one (extracted) frame per
+        # target token (T >= U). Drop infeasible utterances (label length -> 0).
+        transcript_len = transcript_len.to(encoded_len.device)
+        insufficient_frames = encoded_len < transcript_len
+        if torch.any(insufficient_frames):
+            bad_idx = torch.nonzero(insufficient_frames, as_tuple=False).flatten().tolist()
+            details = ", ".join(
+                f"(batch_idx={i}, T={int(encoded_len[i])}, U={int(transcript_len[i])})" for i in bad_idx
+            )
+            logging.warning(
+                f"[chunked-aligner-nar] Skipping {len(bad_idx)}/{int(encoded_len.size(0))} utterance(s) with too "
+                f"few (extracted) frames for the chunked lattice (T < U): {details}."
+            )
+            transcript_len = transcript_len.clone()
+            transcript_len[insufficient_frames] = 0
+
+        max_logit_len = int(encoded_len.max().item())
+        max_targets_len = int(transcript_len.max().item())
+        if transcript.shape[1] != max_targets_len:
+            transcript = transcript.narrow(dim=1, start=0, length=max_targets_len).contiguous()
+
+        # Per-frame head logits [B, T, V] (no joint, no U-axis). Trim padding frames.
+        logits = self._nar_logits(encoded)
+        if logits.shape[1] != max_logit_len:
+            logits = logits.narrow(dim=1, start=0, length=max_logit_len).contiguous()
+
+        loss_value = self.loss(
+            acts=logits,
+            labels=transcript,
+            act_lens=encoded_len,
+            label_lens=transcript_len,
+        )
+        if loss_value.dim() > 0:
+            loss_value = loss_value.squeeze()
+        return loss_value
+
     def _chunked_aligner_loss(
         self,
         encoded: torch.Tensor,
@@ -342,6 +457,8 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         transcript: torch.Tensor,
         transcript_len: torch.Tensor,
     ) -> torch.Tensor:
+        if self.nar:
+            return self._chunked_aligner_nar_loss(encoded, encoded_len, transcript, transcript_len)
         # The chunked lattice needs at least one encoder frame per target token
         # (T >= U). Utterances with too few frames cannot host all tokens, so we
         # drop them from the loss (mask label length to 0) and warn -- mirroring

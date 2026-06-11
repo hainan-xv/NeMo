@@ -1464,6 +1464,17 @@ def logp_ms(acts: torch.Tensor, maxT: int, maxU: int, alphabet_size: int, mb: in
 
 
 @cuda.jit(device=True, inline=True)
+def logp_nar(acts: torch.Tensor, maxT: int, alphabet_size: int, mb: int, t: int, v: int):
+    """Read an already-normalized log-prob from a flattened [B, T, V] tensor (NAR).
+
+    The non-autoregressive Chunked-Aligner has no predictor state, so the per-frame
+    distribution does not depend on ``u``; the activation tensor is [B, T, V].
+    """
+    col = mb * maxT + t
+    return acts[col * alphabet_size + v]
+
+
+@cuda.jit(device=True, inline=True)
 def emit_logp_ms(
     acts: torch.Tensor, labels, maxT: int, maxU: int, maxK: int, alphabet_size: int, mb: int, t: int, u: int
 ):
@@ -2128,5 +2139,252 @@ def chunked_aligner_compute_grad_kernel(
                 g = min(g, clamp)
                 g = max(g, -clamp)
                 grads[col * alphabet_size + idx] = g
+
+            idx += GPU_RNNT_THREAD_SIZE
+
+
+# --------------------------------------------------------------------------- #
+# Non-autoregressive (NAR) Chunked-Aligner kernels
+#
+# Identical lattice / DP to the AR Chunked-Aligner kernels above, but the
+# per-frame token distribution does NOT depend on the predictor state ``u``
+# (there is no prediction network / joint). The activation tensor is therefore
+# [B, T, V] (a per-frame projection head output) instead of [B, T, U, V], and
+# every arc reads ``logp_nar(acts, maxT, V, b, t, v)`` (no ``u`` index). The
+# alpha/beta DP tables remain [B, T, U] (the lattice topology is unchanged).
+#
+# The gradient w.r.t. a per-frame log-prob ``logp[b, t, v]`` is the sum over all
+# predictor states ``u`` of the negative arc posteriors that consume column ``v``
+# at frame ``t`` -- i.e. exactly the AR gradient summed over the ``u`` axis (which
+# is the "trivial join" relationship verified in the tests). The grad kernel
+# therefore uses one block per (b, t) and accumulates over ``u`` internally.
+# --------------------------------------------------------------------------- #
+
+
+@cuda.jit()
+def chunked_aligner_nar_compute_alphas_kernel(
+    acts: torch.Tensor,  # [B, T, V] flattened
+    alphas: torch.Tensor,
+    llForward: torch.Tensor,
+    xlen: torch.Tensor,
+    ylen: torch.Tensor,
+    mlabels: torch.Tensor,  # [B, U]
+    minibatch: int,
+    maxT: int,
+    maxU: int,
+    alphabet_size: int,
+    blank_: int,
+    chunk_size: int,
+):
+    """Forward (alpha) recursion for the NAR Chunked-Aligner lattice.
+
+    Same recursion as :func:`chunked_aligner_compute_alphas_kernel`, but every
+    activation read drops the ``u`` index (``acts`` is [B, T, V]).
+    """
+    b = cuda.blockIdx.x  # batch id
+    u = cuda.threadIdx.x  # predictor state id (number of tokens emitted)
+    T = xlen[b]
+    U = ylen[b] + 1
+
+    labels = mlabels[b]
+    offset = b * maxT * maxU
+
+    if u == 0:
+        alphas[offset] = 0.0
+
+    cuda.syncthreads()
+
+    for t in range(0, T):
+        if u < U and not (t == 0 and u == 0):
+            n = t // chunk_size
+            val = -INF
+
+            # token arc: (t-1, u-1) -> (t, u)
+            if t >= 1 and u >= 1:
+                val = rnnt_helper.log_sum_exp(
+                    val,
+                    alphas[offset + (t - 1) * maxU + (u - 1)]
+                    + logp_nar(acts, maxT, alphabet_size, b, t - 1, labels[u - 1]),
+                )
+
+            # blank/EOC arcs: any frame of the previous chunk -> this chunk start
+            if (t - n * chunk_size) == 0 and n >= 1:
+                for t_prev in range((n - 1) * chunk_size, n * chunk_size):
+                    val = rnnt_helper.log_sum_exp(
+                        val,
+                        alphas[offset + t_prev * maxU + u] + logp_nar(acts, maxT, alphabet_size, b, t_prev, blank_),
+                    )
+
+            alphas[offset + t * maxU + u] = val
+
+        cuda.syncthreads()
+
+    if u == 0:
+        n_chunks = (T + chunk_size - 1) // chunk_size
+        last_chunk_start = (n_chunks - 1) * chunk_size
+        loglike = -INF
+
+        # (a) blank/EOC at any frame of the last chunk, with all tokens emitted.
+        for t_prev in range(last_chunk_start, T):
+            loglike = rnnt_helper.log_sum_exp(
+                loglike,
+                alphas[offset + t_prev * maxU + (U - 1)] + logp_nar(acts, maxT, alphabet_size, b, t_prev, blank_),
+            )
+
+        # (b) last token emitted exactly on the final audio frame (full last chunk).
+        if U - 1 >= 1:
+            loglike = rnnt_helper.log_sum_exp(
+                loglike,
+                alphas[offset + (T - 1) * maxU + (U - 2)]
+                + logp_nar(acts, maxT, alphabet_size, b, T - 1, labels[U - 2]),
+            )
+
+        llForward[b] = loglike
+
+
+@cuda.jit()
+def chunked_aligner_nar_compute_betas_kernel(
+    acts: torch.Tensor,  # [B, T, V] flattened
+    betas: torch.Tensor,
+    llBackward: torch.Tensor,
+    xlen: torch.Tensor,
+    ylen: torch.Tensor,
+    mlabels: torch.Tensor,  # [B, U]
+    minibatch: int,
+    maxT: int,
+    maxU: int,
+    alphabet_size: int,
+    blank_: int,
+    chunk_size: int,
+):
+    """Backward (beta) recursion for the NAR Chunked-Aligner lattice.
+
+    Same recursion as :func:`chunked_aligner_compute_betas_kernel`, but every
+    activation read drops the ``u`` index (``acts`` is [B, T, V]).
+    """
+    b = cuda.blockIdx.x
+    u = cuda.threadIdx.x
+    T = xlen[b]
+    U = ylen[b] + 1
+
+    labels = mlabels[b]
+    offset = b * maxT * maxU
+
+    for t in range(T - 1, -1, -1):
+        if u < U:
+            n = t // chunk_size
+            val = -INF
+
+            # token arc out: (t, u) -> (t+1, u+1), emitting labels[u]
+            if u < U - 1:
+                if t + 1 < T:
+                    val = rnnt_helper.log_sum_exp(
+                        val,
+                        logp_nar(acts, maxT, alphabet_size, b, t, labels[u]) + betas[offset + (t + 1) * maxU + (u + 1)],
+                    )
+                elif u == U - 2:
+                    val = rnnt_helper.log_sum_exp(val, logp_nar(acts, maxT, alphabet_size, b, t, labels[u]))
+
+            # blank/EOC arc out: (t, u) -> (next chunk start, u)
+            dest_t = (n + 1) * chunk_size
+            if dest_t < T:
+                val = rnnt_helper.log_sum_exp(
+                    val,
+                    logp_nar(acts, maxT, alphabet_size, b, t, blank_) + betas[offset + dest_t * maxU + u],
+                )
+            elif u == U - 1:
+                val = rnnt_helper.log_sum_exp(val, logp_nar(acts, maxT, alphabet_size, b, t, blank_))
+
+            betas[offset + t * maxU + u] = val
+
+        cuda.syncthreads()
+
+    if u == 0:
+        llBackward[b] = betas[offset]
+
+
+@cuda.jit()
+def chunked_aligner_nar_compute_grad_kernel(
+    grads: torch.Tensor,  # [B, T, V] flattened
+    acts: torch.Tensor,  # [B, T, V] flattened
+    alphas: torch.Tensor,
+    betas: torch.Tensor,
+    logll: torch.Tensor,
+    xlen: torch.Tensor,
+    ylen: torch.Tensor,
+    mlabels: torch.Tensor,  # [B, U]
+    minibatch: int,
+    maxT: int,
+    maxU: int,
+    alphabet_size: int,
+    blank_: int,
+    chunk_size: int,
+    clamp: float,
+):
+    """Gradient of the NAR Chunked-Aligner loss w.r.t. the per-frame log-probs.
+
+    Because the per-frame distribution is shared across predictor states, the
+    gradient at ``logp[b, t, v]`` is the sum over all ``u`` of the negative arc
+    posteriors consuming column ``v`` at frame ``t`` (the AR gradient summed over
+    the ``u`` axis). One block is launched per ``(b, t)``; threads stride over the
+    vocabulary and accumulate the contributions of every ``u`` for that frame.
+    """
+    tid = cuda.threadIdx.x
+    col_bt = cuda.blockIdx.x  # fused (b, t)
+
+    t = col_bt % maxT
+    mb = (col_bt - t) // maxT
+
+    T = xlen[mb]
+    U = ylen[mb] + 1
+    labels = mlabels[mb]
+    offset = (mb * maxT) * maxU
+
+    if t < T:
+        n = t // chunk_size
+        dest_t = (n + 1) * chunk_size
+
+        idx = tid
+        while idx < alphabet_size:
+            grad = 0.0
+
+            for u in range(U):
+                a = alphas[offset + t * maxU + u]
+
+                # token arc at (t, u): consumes column labels[u]
+                if u < U - 1 and idx == labels[u]:
+                    if t + 1 < T:
+                        grad -= math.exp(
+                            a
+                            + logp_nar(acts, maxT, alphabet_size, mb, t, labels[u])
+                            + betas[offset + (t + 1) * maxU + (u + 1)]
+                            - logll[mb]
+                        )
+                    elif u == U - 2:
+                        grad -= math.exp(
+                            a + logp_nar(acts, maxT, alphabet_size, mb, t, labels[u]) - logll[mb]
+                        )
+
+                # blank/EOC arc at (t, u): consumes the blank column
+                if idx == blank_:
+                    if dest_t < T:
+                        grad -= math.exp(
+                            a
+                            + logp_nar(acts, maxT, alphabet_size, mb, t, blank_)
+                            + betas[offset + dest_t * maxU + u]
+                            - logll[mb]
+                        )
+                    elif u == U - 1:
+                        grad -= math.exp(
+                            a + logp_nar(acts, maxT, alphabet_size, mb, t, blank_) - logll[mb]
+                        )
+
+            grads[col_bt * alphabet_size + idx] = grad
+
+            if clamp > 0.0:
+                g = grads[col_bt * alphabet_size + idx]
+                g = min(g, clamp)
+                g = max(g, -clamp)
+                grads[col_bt * alphabet_size + idx] = g
 
             idx += GPU_RNNT_THREAD_SIZE

@@ -50,7 +50,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
-__all__ = ['ChunkedAlignerDecoding']
+__all__ = ['ChunkedAlignerDecoding', 'ChunkedAlignerNarDecoding']
 
 
 class ChunkedAlignerDecoding:
@@ -170,4 +170,98 @@ class ChunkedAlignerDecoding:
 
             hypotheses.append(hyp)
 
+        return hypotheses
+
+
+class ChunkedAlignerNarDecoding:
+    """Greedy decoding for the *non-autoregressive* (NAR) Chunked-Aligner.
+
+    In NAR mode there is no prediction network and no joint: a single per-frame
+    projection head maps each (token-extracted) encoder frame to a distribution
+    over the vocabulary (blank/EOC included). Because the per-frame distributions
+    do not depend on previously emitted tokens, all logits can be computed in one
+    batched matmul and the greedy walk is a cheap arg-max scan that replays the
+    chunk lattice (blank/EOC jumps to the next chunk; a token advances one frame).
+
+    Args:
+        decoding_cfg: Dict-like config. Recognized key is ``max_symbols`` (optional
+            hard cap on emitted tokens per utterance; defaults to #frames).
+        head: The per-frame projection head, a callable mapping ``[B, T, D]`` ->
+            ``[B, T, V]`` (e.g. ``torch.nn.Linear``).
+        blank_id: Index of the blank / end-of-chunk symbol in the head output.
+        chunk_size: Number of (extracted) frames per chunk ``C``.
+        vocabulary: List of tokens for character models (``None`` for BPE).
+        tokenizer: Tokenizer for BPE models (``None`` for character models).
+    """
+
+    def __init__(
+        self,
+        decoding_cfg,
+        head,
+        blank_id: int,
+        chunk_size: int,
+        vocabulary: Optional[List[str]] = None,
+        tokenizer=None,
+    ):
+        if chunk_size < 1:
+            raise ValueError(f"chunk_size must be >= 1, got {chunk_size}.")
+        self.cfg = decoding_cfg
+        self.head = head
+        self.blank_id = blank_id
+        self.chunk_size = chunk_size
+        self.vocabulary = vocabulary
+        self.tokenizer = tokenizer
+        self.max_symbols = decoding_cfg.get('max_symbols', None) if decoding_cfg is not None else None
+
+    def decode_ids_to_str(self, ids: List[int]) -> str:
+        """Convert a list of token ids to a string, dropping blank/EOC ids."""
+        ids = [int(i) for i in ids if int(i) != self.blank_id]
+        if self.tokenizer is not None:
+            return self.tokenizer.ids_to_text(ids)
+        if self.vocabulary is not None:
+            return ''.join(self.vocabulary[i] for i in ids if 0 <= i < len(self.vocabulary))
+        return ' '.join(str(i) for i in ids)
+
+    @torch.no_grad()
+    def decode_encoder_output(
+        self, encoder_output: torch.Tensor, encoded_lengths: torch.Tensor
+    ) -> Tuple[List[str], List[List[int]]]:
+        """Decode a batch of (token-extracted) encoder outputs.
+
+        Args:
+            encoder_output: Encoder/extracted output of shape ``(B, D, T)``.
+            encoded_lengths: Valid frame counts per sample, ``(B,)``.
+
+        Returns:
+            A tuple ``(texts, token_ids)``.
+        """
+        if self.head is None:
+            raise RuntimeError("NAR Chunked-Aligner decoding requires a projection head.")
+        # (B, D, T) -> (B, T, D) -> head -> (B, T, V); arg-max once (no AR dependency).
+        logits = self.head(encoder_output.transpose(1, 2))
+        preds = logits.argmax(dim=-1)  # (B, T)
+        token_ids = self._greedy(preds, encoded_lengths.to(preds.device).long())
+        texts = [self.decode_ids_to_str(ids) for ids in token_ids]
+        return texts, token_ids
+
+    @torch.no_grad()
+    def _greedy(self, preds: torch.Tensor, lengths: torch.Tensor) -> List[List[int]]:
+        C = self.chunk_size
+        hypotheses: List[List[int]] = []
+        for b in range(preds.size(0)):
+            T_b = int(lengths[b].item())
+            max_symbols = self.max_symbols if self.max_symbols is not None else T_b
+            hyp: List[int] = []
+            t = 0
+            while t < T_b:
+                v = int(preds[b, t].item())
+                if v == self.blank_id:
+                    # End-of-chunk: skip to the start of the next chunk.
+                    t = ((t // C) + 1) * C
+                else:
+                    hyp.append(v)
+                    if len(hyp) >= max_symbols:
+                        break
+                    t += 1
+            hypotheses.append(hyp)
         return hypotheses

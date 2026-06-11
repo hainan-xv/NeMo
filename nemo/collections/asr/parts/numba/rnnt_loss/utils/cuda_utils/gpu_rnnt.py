@@ -971,6 +971,7 @@ class GPUChunkedAligner:
         clamp: float,
         num_threads: int,
         stream,
+        nar: bool = False,
     ):
         """
         Args:
@@ -984,6 +985,9 @@ class GPUChunkedAligner:
             clamp: gradient clamp value; <= 0 disables clamping.
             num_threads: number of OMP threads (numba).
             stream: numba CUDA stream.
+            nar: if True, use the non-autoregressive kernels (``acts`` is [B, T, V]
+                with no predictor axis); otherwise the AR kernels (``acts`` is
+                [B, T, U, V]).
         """
         self.minibatch_ = minibatch
         self.maxT_ = maxT
@@ -995,6 +999,7 @@ class GPUChunkedAligner:
         self.clamp_ = abs(clamp)
         self.num_threads_ = num_threads
         self.stream_ = stream
+        self.nar_ = nar
 
         if num_threads > 0:
             numba.set_num_threads(min(multiprocessing.cpu_count(), num_threads))
@@ -1018,8 +1023,19 @@ class GPUChunkedAligner:
 
         _, (alphas, betas, llForward, llBackward) = self._prepare_workspace()
 
+        alphas_kernel = (
+            gpu_rnnt_kernel.chunked_aligner_nar_compute_alphas_kernel
+            if self.nar_
+            else gpu_rnnt_kernel.chunked_aligner_compute_alphas_kernel
+        )
+        betas_kernel = (
+            gpu_rnnt_kernel.chunked_aligner_nar_compute_betas_kernel
+            if self.nar_
+            else gpu_rnnt_kernel.chunked_aligner_compute_betas_kernel
+        )
+
         # `acts` are already log-probs, so no log_softmax / denom is needed.
-        gpu_rnnt_kernel.chunked_aligner_compute_alphas_kernel[self.minibatch_, self.maxU_, self.stream_, 0](
+        alphas_kernel[self.minibatch_, self.maxU_, self.stream_, 0](
             acts,
             alphas,
             llForward,
@@ -1035,7 +1051,7 @@ class GPUChunkedAligner:
         )
 
         if training:
-            gpu_rnnt_kernel.chunked_aligner_compute_betas_kernel[self.minibatch_, self.maxU_, self.stream_, 0](
+            betas_kernel[self.minibatch_, self.maxU_, self.stream_, 0](
                 acts,
                 betas,
                 llBackward,
@@ -1050,27 +1066,50 @@ class GPUChunkedAligner:
                 self.chunk_size_,
             )
 
-            grad_blocks_per_grid = self.minibatch_ * self.maxT_ * self.maxU_
             grad_threads_per_block = gpu_rnnt_kernel.GPU_RNNT_THREAD_SIZE
-            gpu_rnnt_kernel.chunked_aligner_compute_grad_kernel[
-                grad_blocks_per_grid, grad_threads_per_block, self.stream_, 0
-            ](
-                grads,
-                acts,
-                alphas,
-                betas,
-                llForward,
-                input_lengths,
-                label_lengths,
-                labels,
-                self.minibatch_,
-                self.maxT_,
-                self.maxU_,
-                self.alphabet_size_,
-                self.blank_,
-                self.chunk_size_,
-                self.clamp_,
-            )
+            if self.nar_:
+                # NAR grads are [B, T, V]: one block per (b, t), accumulating over u.
+                grad_blocks_per_grid = self.minibatch_ * self.maxT_
+                gpu_rnnt_kernel.chunked_aligner_nar_compute_grad_kernel[
+                    grad_blocks_per_grid, grad_threads_per_block, self.stream_, 0
+                ](
+                    grads,
+                    acts,
+                    alphas,
+                    betas,
+                    llForward,
+                    input_lengths,
+                    label_lengths,
+                    labels,
+                    self.minibatch_,
+                    self.maxT_,
+                    self.maxU_,
+                    self.alphabet_size_,
+                    self.blank_,
+                    self.chunk_size_,
+                    self.clamp_,
+                )
+            else:
+                grad_blocks_per_grid = self.minibatch_ * self.maxT_ * self.maxU_
+                gpu_rnnt_kernel.chunked_aligner_compute_grad_kernel[
+                    grad_blocks_per_grid, grad_threads_per_block, self.stream_, 0
+                ](
+                    grads,
+                    acts,
+                    alphas,
+                    betas,
+                    llForward,
+                    input_lengths,
+                    label_lengths,
+                    labels,
+                    self.minibatch_,
+                    self.maxT_,
+                    self.maxU_,
+                    self.alphabet_size_,
+                    self.blank_,
+                    self.chunk_size_,
+                    self.clamp_,
+                )
 
         # Copy negated log-likelihood into the costs vector (fastemit_lambda = 0).
         threadsperblock = min(costs.shape[0], 32)
