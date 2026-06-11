@@ -33,6 +33,7 @@ from nemo.collections.asr.losses.rnnt import RNNTLoss, resolve_rnnt_default_loss
 from nemo.collections.asr.metrics.wer import WER
 from nemo.collections.asr.models.asr_model import ASRModel, ExportableEncDecModel
 from nemo.collections.asr.modules.aligner import AlignerCTCHead, AlignerJoint
+from nemo.collections.asr.modules.chunk_token_extractor import ChunkTokenExtractor
 from nemo.collections.asr.modules.rnnt import RNNTDecoderJoint
 from nemo.collections.asr.parts.mixins import (
     ASRModuleMixin,
@@ -76,6 +77,11 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         # Initialize components
         self.preprocessor = EncDecRNNTModel.from_config_dict(self.cfg.preprocessor)
         self.encoder = EncDecRNNTModel.from_config_dict(self.cfg.encoder)
+
+        # Optional learned token-extraction layer at the end of the encoder
+        # (only used by the Chunked-Aligner; set up in
+        # ``_setup_chunked_aligner_loss_and_decoding`` when enabled).
+        self.token_extractor = None
 
         if self.loss_type == 'aligner':
             self._setup_aligner_model_components()
@@ -278,9 +284,31 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         doubles as the end-of-chunk (EOC) signal.
         """
         ca_cfg = self.cfg.get('chunked_aligner', None)
-        self.chunk_size = int(ca_cfg.get('chunk_size', 12)) if ca_cfg is not None else 12
-        if self.chunk_size < 1:
-            raise ValueError(f"model.chunked_aligner.chunk_size must be >= 1, got {self.chunk_size}.")
+        # Acoustic chunk: number of encoder frames covered by one chunk.
+        self.frames_per_chunk = int(ca_cfg.get('chunk_size', 12)) if ca_cfg is not None else 12
+        if self.frames_per_chunk < 1:
+            raise ValueError(f"model.chunked_aligner.chunk_size must be >= 1, got {self.frames_per_chunk}.")
+
+        # Optional learned token-extraction layer, controlled by a single knob:
+        # ``token_extraction_size`` = #tokens each acoustic chunk is compressed into
+        # via cross-attention (-1 disables it). When enabled, the loss / decoder
+        # operate on the extracted tokens, so the effective chunk_size becomes
+        # ``token_extraction_size``.
+        token_extraction_size = int(ca_cfg.get('token_extraction_size', -1)) if ca_cfg is not None else -1
+        if token_extraction_size >= 1:
+            self.token_extractor = ChunkTokenExtractor(
+                d_model=int(self.cfg.model_defaults.enc_hidden),
+                frames_per_chunk=self.frames_per_chunk,
+                tokens_per_chunk=token_extraction_size,
+            )
+            # Downstream the lattice runs over extracted tokens.
+            self.chunk_size = token_extraction_size
+            logging.info(
+                f"[chunked-aligner] Token-extraction enabled: {self.frames_per_chunk} encoder frames/chunk -> "
+                f"{token_extraction_size} tokens/chunk (effective chunk_size={self.chunk_size})."
+            )
+        else:
+            self.chunk_size = self.frames_per_chunk
 
         blank_id = self.joint.num_classes_with_blank - 1
 
@@ -954,6 +982,12 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
 
         encoded, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
+
+        # Optional learned token-extraction layer (Chunked-Aligner): compress each
+        # acoustic chunk of encoder frames into a smaller set of learned tokens.
+        if self.token_extractor is not None:
+            encoded, encoded_len = self.token_extractor(encoded, encoded_len)
+
         return encoded, encoded_len
 
     # PTL-specific methods

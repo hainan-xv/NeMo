@@ -42,6 +42,12 @@ model:
     # 'mean_volume' = per-token NLL (~ln V at init, comparable to CE / TDT scale, so
     # the shared LR transfers). 'mean' = total-sequence NLL averaged over the batch.
     reduction: mean_volume
+    # Optional learned token-extraction layer at the end of the encoder. -1 = off.
+    # When >=1, each acoustic chunk of `chunk_size` encoder frames is compressed into
+    # `token_extraction_size` learned tokens via cross-attention (trainable query bank
+    # + Q/K/V/output projections), and the Chunked-Aligner lattice runs over those
+    # tokens (effective chunk_size = token_extraction_size, the max #tokens/chunk).
+    token_extraction_size: -1
   log_stats_every_n_steps: 20        # rank-0 stdout [chunked_aligner-train] summary (<=0 disables)
   log_prediction_every_n_steps: 100  # rank-0 stdout hyp/ref samples (<=0 disables)
   log_prediction_num_samples: 2

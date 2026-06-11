@@ -31,6 +31,19 @@ most once, so the cost is ``O(T)`` joint steps per utterance.
 
 This mirrors the full-sum training objective implemented by
 ``ChunkedAlignerLossNumba`` / ``chunked_aligner_pytorch.py``.
+
+Two equivalent implementations are provided:
+
+* :meth:`ChunkedAlignerDecoding._chunked_greedy` -- a simple per-utterance walk
+  (one joint call per visited frame, looping over the batch in Python). Easy to
+  read; used as the correctness reference.
+* :meth:`ChunkedAlignerDecoding._chunked_greedy_batched` -- a batched
+  "label-looping" walk (https://arxiv.org/abs/2406.06220) that processes the
+  whole batch in lock-step: each outer iteration calls the prediction network at
+  most once for the whole batch (only for utterances that emitted a token), while
+  an inner loop vectorizes the blank/EOC chunk-jumps. This is the default and is
+  numerically identical to the per-utterance version (greedy arg-max). CUDA-graph
+  support is intentionally out of scope for now.
 """
 
 from typing import List, Optional, Tuple
@@ -44,9 +57,10 @@ class ChunkedAlignerDecoding:
     """Holds references to the model sub-modules and performs chunked greedy decoding.
 
     Args:
-        decoding_cfg: Dict-like config. Recognized key is ``max_symbols`` (an
+        decoding_cfg: Dict-like config. Recognized keys are ``max_symbols`` (an
             optional hard cap on the number of emitted tokens per utterance;
-            defaults to the number of encoder frames).
+            defaults to the number of encoder frames) and ``loop_labels`` (use the
+            batched label-looping decoder; defaults to ``True``).
         decoder: The RNN-T prediction network.
         joint: The RNN-T joint network (output space includes the blank/EOC).
         blank_id: Index of the blank / end-of-chunk symbol in the joint output.
@@ -75,6 +89,7 @@ class ChunkedAlignerDecoding:
         self.vocabulary = vocabulary
         self.tokenizer = tokenizer
         self.max_symbols = decoding_cfg.get('max_symbols', None) if decoding_cfg is not None else None
+        self.loop_labels = decoding_cfg.get('loop_labels', True) if decoding_cfg is not None else True
 
     # ------------------------------------------------------------------ #
     # Token id <-> string helpers
