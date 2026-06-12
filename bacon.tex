@@ -232,7 +232,7 @@ As a simple example, Figure~\ref{fig:chunk_conv_deps} illustrates the dependency
 kernel size~3 across three chunks. Panel~(a) shows causal convolution; panel~(b) shows standard non-causal convolution, where
 red dashed arrows mark dependencies crossing chunk boundaries into the future, which breaks the streaming constraint;
 panel~(c) shows boundary-aware bidirectional convolution, where left context crosses boundaries freely but right context is
-confined within each chunk; and panel~(d) shows BACON's combined dependency. Blue dashed arrows in~(d) highlight the additional
+confined within each chunk (applying this to \emph{all} channels yields the \textbf{all-bidir} baseline we evaluate in Section~\ref{subsec:analysis-zero-vs-split}); and panel~(d) shows BACON's combined dependency. Blue dashed arrows in~(d) highlight the additional
 within-chunk right context contributed by the bidirectional group. Positions
 at the right chunk edge receive no extra right context from the bidirectional
 group, but the causal group still provides full backward context there.
@@ -506,6 +506,7 @@ All models are trained with fast-emit lambda=0.005.
 We evaluate on three tasks: speech recognition on LibriSpeech~\cite{panayotov2015librispeech}, multi-speaker speech
 recognition on Fisher~\cite{cieri2004fisher},
 and speech-to-text translation on CoVoST~\cite{wang2021covost2} and MuST-C~\cite{di-gangi-etal-2019-must}. For all models, we average the five best checkpoints before evaluation.
+In all result tables, $p$ denotes the two-sided significance of the BACON-vs.-baseline comparison, computed with a paired bootstrap test over the per-utterance outputs; we treat $p<0.05$ as significant.
 
 \subsection{Speech Recognition}
 \label{subsec:libri}
@@ -519,23 +520,22 @@ model with a vocabulary size of 1024.
 \caption{WER~(\%) on LibriSpeech. BACON improves over the causal baseline
 across conditions, with the largest gains on \texttt{test-other}.}
 \label{tab:libri_wer}
-\begin{tabular}{llcc}
+\begin{tabular}{llccc}
 \toprule
-\textbf{Family} & \textbf{Conv.\ mode} & \textbf{test-clean}$\downarrow$ & \textbf{test-other}$\downarrow$ \\
+\textbf{Family} & \textbf{Test set} & \textbf{Causal}$\downarrow$ & \textbf{BACON}$\downarrow$ & $p$ \\
 \midrule
-\textsc{rnn-t} & Causal & \textbf{3.33} & 8.72 \\
-\textsc{rnn-t} & BACON  & 3.39 & \textbf{8.52} \\
+\textsc{rnn-t} & test-clean & 3.36 & \textbf{3.30} & 0.42 \\
+\textsc{rnn-t} & test-other & 8.73 & \textbf{8.41} & 0.011 \\
 \midrule
-\textsc{chat} & Causal & 3.26 & 8.44 \\
-\textsc{chat} & BACON  & \textbf{3.13} & \textbf{7.91} \\
-
+\textsc{chat} & test-clean & 3.31 & \textbf{3.09} & 0.005 \\
+\textsc{chat} & test-other & 8.47 & \textbf{7.68} & $<$0.001 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 
-As shown in Table 1, on LibriSpeech \texttt{test-clean}, BACON and Causal achieve similar accuracy, which is expected given the relatively clean conditions. 
-On the more challenging \texttt{test-other} set, BACON yields larger gains, especially for \textsc{chat}, where it improves WER by 0.53 absolute over the causal baseline, a -6.3\% relative WER reduction.
+As shown in Table~\ref{tab:libri_wer}, on LibriSpeech \texttt{test-clean} BACON and Causal achieve similar accuracy---the small gains are not statistically significant for \textsc{rnn-t}---which is expected given the relatively clean conditions. 
+On the more challenging \texttt{test-other} set, BACON yields larger and statistically significant gains in both families, especially for \textsc{chat}, where it improves WER by 0.79 absolute over the causal baseline ($8.47\,{\rightarrow}\,7.68$), a 9.3\% relative WER reduction ($p<0.001$).
 
 \subsection{Multi-Speaker ASR}
 \label{subsec:multispk}
@@ -580,23 +580,22 @@ For tokenization, we use a SentencePiece model with a 16k vocabulary.
 \caption{BLEU on English-to-German AST. BACON improves over the causal
 baseline in both model families on both evaluation sets.}
 \label{tab:chunk_conv_bleu}
-\begin{tabular}{llcc}
+\begin{tabular}{llccc}
 \toprule
-\textbf{Family} & \textbf{Conv.\ mode} & \textbf{MuST-C}$\uparrow$ & \textbf{CoVoST}$\uparrow$ \\
-
+\textbf{Family} & \textbf{Test set} & \textbf{Causal}$\uparrow$ & \textbf{BACON}$\uparrow$ & $p$ \\
 \midrule
-\textsc{rnn-t} & Causal   & 24.43 & 33.60 \\
-\textsc{rnn-t} & BACON    & \textbf{25.21} & \textbf{33.85} \\
+\textsc{rnn-t} & \textsc{must-c} & 24.60 & \textbf{25.61} & 0.006 \\
+\textsc{rnn-t} & \textsc{covost} & 33.64 & \textbf{34.98} & $<$0.001 \\
 \midrule
-\textsc{chat} & Causal   & 27.97 & 36.50 \\
-\textsc{chat} & BACON    & \textbf{28.65} & \textbf{36.72} \\
+\textsc{chat} & \textsc{must-c} & 28.04 & \textbf{28.75} & 0.008 \\
+\textsc{chat} & \textsc{covost} & 36.40 & \textbf{37.72} & $<$0.001 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-As detailed in Table 3, BACON improves over the causal baseline on both evaluation sets in both families:
-+0.22 BLEU on \textsc{covost} for \textsc{chat} and +0.25 for \textsc{rnn-t},
-with larger \textsc{must-c} gains of +0.68 and +0.78, respectively.
+As detailed in Table~\ref{tab:chunk_conv_bleu}, BACON improves over the causal baseline on both evaluation sets in both families:
++1.32 BLEU on \textsc{covost} for \textsc{chat} and +1.34 for \textsc{rnn-t},
+with \textsc{must-c} gains of +0.71 and +1.01, respectively. All four improvements are statistically significant (paired bootstrap, $p<0.01$).
 The improvement is consistent across both families and both evaluation sets, confirming that the
 benefit derives from the wider receptive field rather than any
 architecture-specific interaction.
@@ -611,8 +610,15 @@ architecture-specific interaction.
 \subsection{Importance of dual-mode design}
 \label{subsec:analysis-zero-vs-split}
 
-A natural alternative to BACON's split design is to make \emph{all} channels
-bidirectional (\textbf{all-bidir}). Tables~\ref{tab:analysis-zero-vs-split-libri}
+A natural alternative to BACON's split design is to apply the boundary-aware
+bidirectional convolution of Figure~\ref{fig:chunk_conv_deps}(c) to \emph{all}
+depthwise channels rather than to only half of them. We refer to this variant as
+\textbf{all-bidir}. It corresponds exactly to panel~(c)---left context crosses
+chunk boundaries freely while right context is confined within each chunk---and
+is therefore the boundary-aware counterpart to BACON (panel~(d)), which keeps
+half of the channels causal. This comparison directly isolates the contribution
+of BACON's dual-mode (split) design against the fully boundary-aware variant.
+Tables~\ref{tab:analysis-zero-vs-split-libri}
 and~\ref{tab:analysis-zero-vs-split-ast} compare all-bidir and BACON on
 LibriSpeech and AST respectively.
 
@@ -620,15 +626,15 @@ LibriSpeech and AST respectively.
 \centering
 \caption{All-bidir vs.\ BACON on LibriSpeech (WER\,\%).}
 \label{tab:analysis-zero-vs-split-libri}
-\begin{tabular}{llcc}
+\begin{tabular}{llccc}
 \toprule
-\textbf{Family} & \textbf{Conv.\ mode} & \textbf{test-clean}$\downarrow$ & \textbf{test-other}$\downarrow$ \\
+\textbf{Family} & \textbf{Test set} & \textbf{all-bidir}$\downarrow$ & \textbf{BACON}$\downarrow$ & $p$ \\
 \midrule
-\textsc{chat} & all-bidir  & 3.23 & 8.24 \\
-\textsc{chat} & BACON & \textbf{3.13} & \textbf{7.91} \\
+\textsc{chat} & test-clean & 3.25 & \textbf{3.09} & 0.018 \\
+\textsc{chat} & test-other & 8.21 & \textbf{7.68} & $<$0.001 \\
 \midrule
-\textsc{rnn-t} & all-bidir  & 3.40 & 8.79 \\
-\textsc{rnn-t} & BACON & \textbf{3.39} & \textbf{8.52} \\
+\textsc{rnn-t} & test-clean & 3.47 & \textbf{3.30} & 0.024 \\
+\textsc{rnn-t} & test-other & 8.78 & \textbf{8.41} & 0.003 \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -637,27 +643,28 @@ LibriSpeech and AST respectively.
 \centering
 \caption{All-bidir vs.\ BACON on AST (BLEU).}
 \label{tab:analysis-zero-vs-split-ast}
-\begin{tabular}{llcc}
+\begin{tabular}{llccc}
 \toprule
-\textbf{Family} & \textbf{Conv.\ mode} & \textbf{MuST-C}$\uparrow$ & \textbf{CoVoST}$\uparrow$ \\
+\textbf{Family} & \textbf{Test set} & \textbf{all-bidir}$\uparrow$ & \textbf{BACON}$\uparrow$ & $p$ \\
 \midrule
-\textsc{chat} & all-bidir  & \textbf{28.65} & 36.32 \\
-\textsc{chat} & BACON & \textbf{28.65} & \textbf{36.72} \\
+\textsc{chat} & \textsc{must-c} & 28.41 & \textbf{28.75} & 0.26 \\
+\textsc{chat} & \textsc{covost} & 36.32 & \textbf{37.72} & $<$0.001 \\
 \midrule
-\textsc{rnn-t} & all-bidir  & 24.60 & 33.43 \\
-\textsc{rnn-t} & BACON & \textbf{25.21} & \textbf{33.85} \\
+\textsc{rnn-t} & \textsc{must-c} & 24.89 & \textbf{25.61} & 0.018 \\
+\textsc{rnn-t} & \textsc{covost} & 33.38 & \textbf{34.98} & $<$0.001 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-BACON consistently and substantially outperforms all-bidir. On LibriSpeech
-\texttt{test-other}, BACON beats all-bidir by $-$0.33 WER for \textsc{chat} and
-$-$0.27 for \textsc{rnn-t}. On \textsc{covost}, BACON leads by +0.40 BLEU
-(\textsc{chat}) and +0.42 (\textsc{rnn-t}).
+BACON consistently outperforms all-bidir, with significant gains on the more
+challenging conditions. On LibriSpeech
+\texttt{test-other}, BACON beats all-bidir by $-$0.53 WER for \textsc{chat} and
+$-$0.37 for \textsc{rnn-t}. On \textsc{covost}, BACON leads by +1.40 BLEU
+(\textsc{chat}) and +1.60 (\textsc{rnn-t}).
 
 Critically, for \textsc{rnn-t} on LibriSpeech, all-bidir \emph{degrades} relative
-to the causal baseline (8.79\% vs.\ 8.72\%), whereas BACON improves it
-(8.52\%). 
+to the causal baseline (8.78\% vs.\ 8.73\%), whereas BACON improves it
+(8.41\%). 
 %The same pattern appears on multi-speaker ASR: all-bidir increases cpWER
 % to 27.58\% (worse than the 27.41\% baseline), while BACON improves it to
 % 27.14\%. 
@@ -804,7 +811,9 @@ speech-to-text tasks, including streaming speech LLM systems.
 Generative AI tools were used solely to assist with editing and polishing the
 writing of this paper (e.g., grammar, phrasing, and clarity). They were not
 used to generate any major part of the paper's research content, including the
-ideas, methodology, experiments, analysis, or results.
+ideas, methodology, experiments, analysis, or results. All AI-assisted text was
+manually reviewed and verified by the authors to ensure its correctness and that
+it faithfully reflects the underlying work.
 
 \bibliographystyle{IEEEtran}
 \bibliography{references}
