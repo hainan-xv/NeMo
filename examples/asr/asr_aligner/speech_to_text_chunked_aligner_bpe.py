@@ -129,6 +129,21 @@ def main(cfg):
             with open_dict(cfg.model):
                 cfg.model.tokenizer = {"dir": tok_dir, "type": "bpe"}
 
+    # 2b) Apply explicit encoder overrides ON TOP of the (possibly base-injected)
+    # encoder config. Step 1 replaces cfg.model.encoder wholesale with the base
+    # model's encoder, which would otherwise silently clobber any CLI
+    # ``model.encoder.*`` overrides for warm-start runs. ``encoder_overrides`` is
+    # merged in afterwards, so changes such as pinning a single fixed cache-aware
+    # streaming ``att_context_size`` actually take effect.
+    enc_overrides = cfg.get("encoder_overrides", None)
+    if enc_overrides is not None and "encoder" in cfg.model:
+        with open_dict(cfg.model):
+            cfg.model.encoder = OmegaConf.merge(cfg.model.encoder, enc_overrides)
+        logging.info(
+            "Applied encoder_overrides on top of the encoder config: "
+            f"{OmegaConf.to_container(enc_overrides, resolve=True)}"
+        )
+
     # 3) Build trainer / exp_manager.
     trainer = pl.Trainer(**resolve_trainer_cfg(cfg.trainer))
     exp_manager(trainer, cfg.get("exp_manager", None))

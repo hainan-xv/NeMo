@@ -28,6 +28,13 @@ base_model_name: null            # e.g. nvidia/parakeet-tdt-0.6b-v2
 init_encoder_from_base: true     # encoder-only warm start (only if a base model is given)
 tokenizer_out_dir: null          # where to export the base tokenizer (default: temp dir)
 
+# Overrides merged INTO the encoder config AFTER the base-model encoder is injected.
+# The base injection replaces cfg.model.encoder wholesale, so plain `model.encoder.*`
+# CLI overrides are clobbered for warm-start runs -- use this instead. Example: pin a
+# single fixed cache-aware streaming chunk in place of a multi-lookahead base model:
+#   ++encoder_overrides.att_context_size=[70,13]
+encoder_overrides: null
+
 model:
   sample_rate: 16000
   compute_eval_loss: true
@@ -57,6 +64,13 @@ model:
     # each chunk can emit at most k tokens without adding a learned extractor.
     # Mutually exclusive with token_extraction_size.
     first_k_frames_per_chunk: -1
+    # Learned per-chunk query embedding combined with the first-k method (requires
+    # first_k_frames_per_chunk >= 1). When true, a trainable [chunk_size, d_model]
+    # tensor is tiled over time and added to the INPUT of the last conformer layer
+    # (on top of the second-to-last layer output, before its self-attention); the
+    # first-k selection then truncates each chunk to its first k frames for the
+    # logits/loss. Zero-initialized -> identical to plain first-k at init.
+    chunk_query: false
   log_stats_every_n_steps: 20        # rank-0 stdout [chunked_aligner-train] summary (<=0 disables)
   log_prediction_every_n_steps: 100  # rank-0 stdout hyp/ref samples (<=0 disables)
   log_prediction_num_samples: 2

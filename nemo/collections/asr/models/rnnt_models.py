@@ -85,6 +85,9 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         # by the Chunked-Aligner; set up in the chunked-aligner setup methods).
         self.token_extractor = None
         self.first_k_frames_per_chunk = -1
+        # Optional learned per-chunk query embedding (added at the last conformer
+        # layer; only used by the Chunked-Aligner first-k method when chunk_query=true).
+        self.chunk_query_emb = None
         # Non-autoregressive (NAR) Chunked-Aligner flag (no prediction net / joint).
         self.nar = False
 
@@ -311,10 +314,17 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         first_k_frames_per_chunk = (
             int(ca_cfg.get('first_k_frames_per_chunk', -1)) if ca_cfg is not None else -1
         )
+        chunk_query = bool(ca_cfg.get('chunk_query', False)) if ca_cfg is not None else False
         if token_extraction_size >= 1 and first_k_frames_per_chunk >= 1:
             raise ValueError(
                 "model.chunked_aligner.token_extraction_size and "
                 "model.chunked_aligner.first_k_frames_per_chunk are mutually exclusive."
+            )
+        if chunk_query and first_k_frames_per_chunk < 1:
+            raise ValueError(
+                "model.chunked_aligner.chunk_query=true requires "
+                "model.chunked_aligner.first_k_frames_per_chunk >= 1 (the chunk-query "
+                "embedding augments the first-k frame-selection method)."
             )
         if token_extraction_size >= 1:
             self.token_extractor = ChunkTokenExtractor(
@@ -340,8 +350,59 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 f"[chunked-aligner] First-k frame selection enabled: keeping first {first_k_frames_per_chunk}/"
                 f"{self.frames_per_chunk} encoder frames per chunk (effective chunk_size={self.chunk_size})."
             )
+            if chunk_query:
+                self._setup_chunk_query_emb()
         else:
             self.chunk_size = self.frames_per_chunk
+
+    def _setup_chunk_query_emb(self):
+        """Learned per-chunk query embedding injected at the LAST conformer layer.
+
+        A trainable ``[frames_per_chunk, d_model]`` tensor (one row per position in the
+        full acoustic chunk) is tiled over the time axis and added to the INPUT of the
+        final conformer layer -- i.e. on top of the second-to-last layer's output,
+        before that layer runs its self-attention. The downstream first-k selection
+        then keeps only the first ``k`` frames of each chunk for the logits/loss, so
+        these learned per-position queries give the kept frames a chance to summarize
+        the whole chunk through the last self-attention. Zero-initialized, so at the
+        start of training it is identical to plain first-k (warm-start friendly).
+
+        Implemented as a forward pre-hook on ``encoder.layers[-1]`` (rather than via the
+        encoder config) so it survives the warm-start encoder injection untouched and
+        does not require any ConformerEncoder changes. NOTE: this targets the full,
+        non-cached training/validation forward; cache-aware streaming export would need
+        the chunk offset threaded through and is out of scope here.
+        """
+        d_model = int(self.encoder.d_model)
+        self.chunk_query_emb = torch.nn.Parameter(torch.zeros(int(self.frames_per_chunk), d_model))
+        self.encoder.layers[-1].register_forward_pre_hook(self._chunk_query_pre_hook, with_kwargs=True)
+        logging.info(
+            f"[chunked-aligner] Chunk-query embedding enabled: trainable "
+            f"[{self.frames_per_chunk}, {d_model}] added per chunk at the input of the last "
+            f"conformer layer (before first-k truncation to {self.first_k_frames_per_chunk})."
+        )
+
+    def _add_chunk_query(self, x: torch.Tensor) -> torch.Tensor:
+        """Tile the ``[frames_per_chunk, d_model]`` query over time and add to ``x``.
+
+        ``x`` is the last conformer layer input ``[B, T, d_model]``. Chunks are aligned
+        to multiples of ``frames_per_chunk`` from frame 0 (matching the chunked-limited
+        streaming attention and the post-encoder first-k selection).
+        """
+        C = self.chunk_query_emb.shape[0]
+        T = x.shape[1]
+        n_chunks = (T + C - 1) // C
+        q = self.chunk_query_emb.repeat(n_chunks, 1)[:T]  # [T, d_model]
+        return x + q.unsqueeze(0).to(dtype=x.dtype)
+
+    def _chunk_query_pre_hook(self, module, args, kwargs):
+        """Add the tiled chunk-query embedding to the last conformer layer input."""
+        if 'x' in kwargs:
+            kwargs = dict(kwargs)
+            kwargs['x'] = self._add_chunk_query(kwargs['x'])
+        elif len(args) > 0:
+            args = (self._add_chunk_query(args[0]),) + tuple(args[1:])
+        return args, kwargs
 
     def _select_first_k_frames_per_chunk(
         self, encoded: torch.Tensor, encoded_len: torch.Tensor
