@@ -71,6 +71,14 @@ model:
     # first-k selection then truncates each chunk to its first k frames for the
     # logits/loss. Zero-initialized -> identical to plain first-k at init.
     chunk_query: false
+    # Reshape + channel-axis attention token mixer (requires first_k_frames_per_chunk
+    # >= 1, which doubles as the number of tokens/chunk M; mutually exclusive with
+    # token_extraction_size and chunk_query). When true, each [chunk_size, d_model]
+    # chunk is reshaped to [chunk_size*d_model/M, M], self-attended over the M (token)
+    # axis, and the M rows become the per-chunk tokens. The lattice then runs with
+    # chunk_size = M and the joint/head see encoder-out dim chunk_size*d_model/M.
+    chunk_channel_attn: false
+    chunk_channel_attn_heads: 4   # attention heads over the M-token axis (coerced to a divisor of new_d_model)
   log_stats_every_n_steps: 20        # rank-0 stdout [chunked_aligner-train] summary (<=0 disables)
   log_prediction_every_n_steps: 100  # rank-0 stdout hyp/ref samples (<=0 disables)
   log_prediction_num_samples: 2

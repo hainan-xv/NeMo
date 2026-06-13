@@ -477,7 +477,7 @@ group, but the causal group still provides full backward context there.
 \end{tikzpicture}
 
 \caption{Input-to-output dependencies of a 1D convolution (kernel size~3,
-chunk size~4) for 12 frames across three chunks (dashed boundaries).
+chunk size~4) for 12 frames across three chunks.
 \textbf{(a)}~Causal convolution: each output depends only on current and past
 frames.
 \textbf{(b)}~Standard non-causal convolution (not streaming-safe): \textcolor{red!65}{red dashed} arrows
@@ -498,7 +498,7 @@ full backward context at those positions.}
 \label{sec:experiments}
 
 We use NeMo \cite{kuchaiev2019nemo} toolkit to conduct all our experiments. 
-All experiments use a FastConformer encoder, where 8$\times$ subsampling is first performed on 80-dimension Mel-spectrogram features with causal subsampling; then the subsampled representation goes through 17 layers of Conformer blocks, with $d_{\text{model}}{=}512$ and convolution kernel size $k{=}9$. The streaming chunk size is $C{=}14$ subsampled frames, equivalent to $14 \times 80 = 1120$\,ms of speech. Chunked attention is configured so that each frame can attend to any frame in the current chunk as well as 5 chunks in the past. These are all standard configurations for NeMo's FastConformer-Large, with full details available at \url{https://github.com/NVIDIA-NeMo/NeMo/blob/main/examples/asr/conf/fastconformer/cache_aware_streaming/fastconformer_transducer_bpe_streaming.yaml}.
+All experiments use a FastConformer encoder, where 8$\times$ subsampling is first performed on 80-dimension Mel-spectrogram features with causal subsampling; then the subsampled representation goes through 17 layers of Conformer blocks, with $d_{\text{model}}{=}512$ and convolution kernel size $k{=}9$. The streaming chunk size is $C{=}14$ subsampled frames, equivalent to $14 \times 80 = 1120$\,ms of speech. Chunked attention is configured so that each frame can attend to any frame in the current chunk as well as 5 chunks in the past. These are all standard configurations for NeMo's FastConformer-Large, with full details available at \url{examples/asr/conf/fastconformer/cache_aware_streaming/fastconformer_transducer_bpe_streaming.yaml} in NeMo repository.
 
 We use two basic model architectures for training. 1. A standard RNN-T~\cite{graves2012sequence} model and 2. A Chunk-wise Attention Transducer (CHAT)~\cite{xu2026chunk}. 
 For all models and datasets, we train and compare two models with identical architecture and hyper-parameters, except one with causal convolution in conformers, and the other with the BACON architecture in conformer. 
@@ -518,7 +518,7 @@ model with a vocabulary size of 1024.
 \begin{table}[h]
 \centering
 \caption{WER~(\%) on LibriSpeech. BACON improves over the causal baseline
-across conditions, with the largest gains on \texttt{test-other}.}
+across conditions, with the larger gains on \texttt{test-other}.}
 \label{tab:libri_wer}
 \begin{tabular}{llccc}
 \toprule
@@ -537,36 +537,6 @@ across conditions, with the largest gains on \texttt{test-other}.}
 As shown in Table~\ref{tab:libri_wer}, on LibriSpeech \texttt{test-clean} BACON and Causal achieve similar accuracy---the small gains are not statistically significant for \textsc{rnn-t}---which is expected given the relatively clean conditions. 
 On the more challenging \texttt{test-other} set, BACON yields larger and statistically significant gains in both families, especially for \textsc{chat}, where it improves WER by 0.79 absolute over the causal baseline ($8.47\,{\rightarrow}\,7.68$), a 9.3\% relative WER reduction ($p<0.001$).
 
-\subsection{Multi-Speaker ASR}
-\label{subsec:multispk}
-
-To evaluate generality, we further assess BACON on a two-speaker ASR task.
-Following~\cite{wang2024resource}, we insert special speaker
-tokens (\texttt{<spk1>}, \texttt{<spk2>}) at each speaker change to training text in order to model
-speaker turns explicitly. We use segment-level speaker annotations and train onw
-Fisher, which contains approximately 2,000 hours of
-labeled two-speaker conversational speech. Encoder parameters are initialized
-from checkpoints pre-trained for approximately 10k steps on LibriSpeech in the
-corresponding training mode. We report concatenated minimum-permutation word
-error rate (cpWER)~\cite{watanabe2020chime}, the standard metric for
-multi-speaker ASR.
-
-\begin{table}[h]
-\centering
-\caption{cpWER~(\%) on 2-speaker ASR. All models are CHAT-120M with chunk
-configuration [70,13] and 300K training steps.}
-\label{tab:multispk}
-\begin{tabular}{lcc}
-\toprule
-\textbf{Conv.\ mode} & \textbf{cpWER (\%)}$\downarrow$ \\
-\midrule
-Causal (baseline)      & 27.41 \\
-BACON                  & \textbf{27.14} \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-Table 2 demonstrates that BACON reduces cpWER from 27.41\% to 27.14\%, achieving a 0.27\% absolute improvement. Notably, multi-speaker ASR involves rapid speaker alternation where short-range within-chunk context is especially informative for disambiguating overlapping or adjacent speech, making it a particularly natural fit for BACON's wider receptive field.
 \subsection{Speech Translation}
 \label{subsec:ast}
 
@@ -599,6 +569,37 @@ with \textsc{must-c} gains of +0.71 and +1.01, respectively. All four improvemen
 The improvement is consistent across both families and both evaluation sets, confirming that the
 benefit derives from the wider receptive field rather than any
 architecture-specific interaction.
+
+\subsection{Multi-Speaker ASR}
+\label{subsec:multispk}
+
+To evaluate generality, we further assess BACON on a two-speaker ASR task.
+Following~\cite{wang2024resource}, we insert special speaker
+tokens (\texttt{<spk1>}, \texttt{<spk2>}) at each speaker change to training text in order to model
+speaker turns explicitly. We use segment-level speaker annotations and train onw
+Fisher, which contains approximately 2,000 hours of
+labeled two-speaker conversational speech. Encoder parameters are initialized
+from checkpoints pre-trained for approximately 10k steps on LibriSpeech in the
+corresponding training mode. We report concatenated minimum-permutation word
+error rate (cpWER)~\cite{watanabe2020chime}, the standard metric for
+multi-speaker ASR.
+
+\begin{table}[h]
+\centering
+\caption{cpWER~(\%) on 2-speaker ASR. All models are CHAT-120M with chunk
+configuration [70,13].}
+\label{tab:multispk}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Conv.\ mode} & \textbf{cpWER (\%)}$\downarrow$ \\
+\midrule
+Causal (baseline)      & 27.41 \\
+BACON                  & \textbf{27.14} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:multispk} demonstrates that BACON reduces cpWER from 27.41\% to 27.14\%, a 0.27\% absolute improvement. This gain is in the same direction as on the other tasks, though smaller and below the significance threshold ($p=0.19$). The effect is consistently in BACON's favor, but cpWER on this task is dominated by challenging conversational phenomena such as overlapping speech and speaker-attribution errors, and per-utterance variability is high, which makes a small acoustic-level improvement harder to establish as significant. Importantly, BACON does not hurt performance and trends slightly better, confirming that the method generalizes to the multi-speaker setting without any regression.
 
 
 
@@ -661,13 +662,9 @@ challenging conditions. On LibriSpeech
 \texttt{test-other}, BACON beats all-bidir by $-$0.53 WER for \textsc{chat} and
 $-$0.37 for \textsc{rnn-t}. On \textsc{covost}, BACON leads by +1.40 BLEU
 (\textsc{chat}) and +1.60 (\textsc{rnn-t}).
-
 Critically, for \textsc{rnn-t} on LibriSpeech, all-bidir \emph{degrades} relative
 to the causal baseline (8.78\% vs.\ 8.73\%), whereas BACON improves it
 (8.41\%). 
-%The same pattern appears on multi-speaker ASR: all-bidir increases cpWER
-% to 27.58\% (worse than the 27.41\% baseline), while BACON improves it to
-% 27.14\%. 
 This is a direct consequence of chunk boundary effects: when all
 channels are bidirectional, positions at right chunk edges see fewer real
 inputs across every channel simultaneously, reducing the effective receptive
@@ -707,7 +704,7 @@ Non-causal  & \textbf{7.23} \\
 \end{tabular}
 \end{table}
 
-As shown in Table 6, even with full-utterance attention, non-causal convolution reduces WER by 0.93
+As shown in Table~\ref{tab:analysis-fullctx}, even with full-utterance attention, non-causal convolution reduces WER by 0.93
 absolute (8.16\%~$\rightarrow$~7.23\%, an 11.4\% relative improvement). This
 demonstrates that convolution and attention capture complementary structure:
 the convolution module extracts local acoustic patterns that attention does not
@@ -732,7 +729,7 @@ where $\Delta$ is the frame duration and $\delta$ is a processing
 delay shared across all models, which we assume is constant. The true latency for a token corresponding to word~$j$ with
 ground-truth timestamp~$\tau_j$ is
 $\ell_j = t_{\text{emit}}(i_j) - \tau_j$,
-where $i_j$ is the chunk in which the token is emitted. Averaging over all
+where $i_j$ is the chunk the token is emitted in. Averaging over all
 $N$ emitted tokens:
 
 \begin{equation}
@@ -742,11 +739,10 @@ $N$ emitted tokens:
     \end{aligned}
     \label{eq:avg-latency}
 \end{equation}
-
-where $\bar{\imath} = \frac{1}{N}\sum_j i_j$ is the average chunk index of all
-emissions and $\bar{\tau} = \frac{1}{N}\sum_j \tau_j$ is the average
+where $\bar{\imath} = \frac{1}{N}\sum_j i_j$ is the average chunk-index of all
+emissions and $\bar{\tau} = \frac{1}{N}\sum_j \tau_j$ the average
 ground-truth timestamp. When comparing two models~A and~B evaluated on the
-same utterances, the timestamp term $\bar{\tau}$ and the constant
+same utterances, the term $\bar{\tau}$ and the constant
 $(C\cdot\Delta + \delta)$ cancel:
 \begin{equation}
     \bar{\ell}^{A} - \bar{\ell}^{B} = (C\cdot\Delta)\;(\bar{\imath}^{A} - \bar{\imath}^{B}).

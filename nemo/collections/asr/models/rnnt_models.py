@@ -33,6 +33,7 @@ from nemo.collections.asr.losses.rnnt import RNNTLoss, resolve_rnnt_default_loss
 from nemo.collections.asr.metrics.wer import WER
 from nemo.collections.asr.models.asr_model import ASRModel, ExportableEncDecModel
 from nemo.collections.asr.modules.aligner import AlignerCTCHead, AlignerJoint
+from nemo.collections.asr.modules.chunk_channel_token_mixer import ChunkChannelTokenMixer
 from nemo.collections.asr.modules.chunk_token_extractor import ChunkTokenExtractor
 from nemo.collections.asr.modules.rnnt import RNNTDecoderJoint
 from nemo.collections.asr.parts.mixins import (
@@ -85,6 +86,9 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         # by the Chunked-Aligner; set up in the chunked-aligner setup methods).
         self.token_extractor = None
         self.first_k_frames_per_chunk = -1
+        # Optional reshape + channel-axis attention token mixer (Chunked-Aligner only,
+        # chunk_channel_attn=true): emits M tokens/chunk of dim chunk_size*d_model/M.
+        self.channel_token_mixer = None
         # Optional learned per-chunk query embedding (added at the last conformer
         # layer; only used by the Chunked-Aligner first-k method when chunk_query=true).
         self.chunk_query_emb = None
@@ -108,7 +112,9 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             with open_dict(self.cfg.joint):
                 self.cfg.joint.num_classes = len(self.cfg.labels)
                 self.cfg.joint.vocabulary = self.cfg.labels
-                self.cfg.joint.jointnet.encoder_hidden = self.cfg.model_defaults.enc_hidden
+                # When the chunk channel-attention mixer is on, the encoder output that
+                # feeds the joint has dim chunk_size*d_model/M, not d_model.
+                self.cfg.joint.jointnet.encoder_hidden = self._chunked_aligner_enc_out_hidden()
                 self.cfg.joint.jointnet.pred_hidden = self.cfg.model_defaults.pred_hidden
 
             self.decoder = EncDecRNNTModel.from_config_dict(self.cfg.decoder)
@@ -294,6 +300,34 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         ca_cfg = self.cfg.get('chunked_aligner', None)
         return bool(ca_cfg.get('nar', False)) if ca_cfg is not None else False
 
+    def _chunked_aligner_enc_out_hidden(self) -> int:
+        """Encoder-output hidden dim that feeds the joint / NAR head / lattice.
+
+        Normally this is ``model_defaults.enc_hidden`` (= encoder ``d_model``). With
+        the chunk channel-attention mixer (``chunk_channel_attn=true``) the per-chunk
+        reshape changes the per-token feature dim to ``chunk_size * d_model / M``
+        (``M = first_k_frames_per_chunk``), so the joint must be built for that dim.
+        """
+        base = int(self.cfg.model_defaults.enc_hidden)
+        if self.loss_type != 'chunked_aligner':
+            return base
+        ca_cfg = self.cfg.get('chunked_aligner', None)
+        if ca_cfg is None or not bool(ca_cfg.get('chunk_channel_attn', False)):
+            return base
+        C = int(ca_cfg.get('chunk_size', 12))
+        M = int(ca_cfg.get('first_k_frames_per_chunk', -1))
+        if M < 1:
+            raise ValueError(
+                "model.chunked_aligner.chunk_channel_attn=true requires "
+                "model.chunked_aligner.first_k_frames_per_chunk >= 1 (= tokens/chunk M)."
+            )
+        if (C * base) % M != 0:
+            raise ValueError(
+                f"model.chunked_aligner.chunk_channel_attn: chunk_size*d_model ({C * base}) must be "
+                f"divisible by first_k_frames_per_chunk ({M})."
+            )
+        return (C * base) // M
+
     def _setup_chunked_token_extractor(self, ca_cfg):
         """Set chunk geometry and optional chunk-level frame reduction.
 
@@ -315,6 +349,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             int(ca_cfg.get('first_k_frames_per_chunk', -1)) if ca_cfg is not None else -1
         )
         chunk_query = bool(ca_cfg.get('chunk_query', False)) if ca_cfg is not None else False
+        chunk_channel_attn = bool(ca_cfg.get('chunk_channel_attn', False)) if ca_cfg is not None else False
         if token_extraction_size >= 1 and first_k_frames_per_chunk >= 1:
             raise ValueError(
                 "model.chunked_aligner.token_extraction_size and "
@@ -326,6 +361,20 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 "model.chunked_aligner.first_k_frames_per_chunk >= 1 (the chunk-query "
                 "embedding augments the first-k frame-selection method)."
             )
+        if chunk_channel_attn:
+            if first_k_frames_per_chunk < 1:
+                raise ValueError(
+                    "model.chunked_aligner.chunk_channel_attn=true requires "
+                    "model.chunked_aligner.first_k_frames_per_chunk >= 1 (= tokens/chunk M)."
+                )
+            if token_extraction_size >= 1:
+                raise ValueError(
+                    "model.chunked_aligner.chunk_channel_attn and token_extraction_size are mutually exclusive."
+                )
+            if chunk_query:
+                raise ValueError(
+                    "model.chunked_aligner.chunk_channel_attn and chunk_query are mutually exclusive."
+                )
         if token_extraction_size >= 1:
             self.token_extractor = ChunkTokenExtractor(
                 d_model=int(self.cfg.model_defaults.enc_hidden),
@@ -337,6 +386,24 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             logging.info(
                 f"[chunked-aligner] Token-extraction enabled: {self.frames_per_chunk} encoder frames/chunk -> "
                 f"{token_extraction_size} tokens/chunk (effective chunk_size={self.chunk_size})."
+            )
+        elif chunk_channel_attn:
+            # Reshape each [chunk_size, d_model] chunk into M = first_k tokens of dim
+            # chunk_size*d_model/M and self-attend over the M (token) axis. The M rows
+            # become the per-chunk tokens, so the lattice runs with chunk_size = M and
+            # the encoder-out hidden dim seen by the joint becomes chunk_size*d_model/M.
+            m_tokens = first_k_frames_per_chunk
+            self.channel_token_mixer = ChunkChannelTokenMixer(
+                d_model=int(self.cfg.model_defaults.enc_hidden),
+                frames_per_chunk=self.frames_per_chunk,
+                tokens_per_chunk=m_tokens,
+                num_heads=int(ca_cfg.get('chunk_channel_attn_heads', 4)) if ca_cfg is not None else 4,
+            )
+            self.chunk_size = m_tokens
+            logging.info(
+                f"[chunked-aligner] Channel-attention token mixer enabled: {self.frames_per_chunk} encoder "
+                f"frames/chunk -> {m_tokens} tokens/chunk of dim {self.channel_token_mixer.out_dim} "
+                f"(num_heads={self.channel_token_mixer.num_heads}, effective chunk_size={self.chunk_size})."
             )
         elif first_k_frames_per_chunk >= 1:
             if first_k_frames_per_chunk > self.frames_per_chunk:
@@ -462,8 +529,13 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         self.blank_id = self.num_classes_with_blank - 1
 
         # The "joiner" is just a projection + softmax (softmax applied in loss /
-        # decoding). Operates on the (token-extracted) encoder frames of dim enc_hidden.
-        enc_hidden = int(self.cfg.model_defaults.enc_hidden)
+        # decoding). Operates on the (token-extracted) encoder frames; with the channel-
+        # attention mixer the per-token dim is chunk_size*d_model/M, else enc_hidden.
+        enc_hidden = (
+            self.channel_token_mixer.out_dim
+            if self.channel_token_mixer is not None
+            else int(self.cfg.model_defaults.enc_hidden)
+        )
         self.nar_head = torch.nn.Linear(enc_hidden, self.num_classes_with_blank)
 
         # NAR full-sum loss over the per-frame head logits (no joint, no U axis):
@@ -1233,6 +1305,8 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         # acoustic chunk into learned tokens, or keep the left-most k frames.
         if self.token_extractor is not None:
             encoded, encoded_len = self.token_extractor(encoded, encoded_len)
+        elif self.channel_token_mixer is not None:
+            encoded, encoded_len = self.channel_token_mixer(encoded, encoded_len)
         elif self.first_k_frames_per_chunk >= 1:
             encoded, encoded_len = self._select_first_k_frames_per_chunk(encoded, encoded_len)
 
