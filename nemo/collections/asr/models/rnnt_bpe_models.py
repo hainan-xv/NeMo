@@ -35,6 +35,27 @@ from nemo.core.classes.common import PretrainedModelInfo
 from nemo.utils import logging, model_utils
 
 
+def _omegaconf_safe_labels(vocabulary) -> List[str]:
+    """Return token-label strings that are safe to store inside an OmegaConf container.
+
+    OmegaConf reserves the literal string ``"???"`` as its mandatory-missing marker and treats any
+    ``"${...}"`` substring as an interpolation. Some LLM / byte-level BPE vocabularies (e.g. Qwen)
+    contain such surface strings, which makes ``OmegaConf.to_object`` raise ``MissingMandatoryValue``
+    (or mis-resolve) when the config is later serialized. For BPE/HF models these labels are purely
+    informational (decoding goes through the tokenizer, not these strings), so any hostile entry is
+    replaced with a unique, inert placeholder while preserving order and length. This is a no-op for
+    well-behaved (e.g. SentencePiece) vocabularies.
+    """
+    labels = list(vocabulary)
+    safe = []
+    for idx, tok in enumerate(labels):
+        s = tok if isinstance(tok, str) else str(tok)
+        if s == "???" or "${" in s:
+            s = f"<hf_unserializable_token_{idx}>"
+        safe.append(s)
+    return safe
+
+
 class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
     """Base class for encoder decoder RNNT-based models with subword tokenization."""
 
@@ -229,16 +250,17 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
         # Initialize a dummy vocabulary
         vocabulary = self.tokenizer.tokenizer.get_vocab()
 
-        # Set the new vocabulary
+        # Set the new vocabulary (sanitize labels so OmegaConf-hostile surfaces like "???" are safe)
+        safe_vocabulary = _omegaconf_safe_labels(vocabulary)
         with open_dict(cfg):
-            cfg.labels = ListConfig(list(vocabulary))
+            cfg.labels = ListConfig(safe_vocabulary)
 
         with open_dict(cfg.decoder):
             cfg.decoder.vocab_size = len(vocabulary)
 
         with open_dict(cfg.joint):
             cfg.joint.num_classes = len(vocabulary)
-            cfg.joint.vocabulary = ListConfig(list(vocabulary))
+            cfg.joint.vocabulary = ListConfig(safe_vocabulary)
             cfg.joint.jointnet.encoder_hidden = cfg.model_defaults.enc_hidden
             cfg.joint.jointnet.pred_hidden = cfg.model_defaults.pred_hidden
 
