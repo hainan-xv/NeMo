@@ -40,6 +40,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from nemo.collections.asr.models.rnnt_bpe_models import EncDecRNNTBPEModel
 from nemo.collections.common.tokenizers.huggingface.auto_tokenizer import AutoTokenizer
+from nemo.collections.common.tokenizers.huggingface.restricted_auto_tokenizer import RestrictedAutoTokenizer
 from nemo.core.classes.common import PretrainedModelInfo
 from nemo.utils import logging
 
@@ -53,10 +54,12 @@ class EncDecRNNTBPEHFTokenizerModel(EncDecRNNTBPEModel):
 
     def _setup_tokenizer(self, tokenizer_cfg: DictConfig):
         tok_type = str(tokenizer_cfg.get('type', '') or '').lower()
-        if tok_type not in ('hf', 'huggingface'):
+        if tok_type not in ('hf', 'huggingface', 'hf_restricted', 'huggingface_restricted'):
             # Anything else (bpe / wpe / agg) -> the standard ASR tokenizer setup.
             super()._setup_tokenizer(tokenizer_cfg)
             return
+
+        restricted = tok_type in ('hf_restricted', 'huggingface_restricted')
 
         hf_model = tokenizer_cfg.get('hf_model', None) or tokenizer_cfg.get('dir', None)
         if not hf_model:
@@ -69,10 +72,24 @@ class EncDecRNNTBPEHFTokenizerModel(EncDecRNNTBPEModel):
         if not isinstance(hf_kwargs, dict):
             hf_kwargs = OmegaConf.to_container(hf_kwargs, resolve=True)
 
-        # The HF AutoTokenizer wrapper is a TokenizerSpec and exposes the inner HF tokenizer at
-        # `.tokenizer`, which provides `get_vocab()` -- exactly what EncDecRNNTBPEModel.__init__
-        # uses to size the prediction net + joint.
-        self.tokenizer = AutoTokenizer(pretrained_model_name=str(hf_model), **hf_kwargs)
+        # The HF (Restricted)AutoTokenizer wrapper is a TokenizerSpec and exposes the inner HF
+        # tokenizer at `.tokenizer`, whose `get_vocab()` is what EncDecRNNTBPEModel.__init__ uses to
+        # size the prediction net + joint. RestrictedAutoTokenizer makes that report the COMPACT
+        # (English-pruned) vocabulary so the model is sized to the smaller id space.
+        if restricted:
+            restrict_vocab_file = tokenizer_cfg.get('restrict_vocab_file', None) or tokenizer_cfg.get('dir', None)
+            if not restrict_vocab_file:
+                raise ValueError(
+                    "`tokenizer.type=huggingface_restricted` requires `tokenizer.restrict_vocab_file` "
+                    "(the kept-id JSON from scripts/tokenizers/build_restricted_qwen_tokenizer.py)."
+                )
+            # Save the kept-id artifact into the .nemo so resume / restore re-creates the same vocab.
+            restrict_vocab_file = self.register_artifact('tokenizer.restrict_vocab_file', str(restrict_vocab_file))
+            self.tokenizer = RestrictedAutoTokenizer(
+                pretrained_model_name=str(hf_model), restrict_vocab_file=str(restrict_vocab_file), **hf_kwargs
+            )
+        else:
+            self.tokenizer = AutoTokenizer(pretrained_model_name=str(hf_model), **hf_kwargs)
 
         # Downstream RNN-T BPE code only branches on `bpe` (sub-word) vs `wpe`; an HF byte-level
         # BPE is sub-word, so advertise it as `bpe`.
@@ -81,12 +98,12 @@ class EncDecRNNTBPEHFTokenizerModel(EncDecRNNTBPEModel):
         # Keep cfg in sync so a saved .nemo / resume re-instantiates the same HF tokenizer.
         # (`self.cfg` does not exist yet during the first __init__ pass; the guard handles that.)
         if getattr(self, 'cfg', None) is not None and 'tokenizer' in self.cfg:
-            self.cfg.tokenizer.type = 'huggingface'
+            self.cfg.tokenizer.type = 'huggingface_restricted' if restricted else 'huggingface'
             self.cfg.tokenizer.hf_model = str(hf_model)
 
         logging.info(
-            f"Initialized HuggingFace (LLM) tokenizer '{hf_model}' with {self.tokenizer.vocab_size} "
-            f"tokens for baseline RNN-T/TDT (no factorization)."
+            f"Initialized {'restricted ' if restricted else ''}HuggingFace (LLM) tokenizer '{hf_model}' "
+            f"with {self.tokenizer.vocab_size} tokens for baseline RNN-T/TDT (no factorization)."
         )
 
     @classmethod
