@@ -127,10 +127,11 @@ class ChunkChannelTokenMixer(nn.Module):
         if T_pad > T:
             x = F.pad(x, (0, 0, 0, T_pad - T))
 
-        # Run the small attention in float32 for precision/dtype robustness
-        # (encoder output may be bf16/fp16), then cast the result back.
+        # Match the module parameter dtype. Restored/eval models may be converted
+        # to bf16, and LayerNorm/MHA require activations and weights to agree.
         orig_dtype = x.dtype
-        x = x.float()
+        compute_dtype = self.norm.weight.dtype
+        x = x.to(dtype=compute_dtype)
 
         # [B, T_pad, D] -> [B, n_chunks, C, D] -> flatten chunk row-major -> [.., C*D].
         x = x.reshape(B, n_chunks, C * D)
@@ -139,7 +140,7 @@ class ChunkChannelTokenMixer(nn.Module):
         tokens = x.reshape(B * n_chunks, M, self.out_dim)
 
         # Self-attention over the M token axis (pre-norm + residual).
-        h = self.norm(tokens + self.pos.float().unsqueeze(0))
+        h = self.norm(tokens + self.pos.to(dtype=compute_dtype).unsqueeze(0))
         attn_out, _ = self.attn(h, h, h, need_weights=False)
         out = tokens + attn_out
 
