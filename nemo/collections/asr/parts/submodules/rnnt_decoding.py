@@ -1670,7 +1670,14 @@ class RNNTBPEDecoding(AbstractRNNTDecoding):
     """
 
     def __init__(self, decoding_cfg, decoder, joint, tokenizer: TokenizerSpec):
-        blank_id = tokenizer.tokenizer.vocab_size  # RNNT or TDT models.
+        # Blank/SOS id must equal the model's non-blank class count, i.e. the SAME vocabulary the
+        # decoder/joint are sized from in EncDecRNNTBPEModel.__init__ (which uses
+        # ``tokenizer.tokenizer.get_vocab()``). Do NOT use ``tokenizer.tokenizer.vocab_size``: for a
+        # restricted HF tokenizer (e.g. RestrictedAutoTokenizer over Qwen) the inner tokenizer's
+        # ``vocab_size`` still reports the FULL (~151k) base vocab, while ``get_vocab()`` is patched to
+        # the compact size. A too-large blank id would put _SOS out of range of the (compact) decoder
+        # embedding and trigger a CUDA device-side assert during greedy decoding.
+        blank_id = len(tokenizer.tokenizer.get_vocab())  # RNNT or TDT models.
 
         if hasattr(tokenizer, 'supported_punctuation'):
             supported_punctuation = tokenizer.supported_punctuation
@@ -1679,7 +1686,7 @@ class RNNTBPEDecoding(AbstractRNNTDecoding):
 
         # multi-blank RNNTs
         if hasattr(decoding_cfg, 'model_type') and decoding_cfg.model_type == 'multiblank':
-            blank_id = tokenizer.tokenizer.vocab_size + joint.num_extra_outputs
+            blank_id = len(tokenizer.tokenizer.get_vocab()) + joint.num_extra_outputs
 
         self.tokenizer = tokenizer
 
