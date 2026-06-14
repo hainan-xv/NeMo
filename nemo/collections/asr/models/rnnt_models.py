@@ -120,6 +120,10 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             self.decoder = EncDecRNNTModel.from_config_dict(self.cfg.decoder)
             self.joint = EncDecRNNTModel.from_config_dict(self.cfg.joint)
 
+            # CHAT: infer chunk_size for the attention joint (RNNTAttJoint) when not set explicitly.
+            if hasattr(self.joint, 'chunk_size') and self.joint.chunk_size <= 0:
+                self.joint.chunk_size = self._infer_chat_chunk_size()
+
             if self.loss_type == 'chunked_aligner':
                 self._setup_chunked_aligner_loss_and_decoding()
             else:
@@ -723,6 +727,41 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             scores += editdistance.eval(hyp_tokens, ref_tokens)
             words += len(ref_tokens)
         return scores, words
+
+    def _infer_chat_chunk_size(self) -> int:
+        """
+        Infer chunk_size for RNNTAttJoint from the encoder's attention context config.
+
+        Requires the encoder to use 'chunked_limited' attention with a single
+        [left, right] context size. Returns right_context + 1 as the chunk size.
+        """
+        encoder_cfg = self.cfg.get('encoder', {})
+        att_context_style = encoder_cfg.get('att_context_style', 'regular')
+        att_context_size = encoder_cfg.get('att_context_size', None)
+
+        if att_context_style != 'chunked_limited':
+            raise ValueError(
+                f"RNNTAttJoint requires encoder with att_context_style='chunked_limited', "
+                f"got '{att_context_style}'. Set chunk_size explicitly in the joint config "
+                f"or configure the encoder for chunked attention."
+            )
+        if att_context_size is None:
+            raise ValueError(
+                "RNNTAttJoint requires encoder att_context_size to be set. "
+                "Set chunk_size explicitly in the joint config."
+            )
+
+        ctx = list(att_context_size) if hasattr(att_context_size, '__iter__') else att_context_size
+        if not isinstance(ctx, (list, tuple)) or len(ctx) != 2 or not isinstance(ctx[0], int):
+            raise ValueError(
+                f"RNNTAttJoint requires a single [left, right] attention context, "
+                f"got {att_context_size}. Set chunk_size explicitly in the joint config."
+            )
+
+        right_context = ctx[1]
+        chunk_size = right_context + 1
+        logging.info(f"CHAT mode: inferred chunk_size={chunk_size} from encoder att_context_size={ctx}")
+        return chunk_size
 
     def setup_optim_normalization(self):
         """
@@ -1414,10 +1453,13 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
         # If experimental fused Joint-Loss-WER is not used
         if not self.joint.fuse_loss_wer:
-            # Compute full joint and loss
-            joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder)
+            joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder, encoder_lengths=encoded_len)
+            effective_len = getattr(self.joint, 'num_chunks_per_utterance', encoded_len)
             loss_value = self.loss(
-                log_probs=joint, targets=transcript, input_lengths=encoded_len, target_lengths=target_length
+                log_probs=joint,
+                targets=transcript,
+                input_lengths=effective_len,
+                target_lengths=target_length,
             )
 
             # Add auxiliary losses, if registered
@@ -1549,10 +1591,13 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         if not self.joint.fuse_loss_wer:
             if self.compute_eval_loss:
                 decoder, target_length, states = self.decoder(targets=transcript, target_length=transcript_len)
-                joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder)
-
+                joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder, encoder_lengths=encoded_len)
+                effective_len = getattr(self.joint, 'num_chunks_per_utterance', encoded_len)
                 loss_value = self.loss(
-                    log_probs=joint, targets=transcript, input_lengths=encoded_len, target_lengths=target_length
+                    log_probs=joint,
+                    targets=transcript,
+                    input_lengths=effective_len,
+                    target_lengths=target_length,
                 )
 
                 tensorboard_logs['val_loss'] = loss_value
@@ -1683,7 +1728,6 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             return_hypotheses=trcfg.return_hypotheses,
             partial_hypotheses=trcfg.partial_hypothesis,
         )
-        # cleanup memory
         del encoded, encoded_len
 
         if trcfg.timestamps:

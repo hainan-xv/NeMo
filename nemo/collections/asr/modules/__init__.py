@@ -44,6 +44,7 @@ from nemo.collections.asr.modules.hybrid_autoregressive_transducer import HATJoi
 from nemo.collections.asr.modules.lstm_decoder import LSTMDecoder  # noqa: F401
 from nemo.collections.asr.modules.rnn_encoder import RNNEncoder  # noqa: F401
 from nemo.collections.asr.modules.rnnt import (  # noqa: F401
+    RNNTAttJoint,
     RNNTDecoder,
     RNNTDecoderJointSSL,
     RNNTJoint,
