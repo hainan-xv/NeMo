@@ -7,6 +7,12 @@ init_from_nemo_model: null # path to nemo model
 model:
   sample_rate: 16000
 
+  # RNN-T loss reduction (read in EncDecRNNTModel as `model.rnnt_reduction`). 'mean_volume' sums the
+  # loss and divides by the total number of target tokens (per-token, length-normalized -> smaller,
+  # more stable values). The framework default 'mean_batch' divides only by batch size, which yields
+  # much larger losses for long utterances.
+  rnnt_reduction: mean_volume
+
   train_ds:
     manifest_filepath: ???
     sample_rate: ${model.sample_rate}
