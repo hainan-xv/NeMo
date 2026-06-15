@@ -240,13 +240,16 @@ class _GreedyRNNTInfer(Typing, ConfidenceMethodMixin):
         # output: [B, 1, K]
         return self.decoder.predict(label, hidden, add_sos=add_sos, batch_size=batch_size)
 
-    def _joint_step(self, enc, pred, enc_len, log_normalize: Optional[bool] = None):
+    def _joint_step(self, enc, pred, enc_len=None, log_normalize: Optional[bool] = None):
         """
         Common joint step based on AbstractRNNTJoint implementation.
 
         Args:
             enc: Output of the Encoder model. A torch.Tensor of shape [B, 1, H1]
             pred: Output of the Decoder model. A torch.Tensor of shape [B, 1, H2]
+            enc_len: Optional encoder frame lengths, used by CHAT (RNNTAttJoint) for
+                chunk-aware joint computation. Defaults to None for standard RNN-T/TDT
+                joints, which ignore it.
             log_normalize: Whether to log normalize or not. None will log normalize only for CPU.
 
         Returns:
