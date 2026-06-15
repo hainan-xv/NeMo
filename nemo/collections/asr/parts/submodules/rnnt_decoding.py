@@ -721,13 +721,19 @@ class AbstractRNNTDecoding(ConfidenceMixin):
         if chunk_encoder_fn is not None:
             encoder_output, encoded_lengths, chunk_frame_lengths = chunk_encoder_fn(encoder_output, encoded_lengths)
 
+        # `chunk_frame_lengths` is a CHAT-only argument. Only the CHAT-aware
+        # greedy decoders accept it; standard RNN-T / TDT / beam decoders
+        # (e.g. GreedyTDTInfer) do not, so forwarding it unconditionally breaks
+        # every non-CHAT model. Pass it only when CHAT is active.
+        chat_decoding_kwargs = {} if chunk_encoder_fn is None else {'chunk_frame_lengths': chunk_frame_lengths}
+
         # Compute hypotheses
         with torch.inference_mode():
             hypotheses_list = self.decoding(
                 encoder_output=encoder_output,
                 encoded_lengths=encoded_lengths,
                 partial_hypotheses=partial_hypotheses,
-                chunk_frame_lengths=chunk_frame_lengths,
+                **chat_decoding_kwargs,
             )  # type: [List[Hypothesis]]
 
             # extract the hypotheses
