@@ -311,7 +311,12 @@ def main(args):
         raw_audio = sample["audio"]
         sample_id = sample["id"].replace("/", "_").removesuffix(".wav")
         audio_path = os.path.join(cache_dir, f"{sample_id}.wav")
-        if not os.path.exists(audio_path):
+        # Cache as 16 kHz MONO. Some datasets (e.g. earnings22) ship multi-channel audio; the ASR
+        # model is mono and NeMo/Lhotse's transcribe collation chooses its batch layout from only the
+        # first sample, so a mix of mono/stereo cuts within a batch crashes collate_audio. Downmix
+        # here, and re-cache any previously cached file that isn't already mono.
+        already_cached = os.path.exists(audio_path) and soundfile.info(audio_path).channels == 1
+        if not already_cached:
             os.makedirs(os.path.dirname(audio_path), exist_ok=True)
             if isinstance(raw_audio, dict):
                 if "array" in raw_audio and raw_audio["array"] is not None:
@@ -328,6 +333,10 @@ def main(args):
             else:
                 print(f"  WARNING: unexpected audio format for {sample_id}: {type(raw_audio)}, skipping")
                 continue
+            # Downmix multi-channel -> mono before any resampling (soundfile/HF arrays are
+            # [num_frames, num_channels]); this keeps audio 1D so resample/write stay correct.
+            if audio_array.ndim == 2:
+                audio_array = audio_array.mean(axis=1)
             if sr != 16000:
                 import torchaudio
 
