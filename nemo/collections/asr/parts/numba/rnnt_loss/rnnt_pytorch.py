@@ -681,18 +681,33 @@ class MultistreamTDTLossNumba(Module):
         clamp: gradient clamp; <= 0 disables.
     """
 
-    def __init__(self, blank, durations=None, dividers=None, reduction='sum', sigma: float = 0.0, clamp: float = -1):
+    def __init__(
+        self,
+        blank,
+        durations=None,
+        dividers=None,
+        reduction='sum',
+        sigma: float = 0.0,
+        clamp: float = -1,
+        stream_weights=None,
+    ):
         super(MultistreamTDTLossNumba, self).__init__()
         if dividers is None or len(dividers) < 2:
             raise ValueError("`dividers` must be a list with at least 2 entries marking the stream boundaries.")
         if dividers[-1] != blank + 1:
             raise ValueError(f"Expected dividers[-1] ({dividers[-1]}) == blank + 1 ({blank + 1}).")
+        if stream_weights is not None and len(stream_weights) != len(dividers) - 1:
+            raise ValueError(
+                f"`stream_weights` must have one entry per stream ({len(dividers) - 1}), got {len(stream_weights)}."
+            )
         self.blank = blank
         self.durations = durations if durations is not None else []
         self.dividers = list(dividers)
         self.reduction = reduction
         self.sigma = float(sigma)
         self.clamp = float(clamp) if clamp > 0 else 0.0
+        # None (or all-ones) => unweighted path (no extra multiply).
+        self.stream_weights = tuple(float(w) for w in stream_weights) if stream_weights is not None else None
         self.loss = _MultistreamTDTNumba.apply
 
     def forward(self, acts, labels, act_lens, label_lens):
@@ -714,7 +729,20 @@ class MultistreamTDTLossNumba(Module):
             parts.append(
                 torch.log_softmax(label_acts[..., self.dividers[i] : self.dividers[i + 1]], dim=-1) - self.sigma
             )
-        label_logp = torch.cat(parts, dim=-1).contiguous()
+        label_logp = torch.cat(parts, dim=-1)
+
+        # Per-stream weighting: scale each stream's log-prob by its weight so the kernel's
+        # emission score becomes sum_k w_k * logp_k (blank inherits the last stream's weight).
+        # This multiply is differentiable, so autograd chains the weight onto the kernel's
+        # gradients (which are w.r.t. the weighted log-probs).
+        if self.stream_weights is not None:
+            from nemo.collections.asr.losses.rnnt_pytorch import build_stream_weight_vector
+
+            w_vec = build_stream_weight_vector(self.dividers, self.stream_weights, label_logp.device, label_logp.dtype)
+            if w_vec is not None:
+                label_logp = label_logp * w_vec
+
+        label_logp = label_logp.contiguous()
         dur_logp = torch.log_softmax(dur_acts, dim=-1).contiguous()
 
         labels = labels.to(torch.int64).contiguous()

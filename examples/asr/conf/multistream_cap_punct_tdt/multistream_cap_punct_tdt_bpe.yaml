@@ -25,6 +25,15 @@ model:
   batched_decoding: true         # true => batched label-looping decoder; false => per-utterance greedy
   greedy_use_cuda_graph_decoder: false   # CUDA graphs not supported yet (warns + runs without if set)
 
+  # Per-stream loss weighting. Each stream's per-token log-prob contribution to the
+  # multistream TDT loss is scaled by its weight; default 1:1:1 is the standard
+  # (unweighted) objective. Increase a weight to emphasize that stream during training.
+  # The shared blank lives in the spelling stream, so `spell` also scales the blank.
+  loss_stream_weights:
+    spell: 1.0
+    cap: 1.0
+    punct: 1.0
+
   # multistream knobs (architecture comes from the base model at runtime)
   model_defaults:
     num_cap: 4                   # ALL_LOWER / ALL_UPPER / FIRST_UPPER / OTHER

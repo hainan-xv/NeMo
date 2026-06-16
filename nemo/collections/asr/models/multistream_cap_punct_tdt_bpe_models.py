@@ -98,6 +98,11 @@ class EncDecMultiStreamCapPunctTDTBPEModel(EncDecRNNTBPEModel):
 
         self.dividers, self.ms_blank = cap_punct_dividers(self.num_spell, self.num_cap, self.num_punct)
 
+        # ----- per-stream loss weights (default 1:1:1) -----
+        # Users set these by NAME (spell/cap/punct); we assemble them in the loss/dividers
+        # stream order, which is [punct, cap, spell] (see `cap_punct_dividers`).
+        self.stream_weights = self._resolve_stream_weights()
+
         # ----- rebuild the joint with the sum-space layout -----
         # [ punct(V_punct) | cap(V_cap) | spell(V_spell) | blank | durations(n_dur) ]
         joint_cfg = copy.deepcopy(self.joint.to_config_dict())
@@ -119,6 +124,7 @@ class EncDecMultiStreamCapPunctTDTBPEModel(EncDecRNNTBPEModel):
             dividers=self.dividers,
             reduction=self.cfg.get("rnnt_reduction", "mean_batch"),
             sigma=float(self.cfg.get("model_defaults", {}).get("tdt_sigma", 0.0)),
+            stream_weights=self.stream_weights,
         )
 
         # keep cfg in sync
@@ -163,8 +169,38 @@ class EncDecMultiStreamCapPunctTDTBPEModel(EncDecRNNTBPEModel):
             f"V_spell={self.num_spell}, V_cap={self.num_cap}, V_punct={self.num_punct}, "
             f"punct_marks={self.punct_marks}, durations={self.durations}, "
             f"joint dim={self.joint.num_classes_with_blank} (blank={self.ms_blank}), dividers={self.dividers}, "
+            f"stream_weights(punct,cap,spell)={self.stream_weights or '(1, 1, 1)'}, "
             f"decoding={'batched' if self.batched_decoding else 'sequential'}"
         )
+
+    # ------------------------------------------------------------------ #
+    # per-stream loss weighting
+    # ------------------------------------------------------------------ #
+    def _resolve_stream_weights(self):
+        """Read named per-stream loss weights from cfg and order them as [punct, cap, spell].
+
+        Config (all default to 1.0)::
+
+            model:
+              loss_stream_weights:
+                spell: 1.0
+                cap: 1.0
+                punct: 1.0
+
+        Returns ``None`` when every weight is 1.0 so the loss takes its (numerically
+        identical) unweighted path; otherwise a 3-tuple in dividers/stream order
+        ``[punct, cap, spell]``.
+        """
+        weights_cfg = self.cfg.get('loss_stream_weights', None) or {}
+        spell_w = float(weights_cfg.get('spell', 1.0))
+        cap_w = float(weights_cfg.get('cap', 1.0))
+        punct_w = float(weights_cfg.get('punct', 1.0))
+        for name, w in (('spell', spell_w), ('cap', cap_w), ('punct', punct_w)):
+            if w < 0:
+                raise ValueError(f"loss_stream_weights.{name} must be >= 0, got {w}.")
+        # dividers order is [punct, cap, spell] (see cap_punct_dividers).
+        ordered = (punct_w, cap_w, spell_w)
+        return None if all(w == 1.0 for w in ordered) else ordered
 
     # ------------------------------------------------------------------ #
     # factorization helpers

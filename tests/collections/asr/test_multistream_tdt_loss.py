@@ -150,6 +150,99 @@ class TestMultistreamTDTLoss:
         assert torch.autograd.gradcheck(fn, (acts,), eps=1e-6, atol=1e-4, rtol=1e-3, raise_exception=True)
 
 
+class TestMultistreamTDTLossWeighted:
+    """Per-stream loss weighting: each stream's per-token log-prob is scaled by its weight.
+
+    Streams here are [bow, cap, spell] (spell owns the blank). The weighted analytic loss
+    must match the weighted differentiable reference, and weights of all-ones must reproduce
+    the unweighted loss exactly.
+    """
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("device", DEVICES)
+    def test_all_ones_equals_unweighted(self, device):
+        acts, labels, act_lens, label_lens, durations, dividers, blank = _build_inputs(device)
+
+        unweighted = MultistreamTDTLoss(blank=blank, durations=durations, dividers=dividers, reduction='none')
+        ones = MultistreamTDTLoss(
+            blank=blank, durations=durations, dividers=dividers, reduction='none', stream_weights=[1.0, 1.0, 1.0]
+        )
+
+        acts_u = acts.clone().detach().requires_grad_(True)
+        acts_o = acts.clone().detach().requires_grad_(True)
+        loss_u = unweighted(acts_u, labels, act_lens, label_lens)
+        loss_o = ones(acts_o, labels, act_lens, label_lens)
+        loss_u.sum().backward()
+        loss_o.sum().backward()
+
+        assert torch.allclose(loss_u, loss_o, atol=1e-7, rtol=1e-7)
+        assert torch.allclose(acts_u.grad, acts_o.grad, atol=1e-7, rtol=1e-7)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("sigma", [0.0, 0.05])
+    @pytest.mark.parametrize("stream_weights", [[2.0, 0.5, 1.0], [1.0, 0.3, 1.7], [0.5, 2.0, 3.0]])
+    def test_weighted_matches_reference(self, device, sigma, stream_weights):
+        acts, labels, act_lens, label_lens, durations, dividers, blank = _build_inputs(device)
+
+        acts_ref = acts.clone().detach().requires_grad_(True)
+        ref = MultistreamTDTLossPytorch(
+            blank=blank,
+            durations=durations,
+            dividers=dividers,
+            reduction='sum',
+            sigma=sigma,
+            stream_weights=stream_weights,
+        )
+        loss_ref = ref(acts_ref, labels, act_lens, label_lens)
+        loss_ref.backward()
+
+        acts_an = acts.clone().detach().requires_grad_(True)
+        analytic = MultistreamTDTLoss(
+            blank=blank,
+            durations=durations,
+            dividers=dividers,
+            reduction='sum',
+            sigma=sigma,
+            stream_weights=stream_weights,
+        )
+        loss_an = analytic(acts_an, labels, act_lens, label_lens)
+        loss_an.backward()
+
+        assert torch.allclose(loss_ref, loss_an, atol=1e-5, rtol=1e-5), (loss_ref, loss_an)
+        assert torch.allclose(acts_ref.grad, acts_an.grad, atol=1e-5, rtol=1e-5), (
+            (acts_ref.grad - acts_an.grad).abs().max().item()
+        )
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("device", DEVICES)
+    def test_weighted_gradcheck_custom_backward(self, device):
+        acts, labels, act_lens, label_lens, durations, dividers, blank = _build_inputs(device, small=True)
+        analytic = MultistreamTDTLoss(
+            blank=blank,
+            durations=durations,
+            dividers=dividers,
+            reduction='sum',
+            sigma=0.05,
+            stream_weights=[2.0, 0.5, 1.5],
+        )
+
+        acts = acts.clone().detach().requires_grad_(True)
+
+        def fn(a):
+            return analytic(a, labels, act_lens, label_lens)
+
+        assert torch.autograd.gradcheck(fn, (acts,), eps=1e-6, atol=1e-4, rtol=1e-3, raise_exception=True)
+
+    @pytest.mark.unit
+    def test_bad_stream_weights_length_raises(self):
+        acts, labels, act_lens, label_lens, durations, dividers, blank = _build_inputs('cpu', small=True)
+        with pytest.raises(ValueError):
+            MultistreamTDTLoss(
+                blank=blank, durations=durations, dividers=dividers, stream_weights=[1.0, 1.0]  # need 3
+            )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Numba multistream-TDT kernels require CUDA.")
 class TestMultistreamTDTLossNumba:
     """Validate the fused Numba CUDA kernels against the differentiable reference."""
@@ -186,6 +279,43 @@ class TestMultistreamTDTLossNumba:
             loss_nb.item(),
         )
         assert torch.allclose(acts_ref.grad.float(), acts_nb.grad.float(), atol=atol, rtol=rtol), (
+            (acts_ref.grad - acts_nb.grad).abs().max().item()
+        )
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("sigma", [0.0, 0.05])
+    @pytest.mark.parametrize("stream_weights", [[2.0, 0.5, 1.0], [1.0, 0.3, 1.7]])
+    def test_numba_weighted_matches_reference(self, sigma, stream_weights):
+        from nemo.collections.asr.parts.numba.rnnt_loss.rnnt_pytorch import MultistreamTDTLossNumba
+
+        acts, labels, act_lens, label_lens, durations, dividers, blank = _build_inputs('cuda', dtype=torch.float64)
+
+        acts_ref = acts.clone().detach().requires_grad_(True)
+        ref = MultistreamTDTLossPytorch(
+            blank=blank,
+            durations=durations,
+            dividers=dividers,
+            reduction='sum',
+            sigma=sigma,
+            stream_weights=stream_weights,
+        )
+        loss_ref = ref(acts_ref, labels, act_lens, label_lens)
+        loss_ref.backward()
+
+        acts_nb = acts.clone().detach().requires_grad_(True)
+        numba_loss = MultistreamTDTLossNumba(
+            blank=blank,
+            durations=durations,
+            dividers=dividers,
+            reduction='sum',
+            sigma=sigma,
+            stream_weights=stream_weights,
+        )
+        loss_nb = numba_loss(acts_nb, labels, act_lens, label_lens)
+        loss_nb.backward()
+
+        assert torch.allclose(loss_ref.float(), loss_nb.float().view_as(loss_ref), atol=1e-5, rtol=1e-5)
+        assert torch.allclose(acts_ref.grad.float(), acts_nb.grad.float(), atol=1e-5, rtol=1e-5), (
             (acts_ref.grad - acts_nb.grad).abs().max().item()
         )
 

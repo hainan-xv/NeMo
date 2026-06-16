@@ -410,6 +410,38 @@ class MultiblankRNNTLossPytorch(Loss):
 NEG_INF = -1e30
 
 
+def build_stream_weight_vector(
+    dividers: Sequence[int],
+    stream_weights: Optional[Sequence[float]],
+    device=None,
+    dtype=None,
+) -> Optional[torch.Tensor]:
+    """Build a per-vocabulary weight vector over the joint *label* part.
+
+    The label part of the joint is partitioned into ``len(dividers) - 1`` streams
+    by ``dividers``; ``stream_weights[i]`` scales the per-token log-probability of
+    stream ``i`` (in ``dividers`` order). The shared blank lives at the end of the
+    last stream, so it inherits the last stream's weight.
+
+    Returns ``None`` when ``stream_weights`` is ``None`` or all weights are 1.0,
+    so callers can skip the multiply entirely and keep the unweighted path
+    numerically identical to before.
+    """
+    n_streams = len(dividers) - 1
+    if stream_weights is None:
+        return None
+    if len(stream_weights) != n_streams:
+        raise ValueError(
+            f"`stream_weights` must have one entry per stream ({n_streams}), got {len(stream_weights)}."
+        )
+    if all(float(w) == 1.0 for w in stream_weights):
+        return None
+    w = torch.ones(int(dividers[-1]), device=device, dtype=dtype)
+    for i in range(n_streams):
+        w[dividers[i] : dividers[i + 1]] = float(stream_weights[i])
+    return w
+
+
 def _lse(terms: List[float]) -> float:
     """logsumexp over a python list of floats, computed in float64 for accuracy."""
     if len(terms) == 0:
@@ -601,18 +633,24 @@ class MultistreamTDTLossPytorch(Loss):
         dividers: Optional[List[int]] = None,
         reduction: str = 'sum',
         sigma: float = 0.0,
+        stream_weights: Optional[Sequence[float]] = None,
     ):
         super().__init__()
         if dividers is None or len(dividers) < 2:
             raise ValueError("`dividers` must be a list with at least 2 entries marking the stream boundaries.")
         if dividers[-1] != blank + 1:
             raise ValueError(f"Expected dividers[-1] ({dividers[-1]}) == blank + 1 ({blank + 1}).")
+        if stream_weights is not None and len(stream_weights) != len(dividers) - 1:
+            raise ValueError(
+                f"`stream_weights` must have one entry per stream ({len(dividers) - 1}), got {len(stream_weights)}."
+            )
         self.blank = blank
         self.durations = list(durations)
         self.n_durations = len(durations)
         self.dividers = list(dividers)
         self.reduction = reduction
         self.sigma = sigma
+        self.stream_weights = tuple(stream_weights) if stream_weights is not None else None
 
     def _reduce(self, losses, label_lens):
         if self.reduction == 'mean_batch':
@@ -638,6 +676,10 @@ class MultistreamTDTLossPytorch(Loss):
             parts.append(torch.log_softmax(label_acts[..., self.dividers[i] : self.dividers[i + 1]], dim=-1) - self.sigma)
         label_logp = torch.cat(parts, dim=-1)
         dur_logp = torch.log_softmax(dur_acts, dim=-1)
+
+        w_vec = build_stream_weight_vector(self.dividers, self.stream_weights, label_logp.device, label_logp.dtype)
+        if w_vec is not None:
+            label_logp = label_logp * w_vec
 
         forward_logprob = self.compute_forward_prob(label_logp, dur_logp, labels, act_lens, label_lens)
         losses = -forward_logprob
@@ -686,12 +728,21 @@ class _MultistreamTDTLossFunction(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, acts, labels, act_lens, label_lens, blank, durations, dividers, sigma):
+    def forward(ctx, acts, labels, act_lens, label_lens, blank, durations, dividers, sigma, stream_weights):
         label_logp, dur_logp, label_p, dur_p = _split_multistream_tdt_acts(acts, dividers, sigma, durations)
 
+        # Per-stream weighting: scale each stream's log-prob by its weight before the
+        # forward-backward (emission score becomes sum_k w_k * logp_k). The grad returned
+        # below is w.r.t. the *weighted* log-probs, so we chain the weight back through the
+        # `label_logp * w_vec` multiply to recover the grad w.r.t. the raw per-stream log-probs.
+        w_vec = build_stream_weight_vector(dividers, stream_weights, label_logp.device, label_logp.dtype)
+        weighted_logp = label_logp if w_vec is None else label_logp * w_vec
+
         costs, g_label_logp, g_dur_logp = multistream_tdt_alpha_beta_grad(
-            label_logp, dur_logp, labels, act_lens, label_lens, durations, blank
+            weighted_logp, dur_logp, labels, act_lens, label_lens, durations, blank
         )
+        if w_vec is not None:
+            g_label_logp = g_label_logp * w_vec
 
         # Backprop through per-stream log-softmax (label) and duration log-softmax.
         # For y = log_softmax(x): dL/dx = dL/dy - softmax(x) * sum(dL/dy).
@@ -710,7 +761,7 @@ class _MultistreamTDTLossFunction(torch.autograd.Function):
     def backward(ctx, grad_output):
         (grad_acts,) = ctx.saved_tensors
         grad = grad_acts * grad_output.view(-1, 1, 1, 1).to(grad_acts)
-        return grad, None, None, None, None, None, None, None
+        return grad, None, None, None, None, None, None, None, None
 
 
 class MultistreamTDTLoss(Loss):
@@ -745,18 +796,25 @@ class MultistreamTDTLoss(Loss):
         reduction: str = 'sum',
         sigma: float = 0.0,
         clamp: float = -1.0,
+        stream_weights: Optional[Sequence[float]] = None,
     ):
         super().__init__()
         if dividers is None or len(dividers) < 2:
             raise ValueError("`dividers` must be a list with at least 2 entries marking the stream boundaries.")
         if dividers[-1] != blank + 1:
             raise ValueError(f"Expected dividers[-1] ({dividers[-1]}) == blank + 1 ({blank + 1}).")
+        if stream_weights is not None and len(stream_weights) != len(dividers) - 1:
+            raise ValueError(
+                f"`stream_weights` must have one entry per stream ({len(dividers) - 1}), got {len(stream_weights)}."
+            )
         self.blank = blank
         self.durations = tuple(durations)
         self.dividers = tuple(dividers)
         self.reduction = reduction
         self.sigma = float(sigma)
         self.clamp = float(clamp) if clamp and clamp > 0 else 0.0
+        # None (or all-ones) => unweighted path, numerically identical to before.
+        self.stream_weights = tuple(float(w) for w in stream_weights) if stream_weights is not None else None
         self._numba_loss = None
 
     def _get_numba_loss(self):
@@ -772,6 +830,7 @@ class MultistreamTDTLoss(Loss):
                 reduction='none',
                 sigma=self.sigma,
                 clamp=self.clamp,
+                stream_weights=self.stream_weights,
             )
         return self._numba_loss
 
@@ -783,7 +842,15 @@ class MultistreamTDTLoss(Loss):
             losses = self._get_numba_loss()(acts, labels, act_lens, label_lens)
         else:
             losses = _MultistreamTDTLossFunction.apply(
-                acts, labels, act_lens, label_lens, self.blank, self.durations, self.dividers, self.sigma
+                acts,
+                labels,
+                act_lens,
+                label_lens,
+                self.blank,
+                self.durations,
+                self.dividers,
+                self.sigma,
+                self.stream_weights,
             )
 
         if self.reduction == 'mean_batch':

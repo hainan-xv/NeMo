@@ -115,6 +115,7 @@ class GreedyBatchedMultiStreamTDTLabelLoopingComputer(GreedyBatchedLabelLoopingC
         encoder_output_length: torch.Tensor,
         prev_batched_state: Optional[BatchedLabelLoopingState] = None,
         multi_biasing_ids: Optional[torch.Tensor] = None,
+        chunk_frame_lengths: Optional[torch.Tensor] = None,
     ):
         raise NotImplementedError(
             "CUDA graphs are not supported for the multistream TDT batched decoder. Use `torch_impl`."
@@ -126,6 +127,7 @@ class GreedyBatchedMultiStreamTDTLabelLoopingComputer(GreedyBatchedLabelLoopingC
         encoder_output_length: torch.Tensor,
         prev_batched_state: Optional[BatchedLabelLoopingState] = None,
         multi_biasing_ids: Optional[torch.Tensor] = None,
+        chunk_frame_lengths: Optional[torch.Tensor] = None,
     ) -> tuple[rnnt_utils.BatchedHyps, None, BatchedLabelLoopingState]:
         """Pure-PyTorch batched greedy label-looping decoding (multistream TDT)."""
         batch_size, max_time, _unused = encoder_output.shape
