@@ -30,6 +30,22 @@ model:
     num_cap: 4                   # ALL_LOWER / ALL_UPPER / FIRST_UPPER / OTHER
     tdt_durations: null          # null => inherit base model's TDT durations
 
+  # Overrides merged (by the entrypoint) into the encoder config that is copied
+  # verbatim from the base model, whose config has no knowledge of these fields.
+  # The audio-duration-aware embedding is OFF by default here so the standard
+  # SpellCap recipe is unchanged; the experiment launcher
+  # (ord3/multistream_tdt_durationemb_finetune.sh) turns it on via CLI overrides.
+  # When enabled: a trainable [n_buckets, d_out] table indexed by the utterance
+  # duration (ceil to `resolution` s, clamped at `max_seconds`), added as a
+  # per-utterance bias to the encoder output (random-init; warm-start leaves it).
+  encoder_overrides:
+    duration_embedding: false
+    duration_emb_max_seconds: 20.0
+    duration_emb_resolution: 0.5
+    # seconds per ENCODER-output frame; null => 0.01 * subsampling_factor (0.08 for 8x)
+    duration_emb_seconds_per_frame: null
+    duration_emb_init_std: 0.02
+
   train_ds:
     manifest_filepath: null
     sample_rate: ${model.sample_rate}

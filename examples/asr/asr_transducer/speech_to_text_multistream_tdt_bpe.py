@@ -115,6 +115,14 @@ def main(cfg):
     if durations is not None:
         durations = list(durations)
 
+    # Allow the yaml/CLI to override fields of the encoder config that was copied
+    # verbatim from the base model (e.g. to enable the audio-duration-aware
+    # embedding, which the base model's encoder config does not know about).
+    enc_overrides = cfg.model.get("encoder_overrides", None)
+    if enc_overrides is not None and "encoder" in arch:
+        arch["encoder"].update(OmegaConf.to_container(enc_overrides, resolve=True))
+        logging.info(f"Applied encoder_overrides to derived encoder cfg: {dict(enc_overrides)}")
+
     md = arch.setdefault("model_defaults", {})
     # allow CLI/yaml to override; otherwise fall back to base/defaults
     cli_md = cfg.model.get("model_defaults", None)

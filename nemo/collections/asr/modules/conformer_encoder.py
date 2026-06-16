@@ -335,6 +335,11 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         use_pytorch_sdpa: bool = False,
         use_pytorch_sdpa_backends=None,
         sync_max_audio_length: bool = True,
+        duration_embedding: bool = False,
+        duration_emb_max_seconds: float = 20.0,
+        duration_emb_resolution: float = 0.5,
+        duration_emb_seconds_per_frame: Optional[float] = None,
+        duration_emb_init_std: float = 0.02,
     ):
         super().__init__()
         d_ff = d_model * ff_expansion_factor
@@ -502,6 +507,26 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         else:
             self.out_proj = None
             self._feat_out = d_model
+
+        # Optional audio-duration-aware embedding: a trainable [n_buckets, _feat_out]
+        # table indexed by the (ceil'd) utterance duration in seconds, added as a
+        # per-utterance bias to the encoder output (broadcast over time). Lets the
+        # model condition its behavior on how long the audio is. Offline use only
+        # (skipped on the cache-aware streaming path, where total duration is unknown).
+        self.use_duration_embedding = bool(duration_embedding)
+        if self.use_duration_embedding:
+            self.duration_emb_resolution = float(duration_emb_resolution)
+            self.duration_emb_max_seconds = float(duration_emb_max_seconds)
+            if duration_emb_seconds_per_frame is None:
+                # FastConformer-style preprocessor: 10 ms window stride * subsampling.
+                self.duration_emb_seconds_per_frame = 0.01 * self.subsampling_factor
+            else:
+                self.duration_emb_seconds_per_frame = float(duration_emb_seconds_per_frame)
+            self.num_duration_buckets = max(1, math.ceil(self.duration_emb_max_seconds / self.duration_emb_resolution))
+            # Index 0 is reserved/unused; valid bucket indices are 1..num_duration_buckets.
+            self.duration_embedding = nn.Embedding(self.num_duration_buckets + 1, self._feat_out)
+            nn.init.normal_(self.duration_embedding.weight, mean=0.0, std=float(duration_emb_init_std))
+
         self.set_max_audio_length(self.pos_emb_max_len)
         self.use_pad_mask = True
 
@@ -764,6 +789,15 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
 
         audio_signal = torch.transpose(audio_signal, 1, 2)
         length = length.to(dtype=torch.int64)
+
+        # Add the audio-duration-aware bias to the encoder output. Only on the
+        # offline path: with cache-aware streaming the total duration isn't known.
+        if self.use_duration_embedding and cache_last_channel is None:
+            seconds = length.to(audio_signal.dtype) * self.duration_emb_seconds_per_frame
+            dur_idx = torch.ceil(seconds / self.duration_emb_resolution).to(torch.int64)
+            dur_idx = dur_idx.clamp(min=1, max=self.num_duration_buckets)
+            dur_emb = self.duration_embedding(dur_idx)  # [B, _feat_out]
+            audio_signal = audio_signal + dur_emb.unsqueeze(-1)  # broadcast over time
 
         if cache_last_channel is not None:
             cache_last_channel_next = torch.stack(cache_last_channel_next, dim=0)
