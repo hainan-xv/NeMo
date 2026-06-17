@@ -147,6 +147,7 @@ class GreedyBatchedMultiStreamCapPunctTDTLabelLoopingComputer(GreedyBatchedLabel
             float_dtype=float_dtype,
             is_with_durations=self.include_duration,
         )
+        score_dtype = batched_hyps.scores.dtype
 
         model_durations = self.durations.to(device, non_blocking=True)
         num_durations = model_durations.shape[0]
@@ -188,7 +189,8 @@ class GreedyBatchedMultiStreamCapPunctTDTLabelLoopingComputer(GreedyBatchedLabel
             sp_scores, sp_k = spell_log_probs.max(dim=-1)  # spell incl. blank
             cp_scores, cp_k = cap_log_probs.max(dim=-1)
             pn_scores, pn_k = punct_log_probs.max(dim=-1)
-            return sp_scores + cp_scores + pn_scores, sp_k, cp_k, pn_k
+            scores = (sp_scores + cp_scores + pn_scores).to(dtype=score_dtype)
+            return scores, sp_k, cp_k, pn_k
 
         while active_mask.any():
             active_mask_prev.copy_(active_mask)

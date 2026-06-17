@@ -149,6 +149,7 @@ class GreedyBatchedMultiStreamTDTLabelLoopingComputer(GreedyBatchedLabelLoopingC
             float_dtype=float_dtype,
             is_with_durations=self.include_duration,
         )
+        score_dtype = batched_hyps.scores.dtype
 
         model_durations = self.durations.to(device, non_blocking=True)
         num_durations = model_durations.shape[0]
@@ -204,7 +205,7 @@ class GreedyBatchedMultiStreamTDTLabelLoopingComputer(GreedyBatchedLabelLoopingC
             cap_log_probs = F.log_softmax(label_logits[:, :num_cap], dim=-1)
             scores, spell_labels = spell_log_probs.max(dim=-1)
             cap_scores, cap_labels = cap_log_probs.max(dim=-1)
-            scores = scores + cap_scores
+            scores = (scores + cap_scores).to(dtype=score_dtype)
             durations = model_durations[logits[:, -num_durations:].argmax(dim=-1)]
 
             # blank in the spelling stream means "no emission" for this index on this frame
@@ -234,7 +235,7 @@ class GreedyBatchedMultiStreamTDTLabelLoopingComputer(GreedyBatchedLabelLoopingC
                 cap_log_probs = F.log_softmax(label_logits[:, :num_cap], dim=-1)
                 more_scores, more_spell = spell_log_probs.max(dim=-1)
                 more_cap_scores, more_cap = cap_log_probs.max(dim=-1)
-                more_scores = more_scores + more_cap_scores
+                more_scores = (more_scores + more_cap_scores).to(dtype=score_dtype)
                 # replace labels/scores for indices that are still advancing
                 torch.where(advance_mask, more_spell, spell_labels, out=spell_labels)
                 torch.where(advance_mask, more_cap, cap_labels, out=cap_labels)
