@@ -235,7 +235,8 @@ def get_text(sample):
 
 def write_manifest(references, predictions, model_id, dataset_path, dataset_name, split,
                    audio_length=None, transcription_time=None,
-                   references_formatted=None, predictions_formatted=None):
+                   references_formatted=None, predictions_formatted=None,
+                   audio_filepaths=None, sample_ids=None):
     """Write a results manifest.
 
     ``text`` / ``pred_text`` hold the *verbatim* reference and the *formatted* decode output
@@ -256,7 +257,8 @@ def write_manifest(references, predictions, model_id, dataset_path, dataset_name
             ref_fmt = references_formatted[idx] if references_formatted is not None else references[idx]
             pred_fmt = predictions_formatted[idx] if predictions_formatted is not None else predictions[idx]
             datum = {
-                "audio_filepath": f"sample_{idx}",
+                "audio_filepath": audio_filepaths[idx] if audio_filepaths is not None else f"sample_{idx}",
+                "sample_id": sample_ids[idx] if sample_ids is not None else f"sample_{idx}",
                 "duration": audio_length[idx] if audio_length else None,
                 "time": transcription_time[idx] if transcription_time else None,
                 "text": ref_fmt,
@@ -302,7 +304,7 @@ def main(args):
         dataset = dataset.take(args.max_eval_samples)
 
     print("Downloading and caching audio samples...")
-    all_data = {"audio_filepaths": [], "durations": [], "references": [], "references_raw": []}
+    all_data = {"audio_filepaths": [], "durations": [], "references": [], "references_raw": [], "sample_ids": []}
     for sample in tqdm(dataset, desc="Processing samples"):
         ref_raw = get_text(sample)
         ref = text_normalizer(ref_raw)
@@ -346,6 +348,7 @@ def main(args):
             soundfile.write(audio_path, audio_array, 16000)
         info = soundfile.info(audio_path)
         all_data["audio_filepaths"].append(audio_path)
+        all_data["sample_ids"].append(sample_id)
         all_data["durations"].append(info.duration)
         all_data["references"].append(ref)
         all_data["references_raw"].append(ref_raw)
@@ -392,6 +395,7 @@ def main(args):
         all_data["references"], predictions, model_label, args.dataset_path, args.dataset, args.split,
         audio_length=all_data["durations"], transcription_time=[avg_time] * n_samples,
         references_formatted=all_data["references_raw"], predictions_formatted=predictions_formatted,
+        audio_filepaths=all_data["audio_filepaths"], sample_ids=all_data["sample_ids"],
     )
     print("Results saved at:", os.path.abspath(manifest_path))
 

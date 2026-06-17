@@ -53,6 +53,11 @@ model:
     max_duration: 40.0
     min_duration: 0.1
     # lhotse fields are typically set from the launch script (use_lhotse, input_cfg, bucketing)
+    # Optional timing regularization. Enable with perturb_speed=true; mild factors
+    # are recommended based on AMI robustness probes.
+    perturb_speed: false
+    perturb_speed_factors: [0.97, 1.0, 1.03]
+    perturb_speed_weights: null
 
   validation_ds:
     manifest_filepath: null

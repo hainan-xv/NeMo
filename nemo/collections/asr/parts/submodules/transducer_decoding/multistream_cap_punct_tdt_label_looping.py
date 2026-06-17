@@ -31,6 +31,7 @@ CUDA graphs are NOT supported yet: the computer always runs the pure-PyTorch :me
 from typing import Optional
 
 import torch
+import torch.nn.functional as F
 from omegaconf import ListConfig
 
 from nemo.collections.asr.parts.submodules.transducer_decoding.label_looping_base import (
@@ -179,12 +180,15 @@ class GreedyBatchedMultiStreamCapPunctTDTLabelLoopingComputer(GreedyBatchedLabel
         durations = torch.zeros_like(batch_indices)
 
         def split_label_logits(logits):
-            """Return (spell_scores, spell_k, cap_k, punct_k) from the label part of `logits`."""
+            """Return (joint log-prob score, spell_k, cap_k, punct_k) from label logits."""
             label_logits = logits[:, :-num_durations]
-            sp_scores, sp_k = label_logits[:, spell_start:].max(dim=-1)  # spell incl. blank
-            _, cp_k = label_logits[:, cap_start:spell_start].max(dim=-1)
-            _, pn_k = label_logits[:, :cap_start].max(dim=-1)
-            return sp_scores, sp_k, cp_k, pn_k
+            spell_log_probs = F.log_softmax(label_logits[:, spell_start:], dim=-1)
+            cap_log_probs = F.log_softmax(label_logits[:, cap_start:spell_start], dim=-1)
+            punct_log_probs = F.log_softmax(label_logits[:, :cap_start], dim=-1)
+            sp_scores, sp_k = spell_log_probs.max(dim=-1)  # spell incl. blank
+            cp_scores, cp_k = cap_log_probs.max(dim=-1)
+            pn_scores, pn_k = punct_log_probs.max(dim=-1)
+            return sp_scores + cp_scores + pn_scores, sp_k, cp_k, pn_k
 
         while active_mask.any():
             active_mask_prev.copy_(active_mask)

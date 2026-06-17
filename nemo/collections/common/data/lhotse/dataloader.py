@@ -170,8 +170,12 @@ class LhotseDataLoadingConfig:
     )
     noise_snr: tuple[float, float] = (10.0, 20.0)
     noise_mix_prob: float = 0.5
-    #   b. On-the-fly 3-way speed perturbation.
+    #   b. On-the-fly speed perturbation. By default, this preserves the legacy
+    #      3-way setup [0.9, 1.0, 1.1]. Override perturb_speed_factors for milder
+    #      timing regularization, e.g. [0.97, 1.0, 1.03].
     perturb_speed: bool = False
+    perturb_speed_factors: Optional[List[float]] = None
+    perturb_speed_weights: Optional[List[float]] = None
     #   c. Cut concatenation (glue together multiple utterances into a single one)
     concatenate_samples: bool = False
     concatenate_gap_seconds: float = 0.1
@@ -638,11 +642,25 @@ def get_lhotse_sampler_from_config(config, global_rank, world_size, tokenizer=No
     #    and applying it here (before sampler/dataset) ensures optimal
     #    bucket allocation.
     if config.perturb_speed:
-        cuts = CutSet.mux(
-            cuts,
-            cuts.perturb_speed(0.9),
-            cuts.perturb_speed(1.1),
-        )
+        factors = list(config.perturb_speed_factors or [0.9, 1.0, 1.1])
+        if not factors:
+            raise ValueError("perturb_speed=True requires at least one factor in perturb_speed_factors")
+        if any(float(f) <= 0 for f in factors):
+            raise ValueError(f"perturb_speed_factors must be positive, got {factors}")
+
+        weights = None
+        if config.perturb_speed_weights is not None:
+            weights = list(config.perturb_speed_weights)
+            if len(weights) != len(factors):
+                raise ValueError(
+                    "perturb_speed_weights must have the same length as perturb_speed_factors "
+                    f"(got {len(weights)} weights for {len(factors)} factors)"
+                )
+
+        perturbed_cuts = [cuts if float(f) == 1.0 else cuts.perturb_speed(float(f)) for f in factors]
+        # ``shard_seed`` may be a special Lhotse value such as "randomized".
+        # Use the already resolved numeric training seed for augmentation sampling.
+        cuts = CutSet.mux(*perturbed_cuts, weights=weights, seed=config.seed)
 
     # 2.d: truncation/slicing
     if config.truncate_duration is not None:

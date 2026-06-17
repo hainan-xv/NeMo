@@ -29,6 +29,12 @@ model:
     # bucketing params
     bucketing_strategy: "fully_randomized"
     bucketing_batch_size: null
+    # Optional timing regularization via Lhotse. Enable with:
+    #   model.train_ds.use_lhotse=true model.train_ds.perturb_speed=true
+    # Mild factors are recommended; 0.9/1.1 was too aggressive in AMI robustness probes.
+    perturb_speed: false
+    perturb_speed_factors: [0.97, 1.0, 1.03]
+    perturb_speed_weights: null
 
   validation_ds:
     manifest_filepath: ???

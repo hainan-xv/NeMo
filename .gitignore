@@ -203,6 +203,12 @@ results/
 .tmp_cache/
 .mplconfig/
 
+# Model artifacts: NeMo/Lightning checkpoints are multi-GB and exceed GitHub's
+# 100MB file limit, so they must never be committed (a stray *.nemo once
+# bloated a sync push to 2.4GB).
+*.nemo
+*.ckpt
+
 # Launch scripts that embed personal secrets (HF/WANDB tokens) and per-user
 # cluster paths. Kept locally only; rsync to the cluster via the per-dir sync.sh
 # instead of git. Covers ord/, ord2/, ord3/, ... so secrets never get committed.

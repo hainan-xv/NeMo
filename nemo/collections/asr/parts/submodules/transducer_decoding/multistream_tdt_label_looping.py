@@ -34,6 +34,7 @@ CUDA graphs are NOT supported here yet: the computer always runs the pure-PyTorc
 from typing import Optional
 
 import torch
+import torch.nn.functional as F
 from omegaconf import ListConfig
 
 from nemo.collections.asr.parts.submodules.transducer_decoding.label_looping_base import (
@@ -199,8 +200,11 @@ class GreedyBatchedMultiStreamTDTLabelLoopingComputer(GreedyBatchedLabelLoopingC
             )
             label_logits = logits[:, :-num_durations]  # [B, cap | spell | blank]
             # spelling (incl. blank) and capitalization are chosen by argmax over their own slices
-            scores, spell_labels = label_logits[:, num_cap:].max(dim=-1)
-            _cap_scores, cap_labels = label_logits[:, :num_cap].max(dim=-1)
+            spell_log_probs = F.log_softmax(label_logits[:, num_cap:], dim=-1)
+            cap_log_probs = F.log_softmax(label_logits[:, :num_cap], dim=-1)
+            scores, spell_labels = spell_log_probs.max(dim=-1)
+            cap_scores, cap_labels = cap_log_probs.max(dim=-1)
+            scores = scores + cap_scores
             durations = model_durations[logits[:, -num_durations:].argmax(dim=-1)]
 
             # blank in the spelling stream means "no emission" for this index on this frame
@@ -226,8 +230,11 @@ class GreedyBatchedMultiStreamTDTLabelLoopingComputer(GreedyBatchedLabelLoopingC
                     .squeeze(1)
                 )
                 label_logits = logits[:, :-num_durations]
-                more_scores, more_spell = label_logits[:, num_cap:].max(dim=-1)
-                _more_cap_scores, more_cap = label_logits[:, :num_cap].max(dim=-1)
+                spell_log_probs = F.log_softmax(label_logits[:, num_cap:], dim=-1)
+                cap_log_probs = F.log_softmax(label_logits[:, :num_cap], dim=-1)
+                more_scores, more_spell = spell_log_probs.max(dim=-1)
+                more_cap_scores, more_cap = cap_log_probs.max(dim=-1)
+                more_scores = more_scores + more_cap_scores
                 # replace labels/scores for indices that are still advancing
                 torch.where(advance_mask, more_spell, spell_labels, out=spell_labels)
                 torch.where(advance_mask, more_cap, cap_labels, out=cap_labels)
