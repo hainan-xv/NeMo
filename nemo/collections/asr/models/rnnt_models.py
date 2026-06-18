@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import copy
+import json
 import os
 from math import ceil
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -189,6 +190,171 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
         # Setup encoder adapters (from ASRAdapterModelMixin)
         self.setup_adapters()
+
+        # Optional multi-target heads (token + pronunciation). Built last so the
+        # standard RNN-T token head (decoder/joint/loss/decoding/wer) is fully set
+        # up first and remains the primary inference/eval path.
+        self._setup_multi_target()
+
+    def _setup_multi_target(self):
+        """Build auxiliary pronunciation RNN-T heads that share the encoder.
+
+        Enabled via ``model.multi_target.enabled=true``. Each auxiliary head is a
+        full ``(RNNTDecoder + RNNTJoint + RNNTLoss)`` predicting a *pronunciation*
+        relabeling of the char target: ``notone`` (toneless syllable) and, if
+        ``enable_tone`` (default True), ``tone`` (tonal syllable). Because Mandarin
+        is monosyllabic the pron target is an element-wise relabel of the char
+        target (same length), so no dataloader change is needed.
+
+        Per training step a single head (token or an aux head) is sampled and
+        trained; the others are kept in the autograd graph via a zero-weighted
+        parameter term (see ``_multi_target_training_step``) to avoid DDP
+        unused-parameter errors. The token head remains the only inference path.
+        """
+        mt_cfg = self.cfg.get('multi_target', None)
+        self.multi_target_enabled = bool(mt_cfg is not None and mt_cfg.get('enabled', False))
+        if not self.multi_target_enabled:
+            return
+        if self.loss_type != 'rnnt':
+            raise ValueError("model.multi_target is only supported with loss_type='rnnt'.")
+
+        data = self._load_or_inline_pron_map(mt_cfg)
+        if list(data['labels']) != list(self.cfg.labels):
+            raise ValueError(
+                "multi_target pron map 'labels' do not match model.labels "
+                f"({len(data['labels'])} vs {len(self.cfg.labels)}); regenerate pron_map with build_pron_map.py."
+            )
+
+        enable_tone = bool(mt_cfg.get('enable_tone', True))
+        head_specs = [('notone', list(data['notone_vocab']), list(data['labels_to_notone']))]
+        if enable_tone:
+            head_specs.append(('tone', list(data['tone_vocab']), list(data['labels_to_tone'])))
+
+        self.aux_head_names: List[str] = []
+        self.aux_decoders = torch.nn.ModuleList()
+        self.aux_joints = torch.nn.ModuleList()
+        self.aux_losses = torch.nn.ModuleList()
+        rnnt_reduction = self.cfg.get('rnnt_reduction', 'mean_batch')
+
+        for name, vocab, mapping in head_specs:
+            dec_cfg = copy.deepcopy(self.cfg.decoder)
+            joint_cfg = copy.deepcopy(self.cfg.joint)
+            with open_dict(dec_cfg):
+                dec_cfg.vocab_size = len(vocab)
+            with open_dict(joint_cfg):
+                joint_cfg.num_classes = len(vocab)
+                joint_cfg.vocabulary = list(vocab)
+                joint_cfg.jointnet.encoder_hidden = self.cfg.model_defaults.enc_hidden
+                joint_cfg.jointnet.pred_hidden = self.cfg.model_defaults.pred_hidden
+                # Aux heads always train with a plain, non-fused RNN-T joint+loss.
+                joint_cfg.fuse_loss_wer = False
+                joint_cfg.fused_batch_size = None
+
+            decoder = EncDecRNNTModel.from_config_dict(dec_cfg)
+            joint = EncDecRNNTModel.from_config_dict(joint_cfg)
+            loss = RNNTLoss(
+                num_classes=joint.num_classes_with_blank - 1,
+                loss_name='default',
+                reduction=rnnt_reduction,
+            )
+
+            self.aux_head_names.append(name)
+            self.aux_decoders.append(decoder)
+            self.aux_joints.append(joint)
+            self.aux_losses.append(loss)
+            # char_id -> pron_class_id lookup. Derived from the (inlined) cfg, so
+            # non-persistent: it is rebuilt at every construction/restore.
+            self.register_buffer(
+                f'_mt_map_{name}', torch.tensor(mapping, dtype=torch.long), persistent=False
+            )
+
+        n_heads = 1 + len(self.aux_head_names)  # token + aux heads
+        weights = mt_cfg.get('sample_weights', None)
+        weights = [1.0] * n_heads if weights is None else [float(w) for w in weights]
+        if len(weights) != n_heads:
+            raise ValueError(
+                f"model.multi_target.sample_weights must have {n_heads} entries "
+                f"(token + {len(self.aux_head_names)} aux heads), got {len(weights)}."
+            )
+        self.register_buffer('_mt_sample_weights', torch.tensor(weights, dtype=torch.float), persistent=False)
+        logging.info(
+            f"[multi_target] enabled with heads: ['token'(+{len(self.cfg.labels)}) "
+            + ", ".join(f"'{n}'(+{j.num_classes_with_blank - 1})" for n, j in zip(self.aux_head_names, self.aux_joints))
+            + f"]; sample_weights={weights}"
+        )
+
+    def _load_or_inline_pron_map(self, mt_cfg) -> dict:
+        """Return the pron-map dict, preferring the copy inlined in cfg.
+
+        On first construction the map is read from ``pron_map_path`` and inlined
+        into ``self.cfg.multi_target.pron_map`` so the saved ``.nemo`` is
+        self-contained (no pypinyin / external file needed at restore time).
+        """
+        if mt_cfg.get('pron_map', None) is not None:
+            return OmegaConf.to_container(mt_cfg.pron_map, resolve=True)
+        path = mt_cfg.get('pron_map_path', None)
+        if not path or not os.path.exists(path):
+            raise FileNotFoundError(
+                f"model.multi_target.pron_map_path not found: {path!r}. Generate it with "
+                "rno/build_pron_map.py and mount it into the container."
+            )
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        with open_dict(self.cfg):
+            self.cfg.multi_target.pron_map = data
+        return data
+
+    def _mt_sample_head_index(self) -> int:
+        """Pick which head to train this step.
+
+        Seeded by ``global_step`` so every DDP rank (and every grad-accumulation
+        microbatch within a step) selects the *same* head without communication --
+        otherwise different ranks would grad different params and desync.
+        """
+        step = int(self.trainer.global_step) if self.trainer is not None else 0
+        g = torch.Generator()
+        g.manual_seed((0x9E3779B9 ^ step) & 0x7FFFFFFF)
+        idx = torch.multinomial(self._mt_sample_weights.detach().cpu(), 1, generator=g).item()
+        return int(idx)
+
+    def _multi_target_training_step(self, encoded, encoded_len, transcript, transcript_len):
+        """Single-sampled-head RNN-T training step for the multi-target model."""
+        head_idx = self._mt_sample_head_index()
+        if head_idx == 0:
+            head_name = 'token'
+            targets, target_len = transcript, transcript_len
+            decoder, joint, loss_fn = self.decoder, self.joint, self.loss
+        else:
+            aux = head_idx - 1
+            head_name = self.aux_head_names[aux]
+            mapping = getattr(self, f'_mt_map_{head_name}')
+            targets = mapping[transcript.long()]
+            target_len = transcript_len
+            decoder, joint, loss_fn = self.aux_decoders[aux], self.aux_joints[aux], self.aux_losses[aux]
+
+        decoder_out, target_len, _ = decoder(targets=targets, target_length=target_len)
+        joint_out = joint(encoder_outputs=encoded, decoder_outputs=decoder_out, encoder_lengths=encoded_len)
+        loss_value = loss_fn(
+            log_probs=joint_out, targets=targets, input_lengths=encoded_len, target_lengths=target_len
+        )
+
+        # Keep every parameter in the autograd graph this step. The inactive heads
+        # contribute 0*sum(params) -> a real (zero) grad rather than None, which is
+        # what DDP requires (no need for find_unused_parameters).
+        loss_value = loss_value + 0.0 * sum(p.sum() for p in self.parameters())
+        loss_value = self.add_auxiliary_losses(loss_value)
+
+        if AccessMixin.is_access_enabled(self.model_guid):
+            AccessMixin.reset_registry(self)
+
+        tensorboard_logs = {
+            'train_loss': loss_value,
+            f'train_loss_{head_name}': loss_value.detach(),
+            'learning_rate': self._optimizer.param_groups[0]['lr'],
+            'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
+        }
+        self.log_dict(tensorboard_logs)
+        return {'loss': loss_value}
 
     def _setup_aligner_model_components(self):
         """Set up Aligner-Encoder components inside the RNNT model lifecycle."""
@@ -1440,6 +1606,10 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
             self.log_dict(tensorboard_logs)
             return {'loss': loss_value}
+
+        # Multi-target (token + pronunciation) path: sample one head and train it.
+        if getattr(self, 'multi_target_enabled', False):
+            return self._multi_target_training_step(encoded, encoded_len, transcript, transcript_len)
 
         # During training, loss must be computed, so decoder forward is necessary
         decoder, target_length, states = self.decoder(targets=transcript, target_length=transcript_len)
