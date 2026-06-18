@@ -62,6 +62,27 @@ from nemo.core.neural_types import AcousticEncodedRepresentation, AudioSignal, L
 from nemo.utils import logging
 
 
+class _RemapInputEmbedding(torch.nn.Module):
+    """Embedding wrapper that remaps incoming label ids before lookup.
+
+    Used by the multi-target model when the shared prediction network is driven by
+    a *pronunciation* label stream while the rest of the RNN-T pipeline (joint /
+    decoding) still operates on the character/token vocabulary. The prediction net
+    is fed character ids (during both training and greedy decoding), and this
+    wrapper converts each char id to its pronunciation class id (toneless or tonal)
+    before the underlying embedding lookup. The trailing slot of ``remap`` maps the
+    token blank/pad id to the embedding's pad row, so padded positions are safe.
+    """
+
+    def __init__(self, base_embedding: torch.nn.Embedding, remap: torch.Tensor):
+        super().__init__()
+        self.base = base_embedding
+        self.register_buffer('remap', remap, persistent=False)
+
+    def forward(self, y: torch.Tensor) -> torch.Tensor:
+        return self.base(self.remap[y.long()])
+
+
 class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTranscriptionMixin):
     """Base class for encoder decoder RNNT-based models."""
 
@@ -197,19 +218,28 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         self._setup_multi_target()
 
     def _setup_multi_target(self):
-        """Build auxiliary pronunciation RNN-T heads that share the encoder.
+        """Build auxiliary pronunciation joint heads that share the encoder + decoder.
 
-        Enabled via ``model.multi_target.enabled=true``. Each auxiliary head is a
-        full ``(RNNTDecoder + RNNTJoint + RNNTLoss)`` predicting a *pronunciation*
-        relabeling of the char target: ``notone`` (toneless syllable) and, if
-        ``enable_tone`` (default True), ``tone`` (tonal syllable). Because Mandarin
-        is monosyllabic the pron target is an element-wise relabel of the char
-        target (same length), so no dataloader change is needed.
+        Enabled via ``model.multi_target.enabled=true``. There is a SINGLE shared
+        prediction network (``self.decoder``) and one ``(joint + loss)`` per target:
+        the token head (``self.joint``/``self.loss``) plus auxiliary heads predicting
+        a *pronunciation* relabeling of the char target -- ``notone`` (toneless
+        syllable) and, if ``enable_tone`` (default True), ``tone`` (tonal syllable).
 
-        Per training step a single head (token or an aux head) is sampled and
-        trained; the others are kept in the autograd graph via a zero-weighted
-        parameter term (see ``_multi_target_training_step``) to avoid DDP
-        unused-parameter errors. The token head remains the only inference path.
+        The shared predictor's input stream is configurable via
+        ``model.multi_target.predictor_input`` (``token`` | ``notone`` | ``tone``):
+        the predictor conditions on that label stream while the joint heads (and the
+        decoded output vocabulary) are unchanged.
+
+        Because Mandarin is monosyllabic the pron target is an element-wise relabel
+        of the char target (same length), so no dataloader change is needed, and the
+        shared char-driven decoder gives every head an identical U-axis -- keeping
+        the per-head RNN-T alignments in sync.
+
+        Per training step a single head is sampled and trained; the inactive joint
+        heads are kept in the autograd graph via a zero-weighted parameter term (see
+        ``_multi_target_training_step``) to avoid DDP unused-parameter errors. The
+        token head remains the only inference/eval path.
         """
         mt_cfg = self.cfg.get('multi_target', None)
         self.multi_target_enabled = bool(mt_cfg is not None and mt_cfg.get('enabled', False))
@@ -231,27 +261,29 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             head_specs.append(('tone', list(data['tone_vocab']), list(data['labels_to_tone'])))
 
         self.aux_head_names: List[str] = []
-        self.aux_decoders = torch.nn.ModuleList()
         self.aux_joints = torch.nn.ModuleList()
         self.aux_losses = torch.nn.ModuleList()
         rnnt_reduction = self.cfg.get('rnnt_reduction', 'mean_batch')
 
+        # The shared prediction net (self.decoder) is driven by the char/token
+        # labels; its output (pred_hidden) feeds every joint. So each aux head only
+        # needs its own joint (with its pron vocab) + loss -- no extra decoder.
         for name, vocab, mapping in head_specs:
-            dec_cfg = copy.deepcopy(self.cfg.decoder)
             joint_cfg = copy.deepcopy(self.cfg.joint)
-            with open_dict(dec_cfg):
-                dec_cfg.vocab_size = len(vocab)
             with open_dict(joint_cfg):
                 joint_cfg.num_classes = len(vocab)
                 joint_cfg.vocabulary = list(vocab)
                 joint_cfg.jointnet.encoder_hidden = self.cfg.model_defaults.enc_hidden
                 joint_cfg.jointnet.pred_hidden = self.cfg.model_defaults.pred_hidden
-                # Aux heads always train with a plain, non-fused RNN-T joint+loss.
+                # Aux heads always train with a non-fused joint+loss.
                 joint_cfg.fuse_loss_wer = False
                 joint_cfg.fused_batch_size = None
 
-            decoder = EncDecRNNTModel.from_config_dict(dec_cfg)
             joint = EncDecRNNTModel.from_config_dict(joint_cfg)
+            # CHAT: if this is an attention joint (RNNTAttJoint) and chunk_size was
+            # not set explicitly, infer it the same way the token head does.
+            if hasattr(joint, 'chunk_size') and joint.chunk_size <= 0:
+                joint.chunk_size = self._infer_chat_chunk_size()
             loss = RNNTLoss(
                 num_classes=joint.num_classes_with_blank - 1,
                 loss_name='default',
@@ -259,7 +291,6 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             )
 
             self.aux_head_names.append(name)
-            self.aux_decoders.append(decoder)
             self.aux_joints.append(joint)
             self.aux_losses.append(loss)
             # char_id -> pron_class_id lookup. Derived from the (inlined) cfg, so
@@ -277,10 +308,78 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 f"(token + {len(self.aux_head_names)} aux heads), got {len(weights)}."
             )
         self.register_buffer('_mt_sample_weights', torch.tensor(weights, dtype=torch.float), persistent=False)
+
+        # Configurable input to the shared prediction network. By default it is fed
+        # the char/token labels ('token'); it can instead be driven by the toneless
+        # ('notone') or tonal ('tone') pronunciation stream. The joint heads (and
+        # hence the model output vocab) are unchanged -- only the autoregressive
+        # context the predictor conditions on changes.
+        predictor_input = str(mt_cfg.get('predictor_input', 'token')).lower()
+        if predictor_input not in ('token', 'notone', 'tone'):
+            raise ValueError(
+                f"model.multi_target.predictor_input must be 'token', 'notone' or 'tone', got '{predictor_input}'."
+            )
+        self.predictor_input = predictor_input
+        if predictor_input == 'notone':
+            self._rebuild_shared_predictor(list(data['notone_vocab']), list(data['labels_to_notone']))
+        elif predictor_input == 'tone':
+            self._rebuild_shared_predictor(list(data['tone_vocab']), list(data['labels_to_tone']))
+
         logging.info(
-            f"[multi_target] enabled with heads: ['token'(+{len(self.cfg.labels)}) "
+            f"[multi_target] enabled with predictor_input='{predictor_input}'; heads: "
+            f"['token'(+{len(self.cfg.labels)}) "
             + ", ".join(f"'{n}'(+{j.num_classes_with_blank - 1})" for n, j in zip(self.aux_head_names, self.aux_joints))
             + f"]; sample_weights={weights}"
+        )
+
+    def _rebuild_shared_predictor(self, pred_vocab: List[str], char2pred: List[int]):
+        """Rebuild ``self.decoder`` so it embeds a pronunciation label stream.
+
+        The new prediction network's embedding spans the pronunciation vocab
+        (``pred_vocab``), but it is wrapped so its public interface still accepts
+        character ids: each char id is remapped to its pron class id (``char2pred``)
+        before the embedding lookup. This keeps the training step and the greedy
+        decoding loop (which feed char ids) completely unchanged, while the
+        autoregressive context the predictor sees is the pronunciation stream.
+
+        Decoding/WER are rebuilt afterwards so the greedy strategy references the new
+        predictor. The token joint head remains the inference/eval output path.
+        """
+        token_vocab_size = len(self.cfg.labels)
+        pred_vocab_size = len(pred_vocab)
+
+        decoder_cfg = copy.deepcopy(self.cfg.decoder)
+        with open_dict(decoder_cfg):
+            decoder_cfg.vocab_size = pred_vocab_size
+        new_decoder = EncDecRNNTModel.from_config_dict(decoder_cfg)
+
+        # char id -> pron class id; the trailing slot maps the token blank/pad id to
+        # the embedding's pad row (index == pred_vocab_size).
+        remap = torch.full((token_vocab_size + 1,), pred_vocab_size, dtype=torch.long)
+        remap[:token_vocab_size] = torch.tensor(char2pred, dtype=torch.long)
+        new_decoder.prediction["embed"] = _RemapInputEmbedding(new_decoder.prediction["embed"], remap)
+        # Keep the predictor's blank id aligned with the token vocab so any external
+        # blank comparison / feed matches the rest of the (char-vocab) pipeline; the
+        # remap routes that id to the embedding pad row.
+        new_decoder.blank_idx = token_vocab_size
+
+        self.decoder = new_decoder
+
+        # Rebuild decoding + WER so the (greedy/beam) strategy points at the new
+        # predictor. The token joint head stays the output vocabulary.
+        self.cfg.decoding = self.set_decoding_type_according_to_loss(self.cfg.decoding)
+        self.decoding = RNNTDecoding(
+            decoding_cfg=self.cfg.decoding,
+            decoder=self.decoder,
+            joint=self.joint,
+            vocabulary=self.joint.vocabulary,
+        )
+        self.wer = WER(
+            decoding=self.decoding,
+            batch_dim_index=0,
+            use_cer=self._cfg.get('use_cer', False),
+            log_prediction=self._cfg.get('log_prediction', True),
+            dist_sync_on_step=True,
         )
 
     def _load_or_inline_pron_map(self, mt_cfg) -> dict:
@@ -318,24 +417,39 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         return int(idx)
 
     def _multi_target_training_step(self, encoded, encoded_len, transcript, transcript_len):
-        """Single-sampled-head RNN-T training step for the multi-target model."""
+        """Single-sampled-head training step for the multi-target model.
+
+        The shared prediction net runs once on the char/token labels, so every head
+        sees the same U-axis. Only the sampled head's (joint + loss) is computed;
+        its targets are the char labels (token head) or their pron relabeling.
+        """
+        # The shared predictor is always *fed* char ids; when predictor_input is a
+        # pronunciation stream its embedding remaps char -> pron internally
+        # (_RemapInputEmbedding), so this call is identical for every input mode.
+        decoder_out, target_len, _ = self.decoder(targets=transcript, target_length=transcript_len)
+
         head_idx = self._mt_sample_head_index()
         if head_idx == 0:
             head_name = 'token'
-            targets, target_len = transcript, transcript_len
-            decoder, joint, loss_fn = self.decoder, self.joint, self.loss
+            targets = transcript
+            joint, loss_fn = self.joint, self.loss
         else:
             aux = head_idx - 1
             head_name = self.aux_head_names[aux]
-            mapping = getattr(self, f'_mt_map_{head_name}')
-            targets = mapping[transcript.long()]
-            target_len = transcript_len
-            decoder, joint, loss_fn = self.aux_decoders[aux], self.aux_joints[aux], self.aux_losses[aux]
+            # Element-wise relabel char ids -> pron class ids (same length / U-axis).
+            targets = getattr(self, f'_mt_map_{head_name}')[transcript.long()]
+            joint, loss_fn = self.aux_joints[aux], self.aux_losses[aux]
 
-        decoder_out, target_len, _ = decoder(targets=targets, target_length=target_len)
         joint_out = joint(encoder_outputs=encoded, decoder_outputs=decoder_out, encoder_lengths=encoded_len)
+        # For CHAT (RNNTAttJoint) the joint time-axis is the number of chunks, not
+        # encoder frames, so the loss input length must come from the joint's
+        # per-utterance chunk count (set during its forward). Plain RNN-T/TDT joints
+        # leave it None / unset, so fall back to encoded_len in that case.
+        effective_len = getattr(joint, 'num_chunks_per_utterance', None)
+        if effective_len is None:
+            effective_len = encoded_len
         loss_value = loss_fn(
-            log_probs=joint_out, targets=targets, input_lengths=encoded_len, target_lengths=target_len
+            log_probs=joint_out, targets=targets, input_lengths=effective_len, target_lengths=target_len
         )
 
         # Keep every parameter in the autograd graph this step. The inactive heads
