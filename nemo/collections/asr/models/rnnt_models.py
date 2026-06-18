@@ -260,6 +260,18 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         if enable_tone:
             head_specs.append(('tone', list(data['tone_vocab']), list(data['labels_to_tone'])))
 
+        # char_id -> pron_class_id lookups. Registered for BOTH notone and tone
+        # regardless of which aux heads are trained, because they are also used to
+        # report multi-representation error rates (char / notone / tone) from a
+        # single decode (see ``_mt_repr_error_counts``). Derived from the (inlined)
+        # cfg, so non-persistent -- rebuilt at every construction/restore.
+        self.register_buffer(
+            '_mt_map_notone', torch.tensor(list(data['labels_to_notone']), dtype=torch.long), persistent=False
+        )
+        self.register_buffer(
+            '_mt_map_tone', torch.tensor(list(data['labels_to_tone']), dtype=torch.long), persistent=False
+        )
+
         self.aux_head_names: List[str] = []
         self.aux_joints = torch.nn.ModuleList()
         self.aux_losses = torch.nn.ModuleList()
@@ -268,7 +280,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         # The shared prediction net (self.decoder) is driven by the char/token
         # labels; its output (pred_hidden) feeds every joint. So each aux head only
         # needs its own joint (with its pron vocab) + loss -- no extra decoder.
-        for name, vocab, mapping in head_specs:
+        for name, vocab, _mapping in head_specs:
             joint_cfg = copy.deepcopy(self.cfg.joint)
             with open_dict(joint_cfg):
                 joint_cfg.num_classes = len(vocab)
@@ -293,11 +305,9 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             self.aux_head_names.append(name)
             self.aux_joints.append(joint)
             self.aux_losses.append(loss)
-            # char_id -> pron_class_id lookup. Derived from the (inlined) cfg, so
-            # non-persistent: it is rebuilt at every construction/restore.
-            self.register_buffer(
-                f'_mt_map_{name}', torch.tensor(mapping, dtype=torch.long), persistent=False
-            )
+            # The char->pron map for this head was already registered above as
+            # ``_mt_map_{notone,tone}`` (shared with the multi-representation
+            # reporting), so no per-head buffer is needed here.
 
         n_heads = 1 + len(self.aux_head_names)  # token + aux heads
         weights = mt_cfg.get('sample_weights', None)
@@ -416,6 +426,46 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         idx = torch.multinomial(self._mt_sample_weights.detach().cpu(), 1, generator=g).item()
         return int(idx)
 
+    def _mt_repr_error_counts(self, encoded, encoded_len, transcript, transcript_len):
+        """Edit-distance error counts for char / notone / tone, from ONE decode.
+
+        The token head is decoded once (greedy) into char id sequences; both the
+        hypotheses and the char references are then projected into each
+        representation via the precomputed char->pron maps and scored with edit
+        distance. So no representation requires a separate decode: a homophone
+        substitution counts as a char error but not a (toneless/tonal) pinyin error.
+
+        Returns ``{rep: [edits, ref_len]}`` for rep in ('char', 'notone', 'tone').
+        """
+        notone_map = self._mt_map_notone.detach().cpu()
+        tone_map = self._mt_map_tone.detach().cpu()
+
+        def to_seq(ids: List[int], rep: str) -> List[int]:
+            if rep == 'char':
+                return list(ids)
+            m = notone_map if rep == 'notone' else tone_map
+            return m[torch.as_tensor(ids, dtype=torch.long)].tolist() if len(ids) else []
+
+        hyps = self.decoding.rnnt_decoder_predictions_tensor(
+            encoder_output=encoded.detach(), encoded_lengths=encoded_len, return_hypotheses=True
+        )
+        transcript = transcript.long().cpu()
+        transcript_len = transcript_len.long().cpu()
+
+        reps = ('char', 'notone', 'tone')
+        counts = {r: [0, 0] for r in reps}
+        for b, hyp in enumerate(hyps):
+            ref_ids = transcript[b, : int(transcript_len[b])].tolist()
+            hyp_ids = hyp.y_sequence
+            if torch.is_tensor(hyp_ids):
+                hyp_ids = hyp_ids.tolist()
+            for r in reps:
+                ref_seq = to_seq(ref_ids, r)
+                hyp_seq = to_seq(hyp_ids, r)
+                counts[r][0] += editdistance.eval(hyp_seq, ref_seq)
+                counts[r][1] += len(ref_seq)
+        return counts
+
     def _multi_target_training_step(self, encoded, encoded_len, transcript, transcript_len):
         """Single-sampled-head training step for the multi-target model.
 
@@ -467,6 +517,29 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             'learning_rate': self._optimizer.param_groups[0]['lr'],
             'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
         }
+
+        # Training error rates. Like the standard RNN-T step, compute every
+        # ``log_every_n_steps`` -- otherwise nothing populates ``training_batch_wer``
+        # and it never appears in TensorBoard/W&B. A SINGLE token-head decode yields
+        # all three representations (char / notone / tone) via the char->pron maps,
+        # so a homophone substitution shows up as a char error but not a pinyin one.
+        # Always measured on the token head (the eval/output path) regardless of
+        # which head was sampled, so the curves stay comparable across the
+        # token/notone/tone predictor variants.
+        if self._trainer is not None:
+            log_every_n_steps = self._trainer.log_every_n_steps
+            sample_id = self._trainer.global_step
+        else:
+            log_every_n_steps = 1
+            sample_id = 0
+        if log_every_n_steps > 0 and (sample_id + 1) % log_every_n_steps == 0:
+            counts = self._mt_repr_error_counts(encoded, encoded_len, transcript, transcript_len)
+            for rep, (edits, ref_len) in counts.items():
+                key = 'training_batch_wer' if rep == 'char' else f'training_batch_wer_{rep}'
+                tensorboard_logs[key] = torch.tensor(
+                    edits / max(ref_len, 1), dtype=torch.float32, device=encoded.device
+                )
+
         self.log_dict(tensorboard_logs)
         return {'loss': loss_value}
 
@@ -1886,18 +1959,34 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
                 tensorboard_logs['val_loss'] = loss_value
 
-            self.wer.update(
-                predictions=encoded,
-                predictions_lengths=encoded_len,
-                targets=transcript,
-                targets_lengths=transcript_len,
-            )
-            wer, wer_num, wer_denom = self.wer.compute()
-            self.wer.reset()
+            if getattr(self, 'multi_target_enabled', False):
+                # One decode -> char / notone / tone error rates. val_wer (char) stays
+                # the monitored metric; the pinyin reps are extra diagnostics.
+                counts = self._mt_repr_error_counts(encoded, encoded_len, transcript, transcript_len)
+                for rep, (edits, ref_len) in counts.items():
+                    prefix = 'val_wer' if rep == 'char' else f'val_wer_{rep}'
+                    tensorboard_logs[f'{prefix}_num'] = torch.tensor(
+                        edits, dtype=torch.float32, device=encoded.device
+                    )
+                    tensorboard_logs[f'{prefix}_denom'] = torch.tensor(
+                        ref_len, dtype=torch.float32, device=encoded.device
+                    )
+                tensorboard_logs['val_wer'] = torch.tensor(
+                    counts['char'][0] / max(counts['char'][1], 1), dtype=torch.float32, device=encoded.device
+                )
+            else:
+                self.wer.update(
+                    predictions=encoded,
+                    predictions_lengths=encoded_len,
+                    targets=transcript,
+                    targets_lengths=transcript_len,
+                )
+                wer, wer_num, wer_denom = self.wer.compute()
+                self.wer.reset()
 
-            tensorboard_logs['val_wer_num'] = wer_num
-            tensorboard_logs['val_wer_denom'] = wer_denom
-            tensorboard_logs['val_wer'] = wer
+                tensorboard_logs['val_wer_num'] = wer_num
+                tensorboard_logs['val_wer_denom'] = wer_denom
+                tensorboard_logs['val_wer'] = wer
 
         else:
             # If experimental fused Joint-Loss-WER is used
@@ -1956,6 +2045,15 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         wer_num = torch.stack([x['val_wer_num'] for x in outputs]).sum()
         wer_denom = torch.stack([x['val_wer_denom'] for x in outputs]).sum()
         tensorboard_logs = {**val_loss_log, 'val_wer': wer_num.float() / wer_denom}
+        # Aggregate any additional representation-level error rates (e.g.
+        # val_wer_notone / val_wer_tone from the multi-target model), each logged as
+        # summed num/denom per step so the epoch value is a proper micro-average.
+        for base in sorted({k[:-4] for k in outputs[0] if k.endswith('_num') and k != 'val_wer_num'}):
+            if f'{base}_denom' not in outputs[0]:
+                continue
+            num = torch.stack([x[f'{base}_num'] for x in outputs]).sum()
+            denom = torch.stack([x[f'{base}_denom'] for x in outputs]).sum()
+            tensorboard_logs[base] = num.float() / torch.clamp(denom, min=1.0)
         if (
             self.loss_type in ('aligner', 'chunked_aligner')
             and self.trainer is not None
@@ -1983,6 +2081,12 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         wer_num = torch.stack([x['test_wer_num'] for x in outputs]).sum()
         wer_denom = torch.stack([x['test_wer_denom'] for x in outputs]).sum()
         tensorboard_logs = {**test_loss_log, 'test_wer': wer_num.float() / wer_denom}
+        for base in sorted({k[:-4] for k in outputs[0] if k.endswith('_num') and k != 'test_wer_num'}):
+            if f'{base}_denom' not in outputs[0]:
+                continue
+            num = torch.stack([x[f'{base}_num'] for x in outputs]).sum()
+            denom = torch.stack([x[f'{base}_denom'] for x in outputs]).sum()
+            tensorboard_logs[base] = num.float() / torch.clamp(denom, min=1.0)
         return {**test_loss_log, 'log': tensorboard_logs}
 
     """ Transcription related methods """
