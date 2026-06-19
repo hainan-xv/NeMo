@@ -19,6 +19,7 @@ from nemo.collections.asr.modules.audio_preprocessing import (  # noqa: F401
     CropOrPadSpectrogramAugmentation,
     MaskedPatchAugmentation,
     SpectrogramAugmentation,
+    SpectrogramTimePitchWarp,
 )
 from nemo.collections.asr.modules.beam_search_decoder import BeamSearchDecoderWithLM  # noqa: F401
 from nemo.collections.asr.modules.chunk_alternating_conformer_encoder import (  # noqa: F401
@@ -65,6 +66,7 @@ __all__ = [
     'AudioToMelSpectrogramPreprocessor',
     'AudioToMFCCPreprocessor',
     'CropOrPadSpectrogramAugmentation',
+    'SpectrogramTimePitchWarp',
     'MaskedPatchAugmentation',
     'SpectrogramAugmentation',
     'BeamSearchDecoderWithLM',

@@ -42,6 +42,7 @@ __all__ = [
     'AudioToMelSpectrogramPreprocessor',
     'AudioToMFCCPreprocessor',
     'SpectrogramAugmentation',
+    'SpectrogramTimePitchWarp',
     'MaskedPatchAugmentation',
     'CropOrPadSpectrogramAugmentation',
 ]
@@ -526,6 +527,109 @@ class SpectrogramAugmentation(NeuralModule):
         else:
             augmented_spec = self.spec_augment(input_spec=augmented_spec, length=length)
         return augmented_spec
+
+
+class SpectrogramTimePitchWarp(NeuralModule):
+    """Independent 2-D (time x pitch) warp of a (mel-)spectrogram.
+
+    Decouples the two axes that ordinary speed perturbation forces together:
+
+      * Time factor ``alpha`` -> a *tempo* change. The valid region of each
+        sample is stretched/compressed to ``round(alpha * length)`` frames
+        (pitch unchanged). This changes the returned sequence ``length``.
+      * Pitch factor ``beta`` -> a *frequency-axis* warp (VTLP-style). A feature
+        originally at bin ``b`` is mapped to output bin ``beta * b`` (duration
+        unchanged). NOTE: this warps the mel-bin axis directly, a cheap
+        approximation of true linear-Hz VTLP.
+
+    Both factors are sampled *independently per sample* as the average of two
+    i.i.d. ``Uniform[1 - dev, 1 + dev]`` draws -- a symmetric triangular
+    distribution centered at 1.0 that favors mild warps over the extremes. Set a
+    per-axis ``dev`` of 0 to disable that axis.
+
+    Implemented as a single ``grid_sample`` (one bilinear resample handles both
+    axes at once). Applied on the spectrogram, so no waveform resynthesis is
+    needed. Intended for training only; the caller should guard with
+    ``model.training`` and feed the returned ``length`` to the encoder/loss.
+
+    Args:
+        time_warp (float): max deviation ``dev`` for the time factor. Must be in
+            ``[0.0, 1.0)``. ``0`` disables time warping. Default 0.3 -> [0.7, 1.3].
+        pitch_warp (float): max deviation ``dev`` for the pitch factor. Must be in
+            ``[0.0, 1.0)``. ``0`` disables pitch warping. Default 0.3 -> [0.7, 1.3].
+        prob (float): per-batch probability of applying the warp. Default 1.0.
+    """
+
+    @property
+    def input_types(self):
+        """Returns definitions of module input types"""
+        return {
+            "input_spec": NeuralType(('B', 'D', 'T'), SpectrogramType()),
+            "length": NeuralType(tuple('B'), LengthsType()),
+        }
+
+    @property
+    def output_types(self):
+        """Returns definitions of module output types"""
+        return {
+            "augmented_spec": NeuralType(('B', 'D', 'T'), SpectrogramType()),
+            "length": NeuralType(tuple('B'), LengthsType()),
+        }
+
+    def __init__(self, time_warp: float = 0.3, pitch_warp: float = 0.3, prob: float = 1.0):
+        super().__init__()
+        for name, dev in (("time_warp", time_warp), ("pitch_warp", pitch_warp)):
+            if not (0.0 <= dev < 1.0):
+                raise ValueError(f"{name} must be in [0.0, 1.0), got {dev}")
+        if not (0.0 <= prob <= 1.0):
+            raise ValueError(f"prob must be in [0.0, 1.0], got {prob}")
+        self.time_dev = float(time_warp)
+        self.pitch_dev = float(pitch_warp)
+        self.prob = float(prob)
+
+    def _sample_factor(self, dev, n, device):
+        """Per-sample factor = mean of two U[1-dev, 1+dev] draws (triangular)."""
+        if dev <= 0.0:
+            return torch.ones(n, device=device)
+        lo, hi = 1.0 - dev, 1.0 + dev
+        u = torch.rand(n, 2, device=device) * (hi - lo) + lo
+        return u.mean(dim=1)
+
+    @typecheck()
+    def forward(self, input_spec, length):
+        if (self.time_dev <= 0.0 and self.pitch_dev <= 0.0) or (self.prob < 1.0 and random.random() >= self.prob):
+            return input_spec, length
+
+        B, D, T = input_spec.shape
+        device = input_spec.device
+        alpha = self._sample_factor(self.time_dev, B, device)  # time / tempo
+        beta = self._sample_factor(self.pitch_dev, B, device)  # pitch / freq
+
+        # New per-sample valid lengths after the time warp (factor < 2 by construction).
+        new_length = torch.clamp((length.to(torch.float32) * alpha).round().long(), min=1)
+        T_out = int(new_length.max().item())
+
+        # align_corners=True index<->normalized mapping, guard size-1 dims.
+        t_den = max(T - 1, 1)
+        d_den = max(D - 1, 1)
+
+        w = torch.arange(T_out, device=device, dtype=torch.float32)  # [T_out]
+        h = torch.arange(D, device=device, dtype=torch.float32)  # [D]
+        # output time index w samples input time w / alpha; output bin h samples input bin h / beta.
+        ti = w[None, :] / alpha[:, None]  # [B, T_out]
+        fi = h[None, :] / beta[:, None]  # [B, D]
+        gx = 2.0 * ti / t_den - 1.0  # normalized x (time/width)
+        gy = 2.0 * fi / d_den - 1.0  # normalized y (freq/height)
+        grid_x = gx[:, None, :].expand(B, D, T_out)
+        grid_y = gy[:, :, None].expand(B, D, T_out)
+        grid = torch.stack((grid_x, grid_y), dim=-1)  # [B, D, T_out, 2]
+
+        inp = input_spec.unsqueeze(1).to(torch.float32)  # [B, 1, D, T]
+        out = torch.nn.functional.grid_sample(
+            inp, grid, mode='bilinear', padding_mode='border', align_corners=True
+        )
+        out = out.squeeze(1).to(input_spec.dtype)  # [B, D, T_out]
+        return out, new_length
 
 
 class MaskedPatchAugmentation(NeuralModule):

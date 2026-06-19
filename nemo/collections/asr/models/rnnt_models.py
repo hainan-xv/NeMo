@@ -252,6 +252,14 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         else:
             self.spec_augmentation = None
 
+        # Optional 2-D (time x pitch) feature-domain warp (SpectrogramTimePitchWarp).
+        # Unlike spec_augment, this changes the sequence length, so forward() must
+        # propagate the updated length to the encoder.
+        if hasattr(self.cfg, 'spec_warp') and self._cfg.spec_warp is not None:
+            self.spec_warp = EncDecRNNTModel.from_config_dict(self.cfg.spec_warp)
+        else:
+            self.spec_warp = None
+
         # 'aligner' and 'chunked_aligner' use their own decoding objects (set up
         # above) plus a manual edit-distance WER; only standard RNN-T uses the
         # RNNTDecoding + WER metric objects here.
@@ -1958,6 +1966,12 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         # Spec augment is not applied during evaluation/testing
         if self.spec_augmentation is not None and self.training:
             processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
+
+        # Feature-domain time/pitch warp (training only); updates the sequence length.
+        if self.spec_warp is not None and self.training:
+            processed_signal, processed_signal_length = self.spec_warp(
+                input_spec=processed_signal, length=processed_signal_length
+            )
 
         encoded, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
 
