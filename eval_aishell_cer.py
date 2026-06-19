@@ -143,6 +143,20 @@ def main(args):
     if args.consistency_weights:
         consistency_weights = [float(w) for w in args.consistency_weights.replace(",", " ").split()]
 
+    if args.agreement:
+        print(f"Scoring cross-head agreement on {n} samples (decoded-context, top-1)...")
+        rates = R.head_agreement_rates(model, audio_files, args.batch_size)
+        print("\n" + "=" * 70)
+        print("Cross-head top-1 agreement (over cells where both heads emit non-blank):")
+        order_keys = ["token_notone", "token_tone", "notone_tone", "all3"]
+        for pair in order_keys + [k for k in rates if k not in order_keys]:
+            if pair not in rates:
+                continue
+            rate, agree, denom = rates[pair]
+            print(f"  {pair:14s}: {100 * rate:6.2f} %  ({agree}/{denom})")
+        print("=" * 70)
+        return rates
+
     print(f"Transcribing {n} samples...{' [consistency decode]' if args.consistency else ''}")
     start = time.time()
     hyps = transcribe(
@@ -216,6 +230,9 @@ if __name__ == "__main__":
     p.add_argument("--consistency_weights", default=None,
                    help="Per-head weights for --consistency, ordered 'token,notone[,tone]' "
                         "(comma/space separated). Default: all 1.0.")
+    p.add_argument("--agreement", action="store_true",
+                   help="Multi-target only: instead of CER, report cross-head top-1 agreement "
+                        "rates (token/notone/tone) over the model's own decoded output.")
     p.add_argument("--keep_spaces", action="store_true",
                    help="Do NOT collapse whitespace before CER (default: collapse, AISHELL convention)")
     p.add_argument("--output", default=None, help="Optional per-utterance results manifest (jsonl)")

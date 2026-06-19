@@ -557,21 +557,28 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         return counts
 
     @torch.no_grad()
-    def _mt_head_agreement(self, encoded, encoded_len, decoder_out, target_len):
-        """Top-1 agreement rates between the heads on the teacher-forced lattice.
+    def _mt_head_agreement_counts(self, encoded, encoded_len, decoder_out, target_len):
+        """Top-1 cross-head agreement *counts* on a (teacher-forced) lattice.
 
         Every head shares the same encoder + prediction-net context, so for each
         lattice cell ``(b, t, u)`` we take each head's argmax and project it into a
         common space via the char->pron maps (token head) and the tone->notone map
-        (tonal head). For each head pair we report, over cells where *both* heads
-        emit a non-blank symbol, the fraction whose projected predictions match
-        (so a homophone counts as agreement in the toneless space). This is a pure
-        diagnostic: it runs under ``no_grad`` and does not affect the loss.
+        (tonal head). For each head pair we count, over cells where *both* heads emit
+        a non-blank symbol, how many have matching projected predictions (so a
+        homophone counts as agreement in the toneless space). This is a pure
+        diagnostic: it runs under ``no_grad`` and never touches the loss.
 
-        Returns ``{name: rate}`` for whichever pairings the active heads support.
+        Returns ``{pair: (agree, denom)}`` (0-dim long tensors) for whichever
+        pairings the active heads support, so callers can either turn them into a
+        per-batch rate (training) or accumulate them across a dataset (inference).
         """
         # name -> joint. Token head is always present; aux heads depend on cfg.
-        joints = {'token': self.joint}
+        # When consistency decoding is active ``self.joint`` is the combining
+        # wrapper, so reach through to the underlying token head for its raw argmax.
+        token_joint = self.joint
+        if isinstance(token_joint, _MultiTargetConsistencyJoint):
+            token_joint = token_joint.joints[0]
+        joints = {'token': token_joint}
         for name, j in zip(self.aux_head_names, self.aux_joints):
             joints[name] = j
 
@@ -595,33 +602,30 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 valid = (t_idx < t_len) & (u_idx < u_len)
             del out
 
-        # Projections into common spaces (sentinel handled by the non-blank masks).
+        # Projections into common spaces (blanks handled by the non-blank masks).
         def proj(name: str, mapping: Optional[torch.Tensor]) -> torch.Tensor:
             p = preds[name]
             if mapping is None:
                 return p
             return mapping.to(p.device)[p.clamp(max=mapping.numel() - 1)]
 
-        def pair_rate(a_name, a_map, b_name, b_map) -> Optional[torch.Tensor]:
+        def pair_counts(a_name, a_map, b_name, b_map) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
             if a_name not in preds or b_name not in preds:
                 return None
             both = valid & (preds[a_name] != blanks[a_name]) & (preds[b_name] != blanks[b_name])
-            denom = both.sum()
-            if denom == 0:
-                return torch.zeros((), dtype=torch.float32, device=encoded.device)
             agree = (proj(a_name, a_map) == proj(b_name, b_map)) & both
-            return agree.sum().float() / denom.float()
+            return agree.sum(), both.sum()
 
-        rates: Dict[str, torch.Tensor] = {}
-        tn = pair_rate('token', self._mt_map_notone, 'notone', None)
+        counts: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
+        tn = pair_counts('token', self._mt_map_notone, 'notone', None)
         if tn is not None:
-            rates['token_notone'] = tn
-        tt = pair_rate('token', self._mt_map_tone, 'tone', None)
+            counts['token_notone'] = tn
+        tt = pair_counts('token', self._mt_map_tone, 'tone', None)
         if tt is not None:
-            rates['token_tone'] = tt
-        nt = pair_rate('notone', None, 'tone', self._mt_tone_to_notone)
+            counts['token_tone'] = tt
+        nt = pair_counts('notone', None, 'tone', self._mt_tone_to_notone)
         if nt is not None:
-            rates['notone_tone'] = nt
+            counts['notone_tone'] = nt
 
         # All-three agreement: cells where all heads are non-blank and the token
         # head's projected pron matches both aux heads.
@@ -632,17 +636,46 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 & (preds['notone'] != blanks['notone'])
                 & (preds['tone'] != blanks['tone'])
             )
-            denom = both.sum()
-            if denom == 0:
-                rates['all3'] = torch.zeros((), dtype=torch.float32, device=encoded.device)
-            else:
-                agree = (
-                    (proj('token', self._mt_map_notone) == preds['notone'])
-                    & (proj('token', self._mt_map_tone) == preds['tone'])
-                    & both
-                )
-                rates['all3'] = agree.sum().float() / denom.float()
-        return rates
+            agree = (
+                (proj('token', self._mt_map_notone) == preds['notone'])
+                & (proj('token', self._mt_map_tone) == preds['tone'])
+                & both
+            )
+            counts['all3'] = (agree.sum(), both.sum())
+        return counts
+
+    @torch.no_grad()
+    def multi_target_agreement_counts(self, encoded, encoded_len):
+        """Cross-head agreement counts on the model's *own* decoded output.
+
+        Inference-time sibling of the teacher-forced training diagnostic: the token
+        head is greedily decoded, the shared prediction net is re-run on that decoded
+        char context, and every head's argmax is compared on the resulting lattice
+        (see :meth:`_mt_head_agreement_counts`). So this reports how consistent the
+        heads are given the autoregressive context the model actually produces.
+
+        Returns ``{pair: (agree, denom)}`` (0-dim long tensors), empty if nothing was
+        emitted in the batch.
+        """
+        hyps = self.decoding.rnnt_decoder_predictions_tensor(
+            encoder_output=encoded, encoded_lengths=encoded_len, return_hypotheses=True
+        )
+        seqs = []
+        for h in hyps:
+            y = h.y_sequence
+            if torch.is_tensor(y):
+                y = y.tolist()
+            seqs.append([int(t) for t in y])
+        lens = torch.tensor([len(s) for s in seqs], dtype=torch.long, device=encoded.device)
+        if int(lens.max().item()) == 0:
+            return {}
+        max_u = int(lens.max().item())
+        transcript = torch.zeros(len(seqs), max_u, dtype=torch.long, device=encoded.device)
+        for i, s in enumerate(seqs):
+            if s:
+                transcript[i, : len(s)] = torch.tensor(s, dtype=torch.long, device=encoded.device)
+        decoder_out, target_len, _ = self.decoder(targets=transcript, target_length=lens)
+        return self._mt_head_agreement_counts(encoded, encoded_len, decoder_out, target_len)
 
     def _multi_target_training_step(self, encoded, encoded_len, transcript, transcript_len):
         """Single-sampled-head training step for the multi-target model.
@@ -717,9 +750,6 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 tensorboard_logs[key] = torch.tensor(
                     edits / max(ref_len, 1), dtype=torch.float32, device=encoded.device
                 )
-            # Cross-head top-1 agreement (pronunciation consistency diagnostic).
-            for pair, rate in self._mt_head_agreement(encoded, encoded_len, decoder_out, target_len).items():
-                tensorboard_logs[f'training_agreement_{pair}'] = rate
 
         self.log_dict(tensorboard_logs)
         return {'loss': loss_value}

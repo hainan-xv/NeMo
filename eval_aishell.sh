@@ -309,6 +309,9 @@ EXTRA_ARGS=()
 # CONSISTENCY=1 ./eval_aishell.sh ...   (optionally CONSISTENCY_WEIGHTS="token,notone,tone")
 [ "${CONSISTENCY:-0}" = "1" ] && EXTRA_ARGS+=(--consistency)
 [ -n "${CONSISTENCY_WEIGHTS:-}" ] && EXTRA_ARGS+=(--consistency_weights "$CONSISTENCY_WEIGHTS")
+# Multi-target only: report cross-head top-1 agreement instead of CER.
+# AGREEMENT=1 ./eval_aishell.sh ...
+[ "${AGREEMENT:-0}" = "1" ] && EXTRA_ARGS+=(--agreement)
 
 EVAL_LOG="${LOCAL_CKPT_DIR}/${EXP_NAME}/eval_aishell_$(basename "${LOCAL_CKPT_PATH}").log"
 mkdir -p "$(dirname "$EVAL_LOG")"

@@ -235,6 +235,37 @@ def transcribe_consistency(model, audio_files, batch_size, head_weights=None):
     return transcribe_tdt(model, audio_files, batch_size)
 
 
+@torch.inference_mode()
+def head_agreement_rates(model, audio_files, batch_size):
+    """Aggregate cross-head top-1 agreement rates over a set of audio files.
+
+    For each batch the encoder is run once, the token head is greedily decoded, and
+    every head's argmax is compared on the model's own decoded context (see
+    ``EncDecRNNTModel.multi_target_agreement_counts``). Counts are summed across the
+    dataset, then turned into rates. Returns ``{pair: (rate, agree, denom)}``.
+    """
+    if not getattr(model, "multi_target_enabled", False):
+        raise SystemExit("--agreement requires a multi_target model (token + pronunciation heads).")
+
+    dloader = torch.utils.data.DataLoader(
+        AudioFileDataset(audio_files),
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+        collate_fn=_collate_audio,
+    )
+    totals = {}  # pair -> [agree, denom]
+    for signal, signal_len in tqdm(dloader, desc="Scoring head agreement"):
+        signal = signal.to(model.device, non_blocking=True)
+        signal_len = signal_len.to(model.device, non_blocking=True)
+        encoded, encoded_len = model.forward(input_signal=signal, input_signal_length=signal_len)
+        for pair, (agree, denom) in model.multi_target_agreement_counts(encoded, encoded_len).items():
+            acc = totals.setdefault(pair, [0, 0])
+            acc[0] += int(agree.item())
+            acc[1] += int(denom.item())
+    return {pair: (agree / denom if denom else 0.0, agree, denom) for pair, (agree, denom) in totals.items()}
+
+
 # --------------------------------------------------------------------------- #
 # Dataset handling -- mirrors run_eval_sslm.py
 # --------------------------------------------------------------------------- #
