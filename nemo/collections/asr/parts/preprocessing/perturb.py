@@ -171,6 +171,55 @@ class SpeedPerturbation(Perturbation):
             return
 
 
+class SpeedPerturbationAvg2(SpeedPerturbation):
+    """Speed perturbation with a continuous, triangular speed-rate distribution.
+
+    Resampling is identical to :class:`SpeedPerturbation`, but instead of a uniform
+    or discretized rate, the speed rate is the *average of two* i.i.d.
+    ``Uniform[min_speed_rate, max_speed_rate]`` draws. That average follows a
+    symmetric triangular distribution centered at the midpoint -- i.e. 1.0 for a
+    symmetric ``[1 - dev, 1 + dev]`` range -- so mild warps near 1.0 are favored
+    over the extremes. ``num_rates`` is ignored (the rate is always continuous).
+
+    Args:
+        sr: Original sampling rate.
+        resample_type: Resampling method ('kaiser_best', 'kaiser_fast', 'fft', 'scipy').
+        min_speed_rate: Lower bound of each uniform draw (e.g. 1 - dev).
+        max_speed_rate: Upper bound of each uniform draw (e.g. 1 + dev).
+        num_rates: Unused; kept for config compatibility with `speed`.
+        rng: Random seed. Default is None.
+    """
+
+    def __init__(self, sr, resample_type, min_speed_rate=0.75, max_speed_rate=1.25, num_rates=-1, rng=None):
+        super().__init__(
+            sr=sr,
+            resample_type=resample_type,
+            min_speed_rate=min_speed_rate,
+            max_speed_rate=max_speed_rate,
+            num_rates=-1,
+            rng=rng,
+        )
+
+    def perturb(self, data):
+        # Triangular factor = mean of two i.i.d. Uniform[min_rate, max_rate] draws.
+        speed_rate = 0.5 * (
+            random.uniform(self._min_rate, self._max_rate) + random.uniform(self._min_rate, self._max_rate)
+        )
+
+        # Skip perturbation in case of identity speed rate
+        if speed_rate == 1.0:
+            return
+
+        new_sr = int(self._sr * speed_rate)
+        try:
+            data._samples = librosa.core.resample(
+                data._samples, orig_sr=self._sr, target_sr=new_sr, res_type=self._res_type
+            )
+        except Exception as e:
+            logging.warning(f"Failed to resample audio from {self._sr} to {new_sr}. Skipping augmentation. Error: {e}")
+            return
+
+
 class TimeStretchPerturbation(Perturbation):
     """
     Time-stretch an audio series by a fixed rate while preserving pitch, based on [1]_, [2]_.
@@ -1120,6 +1169,7 @@ class RandomSegmentPerturbation(Perturbation):
 
 perturbation_types = {
     "speed": SpeedPerturbation,
+    "speed_avg2": SpeedPerturbationAvg2,
     "time_stretch": TimeStretchPerturbation,
     "gain": GainPerturbation,
     "silence": SilencePerturbation,
