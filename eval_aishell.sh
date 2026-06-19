@@ -305,6 +305,10 @@ EXTRA_ARGS=()
 [ -n "$AUDIO_DST_PREFIX" ] && EXTRA_ARGS+=(--audio_dst_prefix "$AUDIO_DST_PREFIX")
 [ -n "$MAX_EVAL_SAMPLES" ] && EXTRA_ARGS+=(--max_eval_samples "$MAX_EVAL_SAMPLES")
 [ "${KEEP_SPACES:-0}" = "1" ] && EXTRA_ARGS+=(--keep_spaces)
+# Multi-target only: consistency-maintaining decode (token + pronunciation heads).
+# CONSISTENCY=1 ./eval_aishell.sh ...   (optionally CONSISTENCY_WEIGHTS="token,notone,tone")
+[ "${CONSISTENCY:-0}" = "1" ] && EXTRA_ARGS+=(--consistency)
+[ -n "${CONSISTENCY_WEIGHTS:-}" ] && EXTRA_ARGS+=(--consistency_weights "$CONSISTENCY_WEIGHTS")
 
 EVAL_LOG="${LOCAL_CKPT_DIR}/${EXP_NAME}/eval_aishell_$(basename "${LOCAL_CKPT_PATH}").log"
 mkdir -p "$(dirname "$EVAL_LOG")"

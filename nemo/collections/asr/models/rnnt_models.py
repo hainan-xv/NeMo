@@ -83,6 +83,89 @@ class _RemapInputEmbedding(torch.nn.Module):
         return self.base(self.remap[y.long()])
 
 
+class _MultiTargetConsistencyJoint(torch.nn.Module):
+    """Joint wrapper that folds the multi-target consistency score into the joiner.
+
+    The multi-target model has one shared encoder + prediction net and several joint
+    heads (token + pronunciation), and every char maps deterministically to a
+    toneless / tonal syllable. This wrapper presents the *token* joint interface but,
+    on each joint evaluation, also evaluates the aux (pron) heads and returns, over
+    the char vocabulary, the consistency score::
+
+        s(c) = w_tok*logP_token(c) + sum_aux w_aux*logP_aux(map_aux[c])
+
+    (the trailing blank entry sums each head's own blank log-prob). Because the
+    combination lives *inside* the joiner, the standard (batched, CUDA-graphed)
+    greedy decoder runs unchanged and stays fast -- no custom decode loop.
+
+    The batched decoder pre-projects the encoder once via ``project_encoder`` and the
+    prednet via ``project_prednet`` and then calls ``joint_after_projection``. Each
+    head has its *own* projections, so here ``project_*`` are identity and every head
+    re-projects internally inside ``joint_after_projection`` / ``joint``. Other
+    attributes (vocab size, chunking, ...) delegate to the token head via __getattr__.
+    """
+
+    def __init__(self, token_joint, aux_joints, aux_maps, weights):
+        super().__init__()
+        # index 0 == token head; the rest are the aux (pron) heads, same order as aux_maps.
+        self.joints = torch.nn.ModuleList([token_joint, *aux_joints])
+        self._num_aux = len(aux_joints)
+        self.weights = [float(w) for w in weights]
+        for i, m in enumerate(aux_maps):
+            # char_id -> pron_class_id for aux head i (non-persistent: this is an
+            # eval-only wrapper, never saved).
+            self.register_buffer(f'_map_{i}', m, persistent=False)
+
+    def __getattr__(self, name):
+        # nn.Module.__getattr__ handles params/buffers/submodules + normal attrs;
+        # anything else (num_classes_with_blank, num_extra_outputs, vocabulary,
+        # encoder_hidden, chunk_size, chunk_encoder_for_decoding, ...) delegates to
+        # the token head so the decoding pipeline sees a normal token joint.
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            joints = self._modules.get('joints', None)
+            if joints is not None and len(joints) > 0:
+                return getattr(joints[0], name)
+            raise
+
+    # Projections are identity; each head re-projects internally (see class doc).
+    def project_encoder(self, encoder_output: torch.Tensor) -> torch.Tensor:
+        return encoder_output
+
+    def project_prednet(self, prednet_output: torch.Tensor) -> torch.Tensor:
+        return prednet_output
+
+    def _combine(self, logits_list: List[torch.Tensor]) -> torch.Tensor:
+        """Combine per-head raw logits (..., V_head+1) into char-vocab log-probs."""
+        tok = logits_list[0].float().log_softmax(dim=-1)
+        v_char = tok.shape[-1] - 1
+        combined = self.weights[0] * tok
+        for i in range(self._num_aux):
+            aux = logits_list[i + 1].float().log_softmax(dim=-1)
+            char2pron = getattr(self, f'_map_{i}')  # [V_char] -> pron id
+            w = self.weights[i + 1]
+            combined[..., :v_char] = combined[..., :v_char] + w * aux[..., char2pron]
+            combined[..., v_char] = combined[..., v_char] + w * aux[..., -1]
+        return combined
+
+    def joint_after_projection(self, f, g, f_len=None):
+        # f, g are *unprojected* (project_* are identity); re-project per head.
+        logits_list = [
+            j.joint_after_projection(j.project_encoder(f), j.project_prednet(g), f_len) for j in self.joints
+        ]
+        # Combine in float32 (log_softmax stability) then cast back to the encoder
+        # dtype: the batched decoder allocates its score buffers from f.dtype, and a
+        # normal joint returns logits in that dtype -- mismatching it (e.g. bf16 buf
+        # vs float32 scores) trips an out-dtype error in BatchedHyps.
+        return self._combine(logits_list).to(f.dtype)
+
+    def joint(self, f, g, f_len=None):
+        # Full path (used by the non-batched greedy decoder); each head handles its
+        # own projection / chunking inside .joint().
+        return self._combine([j.joint(f, g, f_len) for j in self.joints]).to(f.dtype)
+
+
 class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTranscriptionMixin):
     """Base class for encoder decoder RNNT-based models."""
 
@@ -271,6 +354,13 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         self.register_buffer(
             '_mt_map_tone', torch.tensor(list(data['labels_to_tone']), dtype=torch.long), persistent=False
         )
+        # tone_class_id -> notone_class_id, so the tonal head's prediction can be
+        # projected into the toneless space for cross-head agreement (every tonal
+        # syllable comes from some char, whose toneless form is known).
+        tone2notone = [0] * len(data['tone_vocab'])
+        for tone_id, notone_id in zip(data['labels_to_tone'], data['labels_to_notone']):
+            tone2notone[int(tone_id)] = int(notone_id)
+        self.register_buffer('_mt_tone_to_notone', torch.tensor(tone2notone, dtype=torch.long), persistent=False)
 
         self.aux_head_names: List[str] = []
         self.aux_joints = torch.nn.ModuleList()
@@ -466,6 +556,94 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 counts[r][1] += len(ref_seq)
         return counts
 
+    @torch.no_grad()
+    def _mt_head_agreement(self, encoded, encoded_len, decoder_out, target_len):
+        """Top-1 agreement rates between the heads on the teacher-forced lattice.
+
+        Every head shares the same encoder + prediction-net context, so for each
+        lattice cell ``(b, t, u)`` we take each head's argmax and project it into a
+        common space via the char->pron maps (token head) and the tone->notone map
+        (tonal head). For each head pair we report, over cells where *both* heads
+        emit a non-blank symbol, the fraction whose projected predictions match
+        (so a homophone counts as agreement in the toneless space). This is a pure
+        diagnostic: it runs under ``no_grad`` and does not affect the loss.
+
+        Returns ``{name: rate}`` for whichever pairings the active heads support.
+        """
+        # name -> joint. Token head is always present; aux heads depend on cfg.
+        joints = {'token': self.joint}
+        for name, j in zip(self.aux_head_names, self.aux_joints):
+            joints[name] = j
+
+        preds: Dict[str, torch.Tensor] = {}
+        blanks: Dict[str, int] = {}
+        valid = None  # [B, T, U] bool mask of in-bounds cells
+        for name, j in joints.items():
+            out = j(encoder_outputs=encoded, decoder_outputs=decoder_out, encoder_lengths=encoded_len)
+            preds[name] = out.argmax(dim=-1)  # [B, T, U]
+            blanks[name] = out.shape[-1] - 1
+            if valid is None:
+                B, T, U = out.shape[0], out.shape[1], out.shape[2]
+                # CHAT (RNNTAttJoint) time-axis is #chunks; plain joints use frames.
+                t_len = getattr(j, 'num_chunks_per_utterance', None)
+                if t_len is None:
+                    t_len = encoded_len
+                t_len = t_len.to(encoded.device).view(B, 1, 1)
+                u_len = (target_len.to(encoded.device) + 1).view(B, 1, 1)  # +1 for the SOS/blank row
+                t_idx = torch.arange(T, device=encoded.device).view(1, T, 1)
+                u_idx = torch.arange(U, device=encoded.device).view(1, 1, U)
+                valid = (t_idx < t_len) & (u_idx < u_len)
+            del out
+
+        # Projections into common spaces (sentinel handled by the non-blank masks).
+        def proj(name: str, mapping: Optional[torch.Tensor]) -> torch.Tensor:
+            p = preds[name]
+            if mapping is None:
+                return p
+            return mapping.to(p.device)[p.clamp(max=mapping.numel() - 1)]
+
+        def pair_rate(a_name, a_map, b_name, b_map) -> Optional[torch.Tensor]:
+            if a_name not in preds or b_name not in preds:
+                return None
+            both = valid & (preds[a_name] != blanks[a_name]) & (preds[b_name] != blanks[b_name])
+            denom = both.sum()
+            if denom == 0:
+                return torch.zeros((), dtype=torch.float32, device=encoded.device)
+            agree = (proj(a_name, a_map) == proj(b_name, b_map)) & both
+            return agree.sum().float() / denom.float()
+
+        rates: Dict[str, torch.Tensor] = {}
+        tn = pair_rate('token', self._mt_map_notone, 'notone', None)
+        if tn is not None:
+            rates['token_notone'] = tn
+        tt = pair_rate('token', self._mt_map_tone, 'tone', None)
+        if tt is not None:
+            rates['token_tone'] = tt
+        nt = pair_rate('notone', None, 'tone', self._mt_tone_to_notone)
+        if nt is not None:
+            rates['notone_tone'] = nt
+
+        # All-three agreement: cells where all heads are non-blank and the token
+        # head's projected pron matches both aux heads.
+        if {'token', 'notone', 'tone'} <= set(preds):
+            both = (
+                valid
+                & (preds['token'] != blanks['token'])
+                & (preds['notone'] != blanks['notone'])
+                & (preds['tone'] != blanks['tone'])
+            )
+            denom = both.sum()
+            if denom == 0:
+                rates['all3'] = torch.zeros((), dtype=torch.float32, device=encoded.device)
+            else:
+                agree = (
+                    (proj('token', self._mt_map_notone) == preds['notone'])
+                    & (proj('token', self._mt_map_tone) == preds['tone'])
+                    & both
+                )
+                rates['all3'] = agree.sum().float() / denom.float()
+        return rates
+
     def _multi_target_training_step(self, encoded, encoded_len, transcript, transcript_len):
         """Single-sampled-head training step for the multi-target model.
 
@@ -539,9 +717,69 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 tensorboard_logs[key] = torch.tensor(
                     edits / max(ref_len, 1), dtype=torch.float32, device=encoded.device
                 )
+            # Cross-head top-1 agreement (pronunciation consistency diagnostic).
+            for pair, rate in self._mt_head_agreement(encoded, encoded_len, decoder_out, target_len).items():
+                tensorboard_logs[f'training_agreement_{pair}'] = rate
 
         self.log_dict(tensorboard_logs)
         return {'loss': loss_value}
+
+    def enable_consistency_decoding(self, head_weights=None):
+        """Switch decoding to the "consistency-maintaining" joint (in-place).
+
+        Rebuilds ``self.decoding`` so the joiner is the :class:`_MultiTargetConsistencyJoint`
+        wrapper: at every joint evaluation the token score for each char ``c`` is
+        combined with the (toneless/tonal) pronunciation log-probs of the syllables it
+        implies, ``s(c) = w_tok*logP_token(c) + sum_aux w_aux*logP_aux(map[c])``. The
+        combination lives inside the joiner, so the standard fast (batched, CUDA-graph)
+        greedy decoder is reused with no algorithm change -- ``transcribe`` just works.
+
+        Output stays the char vocabulary, so CER is directly comparable to the plain
+        token-head decode.
+
+        Args:
+            head_weights: per-head weights ordered ``[token, notone, tone?]``;
+                defaults to all-ones over (token + active aux heads).
+        """
+        if not getattr(self, 'multi_target_enabled', False):
+            raise RuntimeError("consistency decoding requires a multi_target model.")
+        if self.loss_type != 'rnnt':
+            raise RuntimeError("consistency decoding is only supported for loss_type='rnnt'.")
+
+        n_heads = 1 + len(self.aux_head_names)
+        weights = [1.0] * n_heads if head_weights is None else [float(w) for w in head_weights]
+        if len(weights) != n_heads:
+            raise ValueError(
+                f"head_weights must have {n_heads} entries (token + {len(self.aux_head_names)} aux heads), "
+                f"got {len(weights)}."
+            )
+
+        aux_maps = [getattr(self, f'_mt_map_{name}') for name in self.aux_head_names]
+        cons_joint = _MultiTargetConsistencyJoint(self.joint, list(self.aux_joints), aux_maps, weights)
+
+        # Rebuild decoding + WER around the consistency joint. The token vocabulary
+        # (and hence blank id) is unchanged, so greedy/beam decoding is identical
+        # except that each step's scores already encode cross-head agreement.
+        self.cfg.decoding = self.set_decoding_type_according_to_loss(self.cfg.decoding)
+        self.decoding = RNNTDecoding(
+            decoding_cfg=self.cfg.decoding,
+            decoder=self.decoder,
+            joint=cons_joint,
+            vocabulary=self.joint.vocabulary,
+        )
+        self.wer = WER(
+            decoding=self.decoding,
+            batch_dim_index=0,
+            use_cer=self._cfg.get('use_cer', False),
+            log_prediction=self._cfg.get('log_prediction', True),
+            dist_sync_on_step=True,
+        )
+        logging.info(
+            f"[multi_target] consistency decoding enabled; heads=['token', "
+            + ", ".join(f"'{n}'" for n in self.aux_head_names)
+            + f"]; weights={weights}"
+        )
+        return cons_joint
 
     def _setup_aligner_model_components(self):
         """Set up Aligner-Encoder components inside the RNNT model lifecycle."""

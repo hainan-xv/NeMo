@@ -75,10 +75,14 @@ def normalize(s, keep_spaces):
     return s
 
 
-def transcribe(model, is_multistream, audio_files, batch_size):
+def transcribe(model, is_multistream, audio_files, batch_size, consistency=False, consistency_weights=None):
     """Dispatch to the right decode path (mirrors run_eval_asr.main)."""
     loss_type = getattr(model, "loss_type", None)
     is_aligner_like = loss_type in ("aligner", "chunked_aligner")
+    if consistency:
+        if not getattr(model, "multi_target_enabled", False):
+            raise SystemExit("--consistency requires a multi_target model (token + pronunciation heads).")
+        return R.transcribe_consistency(model, audio_files, batch_size, head_weights=consistency_weights)
     if is_multistream:
         return R.transcribe_multistream(model, audio_files, batch_size)
     if is_aligner_like:
@@ -135,9 +139,20 @@ def main(args):
     references = [references[i] for i in order]
     durations = [durations[i] for i in order]
 
-    print(f"Transcribing {n} samples...")
+    consistency_weights = None
+    if args.consistency_weights:
+        consistency_weights = [float(w) for w in args.consistency_weights.replace(",", " ").split()]
+
+    print(f"Transcribing {n} samples...{' [consistency decode]' if args.consistency else ''}")
     start = time.time()
-    hyps = transcribe(model, is_multistream, audio_files, args.batch_size)
+    hyps = transcribe(
+        model,
+        is_multistream,
+        audio_files,
+        args.batch_size,
+        consistency=args.consistency,
+        consistency_weights=consistency_weights,
+    )
     total_time = time.time() - start
 
     if len(hyps) != n:
@@ -195,6 +210,12 @@ if __name__ == "__main__":
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--max_eval_samples", type=int, default=None)
     p.add_argument("--max_symbols_per_step", type=int, default=None)
+    p.add_argument("--consistency", action="store_true",
+                   help="Multi-target only: consistency-maintaining decode (combine token + "
+                        "pronunciation head log-probs per char).")
+    p.add_argument("--consistency_weights", default=None,
+                   help="Per-head weights for --consistency, ordered 'token,notone[,tone]' "
+                        "(comma/space separated). Default: all 1.0.")
     p.add_argument("--keep_spaces", action="store_true",
                    help="Do NOT collapse whitespace before CER (default: collapse, AISHELL convention)")
     p.add_argument("--output", default=None, help="Optional per-utterance results manifest (jsonl)")

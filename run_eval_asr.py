@@ -223,6 +223,18 @@ def transcribe_aligner_like(model, audio_files, batch_size):
     return hyps
 
 
+def transcribe_consistency(model, audio_files, batch_size, head_weights=None):
+    """Decode a multi-target model with the consistency-maintaining joint.
+
+    Folds the cross-head (token + pronunciation) combination *inside the joiner*
+    (``model.enable_consistency_decoding``), so the model's own fast batched
+    ``transcribe`` runs unchanged -- each greedy step's scores already encode the
+    char/notone/tone agreement. Output stays the char vocabulary (CER-comparable).
+    """
+    model.enable_consistency_decoding(head_weights=head_weights)
+    return transcribe_tdt(model, audio_files, batch_size)
+
+
 # --------------------------------------------------------------------------- #
 # Dataset handling -- mirrors run_eval_sslm.py
 # --------------------------------------------------------------------------- #
