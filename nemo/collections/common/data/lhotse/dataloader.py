@@ -176,6 +176,12 @@ class LhotseDataLoadingConfig:
     perturb_speed: bool = False
     perturb_speed_factors: Optional[List[float]] = None
     perturb_speed_weights: Optional[List[float]] = None
+    #      Continuous alternative to the discrete factors above: set a single max
+    #      deviation (e.g. 0.25) and each cut is warped by a *continuous* factor drawn
+    #      as the average of two i.i.d. Uniform[1 - dev, 1 + dev] samples (a symmetric
+    #      triangular distribution centered at 1.0, favoring mild warps). Mutually
+    #      exclusive with perturb_speed (discrete). Must be in [0.0, 1.0).
+    perturb_speed_range: Optional[float] = None
     #   c. Cut concatenation (glue together multiple utterances into a single one)
     concatenate_samples: bool = False
     concatenate_gap_seconds: float = 0.1
@@ -641,7 +647,21 @@ def get_lhotse_sampler_from_config(config, global_rank, world_size, tokenizer=No
     #    mux here ensures it's uniformly distributed throughout sampling,
     #    and applying it here (before sampler/dataset) ensures optimal
     #    bucket allocation.
-    if config.perturb_speed:
+    if config.perturb_speed and config.perturb_speed_range is not None:
+        raise ValueError(
+            "Set either perturb_speed (discrete factors) or perturb_speed_range (continuous), not both."
+        )
+    if config.perturb_speed_range is not None:
+        # Continuous per-cut speed perturbation: factor = mean of two i.i.d.
+        # Uniform[1 - dev, 1 + dev] draws (triangular distribution centered at 1.0).
+        dev = float(config.perturb_speed_range)
+        if not (0.0 <= dev < 1.0):
+            raise ValueError(f"perturb_speed_range must be in [0.0, 1.0), got {dev}")
+        if dev > 0.0:
+            # Sampling uses the global RNG, which lhotse's worker_init_fn seeds per
+            # (rank, worker), so the warp factors are decorrelated across workers.
+            cuts = cuts.map(partial(_perturb_speed_avg2, max_dev=dev), apply_fn=None)
+    elif config.perturb_speed:
         factors = list(config.perturb_speed_factors or [0.9, 1.0, 1.1])
         if not factors:
             raise ValueError("perturb_speed=True requires at least one factor in perturb_speed_factors")
@@ -1086,6 +1106,33 @@ def resample(example, sampling_rate):
         for turn in example.turns:
             if hasattr(turn, "cut"):
                 turn.cut = turn.cut.resample(sampling_rate)
+        return example
+    else:
+        return example
+
+
+def _perturb_speed_avg2(example, max_dev: float):
+    """Continuous speed perturbation with a triangular factor distribution.
+
+    The warp factor is the average of two i.i.d. ``Uniform[1 - max_dev, 1 + max_dev]``
+    draws, i.e. a symmetric triangular distribution centered at 1.0 on
+    ``[1 - max_dev, 1 + max_dev]`` -- so mild warps near 1.0 are favored over the
+    extremes. Sampling uses the global RNG, which the dataloader seeds per
+    (rank, worker) via lhotse's worker_init_fn, so factors decorrelate across workers.
+    """
+    from nemo.collections.common.data.lhotse.text_adapters import NeMoMultimodalConversation
+
+    lo, hi = 1.0 - max_dev, 1.0 + max_dev
+
+    def _factor():
+        return 0.5 * (random.uniform(lo, hi) + random.uniform(lo, hi))
+
+    if isinstance(example, Cut):
+        return example.perturb_speed(_factor())
+    elif isinstance(example, NeMoMultimodalConversation):
+        for turn in example.turns:
+            if hasattr(turn, "cut"):
+                turn.cut = turn.cut.perturb_speed(_factor())
         return example
     else:
         return example
