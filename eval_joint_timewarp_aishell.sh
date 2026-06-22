@@ -19,6 +19,8 @@ set -o pipefail
 # Env overrides:
 #   FACTORS        warp factors (default 0.9,1.0,1.1; 1.0 auto-added if absent)
 #   METHOD         speed | time_stretch   (default speed)
+#   SCORE_EPSILON  switch to a warped stream only if its top log-prob beats x1.0's
+#                  by >= epsilon (default 0.0 = pure most-confident, x1.0-preferred)
 #   MANIFEST_DIR / AUDIO_SRC_PREFIX / AUDIO_DST_PREFIX   dataset paths
 #   SETS / ONLY    test sets (default "test_android test_ios test_mic")
 #   MAX_EVAL_SAMPLES   cap samples per set (fast iteration)
@@ -53,6 +55,8 @@ SETS="${SETS//,/ }"
 
 FACTORS="${FACTORS:-0.9,1.0,1.1}"
 METHOD="${METHOD:-speed}"
+SCORE_EPSILON="${SCORE_EPSILON:-0.0}"
+FUSION="${FUSION:-max}"   # comma-separated strategies or 'all'
 OUT_DIR="${OUT_DIR:-${NEMO_ROOT}/joint_results_aishell}"
 
 if [ -n "${1:-}" ]; then
@@ -87,7 +91,7 @@ mkdir -p "$OUT_DIR"
 EVAL_LOG="${OUT_DIR}/joint_timewarp_aishell_$(basename "${LOCAL_CKPT_PATH}").log"
 : > "$EVAL_LOG"
 echo "==> model=${LOCAL_CKPT_PATH}"
-echo "==> factors=${FACTORS}  method=${METHOD}  sets='${SETS}'  device=${DEVICE_ID}"
+echo "==> factors=${FACTORS}  method=${METHOD}  epsilon=${SCORE_EPSILON}  fusion=${FUSION}  sets='${SETS}'  device=${DEVICE_ID}"
 echo "==> Logging to $EVAL_LOG"
 
 IFS=',' read -r -a FACTOR_LIST <<< "$FACTORS"
@@ -120,6 +124,8 @@ for set_name in $SETS; do
         --set_name "$set_name" \
         --factors "$FACTORS" \
         --method "$METHOD" \
+        --score_epsilon "$SCORE_EPSILON" \
+        --fusion "$FUSION" \
         --device "$DEVICE_ID" \
         --output "${OUT_DIR}/joint_${set_name}.jsonl" \
         "${EXTRA_ARGS[@]}" \

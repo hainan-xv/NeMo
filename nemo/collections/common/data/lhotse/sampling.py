@@ -268,6 +268,32 @@ class DurationFilter:
             return True  # does not apply to text etc.
 
 
+class NonEmptyAudioFilter:
+    """
+    Callable, returns ``False`` for cuts that carry no loadable audio (non-positive
+    duration or zero recording samples) and ``True`` otherwise.
+
+    Corrupt/empty manifest entries (``duration=0.0`` / ``num_samples=0``) otherwise
+    survive downstream padding -- e.g. ``pad_extra_duration`` / ``pad_min_duration``
+    wrap the empty cut in a non-empty ``MixedCut`` so ``DurationFilter`` no longer
+    rejects it -- and then crash a dataloader worker inside ``Recording.load_audio``
+    with "cannot reshape tensor of 0 elements into shape [-1, 0]". Filtering here,
+    before any padding, drops those degenerate cuts up front.
+
+    Acts as a pass-through for objects of other type than Cut.
+    """
+
+    def __call__(self, example) -> bool:
+        if not isinstance(example, Cut):
+            return True  # does not apply to text etc.
+        if example.duration is not None and example.duration <= 0.0:
+            return False
+        recording = getattr(example, "recording", None)
+        if recording is not None and getattr(recording, "num_samples", None) == 0:
+            return False
+        return True
+
+
 class ValidationStatusFilter:
     """
     Callable, returns ``True`` if a cut's validation status is equal to keep and ``False`` otherwise.

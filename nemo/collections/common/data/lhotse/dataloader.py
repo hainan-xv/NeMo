@@ -57,6 +57,7 @@ from nemo.collections.common.data.lhotse.sampling import (
     FixedBucketBatchSizeConstraint2D,
     MultimodalFixedBucketBatchSizeConstraint2D,
     MultimodalSamplingConstraint,
+    NonEmptyAudioFilter,
     TokenCountFilter,
     TokenPerSecondFilter,
     TokenPerTokenFilter,
@@ -695,6 +696,12 @@ def get_lhotse_sampler_from_config(config, global_rank, world_size, tokenizer=No
             hop=config.cut_into_windows_hop,
             keep_excessive_supervisions=config.keep_excessive_supervisions,
         )
+
+    # Drop degenerate cuts (zero/negative duration or empty recordings) BEFORE any
+    # padding. Otherwise padding wraps them in a non-empty MixedCut that slips past
+    # DurationFilter below and later crashes a dataloader worker inside
+    # Recording.load_audio ("cannot reshape tensor of 0 elements into shape [-1, 0]").
+    cuts = cuts.filter(NonEmptyAudioFilter())
 
     if config.pad_min_duration is not None:
         cuts = cuts.pad(duration=config.pad_min_duration, direction=config.pad_direction, preserve_id=True)
