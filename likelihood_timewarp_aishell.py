@@ -46,6 +46,25 @@ def _hyp_text(model, hyp):
     return str(hyp).strip()
 
 
+def _token_text(model, token_id):
+    """Best-effort decode of a single token id to its surface text."""
+    tok = getattr(model, "tokenizer", None)
+    if tok is None:
+        return str(token_id)
+    try:
+        return tok.ids_to_text([int(token_id)])
+    except Exception:
+        for attr in ("ids_to_tokens", "decode"):
+            fn = getattr(tok, attr, None)
+            if fn is not None:
+                try:
+                    out = fn([int(token_id)])
+                    return out[0] if isinstance(out, (list, tuple)) else str(out)
+                except Exception:
+                    continue
+        return str(token_id)
+
+
 def _hyp_token_len(hyp, text):
     seq = getattr(hyp, "y_sequence", None)
     if isinstance(seq, torch.Tensor):
@@ -132,13 +151,18 @@ def _restore_decoding(model, old_cfg):
 
 
 def _alignment_token_logprob(hyp, blank_id):
-    """Return (sum log P(emitted token), emitted token count) from preserved alignments."""
+    """Extract per-token log-probabilities from preserved alignments.
+
+    Returns ``(total, count, per_token)`` where ``per_token`` is a list of
+    ``(token_id, logprob)`` for every emitted non-blank token, in order, or
+    ``None`` if alignments are unavailable.
+    """
     alignments = getattr(hyp, "alignments", None)
     if alignments is None or blank_id is None:
         return None
 
     total = 0.0
-    count = 0
+    per_token = []
     for frame in alignments:
         for item in frame:
             if not item:
@@ -153,9 +177,10 @@ def _alignment_token_logprob(hyp, blank_id):
             logits = logits.detach().float().cpu()
             if label < 0 or label >= logits.numel():
                 continue
-            total += float(torch.log_softmax(logits, dim=-1)[label].item())
-            count += 1
-    return total, count
+            lp = float(torch.log_softmax(logits, dim=-1)[label].item())
+            total += lp
+            per_token.append((label, lp))
+    return total, len(per_token), per_token
 
 
 @torch.inference_mode()
@@ -201,6 +226,8 @@ def transcribe_scored(model, is_multistream, audio_files, batch_size, score_norm
         _restore_decoding(model, old_decoding_cfg)
 
     texts, norm_texts, raw_scores, select_scores = [], [], [], []
+    token_counts, total_logprobs = [], []
+    token_logprobs_list, token_texts_list = [], []
     missing_scores = 0
     missing_alignments = 0
     blank_id = _decoder_blank_id(model)
@@ -211,19 +238,29 @@ def transcribe_scored(model, is_multistream, audio_files, batch_size, score_norm
             missing_scores += 1
             raw_score = float("-inf")
         token_len = _hyp_token_len(hyp, text)
+        total_lp = None
+        token_logprobs = None
+        token_texts = None
         if score_norm == "logprob_token":
             aligned = _alignment_token_logprob(hyp, blank_id)
             if aligned is None or aligned[1] == 0:
                 missing_alignments += 1
                 select_score = float("-inf")
             else:
-                select_score = aligned[0] / aligned[1]
+                total_lp, token_len, per_token = aligned
+                select_score = total_lp / token_len
+                token_logprobs = [round(lp, 5) for _tid, lp in per_token]
+                token_texts = [_token_text(model, tid) for tid, _lp in per_token]
         else:
             select_score = normalize_score(raw_score, token_len, text, score_norm)
         texts.append(text)
         norm_texts.append(A.normalize(text, keep_spaces))
         raw_scores.append(raw_score)
         select_scores.append(select_score)
+        token_counts.append(int(token_len))
+        total_logprobs.append(total_lp if total_lp is not None else select_score * token_len)
+        token_logprobs_list.append(token_logprobs)
+        token_texts_list.append(token_texts)
 
     if score_norm != "logprob_token" and missing_scores:
         sys.exit(f"{missing_scores}/{len(hypotheses)} hypotheses did not expose a decoder score")
@@ -232,7 +269,8 @@ def transcribe_scored(model, is_multistream, audio_files, batch_size, score_norm
             f"{missing_alignments}/{len(hypotheses)} hypotheses did not expose emitted-token alignments; "
             "cannot use score_norm=logprob_token"
         )
-    return texts, norm_texts, raw_scores, select_scores
+    return (texts, norm_texts, raw_scores, select_scores, token_counts, total_logprobs,
+            token_logprobs_list, token_texts_list)
 
 
 def decode_factor(model, is_ms, items, factor, args):
@@ -325,13 +363,17 @@ def main(args):
     # to normalise by expected warped-audio duration rather than actual token count.
     _decode_norm = "logprob_token" if args.score_norm == "logprob_token_dur" else args.score_norm
 
-    hyps_fmt, hyps_norm, raw_scores, select_scores, decode_time = {}, {}, {}, {}, {}
+    hyps_fmt, hyps_norm, raw_scores, select_scores = {}, {}, {}, {}
+    token_counts, total_logprobs, decode_time = {}, {}, {}
+    token_logprobs, token_texts = {}, {}
     for factor in factors:
         t0 = time.time()
         # Temporarily override score_norm for the decode call if needed
         _orig_norm = args.score_norm
         args.score_norm = _decode_norm
-        hyps_fmt[factor], hyps_norm[factor], raw_scores[factor], select_scores[factor] = decode_factor(
+        (hyps_fmt[factor], hyps_norm[factor], raw_scores[factor], select_scores[factor],
+         token_counts[factor], total_logprobs[factor],
+         token_logprobs[factor], token_texts[factor]) = decode_factor(
             model, is_ms, items, factor, args
         )
         args.score_norm = _orig_norm
@@ -379,6 +421,11 @@ def main(args):
                         "pred_text_normalized": hyps_norm[f][i],
                         "raw_score": raw_scores[f][i],
                         "selection_score": select_scores[f][i],
+                        "num_tokens": token_counts[f][i],
+                        "total_logprob": total_logprobs[f][i],
+                        "token_logprobs": token_logprobs[f][i],
+                        "token_texts": token_texts[f][i],
+                        "warped_duration": round(items[i]["duration"] / f, 4) if f else items[i]["duration"],
                         "cer": round(O.per_utt_cer(refs[i], hyps_norm[f][i]), 4),
                     }
                     for f in factors

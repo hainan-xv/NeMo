@@ -112,6 +112,30 @@ def pick_epsilon(record: dict, epsilon: float = 0.01, **kw) -> str:
     return _tie_break(tied)
 
 
+def pick_majority(record: dict, **kw) -> str:
+    """Pick the hypothesis text that the most factors agree on; among the factors
+    sharing that text, keep the one with the highest selection_score. If every
+    factor disagrees (no majority), fall back to x1.0 (via tie-break)."""
+    pf = record["per_factor"]
+    text_to_factors: Dict[str, List[str]] = {}
+    for k in pf:
+        t = pf[k].get("pred_text_normalized", "") or ""
+        text_to_factors.setdefault(t, []).append(k)
+
+    # Largest agreeing group (ties between groups → handled by tie-break below).
+    max_count = max(len(v) for v in text_to_factors.values())
+    if max_count == 1:
+        return _tie_break(list(pf.keys()))  # all disagree → default to 1.0
+
+    winning_groups = [grp for grp in text_to_factors.values() if len(grp) == max_count]
+    # Flatten candidate factors from all groups tied for the majority size,
+    # then pick by highest selection_score, then the standard tie-break.
+    candidates = [k for grp in winning_groups for k in grp]
+    best = max(pf[k]["selection_score"] for k in candidates)
+    tied = [k for k in candidates if pf[k]["selection_score"] == best]
+    return _tie_break(tied)
+
+
 def _tie_break(tied: List[str]) -> str:
     """Prefer 1.0, else the factor nearest to 1.0."""
     for k in tied:
@@ -123,6 +147,7 @@ def _tie_break(tied: List[str]) -> str:
 RULES = {
     "argmax": pick_argmax,
     "epsilon": pick_epsilon,
+    "majority": pick_majority,
 }
 
 

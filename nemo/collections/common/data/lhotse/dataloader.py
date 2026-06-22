@@ -1119,13 +1119,23 @@ def _perturb_speed_avg2(example, max_dev: float):
     ``[1 - max_dev, 1 + max_dev]`` -- so mild warps near 1.0 are favored over the
     extremes. Sampling uses the global RNG, which the dataloader seeds per
     (rank, worker) via lhotse's worker_init_fn, so factors decorrelate across workers.
+
+    The sampled factor is quantized to 2 decimals on purpose. Lhotse's ``Speed``
+    transform resamples ``round(sr * factor) -> sr`` using torchaudio resamplers
+    that are cached in a process-global dict that never evicts. With truly
+    continuous factors, every cut yields a distinct ``(round(sr*factor), sr)`` pair,
+    so the cache grows without bound and -- because coprime rate pairs (gcd ~ 1)
+    precompute very large sinc kernels -- the dataloader workers exhausted host RAM
+    (~280 GB/rank -> OOM kill). Rounding to 0.01 bounds the factor set to ~61 values;
+    at 16 kHz each source rate is then a multiple of 160 (gcd >= 160 with 16000), so
+    only a handful of small resamplers are ever built and cached.
     """
     from nemo.collections.common.data.lhotse.text_adapters import NeMoMultimodalConversation
 
     lo, hi = 1.0 - max_dev, 1.0 + max_dev
 
     def _factor():
-        return 0.5 * (random.uniform(lo, hi) + random.uniform(lo, hi))
+        return round(0.5 * (random.uniform(lo, hi) + random.uniform(lo, hi)), 2)
 
     if isinstance(example, Cut):
         return example.perturb_speed(_factor())
