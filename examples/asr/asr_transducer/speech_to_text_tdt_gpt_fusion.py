@@ -29,6 +29,10 @@ Example:
         model.train_ds.input_cfg=... model.validation_ds.manifest_filepath=...
 """
 
+import os
+import shutil
+import tempfile
+
 import lightning.pytorch as pl
 import torch
 from omegaconf import OmegaConf, open_dict
@@ -40,9 +44,10 @@ from nemo.utils import logging
 from nemo.utils.exp_manager import exp_manager
 from nemo.utils.trainer_utils import resolve_trainer_cfg
 
-# Architecture sub-configs copied verbatim from the base TDT model. `loss` (TDT durations/sigma),
-# `decoding` (TDT greedy) and `tokenizer` (SPE-1024) are copied too so the standard TDT machinery and
-# vocabulary are reused as-is.
+# Architecture sub-configs copied verbatim from the base TDT model. `loss` (TDT durations/sigma) and
+# `decoding` (TDT greedy) are copied too so the standard TDT machinery is reused as-is. The
+# `tokenizer` is handled separately (its files are copied out of the base model) because the base
+# config stores them as `nemo:` artifact references that only resolve during a `.nemo` restore.
 _ARCH_KEYS = [
     "preprocessor",
     "encoder",
@@ -52,7 +57,6 @@ _ARCH_KEYS = [
     "model_defaults",
     "loss",
     "decoding",
-    "tokenizer",
 ]
 
 _FUSION_DECODER_TARGET = "nemo.collections.asr.modules.tdt_gpt_fusion.TDTGPTFusionDecoder"
@@ -72,6 +76,44 @@ def _load_base_model(cfg):
     raise ValueError("Provide either `base_model_path` (local .nemo) or `base_model_name` (pretrained).")
 
 
+def _build_tokenizer_cfg_from_base(base_model):
+    """Build a tokenizer config pointing at the base model's (already-resolved) SPE files.
+
+    The base model's ``cfg.tokenizer`` stores ``nemo:<hash>`` artifact references that only resolve
+    while restoring from a ``.nemo``. When we instantiate a fresh model these do not resolve, so we
+    instead copy the resolved tokenizer files (set on the base model during its own setup) into a
+    stable directory and point at them with absolute paths.
+    """
+    base_type = str(base_model.cfg.tokenizer.get("type", "bpe")).lower()
+    if base_type != "bpe":
+        raise ValueError(f"Expected a `bpe` (SentencePiece) tokenizer in the base model, got `{base_type}`.")
+
+    tok_dir = tempfile.mkdtemp(prefix="tdt_gpt_fusion_tok_")
+
+    def _copy(src):
+        if src is None or not os.path.isfile(src):
+            return None
+        dst = os.path.join(tok_dir, os.path.basename(src))
+        shutil.copyfile(src, dst)
+        return dst
+
+    # These absolute paths are set on the base model during its tokenizer setup (mixins.py).
+    model_path = _copy(getattr(base_model, "model_path", None))
+    vocab_path = _copy(getattr(base_model, "vocab_path", None))
+    spe_vocab_path = _copy(getattr(base_model, "spe_vocab_path", None))
+
+    if model_path is None:
+        raise RuntimeError("Could not locate the base model's SentencePiece tokenizer.model file.")
+
+    tokenizer_cfg = {"dir": tok_dir, "type": "bpe", "model_path": model_path}
+    if vocab_path is not None:
+        tokenizer_cfg["vocab_path"] = vocab_path
+    if spe_vocab_path is not None:
+        tokenizer_cfg["spe_tokenizer_vocab"] = spe_vocab_path
+    logging.info(f"Reusing base SPE tokenizer from {tok_dir} (model_path={model_path}).")
+    return tokenizer_cfg
+
+
 @hydra_runner(config_path="../conf/tdt_gpt_fusion", config_name="tdt_gpt_fusion")
 def main(cfg):
     logging.info(f"Hydra config:\n{OmegaConf.to_yaml(cfg)}")
@@ -83,12 +125,16 @@ def main(cfg):
     fusion_gpt_lm = OmegaConf.to_container(cfg.model.decoder.gpt_lm, resolve=True)
     fusion_alpha = float(cfg.model.joint.get("lm_fusion_alpha", 1.0))
 
-    # 1) Inject architecture sub-configs (+ TDT loss / decoding / tokenizer) from the base model.
+    # 1) Inject architecture sub-configs (+ TDT loss / decoding) from the base model, plus the base
+    #    SentencePiece tokenizer (copied to a stable dir; the base config's `nemo:` refs don't resolve
+    #    outside a `.nemo` restore).
     arch = {key: OmegaConf.to_container(base_cfg[key], resolve=True) for key in _ARCH_KEYS if key in base_cfg}
+    tokenizer_cfg = _build_tokenizer_cfg_from_base(base_model)
 
     with open_dict(cfg.model):
         for key, val in arch.items():
             cfg.model[key] = val
+        cfg.model.tokenizer = tokenizer_cfg
 
         # 2) Swap prediction net + joint to the fusion-aware modules and re-apply fusion fields.
         cfg.model.decoder._target_ = _FUSION_DECODER_TARGET
