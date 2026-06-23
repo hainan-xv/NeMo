@@ -30,7 +30,6 @@ Example:
 """
 
 import os
-import shutil
 import tempfile
 
 import lightning.pytorch as pl
@@ -77,41 +76,45 @@ def _load_base_model(cfg):
 
 
 def _build_tokenizer_cfg_from_base(base_model):
-    """Build a tokenizer config pointing at the base model's (already-resolved) SPE files.
+    """Build a tokenizer config that reuses the base model's SentencePiece tokenizer.
 
     The base model's ``cfg.tokenizer`` stores ``nemo:<hash>`` artifact references that only resolve
-    while restoring from a ``.nemo``. When we instantiate a fresh model these do not resolve, so we
-    instead copy the resolved tokenizer files (set on the base model during its own setup) into a
-    stable directory and point at them with absolute paths.
+    while restoring from a ``.nemo``, and the resolved temp files are cleaned up once ``from_pretrained``
+    / ``restore_from`` returns. So instead of relying on any on-disk file, we reconstruct the SPE model
+    from the (fully loaded) in-memory SentencePiece processor and regenerate a ``vocab.txt`` from its
+    pieces, writing both into a stable directory and pointing at them with absolute paths.
     """
     base_type = str(base_model.cfg.tokenizer.get("type", "bpe")).lower()
     if base_type != "bpe":
         raise ValueError(f"Expected a `bpe` (SentencePiece) tokenizer in the base model, got `{base_type}`.")
 
+    tokenizer_wrapper = getattr(base_model, "tokenizer", None)
+    spm = getattr(tokenizer_wrapper, "tokenizer", None)  # underlying sentencepiece.SentencePieceProcessor
+    if spm is None or not hasattr(spm, "serialized_model_proto"):
+        raise RuntimeError(
+            "Base model does not expose a SentencePiece processor; cannot reuse its tokenizer "
+            f"(tokenizer type={type(tokenizer_wrapper).__name__})."
+        )
+
     tok_dir = tempfile.mkdtemp(prefix="tdt_gpt_fusion_tok_")
 
-    def _copy(src):
-        if src is None or not os.path.isfile(src):
-            return None
-        dst = os.path.join(tok_dir, os.path.basename(src))
-        shutil.copyfile(src, dst)
-        return dst
+    # Reconstruct the .model from the in-memory processor's serialized proto.
+    model_path = os.path.join(tok_dir, "tokenizer.model")
+    with open(model_path, "wb") as f:
+        f.write(spm.serialized_model_proto())
 
-    # These absolute paths are set on the base model during its tokenizer setup (mixins.py).
-    model_path = _copy(getattr(base_model, "model_path", None))
-    vocab_path = _copy(getattr(base_model, "vocab_path", None))
-    spe_vocab_path = _copy(getattr(base_model, "spe_vocab_path", None))
+    # Regenerate vocab.txt (one piece per line). The actual vocabulary used by NeMo is derived from
+    # the SPE model itself; this file only needs to exist as a registered artifact.
+    vocab_path = os.path.join(tok_dir, "vocab.txt")
+    with open(vocab_path, "w", encoding="utf-8") as f:
+        for i in range(spm.get_piece_size()):
+            f.write(f"{spm.id_to_piece(i)}\n")
 
-    if model_path is None:
-        raise RuntimeError("Could not locate the base model's SentencePiece tokenizer.model file.")
-
-    tokenizer_cfg = {"dir": tok_dir, "type": "bpe", "model_path": model_path}
-    if vocab_path is not None:
-        tokenizer_cfg["vocab_path"] = vocab_path
-    if spe_vocab_path is not None:
-        tokenizer_cfg["spe_tokenizer_vocab"] = spe_vocab_path
-    logging.info(f"Reusing base SPE tokenizer from {tok_dir} (model_path={model_path}).")
-    return tokenizer_cfg
+    logging.info(
+        f"Reconstructed base SPE tokenizer into {tok_dir} "
+        f"(model_path={model_path}, vocab_size={spm.get_piece_size()})."
+    )
+    return {"dir": tok_dir, "type": "bpe", "model_path": model_path, "vocab_path": vocab_path}
 
 
 @hydra_runner(config_path="../conf/tdt_gpt_fusion", config_name="tdt_gpt_fusion")
