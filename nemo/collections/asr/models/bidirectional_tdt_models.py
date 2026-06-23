@@ -39,6 +39,7 @@ from omegaconf import DictConfig
 
 from nemo.collections.asr.data.audio_to_text_dali import DALIOutputs
 from nemo.collections.asr.models.rnnt_bpe_models import EncDecRNNTBPEModel
+from nemo.collections.asr.parts.submodules.rnnt_decoding import RNNTBPEDecoding
 from nemo.core.classes.common import PretrainedModelInfo
 from nemo.core.classes.mixins import AccessMixin
 from nemo.utils import logging
@@ -70,6 +71,18 @@ class EncDecBidirectionalTDTBPEModel(EncDecRNNTBPEModel):
         # trained from scratch.
         self.decoder_bwd = self.from_config_dict(self.cfg.decoder)
         self.joint_bwd = self.from_config_dict(self.cfg.joint)
+
+        # Decoding object for the backward branch (greedy/beam over decoder_bwd + joint_bwd), used only
+        # to report a backward WER. self.wer / self.decoding (built by the base class) cover the
+        # forward branch. The backward branch decodes the time-reversed encoder output, so its
+        # predicted token sequence is un-reversed before scoring (see _backward_wer_counts), making the
+        # reported backward WER directly comparable to the forward WER.
+        self.decoding_bwd = RNNTBPEDecoding(
+            decoding_cfg=self.cfg.decoding,
+            decoder=self.decoder_bwd,
+            joint=self.joint_bwd,
+            tokenizer=self.tokenizer,
+        )
 
     # -- helpers ---------------------------------------------------------------------------------
 
@@ -139,19 +152,35 @@ class EncDecBidirectionalTDTBPEModel(EncDecRNNTBPEModel):
             encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
         return encoded, encoded_len, transcript, transcript_len
 
-    def _both_direction_losses(
-        self, encoded: torch.Tensor, encoded_len: torch.Tensor, transcript: torch.Tensor, transcript_len: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compute the forward (L2R) and backward (R2L) transducer losses over the shared encoder."""
-        fwd_loss = self._transducer_loss(
-            self.decoder, self.joint, encoded, encoded_len, transcript, transcript_len
+    def _backward_wer_counts(
+        self,
+        enc_rev: torch.Tensor,
+        encoded_len: torch.Tensor,
+        transcript: torch.Tensor,
+        transcript_len: torch.Tensor,
+    ) -> Tuple[int, int]:
+        """Greedy-decode the backward branch and return (edit_distance, ref_words) vs forward refs.
+
+        The backward branch decodes the time-reversed encoder output, so its predicted token sequence
+        is in reverse (R2L) order; we un-reverse it before detokenizing so the resulting text is in
+        normal forward order and directly comparable to the forward references.
+        """
+        hyps = self.decoding_bwd.rnnt_decoder_predictions_tensor(
+            encoder_output=enc_rev, encoded_lengths=encoded_len, return_hypotheses=True
         )
-        enc_rev = self._reverse_time(encoded, encoded_len)
-        y_rev = self._reverse_labels(transcript, transcript_len)
-        bwd_loss = self._transducer_loss(
-            self.decoder_bwd, self.joint_bwd, enc_rev, encoded_len, y_rev, transcript_len
-        )
-        return fwd_loss, bwd_loss
+        if isinstance(hyps, tuple):
+            hyps = hyps[0]
+
+        hyp_texts = []
+        for hyp in hyps:
+            ids = hyp.y_sequence
+            if isinstance(ids, torch.Tensor):
+                ids = ids.tolist()
+            ids = list(ids)[::-1]  # un-reverse R2L prediction -> forward token order
+            hyp_texts.append(self.decoding_bwd.decode_ids_to_str(ids))
+
+        references = self._references_from_targets(transcript, transcript_len)
+        return self._wer_counts(hyp_texts, references)
 
     # -- training / validation -------------------------------------------------------------------
 
@@ -168,7 +197,14 @@ class EncDecBidirectionalTDTBPEModel(EncDecRNNTBPEModel):
             log_every_n_steps = 1
             sample_id = batch_nb
 
-        fwd_loss, bwd_loss = self._both_direction_losses(encoded, encoded_len, transcript, transcript_len)
+        # Backward branch operates on the time-reversed encoder output + reversed labels.
+        enc_rev = self._reverse_time(encoded, encoded_len)
+        y_rev = self._reverse_labels(transcript, transcript_len)
+
+        fwd_loss = self._transducer_loss(self.decoder, self.joint, encoded, encoded_len, transcript, transcript_len)
+        bwd_loss = self._transducer_loss(
+            self.decoder_bwd, self.joint_bwd, enc_rev, encoded_len, y_rev, transcript_len
+        )
         loss_value = fwd_loss + self.backward_loss_weight * bwd_loss
         loss_value = self.add_auxiliary_losses(loss_value)
 
@@ -184,7 +220,7 @@ class EncDecBidirectionalTDTBPEModel(EncDecRNNTBPEModel):
         }
 
         if (sample_id + 1) % log_every_n_steps == 0:
-            # WER is measured on the forward branch (self.decoding wraps self.decoder/self.joint).
+            # Forward-branch WER (self.decoding wraps self.decoder/self.joint).
             self.wer.update(
                 predictions=encoded,
                 predictions_lengths=encoded_len,
@@ -193,7 +229,13 @@ class EncDecBidirectionalTDTBPEModel(EncDecRNNTBPEModel):
             )
             _, scores, words = self.wer.compute()
             self.wer.reset()
-            tensorboard_logs.update({'training_batch_wer': scores.float() / words})
+            tensorboard_logs['training_batch_wer'] = scores.float() / words
+
+            # Backward-branch WER (un-reversed predictions -> comparable to forward).
+            scores_b, words_b = self._backward_wer_counts(enc_rev, encoded_len, transcript, transcript_len)
+            tensorboard_logs['training_batch_wer_bwd'] = torch.tensor(
+                scores_b / max(words_b, 1), dtype=torch.float32, device=encoded.device
+            )
 
         self.log_dict(tensorboard_logs)
 
@@ -205,14 +247,22 @@ class EncDecBidirectionalTDTBPEModel(EncDecRNNTBPEModel):
     def validation_pass(self, batch, batch_idx, dataloader_idx=0):
         encoded, encoded_len, transcript, transcript_len = self._forward_encoder(batch)
 
+        enc_rev = self._reverse_time(encoded, encoded_len)
+        y_rev = self._reverse_labels(transcript, transcript_len)
+
         tensorboard_logs = {}
         if self.compute_eval_loss:
-            fwd_loss, bwd_loss = self._both_direction_losses(encoded, encoded_len, transcript, transcript_len)
+            fwd_loss = self._transducer_loss(
+                self.decoder, self.joint, encoded, encoded_len, transcript, transcript_len
+            )
+            bwd_loss = self._transducer_loss(
+                self.decoder_bwd, self.joint_bwd, enc_rev, encoded_len, y_rev, transcript_len
+            )
             tensorboard_logs['val_loss'] = fwd_loss + self.backward_loss_weight * bwd_loss
             tensorboard_logs['val_fwd_loss'] = fwd_loss.detach()
             tensorboard_logs['val_bwd_loss'] = bwd_loss.detach()
 
-        # Monitored metric: forward-branch WER.
+        # Forward-branch WER (the monitored metric for checkpointing).
         self.wer.update(
             predictions=encoded,
             predictions_lengths=encoded_len,
@@ -224,6 +274,14 @@ class EncDecBidirectionalTDTBPEModel(EncDecRNNTBPEModel):
         tensorboard_logs['val_wer_num'] = wer_num
         tensorboard_logs['val_wer_denom'] = wer_denom
         tensorboard_logs['val_wer'] = wer
+
+        # Backward-branch WER, emitted as summed num/denom so multi_validation_epoch_end micro-averages
+        # it into 'val_wer_bwd' automatically (it aggregates any extra *_num/*_denom pair).
+        scores_b, words_b = self._backward_wer_counts(enc_rev, encoded_len, transcript, transcript_len)
+        tensorboard_logs['val_wer_bwd_num'] = torch.tensor(float(scores_b), dtype=torch.float32, device=encoded.device)
+        tensorboard_logs['val_wer_bwd_denom'] = torch.tensor(
+            float(words_b), dtype=torch.float32, device=encoded.device
+        )
 
         return tensorboard_logs
 
