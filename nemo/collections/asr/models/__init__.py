@@ -32,6 +32,7 @@ from nemo.collections.asr.models.multitalker_asr_models import EncDecMultiTalker
 from nemo.collections.asr.models.rnnt_bpe_models import EncDecRNNTBPEModel  # noqa: F401
 from nemo.collections.asr.models.rnnt_models import EncDecRNNTModel  # noqa: F401
 from nemo.collections.asr.models.sortformer_diar_models import SortformerEncLabelModel  # noqa: F401
+from nemo.collections.asr.models.tdt_gpt_fusion_models import EncDecTDTGPTFusionModel  # noqa: F401
 from nemo.collections.asr.models.ssl_models import (  # noqa: F401
     EncDecDenoiseMaskedTokenPredModel,
     EncDecMaskedTokenPredModel,
@@ -56,6 +57,7 @@ __all__ = [
     'EncDecMultiTalkerRNNTBPEModel',
     'EncDecRNNTBPEModel',
     'EncDecRNNTModel',
+    'EncDecTDTGPTFusionModel',
     'EncDecSpeakerLabelModel',
     'EncDecTransfModelBPE',
     'SortformerEncLabelModel',

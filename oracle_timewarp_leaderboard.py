@@ -274,6 +274,48 @@ def main(args):
     best_f = min(factor_corpus, key=factor_corpus.get)
     counts = Counter(chosen)
 
+    # ---- optional: LM-based (non-cheating) warp selection ----
+    # Pick, per utterance, the warp whose transcript has the highest mean per-token
+    # log-prob under a (lightweight) causal LM such as distilgpt2. Stay on x1.0
+    # unless another factor beats it by >= lm_epsilon.
+    lm_selected_corpus = None
+    lm_counts = None
+    if args.lm_model:
+        scorer = None
+        try:
+            from repick_lm_timewarp import LMScorer
+            lm_dev = args.lm_device if args.lm_device is not None else args.device
+            print(f"[{args.dataset}] loading selection LM: {args.lm_model} (device={lm_dev})")
+            scorer = LMScorer(args.lm_model, device=lm_dev, batch_size=args.lm_batch_size,
+                              max_length=args.lm_max_length)
+        except Exception as e:  # noqa: BLE001 - LM selection is best-effort; never break oracle eval
+            print(f"[{args.dataset}] WARNING: LM selection disabled (failed to load {args.lm_model!r}): {e}")
+            scorer = None
+
+        if scorer is not None:
+            nf = len(factors)
+            flat = [hyps_norm[f][j] for j in range(scored) for f in factors]
+            flat_scores = scorer.score_batch(flat)
+            base_pos = factors.index(1.0)
+            lm_preds, lm_chosen = [], []
+            for j in range(scored):
+                row = flat_scores[j * nf:(j + 1) * nf]
+                base_s = row[base_pos]
+                sel_f, sel_s = 1.0, base_s
+                for fi, f in enumerate(factors):
+                    if f == 1.0:
+                        continue
+                    s = row[fi]
+                    if s >= base_s + args.lm_epsilon and s > sel_s:
+                        sel_s, sel_f = s, f
+                lm_chosen.append(sel_f)
+                lm_preds.append(hyps_norm[sel_f][j])
+                for fi, f in enumerate(factors):
+                    details[j]["per_factor"][str(f)]["lm_score"] = round(float(row[fi]), 5)
+                details[j]["lm_chosen_factor"] = sel_f
+            lm_selected_corpus = 100 * R.wer_metric.compute(references=refs, predictions=lm_preds)
+            lm_counts = Counter(lm_chosen)
+
     lines = []
     p = lines.append
     p("=" * 80)
@@ -289,6 +331,9 @@ def main(args):
     p("")
     p(f"baseline (x1.0)          : {factor_corpus[1.0]:6.2f} %")
     p(f"best single fixed (x{best_f}) : {factor_corpus[best_f]:6.2f} %")
+    if lm_selected_corpus is not None:
+        p(f"LM-selected ({args.lm_model}) : {lm_selected_corpus:6.2f} %  "
+          f"[gain vs baseline {factor_corpus[1.0] - lm_selected_corpus:+.2f} pts]")
     p(f"ORACLE best-of-{len(factors)}        : {oracle_corpus:6.2f} %")
     p(f"  gain vs baseline       : {factor_corpus[1.0] - oracle_corpus:6.2f} pts "
       f"({100*(factor_corpus[1.0]-oracle_corpus)/max(factor_corpus[1.0],1e-9):.1f}% rel.)")
@@ -297,6 +342,12 @@ def main(args):
     for f in factors:
         c = counts.get(f, 0)
         p(f"  x{f:<5}: {c:>6}  ({100*c/scored:5.1f}%)  {'#'*int(round(40*c/scored))}")
+    if lm_counts is not None:
+        p("")
+        p("LM-selected pick distribution:")
+        for f in factors:
+            c = lm_counts.get(f, 0)
+            p(f"  x{f:<5}: {c:>6}  ({100*c/scored:5.1f}%)  {'#'*int(round(40*c/scored))}")
     pick_summary = ",".join(f"x{f}:{100*counts.get(f, 0)/scored:.1f}" for f in factors)
     report = "\n".join(lines)
     print(report)
@@ -304,6 +355,11 @@ def main(args):
     # machine-readable summary line for the wrapper to parse
     print(f"ORACLE_SUMMARY {args.dataset} scored={scored} total={total_rows} baseline={factor_corpus[1.0]:.2f} "
           f"best_fixed={factor_corpus[best_f]:.2f} oracle={oracle_corpus:.2f} picks={pick_summary}")
+    if lm_selected_corpus is not None:
+        lm_pick_summary = ",".join(f"x{f}:{100*lm_counts.get(f, 0)/scored:.1f}" for f in factors)
+        print(f"LM_SUMMARY {args.dataset} lm_model={args.lm_model} lm_epsilon={args.lm_epsilon} "
+              f"scored={scored} baseline={factor_corpus[1.0]:.2f} lm_selected={lm_selected_corpus:.2f} "
+              f"oracle={oracle_corpus:.2f} picks={lm_pick_summary}")
 
     if args.output:
         with open(args.output, "w", encoding="utf-8") as fh:
@@ -328,6 +384,15 @@ if __name__ == "__main__":
     ap.add_argument("--max_samples", type=int, default=None)
     ap.add_argument("--keep_warped", action="store_true")
     ap.add_argument("--output", default=None)
+    # LM-based (non-cheating) warp selection. If --lm_model is unset, skipped.
+    ap.add_argument("--lm_model", default=None,
+                    help="HF causal LM id/path for LM-based warp selection (e.g. distilgpt2).")
+    ap.add_argument("--lm_epsilon", type=float, default=0.0,
+                    help="Stay on x1.0 unless another factor's LM score beats it by >= this.")
+    ap.add_argument("--lm_device", type=int, default=None,
+                    help="GPU id for the selection LM (default: same as --device).")
+    ap.add_argument("--lm_batch_size", type=int, default=16)
+    ap.add_argument("--lm_max_length", type=int, default=256)
     ap.add_argument("--no-streaming", dest="streaming", action="store_false")
     ap.set_defaults(streaming=True)
     main(ap.parse_args())

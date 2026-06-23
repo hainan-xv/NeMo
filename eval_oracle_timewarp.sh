@@ -50,6 +50,10 @@ DEVICE="${DEVICE:-0}"
 BATCH_SIZE="${BATCH_SIZE:-32}"
 DATASET_PATH="${DATASET_PATH:-hf-audio/esb-datasets-test-only-sorted}"
 OUT_DIR="${OUT_DIR:-${NEMO_ROOT}/oracle_results}"
+# LM-based (non-cheating) warp selection. Set LM_MODEL="" to disable.
+LM_MODEL="${LM_MODEL:-distilgpt2}"
+LM_EPSILON="${LM_EPSILON:-0.0}"
+LM_BATCH_SIZE="${LM_BATCH_SIZE:-16}"
 mkdir -p "$OUT_DIR"
 
 DATASETS=(
@@ -67,15 +71,22 @@ fi
 
 EXTRA=()
 [ -n "${MAX_EVAL_SAMPLES:-}" ] && EXTRA+=(--max_samples "$MAX_EVAL_SAMPLES")
+# Needed when MODEL is a .ckpt (tokenizer lives outside the checkpoint); harmless for .nemo.
+[ -n "${TOKENIZER_DIR:-}" ] && EXTRA+=(--tokenizer_dir "$TOKENIZER_DIR")
+# LM-based warp selection (distilgpt2 by default); compares against oracle/baseline.
+if [ -n "$LM_MODEL" ]; then
+    EXTRA+=(--lm_model "$LM_MODEL" --lm_epsilon "$LM_EPSILON" --lm_batch_size "$LM_BATCH_SIZE")
+fi
 
 LOG="${OUT_DIR}/oracle_timewarp_$(basename "$MODEL").log"
 : > "$LOG"
 echo "==> model=$MODEL"
 echo "==> dataset_path=$DATASET_PATH"
 echo "==> factors=$FACTORS  method=$METHOD  device=$DEVICE"
+echo "==> lm_select=${LM_MODEL:-<off>}  lm_epsilon=$LM_EPSILON"
 echo "==> logging to $LOG"
 
-declare -A BASELINE BESTFIX ORACLE SCORED TOTAL PICKS
+declare -A BASELINE BESTFIX ORACLE SCORED TOTAL PICKS LMSEL LMPICKS
 for ds in "${DATASETS[@]}"; do
     echo "running oracle time-warp on ${ds}..."
     run_log=$(mktemp)
@@ -93,7 +104,7 @@ for ds in "${DATASETS[@]}"; do
     { echo "==================== ${ds} ===================="; cat "$run_log"; } >> "$LOG"
     if [ "$rc" -ne 0 ]; then
         echo "  ${ds} FAILED (exit ${rc}) -- see ${LOG}"
-        BASELINE[$ds]="FAIL"; BESTFIX[$ds]="FAIL"; ORACLE[$ds]="FAIL"; SCORED[$ds]="?"; TOTAL[$ds]="?"; PICKS[$ds]="?"
+        BASELINE[$ds]="FAIL"; BESTFIX[$ds]="FAIL"; ORACLE[$ds]="FAIL"; SCORED[$ds]="?"; TOTAL[$ds]="?"; PICKS[$ds]="?"; LMSEL[$ds]="FAIL"; LMPICKS[$ds]="?"
     else
         line=$(grep '^ORACLE_SUMMARY' "$run_log" | tail -1)
         SCORED[$ds]=$(echo "$line" | grep -oE 'scored=[0-9]+' | cut -d= -f2)
@@ -102,7 +113,14 @@ for ds in "${DATASETS[@]}"; do
         BESTFIX[$ds]=$(echo "$line" | grep -oE 'best_fixed=[0-9.]+' | cut -d= -f2)
         ORACLE[$ds]=$(echo "$line" | grep -oE 'oracle=[0-9.]+' | cut -d= -f2)
         PICKS[$ds]=$(echo "$line" | grep -oE 'picks=[^[:space:]]+' | cut -d= -f2)
-        echo "  ${ds}: baseline=${BASELINE[$ds]} best_fixed=${BESTFIX[$ds]} oracle=${ORACLE[$ds]} (scored ${SCORED[$ds]}/${TOTAL[$ds]}; picks ${PICKS[$ds]})"
+        lmline=$(grep '^LM_SUMMARY' "$run_log" | tail -1)
+        if [ -n "$lmline" ]; then
+            LMSEL[$ds]=$(echo "$lmline" | grep -oE 'lm_selected=[0-9.]+' | cut -d= -f2)
+            LMPICKS[$ds]=$(echo "$lmline" | grep -oE 'picks=[^[:space:]]+' | cut -d= -f2)
+        else
+            LMSEL[$ds]="NA"; LMPICKS[$ds]="NA"
+        fi
+        echo "  ${ds}: baseline=${BASELINE[$ds]} best_fixed=${BESTFIX[$ds]} lm=${LMSEL[$ds]} oracle=${ORACLE[$ds]} (scored ${SCORED[$ds]}/${TOTAL[$ds]}; picks ${PICKS[$ds]})"
     fi
     rm -f "$run_log"
 done
@@ -110,18 +128,23 @@ done
 echo ""
 echo "================== Oracle time-warp summary =================="
 echo "model  : $(basename "$MODEL")"
-echo "factors: $FACTORS   method: $METHOD"
-printf "  %-24s %12s %8s %8s %8s  %s\n" "dataset" "scored" "base" "bestfix" "ORACLE" "oracle_pick_%"
-sb=0; so=0; cnt=0
+echo "factors: $FACTORS   method: $METHOD   lm: ${LM_MODEL:-<off>} (eps=$LM_EPSILON)"
+printf "  %-24s %12s %8s %8s %8s %8s  %s\n" "dataset" "scored" "base" "bestfix" "LM-SEL" "ORACLE" "lm_pick_%"
+sb=0; so=0; sl=0; cnt=0; lcnt=0
 for ds in "${DATASETS[@]}"; do
-    printf "  %-24s %12s %8s %8s %8s  %s\n" "$ds" "${SCORED[$ds]:-?}/${TOTAL[$ds]:-?}" "${BASELINE[$ds]:-NA}" "${BESTFIX[$ds]:-NA}" "${ORACLE[$ds]:-NA}" "${PICKS[$ds]:-?}"
+    printf "  %-24s %12s %8s %8s %8s %8s  %s\n" "$ds" "${SCORED[$ds]:-?}/${TOTAL[$ds]:-?}" "${BASELINE[$ds]:-NA}" "${BESTFIX[$ds]:-NA}" "${LMSEL[$ds]:-NA}" "${ORACLE[$ds]:-NA}" "${LMPICKS[$ds]:-?}"
     if [[ "${BASELINE[$ds]}" =~ ^[0-9.]+$ ]] && [[ "${ORACLE[$ds]}" =~ ^[0-9.]+$ ]]; then
         sb=$(echo "$sb + ${BASELINE[$ds]}" | bc -l); so=$(echo "$so + ${ORACLE[$ds]}" | bc -l); cnt=$((cnt+1))
     fi
+    if [[ "${LMSEL[$ds]}" =~ ^[0-9.]+$ ]]; then
+        sl=$(echo "$sl + ${LMSEL[$ds]}" | bc -l); lcnt=$((lcnt+1))
+    fi
 done
 if [ "$cnt" -gt 0 ]; then
-    printf "  %-24s %12s %8s %8s %8s  %s\n" "----" "" "----" "" "----" ""
-    printf "  %-24s %12s %8.2f %8s %8.2f  %s\n" "AVERAGE" "" "$(echo "$sb/$cnt" | bc -l)" "" "$(echo "$so/$cnt" | bc -l)" ""
+    printf "  %-24s %12s %8s %8s %8s %8s  %s\n" "----" "" "----" "" "----" "----" ""
+    lm_avg="NA"
+    [ "$lcnt" -gt 0 ] && lm_avg=$(printf "%.2f" "$(echo "$sl/$lcnt" | bc -l)")
+    printf "  %-24s %12s %8.2f %8s %8s %8.2f  %s\n" "AVERAGE" "" "$(echo "$sb/$cnt" | bc -l)" "" "$lm_avg" "$(echo "$so/$cnt" | bc -l)" ""
 fi
 echo "============================================================="
 echo "Full log: ${LOG}"

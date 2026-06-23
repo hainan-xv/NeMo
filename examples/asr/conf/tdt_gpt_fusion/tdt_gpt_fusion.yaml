@@ -1,0 +1,103 @@
+# Jointly trained GPT-LM + TDT model with detached log-linear fusion.
+#
+# Architecture sub-configs (preprocessor/encoder/decoder/joint/spec_augment/model_defaults/loss/
+# decoding/tokenizer) are derived AT RUNTIME from a base TDT model (base_model_path / base_model_name)
+# by the entrypoint examples/asr/asr_transducer/speech_to_text_tdt_gpt_fusion.py. The encoder,
+# prediction network and joint are warm-started from that base model (the SPE-1024 vocabulary is
+# unchanged); the GPT LM is warm-started from a HuggingFace GPT-2 backbone (blocks only). This file
+# therefore only specifies the fusion-specific bits, data, optimization, trainer and exp_manager.
+
+name: "TDT-GPT-Fusion"
+
+# Base TDT model: architecture + (encoder/prednet/joint) warm-start come from here.
+base_model_path: null            # e.g. /pretrained/parakeet-tdt-0.6b-v2.nemo
+base_model_name: "nvidia/parakeet-tdt-0.6b-v2"
+init_tdt_from_base: true         # warm-start encoder + prediction net + joint from the base TDT
+
+model:
+  sample_rate: 16000
+  log_prediction: false
+  compute_eval_loss: true
+  use_cer: false
+
+  # Weight on the GPT LM's own next-token cross-entropy loss (added to the TDT loss).
+  lm_loss_weight: 1.0
+
+  # The entrypoint overwrites cfg.model.decoder / cfg.model.joint with the base model's sub-configs,
+  # then re-applies the custom _target_ + the extra fields below. We keep them here so they are easy
+  # to override from the launch script (e.g. model.joint.lm_fusion_alpha, model.decoder.gpt_lm.*).
+  decoder:
+    _target_: nemo.collections.asr.modules.tdt_gpt_fusion.TDTGPTFusionDecoder
+    gpt_lm:
+      hf_model: gpt2               # HF GPT-2 backbone whose attention + FFN weights are reused
+      init_from_pretrained: true   # set false for offline / from-scratch LM
+      max_ctx: 1024                # max history tokens kept during decoding (<= GPT-2 n_positions)
+
+  joint:
+    _target_: nemo.collections.asr.modules.tdt_gpt_fusion.TDTGPTFusionJoint
+    lm_fusion_alpha: 1.0           # weight on detached log P_LM added to the non-blank token logits
+
+  train_ds:
+    manifest_filepath: null
+    sample_rate: ${model.sample_rate}
+    batch_size: 16
+    shuffle: true
+    num_workers: 8
+    pin_memory: true
+    max_duration: 40.0
+    min_duration: 0.1
+    # lhotse fields are typically set from the launch script (use_lhotse, input_cfg, bucketing)
+
+  validation_ds:
+    manifest_filepath: null
+    sample_rate: ${model.sample_rate}
+    batch_size: 16
+    shuffle: false
+    num_workers: 4
+    pin_memory: true
+
+  test_ds:
+    manifest_filepath: null
+    sample_rate: ${model.sample_rate}
+    batch_size: 16
+    shuffle: false
+    num_workers: 4
+
+  optim:
+    name: adamw
+    lr: 1e-4
+    betas: [0.9, 0.98]
+    weight_decay: 1e-3
+    sched:
+      name: CosineAnnealing
+      warmup_steps: 5000
+      min_lr: 1e-6
+
+trainer:
+  devices: -1
+  num_nodes: 1
+  max_steps: 100000
+  max_epochs: -1
+  accelerator: gpu
+  strategy: ddp
+  precision: bf16
+  log_every_n_steps: 10
+  val_check_interval: 2000
+  enable_checkpointing: false
+  logger: false
+  benchmark: false
+  use_distributed_sampler: false
+
+exp_manager:
+  exp_dir: null
+  name: ${name}
+  create_tensorboard_logger: true
+  create_checkpoint_callback: true
+  checkpoint_callback_params:
+    monitor: "val_wer"
+    mode: "min"
+    save_top_k: 3
+    always_save_nemo: true
+  resume_if_exists: true
+  resume_ignore_no_checkpoint: true
+  create_wandb_logger: false
