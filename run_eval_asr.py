@@ -327,6 +327,22 @@ def main(args):
     if args.max_symbols_per_step is not None and hasattr(model, "ms_greedy"):
         model.ms_greedy.max_symbols = args.max_symbols_per_step
 
+    # Optional GPT-LM fusion override (TDT+GPT fusion models only). Setting alpha=0 zeroes the
+    # LM's contribution to the joint logits, so decoding falls back to the TDT-only model -- useful
+    # to measure how much the fused LM actually helps. The LM is still run but multiplied by 0.
+    if getattr(args, "lm_fusion_alpha", None) is not None:
+        joint = getattr(model, "joint", None)
+        if joint is not None and hasattr(joint, "lm_fusion_alpha"):
+            prev = joint.lm_fusion_alpha
+            joint.lm_fusion_alpha = float(args.lm_fusion_alpha)
+            mode = "LM DISABLED (TDT-only)" if joint.lm_fusion_alpha == 0.0 else "LM fusion active"
+            print(f"  LM fusion alpha override: {prev} -> {joint.lm_fusion_alpha}  [{mode}]")
+        else:
+            print(
+                "  WARNING: --lm_fusion_alpha given but model.joint has no 'lm_fusion_alpha' "
+                "(not a TDT+GPT fusion model); ignoring."
+            )
+
     rev_str = f"@{args.dataset_revision}" if args.dataset_revision else ""
     print(f"Loading dataset: {args.dataset_path}{rev_str}/{args.dataset} split={args.split}")
     load_kwargs = dict(
@@ -477,6 +493,13 @@ if __name__ == "__main__":
     parser.add_argument("--use_cer", action="store_true", help="Report CER instead of WER (multistream).")
     parser.add_argument(
         "--max_symbols_per_step", type=int, default=None, help="Override greedy symbols-per-step (multistream only)."
+    )
+    parser.add_argument(
+        "--lm_fusion_alpha",
+        type=float,
+        default=None,
+        help="Override the GPT-LM fusion weight on model.joint (TDT+GPT fusion models only). "
+        "Set 0.0 to disable the LM and measure TDT-only decoding.",
     )
     parser.add_argument("--verbose", action="store_true", help="Print each REF/HYP pair to stdout")
     parser.add_argument(

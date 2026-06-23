@@ -37,6 +37,11 @@ set -o pipefail
 #   RUN_AVERAGING  1 -> average all non '-last' ckpts into a *-averaged.nemo before eval
 #   FORCE_AVERAGE  1 -> recompute the averaged .nemo (else the cached one is reused)
 #   REUSE_AVG      1 -> reuse an existing local *-averaged.nemo with no remote access
+#   REUSE          1 -> reuse any cached local copy without prompting (skip the interactive ask)
+#   LM_FUSION_ALPHA  override the GPT-LM fusion weight (TDT+GPT fusion models only); 0 = LM disabled (TDT-only)
+#
+# When a checkpoint is already cached locally, the script asks whether to reuse it or
+# re-download a fresh copy (unless FORCE_DOWNLOAD=1 / REUSE=1, or it is run non-interactively).
 # ============================================================================
 
 # ---------- ORD connection ----------
@@ -80,6 +85,31 @@ ONLY="${ONLY:-}"
 # TED-LIUM was removed from hf-audio/open-asr-leaderboard on 2026-05-27; pin to
 # the last commit that still has the parquet so historical numbers reproduce.
 TEDLIUM_REVISION="${TEDLIUM_REVISION:-20a009a}"
+
+# ---------- Cached-checkpoint reuse prompt ----------
+# When a local copy already exists, ask once whether to reuse it or pull a fresh copy.
+# A "fresh" answer flips FORCE_DOWNLOAD/FORCE_AVERAGE so every downstream artifact is re-fetched
+# consistently. Honors explicit overrides and stays non-interactive-safe (defaults to reuse).
+_REUSE_ASKED=0
+_REUSE_ANS=""
+maybe_reuse() {
+    local path="$1"
+    [ "${FORCE_DOWNLOAD:-0}" = "1" ] && return 1   # already forced fresh
+    [ "${REUSE:-0}" = "1" ] && return 0            # forced reuse, no prompt
+    if [ "$_REUSE_ASKED" = "1" ]; then
+        [ "$_REUSE_ANS" = "reuse" ] && return 0 || return 1
+    fi
+    # No controlling terminal -> preserve old behavior (silently reuse the cache).
+    if [ ! -e /dev/tty ]; then return 0; fi
+    _REUSE_ASKED=1
+    printf '\n==> A locally cached copy already exists:\n      %s\n' "$path" >&2
+    local ans=""
+    read -r -p "    Reuse it? [Y/n]  (n = re-download a fresh copy) " ans </dev/tty || ans=""
+    case "$ans" in
+        [Nn]*) _REUSE_ANS="fresh"; FORCE_DOWNLOAD=1; FORCE_AVERAGE=1; echo "    -> re-downloading fresh." >&2; return 1 ;;
+        *)     _REUSE_ANS="reuse"; echo "    -> reusing cached copy." >&2; return 0 ;;
+    esac
+}
 
 # ---------- Resolve / download the checkpoint ----------
 LOCAL_CKPT_PATH=""
@@ -149,15 +179,22 @@ else
         AVG_SCRIPT="${NEMO_ROOT}/scripts/checkpoint_averaging/checkpoint_averaging.py"
         AVG_DIR="${LOCAL_CKPT_DIR}/${EXP_NAME}/avg_inputs"
 
-        # REUSE_AVG=1: reuse a previously-built *-averaged.nemo with no remote access.
-        if [ "${REUSE_AVG:-0}" = "1" ] && [ "${FORCE_AVERAGE:-0}" != "1" ] && [ "${FORCE_DOWNLOAD:-0}" != "1" ]; then
+        # The *-averaged.nemo is the actual model we run inference with. If one is already cached,
+        # reuse it (and skip ALL download + averaging) -- either silently (REUSE_AVG=1) or after an
+        # interactive prompt. FORCE_AVERAGE=1 / FORCE_DOWNLOAD=1 always rebuild it from scratch.
+        if [ "${FORCE_AVERAGE:-0}" != "1" ] && [ "${FORCE_DOWNLOAD:-0}" != "1" ]; then
             existing_avg=$(ls -t "${AVG_DIR}"/*-averaged.nemo 2>/dev/null | head -1)
-            if [ -n "$existing_avg" ]; then
+            if [ "${REUSE_AVG:-0}" = "1" ]; then
+                if [ -n "$existing_avg" ]; then
+                    LOCAL_CKPT_PATH="$existing_avg"
+                    echo "==> REUSE_AVG=1: reusing existing averaged model: $LOCAL_CKPT_PATH"
+                else
+                    echo "ERROR: REUSE_AVG=1 but no *-averaged.nemo in ${AVG_DIR}" >&2
+                    exit 1
+                fi
+            elif [ -n "$existing_avg" ] && maybe_reuse "$existing_avg"; then
                 LOCAL_CKPT_PATH="$existing_avg"
-                echo "==> REUSE_AVG=1: reusing existing averaged model: $LOCAL_CKPT_PATH"
-            else
-                echo "ERROR: REUSE_AVG=1 but no *-averaged.nemo in ${AVG_DIR}" >&2
-                exit 1
+                echo "==> Reusing existing averaged model (no re-download/averaging): $LOCAL_CKPT_PATH"
             fi
         fi
 
@@ -178,8 +215,12 @@ else
                 exit 1
             fi
             LOCAL_NEMO="${AVG_DIR}/${NEMO_FNAME}"
-            if [ -f "$LOCAL_NEMO" ] && [ "${FORCE_DOWNLOAD:-0}" != "1" ]; then
-                echo "==> Cached base model: ${NEMO_FNAME}"
+            # The base .nemo only supplies the model class/config/tokenizer; checkpoint_averaging.py
+            # OVERWRITES its weights with the average of the .ckpt files (load_state_dict, strict=True).
+            # So its weights are irrelevant and it never needs a "fresh" re-download -- reuse any cached
+            # copy and fetch it only when missing/empty (even on a fresh-checkpoint re-download).
+            if [ -s "$LOCAL_NEMO" ]; then
+                echo "==> Cached base model (weights unused; supplies arch+tokenizer only): ${NEMO_FNAME}"
             else
                 echo "==> Downloading base model ${NEMO_FNAME}..."
                 scp $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_CKPT_DIR}/${NEMO_FNAME}" "$LOCAL_NEMO" || exit 1
@@ -196,27 +237,55 @@ else
             echo "    Found ${NUM_CKPTS} checkpoint(s) to average:"
             echo "$REMOTE_CKPT_FILES" | sed 's/^/      - /'
 
-            # Download every non '-last' .ckpt into the .nemo's folder (the script
-            # auto-discovers them and ignores -last.ckpt).
+            # Sync EXACTLY the current top-k non '-last' .ckpt set into the .nemo's folder via rsync
+            # (resumable, skips byte-identical files), then PRUNE any stale .ckpt left from a previous
+            # run. This is critical: checkpoint_averaging.py averages EVERY *.ckpt in the folder
+            # (os.listdir, ignoring only -last.ckpt), so a leftover older checkpoint would silently be
+            # folded into the average. Pruning guarantees we average ONLY these ${NUM_CKPTS}.
+            CKPT_LIST_FILE=$(mktemp)
+            printf '%s\n' "$REMOTE_CKPT_FILES" > "$CKPT_LIST_FILE"
+            RSYNC_OPTS=(-vh --times --partial --files-from="$CKPT_LIST_FILE" -e "ssh $SSH_OPTS")
+            # A "fresh re-download" forces rsync to re-transfer even byte-identical files.
+            [ "${FORCE_DOWNLOAD:-0}" = "1" ] && RSYNC_OPTS+=(--ignore-times)
+            echo "==> Syncing ${NUM_CKPTS} checkpoint(s) from ORD via rsync..."
+            if ! rsync "${RSYNC_OPTS[@]}" \
+                    "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_CKPT_DIR}/" "$AVG_DIR/"; then
+                echo "ERROR: rsync of averaging checkpoints failed." >&2
+                rm -f "$CKPT_LIST_FILE"
+                exit 1
+            fi
+            rm -f "$CKPT_LIST_FILE"
+
+            # Prune any local non '-last' .ckpt that is NOT in the current remote top-k set, so the
+            # averaging input set == the current ${NUM_CKPTS} checkpoints (no stale ones).
             NEWEST_INPUT="$LOCAL_NEMO"
-            while IFS= read -r fname; do
-                [ -z "$fname" ] && continue
-                local_path="${AVG_DIR}/${fname}"
-                if [ -f "$local_path" ] && [ "${FORCE_DOWNLOAD:-0}" != "1" ]; then
-                    echo "==> Cached: ${fname} ($(du -h "$local_path" | cut -f1))"
+            PRUNED_STALE=0
+            shopt -s nullglob
+            for f in "$AVG_DIR"/*.ckpt; do
+                base=$(basename "$f")
+                case "$base" in *-last.ckpt) continue ;; esac
+                if printf '%s\n' "$REMOTE_CKPT_FILES" | grep -qxF "$base"; then
+                    [ "$f" -nt "$NEWEST_INPUT" ] && NEWEST_INPUT="$f"
                 else
-                    echo "==> Downloading ${fname}..."
-                    if ! scp $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_CKPT_DIR}/${fname}" "$local_path"; then
-                        echo "ERROR: scp failed for ${fname}" >&2
-                        [ -f "$local_path" ] && [ ! -s "$local_path" ] && rm -f "$local_path"
-                        exit 1
-                    fi
+                    echo "==> Pruning stale checkpoint (not in current top-${NUM_CKPTS}): $base"
+                    rm -f "$f"
+                    PRUNED_STALE=1
                 fi
-                [ "$local_path" -nt "$NEWEST_INPUT" ] && NEWEST_INPUT="$local_path"
-            done <<< "$REMOTE_CKPT_FILES"
+            done
+            shopt -u nullglob
+
+            # Sanity: the folder must now hold exactly the current set of non '-last' ckpts.
+            LOCAL_NUM_CKPTS=$(find "$AVG_DIR" -maxdepth 1 -name '*.ckpt' ! -name '*-last.ckpt' | wc -l)
+            if [ "$LOCAL_NUM_CKPTS" -ne "$NUM_CKPTS" ]; then
+                echo "ERROR: expected ${NUM_CKPTS} checkpoint(s) to average but ${AVG_DIR} has ${LOCAL_NUM_CKPTS}." >&2
+                exit 1
+            fi
+            echo "==> Averaging input set: ${LOCAL_NUM_CKPTS} checkpoint(s) (stale ones pruned: ${PRUNED_STALE})"
 
             # checkpoint_averaging.py writes <nemo_basename>-averaged.nemo next to the inputs.
             LOCAL_CKPT_PATH="${AVG_DIR}/${NEMO_FNAME%.nemo}-averaged.nemo"
+            # If we pruned a stale ckpt the input set changed even if timestamps didn't, so force recompute.
+            [ "$PRUNED_STALE" = "1" ] && FORCE_AVERAGE=1
             if [ -f "$LOCAL_CKPT_PATH" ] && [ "${FORCE_AVERAGE:-0}" != "1" ] && [ ! "$NEWEST_INPUT" -nt "$LOCAL_CKPT_PATH" ]; then
                 echo "==> Using cached averaged model: $LOCAL_CKPT_PATH (FORCE_AVERAGE=1 to recompute)"
             else
@@ -268,8 +337,8 @@ else
         # Download the checkpoint (cache-first).
         REMOTE_CKPT_PATH="${REMOTE_CKPT_DIR}/${CKPT_FILENAME}"
         LOCAL_CKPT_PATH="${LOCAL_CKPT_DIR}/${EXP_NAME}/${CKPT_FILENAME}"
-        if [ -f "$LOCAL_CKPT_PATH" ] && [ "${FORCE_DOWNLOAD:-0}" != "1" ]; then
-            echo "==> Using cached local checkpoint (FORCE_DOWNLOAD=1 to refresh): $LOCAL_CKPT_PATH"
+        if [ -f "$LOCAL_CKPT_PATH" ] && maybe_reuse "$LOCAL_CKPT_PATH"; then
+            echo "==> Using cached local checkpoint: $LOCAL_CKPT_PATH"
         else
             echo "==> Downloading checkpoint from ORD..."
             echo "    ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_CKPT_PATH}"
@@ -347,8 +416,12 @@ EXTRA_ARGS=()
 [ "${USE_CER:-0}" = "1" ] && EXTRA_ARGS+=(--use_cer)
 [ -n "${MAX_SYMBOLS:-}" ] && EXTRA_ARGS+=(--max_symbols_per_step "$MAX_SYMBOLS")
 [ -n "$MAX_EVAL_SAMPLES" ] && EXTRA_ARGS+=(--max_eval_samples "$MAX_EVAL_SAMPLES")
+[ -n "${LM_FUSION_ALPHA:-}" ] && EXTRA_ARGS+=(--lm_fusion_alpha "$LM_FUSION_ALPHA")
 
-EVAL_LOG="${LOCAL_CKPT_DIR}/${EXP_NAME}/eval_$(basename "${LOCAL_CKPT_PATH}").log"
+# Tag the log file with the fusion alpha so TDT-only (alpha=0) and fused runs don't clobber logs.
+LOG_TAG=""
+[ -n "${LM_FUSION_ALPHA:-}" ] && LOG_TAG="_lmAlpha${LM_FUSION_ALPHA}"
+EVAL_LOG="${LOCAL_CKPT_DIR}/${EXP_NAME}/eval_$(basename "${LOCAL_CKPT_PATH}")${LOG_TAG}.log"
 mkdir -p "$(dirname "$EVAL_LOG")"
 : > "$EVAL_LOG"
 echo "==> Logging to $EVAL_LOG"
@@ -407,6 +480,7 @@ echo "================ Evaluation summary ================"
 echo "exp    : ${EXP_NAME}"
 echo "ckpt   : $(basename "${LOCAL_CKPT_PATH}")"
 echo "metric : $([ "${USE_CER:-0}" = "1" ] && echo CER || echo WER)"
+[ -n "${LM_FUSION_ALPHA:-}" ] && echo "lm_alpha: ${LM_FUSION_ALPHA}$([ "${LM_FUSION_ALPHA}" = "0" ] && echo '  (LM disabled: TDT-only)')"
 sum=0; cnt=0
 for ds_entry in "${DATASETS[@]}"; do
     v="${WER_RESULTS[$ds_entry]:-N/A}"

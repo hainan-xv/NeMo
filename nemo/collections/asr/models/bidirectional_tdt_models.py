@@ -1,0 +1,232 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Bidirectional TDT transducer: one shared encoder, two (prediction-net, joint) pairs.
+
+A standard parakeet-style TDT (:class:`EncDecRNNTBPEModel`) is extended with a second
+prediction-network + joint pair that is trained in the *backward* (right-to-left) direction. The
+encoder is shared and runs once per step; the backward branch consumes the **time-reversed** encoder
+output aligned to the **reversed** label sequence. Reversing *both* time and labels keeps the
+transducer's monotonic alignment valid (reversed-frame 0 = end of audio, reversed-label 0 = last
+token), so the backward branch is a genuine right-to-left acoustic model rather than a broken
+forward-time / reversed-label alignment.
+
+The total training loss is::
+
+    L = L_fwd + backward_loss_weight * L_bwd
+
+Both branches use the same TDT loss object (it is stateless w.r.t. direction). Only the training
+objective is implemented here; inference-time combination of the two directions is intentionally left
+for later (the monitored ``val_wer`` is still computed from the forward branch).
+"""
+
+from typing import Optional, Tuple
+
+import torch
+from lightning.pytorch import Trainer
+from omegaconf import DictConfig
+
+from nemo.collections.asr.data.audio_to_text_dali import DALIOutputs
+from nemo.collections.asr.models.rnnt_bpe_models import EncDecRNNTBPEModel
+from nemo.core.classes.common import PretrainedModelInfo
+from nemo.core.classes.mixins import AccessMixin
+from nemo.utils import logging
+
+
+class EncDecBidirectionalTDTBPEModel(EncDecRNNTBPEModel):
+    """TDT transducer trained jointly left-to-right and right-to-left over a shared encoder."""
+
+    def __init__(self, cfg: DictConfig, trainer: Trainer = None):
+        super().__init__(cfg=cfg, trainer=trainer)
+
+        if self.loss_type != 'rnnt':
+            raise ValueError(
+                f"EncDecBidirectionalTDTBPEModel only supports loss_type='rnnt' (TDT/RNN-T), got "
+                f"'{self.loss_type}'."
+            )
+        if getattr(self.joint, 'fuse_loss_wer', False):
+            raise ValueError(
+                "EncDecBidirectionalTDTBPEModel requires model.joint.fuse_loss_wer=false (the forward "
+                "and backward losses are computed explicitly outside the fused joint path)."
+            )
+
+        # Weight on the backward (right-to-left) transducer loss added to the forward loss.
+        self.backward_loss_weight = float(self.cfg.get('backward_loss_weight', 1.0))
+
+        # Second (prediction-net, joint) pair, built from the SAME sub-configs as the forward pair so
+        # the architecture (incl. TDT durations via joint.num_extra_outputs) is identical. These are
+        # fresh modules: by default the entrypoint warm-starts only the forward pair, leaving these
+        # trained from scratch.
+        self.decoder_bwd = self.from_config_dict(self.cfg.decoder)
+        self.joint_bwd = self.from_config_dict(self.cfg.joint)
+
+    # -- helpers ---------------------------------------------------------------------------------
+
+    @staticmethod
+    def _reverse_time(encoded: torch.Tensor, encoded_len: torch.Tensor) -> torch.Tensor:
+        """Reverse the encoder output along time, per-sample, respecting valid lengths.
+
+        Args:
+            encoded: ``[B, D, T]`` encoder output (channel-first, as fed to the joint).
+            encoded_len: ``[B]`` number of valid frames per sample.
+
+        Returns:
+            ``[B, D, T]`` with frames ``0..L-1`` reversed and padding frames ``L..T-1`` left in place.
+        """
+        B, D, T = encoded.shape
+        device = encoded.device
+        idx = torch.arange(T, device=device).unsqueeze(0)  # [1, T]
+        lengths = encoded_len.to(device).long().unsqueeze(1)  # [B, 1]
+        src = torch.where(idx < lengths, lengths - 1 - idx, idx).clamp_(min=0, max=max(T - 1, 0))  # [B, T]
+        src = src.unsqueeze(1).expand(B, D, T)
+        return torch.gather(encoded, 2, src)
+
+    @staticmethod
+    def _reverse_labels(transcript: torch.Tensor, transcript_len: torch.Tensor) -> torch.Tensor:
+        """Reverse the label sequence, per-sample, respecting valid lengths.
+
+        Args:
+            transcript: ``[B, U]`` token ids.
+            transcript_len: ``[B]`` number of valid tokens per sample.
+
+        Returns:
+            ``[B, U]`` with tokens ``0..L-1`` reversed and padding tokens left in place.
+        """
+        B, U = transcript.shape
+        if U == 0:
+            return transcript
+        device = transcript.device
+        idx = torch.arange(U, device=device).unsqueeze(0)  # [1, U]
+        lengths = transcript_len.to(device).long().unsqueeze(1)  # [B, 1]
+        src = torch.where(idx < lengths, lengths - 1 - idx, idx).clamp_(min=0, max=U - 1)  # [B, U]
+        return torch.gather(transcript, 1, src)
+
+    def _transducer_loss(
+        self,
+        decoder_module,
+        joint_module,
+        encoded: torch.Tensor,
+        encoded_len: torch.Tensor,
+        transcript: torch.Tensor,
+        transcript_len: torch.Tensor,
+    ) -> torch.Tensor:
+        """Standard (non-fused) TDT loss for one (prediction-net, joint) pair."""
+        dec, target_length, _ = decoder_module(targets=transcript, target_length=transcript_len)
+        joint = joint_module(encoder_outputs=encoded, decoder_outputs=dec, encoder_lengths=encoded_len)
+        return self.loss(
+            log_probs=joint,
+            targets=transcript,
+            input_lengths=encoded_len,
+            target_lengths=target_length,
+        )
+
+    def _forward_encoder(self, batch):
+        signal, signal_len, transcript, transcript_len = batch
+        if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
+            encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
+        else:
+            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
+        return encoded, encoded_len, transcript, transcript_len
+
+    def _both_direction_losses(
+        self, encoded: torch.Tensor, encoded_len: torch.Tensor, transcript: torch.Tensor, transcript_len: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute the forward (L2R) and backward (R2L) transducer losses over the shared encoder."""
+        fwd_loss = self._transducer_loss(
+            self.decoder, self.joint, encoded, encoded_len, transcript, transcript_len
+        )
+        enc_rev = self._reverse_time(encoded, encoded_len)
+        y_rev = self._reverse_labels(transcript, transcript_len)
+        bwd_loss = self._transducer_loss(
+            self.decoder_bwd, self.joint_bwd, enc_rev, encoded_len, y_rev, transcript_len
+        )
+        return fwd_loss, bwd_loss
+
+    # -- training / validation -------------------------------------------------------------------
+
+    def training_step(self, batch, batch_nb):
+        if AccessMixin.is_access_enabled(self.model_guid):
+            AccessMixin.reset_registry(self)
+
+        encoded, encoded_len, transcript, transcript_len = self._forward_encoder(batch)
+
+        if hasattr(self, '_trainer') and self._trainer is not None:
+            log_every_n_steps = self._trainer.log_every_n_steps
+            sample_id = self._trainer.global_step
+        else:
+            log_every_n_steps = 1
+            sample_id = batch_nb
+
+        fwd_loss, bwd_loss = self._both_direction_losses(encoded, encoded_len, transcript, transcript_len)
+        loss_value = fwd_loss + self.backward_loss_weight * bwd_loss
+        loss_value = self.add_auxiliary_losses(loss_value)
+
+        if AccessMixin.is_access_enabled(self.model_guid):
+            AccessMixin.reset_registry(self)
+
+        tensorboard_logs = {
+            'train_loss': loss_value,
+            'train_fwd_loss': fwd_loss.detach(),
+            'train_bwd_loss': bwd_loss.detach(),
+            'learning_rate': self._optimizer.param_groups[0]['lr'],
+            'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
+        }
+
+        if (sample_id + 1) % log_every_n_steps == 0:
+            # WER is measured on the forward branch (self.decoding wraps self.decoder/self.joint).
+            self.wer.update(
+                predictions=encoded,
+                predictions_lengths=encoded_len,
+                targets=transcript,
+                targets_lengths=transcript_len,
+            )
+            _, scores, words = self.wer.compute()
+            self.wer.reset()
+            tensorboard_logs.update({'training_batch_wer': scores.float() / words})
+
+        self.log_dict(tensorboard_logs)
+
+        if self._optim_normalize_joint_txu:
+            self._optim_normalize_txu = [encoded_len.max(), transcript_len.max()]
+
+        return {'loss': loss_value}
+
+    def validation_pass(self, batch, batch_idx, dataloader_idx=0):
+        encoded, encoded_len, transcript, transcript_len = self._forward_encoder(batch)
+
+        tensorboard_logs = {}
+        if self.compute_eval_loss:
+            fwd_loss, bwd_loss = self._both_direction_losses(encoded, encoded_len, transcript, transcript_len)
+            tensorboard_logs['val_loss'] = fwd_loss + self.backward_loss_weight * bwd_loss
+            tensorboard_logs['val_fwd_loss'] = fwd_loss.detach()
+            tensorboard_logs['val_bwd_loss'] = bwd_loss.detach()
+
+        # Monitored metric: forward-branch WER.
+        self.wer.update(
+            predictions=encoded,
+            predictions_lengths=encoded_len,
+            targets=transcript,
+            targets_lengths=transcript_len,
+        )
+        wer, wer_num, wer_denom = self.wer.compute()
+        self.wer.reset()
+        tensorboard_logs['val_wer_num'] = wer_num
+        tensorboard_logs['val_wer_denom'] = wer_denom
+        tensorboard_logs['val_wer'] = wer
+
+        return tensorboard_logs
+
+    @classmethod
+    def list_available_models(cls) -> Optional[PretrainedModelInfo]:
+        return []
