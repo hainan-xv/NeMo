@@ -46,6 +46,16 @@ class EncDecTDTGPTFusionModel(EncDecRNNTBPEModel):
     def __init__(self, cfg: DictConfig, trainer: Trainer = None):
         super().__init__(cfg=cfg, trainer=trainer)
         self.lm_loss_weight = float(self.cfg.get('lm_loss_weight', 1.0))
+        # How to reduce the LM next-token CE loss:
+        #   'token_mean'  -> mean over ALL valid tokens in the batch (default; back-compat).
+        #   'sample_mean' -> per-utterance per-token mean, then averaged over the batch. This matches
+        #                    the TDT loss when `rnnt_reduction=mean`, so both terms are length-normalized
+        #                    and weight each utterance equally.
+        self.lm_loss_reduction = str(self.cfg.get('lm_loss_reduction', 'token_mean')).lower()
+        if self.lm_loss_reduction not in ('token_mean', 'sample_mean'):
+            raise ValueError(
+                f"`lm_loss_reduction` must be 'token_mean' or 'sample_mean', got '{self.lm_loss_reduction}'."
+            )
         if not hasattr(self.decoder, 'get_last_lm_logits'):
             raise ValueError(
                 "EncDecTDTGPTFusionModel requires a fusion-aware decoder "
@@ -69,9 +79,17 @@ class EncDecTDTGPTFusionModel(EncDecRNNTBPEModel):
 
         device = transcript.device
         mask = (torch.arange(steps, device=device)[None, :] < transcript_len[:, None].to(device)).float()
-        denom = mask.sum().clamp(min=1.0)
-        lm_loss = (ce * mask).sum() / denom
-        ppl = torch.exp(lm_loss.detach())
+        ce = ce * mask
+
+        # Perplexity is always reported as a per-token quantity (independent of the loss reduction).
+        token_mean = ce.sum() / mask.sum().clamp(min=1.0)
+        ppl = torch.exp(token_mean.detach())
+
+        if self.lm_loss_reduction == 'sample_mean':
+            per_sample = ce.sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)  # per-utterance per-token loss
+            lm_loss = per_sample.mean()
+        else:  # 'token_mean'
+            lm_loss = token_mean
         return lm_loss, ppl
 
     def training_step(self, batch, batch_nb):
