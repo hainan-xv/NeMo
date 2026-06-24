@@ -34,6 +34,14 @@ set -o pipefail
 #   QUICK_TEST     1 -> 10 samples from ami/test only
 #   FORCE_DOWNLOAD 1 -> re-scp even if a local copy exists
 #   MAX_SYMBOLS    override greedy symbols-per-step (multistream only)
+#   BACKWARD       1 -> decode with the backward (R2L) branch of a bidirectional model
+#                       (requires model.decoding_bwd; writes *_backward_* manifests + log)
+#   NAR            1 -> non-autoregressive decode (no prediction-net) for a HAINAN model;
+#                       combine with BACKWARD=1 for the R2L branch (writes *_nar_* manifests + log)
+#   NAR_SWAP_EMBED 1 -> (NAR diagnostic) use the other branch's output token-embedding head
+#                       (forward head for a backward run and vice versa)
+#   NAR_ENSEMBLE_WEIGHT w -> (NAR) log-linearly pool fwd+bwd joiner distributions, weight w on the
+#                       other branch (0=own, 1=other, 0.5=equal 2-branch ensemble)
 #   RUN_AVERAGING  1 -> average all non '-last' ckpts into a *-averaged.nemo before eval
 #   FORCE_AVERAGE  1 -> recompute the averaged .nemo (else the cached one is reused)
 #   REUSE_AVG      1 -> reuse an existing local *-averaged.nemo with no remote access
@@ -183,7 +191,10 @@ else
         # reuse it (and skip ALL download + averaging) -- either silently (REUSE_AVG=1) or after an
         # interactive prompt. FORCE_AVERAGE=1 / FORCE_DOWNLOAD=1 always rebuild it from scratch.
         if [ "${FORCE_AVERAGE:-0}" != "1" ] && [ "${FORCE_DOWNLOAD:-0}" != "1" ]; then
-            existing_avg=$(ls -t "${AVG_DIR}"/*-averaged.nemo 2>/dev/null | head -1)
+            # NOTE: `|| true` is required -- with `set -e`+`set -o pipefail`, a no-match `ls` exits
+            # non-zero and would otherwise silently kill the script on the first eval of a new exp
+            # (before any avg_inputs dir exists).
+            existing_avg=$(ls -t "${AVG_DIR}"/*-averaged.nemo 2>/dev/null | head -1) || true
             if [ "${REUSE_AVG:-0}" = "1" ]; then
                 if [ -n "$existing_avg" ]; then
                     LOCAL_CKPT_PATH="$existing_avg"
@@ -417,10 +428,19 @@ EXTRA_ARGS=()
 [ -n "${MAX_SYMBOLS:-}" ] && EXTRA_ARGS+=(--max_symbols_per_step "$MAX_SYMBOLS")
 [ -n "$MAX_EVAL_SAMPLES" ] && EXTRA_ARGS+=(--max_eval_samples "$MAX_EVAL_SAMPLES")
 [ -n "${LM_FUSION_ALPHA:-}" ] && EXTRA_ARGS+=(--lm_fusion_alpha "$LM_FUSION_ALPHA")
+[ "${BACKWARD:-0}" = "1" ] && EXTRA_ARGS+=(--backward)
+[ "${NAR:-0}" = "1" ] && EXTRA_ARGS+=(--nar)
+[ "${NAR_SWAP_EMBED:-0}" = "1" ] && EXTRA_ARGS+=(--nar_swap_embed)
+[ -n "${NAR_ENSEMBLE_WEIGHT:-}" ] && EXTRA_ARGS+=(--nar_ensemble_weight "$NAR_ENSEMBLE_WEIGHT")
 
 # Tag the log file with the fusion alpha so TDT-only (alpha=0) and fused runs don't clobber logs.
 LOG_TAG=""
 [ -n "${LM_FUSION_ALPHA:-}" ] && LOG_TAG="_lmAlpha${LM_FUSION_ALPHA}"
+# Tag NAR / backward runs so their logs don't clobber the forward (AR/L2R) run's log.
+[ "${NAR:-0}" = "1" ] && LOG_TAG="${LOG_TAG}_nar"
+[ -n "${NAR_ENSEMBLE_WEIGHT:-}" ] && LOG_TAG="${LOG_TAG}ens${NAR_ENSEMBLE_WEIGHT}"
+[ "${NAR_SWAP_EMBED:-0}" = "1" ] && LOG_TAG="${LOG_TAG}swap"
+[ "${BACKWARD:-0}" = "1" ] && LOG_TAG="${LOG_TAG}_backward"
 EVAL_LOG="${LOCAL_CKPT_DIR}/${EXP_NAME}/eval_$(basename "${LOCAL_CKPT_PATH}")${LOG_TAG}.log"
 mkdir -p "$(dirname "$EVAL_LOG")"
 : > "$EVAL_LOG"
@@ -461,8 +481,10 @@ for ds_entry in "${DATASETS[@]}"; do
         echo "  ${DATASET} FAILED (exit ${rc}) -- see ${EVAL_LOG}"
         WER_RESULTS[$ds_entry]="FAIL"
     else
-        wer=$(grep -oE 'WER:[[:space:]]*[0-9.]+' "$run_log" | tail -1 | grep -oE '[0-9.]+$')
-        rtfx=$(grep -oE 'RTFX:[[:space:]]*[0-9.]+' "$run_log" | tail -1 | grep -oE '[0-9.]+$')
+        # `|| true`: a missing WER/RTFX line makes grep exit non-zero which, under set -e+pipefail,
+        # would silently kill the script instead of falling through to the "no WER parsed" branch.
+        wer=$(grep -oE 'WER:[[:space:]]*[0-9.]+' "$run_log" | tail -1 | grep -oE '[0-9.]+$') || true
+        rtfx=$(grep -oE 'RTFX:[[:space:]]*[0-9.]+' "$run_log" | tail -1 | grep -oE '[0-9.]+$') || true
         if [ -n "$wer" ]; then
             echo "  ${DATASET} WER: ${wer} | RTFx: ${rtfx:-?}"
             WER_RESULTS[$ds_entry]="$wer"
@@ -480,6 +502,7 @@ echo "================ Evaluation summary ================"
 echo "exp    : ${EXP_NAME}"
 echo "ckpt   : $(basename "${LOCAL_CKPT_PATH}")"
 echo "metric : $([ "${USE_CER:-0}" = "1" ] && echo CER || echo WER)"
+echo "decode : $([ "${NAR:-0}" = "1" ] && echo 'NAR ' || echo '')$([ "${BACKWARD:-0}" = "1" ] && echo 'backward (R2L)' || echo 'forward (L2R)')"
 [ -n "${LM_FUSION_ALPHA:-}" ] && echo "lm_alpha: ${LM_FUSION_ALPHA}$([ "${LM_FUSION_ALPHA}" = "0" ] && echo '  (LM disabled: TDT-only)')"
 sum=0; cnt=0
 for ds_entry in "${DATASETS[@]}"; do

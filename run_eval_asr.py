@@ -223,6 +223,92 @@ def transcribe_aligner_like(model, audio_files, batch_size):
     return hyps
 
 
+@torch.inference_mode()
+def transcribe_backward(model, audio_files, batch_size):
+    """Backward (right-to-left) greedy decode for a bidirectional model.
+
+    The model has a second (prediction-net, joint) pair trained on the time-reversed
+    encoder output + reversed labels (``model.decoder_bwd`` / ``model.joint_bwd`` /
+    ``model.decoding_bwd``). We run the shared encoder, reverse its output along time
+    (``model._reverse_time``), greedily decode with the backward branch, then un-reverse
+    the predicted token ids so the detokenized text is in normal forward order and
+    directly comparable to the forward branch. Mirrors ``EncDecBidirectionalTDTBPEModel.
+    _backward_wer_counts``; uses the same soundfile loader as ``transcribe_aligner_like``
+    (leaderboard audio is cached as 16 kHz mono).
+    """
+    if not hasattr(model, "decoding_bwd"):
+        raise SystemExit(
+            "--backward requires a bidirectional model exposing a 'decoding_bwd' branch "
+            f"(got {type(model).__name__})."
+        )
+    dloader = torch.utils.data.DataLoader(
+        AudioFileDataset(audio_files),
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+        collate_fn=_collate_audio,
+    )
+    hyps = []
+    for signal, signal_len in tqdm(dloader, desc="Transcribing (backward R2L)"):
+        signal = signal.to(model.device, non_blocking=True)
+        signal_len = signal_len.to(model.device, non_blocking=True)
+        encoded, encoded_len = model.forward(input_signal=signal, input_signal_length=signal_len)
+        enc_rev = model._reverse_time(encoded, encoded_len)
+        out = model.decoding_bwd.rnnt_decoder_predictions_tensor(
+            encoder_output=enc_rev, encoded_lengths=encoded_len, return_hypotheses=True
+        )
+        if isinstance(out, tuple):
+            out = out[0]
+        for hyp in out:
+            ids = hyp.y_sequence
+            if isinstance(ids, torch.Tensor):
+                ids = ids.tolist()
+            ids = list(ids)[::-1]  # un-reverse R2L prediction -> forward token order
+            hyps.append(model.decoding_bwd.decode_ids_to_str(ids))
+    return hyps
+
+
+@torch.inference_mode()
+def transcribe_nar(model, audio_files, batch_size, backward=False, swap_token_embed=False, ensemble_weight=None):
+    """Non-autoregressive (NAR) greedy decode for a bidirectional HAINAN model.
+
+    Runs the shared encoder, then ``model.nar_greedy_decode`` -- which computes the per-frame token +
+    duration distribution in ONE masked-predictor joint call (no prediction-net / decoder), and a
+    pure-Python loop walks the TDT durations to emit tokens. ``backward=True`` uses the R2L branch;
+    ``swap_token_embed=True`` applies the OTHER branch's output token-embedding head (diagnostic);
+    ``ensemble_weight`` log-linearly pools both branches' distributions (0=own, 1=other, 0.5=equal).
+    Same 16 kHz cached-audio loader as ``transcribe_aligner_like``.
+    """
+    if not hasattr(model, "nar_greedy_decode"):
+        raise SystemExit(
+            "--nar requires a bidirectional HAINAN model exposing 'nar_greedy_decode' "
+            f"(got {type(model).__name__})."
+        )
+    dloader = torch.utils.data.DataLoader(
+        AudioFileDataset(audio_files),
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+        collate_fn=_collate_audio,
+    )
+    hyps = []
+    desc = "Transcribing (NAR backward R2L)" if backward else "Transcribing (NAR forward L2R)"
+    for signal, signal_len in tqdm(dloader, desc=desc):
+        signal = signal.to(model.device, non_blocking=True)
+        signal_len = signal_len.to(model.device, non_blocking=True)
+        encoded, encoded_len = model.forward(input_signal=signal, input_signal_length=signal_len)
+        hyps.extend(
+            model.nar_greedy_decode(
+                encoded,
+                encoded_len,
+                backward=backward,
+                swap_token_embed=swap_token_embed,
+                ensemble_weight=ensemble_weight,
+            )
+        )
+    return hyps
+
+
 def transcribe_consistency(model, audio_files, batch_size, head_weights=None):
     """Decode a multi-target model with the consistency-maintaining joint.
 
@@ -425,10 +511,36 @@ def main(args):
 
     loss_type = getattr(model, "loss_type", None)
     is_aligner_like = loss_type in ("aligner", "chunked_aligner")
-    decode_kind = "multistream" if is_multistream else ("aligner/chunked" if is_aligner_like else "tdt")
+    direction = "backward (R2L)" if args.backward else "forward (L2R)"
+    if args.nar:
+        if args.nar_ensemble_weight is not None:
+            decode_kind = f"NAR {direction} [2-branch log-linear ensemble w={args.nar_ensemble_weight}]"
+        elif args.nar_swap_embed:
+            decode_kind = f"NAR {direction} [swapped token head]"
+        else:
+            decode_kind = f"NAR {direction}"
+    elif args.backward:
+        decode_kind = "backward (R2L)"
+    elif is_multistream:
+        decode_kind = "multistream"
+    elif is_aligner_like:
+        decode_kind = "aligner/chunked"
+    else:
+        decode_kind = "tdt"
     print(f"Transcribing {n_samples} samples ({decode_kind})...")
     start = time.time()
-    if is_multistream:
+    if args.nar:
+        transcriptions = transcribe_nar(
+            model,
+            all_data["audio_filepaths"],
+            args.batch_size,
+            backward=args.backward,
+            swap_token_embed=args.nar_swap_embed,
+            ensemble_weight=args.nar_ensemble_weight,
+        )
+    elif args.backward:
+        transcriptions = transcribe_backward(model, all_data["audio_filepaths"], args.batch_size)
+    elif is_multistream:
         transcriptions = transcribe_multistream(model, all_data["audio_filepaths"], args.batch_size)
     elif is_aligner_like:
         transcriptions = transcribe_aligner_like(model, all_data["audio_filepaths"], args.batch_size)
@@ -450,6 +562,15 @@ def main(args):
 
     avg_time = total_time / n_samples
     model_label = os.path.basename(os.path.dirname(os.path.dirname(os.path.abspath(args.model))))
+    # Keep NAR / backward manifests distinct so they don't clobber the forward (AR/L2R) outputs.
+    if args.nar:
+        model_label = f"{model_label}_nar"
+        if args.nar_ensemble_weight is not None:
+            model_label = f"{model_label}ens{args.nar_ensemble_weight}"
+        elif args.nar_swap_embed:
+            model_label = f"{model_label}swap"
+    if args.backward:
+        model_label = f"{model_label}_backward"
     manifest_path = write_manifest(
         all_data["references"], predictions, model_label, args.dataset_path, args.dataset, args.split,
         audio_length=all_data["durations"], transcription_time=[avg_time] * n_samples,
@@ -500,6 +621,30 @@ if __name__ == "__main__":
         default=None,
         help="Override the GPT-LM fusion weight on model.joint (TDT+GPT fusion models only). "
         "Set 0.0 to disable the LM and measure TDT-only decoding.",
+    )
+    parser.add_argument(
+        "--backward",
+        action="store_true",
+        help="Decode with the backward (R2L) branch of a bidirectional model (requires model.decoding_bwd).",
+    )
+    parser.add_argument(
+        "--nar",
+        action="store_true",
+        help="Non-autoregressive decode (no prediction-net) for a bidirectional HAINAN model. "
+        "Combine with --backward to run the R2L branch.",
+    )
+    parser.add_argument(
+        "--nar_swap_embed",
+        action="store_true",
+        help="(NAR diagnostic) Use the OTHER branch's output token-embedding head -- forward head "
+        "for a backward run and vice versa -- keeping each branch's own enc/pred projections.",
+    )
+    parser.add_argument(
+        "--nar_ensemble_weight",
+        type=float,
+        default=None,
+        help="(NAR) Log-linearly pool the forward & backward joiners' per-frame distributions: "
+        "logP = (1-w)*logP_own + w*logP_other, per TDT block. w=0 own only, 1 other only, 0.5 equal.",
     )
     parser.add_argument("--verbose", action="store_true", help="Print each REF/HYP pair to stdout")
     parser.add_argument(

@@ -212,6 +212,119 @@ class EncDecBidirectionalTDTBPEModel(EncDecRNNTBPEModel):
         references = self._references_from_targets(transcript, transcript_len)
         return self._wer_counts(hyp_texts, references)
 
+    # -- non-autoregressive (NAR) inference ------------------------------------------------------
+
+    @staticmethod
+    def _nar_joint_logits(joint, enc_btd):
+        """Full masked-predictor joint logits ``[B, T, V]`` for one branch (self-consistent).
+
+        Runs the branch's OWN enc projection + a single zero/masked predictor step through its OWN
+        output head, so the returned token AND duration logits both live in this branch's joint-hidden
+        basis. ``enc_btd`` is ``[B, T, D]``.
+        """
+        f = joint.project_encoder(enc_btd)  # [B, T, H]
+        g0 = joint.project_prednet(
+            torch.zeros(enc_btd.size(0), 1, joint.pred.in_features, device=enc_btd.device, dtype=enc_btd.dtype)
+        )  # [B, 1, H]  (== projected zero/masked predictor)
+        return joint.joint_after_projection(f, g0)[:, :, 0, :]  # [B, T, V]
+
+    @torch.no_grad()
+    def nar_greedy_decode(
+        self,
+        encoded: torch.Tensor,
+        encoded_len: torch.Tensor,
+        backward: bool = False,
+        swap_token_embed: bool = False,
+        ensemble_weight: float = None,
+    ):
+        """Non-autoregressive greedy decode -- no prediction-network / decoder is run.
+
+        HAINAN trains the joint to also predict from the encoder alone (the prediction-net output is
+        stochastically zero-masked). At inference we exploit that: feed the joint a SINGLE masked
+        (all-zero) predictor step and compute the token + duration distribution for **every encoder
+        frame in parallel** with one joint call. A pure-Python loop (no neural-net compute) then walks
+        the frames, using each frame's predicted TDT duration to jump, emitting the per-frame argmax
+        token when it is not blank.
+
+        Args:
+            encoded:     ``[B, D, T]`` forward encoder output (channel-first), from ``self.forward``.
+            encoded_len: ``[B]`` valid frame counts.
+            backward:    if True, decode with the backward (R2L) branch -- the encoder output is
+                         time-reversed and the R2L token stream is un-reversed before detokenizing, so
+                         the returned text is in normal forward order (comparable to forward NAR).
+            swap_token_embed: if True, take the per-frame TOKEN logits from the OTHER branch's joiner
+                         (forward tokens for a backward run, and vice versa) while keeping the running
+                         branch's own DURATION logits. Each branch's joiner is run in full and
+                         self-consistently (its own enc projection + own output head), then the token
+                         block is spliced from the other branch -- so there is no joint-hidden basis
+                         mismatch. Since the two branches agree ~99% per-frame on tokens, this should
+                         decode about as well as the running branch alone. Ignored if ``ensemble_weight``
+                         is set.
+            ensemble_weight: if not None, log-linearly (geometrically) pool BOTH branches' NAR
+                         distributions: ``logP = (1-w)*logP_own + w*logP_other``, applied separately to
+                         the token block and the duration block (each a proper softmax). ``w=0`` == own
+                         branch only, ``w=1`` == other branch only, ``w=0.5`` == equal 2-branch ensemble.
+                         Both joiners are run fully self-consistently (no basis mismatch).
+
+        Returns:
+            list[str] of length B (forward-order transcripts).
+        """
+        joint = self.joint_bwd if backward else self.joint
+        decoding = self.decoding_bwd if backward else self.decoding
+        durations = list(decoding.durations) if decoding.durations else [0, 1]
+        if backward:
+            encoded = self._reverse_time(encoded, encoded_len)
+
+        # ---- parallel joint over all frames with a masked (zero) predictor ----
+        enc_btd = encoded.transpose(1, 2)  # [B, D, T] -> [B, T, D]
+        num_dur = len(durations)
+        logits = self._nar_joint_logits(joint, enc_btd)  # [B, T, V]  (own branch, self-consistent)
+        if ensemble_weight is not None:
+            other = self.joint if backward else self.joint_bwd
+            logits_other = self._nar_joint_logits(other, enc_btd)  # [B, T, V] (other branch, self-consistent)
+            w = float(ensemble_weight)
+            # log-linear pooling, per TDT block (token + blank, and durations) normalized separately
+            tok = (1.0 - w) * torch.log_softmax(logits[..., :-num_dur], dim=-1) + w * torch.log_softmax(
+                logits_other[..., :-num_dur], dim=-1
+            )
+            dur = (1.0 - w) * torch.log_softmax(logits[..., -num_dur:], dim=-1) + w * torch.log_softmax(
+                logits_other[..., -num_dur:], dim=-1
+            )
+            logits = torch.cat([tok, dur], dim=-1)
+        elif swap_token_embed:
+            other = self.joint if backward else self.joint_bwd
+            logits_other = self._nar_joint_logits(other, enc_btd)  # [B, T, V]  (other branch, self-consistent)
+            # token block (real tokens + blank) from the OTHER branch; duration block from the OWN branch.
+            # Both blocks come from a fully self-consistent joiner (own enc_proj+head), so no basis mismatch.
+            logits = torch.cat([logits_other[..., :-num_dur], logits[..., -num_dur:]], dim=-1)
+
+        dur_values = torch.tensor(durations, device=logits.device)
+        token_logits = logits[..., :-num_dur]  # [B, T, num_tokens(+blank)]
+        dur_logits = logits[..., -num_dur:]  # [B, T, num_durations]
+        blank_id = token_logits.size(-1) - 1  # blank is the last token class
+        tokens = token_logits.argmax(dim=-1)  # [B, T]
+        jumps = dur_values[dur_logits.argmax(dim=-1)]  # [B, T]
+
+        # ---- pure-Python extraction loop (no neural-net compute inside) ----
+        tokens_l = tokens.tolist()
+        jumps_l = jumps.tolist()
+        lens_l = encoded_len.tolist()
+        results = []
+        for b in range(len(lens_l)):
+            T = int(lens_l[b])
+            tok_b, jmp_b = tokens_l[b], jumps_l[b]
+            ids, t = [], 0
+            while t < T:
+                k = tok_b[t]
+                if k != blank_id:
+                    ids.append(k)
+                d = jmp_b[t]
+                t += d if d > 0 else 1  # always progress (blank-with-dur-0 -> +1; matches TDT rule)
+            if backward:
+                ids = ids[::-1]  # un-reverse R2L prediction -> forward token order
+            results.append(decoding.decode_ids_to_str(ids))
+        return results
+
     # -- training / validation -------------------------------------------------------------------
 
     def training_step(self, batch, batch_nb):
