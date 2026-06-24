@@ -154,6 +154,19 @@ class StreamingSTTModelConfig:
     audio_pad_to: Optional[int] = None
     sample_rate: int = 16000
     frame_length_in_secs: float = 0.08
+    # --- Optional trainable subsampling of the encoder output ---
+    # When > 1, a trainable Conv1d (kernel_size = stride = factor) is applied to
+    # the perception/encoder output, shrinking the time axis by this factor
+    # BEFORE the audio embeddings enter the LLM. With factor=1 (default) the
+    # layer is not created at all and the model is byte-for-byte unchanged.
+    #
+    # Semantics ("frames fixed"): ``chunk_size`` keeps meaning *encoder frames*
+    # per chunk (audio duration per chunk is unchanged, alignment/timeline math
+    # stays in 80 ms frames). The LLM then sees ``chunk_size // factor`` audio
+    # tokens per chunk, so ``chunk_size`` MUST be divisible by the factor and
+    # fixed chunking (chunk_size > 0) is required. This is propagated to the
+    # dataset so it emits the matching number of ``<audio>`` placeholders.
+    encoder_subsampling_factor: int = 1
     blank_loss_weight: float = 1.0
     supervise_im_end_in_loss: bool = False
     project_unaligned_text_to_chunks: bool = False
@@ -423,6 +436,12 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 # this flag keep byte-identical saved configs.
                 if bool(self.core_cfg.empty_chunk_eos_only):
                     data_cfg.empty_chunk_eos_only = True
+                # Encoder subsampling: the dataset must emit chunk_size//factor
+                # audio placeholders per chunk to match the subsampled encoder
+                # output. Only set the key when the feature is requested so
+                # existing runs keep byte-identical data_cfg snapshots.
+                if int(getattr(self.core_cfg, "encoder_subsampling_factor", 1) or 1) > 1:
+                    data_cfg.encoder_subsampling_factor = int(self.core_cfg.encoder_subsampling_factor)
                 # Only touch parallel_chunk_slots in data_cfg when the feature
                 # is actively requested — otherwise leave the dict identical to
                 # what existing runs produce (back-compat: no spurious key, no
@@ -554,6 +573,30 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             audio_pad_to=self.core_cfg.audio_pad_to,
             att_context_size=self.core_cfg.att_context_size,
         )
+
+        # --- Optional trainable encoder-output subsampler ---
+        # Conv1d with kernel_size = stride = factor performs a clean,
+        # non-overlapping factor-S reduction of the encoder time axis. Created
+        # only when factor > 1 so factor==1 runs are byte-for-byte unchanged.
+        self.encoder_subsampling_factor = int(getattr(self.core_cfg, "encoder_subsampling_factor", 1) or 1)
+        if self.encoder_subsampling_factor > 1:
+            S = self.encoder_subsampling_factor
+            assert self.core_cfg.chunk_size > 0, (
+                f"encoder_subsampling_factor={S} requires fixed chunking (chunk_size>0), "
+                f"got chunk_size={self.core_cfg.chunk_size}"
+            )
+            assert self.core_cfg.chunk_size % S == 0, (
+                f"chunk_size ({self.core_cfg.chunk_size}) must be divisible by "
+                f"encoder_subsampling_factor ({S})"
+            )
+            H = self.llm.config.hidden_size
+            self.audio_subsampler = nn.Conv1d(H, H, kernel_size=S, stride=S)
+            logging.info(
+                f"Encoder subsampling enabled: factor={S}, Conv1d(H={H}, kernel=stride={S}); "
+                f"LLM sees {self.core_cfg.chunk_size // S} audio tokens per {self.core_cfg.chunk_size}-frame chunk."
+            )
+        else:
+            self.audio_subsampler = None
 
         # --- Aux chunk-boundary classifier (only built when enabled) ---
         # Only valid in dynamic-chunking mode (chunk_size == 0). When disabled,
@@ -776,6 +819,31 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
     # Core: efficient audio-text embedding interleaving
     # ------------------------------------------------------------------
 
+    def _apply_audio_subsampling(
+        self, audio_embs: Tensor, emb_lens: Optional[Tensor] = None
+    ) -> tuple[Tensor, Optional[Tensor]]:
+        """Optionally shrink the encoder time axis with the trainable Conv1d.
+
+        No-op (identity) when ``encoder_subsampling_factor == 1``. Otherwise the
+        ``(B, T, H)`` input is padded up to a multiple of the factor, run through
+        a ``Conv1d(kernel=stride=S)``, and returned as ``(B, ceil(T/S), H)``.
+        ``emb_lens`` (valid frames per sample) are reduced by ``ceil(len/S)``.
+        """
+        if self.audio_subsampler is None:
+            return audio_embs, emb_lens
+        S = self.encoder_subsampling_factor
+        B, T, H = audio_embs.shape
+        pad = (S - (T % S)) % S
+        if pad:
+            audio_embs = F.pad(audio_embs, (0, 0, 0, pad))
+        x = audio_embs.transpose(1, 2)  # (B, H, T)
+        w = self.audio_subsampler.weight
+        x = self.audio_subsampler(x.to(w.dtype))
+        x = x.transpose(1, 2).to(audio_embs.dtype)  # (B, ceil(T/S), H)
+        if emb_lens is not None:
+            emb_lens = torch.div(emb_lens + (S - 1), S, rounding_mode="floor")
+        return x, emb_lens
+
     def _build_input_embeds(
         self,
         input_tokens: Tensor,
@@ -819,6 +887,10 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 input_signal=audios,
                 input_signal_length=audio_lens,
             )  # audio_embs: (B, T_enc, H)
+            # Optional trainable subsampling: (B, T_enc, H) -> (B, T_enc//S, H).
+            # In the encoder-reuse path (audio_embs is not None) the caller has
+            # already applied this, so we only subsample on a fresh encode.
+            audio_embs, _audio_emb_lens = self._apply_audio_subsampling(audio_embs, _audio_emb_lens)
 
         # --- interleave & build attention mask ---
         inputs = interleave_embeddings(
@@ -1477,6 +1549,9 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                     input_signal=bk.audios,
                     input_signal_length=bk.audio_lens,
                 )
+                # Subsample ONCE so all K reused partitions share the same
+                # (subsampled) encoder output and audio-slot count.
+                audio_embs, _ = self._apply_audio_subsampling(audio_embs)
             mk = self._partition_forward_loss(bk, batch_idx, audio_embs=audio_embs)
             if mk.get("skip"):
                 continue
@@ -2263,7 +2338,11 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         self._user_footer_first_id = user_footer_and_asst_header_ids[0] if user_footer_and_asst_header_ids else None
 
         if chunk_size > 0:
-            turn_ids = user_header_ids + [AUDIO_TOKEN_IDX] * chunk_size + user_footer_and_asst_header_ids
+            # ``chunk_size`` is in encoder frames; the LLM consumes
+            # ``chunk_size // factor`` audio tokens per chunk when the trainable
+            # subsampler is enabled (factor==1 -> unchanged).
+            n_audio_slots = chunk_size // int(getattr(self.core_cfg, "encoder_subsampling_factor", 1) or 1)
+            turn_ids = user_header_ids + [AUDIO_TOKEN_IDX] * n_audio_slots + user_footer_and_asst_header_ids
             self._turn_template_ids = turn_ids
             n_audio = turn_ids.count(AUDIO_TOKEN_IDX)
             logging.info(
@@ -3041,7 +3120,11 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         state: StreamingState,
         chunk_size_frames: int,
     ) -> Tensor:
-        """Run one streaming-encoder update and return exactly ``chunk_size_frames`` embeddings."""
+        """Run one streaming-encoder update and return the chunk's audio embeddings.
+
+        Returns ``chunk_size_frames`` embeddings, or ``chunk_size_frames //
+        encoder_subsampling_factor`` when the trainable subsampler is enabled.
+        """
         device = audio_chunks.device
         B = state.batch_size
         if audio_chunk_lens is None:
@@ -3081,6 +3164,8 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             audio_chunk_embs = F.pad(audio_chunk_embs, (0, 0, 0, chunk_size_frames - n_frames))
         elif n_frames > chunk_size_frames:
             audio_chunk_embs = audio_chunk_embs[:, :chunk_size_frames, :]
+        # Trainable subsampling: (B, chunk_size_frames, H) -> (B, chunk_size_frames//S, H).
+        audio_chunk_embs, _ = self._apply_audio_subsampling(audio_chunk_embs)
         return audio_chunk_embs
 
     @torch.no_grad()
@@ -3129,12 +3214,16 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             )
 
         # 3. Pad/trim to the number of audio slots in this inference turn.
+        # ``chunk_size`` counts ENCODER frames; the LLM sees ``n_audio_slots =
+        # chunk_size // factor`` audio tokens (the subsampler already shrank the
+        # embeddings above).
         chunk_size = int(inference_chunk_size_frames or self.core_cfg.chunk_size)
+        n_audio_slots = chunk_size // self.encoder_subsampling_factor
         n_frames = audio_chunk_embs.shape[1]
-        if n_frames < chunk_size:
-            audio_chunk_embs = F.pad(audio_chunk_embs, (0, 0, 0, chunk_size - n_frames))
-        elif n_frames > chunk_size:
-            audio_chunk_embs = audio_chunk_embs[:, :chunk_size, :]
+        if n_frames < n_audio_slots:
+            audio_chunk_embs = F.pad(audio_chunk_embs, (0, 0, 0, n_audio_slots - n_frames))
+        elif n_frames > n_audio_slots:
+            audio_chunk_embs = audio_chunk_embs[:, :n_audio_slots, :]
 
         # 4. Build input embeddings from cached turn template — (B, L, H)
         if chunk_size == self.core_cfg.chunk_size:
@@ -3142,7 +3231,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         else:
             turn_template_ids = (
                 self._user_header_ids
-                + [AUDIO_TOKEN_IDX] * chunk_size
+                + [AUDIO_TOKEN_IDX] * n_audio_slots
                 + self._user_footer_and_asst_header_ids
             )
         turn_ids_t = torch.tensor(turn_template_ids, device=device).unsqueeze(0).expand(B, -1)  # (B, L)
@@ -3348,13 +3437,16 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 input_signal=audio_wav.unsqueeze(0),
                 input_signal_length=torch.tensor([n_samples], device=device),
             )
+            offline_embs, _ = self._apply_audio_subsampling(offline_embs)
+        # After subsampling each chunk holds chunk_size // factor audio tokens.
+        slot_size = chunk_size // self.encoder_subsampling_factor
         total_frames = offline_embs.shape[1]
         chunks: list[Tensor] = []
-        for start in range(0, total_frames, chunk_size):
-            end = min(start + chunk_size, total_frames)
+        for start in range(0, total_frames, slot_size):
+            end = min(start + slot_size, total_frames)
             chunk = offline_embs[:, start:end, :]
-            if chunk.shape[1] < chunk_size:
-                chunk = F.pad(chunk, (0, 0, 0, chunk_size - chunk.shape[1]))
+            if chunk.shape[1] < slot_size:
+                chunk = F.pad(chunk, (0, 0, 0, slot_size - chunk.shape[1]))
             chunks.append(chunk)
         return chunks
 
@@ -3421,6 +3513,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             input_signal=audios,
             input_signal_length=audio_lens_t,
         )  # (B, T_enc_max, H), (B,)
+        batch_audio_embs, batch_emb_lens = self._apply_audio_subsampling(batch_audio_embs, batch_emb_lens)
         batch_audio_embs = batch_audio_embs.type_as(self.embed_tokens.weight)
         all_audio_embs = [batch_audio_embs[b, : int(batch_emb_lens[b].item())] for b in range(B)]
 

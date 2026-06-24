@@ -168,6 +168,12 @@ class StreamingSTTDataConfig:
     chunk_size: int
     num_delay_frames: int = 0
     words_per_group: int = 1
+    # Trainable encoder-output subsampling factor (see the model config). With
+    # factor > 1 the LLM consumes ``chunk_size // factor`` audio placeholders per
+    # chunk while the alignment/timeline math stays in ``chunk_size`` encoder
+    # frames. Requires fixed chunking and chunk_size % factor == 0. Default 1 =
+    # no subsampling (one audio token per encoder frame, unchanged behavior).
+    encoder_subsampling_factor: int = 1
     audio_tag: str = "<audio>"
     blank_token: str = "<blank>"
     system_role: str = "system"
@@ -595,6 +601,7 @@ def get_llm_messages_for_sample(
     chunk_step: int = 1,
     project_unaligned_text_to_chunks: bool = False,
     fixed_chunk_group_schedule: Optional[List[int]] = None,
+    subsampling_factor: int = 1,
 ) -> List[dict]:
     """
     Get the LLM messages for a sample, using the alignments to determine the turns for the audio and text.
@@ -644,6 +651,15 @@ def get_llm_messages_for_sample(
 
     messages = [{"role": system_role, "content": system_prompt}]
 
+    # Encoder subsampling: the model shrinks the encoder output by this factor,
+    # so each chunk of ``F`` encoder frames is represented by ``F // S`` audio
+    # placeholders in the LLM sequence. ``audio_tokens(F)`` converts a frame
+    # count into the placeholder count. S==1 -> identity (unchanged behavior).
+    S = max(int(subsampling_factor), 1)
+
+    def audio_tokens(num_audio_frames: int) -> int:
+        return num_audio_frames // S
+
     num_frames = math.ceil(audio_duration_secs / frame_length_in_secs)
 
     if chunk_size < 0 or chunk_size is None:
@@ -659,7 +675,7 @@ def get_llm_messages_for_sample(
         alignments = []
 
     if offline_mode and not alignments:
-        messages.append({"role": "user", "content": audio_tag * num_frames})
+        messages.append({"role": "user", "content": audio_tag * audio_tokens(num_frames)})
         messages.append({"role": "assistant", "content": transcript if transcript is not None else blank_token})
         return messages
 
@@ -698,7 +714,7 @@ def get_llm_messages_for_sample(
             n_frames_chunk = group_end_frame - prev_end_frame
 
             if n_frames_chunk > 0:
-                messages.append({"role": "user", "content": audio_tag * n_frames_chunk})
+                messages.append({"role": "user", "content": audio_tag * audio_tokens(n_frames_chunk)})
 
             # Build assistant content from all buffered words
             if word_spans and transcript:
@@ -722,7 +738,7 @@ def get_llm_messages_for_sample(
 
         # Trailing silence frames (after last word) — user turn only, no assistant.
         if prev_end_frame < num_frames:
-            messages.append({"role": "user", "content": audio_tag * (num_frames - prev_end_frame)})
+            messages.append({"role": "user", "content": audio_tag * audio_tokens(num_frames - prev_end_frame)})
     else:
         # Fixed chunking: split the audio into equal-sized chunks.
         num_chunks = math.ceil(num_frames / chunk_size) if num_frames > 0 else 0
@@ -753,7 +769,7 @@ def get_llm_messages_for_sample(
             for start_chunk, end_chunk, group_size in iter_fixed_chunk_groups(
                 num_chunks, fixed_chunk_group_schedule
             ):
-                messages.append({"role": "user", "content": audio_tag * (group_size * chunk_size)})
+                messages.append({"role": "user", "content": audio_tag * audio_tokens(group_size * chunk_size)})
                 if transcript:
                     content = "".join(original_chunk_texts[start_chunk:end_chunk])
                 else:
@@ -781,7 +797,7 @@ def get_llm_messages_for_sample(
                 num_chunks, fixed_chunk_group_schedule
             ):
                 chunk_end_frame = end_chunk * chunk_size
-                messages.append({"role": "user", "content": audio_tag * (group_size * chunk_size)})
+                messages.append({"role": "user", "content": audio_tag * audio_tokens(group_size * chunk_size)})
 
                 while word_idx < len(alignments):
                     word = alignments[word_idx]
@@ -845,6 +861,7 @@ def get_llm_messages_for_batch(
     chunk_step: int = 1,
     project_unaligned_text_to_chunks: bool = False,
     fixed_chunk_group_schedule: Optional[List[int]] = None,
+    subsampling_factor: int = 1,
 ) -> List[List[dict]]:
     """
     Get the LLM messages for a batch of samples.
@@ -889,6 +906,7 @@ def get_llm_messages_for_batch(
                 chunk_step=chunk_step,
                 project_unaligned_text_to_chunks=project_unaligned_text_to_chunks,
                 fixed_chunk_group_schedule=fixed_chunk_group_schedule,
+                subsampling_factor=subsampling_factor,
             )
         )
     return batch_messages
@@ -1316,8 +1334,28 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
         # "<audio><audio>" tokenizes differently from encode("<audio>") * 2).
         # When chunk_size=-1 (offline mode), audio_chunk_ids is computed per sample
         # in get_batch_data because num_frames varies per sample.
+        # Encoder subsampling: the LLM consumes ``chunk_size // factor`` audio
+        # placeholders per chunk (the model shrinks the encoder output by the
+        # same factor). Timeline/alignment math stays in ``chunk_size`` frames.
+        self.subsampling_factor = max(int(getattr(self.cfg, "encoder_subsampling_factor", 1) or 1), 1)
+        if self.subsampling_factor > 1:
+            if self.cfg.chunk_size <= 0:
+                raise ValueError(
+                    f"encoder_subsampling_factor={self.subsampling_factor} requires fixed chunking "
+                    f"(chunk_size>0), got chunk_size={self.cfg.chunk_size}"
+                )
+            if self.cfg.chunk_size % self.subsampling_factor != 0:
+                raise ValueError(
+                    f"chunk_size ({self.cfg.chunk_size}) must be divisible by "
+                    f"encoder_subsampling_factor ({self.subsampling_factor})"
+                )
+        # Number of audio placeholders the LLM sees per chunk (post-subsampling).
+        self.audio_tokens_per_chunk = (
+            self.cfg.chunk_size // self.subsampling_factor if self.cfg.chunk_size > 0 else None
+        )
+
         if self.cfg.chunk_size > 0:
-            audio_chunk_str = self.cfg.audio_tag * self.cfg.chunk_size
+            audio_chunk_str = self.cfg.audio_tag * self.audio_tokens_per_chunk
             self.audio_chunk_ids = self.tokenizer.tokenizer.encode(audio_chunk_str, add_special_tokens=False)
         else:
             self.audio_chunk_ids = None
@@ -1485,6 +1523,7 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             chunk_step=K,
             project_unaligned_text_to_chunks=self.cfg.project_unaligned_text_to_chunks,
             fixed_chunk_group_schedule=fixed_chunk_group_schedule,
+            subsampling_factor=self.subsampling_factor,
         )
 
         all_input_ids = []
@@ -1533,9 +1572,10 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             # need per-user matching because BPE can tokenize 14/28/42 adjacent
             # audio tags differently.
             if self.audio_chunk_ids is not None and fixed_chunk_group_schedule is None:
-                # Fixed chunking: single pre-computed pattern
+                # Fixed chunking: single pre-computed pattern. The replacement
+                # count is the post-subsampling token count (chunk_size//factor).
                 input_ids, assistant_mask = _replace_audio_chunks(
-                    input_ids, self.audio_chunk_ids, self.cfg.chunk_size, mask=assistant_mask
+                    input_ids, self.audio_chunk_ids, self.audio_tokens_per_chunk, mask=assistant_mask
                 )
             else:
                 # Offline (chunk_size=-1) or dynamic (chunk_size=0): variable audio tag
