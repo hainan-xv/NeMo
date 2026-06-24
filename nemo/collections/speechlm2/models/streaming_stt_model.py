@@ -366,6 +366,14 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             f"serialization in PTL checkpoints (we got: '{type(cfg)=}')."
         )
         super().__init__()
+        print(
+            "\n"
+            "============================================================\n"
+            ">>> HAINAN /code CHECK: StreamingSTTModel.__init__ running\n"
+            f">>> module file = {__file__}\n"
+            "============================================================\n",
+            flush=True,
+        )
         self.save_hyperparameters()
         self.cfg = DictConfig(cfg)
         self.core_cfg: StreamingSTTModelConfig = to_dataclass(StreamingSTTModelConfig, cfg)
