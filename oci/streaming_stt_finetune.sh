@@ -79,8 +79,9 @@ HFCACHE=${LUSTRE_ACCOUNT_PREFIX}/${USERID}/hf_cache
 DATA_DIR=/lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data
 H_DIR=/lustre/fsw/portfolios/llmservice/users/heh
 HAINAN_DIR=/lustre/fsw/portfolios/llmservice/users/hainanx
-# MY code (synced via sync_to_oci.sh to .../hainanx/NeMo) -> mounted as /code.
-CODE_DIR=${LUSTRE_ACCOUNT_PREFIX}/${USERID}/NeMo
+# MY code (synced via oci/sync.sh to a UNIQUE per-branch dir) -> mounted as
+# /code. Keep this in sync with OCI_REPO in oci/sync.sh.
+CODE_DIR=${LUSTRE_ACCOUNT_PREFIX}/${USERID}/NeMo_ord_sync_d146_current
 
 # Make results dir
 mkdir -p ${RESULTS_DIR}
