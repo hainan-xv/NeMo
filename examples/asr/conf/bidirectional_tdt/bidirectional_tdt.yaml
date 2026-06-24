@@ -24,6 +24,11 @@ model:
   # Weight on the backward (right-to-left) transducer loss added to the forward loss.
   backward_loss_weight: 1.0
 
+  # TDT loss reduction (shared by the forward and backward branches). 'mean_volume' = a global
+  # per-token average (sum of losses / sum of token lengths), which is length-normalized and robust
+  # to zero-length transcripts (unlike per-utterance 'mean').
+  rnnt_reduction: mean_volume
+
   train_ds:
     manifest_filepath: null
     sample_rate: ${model.sample_rate}

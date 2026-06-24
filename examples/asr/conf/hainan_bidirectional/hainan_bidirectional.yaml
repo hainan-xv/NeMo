@@ -1,0 +1,104 @@
+# Bidirectional HAINAN model: identical architecture to the bidirectional TDT (one shared encoder +
+# forward & backward (prediction-net, joint) pairs), trained with HAINAN stochastic predictor masking
+# so the joint also learns to predict from the encoder alone (enables non-/semi-autoregressive
+# inference). Because HAINAN adds NO parameters over the bidirectional TDT, the ENTIRE model
+# (encoder + both branches) is warm-started from a bidirectional TDT checkpoint and only needs to learn
+# masked-predictor robustness -> much faster than training from a plain TDT.
+#
+# Architecture sub-configs (preprocessor/encoder/decoder/joint/spec_augment/model_defaults/loss/
+# decoding/tokenizer) are derived AT RUNTIME from the base (bidirectional TDT) model by the entrypoint
+# examples/asr/asr_transducer/speech_to_text_hainan_bidirectional.py.
+
+name: "Bidirectional-HAINAN"
+
+# Base model: a bidirectional TDT (EncDecBidirectionalTDTBPEModel) .nemo. Architecture + FULL warm-start
+# (encoder + forward AND backward branches) come from here. Point this at the bidirectional TDT model
+# you just trained (best or checkpoint-averaged .nemo).
+base_model_path: null            # e.g. /results/.../Bidirectional-TDT-averaged.nemo
+base_model_name: null            # (unused; the base is a custom bidirectional TDT, not a pretrained name)
+init_from_base: true             # warm-start the WHOLE model (both branches) from the base bidirectional TDT
+
+model:
+  sample_rate: 16000
+  log_prediction: false
+  compute_eval_loss: true
+  use_cer: false
+
+  # Weight on the backward (right-to-left) transducer loss added to the forward loss.
+  backward_loss_weight: 1.0
+
+  # HAINAN stochastic predictor masking probability (training only; applied to BOTH branches). 0.5 is
+  # the value from the HAINAN paper. 0.0 would reduce to a plain bidirectional TDT.
+  hainan_predictor_mask_prob: 0.5
+
+  # TDT loss reduction (shared by the forward and backward branches). 'mean_volume' = a global
+  # per-token average (sum of losses / sum of token lengths), length-normalized and robust to
+  # zero-length transcripts.
+  rnnt_reduction: mean_volume
+
+  train_ds:
+    manifest_filepath: null
+    sample_rate: ${model.sample_rate}
+    batch_size: 16
+    shuffle: true
+    num_workers: 8
+    pin_memory: true
+    max_duration: 40.0
+    min_duration: 0.1
+    # lhotse fields are typically set from the launch script (use_lhotse, input_cfg, bucketing)
+
+  validation_ds:
+    manifest_filepath: null
+    sample_rate: ${model.sample_rate}
+    batch_size: 16
+    shuffle: false
+    num_workers: 4
+    pin_memory: true
+
+  test_ds:
+    manifest_filepath: null
+    sample_rate: ${model.sample_rate}
+    batch_size: 16
+    shuffle: false
+    num_workers: 4
+
+  optim:
+    name: adamw
+    # Lower LR than the bidirectional TDT run: we are fine-tuning an already-trained model to be robust
+    # to predictor masking, not training from scratch.
+    lr: 5e-5
+    betas: [0.9, 0.98]
+    weight_decay: 1e-3
+    sched:
+      name: CosineAnnealing
+      warmup_steps: 2000
+      min_lr: 1e-6
+
+trainer:
+  devices: -1
+  num_nodes: 1
+  max_steps: 50000
+  max_epochs: -1
+  accelerator: gpu
+  strategy: ddp
+  precision: bf16
+  log_every_n_steps: 10
+  val_check_interval: 2000
+  enable_checkpointing: false
+  logger: false
+  benchmark: false
+  use_distributed_sampler: false
+
+exp_manager:
+  exp_dir: null
+  name: ${name}
+  create_tensorboard_logger: true
+  create_checkpoint_callback: true
+  checkpoint_callback_params:
+    monitor: "val_wer"
+    mode: "min"
+    save_top_k: 3
+    always_save_nemo: true
+  resume_if_exists: true
+  resume_ignore_no_checkpoint: true
+  create_wandb_logger: false

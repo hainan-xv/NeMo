@@ -65,6 +65,18 @@ class EncDecBidirectionalTDTBPEModel(EncDecRNNTBPEModel):
         # Weight on the backward (right-to-left) transducer loss added to the forward loss.
         self.backward_loss_weight = float(self.cfg.get('backward_loss_weight', 1.0))
 
+        # HAINAN stochastic predictor masking probability (Xu et al., "HAINAN: ... Hybrid-Autoregressive
+        # Inference Transducer"). During training, the predictor (prediction-net) output is zeroed at a
+        # random subset of text indices with this probability, so the joint also learns to predict from
+        # the encoder alone -> enables non-/semi-autoregressive inference. 0.0 == plain bidirectional TDT
+        # (unchanged behavior); 0.5 == HAINAN. Applied identically to BOTH the forward and backward
+        # branches (training only; never during validation/decoding).
+        self.hainan_predictor_mask_prob = float(self.cfg.get('hainan_predictor_mask_prob', 0.0))
+        if not 0.0 <= self.hainan_predictor_mask_prob <= 1.0:
+            raise ValueError(
+                f"`hainan_predictor_mask_prob` must be in [0, 1], got {self.hainan_predictor_mask_prob}."
+            )
+
         # Second (prediction-net, joint) pair, built from the SAME sub-configs as the forward pair so
         # the architecture (incl. TDT durations via joint.num_extra_outputs) is identical. These are
         # fresh modules: by default the entrypoint warm-starts only the forward pair, leaving these
@@ -134,8 +146,13 @@ class EncDecBidirectionalTDTBPEModel(EncDecRNNTBPEModel):
         transcript: torch.Tensor,
         transcript_len: torch.Tensor,
     ) -> torch.Tensor:
-        """Standard (non-fused) TDT loss for one (prediction-net, joint) pair."""
+        """Standard (non-fused) TDT loss for one (prediction-net, joint) pair.
+
+        With ``hainan_predictor_mask_prob > 0`` the predictor output is stochastically masked (HAINAN)
+        during training before the joint, so the joint also learns to predict from the encoder alone.
+        """
         dec, target_length, _ = decoder_module(targets=transcript, target_length=transcript_len)
+        dec = self._maybe_mask_predictor(dec)
         joint = joint_module(encoder_outputs=encoded, decoder_outputs=dec, encoder_lengths=encoded_len)
         return self.loss(
             log_probs=joint,
@@ -143,6 +160,19 @@ class EncDecBidirectionalTDTBPEModel(EncDecRNNTBPEModel):
             input_lengths=encoded_len,
             target_lengths=target_length,
         )
+
+    def _maybe_mask_predictor(self, dec: torch.Tensor) -> torch.Tensor:
+        """HAINAN stochastic predictor masking (training only).
+
+        ``dec`` is the prediction-network output ``[B, D, U+1]``. With probability
+        ``hainan_predictor_mask_prob``, zero the predictor vector at each text index (per [batch,
+        text-index], broadcast over the feature dim), matching ``joint(E_t, D_u * 0)`` from the paper.
+        No-op outside training or when the probability is 0 (plain bidirectional TDT).
+        """
+        if not self.training or self.hainan_predictor_mask_prob <= 0.0:
+            return dec
+        keep = torch.rand(dec.size(0), 1, dec.size(2), device=dec.device) >= self.hainan_predictor_mask_prob
+        return dec * keep.to(dec.dtype)
 
     def _forward_encoder(self, batch):
         signal, signal_len, transcript, transcript_len = batch
