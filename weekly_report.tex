@@ -1,0 +1,68 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{enumitem}
+\usepackage{titlesec}
+\usepackage{hyperref}
+
+\setlist[itemize]{leftmargin=1.5em, itemsep=2pt, topsep=2pt}
+\titlespacing*{\section}{0pt}{1.2em}{0.4em}
+\titleformat{\section}{\large\bfseries}{\thesection.}{0.5em}{}
+
+\title{\vspace{-2.5em}\textbf{Bi-Weekly Status Report}}
+\author{Hainan Xu}
+\date{June 11 -- June 25, 2026}
+
+\begin{document}
+\maketitle
+\vspace{-1.5em}
+
+\section{Chunked Aligner: a new streaming ASR loss}
+\begin{itemize}
+  \item Designed a novel chunked-aligner loss that learns alignment from scratch (no external timestamps), using an RNNT/CTC-style forward--backward over all valid paths with a blank end-of-chunk signal.
+  \item Implemented a PyTorch reference loss, then a Numba CUDA kernel, with tests asserting the kernel matches autograd.
+  \item Built variants: token-extraction layer, first-$k$-frames cap, and a non-autoregressive (NAR) version that drops the predictor/joiner for large memory savings.
+  \item Launched training on both grids (English and Chinese/AISHELL-2) and drafted an ICASSP-style paper of the method.
+\end{itemize}
+
+\section{Time-warp: augmentation and inference-time selection}
+\begin{itemize}
+  \item Added time-warp training augmentation (random factor; pitch-preserving and 2D time/pitch variants explored).
+  \item Built inference-time hypothesis selection over multiple warp factors: oracle, token-likelihood, per-token joint decoding, epsilon picking, and external LM (distilgpt2) scoring.
+  \item Finding: non-oracle methods only slightly beat the baseline and remain short of oracle; informs next direction (token-level / LM-guided selection).
+\end{itemize}
+
+\section{GPT-LM + TDT fusion and bidirectional decoding}
+\begin{itemize}
+  \item Implemented joint training of a GPT-style LM and a TDT model, with detached log-linear fusion so TDT gradients never update the LM.
+  \item Debugged to a stable run (tokenizer, token expiry, NaN loss, per-token normalization); added LM-weight control and checkpoint averaging.
+  \item Extended TDT to bidirectional (forward + reversed-text) and explored a bidirectional HAINAN model with NAR forward/backward inference.
+\end{itemize}
+
+\section{Chinese (AISHELL-2) models}
+\begin{itemize}
+  \item Built TDT and CHAT (chunk-16) baselines with char tokenizer, automated table-based eval over all models, and SOTA/ESPnet comparisons.
+  \item Built a multi-target model jointly predicting token + pronunciation (with/without tones) with shared predictor, multiple joiner heads, and consistency-maintaining decoding.
+\end{itemize}
+
+\section{Interspeech 2026 camera-ready (BACON)}
+\begin{itemize}
+  \item Added the mandatory Generative AI Use Disclosure section.
+  \item Added bootstrap statistical significance testing (p-values, 95\% CI) aligned 1:1 with paper tables.
+  \item Addressed reviewer comments (DCConv/C2Conv/SSCFormer citations; clarified the boundary-aware variant; honest 2-speaker results).
+\end{itemize}
+
+\section{Infrastructure and tooling}
+\begin{itemize}
+  \item Migrated workloads to OCI when ord was down: new \texttt{oci/} scripts, sync tooling, and a vLLM eval path.
+  \item Added weighted multi-stream training for the factorized cap/punct/spelling model, an audio-length-aware encoder embedding, and an encoder-output subsampling option.
+\end{itemize}
+
+\section{Next steps}
+\begin{itemize}
+  \item Push token-level / LM-guided time-warp selection toward the oracle gap.
+  \item Continue training and ablations on the chunked-aligner and GPT-LM+TDT fusion models toward a conference submission.
+  \item Finalize and submit the Interspeech camera-ready.
+\end{itemize}
+
+\end{document}
