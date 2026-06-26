@@ -29,7 +29,49 @@ from nemo.collections.asr.parts.utils.activations import Swish
 from nemo.collections.common.parts.utils import activation_registry
 from nemo.core.classes.mixins import AccessMixin
 
-__all__ = ['ConformerConvolution', 'ConformerFeedForward', 'ConformerLayer']
+__all__ = ['ConformerConvolution', 'ConformerFeedForward', 'ConformerLayer', 'UnitaryResidual']
+
+
+class UnitaryResidual(nn.Module):
+    """Trainable orthogonal transform of the residual stream.
+
+    Relaxes the standard identity skip connection ``y = x + f(x)`` into
+    ``y = Q x + f(x)``, where ``Q`` is a trainable orthogonal matrix. ``Q`` is
+    parametrized as the matrix exponential of a skew-symmetric matrix,
+    ``Q = expm(W - W^T)``. This parametrization is orthogonal *by construction*
+    for any value of the underlying weight ``W`` (``Q^T Q = I`` and ``det Q = +1``),
+    so the constraint holds exactly throughout training without any projection,
+    penalty, or re-orthogonalization step. The exponential map from skew-symmetric
+    matrices is surjective onto ``SO(d)``, so every special-orthogonal matrix is
+    representable.
+
+    The underlying weight is initialized to zero, hence ``Q = I`` at
+    initialization. This means a freshly constructed module reproduces the
+    standard identity-residual behaviour exactly, and training departs from it
+    smoothly.
+
+    Args:
+        d_model (int): dimension of the residual stream the transform acts on.
+    """
+
+    def __init__(self, d_model: int):
+        super().__init__()
+        self.d_model = d_model
+        # Free (unconstrained) weight; the skew-symmetric part W - W^T is what matters.
+        # Zero-init => skew = 0 => Q = expm(0) = I, recovering the identity residual.
+        self.weight = nn.Parameter(torch.zeros(d_model, d_model))
+
+    def get_orthogonal_matrix(self) -> torch.Tensor:
+        """Materialize the orthogonal matrix ``Q = expm(W - W^T)`` in float32."""
+        weight = self.weight.float()
+        skew = weight - weight.transpose(-1, -2)
+        return torch.matrix_exp(skew)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply ``Q`` to the last dimension of ``x`` (shape ``(..., d_model)``)."""
+        q = self.get_orthogonal_matrix().to(dtype=x.dtype)
+        # Row-vectors: each v in x maps to (Q v) => v @ Q^T.
+        return torch.matmul(x, q.transpose(-1, -2))
 
 
 class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
@@ -79,6 +121,7 @@ class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
         use_bias=True,
         use_pytorch_sdpa=False,
         use_pytorch_sdpa_backends=None,
+        use_unitary_residual=False,
     ):
         super(ConformerLayer, self).__init__()
 
@@ -89,6 +132,17 @@ class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
         self.self_attention_model = self_attention_model
         self.n_heads = n_heads
         self.fc_factor = 0.5
+
+        # Optional trainable orthogonal transform of the residual stream at each of the
+        # four residual-add sites (FF1 / MHA / Conv / FF2). Disabled by default so the
+        # layer is fully backward compatible; when enabled the transforms are identity at
+        # init (see UnitaryResidual), so behaviour still matches a standard layer initially.
+        self.use_unitary_residual = use_unitary_residual
+        if use_unitary_residual:
+            self.unitary_feed_forward1 = UnitaryResidual(d_model)
+            self.unitary_self_att = UnitaryResidual(d_model)
+            self.unitary_conv = UnitaryResidual(d_model)
+            self.unitary_feed_forward2 = UnitaryResidual(d_model)
 
         # first feed forward module
         self.norm_feed_forward1 = LayerNorm(d_model)
@@ -157,6 +211,17 @@ class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
         self.dropout = nn.Dropout(dropout)
         self.norm_out = LayerNorm(d_model)
 
+    def _residual_add(self, name, residual, update):
+        """Combine the residual stream with a sublayer ``update``.
+
+        Standard behaviour is ``residual + update``. When ``use_unitary_residual`` is
+        enabled, the residual stream is first passed through the named orthogonal
+        transform: ``Q @ residual + update`` (i.e. ``y = A x + b`` with ``A`` orthogonal).
+        """
+        if self.use_unitary_residual:
+            residual = getattr(self, f'unitary_{name}')(residual)
+        return residual + update
+
     def forward(self, x, att_mask=None, pos_emb=None, pad_mask=None, cache_last_channel=None, cache_last_time=None):
         """
         Args:
@@ -174,7 +239,7 @@ class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
         residual = x
         x = self.norm_feed_forward1(x)
         x = self.feed_forward1(x)
-        residual = residual + self.dropout(x) * self.fc_factor
+        residual = self._residual_add('feed_forward1', residual, self.dropout(x) * self.fc_factor)
 
         x = self.norm_self_att(residual)
         if self.self_attention_model == 'rel_pos':
@@ -189,7 +254,7 @@ class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
         if x is not None and cache_last_channel is not None:
             (x, cache_last_channel) = x
 
-        residual = residual + self.dropout(x)
+        residual = self._residual_add('self_att', residual, self.dropout(x))
 
         if self.is_adapter_available():
             # Call the MHA adapters
@@ -206,11 +271,11 @@ class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
         x = self.conv(x, pad_mask=pad_mask, cache=cache_last_time)
         if cache_last_time is not None:
             (x, cache_last_time) = x
-        residual = residual + self.dropout(x)
+        residual = self._residual_add('conv', residual, self.dropout(x))
 
         x = self.norm_feed_forward2(residual)
         x = self.feed_forward2(x)
-        residual = residual + self.dropout(x) * self.fc_factor
+        residual = self._residual_add('feed_forward2', residual, self.dropout(x) * self.fc_factor)
 
         x = self.norm_out(residual)
 

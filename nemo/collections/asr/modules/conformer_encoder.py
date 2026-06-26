@@ -171,6 +171,11 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         use_pytorch_sdpa_backends (list[str]): list of backend names to use in sdpa.
             None or empty list means all backends. e.g. ["MATH"]
             Defaults to None.
+        use_unitary_residual (bool): if True, replace each identity residual skip connection inside every
+            ConformerLayer with a trainable orthogonal transform of the residual stream, i.e. ``y = Q x + f(x)``
+            with ``Q = expm(W - W^T)`` orthogonal by construction. ``Q`` is identity at initialization, so the
+            model starts out identical to the standard configuration. Disabled by default for full backward
+            compatibility. Defaults to False.
         bypass_pre_encode: if True, skip the pre-encoder module and the `audio_signal` should be pre-encoded
             embeddings. The `audio_signal` input supports two formats depending on the `bypass_pre_encode`
             boolean flag. This determines the required format of the input variable `audio_signal`.
@@ -334,6 +339,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         global_attn_separate: bool = False,
         use_pytorch_sdpa: bool = False,
         use_pytorch_sdpa_backends=None,
+        use_unitary_residual: bool = False,
         sync_max_audio_length: bool = True,
         duration_embedding: bool = False,
         duration_emb_max_seconds: float = 20.0,
@@ -358,6 +364,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         if use_pytorch_sdpa_backends is None:
             use_pytorch_sdpa_backends = []
         self.use_pytorch_sdpa_backends = use_pytorch_sdpa_backends
+        self.use_unitary_residual = use_unitary_residual
         self.sync_max_audio_length = sync_max_audio_length
 
         assert conv_context_style in ["regular", "dcc"], f"Invalid conv_context_style: {conv_context_style}!"
@@ -498,6 +505,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                 use_bias=use_bias,
                 use_pytorch_sdpa=self.use_pytorch_sdpa,
                 use_pytorch_sdpa_backends=self.use_pytorch_sdpa_backends,
+                use_unitary_residual=use_unitary_residual,
             )
             self.layers.append(layer)
 
