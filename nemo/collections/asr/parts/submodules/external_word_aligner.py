@@ -144,23 +144,32 @@ class QwenWordForcedAligner:
             return
         if self._device is None:
             self._device = device
+        # Reuse the battle-tested speechlm2 wrapper rather than re-implementing the
+        # Qwen call: it owns the correct ``from_pretrained`` kwargs, the
+        # ``set_default_dtype(float32)`` safeguard (qwen_asr builds bf16 scalar
+        # tensors numpy cannot convert), and a fast pre-resampled numpy path.
         try:
-            from qwen_asr import Qwen3ForcedAligner
+            from nemo.collections.speechlm2.modules.qwen_forced_aligner import QwenForcedAligner
         except Exception as e:  # pragma: no cover - depends on optional package
             raise ImportError(
                 "The Qwen word-level aligner backend requires the `qwen-asr` package "
-                "(pip install -U qwen-asr) which provides `Qwen3ForcedAligner`. "
+                "(provides `Qwen3ForcedAligner`) and `nemo.collections.speechlm2`. "
+                "Install `qwen_asr` into the container image (see docker/Dockerfile.speech: "
+                "`RUN pip install qwen_asr`) rather than at launch time. "
                 f"Import failed: {e!r}"
             )
         device_map = str(self._device) if self._device.type == "cuda" else "cpu"
+        dtype = self.dtype if self.dtype is not None else torch.bfloat16
         logging.info(
             f"[chunkwise-aligner] Loading frozen word-level aligner '{self.model_name_or_path}' "
-            f"on {device_map} (dtype={self.dtype})."
+            f"on {device_map} (dtype={dtype})."
         )
-        kwargs = {"device_map": device_map}
-        if self.dtype is not None:
-            kwargs["dtype"] = self.dtype
-        self._aligner = Qwen3ForcedAligner.from_pretrained(self.model_name_or_path, **kwargs)
+        self._aligner = QwenForcedAligner(
+            pretrained_model=self.model_name_or_path,
+            language=self.language,
+            device=device_map,
+            dtype=dtype,
+        )
 
     def to(self, device, dtype=None):
         # The HF aligner is placed via device_map at load time; just record intent.
@@ -178,12 +187,26 @@ class QwenWordForcedAligner:
 
     # ------------------------------------------------------------------ qwen call
     def _run_aligner(self, audios, texts) -> List[Sequence]:
-        """Call the external aligner. Returns one result per sample; each result is
-        a sequence of items exposing ``.start_time`` (seconds). Isolated so tests
-        can stub it without the heavy model / package."""
+        """Call the external aligner. ``audios`` is a list of mono float32 numpy
+        arrays (one per sample). Returns one result per sample; each result is a
+        sequence of :class:`WordAlignment`-like items exposing ``.start_time``
+        (seconds). Isolated so tests can stub it without the heavy model / package.
+        """
         self._ensure_loaded(self._device or torch.device("cpu"))
-        languages = [self.language] * len(audios)
-        return self._aligner.align(audio=audios, text=texts, language=languages)
+        sr_target = getattr(self._aligner, "SAMPLE_RATE", 16000)
+        if self.sample_rate == sr_target:
+            # Fast path: audio is already at the aligner's sample rate.
+            return self._aligner.align_numpy(audios, texts)
+        # Otherwise hand to the resampling tensor path of the wrapper.
+        import numpy as np
+
+        lens = torch.tensor([int(np.asarray(a).shape[0]) for a in audios], dtype=torch.long)
+        maxlen = int(lens.max()) if len(audios) else 0
+        batch = torch.zeros(len(audios), maxlen, dtype=torch.float32)
+        for i, a in enumerate(audios):
+            a = np.asarray(a, dtype=np.float32)
+            batch[i, : a.shape[0]] = torch.from_numpy(a)
+        return self._aligner.align(batch, lens, texts, source_sample_rate=self.sample_rate)
 
     # --------------------------------------------------------------------- align
     @torch.no_grad()
@@ -243,7 +266,7 @@ class QwenWordForcedAligner:
 
             n = max(int(sig_len_cpu[b]), 1)
             wav = input_signal[b, :n].detach().to('cpu', dtype=torch.float32).contiguous().numpy()
-            audios.append((wav, self.sample_rate))
+            audios.append(wav)
             align_indices.append(b)
 
         if not align_indices:
