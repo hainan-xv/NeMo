@@ -43,6 +43,7 @@ from nemo.collections.asr.parts.mixins import (
     TranscribeConfig,
     TranscriptionReturnType,
 )
+from nemo.collections.asr.losses.chunked_aligner_pytorch import ChunkwiseAlignerLoss
 from nemo.collections.asr.parts.numba.rnnt_loss.rnnt_pytorch import ChunkedAlignerLossNumba, ChunkedAlignerNarLossNumba
 from nemo.collections.asr.parts.preprocessing.segment import ChannelSelectorType
 from nemo.collections.asr.parts.submodules.aligner_decoding import AlignerDecoding
@@ -178,10 +179,14 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
         super().__init__(cfg=cfg, trainer=trainer)
         self.loss_type = str(self.cfg.get('loss_type', 'rnnt')).lower()
-        if self.loss_type not in ('rnnt', 'aligner', 'chunked_aligner'):
+        if self.loss_type not in ('rnnt', 'aligner', 'chunked_aligner', 'chunkwise_aligner'):
             raise ValueError(
-                f"model.loss_type must be one of ['rnnt', 'aligner', 'chunked_aligner'], got '{self.loss_type}'."
+                "model.loss_type must be one of ['rnnt', 'aligner', 'chunked_aligner', 'chunkwise_aligner'], "
+                f"got '{self.loss_type}'."
             )
+        # Frozen external CTC aligner used by the 'chunkwise_aligner' baseline
+        # (lazily built in its setup); kept out of nn.Module child registration.
+        self._external_aligner = None
 
         # Initialize components
         self.preprocessor = EncDecRNNTModel.from_config_dict(self.cfg.preprocessor)
@@ -231,6 +236,8 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
             if self.loss_type == 'chunked_aligner':
                 self._setup_chunked_aligner_loss_and_decoding()
+            elif self.loss_type == 'chunkwise_aligner':
+                self._setup_chunkwise_aligner_loss_and_decoding()
             else:
                 # Setup RNNT Loss
                 loss_name, loss_kwargs = self.extract_rnnt_loss_cfg(self.cfg.get("loss", None))
@@ -942,7 +949,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         (``M = first_k_frames_per_chunk``), so the joint must be built for that dim.
         """
         base = int(self.cfg.model_defaults.enc_hidden)
-        if self.loss_type != 'chunked_aligner':
+        if self.loss_type not in ('chunked_aligner', 'chunkwise_aligner'):
             return base
         ca_cfg = self.cfg.get('chunked_aligner', None)
         if ca_cfg is None or not bool(ca_cfg.get('chunk_channel_attn', False)):
@@ -1230,6 +1237,128 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             vocabulary=self.joint.vocabulary,
             tokenizer=getattr(self, 'tokenizer', None),
         )
+
+    def _setup_chunkwise_aligner_loss_and_decoding(self):
+        """Set up the *external-alignment* Chunkwise-Aligner baseline.
+
+        Architecturally identical to the AR Chunked-Aligner (same RNN-T prediction
+        net + joint, same chunk geometry / optional token extraction, same greedy
+        chunked decoding). The ONLY differences are the training objective -- the
+        single fixed-path NLL (:class:`ChunkwiseAlignerLoss`) for the segmentation
+        produced by a frozen external CTC aligner -- and the on-the-fly alignment
+        step. Reuses the ``model.chunked_aligner`` config block for chunk geometry
+        and ``model.external_aligner`` for the frozen aligner. NAR is not supported.
+        """
+        ca_cfg = self.cfg.get('chunked_aligner', None)
+        if ca_cfg is not None and bool(ca_cfg.get('nar', False)):
+            raise ValueError("loss_type='chunkwise_aligner' does not support the non-autoregressive (nar) mode.")
+        self._setup_chunked_token_extractor(ca_cfg)
+
+        blank_id = self.joint.num_classes_with_blank - 1
+
+        reduction = str(ca_cfg.get('reduction', 'mean_volume')) if ca_cfg is not None else 'mean_volume'
+
+        self.loss = ChunkwiseAlignerLoss(
+            blank=blank_id,
+            chunk_size=self.chunk_size,
+            reduction=reduction,
+        )
+
+        # Inference is alignment-free and identical to the Chunked Aligner: greedily
+        # replay the same lattice. Reuse the chunked-aligner decoder verbatim.
+        self.decoding = ChunkedAlignerDecoding(
+            decoding_cfg=self.cfg.get('decoding', None),
+            decoder=self.decoder,
+            joint=self.joint,
+            blank_id=blank_id,
+            chunk_size=self.chunk_size,
+            vocabulary=self.joint.vocabulary,
+            tokenizer=getattr(self, 'tokenizer', None),
+        )
+
+        # Build the frozen external CTC aligner that fixes the label->chunk path.
+        ext_cfg = self.cfg.get('external_aligner', None)
+        if ext_cfg is None:
+            raise ValueError(
+                "loss_type='chunkwise_aligner' requires a `model.external_aligner` config block with either "
+                "`model_path` (a local .nemo CTC model) or `pretrained_name`."
+            )
+        from nemo.collections.asr.parts.submodules.external_ctc_aligner import ExternalCTCForcedAligner
+
+        expected_vocab = len(self.cfg.labels) if self.cfg.get('labels', None) is not None else None
+        self._external_aligner = ExternalCTCForcedAligner(
+            model_path=ext_cfg.get('model_path', None),
+            pretrained_name=ext_cfg.get('pretrained_name', None),
+            expected_vocab_size=expected_vocab,
+            viterbi_device=ext_cfg.get('viterbi_device', None),
+        )
+
+    @torch.no_grad()
+    def _external_chunk_assignment(
+        self,
+        signal: torch.Tensor,
+        signal_len: torch.Tensor,
+        transcript: torch.Tensor,
+        transcript_len: torch.Tensor,
+        encoded_len: torch.Tensor,
+        is_processed_signal: bool = False,
+    ):
+        """Force-align the batch with the frozen external CTC model.
+
+        Returns ``(token_chunk_ids [B, U], valid_mask [B], n_discarded, n_total)``.
+        """
+        if is_processed_signal:
+            raise ValueError(
+                "loss_type='chunkwise_aligner' needs raw audio for the external CTC aligner, but received a "
+                "pre-processed (DALI) signal. Disable DALI / processed-signal input for this baseline."
+            )
+        token_chunk_ids, valid_mask = self._external_aligner.align_to_chunks(
+            input_signal=signal,
+            input_signal_length=signal_len,
+            labels=transcript,
+            label_lens=transcript_len,
+            target_frame_lengths=encoded_len,
+            chunk_size=self.chunk_size,
+        )
+        n_total = int(valid_mask.numel())
+        n_discarded = int((~valid_mask).sum().item())
+        return token_chunk_ids, valid_mask, n_discarded, n_total
+
+    def _chunkwise_aligner_loss(
+        self,
+        encoded: torch.Tensor,
+        encoded_len: torch.Tensor,
+        transcript: torch.Tensor,
+        transcript_len: torch.Tensor,
+        token_chunk_ids: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        # Trim to valid lengths exactly as the full-sum chunked-aligner loss does.
+        transcript_len = transcript_len.to(encoded_len.device)
+        max_logit_len = int(encoded_len.max().item())
+        max_targets_len = int(transcript_len.max().item()) if transcript_len.numel() > 0 else 0
+        max_targets_len = max(max_targets_len, 1)
+        if transcript.shape[1] != max_targets_len:
+            transcript = transcript.narrow(dim=1, start=0, length=max_targets_len).contiguous()
+        if token_chunk_ids.shape[1] != max_targets_len:
+            token_chunk_ids = token_chunk_ids.narrow(dim=1, start=0, length=max_targets_len).contiguous()
+
+        decoder_outputs, _, _ = self.decoder(targets=transcript, target_length=transcript_len)
+        joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder_outputs)
+        if joint.shape[1] != max_logit_len:
+            joint = joint.narrow(dim=1, start=0, length=max_logit_len).contiguous()
+
+        loss_value = self.loss(
+            acts=joint,
+            labels=transcript,
+            act_lens=encoded_len,
+            label_lens=transcript_len,
+            token_chunk_ids=token_chunk_ids,
+            valid_mask=valid_mask,
+        )
+        if loss_value.dim() > 0:
+            loss_value = loss_value.squeeze()
+        return loss_value
 
     def _chunked_aligner_nar_loss(
         self,
@@ -1995,17 +2124,31 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         signal, signal_len, transcript, transcript_len = batch
 
         # forward() only performs encoder forward
-        if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
+        is_processed_signal = isinstance(batch, DALIOutputs) and batch.has_processed_signal
+        if is_processed_signal:
             encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
         else:
             encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
+
+        # Chunkwise-Aligner baseline: derive the external label->chunk alignment
+        # while the raw audio is still available (it needs the frozen CTC model).
+        chunkwise_assignment = None
+        if self.loss_type == 'chunkwise_aligner':
+            chunkwise_assignment = self._external_chunk_assignment(
+                signal, signal_len, transcript, transcript_len, encoded_len, is_processed_signal=is_processed_signal
+            )
         del signal
 
-        if self.loss_type in ('aligner', 'chunked_aligner'):
+        if self.loss_type in ('aligner', 'chunked_aligner', 'chunkwise_aligner'):
             if self.loss_type == 'aligner':
                 loss_value = self._aligner_loss(encoded, encoded_len, transcript, transcript_len)
-            else:
+            elif self.loss_type == 'chunked_aligner':
                 loss_value = self._chunked_aligner_loss(encoded, encoded_len, transcript, transcript_len)
+            else:
+                token_chunk_ids, valid_mask, n_discarded, n_total = chunkwise_assignment
+                loss_value = self._chunkwise_aligner_loss(
+                    encoded, encoded_len, transcript, transcript_len, token_chunk_ids, valid_mask
+                )
             loss_value = self.add_auxiliary_losses(loss_value)
 
             if AccessMixin.is_access_enabled(self.model_guid):
@@ -2064,6 +2207,11 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                     f"tgt_len_mean={float(transcript_len.float().mean().detach().cpu()):.1f} "
                     f"tgt_len_max={int(transcript_len.max().detach().cpu())}"
                     + (f" training_batch_wer={float(train_wer.detach().cpu()):.4f}" if train_wer is not None else "")
+                    + (
+                        f" discarded={chunkwise_assignment[2]}/{chunkwise_assignment[3]}"
+                        if chunkwise_assignment is not None
+                        else ""
+                    )
                 )
 
             if log_prediction and hypotheses is not None and references is not None:
@@ -2177,7 +2325,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
         del signal
 
-        if self.loss_type in ('aligner', 'chunked_aligner'):
+        if self.loss_type in ('aligner', 'chunked_aligner', 'chunkwise_aligner'):
             texts, _ = self.decoding.decode_encoder_output(encoded, encoded_len)
             if isinstance(sample_id, torch.Tensor):
                 sample_id = sample_id.cpu().detach().numpy()
@@ -2195,23 +2343,38 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         signal, signal_len, transcript, transcript_len = batch
 
         # forward() only performs encoder forward
-        if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
+        is_processed_signal = isinstance(batch, DALIOutputs) and batch.has_processed_signal
+        if is_processed_signal:
             encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
         else:
             encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
+
+        # Chunkwise-Aligner baseline: external label->chunk alignment (raw audio
+        # still available). Computed unconditionally so the discard ratio is always
+        # reported alongside val_wer, even when compute_eval_loss is off.
+        chunkwise_assignment = None
+        if self.loss_type == 'chunkwise_aligner':
+            chunkwise_assignment = self._external_chunk_assignment(
+                signal, signal_len, transcript, transcript_len, encoded_len, is_processed_signal=is_processed_signal
+            )
         del signal
 
         tensorboard_logs = {}
 
-        if self.loss_type in ('aligner', 'chunked_aligner'):
+        if self.loss_type in ('aligner', 'chunked_aligner', 'chunkwise_aligner'):
             if self.compute_eval_loss:
                 if self.loss_type == 'aligner':
                     tensorboard_logs['val_loss'] = self._aligner_loss(
                         encoded, encoded_len, transcript, transcript_len
                     )
-                else:
+                elif self.loss_type == 'chunked_aligner':
                     tensorboard_logs['val_loss'] = self._chunked_aligner_loss(
                         encoded, encoded_len, transcript, transcript_len
+                    )
+                else:
+                    token_chunk_ids, valid_mask, _, _ = chunkwise_assignment
+                    tensorboard_logs['val_loss'] = self._chunkwise_aligner_loss(
+                        encoded, encoded_len, transcript, transcript_len, token_chunk_ids, valid_mask
                     )
 
             hypotheses, _ = self.decoding.decode_encoder_output(encoded, encoded_len)
@@ -2223,6 +2386,20 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             tensorboard_logs['val_wer'] = torch.tensor(
                 scores / max(words, 1), dtype=torch.float32, device=encoded.device
             )
+
+            # Report the fraction of utterances dropped because the external
+            # alignment could not be left-packed into the chunk lattice. Logged as
+            # summed num/denom so multi_validation_epoch_end micro-averages it into
+            # ``val_discard`` automatically.
+            if chunkwise_assignment is not None:
+                _, _, n_discarded, n_total = chunkwise_assignment
+                tensorboard_logs['val_discard_num'] = torch.tensor(
+                    float(n_discarded), dtype=torch.float32, device=encoded.device
+                )
+                tensorboard_logs['val_discard_denom'] = torch.tensor(
+                    float(n_total), dtype=torch.float32, device=encoded.device
+                )
+
             self.log('global_step', torch.tensor(self.trainer.global_step, dtype=torch.float32))
             return tensorboard_logs
 
@@ -2336,13 +2513,37 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             num = torch.stack([x[f'{base}_num'] for x in outputs]).sum()
             denom = torch.stack([x[f'{base}_denom'] for x in outputs]).sum()
             tensorboard_logs[base] = num.float() / torch.clamp(denom, min=1.0)
+        # Corrupt/skipped tarred-shard stats (printed every validation). Cheap no-op
+        # unless a tarred dataset actually skipped an unreadable shard/sample.
+        if self.trainer is not None and self.trainer.is_global_zero:
+            try:
+                from nemo.collections.asr.data.audio_to_text import get_tarred_skipped_count
+
+                total_skipped = get_tarred_skipped_count()
+            except Exception:
+                total_skipped = 0
+            if total_skipped > 0:
+                prev = getattr(self, '_prev_tarred_skipped', 0)
+                logging.info(
+                    f"[tarred-data] step={self.trainer.global_step} "
+                    f"corrupt/skipped tar entries: total={total_skipped} "
+                    f"(+{total_skipped - prev} since last validation) on this rank's worker pool."
+                )
+                self._prev_tarred_skipped = total_skipped
+                tensorboard_logs['tarred_skipped_total'] = torch.tensor(float(total_skipped))
+
         if (
-            self.loss_type in ('aligner', 'chunked_aligner')
+            self.loss_type in ('aligner', 'chunked_aligner', 'chunkwise_aligner')
             and self.trainer is not None
             and self.trainer.is_global_zero
         ):
             val_loss_msg = (
                 f" val_loss={float(val_loss_mean.detach().float().cpu()):.4f}" if self.compute_eval_loss else ""
+            )
+            discard_msg = (
+                f" val_discard={float(tensorboard_logs['val_discard'].detach().float().cpu()):.4f}"
+                if 'val_discard' in tensorboard_logs
+                else ""
             )
             logging.info(
                 f"[{self.loss_type}-val] "
@@ -2351,6 +2552,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 f"{val_loss_msg} "
                 f"val_wer={float(tensorboard_logs['val_wer'].detach().float().cpu()):.4f} "
                 f"words={int(wer_denom.detach().cpu())}"
+                f"{discard_msg}"
             )
         return {**val_loss_log, 'log': tensorboard_logs}
 
@@ -2384,7 +2586,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         encoded = outputs.pop('encoded')
         encoded_len = outputs.pop('encoded_len')
 
-        if self.loss_type in ('aligner', 'chunked_aligner'):
+        if self.loss_type in ('aligner', 'chunked_aligner', 'chunkwise_aligner'):
             texts, token_ids = self.decoding.decode_encoder_output(encoded, encoded_len)
             del encoded, encoded_len
             return [

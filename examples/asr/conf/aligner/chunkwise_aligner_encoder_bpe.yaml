@@ -1,0 +1,249 @@
+# Configuration for the Chunkwise-Aligner BASELINE (external alignment; sub-word / BPE).
+#
+# This is the published "Chunkwise Aligners for Streaming Speech Recognition"
+# (arXiv:2605.11422) baseline that our alignment-free Chunked Aligner is compared
+# against. Architecturally it is IDENTICAL to chunked_aligner_encoder_bpe.yaml
+# (same FastConformer-large encoder + RNN-T prediction net + joint + greedy
+# chunked decoding, blank = end-of-chunk). The ONLY difference is the training
+# objective:
+#
+#   * Chunked Aligner (ours): full-sum over every label->chunk segmentation; no
+#     external timestamps needed.
+#   * Chunkwise Aligner (this baseline): a FROZEN external CTC model force-aligns
+#     each label to a frame, the label->chunk assignment is FIXED from that
+#     alignment, and the trainee maximizes the probability of that single path.
+#
+# The external CTC model MUST share this model's tokenizer (so its forced
+# alignment is indexed by the same token ids). Utterances whose alignment cannot
+# be left-packed into the chunk lattice are skipped during training; the skipped
+# fraction is reported as ``val_discard`` alongside ``val_wer``.
+
+name: "Chunkwise-Aligner-Encoder-BPE"
+
+# Optional warm-start from a base TDT/RNN-T model (encoder-only), same as the
+# Chunked-Aligner recipe.
+base_model_path: null
+base_model_name: null
+init_encoder_from_base: true
+tokenizer_out_dir: null
+encoder_overrides: null
+
+model:
+  sample_rate: 16000
+  compute_eval_loss: true
+  log_prediction: true
+  skip_nan_grad: false
+
+  # Single fixed-path (external-alignment) Chunkwise-Aligner objective.
+  loss_type: "chunkwise_aligner"
+
+  # Frozen external CTC model used to generate the label->chunk alignment on the
+  # fly. Provide EITHER a local .nemo (`model_path`) OR a `pretrained_name`. It
+  # must share this model's tokenizer/vocabulary.
+  external_aligner:
+    model_path: null            # e.g. /pretrained/stt_en_fastconformer_ctc_large.nemo
+    pretrained_name: null       # e.g. stt_en_fastconformer_ctc_large
+    viterbi_device: null        # null -> same device as the audio
+
+  # Chunk geometry / optional token extraction are SHARED with the Chunked-Aligner
+  # so the two models are architecturally identical (only the loss differs). NAR
+  # is not supported for this baseline.
+  chunked_aligner:
+    chunk_size: 12              # number of encoder frames per chunk
+    nar: false
+    # 'mean_volume' = per-token NLL (~ln V at init), comparable to the chunked
+    # aligner / TDT scale so a shared LR transfers. 'mean' = total-sequence NLL.
+    reduction: mean_volume
+    token_extraction_size: -1
+    first_k_frames_per_chunk: -1
+    chunk_query: false
+    chunk_channel_attn: false
+    chunk_channel_attn_heads: 4
+  log_stats_every_n_steps: 20
+  log_prediction_every_n_steps: 100
+  log_prediction_num_samples: 2
+
+  model_defaults:
+    enc_hidden: ${model.encoder.d_model}
+    pred_hidden: 640
+    joint_hidden: 640
+
+  train_ds:
+    manifest_filepath: ???
+    sample_rate: ${model.sample_rate}
+    batch_size: 16
+    shuffle: true
+    num_workers: 8
+    pin_memory: true
+    max_duration: 16.7
+    min_duration: 0.1
+    is_tarred: false
+    tarred_audio_filepaths: null
+    shuffle_n: 2048
+    bucketing_strategy: "synced_randomized"
+    bucketing_batch_size: null
+
+  validation_ds:
+    manifest_filepath: ???
+    sample_rate: ${model.sample_rate}
+    batch_size: 16
+    shuffle: false
+    use_start_end_token: false
+    num_workers: 8
+    pin_memory: true
+
+  test_ds:
+    manifest_filepath: null
+    sample_rate: ${model.sample_rate}
+    batch_size: 16
+    shuffle: false
+    use_start_end_token: false
+    num_workers: 8
+    pin_memory: true
+
+  # recommend to use SPE Unigram tokenizer with vocab size of 1K to 4k when using 4x sub-sampling
+  tokenizer:
+    dir: ???  # path to directory which contains either tokenizer.model (bpe) or vocab.txt (for wpe)
+    type: bpe  # Can be either bpe (SentencePiece tokenizer) or wpe (WordPiece tokenizer)
+
+  preprocessor:
+    _target_: nemo.collections.asr.modules.AudioToMelSpectrogramPreprocessor
+    sample_rate: ${model.sample_rate}
+    normalize: "per_feature"
+    window_size: 0.025
+    window_stride: 0.01
+    window: "hann"
+    features: 80
+    n_fft: 512
+    frame_splicing: 1
+    dither: 0.00001
+    pad_to: 0
+
+  spec_augment:
+    _target_: nemo.collections.asr.modules.SpectrogramAugmentation
+    freq_masks: 2
+    time_masks: 10
+    freq_width: 27
+    time_width: 0.05
+
+  # FastConformer-large (~110M params). Identical to the Chunked-Aligner encoder
+  # so the two models differ only in the training objective.
+  encoder:
+    _target_: nemo.collections.asr.modules.ConformerEncoder
+    feat_in: ${model.preprocessor.features}
+    feat_out: -1
+    n_layers: 17
+    d_model: 512
+
+    # Sub-sampling parameters (FastConformer: 8x depthwise-striding).
+    subsampling: dw_striding
+    subsampling_factor: 8
+    subsampling_conv_channels: 256
+    causal_downsampling: false
+
+    reduction: null
+    reduction_position: null
+    reduction_factor: 1
+
+    ff_expansion_factor: 4
+
+    self_attention_model: rel_pos
+    n_heads: 8
+    att_context_size: [-1, -1]
+    att_context_style: regular
+    xscaling: true
+    untie_biases: true
+    pos_emb_max_len: 5000
+
+    conv_kernel_size: 9
+    conv_norm_type: 'batch_norm'
+    conv_context_size: null
+
+    dropout: 0.1
+    dropout_pre_encoder: 0.1
+    dropout_emb: 0.0
+    dropout_att: 0.1
+
+    stochastic_depth_drop_prob: 0.0
+    stochastic_depth_mode: linear
+    stochastic_depth_start_layer: 1
+
+  # Standard RNN-T prediction network (text-only recurrence).
+  decoder:
+    _target_: nemo.collections.asr.modules.RNNTDecoder
+    normalization_mode: null
+    random_state_sampling: false
+    blank_as_pad: true
+
+    prednet:
+      pred_hidden: ${model.model_defaults.pred_hidden}
+      pred_rnn_layers: 1
+      t_max: null
+      dropout: 0.2
+
+  # Standard RNN-T joint (output space includes the blank/EOC). NOTE: fused
+  # loss/WER must stay OFF -- the Chunkwise Aligner uses its own loss + decoding.
+  joint:
+    _target_: nemo.collections.asr.modules.RNNTJoint
+    log_softmax: null
+    preserve_memory: false
+    fuse_loss_wer: false
+
+    jointnet:
+      joint_hidden: ${model.model_defaults.joint_hidden}
+      activation: "relu"
+      dropout: 0.2
+
+  decoding:
+    max_symbols: null  # null -> bounded by the number of encoder frames
+
+  optim:
+    name: adamw
+    lr: 1e-4
+    betas: [0.9, 0.98]
+    weight_decay: 1e-3
+
+    sched:
+      name: CosineAnnealing
+      warmup_steps: 10000
+      warmup_ratio: null
+      min_lr: 1e-6
+
+trainer:
+  devices: -1
+  num_nodes: 1
+  max_epochs: 500
+  max_steps: -1
+  val_check_interval: 1.0
+  accelerator: auto
+  strategy: ddp
+  accumulate_grad_batches: 1
+  gradient_clip_val: 0.0
+  precision: 32
+  log_every_n_steps: 10
+  enable_progress_bar: True
+  num_sanity_val_steps: 0
+  check_val_every_n_epoch: 1
+  sync_batchnorm: true
+  enable_checkpointing: False
+  logger: false
+  benchmark: false
+
+exp_manager:
+  exp_dir: null
+  name: ${name}
+  create_tensorboard_logger: false
+  create_checkpoint_callback: true
+  checkpoint_callback_params:
+    monitor: "val_wer"
+    mode: "min"
+    save_top_k: 5
+    always_save_nemo: True
+  resume_from_checkpoint: null
+  resume_if_exists: false
+  resume_ignore_no_checkpoint: false
+
+  create_wandb_logger: false
+  wandb_logger_kwargs:
+    name: null
+    project: null

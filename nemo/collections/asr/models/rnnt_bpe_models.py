@@ -269,7 +269,7 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
         # The Aligner / Chunked-Aligner variants build their own decoding objects
         # (and a manual WER) inside the base __init__, so skip the RNNT-BPE
         # decoding / WER / fused-joint setup below.
-        if getattr(self, 'loss_type', 'rnnt') in ('aligner', 'chunked_aligner'):
+        if getattr(self, 'loss_type', 'rnnt') in ('aligner', 'chunked_aligner', 'chunkwise_aligner'):
             return
 
         self.cfg.decoding = self.set_decoding_type_according_to_loss(self.cfg.decoding)

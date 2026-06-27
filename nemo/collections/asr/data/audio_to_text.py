@@ -49,6 +49,51 @@ __all__ = [
 VALID_FILE_FORMATS = ';'.join(['wav', 'mp3', 'flac', 'opus'] + [fmt.lower() for fmt in valid_sf_formats.keys()])
 
 
+# ---------------------------------------------------------------------------
+# Corrupt-shard safe guard for tarred (WebDataset) datasets.
+#
+# A truncated / unreadable tar shard (e.g. "tarfile.ReadError: unexpected end of
+# data") or a sample that fails to decode otherwise propagates out of the
+# DataLoader worker (WebDataset's default ``reraise_exception``) and crashes /
+# hangs training. ``tarred_audio_skip_handler`` instead logs + counts the bad
+# entry and tells WebDataset to skip it and keep iterating.
+#
+# The counter is a shared ``multiprocessing.Value`` so the main process can read
+# the total accumulated by the (forked) DataLoader workers. This works with the
+# default 'fork' start method (Linux); with 'spawn' each worker keeps its own
+# counter but the per-skip warnings are still emitted to the log.
+# ---------------------------------------------------------------------------
+_TARRED_SKIPPED_SAMPLES = multiprocessing.Value('L', 0)
+
+
+def get_tarred_skipped_count() -> int:
+    """Total number of tar entries / samples skipped so far due to read/decode errors."""
+    with _TARRED_SKIPPED_SAMPLES.get_lock():
+        return int(_TARRED_SKIPPED_SAMPLES.value)
+
+
+def reset_tarred_skipped_count() -> None:
+    """Reset the corrupt-shard skip counter (mainly for tests)."""
+    with _TARRED_SKIPPED_SAMPLES.get_lock():
+        _TARRED_SKIPPED_SAMPLES.value = 0
+
+
+def tarred_audio_skip_handler(exn: Exception) -> bool:
+    """WebDataset error handler: log + count a corrupt tar entry/sample, then continue.
+
+    Returning ``True`` tells WebDataset to skip the offending shard/sample and
+    resume with the next one (instead of re-raising and killing the worker).
+    """
+    with _TARRED_SKIPPED_SAMPLES.get_lock():
+        _TARRED_SKIPPED_SAMPLES.value += 1
+        total = int(_TARRED_SKIPPED_SAMPLES.value)
+    logging.warning(
+        "[tarred-data] Skipping unreadable/corrupt tar entry or sample and continuing "
+        f"(total skipped so far in this worker pool: {total}). Cause: {repr(exn)}"
+    )
+    return True
+
+
 def _speech_collate_fn(batch, pad_id):
     """collate batch of audio sig, audio len, tokens, tokens len
     Args:
@@ -879,17 +924,19 @@ class _TarredAudioToTextDataset(IterableDataset):
             global_rank=global_rank,
         )
 
-        # Put together WebDataset pipeline
+        # Put together WebDataset pipeline. ``tarred_audio_skip_handler`` keeps
+        # training alive across corrupt/truncated tar shards (and undecodable
+        # samples) by skipping + counting them instead of crashing the worker.
         self._dataset = wds.DataPipeline(
             wds.SimpleShardList(urls=audio_tar_filepaths),
             webdataset_split_by_workers,
             wds.shuffle(shuffle_n),
-            wds.tarfile_to_samples(),
+            wds.tarfile_to_samples(handler=tarred_audio_skip_handler),
             wds.rename(audio=VALID_FILE_FORMATS, key='__key__'),
             wds.to_tuple('audio', 'key'),
             self._filter,
             self._loop_offsets,
-            wds.map(self._build_sample),
+            wds.map(self._build_sample, handler=tarred_audio_skip_handler),
         )
 
     def _filter(self, iterator):

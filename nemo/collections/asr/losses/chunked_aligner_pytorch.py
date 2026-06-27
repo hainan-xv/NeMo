@@ -88,6 +88,8 @@ __all__ = [
     'chunked_aligner_loss_bruteforce',
     'ChunkedAlignerNarLossPytorch',
     'chunked_aligner_nar_loss_bruteforce',
+    'ChunkwiseAlignerLoss',
+    'chunkwise_aligner_single_path_logprob',
 ]
 
 # Large finite stand-in for log(0); mirrors the other PyTorch loss references
@@ -277,6 +279,226 @@ def chunked_aligner_loss_bruteforce(
             out.append(torch.tensor(NEG_INF))
 
     return torch.stack(out)
+
+
+# ============================================================================
+# Chunkwise-Aligner baseline (external alignment, single fixed path)
+# ============================================================================
+# This is the *external-alignment* counterpart of the alignment-free Chunked
+# Aligner above. It implements the training objective of "Chunkwise Aligners for
+# Streaming Speech Recognition" (arXiv:2605.11422): instead of full-summing over
+# every way to distribute the labels across chunks, an EXTERNAL aligner fixes the
+# label->chunk assignment, and training maximizes the probability of that single
+# path through the SAME lattice / topology as ``ChunkedAlignerLossPytorch``.
+#
+# Given the per-token chunk assignment (which chunk each label is emitted in),
+# left-packing within a chunk fully determines the path: the j-th token assigned
+# to chunk ``c`` (j = 0..k_c-1) is emitted at frame ``c*C + j`` from predictor
+# state = its global token index, and a blank/EOC closes chunk ``c`` at frame
+# ``c*C + k_c`` whenever ``k_c < frames_in_chunk_c`` (a completely filled chunk
+# rolls over with no blank, exactly as in the full-sum lattice). The loss is then
+# just the negative sum of the token + EOC log-probs along that one path -- a sum
+# of differentiable ``gather`` ops, so autograd provides the backward (no DP, no
+# CUDA kernel needed). This makes it directly comparable to the full-sum loss:
+# both score the same arcs, the baseline simply commits to one segmentation.
+
+
+def chunkwise_aligner_single_path_logprob(
+    acts: torch.Tensor,
+    labels: torch.Tensor,
+    act_lens: torch.Tensor,
+    label_lens: torch.Tensor,
+    chunk_counts: torch.Tensor,
+    blank: int,
+    chunk_size: int,
+) -> torch.Tensor:
+    """Reference single-path log-prob for a *fixed* chunk segmentation (loop-based).
+
+    ``chunk_counts[b, c]`` is the number of labels assigned to chunk ``c`` for
+    sample ``b`` (``sum_c chunk_counts[b, c] == U_b``). Returns per-sample
+    ``log P(path | acts)`` of shape ``(B,)`` for the single left-packed path
+    implied by that segmentation, or ``NEG_INF`` if the segmentation is infeasible
+    (a chunk is assigned more tokens than it has frames, or the counts do not sum
+    to ``U_b``). ``acts`` are raw logits (log_softmax applied internally), matching
+    :class:`ChunkwiseAlignerLoss`. Mirrors a single ``recurse`` branch of
+    :func:`chunked_aligner_loss_bruteforce` -- used for correctness tests.
+    """
+    acts = torch.log_softmax(acts.float(), dim=-1)
+    B = acts.shape[0]
+    C = chunk_size
+
+    out = []
+    for b in range(B):
+        T_b = int(act_lens[b])
+        U_b = int(label_lens[b])
+        n_chunks = (T_b + C - 1) // C
+        counts = [int(chunk_counts[b, c]) for c in range(n_chunks)]
+
+        feasible = sum(counts) == U_b
+        score = 0.0
+        u = 0
+        if feasible:
+            for c in range(n_chunks):
+                base = c * C
+                frames_here = min(C, T_b - base)
+                k = counts[c]
+                if k > frames_here or u + k > U_b:
+                    feasible = False
+                    break
+                for i in range(k):
+                    score = score + float(acts[b, base + i, u, labels[b, u]])
+                    u += 1
+                if k < frames_here:
+                    score = score + float(acts[b, base + k, u, blank])
+
+        if feasible and u == U_b:
+            out.append(torch.tensor(score))
+        else:
+            out.append(torch.tensor(NEG_INF))
+
+    return torch.stack(out)
+
+
+class ChunkwiseAlignerLoss(Loss):
+    """Single fixed-path (external-alignment) Chunkwise-Aligner loss.
+
+    Same lattice / topology and ``acts`` layout as :class:`ChunkedAlignerLossPytorch`
+    (``acts: (B, T, U+1, V)`` raw logits, ``blank`` doubles as end-of-chunk), but
+    instead of full-summing over segmentations the loss scores the SINGLE path
+    fixed by an external aligner via the per-token chunk assignment
+    ``token_chunk_ids``. The forward is a sum of ``gather`` ops, so autograd
+    provides the backward.
+
+    Args:
+        blank: index of the blank / end-of-chunk (EOC) symbol within ``V``.
+        chunk_size: number of encoder frames per chunk ``C``.
+        reduction: one of ``'none'``, ``'sum'``, ``'mean'`` (per-sample loss
+            divided by label length, then averaged), ``'mean_batch'`` (mean over
+            the valid samples) or ``'mean_volume'`` (sum divided by the total
+            number of labels in the valid samples).
+    """
+
+    @property
+    def input_types(self):
+        return {
+            "acts": NeuralType(('B', 'T', 'T', 'D'), LogprobsType()),
+            "labels": NeuralType(('B', 'T'), LabelsType()),
+            "act_lens": NeuralType(tuple('B'), LengthsType()),
+            "label_lens": NeuralType(tuple('B'), LengthsType()),
+            "token_chunk_ids": NeuralType(('B', 'T'), LabelsType()),
+        }
+
+    @property
+    def output_types(self):
+        return {"loss": NeuralType(elements_type=LossType())}
+
+    def __init__(self, blank: int, chunk_size: int, reduction: str = 'mean_volume'):
+        super().__init__()
+        if chunk_size < 1:
+            raise ValueError(f"chunk_size must be >= 1, got {chunk_size}.")
+        if reduction not in ('none', 'sum', 'mean', 'mean_batch', 'mean_volume'):
+            raise ValueError(
+                "reduction must be one of "
+                "['none', 'sum', 'mean', 'mean_batch', 'mean_volume'], "
+                f"got '{reduction}'."
+            )
+        self.blank = blank
+        self.chunk_size = chunk_size
+        self.reduction = reduction
+
+    def _sample_path_logprob(self, logp_b, labels_b, cids_b, T_b, U_b):
+        """Differentiable log-prob of the fixed path for one sample.
+
+        Returns ``(logprob, feasible)`` where ``logprob`` is a scalar tensor (a
+        zero tensor when infeasible) and ``feasible`` is a Python bool.
+        """
+        C = self.chunk_size
+        device = logp_b.device
+        n_chunks = (T_b + C - 1) // C
+
+        chunk_range = torch.arange(n_chunks, device=device)
+        frames_here = torch.clamp(T_b - chunk_range * C, max=C)  # [n_chunks]
+
+        if U_b == 0:
+            # Degenerate "all blanks" path; only reached for samples that are
+            # already flagged invalid upstream, so feasibility is reported False.
+            return logp_b.new_zeros(()), False
+
+        cids = cids_b[:U_b].long()
+        # Monotonic, in-range assignment is required for left-packing.
+        if cids.min().item() < 0 or cids.max().item() >= n_chunks:
+            return logp_b.new_zeros(()), False
+        if U_b > 1 and bool((cids[1:] < cids[:-1]).any().item()):
+            return logp_b.new_zeros(()), False
+
+        counts = torch.bincount(cids, minlength=n_chunks)[:n_chunks]  # [n_chunks]
+        if bool((counts > frames_here).any().item()):
+            return logp_b.new_zeros(()), False
+
+        prefix_incl = torch.cumsum(counts, dim=0)  # tokens emitted through chunk c
+        prefix_excl = prefix_incl - counts  # global index of first token in chunk c
+
+        # ---- token arcs: token u emitted at frame (chunk*C + within-chunk pos) ----
+        u_idx = torch.arange(U_b, device=device)
+        within = u_idx - prefix_excl[cids]
+        frames = cids * C + within
+        tok_logp = logp_b[frames, u_idx, labels_b[:U_b].long()]
+
+        # ---- blank/EOC arcs: one per chunk that is not completely filled ----
+        blank_mask = counts < frames_here
+        score = tok_logp.sum()
+        if bool(blank_mask.any().item()):
+            blank_frames = (chunk_range * C + counts)[blank_mask]
+            blank_states = prefix_incl[blank_mask]
+            bl_logp = logp_b[blank_frames, blank_states, self.blank]
+            score = score + bl_logp.sum()
+        return score, True
+
+    def forward(self, acts, labels, act_lens, label_lens, token_chunk_ids, valid_mask=None):
+        # CPU patch for FP16 (log_softmax on CPU is not implemented for half).
+        if not acts.is_cuda and acts.dtype == torch.float16:
+            acts = acts.float()
+
+        logp = torch.log_softmax(acts, dim=-1)
+        B = acts.shape[0]
+
+        losses = []
+        valids = []
+        for b in range(B):
+            T_b = int(act_lens[b])
+            U_b = int(label_lens[b])
+            externally_valid = True if valid_mask is None else bool(valid_mask[b])
+            if not externally_valid:
+                losses.append(logp.new_zeros(()))
+                valids.append(False)
+                continue
+            logprob, feasible = self._sample_path_logprob(logp[b], labels[b], token_chunk_ids[b], T_b, U_b)
+            losses.append(-logprob)
+            valids.append(feasible)
+
+        losses = torch.stack(losses)
+        valids_t = torch.tensor(valids, device=losses.device, dtype=torch.bool)
+
+        if self.reduction == 'none':
+            return losses
+
+        # Zero out invalid samples so they never contribute to the (masked) reduction.
+        losses = torch.where(valids_t, losses, torch.zeros_like(losses))
+        label_lens = label_lens.to(losses.device)
+        valid_lens = torch.where(valids_t, label_lens, torch.zeros_like(label_lens))
+
+        if self.reduction == 'sum':
+            return losses.sum()
+        if self.reduction == 'mean_volume':
+            return losses.sum() / valid_lens.sum().clamp(min=1)
+        if self.reduction == 'mean_batch':
+            denom = valids_t.sum().clamp(min=1)
+            return losses.sum() / denom
+        if self.reduction == 'mean':
+            per_sample = torch.div(losses, valid_lens.clamp(min=1))
+            denom = valids_t.sum().clamp(min=1)
+            return per_sample.sum() / denom
+        return losses
 
 
 # ============================================================================
