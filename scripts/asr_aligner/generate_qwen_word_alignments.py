@@ -27,20 +27,32 @@ Run it in an environment that has ``qwen_asr`` (e.g. the same image used for
 Option A). Shard across GPUs with ``--num-shards`` / ``--shard-index`` and point
 the trainer's ``alignments_path`` at the output *directory* to merge shards.
 
-Example
--------
+Two input modes
+---------------
+* **non-tarred** (default): ``--manifest`` lines carry ``audio_filepath`` to real
+  audio files; sharding is round-robin over manifest entries.
+* **tarred** (``--tarred-audio-filepaths``): reads audio directly from NeMo tar
+  shards (use this for tarred / speed-perturbed training data so file_ids AND
+  durations match exactly what training sees). ``--manifest`` is the tarred
+  manifest (member name + text); sharding is round-robin over tar shards.
+
+Examples
+--------
+    # tarred (matches tarred training data) -- one shard per GPU on a single node
     python scripts/asr_aligner/generate_qwen_word_alignments.py \
-        --manifest /data/librispeech/train_960.json \
-        --output   /results/qwen_word_aligns/train_960 \
-        --aligner  /aligner_qwen \
-        --language English --dtype bfloat16 --device cuda:0 \
-        --batch-size 16 --num-shards 8 --shard-index 0
+        --manifest /data/tarred_train/tarred_audio_manifest.json \
+        --tarred-audio-filepaths "/data/tarred_train/audio__OP_0..511_CL_.tar" \
+        --output   /results/.../qwen_word_aligns/train_960 \
+        --aligner  /aligner_qwen --device cuda:0 \
+        --num-shards 8 --shard-index 0
 """
 
 import argparse
+import io
 import json
 import os
-from typing import List
+import tarfile
+from typing import Dict, Iterator, List, Tuple
 
 import numpy as np
 
@@ -51,8 +63,8 @@ def parse_args():
     p.add_argument(
         '--output',
         required=True,
-        help='Output path. With --num-shards>1, a directory is created and each shard writes shard_XXXX.json into it; '
-        'point the trainer alignments_path at that directory. With a single shard, writes <output>.json.',
+        help='Output DIRECTORY. Each shard writes shard_XXXX.json into it; point the trainer '
+        'external_aligner.alignments_path at this directory (shards are merged on load).',
     )
     p.add_argument('--aligner', default='Qwen/Qwen3-ForcedAligner-0.6B', help='Qwen aligner repo id or local dir.')
     p.add_argument('--language', default='English')
@@ -65,6 +77,12 @@ def parse_args():
     p.add_argument('--shard-index', type=int, default=0)
     p.add_argument('--text-key', default='text')
     p.add_argument('--audio-key', default='audio_filepath')
+    p.add_argument(
+        '--tarred-audio-filepaths',
+        default=None,
+        help='If set, read audio from these NeMo tar shards (brace pattern or comma-separated). '
+        'Use for tarred/speed-perturbed training data. --manifest is then the tarred manifest.',
+    )
     p.add_argument('--limit', type=int, default=None, help='Process at most N (post-shard) utterances (debug).')
     return p.parse_args()
 
@@ -83,41 +101,134 @@ def read_manifest(path: str) -> List[dict]:
     return items
 
 
+def _resample(audio: np.ndarray, sr: int, target_sr: int) -> np.ndarray:
+    if sr == target_sr:
+        return np.ascontiguousarray(audio, dtype=np.float32)
+    import librosa
+
+    return np.ascontiguousarray(librosa.resample(audio, orig_sr=sr, target_sr=target_sr), dtype=np.float32)
+
+
 def load_audio(path: str, target_sr: int) -> np.ndarray:
     import soundfile as sf
 
     audio, sr = sf.read(path, dtype='float32', always_2d=False)
     if audio.ndim > 1:  # downmix to mono
         audio = audio.mean(axis=1)
-    if sr != target_sr:
-        import librosa
+    return _resample(audio, sr, target_sr)
 
-        audio = librosa.resample(audio, orig_sr=sr, target_sr=target_sr)
-    return np.ascontiguousarray(audio, dtype=np.float32)
+
+def _decode_audio_bytes(raw: bytes, target_sr: int) -> np.ndarray:
+    import soundfile as sf
+
+    audio, sr = sf.read(io.BytesIO(raw), dtype='float32', always_2d=False)
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+    return _resample(audio, sr, target_sr)
+
+
+def _expand_tar_pattern(pattern: str) -> List[str]:
+    """Expand a NeMo tar filepath spec into a sorted list of tar paths.
+
+    Accepts a comma-separated list and/or NeMo's ``_OP_a..b_CL_`` brace syntax
+    (equivalent to ``{a..b}``).
+    """
+    from braceexpand import braceexpand
+
+    out: List[str] = []
+    for part in str(pattern).split(','):
+        part = part.strip()
+        if not part:
+            continue
+        part = part.replace('_OP_', '{').replace('_CL_', '}')
+        out.extend(braceexpand(part))
+    return sorted(out)
+
+
+def iter_nontarred(items: List[dict], args) -> Iterator[Tuple[str, str, np.ndarray]]:
+    items = [it for i, it in enumerate(items) if i % args.num_shards == args.shard_index]
+    if args.limit is not None:
+        items = items[: args.limit]
+    print(f"[gen-align] shard {args.shard_index}/{args.num_shards}: {len(items)} utterances (non-tarred).")
+    for it in items:
+        apath = it.get(args.audio_key)
+        text = it.get(args.text_key, '')
+        dur = it.get('duration', None)
+        if apath is None or not text:
+            continue
+        if args.max_duration is not None and dur is not None and float(dur) > args.max_duration:
+            continue
+        try:
+            audio = load_audio(apath, args.sample_rate)
+        except Exception as e:  # noqa: BLE001
+            print(f"[gen-align] WARNING: failed to read '{apath}' ({e!r}); skipping.")
+            continue
+        yield _file_id(apath), text, audio
+
+
+def iter_tarred(items: List[dict], args) -> Iterator[Tuple[str, str, np.ndarray]]:
+    # file_id -> (text, duration) from the tarred manifest.
+    id2meta: Dict[str, Tuple[str, float]] = {}
+    for it in items:
+        apath = it.get(args.audio_key)
+        text = it.get(args.text_key, '')
+        if apath is None or not text:
+            continue
+        id2meta[_file_id(apath)] = (text, it.get('duration', None))
+
+    all_tars = _expand_tar_pattern(args.tarred_audio_filepaths)
+    my_tars = [t for i, t in enumerate(all_tars) if i % args.num_shards == args.shard_index]
+    print(
+        f"[gen-align] shard {args.shard_index}/{args.num_shards}: {len(my_tars)}/{len(all_tars)} tar shards "
+        f"({len(id2meta)} manifest entries, tarred)."
+    )
+    n = 0
+    for tpath in my_tars:
+        try:
+            tf = tarfile.open(tpath, 'r')
+        except Exception as e:  # noqa: BLE001
+            print(f"[gen-align] WARNING: cannot open tar '{tpath}' ({e!r}); skipping shard file.")
+            continue
+        with tf:
+            for member in tf:
+                if not member.isfile():
+                    continue
+                fid = _file_id(member.name)
+                meta = id2meta.get(fid)
+                if meta is None:
+                    continue
+                text, dur = meta
+                if args.max_duration is not None and dur is not None and float(dur) > args.max_duration:
+                    continue
+                try:
+                    raw = tf.extractfile(member).read()
+                    audio = _decode_audio_bytes(raw, args.sample_rate)
+                except Exception as e:  # noqa: BLE001
+                    print(f"[gen-align] WARNING: failed to decode '{member.name}' in '{tpath}' ({e!r}); skipping.")
+                    continue
+                n += 1
+                if args.limit is not None and n > args.limit:
+                    return
+                yield fid, text, audio
 
 
 def main():
     args = parse_args()
 
-    from nemo.collections.speechlm2.modules.qwen_forced_aligner import QwenForcedAligner
-
-    dtype_map = {'bfloat16': 'bfloat16', 'float16': 'float16', 'float32': 'float32'}
     import torch
 
-    torch_dtype = {'bfloat16': torch.bfloat16, 'float16': torch.float16, 'float32': torch.float32}[dtype_map[args.dtype]]
+    from nemo.collections.speechlm2.modules.qwen_forced_aligner import QwenForcedAligner
+
+    torch_dtype = {'bfloat16': torch.bfloat16, 'float16': torch.float16, 'float32': torch.float32}[args.dtype]
 
     items = read_manifest(args.manifest)
-    # Deterministic round-robin sharding across parallel jobs.
-    items = [it for i, it in enumerate(items) if i % args.num_shards == args.shard_index]
-    if args.limit is not None:
-        items = items[: args.limit]
-    print(f"[gen-align] shard {args.shard_index}/{args.num_shards}: {len(items)} utterances to align.")
+    sample_iter = iter_tarred(items, args) if args.tarred_audio_filepaths else iter_nontarred(items, args)
 
     aligner = QwenForcedAligner(
         pretrained_model=args.aligner, language=args.language, device=args.device, dtype=torch_dtype
     )
 
-    results = {}
+    results: Dict[str, List[float]] = {}
     n_ok = n_skip = 0
     buf_audio: List[np.ndarray] = []
     buf_text: List[str] = []
@@ -139,37 +250,20 @@ def main():
             n_ok += 1
         buf_audio.clear(); buf_text.clear(); buf_key.clear()
 
-    for it in items:
-        apath = it.get(args.audio_key)
-        text = it.get(args.text_key, '')
-        dur = it.get('duration', None)
-        if apath is None or not text:
-            n_skip += 1
-            continue
-        if args.max_duration is not None and dur is not None and float(dur) > args.max_duration:
-            n_skip += 1
-            continue
-        try:
-            audio = load_audio(apath, args.sample_rate)
-        except Exception as e:  # noqa: BLE001
-            print(f"[gen-align] WARNING: failed to read '{apath}' ({e!r}); skipping.")
-            n_skip += 1
-            continue
+    for fid, text, audio in sample_iter:
         buf_audio.append(audio)
         buf_text.append(text)
-        buf_key.append(_file_id(apath))
+        buf_key.append(fid)
         if len(buf_audio) >= args.batch_size:
             flush()
         if (n_ok + n_skip) and (n_ok + n_skip) % 1000 == 0:
             print(f"[gen-align] processed ~{n_ok + n_skip} (ok={n_ok}, skip={n_skip})")
     flush()
 
-    if args.num_shards > 1:
-        os.makedirs(args.output, exist_ok=True)
-        out_path = os.path.join(args.output, f"shard_{args.shard_index:04d}.json")
-    else:
-        os.makedirs(os.path.dirname(os.path.abspath(args.output)) or '.', exist_ok=True)
-        out_path = args.output if args.output.endswith('.json') else args.output + '.json'
+    # Always write a per-shard file INTO the output directory so the trainer's
+    # directory-merge works uniformly for any shard count (incl. a single shard).
+    os.makedirs(args.output, exist_ok=True)
+    out_path = os.path.join(args.output, f"shard_{args.shard_index:04d}.json")
 
     with open(out_path, 'w', encoding='utf-8') as f:
         json.dump(results, f)
