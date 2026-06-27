@@ -7,11 +7,18 @@
 # (arXiv:2605.11422) baseline that our alignment-free Chunked Aligner is compared
 # against. The model is architecturally IDENTICAL to the Chunked Aligner (same
 # encoder + RNN-T prediction net + joint + greedy chunked decoding); the ONLY
-# difference is the training objective: a FROZEN external CTC model force-aligns
-# each label to a frame, the label->chunk assignment is fixed from that alignment,
-# and the trainee maximizes the probability of that single path. The fraction of
+# difference is the training objective: a FROZEN external model force-aligns the
+# transcript, the label->chunk assignment is fixed from that alignment, and the
+# trainee maximizes the probability of that single path. The fraction of
 # utterances skipped (alignment not left-packable into the lattice) is reported as
 # `val_discard` alongside `val_wer`.
+#
+# Two external-alignment backends (set BACKEND below):
+#   * qwen (default) -- WORD-level forced alignment via Qwen3-ForcedAligner. All
+#     sub-words of a word share the word's chunk, so the external tokenizer need
+#     NOT match this model's tokenizer. Requires `pip install -U qwen-asr`.
+#   * ctc            -- TOKEN-level CTC forced alignment; the external CTC model
+#     MUST share this model's tokenizer.
 #
 # See examples/asr/conf/aligner/chunkwise_aligner_encoder_bpe.yaml.
 #
@@ -20,9 +27,6 @@
 #     arg1 CHUNK_SIZE : encoder frames per chunk (default 12)
 #     arg2 GPU_ID     : CUDA device id to use (default 0)
 #   e.g.  ./train_chunkwise_aligner_librispeech.sh 12 0
-#
-# IMPORTANT: set EXTERNAL_ALIGNER_* below to a frozen CTC model that SHARES this
-# model's tokenizer (so its forced alignment is indexed by the same token ids).
 #
 # Entrypoint:  examples/asr/asr_aligner/speech_to_text_chunkwise_aligner_bpe.py
 # Base config: examples/asr/conf/aligner/chunkwise_aligner_encoder_bpe.yaml
@@ -46,9 +50,16 @@ TEST_MANIFEST="${DATA_DIR}/test_clean.json"   # set to null to skip the final te
 CHUNK_SIZE="${1:-12}"       # arg1: encoder frames per chunk (each chunk emits <= chunk_size tokens)
 REDUCTION=mean_volume       # 'mean_volume' (per-token NLL) | 'mean' (per-sequence NLL)
 
-# --- Frozen external CTC aligner (MUST share the tokenizer below) ---
+# --- Frozen external aligner backend ---
+BACKEND="${BACKEND:-qwen}"   # 'qwen' (word-level, tokenizer-agnostic) | 'ctc' (token-level)
+
+# qwen (word-level) backend: any forced aligner exposing word timestamps.
+QWEN_ALIGNER_NAME="Qwen/Qwen3-ForcedAligner-0.6B"    # HF repo id or local dir
+QWEN_ALIGNER_LANGUAGE="English"
+QWEN_ALIGNER_DTYPE="bfloat16"
+
+# ctc (token-level) backend: external CTC model MUST share the tokenizer below.
 # Provide EITHER a local .nemo (preferred for reproducibility) OR a pretrained name.
-# Leave EXTERNAL_ALIGNER_NEMO empty to use EXTERNAL_ALIGNER_NAME instead.
 EXTERNAL_ALIGNER_NEMO=""                              # e.g. /path/to/ls960_ctc_v1024.nemo
 EXTERNAL_ALIGNER_NAME="stt_en_fastconformer_ctc_large"  # used only if EXTERNAL_ALIGNER_NEMO is empty
 
@@ -101,13 +112,19 @@ else
   STRATEGY=auto
 fi
 
-# External aligner: pass model_path if a local .nemo is given, else pretrained_name.
-if [ -n "${EXTERNAL_ALIGNER_NEMO}" ]; then
-  EXTERNAL_ALIGNER_OVERRIDE="model.external_aligner.model_path=${EXTERNAL_ALIGNER_NEMO}"
-  echo "[external-aligner] using local CTC model: ${EXTERNAL_ALIGNER_NEMO}"
+# External aligner overrides depend on the selected backend.
+if [ "${BACKEND}" = "qwen" ]; then
+  EXTERNAL_ALIGNER_OVERRIDE="model.external_aligner.backend=qwen \
+    model.external_aligner.model_name=${QWEN_ALIGNER_NAME} \
+    model.external_aligner.language=${QWEN_ALIGNER_LANGUAGE} \
+    model.external_aligner.dtype=${QWEN_ALIGNER_DTYPE}"
+  echo "[external-aligner] backend=qwen (word-level): ${QWEN_ALIGNER_NAME} lang=${QWEN_ALIGNER_LANGUAGE}"
+elif [ -n "${EXTERNAL_ALIGNER_NEMO}" ]; then
+  EXTERNAL_ALIGNER_OVERRIDE="model.external_aligner.backend=ctc model.external_aligner.model_path=${EXTERNAL_ALIGNER_NEMO}"
+  echo "[external-aligner] backend=ctc, local CTC model: ${EXTERNAL_ALIGNER_NEMO}"
 else
-  EXTERNAL_ALIGNER_OVERRIDE="model.external_aligner.pretrained_name=${EXTERNAL_ALIGNER_NAME}"
-  echo "[external-aligner] using pretrained CTC model: ${EXTERNAL_ALIGNER_NAME}"
+  EXTERNAL_ALIGNER_OVERRIDE="model.external_aligner.backend=ctc model.external_aligner.pretrained_name=${EXTERNAL_ALIGNER_NAME}"
+  echo "[external-aligner] backend=ctc, pretrained CTC model: ${EXTERNAL_ALIGNER_NAME}"
 fi
 
 # --- Build the BPE tokenizer once (idempotent; shared with the other scripts) ---

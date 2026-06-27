@@ -9,14 +9,21 @@
 #
 #   * Chunked Aligner (ours): full-sum over every label->chunk segmentation; no
 #     external timestamps needed.
-#   * Chunkwise Aligner (this baseline): a FROZEN external CTC model force-aligns
-#     each label to a frame, the label->chunk assignment is FIXED from that
-#     alignment, and the trainee maximizes the probability of that single path.
+#   * Chunkwise Aligner (this baseline): a FROZEN external model force-aligns the
+#     transcript, the label->chunk assignment is FIXED from that alignment, and
+#     the trainee maximizes the probability of that single path.
 #
-# The external CTC model MUST share this model's tokenizer (so its forced
-# alignment is indexed by the same token ids). Utterances whose alignment cannot
-# be left-packed into the chunk lattice are skipped during training; the skipped
-# fraction is reported as ``val_discard`` alongside ``val_wer``.
+# Two external-alignment backends are supported (see model.external_aligner):
+#   * backend: qwen (DEFAULT here) -- WORD-level forced alignment via
+#     Qwen3-ForcedAligner. All sub-words of a word are assigned to the word's
+#     chunk, so the external model's tokenizer is irrelevant (only the word
+#     sequence must match the transcript). Requires the `qwen-asr` package.
+#   * backend: ctc -- TOKEN-level CTC forced alignment; the external CTC model
+#     MUST share this model's tokenizer/vocabulary.
+#
+# Utterances whose alignment cannot be left-packed into the chunk lattice (or
+# whose word counts disagree) are skipped during training; the skipped fraction
+# is reported as ``val_discard`` alongside ``val_wer``.
 
 name: "Chunkwise-Aligner-Encoder-BPE"
 
@@ -37,10 +44,19 @@ model:
   # Single fixed-path (external-alignment) Chunkwise-Aligner objective.
   loss_type: "chunkwise_aligner"
 
-  # Frozen external CTC model used to generate the label->chunk alignment on the
-  # fly. Provide EITHER a local .nemo (`model_path`) OR a `pretrained_name`. It
-  # must share this model's tokenizer/vocabulary.
+  # Frozen external aligner used to generate the label->chunk alignment on the fly.
   external_aligner:
+    # 'qwen' -> WORD-level alignment (tokenizer-agnostic, recommended).
+    # 'ctc'  -> TOKEN-level CTC alignment (must share this model's tokenizer).
+    backend: qwen
+
+    # --- qwen (word-level) backend -------------------------------------------
+    model_name: "Qwen/Qwen3-ForcedAligner-0.6B"  # HF repo id or local dir
+    language: English           # transcript language passed to the aligner
+    dtype: bfloat16             # aligner compute dtype (bf16/fp16/fp32)
+    device: null                # null -> same accelerator as the audio
+
+    # --- ctc (token-level) backend -------------------------------------------
     model_path: null            # e.g. /pretrained/stt_en_fastconformer_ctc_large.nemo
     pretrained_name: null       # e.g. stt_en_fastconformer_ctc_large
     viterbi_device: null        # null -> same device as the audio

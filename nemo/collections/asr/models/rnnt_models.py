@@ -1276,22 +1276,53 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             tokenizer=getattr(self, 'tokenizer', None),
         )
 
-        # Build the frozen external CTC aligner that fixes the label->chunk path.
+        # Build the frozen external aligner that fixes the label->chunk path.
         ext_cfg = self.cfg.get('external_aligner', None)
         if ext_cfg is None:
             raise ValueError(
-                "loss_type='chunkwise_aligner' requires a `model.external_aligner` config block with either "
-                "`model_path` (a local .nemo CTC model) or `pretrained_name`."
+                "loss_type='chunkwise_aligner' requires a `model.external_aligner` config block. Use "
+                "`backend: qwen` (word-level, tokenizer-agnostic) with `model_name`, or `backend: ctc` "
+                "(token-level) with `model_path`/`pretrained_name`."
             )
-        from nemo.collections.asr.parts.submodules.external_ctc_aligner import ExternalCTCForcedAligner
 
-        expected_vocab = len(self.cfg.labels) if self.cfg.get('labels', None) is not None else None
-        self._external_aligner = ExternalCTCForcedAligner(
-            model_path=ext_cfg.get('model_path', None),
-            pretrained_name=ext_cfg.get('pretrained_name', None),
-            expected_vocab_size=expected_vocab,
-            viterbi_device=ext_cfg.get('viterbi_device', None),
-        )
+        # 'ctc'  -> token-level forced alignment; external model MUST share the
+        #           trainee tokenizer (legacy behaviour, default for back-compat).
+        # 'qwen' -> word-level forced alignment; all sub-words of a word share the
+        #           word's chunk, so the external tokenizer is irrelevant.
+        backend = str(ext_cfg.get('backend', 'ctc')).lower()
+        if backend in ('qwen', 'word', 'qwen_word'):
+            from nemo.collections.asr.parts.submodules.external_word_aligner import QwenWordForcedAligner
+
+            tokenizer = getattr(self, 'tokenizer', None)
+            if tokenizer is None:
+                raise ValueError(
+                    "external_aligner.backend='qwen' (word-level) requires a sub-word tokenizer model "
+                    "(e.g. a *_bpe model) so sub-words can be grouped into words."
+                )
+            model_name = (
+                ext_cfg.get('model_name', None)
+                or ext_cfg.get('pretrained_name', None)
+                or ext_cfg.get('model_path', None)
+                or "Qwen/Qwen3-ForcedAligner-0.6B"
+            )
+            self._external_aligner = QwenWordForcedAligner(
+                tokenizer=tokenizer,
+                model_name_or_path=model_name,
+                language=ext_cfg.get('language', 'English'),
+                dtype=ext_cfg.get('dtype', 'bfloat16'),
+                device=ext_cfg.get('device', None),
+                sample_rate=int(self.cfg.get('sample_rate', 16000)),
+            )
+        else:
+            from nemo.collections.asr.parts.submodules.external_ctc_aligner import ExternalCTCForcedAligner
+
+            expected_vocab = len(self.cfg.labels) if self.cfg.get('labels', None) is not None else None
+            self._external_aligner = ExternalCTCForcedAligner(
+                model_path=ext_cfg.get('model_path', None),
+                pretrained_name=ext_cfg.get('pretrained_name', None),
+                expected_vocab_size=expected_vocab,
+                viterbi_device=ext_cfg.get('viterbi_device', None),
+            )
 
     @torch.no_grad()
     def _external_chunk_assignment(

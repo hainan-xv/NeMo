@@ -447,3 +447,233 @@ def test_model_chunkwise_greedy_decode_shapes():
     assert len(texts) == B
     assert len(token_ids) == B
     assert all(isinstance(t, str) for t in texts)
+
+
+# ---------------------------------------------------------------------------
+# Word-level (Qwen) external aligner: sub-word -> word grouping + word -> chunk
+# bucketing, with the heavy aligner call stubbed so no model / package is needed.
+# ---------------------------------------------------------------------------
+
+
+class _FakeBPETokenizer:
+    """Minimal SentencePiece-style tokenizer: pieces use the '▁' word marker."""
+
+    def __init__(self, id2piece):
+        self.id2piece = id2piece
+
+    def ids_to_tokens(self, ids):
+        return [self.id2piece[int(i)] for i in ids]
+
+    def ids_to_text(self, ids):
+        s = ''.join(self.id2piece[int(i)] for i in ids)
+        return s.replace('\u2581', ' ').strip()
+
+
+class _Item:
+    def __init__(self, text, start_time, end_time=None):
+        self.text = text
+        self.start_time = start_time
+        self.end_time = end_time if end_time is not None else start_time
+
+
+def _make_word_aligner(id2piece, run_aligner):
+    from nemo.collections.asr.parts.submodules.external_word_aligner import QwenWordForcedAligner
+
+    aligner = QwenWordForcedAligner(tokenizer=_FakeBPETokenizer(id2piece), sample_rate=16000)
+    aligner._run_aligner = run_aligner  # bypass the real Qwen model / package
+    return aligner
+
+
+@pytest.mark.unit
+def test_group_token_ids_into_words_conventions():
+    from nemo.collections.asr.parts.submodules.external_word_aligner import group_token_ids_into_words
+
+    # SentencePiece: '▁' marks word starts.
+    assert group_token_ids_into_words(['\u2581HE', 'LLO', '\u2581WORLD']) == [[0, 1], [2]]
+    # Byte-level BPE: 'Ġ' marks word starts (first piece is always a start).
+    assert group_token_ids_into_words(['He', '\u0120wor', 'ld']) == [[0], [1, 2]]
+    # WordPiece: '##' marks continuations.
+    assert group_token_ids_into_words(['he', '##llo', 'world']) == [[0, 1], [2]]
+
+
+@pytest.mark.unit
+def test_word_aligner_buckets_subwords_into_word_chunks():
+    # "HELLO WORLD" -> ids [1,2,3], pieces ['▁HE','LLO','▁WORLD'] -> 2 words.
+    id2piece = {1: '\u2581HE', 2: 'LLO', 3: '\u2581WORLD'}
+
+    # 1 sample, T_tr=8 frames, chunk_size=4 -> 2 chunks; audio = 1.0s.
+    # word0 starts at 0.0s -> frame 0 -> chunk 0; word1 at 0.6s -> frame 4 -> chunk 1.
+    def run_aligner(audios, texts):
+        assert texts == ['HELLO WORLD']
+        return [[_Item('HELLO', 0.0), _Item('WORLD', 0.6)]]
+
+    aligner = _make_word_aligner(id2piece, run_aligner)
+    labels = torch.tensor([[1, 2, 3]])
+    label_lens = torch.tensor([3])
+    target_frames = torch.tensor([8])
+
+    token_chunk_ids, valid_mask = aligner.align_to_chunks(
+        input_signal=torch.zeros(1, 16000),
+        input_signal_length=torch.tensor([16000]),
+        labels=labels,
+        label_lens=label_lens,
+        target_frame_lengths=target_frames,
+        chunk_size=4,
+    )
+    assert bool(valid_mask[0])
+    # All sub-words of "HELLO" share chunk 0; "WORLD" -> chunk 1.
+    assert token_chunk_ids[0].tolist() == [0, 0, 1]
+
+
+@pytest.mark.unit
+def test_word_aligner_word_count_mismatch_is_discarded():
+    id2piece = {1: '\u2581HE', 2: 'LLO', 3: '\u2581WORLD'}
+
+    # Aligner returns only ONE word but the transcript has two -> discard.
+    def run_aligner(audios, texts):
+        return [[_Item('HELLO', 0.0)]]
+
+    aligner = _make_word_aligner(id2piece, run_aligner)
+    token_chunk_ids, valid_mask = aligner.align_to_chunks(
+        input_signal=torch.zeros(1, 16000),
+        input_signal_length=torch.tensor([16000]),
+        labels=torch.tensor([[1, 2, 3]]),
+        label_lens=torch.tensor([3]),
+        target_frame_lengths=torch.tensor([8]),
+        chunk_size=4,
+    )
+    assert not bool(valid_mask[0])
+    assert torch.all(token_chunk_ids[0] == -1)
+
+
+@pytest.mark.unit
+def test_word_aligner_flags_T_less_than_U():
+    id2piece = {1: '\u2581HE', 2: 'LLO', 3: '\u2581WORLD'}
+
+    def run_aligner(audios, texts):
+        return [[_Item('HELLO', 0.0), _Item('WORLD', 0.6)]]
+
+    aligner = _make_word_aligner(id2piece, run_aligner)
+    # 3 tokens but only 2 trainee frames -> infeasible.
+    token_chunk_ids, valid_mask = aligner.align_to_chunks(
+        input_signal=torch.zeros(1, 16000),
+        input_signal_length=torch.tensor([16000]),
+        labels=torch.tensor([[1, 2, 3]]),
+        label_lens=torch.tensor([3]),
+        target_frame_lengths=torch.tensor([2]),
+        chunk_size=4,
+    )
+    assert not bool(valid_mask[0])
+
+
+@pytest.mark.unit
+def test_word_aligner_failure_discards_batch_but_does_not_raise():
+    id2piece = {1: '\u2581HE', 2: 'LLO', 3: '\u2581WORLD'}
+
+    def run_aligner(audios, texts):
+        raise RuntimeError("simulated aligner failure")
+
+    aligner = _make_word_aligner(id2piece, run_aligner)
+    token_chunk_ids, valid_mask = aligner.align_to_chunks(
+        input_signal=torch.zeros(2, 16000),
+        input_signal_length=torch.tensor([16000, 16000]),
+        labels=torch.tensor([[1, 2, 3], [1, 3, -1]]),
+        label_lens=torch.tensor([3, 2]),
+        target_frame_lengths=torch.tensor([8, 8]),
+        chunk_size=4,
+    )
+    # Failure must be swallowed (training continues) and all samples discarded.
+    assert not bool(valid_mask.any())
+    assert torch.all(token_chunk_ids == -1)
+
+
+class _StubWordAligner:
+    """Stand-in for QwenWordForcedAligner: records construction, no model load."""
+
+    last = None
+
+    def __init__(
+        self,
+        tokenizer,
+        model_name_or_path="Qwen/Qwen3-ForcedAligner-0.6B",
+        language="English",
+        dtype="bfloat16",
+        device=None,
+        sample_rate=16000,
+    ):
+        self.tokenizer = tokenizer
+        self.model_name_or_path = model_name_or_path
+        self.language = language
+        self.sample_rate = sample_rate
+        _StubWordAligner.last = self
+
+    def to(self, *args, **kwargs):
+        return self
+
+    def align_to_chunks(self, labels, label_lens, target_frame_lengths, chunk_size, **kwargs):
+        B, U = labels.shape
+        return torch.full((B, U), -1, dtype=torch.long), torch.zeros(B, dtype=torch.bool)
+
+
+@pytest.mark.unit
+def test_model_qwen_backend_wires_word_aligner(monkeypatch):
+    """external_aligner.backend='qwen' must build the word-level aligner with the trainee tokenizer."""
+    from omegaconf import open_dict
+
+    import nemo.collections.asr.parts.submodules.external_word_aligner as wmod
+
+    monkeypatch.setattr(wmod, 'QwenWordForcedAligner', _StubWordAligner)
+
+    model = _build_chunkwise_model(chunk_size=2)
+    model.tokenizer = _FakeBPETokenizer({1: '\u2581a', 2: 'b'})
+    with open_dict(model.cfg.external_aligner):
+        model.cfg.external_aligner.backend = 'qwen'
+        model.cfg.external_aligner.model_name = 'fake/qwen-aligner'
+        model.cfg.external_aligner.language = 'English'
+
+    model._setup_chunkwise_aligner_loss_and_decoding()
+
+    assert isinstance(model._external_aligner, _StubWordAligner)
+    assert model._external_aligner.tokenizer is model.tokenizer
+    assert model._external_aligner.model_name_or_path == 'fake/qwen-aligner'
+
+
+@pytest.mark.unit
+def test_qwen_backend_requires_tokenizer(monkeypatch):
+    """The word-level backend must error clearly when there is no sub-word tokenizer."""
+    from omegaconf import open_dict
+
+    import nemo.collections.asr.parts.submodules.external_word_aligner as wmod
+
+    monkeypatch.setattr(wmod, 'QwenWordForcedAligner', _StubWordAligner)
+
+    model = _build_chunkwise_model(chunk_size=2)  # char model -> no tokenizer
+    assert getattr(model, 'tokenizer', None) is None
+    with open_dict(model.cfg.external_aligner):
+        model.cfg.external_aligner.backend = 'qwen'
+
+    with pytest.raises(ValueError):
+        model._setup_chunkwise_aligner_loss_and_decoding()
+
+
+@pytest.mark.unit
+def test_word_aligner_monotonic_clamp_on_regression():
+    # Two words whose raw timestamps regress (word1 earlier than word0). The
+    # assignment must stay non-decreasing across words.
+    id2piece = {1: '\u2581A', 2: '\u2581B'}
+
+    def run_aligner(audios, texts):
+        return [[_Item('A', 0.6), _Item('B', 0.1)]]  # regressing start times
+
+    aligner = _make_word_aligner(id2piece, run_aligner)
+    token_chunk_ids, valid_mask = aligner.align_to_chunks(
+        input_signal=torch.zeros(1, 16000),
+        input_signal_length=torch.tensor([16000]),
+        labels=torch.tensor([[1, 2]]),
+        label_lens=torch.tensor([2]),
+        target_frame_lengths=torch.tensor([8]),
+        chunk_size=4,
+    )
+    assert bool(valid_mask[0])
+    ids = token_chunk_ids[0].tolist()
+    assert ids[0] <= ids[1]  # non-decreasing
