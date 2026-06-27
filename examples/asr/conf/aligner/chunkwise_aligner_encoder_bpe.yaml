@@ -13,11 +13,16 @@
 #     transcript, the label->chunk assignment is FIXED from that alignment, and
 #     the trainee maximizes the probability of that single path.
 #
-# Two external-alignment backends are supported (see model.external_aligner):
-#   * backend: qwen (DEFAULT here) -- WORD-level forced alignment via
-#     Qwen3-ForcedAligner. All sub-words of a word are assigned to the word's
-#     chunk, so the external model's tokenizer is irrelevant (only the word
-#     sequence must match the transcript). Requires the `qwen-asr` package.
+# Three external-alignment backends are supported (see model.external_aligner):
+#   * backend: precomputed -- OFFLINE word-level alignment (RECOMMENDED, fastest).
+#     Run scripts/asr_aligner/generate_qwen_word_alignments.py ONCE to dump per-word
+#     start times keyed by file_id, then point `alignments_path` at it. No
+#     qwen_asr/transformers runs during training (no per-step aligner forward).
+#     Requires `model.train_ds.return_sample_id=true` (and validation_ds) so each
+#     batch row can be matched back to its precomputed alignment.
+#   * backend: qwen -- LIVE WORD-level forced alignment via Qwen3-ForcedAligner.
+#     All sub-words of a word are assigned to the word's chunk, so the external
+#     model's tokenizer is irrelevant. Requires `qwen-asr`; slow (per-step forward).
 #   * backend: ctc -- TOKEN-level CTC forced alignment; the external CTC model
 #     MUST share this model's tokenizer/vocabulary.
 #
@@ -44,13 +49,20 @@ model:
   # Single fixed-path (external-alignment) Chunkwise-Aligner objective.
   loss_type: "chunkwise_aligner"
 
-  # Frozen external aligner used to generate the label->chunk alignment on the fly.
+  # External aligner that fixes the label->chunk alignment.
   external_aligner:
-    # 'qwen' -> WORD-level alignment (tokenizer-agnostic, recommended).
-    # 'ctc'  -> TOKEN-level CTC alignment (must share this model's tokenizer).
-    backend: qwen
+    # 'precomputed' -> OFFLINE word-level alignment (fastest, recommended).
+    # 'qwen'        -> LIVE word-level alignment (tokenizer-agnostic, slow).
+    # 'ctc'         -> TOKEN-level CTC alignment (must share this model's tokenizer).
+    backend: precomputed
 
-    # --- qwen (word-level) backend -------------------------------------------
+    # --- precomputed (offline word-level) backend ----------------------------
+    # JSON/JSONL file or directory of {file_id: [word_start_sec, ...]} produced by
+    # scripts/asr_aligner/generate_qwen_word_alignments.py. REQUIRES
+    # model.train_ds.return_sample_id=true (and validation_ds.return_sample_id=true).
+    alignments_path: null
+
+    # --- qwen (live word-level) backend --------------------------------------
     model_name: "Qwen/Qwen3-ForcedAligner-0.6B"  # HF repo id or local dir
     language: English           # transcript language passed to the aligner
     dtype: bfloat16             # aligner compute dtype (bf16/fp16/fp32)

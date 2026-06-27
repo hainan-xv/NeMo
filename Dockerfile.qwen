@@ -1,0 +1,5 @@
+FROM gitlab-master.nvidia.com/hainanx/nemo_containers:chunked_conv_init
+RUN pip install --no-deps qwen_asr \
+       && pip uninstall -y flash_attn flash-attn || true \
+        && pip install 'transformers==4.57.6' 'accelerate==1.12.0' \
+                        nagisa soynlp qwen-omni-utils librosa soundfile sox

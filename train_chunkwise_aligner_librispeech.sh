@@ -13,10 +13,13 @@
 # utterances skipped (alignment not left-packable into the lattice) is reported as
 # `val_discard` alongside `val_wer`.
 #
-# Two external-alignment backends (set BACKEND below):
-#   * qwen (default) -- WORD-level forced alignment via Qwen3-ForcedAligner. All
-#     sub-words of a word share the word's chunk, so the external tokenizer need
-#     NOT match this model's tokenizer. Requires `pip install -U qwen-asr`.
+# Three external-alignment backends (set BACKEND below):
+#   * precomputed -- OFFLINE word-level alignment (fastest). Generate word starts
+#     once with scripts/asr_aligner/generate_qwen_word_alignments.py and set
+#     PRECOMPUTED_ALIGNMENTS to the output file/dir. No qwen_asr at train time.
+#   * qwen (default) -- LIVE WORD-level forced alignment via Qwen3-ForcedAligner.
+#     All sub-words of a word share the word's chunk, so the external tokenizer
+#     need NOT match this model's tokenizer. Requires `qwen-asr`; slow.
 #   * ctc            -- TOKEN-level CTC forced alignment; the external CTC model
 #     MUST share this model's tokenizer.
 #
@@ -51,7 +54,11 @@ CHUNK_SIZE="${1:-12}"       # arg1: encoder frames per chunk (each chunk emits <
 REDUCTION=mean_volume       # 'mean_volume' (per-token NLL) | 'mean' (per-sequence NLL)
 
 # --- Frozen external aligner backend ---
-BACKEND="${BACKEND:-qwen}"   # 'qwen' (word-level, tokenizer-agnostic) | 'ctc' (token-level)
+BACKEND="${BACKEND:-qwen}"   # 'precomputed' | 'qwen' (live word-level) | 'ctc' (token-level)
+
+# precomputed (offline word-level) backend: word-start file/dir from
+# scripts/asr_aligner/generate_qwen_word_alignments.py.
+PRECOMPUTED_ALIGNMENTS="${PRECOMPUTED_ALIGNMENTS:-}"
 
 # qwen (word-level) backend: any forced aligner exposing word timestamps.
 QWEN_ALIGNER_NAME="Qwen/Qwen3-ForcedAligner-0.6B"    # HF repo id or local dir
@@ -113,7 +120,19 @@ else
 fi
 
 # External aligner overrides depend on the selected backend.
-if [ "${BACKEND}" = "qwen" ]; then
+# (set when backend=precomputed so each batch row can be matched to its alignment)
+RETURN_SAMPLE_ID_OVERRIDE=""
+if [ "${BACKEND}" = "precomputed" ]; then
+  if [ -z "${PRECOMPUTED_ALIGNMENTS}" ] || [ ! -e "${PRECOMPUTED_ALIGNMENTS}" ]; then
+    echo "ERROR: BACKEND=precomputed requires PRECOMPUTED_ALIGNMENTS to point at an existing file/dir."
+    echo "       Generate it with scripts/asr_aligner/generate_qwen_word_alignments.py first."
+    exit 1
+  fi
+  EXTERNAL_ALIGNER_OVERRIDE="model.external_aligner.backend=precomputed \
+    ++model.external_aligner.alignments_path=${PRECOMPUTED_ALIGNMENTS}"
+  RETURN_SAMPLE_ID_OVERRIDE="++model.train_ds.return_sample_id=true ++model.validation_ds.return_sample_id=true"
+  echo "[external-aligner] backend=precomputed (offline word-level): ${PRECOMPUTED_ALIGNMENTS}"
+elif [ "${BACKEND}" = "qwen" ]; then
   EXTERNAL_ALIGNER_OVERRIDE="model.external_aligner.backend=qwen \
     model.external_aligner.model_name=${QWEN_ALIGNER_NAME} \
     model.external_aligner.language=${QWEN_ALIGNER_LANGUAGE} \
@@ -160,6 +179,7 @@ python "${REPO_ROOT}/examples/asr/asr_aligner/speech_to_text_chunkwise_aligner_b
     model.chunked_aligner.chunk_size="${CHUNK_SIZE}" \
     model.chunked_aligner.reduction="${REDUCTION}" \
     ${EXTERNAL_ALIGNER_OVERRIDE} \
+    ${RETURN_SAMPLE_ID_OVERRIDE} \
     model.encoder.n_layers="${N_LAYERS}" \
     model.encoder.d_model="${D_MODEL}" \
     model.encoder.n_heads="${N_HEADS}" \

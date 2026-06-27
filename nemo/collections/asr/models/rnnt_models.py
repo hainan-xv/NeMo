@@ -184,9 +184,12 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 "model.loss_type must be one of ['rnnt', 'aligner', 'chunked_aligner', 'chunkwise_aligner'], "
                 f"got '{self.loss_type}'."
             )
-        # Frozen external CTC aligner used by the 'chunkwise_aligner' baseline
+        # Frozen external aligner used by the 'chunkwise_aligner' baseline
         # (lazily built in its setup); kept out of nn.Module child registration.
         self._external_aligner = None
+        # True when the external aligner reads OFFLINE precomputed word alignments
+        # (backend='precomputed'); it is keyed by sample_id->file_id instead of audio.
+        self._external_aligner_is_precomputed = False
 
         # Initialize components
         self.preprocessor = EncDecRNNTModel.from_config_dict(self.cfg.preprocessor)
@@ -1290,7 +1293,32 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         # 'qwen' -> word-level forced alignment; all sub-words of a word share the
         #           word's chunk, so the external tokenizer is irrelevant.
         backend = str(ext_cfg.get('backend', 'ctc')).lower()
-        if backend in ('qwen', 'word', 'qwen_word'):
+        self._external_aligner_is_precomputed = False
+        if backend in ('precomputed', 'offline', 'precomp'):
+            # Option B: word alignments produced OFFLINE by scripts/asr_aligner/
+            # generate_qwen_word_alignments.py. No qwen_asr/transformers at train time.
+            from nemo.collections.asr.parts.submodules.external_word_aligner import PrecomputedWordForcedAligner
+
+            tokenizer = getattr(self, 'tokenizer', None)
+            if tokenizer is None:
+                raise ValueError(
+                    "external_aligner.backend='precomputed' (word-level) requires a sub-word tokenizer model "
+                    "so sub-words can be grouped into words."
+                )
+            alignments_path = ext_cfg.get('alignments_path', None)
+            if not alignments_path:
+                raise ValueError(
+                    "external_aligner.backend='precomputed' requires `external_aligner.alignments_path` "
+                    "(a JSON/JSONL file or directory of word-start alignments). Generate it with "
+                    "scripts/asr_aligner/generate_qwen_word_alignments.py."
+                )
+            self._external_aligner = PrecomputedWordForcedAligner(
+                tokenizer=tokenizer,
+                alignments_path=alignments_path,
+                sample_rate=int(self.cfg.get('sample_rate', 16000)),
+            )
+            self._external_aligner_is_precomputed = True
+        elif backend in ('qwen', 'word', 'qwen_word'):
             from nemo.collections.asr.parts.submodules.external_word_aligner import QwenWordForcedAligner
 
             tokenizer = getattr(self, 'tokenizer', None)
@@ -1349,6 +1377,81 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             labels=transcript,
             label_lens=transcript_len,
             target_frame_lengths=encoded_len,
+            chunk_size=self.chunk_size,
+        )
+        n_total = int(valid_mask.numel())
+        n_discarded = int((~valid_mask).sum().item())
+        return token_chunk_ids, valid_mask, n_discarded, n_total
+
+    def _current_dataset(self, dataloader_idx: int = 0):
+        """Return the dataset backing the active (train vs val) dataloader."""
+        dl = self._train_dl if self.training else self._validation_dl
+        if isinstance(dl, (list, tuple)):
+            dl = dl[dataloader_idx] if 0 <= dataloader_idx < len(dl) else (dl[0] if dl else None)
+        return getattr(dl, 'dataset', None)
+
+    def _resolve_file_ids(self, sample_ids, dataloader_idx: int = 0):
+        """Map dataset ``sample_id``s to stable ``file_id``s (audio basename, no ext).
+
+        Returns a list aligned with the batch; entries are ``None`` when the id
+        cannot be resolved (those samples are then discarded by the aligner).
+        """
+        ds = self._current_dataset(dataloader_idx)
+        get = getattr(ds, 'get_manifest_sample', None)
+        if torch.is_tensor(sample_ids):
+            ids = sample_ids.detach().cpu().tolist()
+        else:
+            ids = list(sample_ids)
+        file_ids = []
+        for sid in ids:
+            fid = None
+            if get is not None:
+                try:
+                    entry = get(int(sid))
+                    fid = getattr(entry, 'audio_file', None) or getattr(entry, 'id', None)
+                except Exception:
+                    fid = None
+            file_ids.append(fid)
+        return file_ids
+
+    @torch.no_grad()
+    def _precomputed_chunk_assignment(
+        self,
+        sample_ids,
+        signal_len: torch.Tensor,
+        transcript: torch.Tensor,
+        transcript_len: torch.Tensor,
+        encoded_len: torch.Tensor,
+        dataloader_idx: int = 0,
+    ):
+        """Chunk assignment from OFFLINE precomputed word starts (backend='precomputed').
+
+        Returns ``(token_chunk_ids [B, U], valid_mask [B], n_discarded, n_total)``.
+        """
+        B = int(transcript.shape[0])
+        U = int(transcript.shape[1])
+        if sample_ids is None:
+            if not getattr(self, '_warned_no_sample_ids', False):
+                logging.warning(
+                    "loss_type='chunkwise_aligner' with backend='precomputed' needs sample ids to match "
+                    "precomputed alignments, but the batch has none. Set "
+                    "`model.train_ds.return_sample_id=true` (and validation_ds) in your launch script. "
+                    "Discarding all samples this step."
+                )
+                self._warned_no_sample_ids = True
+            tci = torch.full((B, U), -1, dtype=torch.long, device=transcript.device)
+            vm = torch.zeros(B, dtype=torch.bool, device=transcript.device)
+            return tci, vm, B, B
+
+        file_ids = self._resolve_file_ids(sample_ids, dataloader_idx)
+        sr = int(self.cfg.get('sample_rate', 16000))
+        durations = signal_len.to(torch.float32) / float(sr)
+        token_chunk_ids, valid_mask = self._external_aligner.align_to_chunks(
+            file_ids=file_ids,
+            labels=transcript,
+            label_lens=transcript_len,
+            target_frame_lengths=encoded_len,
+            audio_durations=durations,
             chunk_size=self.chunk_size,
         )
         n_total = int(valid_mask.numel())
@@ -2152,7 +2255,10 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         if AccessMixin.is_access_enabled(self.model_guid):
             AccessMixin.reset_registry(self)
 
-        signal, signal_len, transcript, transcript_len = batch
+        signal, signal_len, transcript, transcript_len = batch[0], batch[1], batch[2], batch[3]
+        # When return_sample_id=True (used by the precomputed chunkwise aligner), the
+        # collate appends sample ids as a 5th element.
+        sample_ids = batch[4] if (not isinstance(batch, DALIOutputs) and len(batch) > 4) else None
 
         # forward() only performs encoder forward
         is_processed_signal = isinstance(batch, DALIOutputs) and batch.has_processed_signal
@@ -2162,12 +2268,17 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
 
         # Chunkwise-Aligner baseline: derive the external label->chunk alignment
-        # while the raw audio is still available (it needs the frozen CTC model).
+        # while the raw audio is still available (the live aligner needs it).
         chunkwise_assignment = None
         if self.loss_type == 'chunkwise_aligner':
-            chunkwise_assignment = self._external_chunk_assignment(
-                signal, signal_len, transcript, transcript_len, encoded_len, is_processed_signal=is_processed_signal
-            )
+            if self._external_aligner_is_precomputed:
+                chunkwise_assignment = self._precomputed_chunk_assignment(
+                    sample_ids, signal_len, transcript, transcript_len, encoded_len
+                )
+            else:
+                chunkwise_assignment = self._external_chunk_assignment(
+                    signal, signal_len, transcript, transcript_len, encoded_len, is_processed_signal=is_processed_signal
+                )
         del signal
 
         if self.loss_type in ('aligner', 'chunked_aligner', 'chunkwise_aligner'):
@@ -2371,7 +2482,8 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         return list(zip(sample_id, best_hyp_text))
 
     def validation_pass(self, batch, batch_idx, dataloader_idx=0):
-        signal, signal_len, transcript, transcript_len = batch
+        signal, signal_len, transcript, transcript_len = batch[0], batch[1], batch[2], batch[3]
+        sample_ids = batch[4] if (not isinstance(batch, DALIOutputs) and len(batch) > 4) else None
 
         # forward() only performs encoder forward
         is_processed_signal = isinstance(batch, DALIOutputs) and batch.has_processed_signal
@@ -2380,14 +2492,19 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         else:
             encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
 
-        # Chunkwise-Aligner baseline: external label->chunk alignment (raw audio
-        # still available). Computed unconditionally so the discard ratio is always
-        # reported alongside val_wer, even when compute_eval_loss is off.
+        # Chunkwise-Aligner baseline: external label->chunk alignment. Computed
+        # unconditionally so the discard ratio is always reported alongside val_wer,
+        # even when compute_eval_loss is off.
         chunkwise_assignment = None
         if self.loss_type == 'chunkwise_aligner':
-            chunkwise_assignment = self._external_chunk_assignment(
-                signal, signal_len, transcript, transcript_len, encoded_len, is_processed_signal=is_processed_signal
-            )
+            if self._external_aligner_is_precomputed:
+                chunkwise_assignment = self._precomputed_chunk_assignment(
+                    sample_ids, signal_len, transcript, transcript_len, encoded_len, dataloader_idx=dataloader_idx
+                )
+            else:
+                chunkwise_assignment = self._external_chunk_assignment(
+                    signal, signal_len, transcript, transcript_len, encoded_len, is_processed_signal=is_processed_signal
+                )
         del signal
 
         tensorboard_logs = {}

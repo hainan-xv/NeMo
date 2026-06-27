@@ -656,6 +656,125 @@ def test_qwen_backend_requires_tokenizer(monkeypatch):
         model._setup_chunkwise_aligner_loss_and_decoding()
 
 
+# ---------------------------------------------------------------------------
+# Offline (precomputed) word-level aligner: reads word-start times from disk and
+# does the same word -> chunk bucketing without any model / qwen_asr.
+# ---------------------------------------------------------------------------
+
+
+def _write_alignments(tmp_path, mapping, name='aligns.json'):
+    import json
+
+    p = tmp_path / name
+    with open(p, 'w', encoding='utf-8') as f:
+        json.dump(mapping, f)
+    return str(p)
+
+
+@pytest.mark.unit
+def test_precomputed_aligner_buckets_subwords(tmp_path):
+    from nemo.collections.asr.parts.submodules.external_word_aligner import PrecomputedWordForcedAligner
+
+    id2piece = {1: '\u2581HE', 2: 'LLO', 3: '\u2581WORLD'}
+    # Path key normalizes to file_id '1089-0' (basename sans ext).
+    path = _write_alignments(tmp_path, {'/data/x/1089-0.flac': [0.0, 0.6]})
+
+    aligner = PrecomputedWordForcedAligner(tokenizer=_FakeBPETokenizer(id2piece), alignments_path=path)
+    token_chunk_ids, valid_mask = aligner.align_to_chunks(
+        file_ids=['/somewhere/1089-0.wav'],  # different dir/ext -> same file_id
+        labels=torch.tensor([[1, 2, 3]]),
+        label_lens=torch.tensor([3]),
+        target_frame_lengths=torch.tensor([8]),
+        audio_durations=torch.tensor([1.0]),
+        chunk_size=4,
+    )
+    assert bool(valid_mask[0])
+    assert token_chunk_ids[0].tolist() == [0, 0, 1]
+
+
+@pytest.mark.unit
+def test_precomputed_aligner_missing_key_discarded(tmp_path):
+    from nemo.collections.asr.parts.submodules.external_word_aligner import PrecomputedWordForcedAligner
+
+    id2piece = {1: '\u2581HE', 2: 'LLO', 3: '\u2581WORLD'}
+    path = _write_alignments(tmp_path, {'present': [0.0, 0.6]})
+    aligner = PrecomputedWordForcedAligner(tokenizer=_FakeBPETokenizer(id2piece), alignments_path=path)
+
+    token_chunk_ids, valid_mask = aligner.align_to_chunks(
+        file_ids=['absent'],
+        labels=torch.tensor([[1, 2, 3]]),
+        label_lens=torch.tensor([3]),
+        target_frame_lengths=torch.tensor([8]),
+        audio_durations=torch.tensor([1.0]),
+        chunk_size=4,
+    )
+    assert not bool(valid_mask[0])
+    assert torch.all(token_chunk_ids[0] == -1)
+
+
+@pytest.mark.unit
+def test_precomputed_loader_accepts_multiple_formats(tmp_path):
+    from nemo.collections.asr.parts.submodules.external_word_aligner import _load_word_start_alignments
+
+    mapping = {
+        'a': [0.0, 0.5],                                   # bare list of starts
+        'b': {'word_starts': [0.1, 0.7]},                 # word_starts key
+        'c': {'words': [{'start': 0.0}, {'start_time': 0.9}]},  # word dicts
+    }
+    path = _write_alignments(tmp_path, mapping)
+    loaded = _load_word_start_alignments(path)
+    assert loaded['a'] == [0.0, 0.5]
+    assert loaded['b'] == [0.1, 0.7]
+    assert loaded['c'] == [0.0, 0.9]
+
+
+@pytest.mark.unit
+def test_precomputed_loader_merges_directory(tmp_path):
+    from nemo.collections.asr.parts.submodules.external_word_aligner import _load_word_start_alignments
+
+    d = tmp_path / "shards"
+    d.mkdir()
+    _write_alignments(d, {'a': [0.0]}, name='shard_0000.json')
+    _write_alignments(d, {'b': [0.1]}, name='shard_0001.json')
+    loaded = _load_word_start_alignments(str(d))
+    assert set(loaded.keys()) == {'a', 'b'}
+
+
+@pytest.mark.unit
+def test_model_precomputed_backend_wires_aligner(tmp_path):
+    """external_aligner.backend='precomputed' must build the offline aligner."""
+    from omegaconf import open_dict
+
+    from nemo.collections.asr.parts.submodules.external_word_aligner import PrecomputedWordForcedAligner
+
+    path = _write_alignments(tmp_path, {'x': [0.0]})
+
+    model = _build_chunkwise_model(chunk_size=2)
+    model.tokenizer = _FakeBPETokenizer({1: '\u2581a', 2: 'b'})
+    with open_dict(model.cfg.external_aligner):
+        model.cfg.external_aligner.backend = 'precomputed'
+        model.cfg.external_aligner.alignments_path = path
+
+    model._setup_chunkwise_aligner_loss_and_decoding()
+
+    assert isinstance(model._external_aligner, PrecomputedWordForcedAligner)
+    assert model._external_aligner_is_precomputed is True
+
+
+@pytest.mark.unit
+def test_precomputed_backend_requires_alignments_path():
+    from omegaconf import open_dict
+
+    model = _build_chunkwise_model(chunk_size=2)
+    model.tokenizer = _FakeBPETokenizer({1: '\u2581a', 2: 'b'})
+    with open_dict(model.cfg.external_aligner):
+        model.cfg.external_aligner.backend = 'precomputed'
+        model.cfg.external_aligner.alignments_path = None
+
+    with pytest.raises(ValueError):
+        model._setup_chunkwise_aligner_loss_and_decoding()
+
+
 @pytest.mark.unit
 def test_word_aligner_monotonic_clamp_on_regression():
     # Two words whose raw timestamps regress (word1 earlier than word0). The

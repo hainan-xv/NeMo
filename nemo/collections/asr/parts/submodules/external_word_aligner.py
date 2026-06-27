@@ -38,13 +38,15 @@ which the external aligner errors out, are flagged invalid so the caller can ski
 them and report the discard ratio (same contract as the CTC aligner).
 """
 
-from typing import List, Optional, Sequence, Tuple
+import json
+import os
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 
 from nemo.utils import logging
 
-__all__ = ['QwenWordForcedAligner']
+__all__ = ['QwenWordForcedAligner', 'PrecomputedWordForcedAligner']
 
 
 # SentencePiece / byte-level-BPE word-start markers and the WordPiece continuation
@@ -94,6 +96,64 @@ def group_token_ids_into_words(pieces: Sequence[str]) -> List[List[int]]:
         else:
             groups[-1].append(i)
     return groups
+
+
+def map_word_starts_to_token_chunks(
+    word_groups: List[List[int]],
+    word_starts_sec: Sequence[float],
+    audio_dur: float,
+    T_tr: int,
+    U_b: int,
+    chunk_size: int,
+) -> Optional[dict]:
+    """Map per-word start times (seconds) to a per-token chunk assignment.
+
+    Shared by the live (:class:`QwenWordForcedAligner`) and the offline
+    (:class:`PrecomputedWordForcedAligner`) backends so both produce identical
+    chunk assignments.
+
+    Args:
+        word_groups: list of words, each a list of token indices (into the
+            trainee label sequence) that belong to that word.
+        word_starts_sec: per-word start time in seconds (one per group).
+        audio_dur: utterance duration in seconds.
+        T_tr: number of trainee encoder frames for this utterance.
+        U_b: number of (real) trainee tokens.
+        chunk_size: encoder frames per chunk (== max tokens per chunk).
+
+    Returns:
+        ``{token_index: chunk}`` of length ``U_b``, or ``None`` if the assignment
+        is infeasible (word-count mismatch, ``T < U``, or a chunk would have to
+        host more tokens than it has frames -- not left-packable).
+    """
+    if len(word_starts_sec) != len(word_groups) or T_tr < U_b:
+        return None
+    audio_dur = max(float(audio_dur), 1e-6)
+    n_chunks = (T_tr + chunk_size - 1) // chunk_size
+    counts = [0] * n_chunks
+    assignment: dict = {}
+    prev_chunk = 0
+    for wi, group in enumerate(word_groups):
+        start_sec = float(word_starts_sec[wi] or 0.0)
+        tr_frame = int((start_sec / audio_dur) * T_tr)
+        tr_frame = min(max(tr_frame, 0), T_tr - 1)
+        chunk = tr_frame // chunk_size
+        if chunk >= n_chunks:
+            chunk = n_chunks - 1
+        # Word timestamps are monotonic, but proportional rounding could tie /
+        # regress; clamp so the per-token assignment is non-decreasing.
+        if chunk < prev_chunk:
+            chunk = prev_chunk
+        prev_chunk = chunk
+        for ti in group:
+            assignment[ti] = chunk
+            counts[chunk] += 1
+    # Left-packing feasibility: a chunk cannot host more tokens than frames.
+    for c in range(n_chunks):
+        frames_here = min(chunk_size, T_tr - c * chunk_size)
+        if counts[c] > frames_here:
+            return None
+    return assignment
 
 
 class QwenWordForcedAligner:
@@ -300,42 +360,195 @@ class QwenWordForcedAligner:
             U_b = int(label_lens_cpu[b])
             T_tr = int(target_frames_cpu[b])
             groups = word_groups[b]
-            n_words = len(groups)
+            audio_dur = int(sig_len_cpu[b]) / float(self.sample_rate)
+            starts = [float(getattr(w, 'start_time', 0.0) or 0.0) for w in result]
 
-            # Word counts must agree between the trainee transcript and the aligner.
-            if len(result) != n_words or T_tr < U_b:
+            assignment = map_word_starts_to_token_chunks(groups, starts, audio_dur, T_tr, U_b, chunk_size)
+            if assignment is None:
                 valid_mask[b] = False
                 continue
+            for ti, chunk in assignment.items():
+                token_chunk_ids[b, ti] = chunk
 
-            audio_dur = max(int(sig_len_cpu[b]) / float(self.sample_rate), 1e-6)
-            n_chunks = (T_tr + chunk_size - 1) // chunk_size
-            counts = [0] * n_chunks
-            prev_chunk = 0
-            ok = True
-            for wi, group in enumerate(groups):
-                start_sec = float(getattr(result[wi], 'start_time', 0.0) or 0.0)
-                tr_frame = int((start_sec / audio_dur) * T_tr)
-                tr_frame = min(max(tr_frame, 0), T_tr - 1)
-                chunk = tr_frame // chunk_size
-                if chunk >= n_chunks:
-                    chunk = n_chunks - 1
-                # Word timestamps are monotonic, but proportional rounding could tie
-                # / regress; clamp so the per-token assignment is non-decreasing.
-                if chunk < prev_chunk:
-                    chunk = prev_chunk
-                prev_chunk = chunk
-                for ti in group:
-                    token_chunk_ids[b, ti] = chunk
-                    counts[chunk] += 1
+        return token_chunk_ids.to(out_device), valid_mask.to(out_device)
 
-            # Left-packing feasibility: a chunk cannot host more tokens than frames.
-            for c in range(n_chunks):
-                frames_here = min(chunk_size, T_tr - c * chunk_size)
-                if counts[c] > frames_here:
-                    ok = False
-                    break
-            if not ok:
+
+def _file_id(path_or_id: str) -> str:
+    """Normalize a manifest audio path (or id) to a stable key: basename sans ext."""
+    base = os.path.basename(str(path_or_id))
+    stem, _ = os.path.splitext(base)
+    return stem
+
+
+def _load_word_start_alignments(path: str) -> Dict[str, List[float]]:
+    """Load offline word-start alignments into ``{file_id: [start_sec, ...]}``.
+
+    Accepts either:
+      * a JSON dict ``{file_id_or_path: value}``, or
+      * a JSON-lines file with one record per line,
+    where ``value`` / each record is one of:
+      * a list of floats (word start times in seconds),
+      * ``{"word_starts": [float, ...]}``, or
+      * ``{"words": [{"start"|"start_time": float, ...}, ...]}``.
+    Records may carry ``file_id`` / ``audio_filepath`` / ``audio_file`` as the key.
+    """
+
+    def _starts_from_value(v) -> Optional[List[float]]:
+        if isinstance(v, list):
+            if all(isinstance(x, (int, float)) for x in v):
+                return [float(x) for x in v]
+            # list of word dicts
+            out = []
+            for w in v:
+                if isinstance(w, dict):
+                    out.append(float(w.get('start', w.get('start_time', 0.0)) or 0.0))
+            return out
+        if isinstance(v, dict):
+            if 'word_starts' in v:
+                return [float(x) for x in v['word_starts']]
+            if 'words' in v:
+                return [float(w.get('start', w.get('start_time', 0.0)) or 0.0) for w in v['words']]
+        return None
+
+    # A directory -> merge every *.json / *.jsonl inside (handy for sharded runs).
+    if os.path.isdir(path):
+        merged: Dict[str, List[float]] = {}
+        for fn in sorted(os.listdir(path)):
+            if fn.endswith('.json') or fn.endswith('.jsonl'):
+                merged.update(_load_word_start_alignments(os.path.join(path, fn)))
+        return merged
+
+    alignments: Dict[str, List[float]] = {}
+    if path.endswith('.jsonl'):
+        with open(path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                rec = json.loads(line)
+                key = rec.get('file_id') or rec.get('audio_filepath') or rec.get('audio_file')
+                if key is None:
+                    continue
+                starts = _starts_from_value(rec)
+                if starts is not None:
+                    alignments[_file_id(key)] = starts
+    else:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        for key, v in data.items():
+            starts = _starts_from_value(v)
+            if starts is not None:
+                alignments[_file_id(key)] = starts
+    return alignments
+
+
+class PrecomputedWordForcedAligner:
+    """Offline counterpart of :class:`QwenWordForcedAligner` (Option B).
+
+    The heavy Qwen forward is run **once, offline** (see
+    ``scripts/asr_aligner/generate_qwen_word_alignments.py``) and the resulting
+    per-word start times are stored keyed by ``file_id`` (audio basename sans
+    extension). At train time this class only does the cheap word->frame->chunk
+    mapping -- no model, no ``qwen_asr``/``transformers`` in the training process.
+
+    The model resolves each batch row's ``file_id`` (from the dataset's
+    ``sample_id``) and passes it in, so matching is content-stable across tarred
+    shards, shuffling and DDP sharding.
+
+    Args:
+        tokenizer: the trainee tokenizer, used to group sub-words into words.
+        alignments_path: path to the offline word-start file (JSON or JSONL).
+        sample_rate: unused for mapping (durations are passed in seconds) but kept
+            for API parity with the live aligner.
+    """
+
+    def __init__(self, tokenizer, alignments_path: str, sample_rate: int = 16000):
+        if tokenizer is None:
+            raise ValueError(
+                "PrecomputedWordForcedAligner needs the trainee tokenizer to group sub-words into words."
+            )
+        if not alignments_path or not os.path.exists(alignments_path):
+            raise FileNotFoundError(
+                f"external_aligner.alignments_path='{alignments_path}' not found. Generate it first with "
+                "scripts/asr_aligner/generate_qwen_word_alignments.py."
+            )
+        self.tokenizer = tokenizer
+        self.sample_rate = int(sample_rate)
+        self.alignments_path = alignments_path
+        self._alignments = _load_word_start_alignments(alignments_path)
+        self._missing_logged = 0
+        logging.info(
+            f"[chunkwise-aligner] Loaded {len(self._alignments)} precomputed word-start alignments "
+            f"from '{alignments_path}'."
+        )
+
+    def to(self, *args, **kwargs):  # for model.to(device) compatibility
+        return self
+
+    def _pieces(self, ids: List[int]) -> List[str]:
+        return [str(p) for p in self.tokenizer.ids_to_tokens(ids)]
+
+    @torch.no_grad()
+    def align_to_chunks(
+        self,
+        file_ids: Sequence[Optional[str]],
+        labels: torch.Tensor,
+        label_lens: torch.Tensor,
+        target_frame_lengths: torch.Tensor,
+        audio_durations: torch.Tensor,
+        chunk_size: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Bucket each token into a chunk from precomputed word start times.
+
+        Args:
+            file_ids: per-sample ``file_id`` (basename sans ext) or ``None`` when
+                it could not be resolved (-> sample discarded).
+            labels: ``[B, U]`` trainee token ids.
+            label_lens: ``[B]`` real token counts.
+            target_frame_lengths: ``[B]`` trainee encoder frames per sample.
+            audio_durations: ``[B]`` utterance durations in seconds.
+            chunk_size: encoder frames per chunk.
+
+        Returns:
+            ``(token_chunk_ids [B, U], valid_mask [B])`` -- same contract as the
+            live word aligner.
+        """
+        B = int(labels.shape[0])
+        U_max = int(labels.shape[1])
+        out_device = labels.device
+
+        labels_cpu = labels.to(torch.long).cpu()
+        label_lens_cpu = label_lens.to(torch.long).cpu()
+        target_frames_cpu = target_frame_lengths.to(torch.long).cpu()
+        durations_cpu = audio_durations.to(torch.float32).cpu()
+
+        token_chunk_ids = torch.full((B, U_max), -1, dtype=torch.long)
+        valid_mask = torch.ones(B, dtype=torch.bool)
+
+        for b in range(B):
+            U_b = int(label_lens_cpu[b])
+            key = file_ids[b] if b < len(file_ids) else None
+            if U_b <= 0 or key is None:
                 valid_mask[b] = False
-                token_chunk_ids[b, :] = -1
+                continue
+            starts = self._alignments.get(_file_id(key))
+            if starts is None:
+                valid_mask[b] = False
+                if self._missing_logged < 20:
+                    logging.warning(f"[chunkwise-aligner] No precomputed alignment for file_id='{key}'; skipping.")
+                    self._missing_logged += 1
+                continue
+
+            ids_b = labels_cpu[b, :U_b].tolist()
+            groups = group_token_ids_into_words(self._pieces(ids_b))
+            T_tr = int(target_frames_cpu[b])
+            audio_dur = float(durations_cpu[b])
+
+            assignment = map_word_starts_to_token_chunks(groups, starts, audio_dur, T_tr, U_b, chunk_size)
+            if assignment is None:
+                valid_mask[b] = False
+                continue
+            for ti, chunk in assignment.items():
+                token_chunk_ids[b, ti] = chunk
 
         return token_chunk_ids.to(out_device), valid_mask.to(out_device)
