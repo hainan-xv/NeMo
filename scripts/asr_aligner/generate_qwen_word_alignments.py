@@ -183,14 +183,33 @@ def iter_tarred(items: List[dict], args) -> Iterator[Tuple[str, str, np.ndarray]
         f"({len(id2meta)} manifest entries, tarred)."
     )
     n = 0
+    n_bad_tars = 0
     for tpath in my_tars:
         try:
             tf = tarfile.open(tpath, 'r')
         except Exception as e:  # noqa: BLE001
-            print(f"[gen-align] WARNING: cannot open tar '{tpath}' ({e!r}); skipping shard file.")
+            n_bad_tars += 1
+            print(f"[gen-align] WARNING: cannot open tar '{tpath}' ({e!r}); skipping this shard file.")
             continue
         with tf:
-            for member in tf:
+            # Iterate defensively: a truncated/corrupt shard raises tarfile.ReadError
+            # mid-stream. Skip the remainder of that shard and move on (same policy as
+            # the training dataloader's tarred_audio_skip_handler), so a damaged tar
+            # never stalls or kills the run.
+            it = iter(tf)
+            while True:
+                try:
+                    member = next(it)
+                except StopIteration:
+                    break
+                except Exception as e:  # noqa: BLE001  (tarfile.ReadError etc.)
+                    n_bad_tars += 1
+                    print(
+                        f"[gen-align] WARNING: damaged tar '{tpath}' ({e!r}); "
+                        f"skipping the rest of this shard. These utterances get NO alignment "
+                        f"and are dropped at train time too."
+                    )
+                    break
                 if not member.isfile():
                     continue
                 fid = _file_id(member.name)
@@ -201,8 +220,10 @@ def iter_tarred(items: List[dict], args) -> Iterator[Tuple[str, str, np.ndarray]
                 if args.max_duration is not None and dur is not None and float(dur) > args.max_duration:
                     continue
                 try:
-                    raw = tf.extractfile(member).read()
-                    audio = _decode_audio_bytes(raw, args.sample_rate)
+                    f = tf.extractfile(member)
+                    if f is None:
+                        continue
+                    audio = _decode_audio_bytes(f.read(), args.sample_rate)
                 except Exception as e:  # noqa: BLE001
                     print(f"[gen-align] WARNING: failed to decode '{member.name}' in '{tpath}' ({e!r}); skipping.")
                     continue
@@ -210,6 +231,8 @@ def iter_tarred(items: List[dict], args) -> Iterator[Tuple[str, str, np.ndarray]
                 if args.limit is not None and n > args.limit:
                     return
                 yield fid, text, audio
+    if n_bad_tars:
+        print(f"[gen-align] shard {args.shard_index}: {n_bad_tars} damaged/unreadable tar shard(s) skipped.")
 
 
 def main():
