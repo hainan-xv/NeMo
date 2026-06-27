@@ -104,6 +104,15 @@ class ChannelAxisConformerLayer(nn.Module):
         while heads > 1 and self.new_d_model % heads != 0:
             heads -= 1
         self.num_heads = heads
+        if self.num_heads != int(n_heads):
+            from nemo.utils import logging
+
+            logging.warning(
+                f"[ChannelAxisConformerLayer] requested n_heads={int(n_heads)} does not divide "
+                f"new_d_model={self.new_d_model} (= chunk_size*d_model/chunk_tokens); "
+                f"coercing to n_heads={self.num_heads}. Pick chunk_size/chunk_tokens so that "
+                f"new_d_model is divisible by the desired head count to avoid this."
+            )
 
         # Learned positional embedding over the M token slots.
         self.pos = nn.Parameter(torch.zeros(chunk_tokens, self.new_d_model))
@@ -133,6 +142,19 @@ class ChannelAxisConformerLayer(nn.Module):
         C = self.chunk_size
         M = self.chunk_tokens
         new_d = self.new_d_model
+
+        # Zero out padded time steps BEFORE the per-chunk reshape. The reshape folds C
+        # consecutive frames into the channel-token axis and self-attention / conv then
+        # mix every token in the chunk, so any non-zero values left at padded positions
+        # leak into the *valid* frames of the boundary chunk -- and a subsequent
+        # full-context time-axis layer spreads that contamination across the whole
+        # sequence. Without this masking the encoder output at every valid frame depends
+        # on how much padding the batch carries (i.e. on the batch's max length), which
+        # breaks batching-invariance and causes a train/inference mismatch. Zeroing here
+        # makes the padded frames behave like the F.pad zeros used to complete the last
+        # chunk, restoring padding-invariance (matching the standard ConformerEncoder).
+        if pad_mask is not None:
+            x = x.masked_fill(pad_mask.unsqueeze(-1), 0.0)
 
         n_chunks = (T + C - 1) // C
         T_pad = n_chunks * C

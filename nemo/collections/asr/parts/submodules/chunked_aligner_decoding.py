@@ -50,6 +50,8 @@ from typing import List, Optional, Tuple
 
 import torch
 
+from nemo.utils import logging
+
 __all__ = ['ChunkedAlignerDecoding', 'ChunkedAlignerNarDecoding']
 
 
@@ -91,6 +93,15 @@ class ChunkedAlignerDecoding:
         self.max_symbols = decoding_cfg.get('max_symbols', None) if decoding_cfg is not None else None
         self.loop_labels = decoding_cfg.get('loop_labels', True) if decoding_cfg is not None else True
 
+        # CUDA-graph decoding is not implemented for the Chunked Aligner. If a
+        # config requests it (top-level or under a ``greedy`` block), force it off
+        # and warn rather than silently ignoring the flag.
+        if _requests_cuda_graph(decoding_cfg):
+            logging.warning(
+                "[ChunkedAlignerDecoding] CUDA-graph decoding (use_cuda_graph_decoder=true) is not "
+                "supported by the Chunked-Aligner greedy decoder; disabling it for this run."
+            )
+
     # ------------------------------------------------------------------ #
     # Token id <-> string helpers
     # ------------------------------------------------------------------ #
@@ -112,6 +123,10 @@ class ChunkedAlignerDecoding:
     ) -> Tuple[List[str], List[List[int]]]:
         """Decode a batch of encoder outputs into hypothesis strings and ids.
 
+        Uses the batched label-looping walk by default (``loop_labels=True``);
+        set ``loop_labels=False`` to fall back to the per-utterance reference walk
+        (both produce identical greedy arg-max hypotheses).
+
         Args:
             encoder_output: Encoder output of shape ``(B, D, T)``.
             encoded_lengths: Valid frame counts per sample, ``(B,)``.
@@ -119,7 +134,10 @@ class ChunkedAlignerDecoding:
         Returns:
             A tuple ``(texts, token_ids)``.
         """
-        token_ids = self._chunked_greedy(encoder_output, encoded_lengths)
+        if self.loop_labels:
+            token_ids = self._chunked_greedy_batched(encoder_output, encoded_lengths)
+        else:
+            token_ids = self._chunked_greedy(encoder_output, encoded_lengths)
         texts = [self.decode_ids_to_str(ids) for ids in token_ids]
         return texts, token_ids
 
@@ -171,6 +189,113 @@ class ChunkedAlignerDecoding:
             hypotheses.append(hyp)
 
         return hypotheses
+
+    # ------------------------------------------------------------------ #
+    # Batched (label-looping) chunked greedy decoding
+    # ------------------------------------------------------------------ #
+    @torch.no_grad()
+    def _chunked_greedy_batched(
+        self, encoder_output: torch.Tensor, encoded_lengths: torch.Tensor
+    ) -> List[List[int]]:
+        """Batched label-looping walk; numerically identical to :meth:`_chunked_greedy`.
+
+        The whole batch advances in lock-step. Each outer iteration calls the
+        prediction network at most once (after every still-active utterance has
+        landed on a token-emitting frame), while an inner loop vectorizes the
+        blank/EOC chunk-jumps -- on a blank the predictor state is unchanged, so no
+        prediction-network call is needed to skip a chunk. See
+        https://arxiv.org/abs/2406.06220 for the label-looping idea.
+        """
+        if self.decoder is None or self.joint is None:
+            raise RuntimeError("Chunked-Aligner decoding requires both a prediction network and a joint network.")
+
+        device = encoder_output.device
+        B = encoder_output.size(0)
+        # (B, D, T) -> (B, T, D)
+        h = encoder_output.transpose(1, 2)
+        T_max = h.size(1)
+        C = self.chunk_size
+        lengths = encoded_lengths.to(device).long()
+
+        if B == 0 or T_max == 0:
+            return [[] for _ in range(B)]
+
+        # Per-utterance emission cap (defaults to the number of valid frames).
+        if self.max_symbols is not None:
+            cap = torch.full((B,), int(self.max_symbols), dtype=torch.long, device=device)
+        else:
+            cap = lengths.clone()
+
+        batch_idx = torch.arange(B, device=device)
+        t = torch.zeros(B, dtype=torch.long, device=device)
+        emitted = torch.zeros(B, dtype=torch.long, device=device)
+        active = (t < lengths) & (lengths > 0) & (emitted < cap)
+
+        hypotheses: List[List[int]] = [[] for _ in range(B)]
+
+        # Seed the predictor with the SOS (zero) embedding for u = 0 (whole batch).
+        g, states = self.decoder.predict(None, None, add_sos=False, batch_size=B)
+        g_step = g.transpose(1, 2)  # (B, H, 1)
+
+        v = torch.zeros(B, dtype=torch.long, device=device)
+        while bool(active.any()):
+            # Inner loop: skip blank/EOC frames (jumping chunk-by-chunk) until every
+            # still-active utterance sits on a token-emitting frame. The predictor
+            # state is unchanged on a blank, so g_step stays fixed here.
+            while True:
+                t_safe = t.clamp(max=T_max - 1)
+                frame = h[batch_idx, t_safe, :].unsqueeze(-1)  # (B, D, 1)
+                logits = self.joint(encoder_outputs=frame, decoder_outputs=g_step)
+                v = logits.reshape(B, -1).argmax(dim=-1)  # (B,)
+
+                is_blank = (v == self.blank_id) & active
+                next_chunk_start = ((t // C) + 1) * C
+                t = torch.where(is_blank, next_chunk_start, t)
+                ran_off = is_blank & (t >= lengths)
+                active = active & ~ran_off
+                # Utterances that jumped to a valid frame must be re-evaluated.
+                if not bool((is_blank & active).any()):
+                    break
+
+            if not bool(active.any()):
+                break
+
+            # Every active utterance now has a (non-blank) token at its current frame.
+            emit = active
+            v_list = v.tolist()
+            emit_list = emit.tolist()
+            for b in range(B):
+                if emit_list[b]:
+                    hypotheses[b].append(int(v_list[b]))
+            emitted = emitted + emit.long()
+
+            # Advance the predictor for emitting utterances (one batched call). For
+            # non-emitting (finished) utterances feed the blank/pad id, whose
+            # embedding is the zero/pad vector, so their state update is harmless.
+            labels = torch.where(emit, v, torch.full_like(v, self.blank_id))
+            g, states = self.decoder.predict(labels.unsqueeze(1), states, add_sos=False)
+            g_step = g.transpose(1, 2)
+
+            # Token arc advances the frame by one; recompute who is still active.
+            t = torch.where(emit, t + 1, t)
+            active = emit & (t < lengths) & (emitted < cap)
+
+        return hypotheses
+
+
+def _requests_cuda_graph(decoding_cfg) -> bool:
+    """True if the decoding config asks for CUDA-graph decoding (top-level or greedy)."""
+    if decoding_cfg is None:
+        return False
+    try:
+        if bool(decoding_cfg.get('use_cuda_graph_decoder', False)):
+            return True
+        greedy_cfg = decoding_cfg.get('greedy', None)
+        if greedy_cfg is not None and bool(greedy_cfg.get('use_cuda_graph_decoder', False)):
+            return True
+    except (AttributeError, TypeError):
+        return False
+    return False
 
 
 class ChunkedAlignerNarDecoding:
