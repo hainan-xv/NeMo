@@ -56,6 +56,18 @@ model:
     #   'start' -> word onset (legacy; tends to force premature emission).
     anchor: end
 
+    # Delay-randomized, position-weighted objective (training only). When
+    # num_variants>=1, each step averages `num_variants` randomly delayed
+    # alignments of a weighted single-path CE on the same joint (encoder reused).
+    # Each token is delayed by ~Uniform{0..max_delay} chunks (kept monotonic), and
+    # its CE term is weighted by weight_gamma**p, where p is its within-chunk frame
+    # position (0=chunk start); a token pushed to a later chunk than its audio is
+    # treated as p=0 (max weight). num_variants=0 -> plain baseline (no delay/weight).
+    delay:
+      num_variants: 0       # 0 disables; e.g. 4 to enable
+      max_delay: 2          # max per-token delay in chunks (0 -> position-weight only)
+      weight_gamma: 0.8     # within-chunk position weight base gamma**p (1.0 -> uniform)
+
     # --- precomputed (offline word-level) backend ----------------------------
     # JSON/JSONL file or directory of {file_id: {"starts": [...], "ends": [...]}}
     # produced by scripts/asr_aligner/generate_qwen_word_alignments.py. REQUIRES

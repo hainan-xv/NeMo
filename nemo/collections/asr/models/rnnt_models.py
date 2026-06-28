@@ -1403,13 +1403,34 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         ext_cfg = self.cfg.get('external_aligner', None)
         reduction = str(ext_cfg.get('reduction', 'mean_volume')) if ext_cfg is not None else 'mean_volume'
 
-        self.loss = ChatExternalAlignerCELoss(blank=blank_id, reduction=reduction)
+        # Optional delay-randomized, position-weighted objective (see
+        # ChatExternalAlignerCELoss). Configured under external_aligner.delay.
+        delay_cfg = ext_cfg.get('delay', None) if ext_cfg is not None else None
+        num_delay_variants = int(delay_cfg.get('num_variants', 0)) if delay_cfg is not None else 0
+        max_delay = int(delay_cfg.get('max_delay', 0)) if delay_cfg is not None else 0
+        weight_gamma = float(delay_cfg.get('weight_gamma', 1.0)) if delay_cfg is not None else 1.0
+        self._chat_delay_enabled = num_delay_variants >= 1
+
+        self.loss = ChatExternalAlignerCELoss(
+            blank=blank_id,
+            reduction=reduction,
+            num_delay_variants=num_delay_variants,
+            max_delay=max_delay,
+            weight_gamma=weight_gamma,
+            chunk_size=self.chunk_size,
+        )
 
         # Build the frozen external aligner that fixes the token->chunk path.
         self._build_external_aligner('chat_aligner')
         # CHAT's cross-attention pools the whole chunk, so a chunk may host any
         # number of tokens (no left-packing onto frames).
         self._aligner_enforce_left_packing = False
+        if self._chat_delay_enabled:
+            logging.info(
+                f"[chat-aligner] delay-randomized weighted CE enabled: "
+                f"num_variants={num_delay_variants}, max_delay={max_delay}, weight_gamma={weight_gamma}, "
+                f"chunk_size={self.chunk_size}."
+            )
 
     @torch.no_grad()
     def _external_chunk_assignment(
@@ -1420,28 +1441,45 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         transcript_len: torch.Tensor,
         encoded_len: torch.Tensor,
         is_processed_signal: bool = False,
+        return_positions: bool = False,
     ):
         """Force-align the batch with the frozen external CTC model.
 
-        Returns ``(token_chunk_ids [B, U], valid_mask [B], n_discarded, n_total)``.
+        Returns ``(token_chunk_ids [B, U], valid_mask [B], n_discarded, n_total,
+        token_chunk_pos)`` where ``token_chunk_pos`` is ``None`` unless
+        ``return_positions`` (within-chunk frame position per token, for the
+        delay-weighted CHAT loss).
         """
         if is_processed_signal:
             raise ValueError(
                 "loss_type='chunkwise_aligner' needs raw audio for the external CTC aligner, but received a "
                 "pre-processed (DALI) signal. Disable DALI / processed-signal input for this baseline."
             )
-        token_chunk_ids, valid_mask = self._external_aligner.align_to_chunks(
-            input_signal=signal,
-            input_signal_length=signal_len,
-            labels=transcript,
-            label_lens=transcript_len,
-            target_frame_lengths=encoded_len,
-            chunk_size=self.chunk_size,
-            enforce_left_packing=self._aligner_enforce_left_packing,
-        )
+        if return_positions:
+            token_chunk_ids, valid_mask, token_chunk_pos = self._external_aligner.align_to_chunks(
+                input_signal=signal,
+                input_signal_length=signal_len,
+                labels=transcript,
+                label_lens=transcript_len,
+                target_frame_lengths=encoded_len,
+                chunk_size=self.chunk_size,
+                enforce_left_packing=self._aligner_enforce_left_packing,
+                return_positions=True,
+            )
+        else:
+            token_chunk_ids, valid_mask = self._external_aligner.align_to_chunks(
+                input_signal=signal,
+                input_signal_length=signal_len,
+                labels=transcript,
+                label_lens=transcript_len,
+                target_frame_lengths=encoded_len,
+                chunk_size=self.chunk_size,
+                enforce_left_packing=self._aligner_enforce_left_packing,
+            )
+            token_chunk_pos = None
         n_total = int(valid_mask.numel())
         n_discarded = int((~valid_mask).sum().item())
-        return token_chunk_ids, valid_mask, n_discarded, n_total
+        return token_chunk_ids, valid_mask, n_discarded, n_total, token_chunk_pos
 
     def _current_dataset(self, dataloader_idx: int = 0):
         """Return the dataset backing the active (train vs val) dataloader."""
@@ -1483,10 +1521,13 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         transcript_len: torch.Tensor,
         encoded_len: torch.Tensor,
         dataloader_idx: int = 0,
+        return_positions: bool = False,
     ):
         """Chunk assignment from OFFLINE precomputed word starts (backend='precomputed').
 
-        Returns ``(token_chunk_ids [B, U], valid_mask [B], n_discarded, n_total)``.
+        Returns ``(token_chunk_ids [B, U], valid_mask [B], n_discarded, n_total,
+        token_chunk_pos)`` where ``token_chunk_pos`` is ``None`` unless
+        ``return_positions``.
         """
         B = int(transcript.shape[0])
         U = int(transcript.shape[1])
@@ -1501,23 +1542,37 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 self._warned_no_sample_ids = True
             tci = torch.full((B, U), -1, dtype=torch.long, device=transcript.device)
             vm = torch.zeros(B, dtype=torch.bool, device=transcript.device)
-            return tci, vm, B, B
+            pos = torch.full((B, U), -1, dtype=torch.long, device=transcript.device) if return_positions else None
+            return tci, vm, B, B, pos
 
         file_ids = self._resolve_file_ids(sample_ids, dataloader_idx)
         sr = int(self.cfg.get('sample_rate', 16000))
         durations = signal_len.to(torch.float32) / float(sr)
-        token_chunk_ids, valid_mask = self._external_aligner.align_to_chunks(
-            file_ids=file_ids,
-            labels=transcript,
-            label_lens=transcript_len,
-            target_frame_lengths=encoded_len,
-            audio_durations=durations,
-            chunk_size=self.chunk_size,
-            enforce_left_packing=self._aligner_enforce_left_packing,
-        )
+        if return_positions:
+            token_chunk_ids, valid_mask, token_chunk_pos = self._external_aligner.align_to_chunks(
+                file_ids=file_ids,
+                labels=transcript,
+                label_lens=transcript_len,
+                target_frame_lengths=encoded_len,
+                audio_durations=durations,
+                chunk_size=self.chunk_size,
+                enforce_left_packing=self._aligner_enforce_left_packing,
+                return_positions=True,
+            )
+        else:
+            token_chunk_ids, valid_mask = self._external_aligner.align_to_chunks(
+                file_ids=file_ids,
+                labels=transcript,
+                label_lens=transcript_len,
+                target_frame_lengths=encoded_len,
+                audio_durations=durations,
+                chunk_size=self.chunk_size,
+                enforce_left_packing=self._aligner_enforce_left_packing,
+            )
+            token_chunk_pos = None
         n_total = int(valid_mask.numel())
         n_discarded = int((~valid_mask).sum().item())
-        return token_chunk_ids, valid_mask, n_discarded, n_total
+        return token_chunk_ids, valid_mask, n_discarded, n_total, token_chunk_pos
 
     def _chunkwise_aligner_loss(
         self,
@@ -1563,6 +1618,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         num_chunks: torch.Tensor,
         token_chunk_ids: torch.Tensor,
         valid_mask: torch.Tensor,
+        token_chunk_pos: torch.Tensor = None,
     ) -> torch.Tensor:
         """Single fixed-path cross-entropy loss for the CHAT external-alignment baseline.
 
@@ -1571,6 +1627,10 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         (``joint.num_chunks_per_utterance``), and ``token_chunk_ids`` / ``valid_mask``
         come from the frozen external aligner. The loss slices each sample by
         ``label_lens`` / ``act_lens`` internally, so no trimming is required.
+
+        ``token_chunk_pos`` (``[B, U]`` within-chunk frame positions) enables the
+        delay-randomized, position-weighted objective (training only); when ``None``
+        the plain single-path CE is used (e.g. for a deterministic validation loss).
         """
         loss_value = self.loss(
             acts=joint,
@@ -1579,6 +1639,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             label_lens=transcript_len,
             token_chunk_ids=token_chunk_ids,
             valid_mask=valid_mask,
+            token_chunk_pos=token_chunk_pos,
         )
         if loss_value.dim() > 0:
             loss_value = loss_value.squeeze()
@@ -2362,13 +2423,20 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         # aligner needs it). Both reuse the same external aligner + assignment.
         chunkwise_assignment = None
         if self.loss_type in ('chunkwise_aligner', 'chat_aligner'):
+            want_pos = self.loss_type == 'chat_aligner' and getattr(self, '_chat_delay_enabled', False)
             if self._external_aligner_is_precomputed:
                 chunkwise_assignment = self._precomputed_chunk_assignment(
-                    sample_ids, signal_len, transcript, transcript_len, encoded_len
+                    sample_ids, signal_len, transcript, transcript_len, encoded_len, return_positions=want_pos
                 )
             else:
                 chunkwise_assignment = self._external_chunk_assignment(
-                    signal, signal_len, transcript, transcript_len, encoded_len, is_processed_signal=is_processed_signal
+                    signal,
+                    signal_len,
+                    transcript,
+                    transcript_len,
+                    encoded_len,
+                    is_processed_signal=is_processed_signal,
+                    return_positions=want_pos,
                 )
         del signal
 
@@ -2378,7 +2446,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             elif self.loss_type == 'chunked_aligner':
                 loss_value = self._chunked_aligner_loss(encoded, encoded_len, transcript, transcript_len)
             else:
-                token_chunk_ids, valid_mask, n_discarded, n_total = chunkwise_assignment
+                token_chunk_ids, valid_mask, n_discarded, n_total, _ = chunkwise_assignment
                 loss_value = self._chunkwise_aligner_loss(
                     encoded, encoded_len, transcript, transcript_len, token_chunk_ids, valid_mask
                 )
@@ -2479,9 +2547,9 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 # CHAT external-alignment baseline: cross-entropy over the single
                 # token->chunk path fixed by the frozen external aligner (computed
                 # above), instead of the full-sum RNN-T loss.
-                token_chunk_ids, valid_mask, _, _ = chunkwise_assignment
+                token_chunk_ids, valid_mask, _, _, token_chunk_pos = chunkwise_assignment
                 loss_value = self._chat_aligner_loss(
-                    joint, transcript, target_length, effective_len, token_chunk_ids, valid_mask
+                    joint, transcript, target_length, effective_len, token_chunk_ids, valid_mask, token_chunk_pos
                 )
             else:
                 loss_value = self.loss(
@@ -2620,7 +2688,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                         encoded, encoded_len, transcript, transcript_len
                     )
                 else:
-                    token_chunk_ids, valid_mask, _, _ = chunkwise_assignment
+                    token_chunk_ids, valid_mask, _, _, _ = chunkwise_assignment
                     tensorboard_logs['val_loss'] = self._chunkwise_aligner_loss(
                         encoded, encoded_len, transcript, transcript_len, token_chunk_ids, valid_mask
                     )
@@ -2640,7 +2708,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             # summed num/denom so multi_validation_epoch_end micro-averages it into
             # ``val_discard`` automatically.
             if chunkwise_assignment is not None:
-                _, _, n_discarded, n_total = chunkwise_assignment
+                _, _, n_discarded, n_total, _ = chunkwise_assignment
                 tensorboard_logs['val_discard_num'] = torch.tensor(
                     float(n_discarded), dtype=torch.float32, device=encoded.device
                 )
@@ -2658,7 +2726,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder, encoder_lengths=encoded_len)
                 effective_len = getattr(self.joint, 'num_chunks_per_utterance', encoded_len)
                 if self.loss_type == 'chat_aligner':
-                    token_chunk_ids, valid_mask, _, _ = chunkwise_assignment
+                    token_chunk_ids, valid_mask, _, _, _ = chunkwise_assignment
                     loss_value = self._chat_aligner_loss(
                         joint, transcript, target_length, effective_len, token_chunk_ids, valid_mask
                     )
@@ -2675,7 +2743,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             # Report the external-alignment discard ratio (CHAT baseline) as summed
             # num/denom so multi_validation_epoch_end micro-averages it -> val_discard.
             if chunkwise_assignment is not None:
-                _, _, n_discarded, n_total = chunkwise_assignment
+                _, _, n_discarded, n_total, _ = chunkwise_assignment
                 tensorboard_logs['val_discard_num'] = torch.tensor(
                     float(n_discarded), dtype=torch.float32, device=encoded.device
                 )

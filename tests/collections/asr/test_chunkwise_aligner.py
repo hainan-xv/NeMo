@@ -330,10 +330,12 @@ class _StubAligner:
         target_frame_lengths,
         chunk_size,
         enforce_left_packing=True,
+        return_positions=False,
     ):
         B, U = labels.shape
         device = labels.device
         token_chunk_ids = torch.full((B, U), -1, dtype=torch.long, device=device)
+        token_chunk_pos = torch.full((B, U), -1, dtype=torch.long, device=device)
         valid = torch.ones(B, dtype=torch.bool, device=device)
         for b in range(B):
             U_b = int(label_lens[b])
@@ -344,6 +346,9 @@ class _StubAligner:
                 continue
             for u in range(U_b):
                 token_chunk_ids[b, u] = u  # one token per chunk
+                token_chunk_pos[b, u] = 0
+        if return_positions:
+            return token_chunk_ids, valid, token_chunk_pos
         return token_chunk_ids, valid
 
 
@@ -896,6 +901,141 @@ def test_chat_ce_loss_invalid_assignment_masked():
     # Only sample 0's tokens count: mean_volume == sample0 NLL / U.
     expected = float(-ref[0]) / U
     assert math.isclose(float(val), expected, rel_tol=1e-4, abs_tol=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# Delay-randomized, position-weighted CHAT objective.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_chat_ce_delay_gamma1_maxdelay0_equals_baseline_in_train():
+    """num_variants>=1 but gamma=1 & max_delay=0 (train mode) == plain baseline."""
+    B, n_chunks, U, V = 3, 5, 4, 8
+    blank = V - 1
+    acts = torch.randn(B, n_chunks, U + 1, V)
+    labels = torch.randint(0, blank, (B, U))
+    act_lens = torch.tensor([n_chunks, n_chunks, n_chunks])
+    label_lens = torch.tensor([U, U, U])
+    token_chunk_ids = torch.tensor([[0, 1, 2, 3], [0, 0, 1, 2], [0, 1, 1, 4]])
+    token_chunk_pos = torch.randint(0, 6, (B, U))  # ignored when gamma=1
+
+    base = ChatExternalAlignerCELoss(blank=blank, reduction='none')(acts, labels, act_lens, label_lens, token_chunk_ids)
+
+    delayed = ChatExternalAlignerCELoss(
+        blank=blank, reduction='none', num_delay_variants=3, max_delay=0, weight_gamma=1.0, chunk_size=6
+    )
+    delayed.train()
+    val = delayed(acts, labels, act_lens, label_lens, token_chunk_ids, token_chunk_pos=token_chunk_pos)
+    assert torch.allclose(val, base, atol=1e-5)
+
+
+@pytest.mark.unit
+def test_chat_ce_delay_eval_is_deterministic_baseline():
+    """In eval mode the delayed loss falls back to the plain single-path CE."""
+    B, n_chunks, U, V = 2, 4, 3, 7
+    blank = V - 1
+    acts = torch.randn(B, n_chunks, U + 1, V)
+    labels = torch.randint(0, blank, (B, U))
+    act_lens = torch.tensor([n_chunks, n_chunks])
+    label_lens = torch.tensor([U, U])
+    token_chunk_ids = torch.tensor([[0, 1, 2], [0, 0, 3]])
+    token_chunk_pos = torch.tensor([[2, 1, 0], [3, 2, 0]])
+
+    base = ChatExternalAlignerCELoss(blank=blank, reduction='none')(acts, labels, act_lens, label_lens, token_chunk_ids)
+
+    delayed = ChatExternalAlignerCELoss(
+        blank=blank, reduction='none', num_delay_variants=5, max_delay=3, weight_gamma=0.5, chunk_size=6
+    )
+    delayed.eval()
+    a = delayed(acts, labels, act_lens, label_lens, token_chunk_ids, token_chunk_pos=token_chunk_pos)
+    b = delayed(acts, labels, act_lens, label_lens, token_chunk_ids, token_chunk_pos=token_chunk_pos)
+    assert torch.allclose(a, b)  # deterministic
+    assert torch.allclose(a, base, atol=1e-5)  # == baseline
+
+
+@pytest.mark.unit
+def test_chat_ce_delay_position_weighting_matches_manual():
+    """max_delay=0: token CE terms scaled by gamma**pos; blanks unweighted."""
+    B, n_chunks, U, V = 1, 4, 3, 7
+    blank = V - 1
+    gamma = 0.5
+    chunk_size = 6
+    acts = torch.randn(B, n_chunks, U + 1, V)
+    labels = torch.randint(0, blank, (B, U))
+    act_lens = torch.tensor([n_chunks])
+    label_lens = torch.tensor([U])
+    token_chunk_ids = torch.tensor([[0, 1, 2]])
+    token_chunk_pos = torch.tensor([[0, 3, 5]])
+
+    logp = torch.log_softmax(acts, dim=-1)[0]
+    # token arcs at (chunk, u, label), weighted by gamma**pos
+    weights = torch.tensor([gamma ** 0, gamma ** 3, gamma ** 5])
+    tok = sum(weights[u] * logp[token_chunk_ids[0, u], u, labels[0, u]] for u in range(U))
+    counts = torch.bincount(token_chunk_ids[0], minlength=n_chunks)
+    prefix = torch.cumsum(counts, dim=0)
+    bl = sum(logp[c, prefix[c], blank] for c in range(n_chunks))
+    expected = float(-(tok + bl))
+
+    delayed = ChatExternalAlignerCELoss(
+        blank=blank, reduction='none', num_delay_variants=1, max_delay=0, weight_gamma=gamma, chunk_size=chunk_size
+    )
+    delayed.train()
+    val = delayed(acts, labels, act_lens, label_lens, token_chunk_ids, token_chunk_pos=token_chunk_pos)
+    assert math.isclose(float(val[0]), expected, rel_tol=1e-4, abs_tol=1e-4)
+
+
+@pytest.mark.unit
+def test_chat_ce_delay_runs_and_is_feasible_with_delays():
+    """With max_delay>0 the loss stays finite and monotonic/in-range (smoke)."""
+    torch.manual_seed(0)
+    B, n_chunks, U, V = 2, 8, 5, 9
+    blank = V - 1
+    acts = torch.randn(B, n_chunks, U + 1, V, requires_grad=True)
+    labels = torch.randint(0, blank, (B, U))
+    act_lens = torch.tensor([n_chunks, n_chunks])
+    label_lens = torch.tensor([U, U])
+    token_chunk_ids = torch.tensor([[0, 1, 2, 3, 4], [0, 0, 1, 2, 3]])
+    token_chunk_pos = torch.tensor([[0, 1, 2, 3, 4], [0, 3, 0, 1, 2]])
+
+    delayed = ChatExternalAlignerCELoss(
+        blank=blank, reduction='mean_volume', num_delay_variants=4, max_delay=2, weight_gamma=0.8, chunk_size=6
+    )
+    delayed.train()
+    val = delayed(acts, labels, act_lens, label_lens, token_chunk_ids, token_chunk_pos=token_chunk_pos)
+    assert torch.isfinite(val)
+    val.backward()
+    assert acts.grad is not None and torch.isfinite(acts.grad).all()
+
+
+@pytest.mark.unit
+def test_map_word_starts_returns_positions():
+    """return_positions yields within-chunk positions; bumped-later-chunk -> 0."""
+    from nemo.collections.asr.parts.submodules.external_word_aligner import map_word_starts_to_token_chunks
+
+    # audio_dur=1s, T_tr=10, chunk_size=2 -> 5 chunks. anchor='end'.
+    # word0 tokens[0,1] end 0.5 -> frame 5 -> chunk 2, pos = 5 - 2*2 = 1
+    # word1 token [2]    end 0.9 -> frame 9 -> chunk 4, pos = 9 - 4*2 = 1
+    word_groups = [[0, 1], [2]]
+    starts = [0.0, 0.6]
+    ends = [0.5, 0.9]
+    chunks, pos = map_word_starts_to_token_chunks(
+        word_groups, starts, 1.0, 10, 3, 2, enforce_left_packing=False, word_ends_sec=ends, anchor='end',
+        return_positions=True,
+    )
+    assert chunks == {0: 2, 1: 2, 2: 4}
+    assert pos == {0: 1, 1: 1, 2: 1}
+
+    # Monotonic bump: word1 ends earlier than word0 -> bumped up to word0's chunk;
+    # its audio is in the past -> pos 0.
+    chunks2, pos2 = map_word_starts_to_token_chunks(
+        [[0], [1]], [0.0, 0.0], 1.0, 10, 2, 2, enforce_left_packing=False,
+        word_ends_sec=[0.6, 0.2], anchor='end', return_positions=True,
+    )
+    # word0 end 0.6 -> frame 6 -> chunk 3, pos 0; word1 end 0.2 -> frame 2 -> chunk 1
+    # but bumped to >=3 -> chunk 3, pos 0 (bumped).
+    assert chunks2 == {0: 3, 1: 3}
+    assert pos2 == {0: 0, 1: 0}
 
 
 @pytest.mark.unit

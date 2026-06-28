@@ -108,7 +108,8 @@ def map_word_starts_to_token_chunks(
     enforce_left_packing: bool = True,
     word_ends_sec: Optional[Sequence[float]] = None,
     anchor: str = 'start',
-) -> Optional[dict]:
+    return_positions: bool = False,
+):
     """Map per-word timestamps (seconds) to a per-token chunk assignment.
 
     Shared by the live (:class:`QwenWordForcedAligner`) and the offline
@@ -137,10 +138,19 @@ def map_word_starts_to_token_chunks(
             heard -- a better match for an RNN-T/CHAT model's natural delayed
             emission). Falls back to ``'start'`` if end times are unavailable.
 
+        return_positions: when ``True`` also return ``{token_index: pos}`` where
+            ``pos`` is the token's WITHIN-CHUNK frame position (0 = chunk's first
+            frame). A token bumped to a later chunk than its anchor frame (by the
+            monotonic clamp) gets ``pos=0`` -- its audio is fully in the past, so
+            it is "available" from the start of the assigned chunk. Used by the
+            delay-weighted CHAT loss.
+
     Returns:
-        ``{token_index: chunk}`` of length ``U_b``, or ``None`` if the assignment
-        is infeasible (word-count mismatch; or, when ``enforce_left_packing``,
-        ``T < U`` or a chunk would host more tokens than it has frames).
+        ``{token_index: chunk}`` of length ``U_b`` (or, when ``return_positions``,
+        the tuple ``({token_index: chunk}, {token_index: pos})``), or ``None`` if
+        the assignment is infeasible (word-count mismatch; or, when
+        ``enforce_left_packing``, ``T < U`` or a chunk would host more tokens than
+        it has frames).
     """
     if len(word_starts_sec) != len(word_groups):
         return None
@@ -154,12 +164,14 @@ def map_word_starts_to_token_chunks(
     n_chunks = (T_tr + chunk_size - 1) // chunk_size
     counts = [0] * n_chunks
     assignment: dict = {}
+    positions: dict = {}
     prev_chunk = 0
     for wi, group in enumerate(word_groups):
         anchor_sec = float(anchor_times[wi] or 0.0)
         tr_frame = int((anchor_sec / audio_dur) * T_tr)
         tr_frame = min(max(tr_frame, 0), T_tr - 1)
-        chunk = tr_frame // chunk_size
+        natural_chunk = tr_frame // chunk_size
+        chunk = natural_chunk
         if chunk >= n_chunks:
             chunk = n_chunks - 1
         # Word timestamps are monotonic, but proportional rounding could tie /
@@ -167,8 +179,15 @@ def map_word_starts_to_token_chunks(
         if chunk < prev_chunk:
             chunk = prev_chunk
         prev_chunk = chunk
+        # Within-chunk position of the anchor frame (0 = chunk start). When the
+        # token was bumped to a chunk LATER than its anchor frame's natural chunk,
+        # its audio is entirely in the past -> available from frame 0.
+        pos = (tr_frame - chunk * chunk_size) if chunk == natural_chunk else 0
+        if pos < 0:
+            pos = 0
         for ti in group:
             assignment[ti] = chunk
+            positions[ti] = pos
             counts[chunk] += 1
     # Left-packing feasibility: a chunk cannot host more tokens than frames
     # (additive-joint baseline only; CHAT cross-attention pools the whole chunk).
@@ -177,6 +196,8 @@ def map_word_starts_to_token_chunks(
             frames_here = min(chunk_size, T_tr - c * chunk_size)
             if counts[c] > frames_here:
                 return None
+    if return_positions:
+        return assignment, positions
     return assignment
 
 
@@ -305,7 +326,8 @@ class QwenWordForcedAligner:
         target_frame_lengths: torch.Tensor,
         chunk_size: int,
         enforce_left_packing: bool = True,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return_positions: bool = False,
+    ):
         """Word-align the batch and bucket each token into a trainee encoder chunk.
 
         Mirrors :meth:`ExternalCTCForcedAligner.align_to_chunks`:
@@ -314,6 +336,9 @@ class QwenWordForcedAligner:
             token_chunk_ids: ``[B, U]`` long; chunk index per token, ``-1`` padded
                 beyond ``label_lens`` and for invalid samples.
             valid_mask: ``[B]`` bool; ``False`` for utterances to skip.
+            token_chunk_pos (only if ``return_positions``): ``[B, U]`` long;
+                within-chunk frame position per token (``-1`` padded/invalid),
+                used by the delay-weighted CHAT loss.
         """
         B = int(labels.shape[0])
         U_max = int(labels.shape[1])
@@ -329,7 +354,13 @@ class QwenWordForcedAligner:
         labels_cpu = labels.to(torch.long).cpu()
 
         token_chunk_ids = torch.full((B, U_max), -1, dtype=torch.long)
+        token_chunk_pos = torch.full((B, U_max), -1, dtype=torch.long)
         valid_mask = torch.ones(B, dtype=torch.bool)
+
+        def _ret():
+            if return_positions:
+                return token_chunk_ids.to(out_device), valid_mask.to(out_device), token_chunk_pos.to(out_device)
+            return token_chunk_ids.to(out_device), valid_mask.to(out_device)
 
         # 1) Group each sample's sub-words into words; build reference text + audio.
         word_groups: List[List[List[int]]] = [[] for _ in range(B)]
@@ -357,7 +388,7 @@ class QwenWordForcedAligner:
             align_indices.append(b)
 
         if not align_indices:
-            return token_chunk_ids.to(out_device), valid_mask.to(out_device)
+            return _ret()
 
         # 2) Run the external word aligner on the valid subset (best-effort: any
         #    failure discards that batch's samples but keeps training alive).
@@ -371,7 +402,7 @@ class QwenWordForcedAligner:
             )
             for b in align_indices:
                 valid_mask[b] = False
-            return token_chunk_ids.to(out_device), valid_mask.to(out_device)
+            return _ret()
 
         if len(results) != len(align_indices):
             logging.warning(
@@ -380,7 +411,7 @@ class QwenWordForcedAligner:
             )
             for b in align_indices:
                 valid_mask[b] = False
-            return token_chunk_ids.to(out_device), valid_mask.to(out_device)
+            return _ret()
 
         # 3) Map each word's start time -> trainee frame -> chunk; expand to sub-words.
         for result, b in zip(results, align_indices):
@@ -391,7 +422,7 @@ class QwenWordForcedAligner:
             starts = [float(getattr(w, 'start_time', 0.0) or 0.0) for w in result]
             ends = [float(getattr(w, 'end_time', 0.0) or 0.0) for w in result]
 
-            assignment = map_word_starts_to_token_chunks(
+            mapped = map_word_starts_to_token_chunks(
                 groups,
                 starts,
                 audio_dur,
@@ -401,14 +432,21 @@ class QwenWordForcedAligner:
                 enforce_left_packing=enforce_left_packing,
                 word_ends_sec=ends,
                 anchor=self.anchor,
+                return_positions=return_positions,
             )
-            if assignment is None:
+            if mapped is None:
                 valid_mask[b] = False
                 continue
-            for ti, chunk in assignment.items():
-                token_chunk_ids[b, ti] = chunk
+            if return_positions:
+                assignment, positions = mapped
+                for ti, chunk in assignment.items():
+                    token_chunk_ids[b, ti] = chunk
+                    token_chunk_pos[b, ti] = positions[ti]
+            else:
+                for ti, chunk in mapped.items():
+                    token_chunk_ids[b, ti] = chunk
 
-        return token_chunk_ids.to(out_device), valid_mask.to(out_device)
+        return _ret()
 
 
 def _file_id(path_or_id: str) -> str:
@@ -555,7 +593,8 @@ class PrecomputedWordForcedAligner:
         audio_durations: torch.Tensor,
         chunk_size: int,
         enforce_left_packing: bool = True,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return_positions: bool = False,
+    ):
         """Bucket each token into a chunk from precomputed word start times.
 
         Args:
@@ -566,10 +605,13 @@ class PrecomputedWordForcedAligner:
             target_frame_lengths: ``[B]`` trainee encoder frames per sample.
             audio_durations: ``[B]`` utterance durations in seconds.
             chunk_size: encoder frames per chunk.
+            return_positions: also return ``token_chunk_pos [B, U]`` (within-chunk
+                frame position per token; ``-1`` padded/invalid).
 
         Returns:
             ``(token_chunk_ids [B, U], valid_mask [B])`` -- same contract as the
-            live word aligner.
+            live word aligner -- plus ``token_chunk_pos [B, U]`` when
+            ``return_positions``.
         """
         B = int(labels.shape[0])
         U_max = int(labels.shape[1])
@@ -581,6 +623,7 @@ class PrecomputedWordForcedAligner:
         durations_cpu = audio_durations.to(torch.float32).cpu()
 
         token_chunk_ids = torch.full((B, U_max), -1, dtype=torch.long)
+        token_chunk_pos = torch.full((B, U_max), -1, dtype=torch.long)
         valid_mask = torch.ones(B, dtype=torch.bool)
 
         for b in range(B):
@@ -603,7 +646,7 @@ class PrecomputedWordForcedAligner:
             T_tr = int(target_frames_cpu[b])
             audio_dur = float(durations_cpu[b])
 
-            assignment = map_word_starts_to_token_chunks(
+            mapped = map_word_starts_to_token_chunks(
                 groups,
                 starts,
                 audio_dur,
@@ -613,11 +656,20 @@ class PrecomputedWordForcedAligner:
                 enforce_left_packing=enforce_left_packing,
                 word_ends_sec=ends,
                 anchor=self.anchor,
+                return_positions=return_positions,
             )
-            if assignment is None:
+            if mapped is None:
                 valid_mask[b] = False
                 continue
-            for ti, chunk in assignment.items():
-                token_chunk_ids[b, ti] = chunk
+            if return_positions:
+                assignment, positions = mapped
+                for ti, chunk in assignment.items():
+                    token_chunk_ids[b, ti] = chunk
+                    token_chunk_pos[b, ti] = positions[ti]
+            else:
+                for ti, chunk in mapped.items():
+                    token_chunk_ids[b, ti] = chunk
 
+        if return_positions:
+            return token_chunk_ids.to(out_device), valid_mask.to(out_device), token_chunk_pos.to(out_device)
         return token_chunk_ids.to(out_device), valid_mask.to(out_device)
