@@ -21,7 +21,9 @@ import pytest
 import torch
 
 from nemo.collections.asr.losses.chunked_aligner_pytorch import (
+    ChatExternalAlignerCELoss,
     ChunkwiseAlignerLoss,
+    chat_external_aligner_single_path_logprob,
     chunked_aligner_loss_bruteforce,
     chunkwise_aligner_single_path_logprob,
 )
@@ -319,7 +321,16 @@ class _StubAligner:
     def to(self, *args, **kwargs):
         return self
 
-    def align_to_chunks(self, input_signal, input_signal_length, labels, label_lens, target_frame_lengths, chunk_size):
+    def align_to_chunks(
+        self,
+        input_signal,
+        input_signal_length,
+        labels,
+        label_lens,
+        target_frame_lengths,
+        chunk_size,
+        enforce_left_packing=True,
+    ):
         B, U = labels.shape
         device = labels.device
         token_chunk_ids = torch.full((B, U), -1, dtype=torch.long, device=device)
@@ -796,3 +807,225 @@ def test_word_aligner_monotonic_clamp_on_regression():
     assert bool(valid_mask[0])
     ids = token_chunk_ids[0].tolist()
     assert ids[0] <= ids[1]  # non-decreasing
+
+
+# ===========================================================================
+# CHAT external-alignment cross-entropy baseline (loss_type='chat_aligner')
+# ===========================================================================
+# The CHAT joint's activations are CHUNK-indexed (B, n_chunks, U+1, V): the chunk
+# axis IS the RNN-T "time" axis. The CE loss scores the single token->chunk path,
+# one blank per chunk, with NO left-packing constraint (a chunk may host any
+# number of tokens).
+
+
+def _random_monotonic_chunk_ids(U_b, n_chunks, rng):
+    """Random non-decreasing chunk ids in [0, n_chunks) of length U_b."""
+    ids = sorted(rng.randint(0, n_chunks - 1) for _ in range(U_b))
+    return ids
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("seed", [0, 1, 2, 3])
+def test_chat_ce_loss_matches_single_path_reference(seed):
+    """ChatExternalAlignerCELoss(reduction='none') == -reference single-path logprob."""
+    import random
+
+    rng = random.Random(100 + seed)
+    B, n_chunks, U_max, V = 4, 5, 6, 9
+    blank = V - 1
+
+    acts = torch.randn(B, n_chunks, U_max + 1, V)
+    labels = torch.randint(0, blank, (B, U_max))
+    act_lens = torch.tensor([rng.randint(2, n_chunks) for _ in range(B)])
+    label_lens = torch.tensor([rng.randint(1, U_max) for _ in range(B)])
+
+    token_chunk_ids = torch.full((B, U_max), -1, dtype=torch.long)
+    for b in range(B):
+        ids = _random_monotonic_chunk_ids(int(label_lens[b]), int(act_lens[b]), rng)
+        for u, c in enumerate(ids):
+            token_chunk_ids[b, u] = c
+
+    loss = ChatExternalAlignerCELoss(blank=blank, reduction='none')
+    per_sample = loss(acts, labels, act_lens, label_lens, token_chunk_ids)
+    ref = chat_external_aligner_single_path_logprob(acts, labels, act_lens, label_lens, token_chunk_ids, blank)
+
+    for b in range(B):
+        assert math.isclose(float(per_sample[b]), float(-ref[b]), rel_tol=1e-4, abs_tol=1e-4)
+
+
+@pytest.mark.unit
+def test_chat_ce_loss_allows_many_tokens_per_chunk():
+    """Unlike the additive-joint baseline, a CHAT chunk may host > chunk_size tokens."""
+    B, n_chunks, U, V = 1, 2, 5, 7
+    blank = V - 1
+    acts = torch.randn(B, n_chunks, U + 1, V)
+    labels = torch.randint(0, blank, (B, U))
+    act_lens = torch.tensor([n_chunks])
+    label_lens = torch.tensor([U])
+    # All 5 tokens packed into chunk 0 (would be infeasible for a 2-frame chunk
+    # under left-packing, but fine for CHAT cross-attention pooling).
+    token_chunk_ids = torch.tensor([[0, 0, 0, 0, 0]])
+
+    loss = ChatExternalAlignerCELoss(blank=blank, reduction='none')
+    val = loss(acts, labels, act_lens, label_lens, token_chunk_ids)
+    ref = chat_external_aligner_single_path_logprob(acts, labels, act_lens, label_lens, token_chunk_ids, blank)
+    assert torch.isfinite(val[0])
+    assert math.isclose(float(val[0]), float(-ref[0]), rel_tol=1e-4, abs_tol=1e-4)
+
+
+@pytest.mark.unit
+def test_chat_ce_loss_invalid_assignment_masked():
+    """Out-of-range / non-monotonic chunk ids -> infeasible -> masked out (mean_volume)."""
+    B, n_chunks, U, V = 2, 3, 3, 6
+    blank = V - 1
+    acts = torch.randn(B, n_chunks, U + 1, V)
+    labels = torch.randint(0, blank, (B, U))
+    act_lens = torch.tensor([n_chunks, n_chunks])
+    label_lens = torch.tensor([U, U])
+    # Sample 0: valid monotonic. Sample 1: non-monotonic (1 -> 0) -> infeasible.
+    token_chunk_ids = torch.tensor([[0, 1, 2], [1, 0, 2]])
+
+    ref = chat_external_aligner_single_path_logprob(acts, labels, act_lens, label_lens, token_chunk_ids, blank)
+    assert torch.isfinite(ref[0]) and float(ref[1]) <= -1e8  # NEG_INF for sample 1
+
+    loss = ChatExternalAlignerCELoss(blank=blank, reduction='mean_volume')
+    val = loss(acts, labels, act_lens, label_lens, token_chunk_ids)
+    # Only sample 0's tokens count: mean_volume == sample0 NLL / U.
+    expected = float(-ref[0]) / U
+    assert math.isclose(float(val), expected, rel_tol=1e-4, abs_tol=1e-4)
+
+
+@pytest.mark.unit
+def test_map_word_starts_relaxed_left_packing():
+    """enforce_left_packing=False allows T<U and >chunk_size tokens per chunk."""
+    from nemo.collections.asr.parts.submodules.external_word_aligner import map_word_starts_to_token_chunks
+
+    # 1 word covering 3 tokens, T_tr=2 frames, chunk_size=2 -> 1 chunk. Under
+    # left-packing this is infeasible (T<U and counts>frames); relaxed it is fine.
+    word_groups = [[0, 1, 2]]
+    word_starts = [0.0]
+    strict = map_word_starts_to_token_chunks(word_groups, word_starts, 1.0, 2, 3, 2, enforce_left_packing=True)
+    relaxed = map_word_starts_to_token_chunks(word_groups, word_starts, 1.0, 2, 3, 2, enforce_left_packing=False)
+    assert strict is None
+    assert relaxed == {0: 0, 1: 0, 2: 0}
+
+
+# ---------------------------------------------------------------------------
+# End-to-end CHAT external-aligner model wiring (RNNTAttJoint + CE loss).
+# ---------------------------------------------------------------------------
+
+
+def _build_chat_aligner_model(chunk_size=2):
+    from omegaconf import DictConfig, ListConfig
+
+    import nemo.collections.asr.parts.submodules.external_ctc_aligner as ext_mod
+    from nemo.collections.asr.models import EncDecRNNTModel
+
+    # Stub the CTC loader so no real model is restored (backend defaults to 'ctc').
+    ext_mod.ExternalCTCForcedAligner = _StubAligner
+
+    model_defaults = {'enc_hidden': 128, 'pred_hidden': 64, 'joint_hidden': 64}
+    preprocessor = {'_target_': 'nemo.collections.asr.modules.AudioToMelSpectrogramPreprocessor', 'features': 64}
+    encoder = {
+        '_target_': 'nemo.collections.asr.modules.ConvASREncoder',
+        'feat_in': 64,
+        'activation': 'relu',
+        'conv_mask': True,
+        'jasper': [
+            {
+                'filters': model_defaults['enc_hidden'],
+                'repeat': 1,
+                'kernel': [1],
+                'stride': [1],
+                'dilation': [1],
+                'dropout': 0.0,
+                'residual': False,
+                'separable': True,
+                'se': True,
+                'se_context_size': -1,
+            }
+        ],
+    }
+    decoder = {
+        '_target_': 'nemo.collections.asr.modules.RNNTDecoder',
+        'prednet': {'pred_hidden': model_defaults['pred_hidden'], 'pred_rnn_layers': 1},
+    }
+    # CHAT cross-attention joint; chunk_size set explicitly so the encoder need not
+    # use chunked_limited attention in this unit test.
+    joint = {
+        '_target_': 'nemo.collections.asr.modules.RNNTAttJoint',
+        'fuse_loss_wer': False,
+        'chunk_size': chunk_size,
+        'jointnet': {'joint_hidden': model_defaults['joint_hidden'], 'activation': 'relu'},
+    }
+    decoding = {
+        'strategy': 'greedy_batch',
+        'greedy': {'max_symbols': 5},
+        'beam': {'beam_size': 1, 'return_best_hypothesis': True},
+    }
+    cfg = DictConfig(
+        {
+            'labels': ListConfig(_LABELS),
+            'loss_type': 'chat_aligner',
+            'compute_eval_loss': True,
+            'external_aligner': DictConfig(
+                {'backend': 'ctc', 'pretrained_name': 'dummy', 'model_path': None, 'reduction': 'mean_volume'}
+            ),
+            'preprocessor': DictConfig(preprocessor),
+            'model_defaults': DictConfig(model_defaults),
+            'encoder': DictConfig(encoder),
+            'decoder': DictConfig(decoder),
+            'joint': DictConfig(joint),
+            'decoding': DictConfig(decoding),
+        }
+    )
+    return EncDecRNNTModel(cfg=cfg)
+
+
+@pytest.mark.unit
+def test_model_chat_aligner_wires_ce_loss_and_rnnt_decoding():
+    from nemo.collections.asr.metrics.wer import WER
+    from nemo.collections.asr.parts.submodules.rnnt_decoding import RNNTDecoding
+
+    model = _build_chat_aligner_model(chunk_size=2)
+    assert model.loss_type == 'chat_aligner'
+    assert isinstance(model.loss, ChatExternalAlignerCELoss)
+    # CHAT reuses the standard RNN-T decoding + WER objects.
+    assert isinstance(model.decoding, RNNTDecoding)
+    assert isinstance(model.wer, WER)
+    # CHAT pools the whole chunk -> no left-packing constraint on the aligner.
+    assert model._aligner_enforce_left_packing is False
+    # chunk_size threaded from the joint for the external aligner bucketing.
+    assert int(model.chunk_size) == 2
+    assert isinstance(model._external_aligner, _StubAligner)
+
+
+@pytest.mark.unit
+def test_model_chat_aligner_loss_runs_and_backprops():
+    model = _build_chat_aligner_model(chunk_size=2)
+    model.train()
+    B, audio_len = 3, 8000
+    signal = torch.randn(B, audio_len)
+    signal_len = torch.full((B,), audio_len, dtype=torch.long)
+    transcript = torch.randint(0, len(_LABELS), (B, 4))
+    transcript_len = torch.tensor([3, 2, 4])
+
+    encoded, encoded_len = model.forward(input_signal=signal, input_signal_length=signal_len)
+    decoder_out, target_len, _ = model.decoder(targets=transcript, target_length=transcript_len)
+    joint = model.joint(encoder_outputs=encoded, decoder_outputs=decoder_out, encoder_lengths=encoded_len)
+    num_chunks = model.joint.num_chunks_per_utterance
+    assert num_chunks is not None
+
+    # Build a valid monotonic token->chunk assignment within each sample's chunks.
+    token_chunk_ids = torch.full_like(transcript, -1)
+    valid_mask = torch.ones(B, dtype=torch.bool)
+    for b in range(B):
+        n_b = int(num_chunks[b])
+        for u in range(int(transcript_len[b])):
+            token_chunk_ids[b, u] = min(u, n_b - 1)
+
+    loss = model._chat_aligner_loss(joint, transcript, target_len, num_chunks, token_chunk_ids, valid_mask)
+    assert torch.isfinite(loss)
+    loss.backward()
+    grads = [p.grad for p in model.encoder.parameters() if p.requires_grad]
+    assert any(g is not None and torch.isfinite(g).all() for g in grads)

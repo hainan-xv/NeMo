@@ -264,7 +264,7 @@ trainer:
 exp_manager:
   exp_dir: null
   name: ${name}
-  create_tensorboard_logger: true
+  create_tensorboard_logger: false
   create_checkpoint_callback: true
   checkpoint_callback_params:
     monitor: "val_wer"
