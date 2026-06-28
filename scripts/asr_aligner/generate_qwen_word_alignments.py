@@ -15,7 +15,9 @@
 """Offline word-level forced alignment with the Qwen3 ForcedAligner (Option B).
 
 Runs the heavy Qwen aligner ONCE over a NeMo ASR manifest and writes per-word
-**start times** (seconds) keyed by ``file_id`` (audio basename without extension).
+**start AND end times** (seconds) keyed by ``file_id`` (audio basename without
+extension) as ``{file_id: {"starts": [...], "ends": [...]}}``. Training anchors a
+word's tokens on whichever timestamp the config selects (default: word END).
 Training then reads this file via
 :class:`~nemo.collections.asr.parts.submodules.external_word_aligner.PrecomputedWordForcedAligner`
 (``loss_type=chunkwise_aligner`` with ``external_aligner.backend=precomputed``),
@@ -251,7 +253,7 @@ def main():
         pretrained_model=args.aligner, language=args.language, device=args.device, dtype=torch_dtype
     )
 
-    results: Dict[str, List[float]] = {}
+    results: Dict[str, Dict[str, List[float]]] = {}
     n_ok = n_skip = 0
     buf_audio: List[np.ndarray] = []
     buf_text: List[str] = []
@@ -269,7 +271,13 @@ def main():
             buf_audio.clear(); buf_text.clear(); buf_key.clear()
             return
         for key, words in zip(buf_key, batch_aligns):
-            results[key] = [round(float(w.start_time), 3) for w in words]
+            # Store BOTH the word onset (start) and the end of the word's last
+            # sub-word (end). Training anchors a word's tokens on whichever the
+            # config selects (default: end -> emit after the audio is heard).
+            results[key] = {
+                'starts': [round(float(w.start_time), 3) for w in words],
+                'ends': [round(float(w.end_time), 3) for w in words],
+            }
             n_ok += 1
         buf_audio.clear(); buf_text.clear(); buf_key.clear()
 

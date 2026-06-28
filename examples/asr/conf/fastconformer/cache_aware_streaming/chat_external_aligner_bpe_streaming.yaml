@@ -50,9 +50,15 @@ model:
     # comparable to the RNN-T scale) | 'mean' | 'mean_batch' | 'sum'.
     reduction: mean_volume
 
+    # Which word timestamp anchors a word's tokens to a chunk (word-level backends):
+    #   'end'   -> end of the word's LAST sub-word (default; emit AFTER the audio is
+    #              heard, matching an RNN-T/CHAT model's natural delayed emission).
+    #   'start' -> word onset (legacy; tends to force premature emission).
+    anchor: end
+
     # --- precomputed (offline word-level) backend ----------------------------
-    # JSON/JSONL file or directory of {file_id: [word_start_sec, ...]} produced by
-    # scripts/asr_aligner/generate_qwen_word_alignments.py. REQUIRES
+    # JSON/JSONL file or directory of {file_id: {"starts": [...], "ends": [...]}}
+    # produced by scripts/asr_aligner/generate_qwen_word_alignments.py. REQUIRES
     # model.train_ds.return_sample_id=true (and validation_ds.return_sample_id=true).
     alignments_path: null
 

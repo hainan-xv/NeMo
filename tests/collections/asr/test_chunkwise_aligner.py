@@ -728,15 +728,18 @@ def test_precomputed_loader_accepts_multiple_formats(tmp_path):
     from nemo.collections.asr.parts.submodules.external_word_aligner import _load_word_start_alignments
 
     mapping = {
-        'a': [0.0, 0.5],                                   # bare list of starts
+        'a': [0.0, 0.5],                                   # bare list of starts (no ends)
         'b': {'word_starts': [0.1, 0.7]},                 # word_starts key
-        'c': {'words': [{'start': 0.0}, {'start_time': 0.9}]},  # word dicts
+        'c': {'words': [{'start': 0.0, 'end': 0.4}, {'start_time': 0.9, 'end_time': 1.0}]},  # word dicts
+        'd': {'starts': [0.0, 0.6], 'ends': [0.5, 0.9]},  # preferred starts/ends format
     }
     path = _write_alignments(tmp_path, mapping)
     loaded = _load_word_start_alignments(path)
-    assert loaded['a'] == [0.0, 0.5]
-    assert loaded['b'] == [0.1, 0.7]
-    assert loaded['c'] == [0.0, 0.9]
+    # The loader now returns (starts, ends|None) tuples.
+    assert loaded['a'] == ([0.0, 0.5], None)
+    assert loaded['b'] == ([0.1, 0.7], None)
+    assert loaded['c'] == ([0.0, 0.9], [0.4, 1.0])
+    assert loaded['d'] == ([0.0, 0.6], [0.5, 0.9])
 
 
 @pytest.mark.unit
@@ -908,6 +911,34 @@ def test_map_word_starts_relaxed_left_packing():
     relaxed = map_word_starts_to_token_chunks(word_groups, word_starts, 1.0, 2, 3, 2, enforce_left_packing=False)
     assert strict is None
     assert relaxed == {0: 0, 1: 0, 2: 0}
+
+
+@pytest.mark.unit
+def test_map_word_starts_end_anchor():
+    """anchor='end' buckets a word by the end of its last sub-word, not its onset."""
+    from nemo.collections.asr.parts.submodules.external_word_aligner import map_word_starts_to_token_chunks
+
+    # 2 words; audio_dur=1s, T_tr=10 frames, chunk_size=2 -> 5 chunks.
+    # word 0: tokens [0,1] start 0.0s (frame 0 -> chunk 0), end 0.5s (frame 5 -> chunk 2)
+    # word 1: token  [2]   start 0.6s (frame 6 -> chunk 3), end 0.9s (frame 9 -> chunk 4)
+    word_groups = [[0, 1], [2]]
+    starts = [0.0, 0.6]
+    ends = [0.5, 0.9]
+
+    by_start = map_word_starts_to_token_chunks(
+        word_groups, starts, 1.0, 10, 3, 2, enforce_left_packing=False, word_ends_sec=ends, anchor='start'
+    )
+    by_end = map_word_starts_to_token_chunks(
+        word_groups, starts, 1.0, 10, 3, 2, enforce_left_packing=False, word_ends_sec=ends, anchor='end'
+    )
+    assert by_start == {0: 0, 1: 0, 2: 3}
+    assert by_end == {0: 2, 1: 2, 2: 4}
+
+    # anchor='end' with no end times provided -> falls back to start anchoring.
+    fallback = map_word_starts_to_token_chunks(
+        word_groups, starts, 1.0, 10, 3, 2, enforce_left_packing=False, word_ends_sec=None, anchor='end'
+    )
+    assert fallback == by_start
 
 
 # ---------------------------------------------------------------------------

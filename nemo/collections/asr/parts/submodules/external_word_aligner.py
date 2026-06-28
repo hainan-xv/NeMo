@@ -106,8 +106,10 @@ def map_word_starts_to_token_chunks(
     U_b: int,
     chunk_size: int,
     enforce_left_packing: bool = True,
+    word_ends_sec: Optional[Sequence[float]] = None,
+    anchor: str = 'start',
 ) -> Optional[dict]:
-    """Map per-word start times (seconds) to a per-token chunk assignment.
+    """Map per-word timestamps (seconds) to a per-token chunk assignment.
 
     Shared by the live (:class:`QwenWordForcedAligner`) and the offline
     (:class:`PrecomputedWordForcedAligner`) backends so both produce identical
@@ -127,6 +129,13 @@ def map_word_starts_to_token_chunks(
             (CHAT cross-attention baseline) a chunk pools all its frames into one
             representation and may host arbitrarily many tokens, so neither
             constraint applies -- only monotonicity / in-range bucketing.
+        word_ends_sec: per-word END time in seconds (one per group). Required when
+            ``anchor='end'``; ignored otherwise.
+        anchor: which word timestamp anchors a word's tokens to a chunk.
+            ``'start'`` uses the word onset; ``'end'`` uses the end of the word's
+            last sub-word (so a token is only emitted once its audio has been
+            heard -- a better match for an RNN-T/CHAT model's natural delayed
+            emission). Falls back to ``'start'`` if end times are unavailable.
 
     Returns:
         ``{token_index: chunk}`` of length ``U_b``, or ``None`` if the assignment
@@ -135,6 +144,10 @@ def map_word_starts_to_token_chunks(
     """
     if len(word_starts_sec) != len(word_groups):
         return None
+    use_end = str(anchor).lower() == 'end' and word_ends_sec is not None
+    if use_end and len(word_ends_sec) != len(word_groups):
+        return None
+    anchor_times = word_ends_sec if use_end else word_starts_sec
     if enforce_left_packing and T_tr < U_b:
         return None
     audio_dur = max(float(audio_dur), 1e-6)
@@ -143,8 +156,8 @@ def map_word_starts_to_token_chunks(
     assignment: dict = {}
     prev_chunk = 0
     for wi, group in enumerate(word_groups):
-        start_sec = float(word_starts_sec[wi] or 0.0)
-        tr_frame = int((start_sec / audio_dur) * T_tr)
+        anchor_sec = float(anchor_times[wi] or 0.0)
+        tr_frame = int((anchor_sec / audio_dur) * T_tr)
         tr_frame = min(max(tr_frame, 0), T_tr - 1)
         chunk = tr_frame // chunk_size
         if chunk >= n_chunks:
@@ -194,6 +207,7 @@ class QwenWordForcedAligner:
         dtype="bfloat16",
         device: Optional[str] = None,
         sample_rate: int = 16000,
+        anchor: str = "end",
     ):
         if tokenizer is None:
             raise ValueError(
@@ -206,6 +220,7 @@ class QwenWordForcedAligner:
         self.language = language
         self.dtype = _to_torch_dtype(dtype)
         self.sample_rate = int(sample_rate)
+        self.anchor = str(anchor).lower()
         self._device = torch.device(device) if device is not None else None
         self._aligner = None  # lazily constructed on first use
 
@@ -374,9 +389,18 @@ class QwenWordForcedAligner:
             groups = word_groups[b]
             audio_dur = int(sig_len_cpu[b]) / float(self.sample_rate)
             starts = [float(getattr(w, 'start_time', 0.0) or 0.0) for w in result]
+            ends = [float(getattr(w, 'end_time', 0.0) or 0.0) for w in result]
 
             assignment = map_word_starts_to_token_chunks(
-                groups, starts, audio_dur, T_tr, U_b, chunk_size, enforce_left_packing=enforce_left_packing
+                groups,
+                starts,
+                audio_dur,
+                T_tr,
+                U_b,
+                chunk_size,
+                enforce_left_packing=enforce_left_packing,
+                word_ends_sec=ends,
+                anchor=self.anchor,
             )
             if assignment is None:
                 valid_mask[b] = False
@@ -394,45 +418,55 @@ def _file_id(path_or_id: str) -> str:
     return stem
 
 
-def _load_word_start_alignments(path: str) -> Dict[str, List[float]]:
-    """Load offline word-start alignments into ``{file_id: [start_sec, ...]}``.
+def _load_word_start_alignments(path: str) -> Dict[str, Tuple[List[float], Optional[List[float]]]]:
+    """Load offline word alignments into ``{file_id: (starts_sec, ends_sec|None)}``.
 
     Accepts either:
       * a JSON dict ``{file_id_or_path: value}``, or
       * a JSON-lines file with one record per line,
     where ``value`` / each record is one of:
-      * a list of floats (word start times in seconds),
-      * ``{"word_starts": [float, ...]}``, or
-      * ``{"words": [{"start"|"start_time": float, ...}, ...]}``.
+      * a list of floats (word start times in seconds; no ends),
+      * ``{"starts": [float, ...], "ends": [float, ...]}`` (preferred -- carries
+        both onset and end-of-last-sub-word times),
+      * ``{"word_starts": [...], "word_ends": [...]}``, or
+      * ``{"words": [{"start"|"start_time": float, "end"|"end_time": float}, ...]}``.
     Records may carry ``file_id`` / ``audio_filepath`` / ``audio_file`` as the key.
     """
 
-    def _starts_from_value(v) -> Optional[List[float]]:
+    def _times_from_value(v) -> Optional[Tuple[List[float], Optional[List[float]]]]:
         if isinstance(v, list):
             if all(isinstance(x, (int, float)) for x in v):
-                return [float(x) for x in v]
+                return [float(x) for x in v], None
             # list of word dicts
-            out = []
+            starts, ends = [], []
             for w in v:
                 if isinstance(w, dict):
-                    out.append(float(w.get('start', w.get('start_time', 0.0)) or 0.0))
-            return out
+                    starts.append(float(w.get('start', w.get('start_time', 0.0)) or 0.0))
+                    ends.append(float(w.get('end', w.get('end_time', 0.0)) or 0.0))
+            return starts, (ends if len(ends) == len(starts) and any(ends) else None)
         if isinstance(v, dict):
-            if 'word_starts' in v:
-                return [float(x) for x in v['word_starts']]
+            if 'starts' in v or 'word_starts' in v:
+                starts = [float(x) for x in (v.get('starts') or v.get('word_starts'))]
+                raw_ends = v.get('ends') if v.get('ends') is not None else v.get('word_ends')
+                ends = [float(x) for x in raw_ends] if raw_ends is not None else None
+                if ends is not None and len(ends) != len(starts):
+                    ends = None
+                return starts, ends
             if 'words' in v:
-                return [float(w.get('start', w.get('start_time', 0.0)) or 0.0) for w in v['words']]
+                starts = [float(w.get('start', w.get('start_time', 0.0)) or 0.0) for w in v['words']]
+                ends = [float(w.get('end', w.get('end_time', 0.0)) or 0.0) for w in v['words']]
+                return starts, (ends if any(ends) else None)
         return None
 
     # A directory -> merge every *.json / *.jsonl inside (handy for sharded runs).
     if os.path.isdir(path):
-        merged: Dict[str, List[float]] = {}
+        merged: Dict[str, Tuple[List[float], Optional[List[float]]]] = {}
         for fn in sorted(os.listdir(path)):
             if fn.endswith('.json') or fn.endswith('.jsonl'):
                 merged.update(_load_word_start_alignments(os.path.join(path, fn)))
         return merged
 
-    alignments: Dict[str, List[float]] = {}
+    alignments: Dict[str, Tuple[List[float], Optional[List[float]]]] = {}
     if path.endswith('.jsonl'):
         with open(path, 'r', encoding='utf-8') as f:
             for line in f:
@@ -443,16 +477,16 @@ def _load_word_start_alignments(path: str) -> Dict[str, List[float]]:
                 key = rec.get('file_id') or rec.get('audio_filepath') or rec.get('audio_file')
                 if key is None:
                     continue
-                starts = _starts_from_value(rec)
-                if starts is not None:
-                    alignments[_file_id(key)] = starts
+                times = _times_from_value(rec)
+                if times is not None:
+                    alignments[_file_id(key)] = times
     else:
         with open(path, 'r', encoding='utf-8') as f:
             data = json.load(f)
         for key, v in data.items():
-            starts = _starts_from_value(v)
-            if starts is not None:
-                alignments[_file_id(key)] = starts
+            times = _times_from_value(v)
+            if times is not None:
+                alignments[_file_id(key)] = times
     return alignments
 
 
@@ -476,7 +510,7 @@ class PrecomputedWordForcedAligner:
             for API parity with the live aligner.
     """
 
-    def __init__(self, tokenizer, alignments_path: str, sample_rate: int = 16000):
+    def __init__(self, tokenizer, alignments_path: str, sample_rate: int = 16000, anchor: str = "end"):
         if tokenizer is None:
             raise ValueError(
                 "PrecomputedWordForcedAligner needs the trainee tokenizer to group sub-words into words."
@@ -488,13 +522,22 @@ class PrecomputedWordForcedAligner:
             )
         self.tokenizer = tokenizer
         self.sample_rate = int(sample_rate)
+        self.anchor = str(anchor).lower()
         self.alignments_path = alignments_path
         self._alignments = _load_word_start_alignments(alignments_path)
         self._missing_logged = 0
+        self._warned_missing_ends = False
+        n_with_ends = sum(1 for _, ends in self._alignments.values() if ends is not None)
         logging.info(
-            f"[chunkwise-aligner] Loaded {len(self._alignments)} precomputed word-start alignments "
-            f"from '{alignments_path}'."
+            f"[chunkwise-aligner] Loaded {len(self._alignments)} precomputed word alignments "
+            f"from '{alignments_path}' ({n_with_ends} with end times; anchor='{self.anchor}')."
         )
+        if self.anchor == 'end' and n_with_ends == 0:
+            logging.warning(
+                "[chunkwise-aligner] anchor='end' but the precomputed alignments carry NO end times "
+                "(old format = start times only). Falling back to word-start anchoring. Regenerate the "
+                "alignments with scripts/asr_aligner/generate_qwen_word_alignments.py to store end times."
+            )
 
     def to(self, *args, **kwargs):  # for model.to(device) compatibility
         return self
@@ -546,13 +589,14 @@ class PrecomputedWordForcedAligner:
             if U_b <= 0 or key is None:
                 valid_mask[b] = False
                 continue
-            starts = self._alignments.get(_file_id(key))
-            if starts is None:
+            entry = self._alignments.get(_file_id(key))
+            if entry is None:
                 valid_mask[b] = False
                 if self._missing_logged < 20:
                     logging.warning(f"[chunkwise-aligner] No precomputed alignment for file_id='{key}'; skipping.")
                     self._missing_logged += 1
                 continue
+            starts, ends = entry
 
             ids_b = labels_cpu[b, :U_b].tolist()
             groups = group_token_ids_into_words(self._pieces(ids_b))
@@ -560,7 +604,15 @@ class PrecomputedWordForcedAligner:
             audio_dur = float(durations_cpu[b])
 
             assignment = map_word_starts_to_token_chunks(
-                groups, starts, audio_dur, T_tr, U_b, chunk_size, enforce_left_packing=enforce_left_packing
+                groups,
+                starts,
+                audio_dur,
+                T_tr,
+                U_b,
+                chunk_size,
+                enforce_left_packing=enforce_left_packing,
+                word_ends_sec=ends,
+                anchor=self.anchor,
             )
             if assignment is None:
                 valid_mask[b] = False

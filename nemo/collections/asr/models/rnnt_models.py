@@ -1337,6 +1337,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 tokenizer=tokenizer,
                 alignments_path=alignments_path,
                 sample_rate=int(self.cfg.get('sample_rate', 16000)),
+                anchor=str(ext_cfg.get('anchor', 'end')),
             )
             self._external_aligner_is_precomputed = True
         elif backend in ('qwen', 'word', 'qwen_word'):
@@ -1361,6 +1362,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 dtype=ext_cfg.get('dtype', 'bfloat16'),
                 device=ext_cfg.get('device', None),
                 sample_rate=int(self.cfg.get('sample_rate', 16000)),
+                anchor=str(ext_cfg.get('anchor', 'end')),
             )
         else:
             from nemo.collections.asr.parts.submodules.external_ctc_aligner import ExternalCTCForcedAligner
