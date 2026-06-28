@@ -1409,6 +1409,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         num_delay_variants = int(delay_cfg.get('num_variants', 0)) if delay_cfg is not None else 0
         max_delay = int(delay_cfg.get('max_delay', 0)) if delay_cfg is not None else 0
         weight_gamma = float(delay_cfg.get('weight_gamma', 1.0)) if delay_cfg is not None else 1.0
+        stat_log_every = int(delay_cfg.get('log_every', 200)) if delay_cfg is not None else 200
         self._chat_delay_enabled = num_delay_variants >= 1
 
         self.loss = ChatExternalAlignerCELoss(
@@ -1418,6 +1419,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             max_delay=max_delay,
             weight_gamma=weight_gamma,
             chunk_size=self.chunk_size,
+            stat_log_every=stat_log_every,
         )
 
         # Build the frozen external aligner that fixes the token->chunk path.

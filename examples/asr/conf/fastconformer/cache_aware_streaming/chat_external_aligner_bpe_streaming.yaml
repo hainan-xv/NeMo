@@ -67,6 +67,7 @@ model:
       num_variants: 0       # 0 disables; e.g. 4 to enable
       max_delay: 2          # max per-token delay in chunks (0 -> position-weight only)
       weight_gamma: 0.8     # within-chunk position weight base gamma**p (1.0 -> uniform)
+      log_every: 200        # log mean-weight / frac-delayed every N steps (rank 0; 0 disables)
 
     # --- precomputed (offline word-level) backend ----------------------------
     # JSON/JSONL file or directory of {file_id: {"starts": [...], "ends": [...]}}

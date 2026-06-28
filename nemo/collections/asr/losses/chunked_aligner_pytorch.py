@@ -82,6 +82,19 @@ import torch
 
 from nemo.core.classes import Loss
 from nemo.core.neural_types import LabelsType, LengthsType, LogprobsType, LossType, NeuralType
+from nemo.utils import logging
+
+
+def _is_global_rank0() -> bool:
+    """True on rank 0 (or when distributed is not initialized)."""
+    try:
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            return dist.get_rank() == 0
+    except Exception:
+        pass
+    return True
 
 __all__ = [
     'ChunkedAlignerLossPytorch',
@@ -607,10 +620,12 @@ class ChatExternalAlignerCELoss(Loss):
     where ``p`` is its within-chunk frame position (0 = chunk start): a token that
     stays in its base chunk keeps ``w = gamma**p`` (decays the later in the chunk
     its audio finishes), while a token moved to a later chunk is treated as
-    available from frame 0 -> ``w = gamma**0 = 1`` (max). With ``weight_gamma=1``
-    and ``max_delay=0`` this reduces EXACTLY to the plain single-path CE. In eval
-    mode (or when ``token_chunk_pos`` is ``None``) the plain single-path CE is used
-    so the validation loss is deterministic.
+    available from frame 0 -> ``w = gamma**0 = 1`` (max). The blank/EOC arc closing
+    each chunk takes the weight of the LAST token emitted in that chunk (1.0 if the
+    chunk has no tokens). With ``weight_gamma=1`` and ``max_delay=0`` this reduces
+    EXACTLY to the plain single-path CE. In eval mode (or when ``token_chunk_pos``
+    is ``None``) the plain single-path CE is used so the validation loss is
+    deterministic.
 
     Args:
         blank: index of the blank / end-of-chunk (EOC) symbol within ``V``.
@@ -625,6 +640,8 @@ class ChatExternalAlignerCELoss(Loss):
         weight_gamma: base of the within-chunk position weight ``gamma**p``
             (``(0, 1]``; ``1`` -> uniform weights).
         chunk_size: encoder frames per chunk (used to clamp positions).
+        stat_log_every: log mean weight / fraction-delayed / mean-delay every this
+            many training forwards (rank 0 only; ``<=0`` disables).
     """
 
     @property
@@ -649,6 +666,7 @@ class ChatExternalAlignerCELoss(Loss):
         max_delay: int = 0,
         weight_gamma: float = 1.0,
         chunk_size: int = 0,
+        stat_log_every: int = 200,
     ):
         super().__init__()
         if reduction not in ('none', 'sum', 'mean', 'mean_batch', 'mean_volume'):
@@ -663,6 +681,8 @@ class ChatExternalAlignerCELoss(Loss):
         self.max_delay = max(int(max_delay), 0)
         self.weight_gamma = float(weight_gamma)
         self.chunk_size = int(chunk_size)
+        self.stat_log_every = int(stat_log_every)
+        self._delay_step = 0  # counts training forwards with the delay objective
 
     def _sample_path_logprob(self, logp_b, labels_b, cids_b, n_b, U_b):
         """Differentiable log-prob of the fixed CHAT path for one sample.
@@ -702,18 +722,21 @@ class ChatExternalAlignerCELoss(Loss):
         chunks (running-max for monotonicity, clamped ``< n_chunks``), then weights
         each token arc by ``weight_gamma ** p_eff`` where ``p_eff`` is its
         within-chunk position (0 if it moved to a later chunk than its audio, or if
-        the position is unknown). Blank/EOC arcs are unweighted. Returns
-        ``(weighted_logprob, feasible)``.
+        the position is unknown). The blank/EOC arc that closes each chunk takes the
+        weight of the LAST token emitted in that chunk (the "prior token"), or 1.0
+        for a chunk with no tokens. Returns ``(weighted_logprob, feasible, stats)``
+        where ``stats`` is ``(sum_weight, n_delayed, sum_delta, n_tokens)`` tensors/
+        ints for periodic logging (``None`` when infeasible).
         """
         device = logp_b.device
         if U_b == 0 or n_b == 0:
-            return logp_b.new_zeros(()), False
+            return logp_b.new_zeros(()), False, None
 
         cids = cids_b[:U_b].long()
         if cids.min().item() < 0 or cids.max().item() >= n_b:
-            return logp_b.new_zeros(()), False
+            return logp_b.new_zeros(()), False, None
         if U_b > 1 and bool((cids[1:] < cids[:-1]).any().item()):
-            return logp_b.new_zeros(()), False
+            return logp_b.new_zeros(()), False, None
 
         # Sample per-token chunk delays, then make monotonic non-decreasing and
         # clamp into range. cummax of a non-decreasing-plus-noise sequence stays
@@ -744,7 +767,16 @@ class ChatExternalAlignerCELoss(Loss):
         chunk_range = torch.arange(n_b, device=device)
         bl_logp = logp_b[chunk_range, prefix_incl, self.blank]
 
-        return weighted_tok + bl_logp.sum(), True
+        # EOC/blank weight = weight of the last token emitted in that chunk (the
+        # token sitting at index prefix_incl[c]-1); 1.0 for a chunk with no tokens.
+        last_idx = (prefix_incl - 1).clamp(min=0)
+        blank_weights = torch.where(
+            counts > 0, weights[last_idx], torch.ones_like(weights[last_idx])
+        )
+        weighted_bl = (blank_weights * bl_logp).sum()
+
+        stats = (weights.sum().detach(), (delta > 0).sum().detach(), delta.sum().detach(), U_b)
+        return weighted_tok + weighted_bl, True, stats
 
     def forward(self, acts, labels, act_lens, label_lens, token_chunk_ids, valid_mask=None, token_chunk_pos=None):
         # CPU patch for FP16 (log_softmax on CPU is not implemented for half).
@@ -760,6 +792,12 @@ class ChatExternalAlignerCELoss(Loss):
         use_delay = self.training and self.num_delay_variants >= 1 and token_chunk_pos is not None
         K = self.num_delay_variants if use_delay else 1
 
+        # Running stats over this batch (tokens x variants) for periodic logging.
+        stat_sum_w = logp.new_zeros(())
+        stat_n_delayed = logp.new_zeros(())
+        stat_sum_delta = logp.new_zeros(())
+        stat_n_tok = 0
+
         losses = []
         valids = []
         for b in range(B):
@@ -774,17 +812,40 @@ class ChatExternalAlignerCELoss(Loss):
                 acc = logp.new_zeros(())
                 feasible = False
                 for _ in range(K):
-                    lp, feas = self._sample_delayed_path_logprob(
+                    lp, feas, st = self._sample_delayed_path_logprob(
                         logp[b], labels[b], token_chunk_ids[b], token_chunk_pos[b], n_b, U_b
                     )
                     acc = acc + (-lp)
                     feasible = feasible or feas
+                    if st is not None:
+                        sw, nd, sd, nt = st
+                        stat_sum_w = stat_sum_w + sw
+                        stat_n_delayed = stat_n_delayed + nd
+                        stat_sum_delta = stat_sum_delta + sd
+                        stat_n_tok += int(nt)
                 losses.append(acc / K)
                 valids.append(feasible)
             else:
                 logprob, feasible = self._sample_path_logprob(logp[b], labels[b], token_chunk_ids[b], n_b, U_b)
                 losses.append(-logprob)
                 valids.append(feasible)
+
+        if use_delay:
+            self._delay_step += 1
+            if (
+                self.stat_log_every > 0
+                and self._delay_step % self.stat_log_every == 0
+                and stat_n_tok > 0
+                and _is_global_rank0()
+            ):
+                ntok = float(stat_n_tok)
+                logging.info(
+                    f"[chat-aligner] delay-weight stats (step~{self._delay_step}, K={K}): "
+                    f"mean_token_weight={float(stat_sum_w.item()) / ntok:.3f}, "
+                    f"frac_delayed={float(stat_n_delayed.item()) / ntok:.3f}, "
+                    f"mean_delta_chunks={float(stat_sum_delta.item()) / ntok:.3f} "
+                    f"(over {stat_n_tok} token x variant slots)."
+                )
 
         losses = torch.stack(losses)
         valids_t = torch.tensor(valids, device=losses.device, dtype=torch.bool)

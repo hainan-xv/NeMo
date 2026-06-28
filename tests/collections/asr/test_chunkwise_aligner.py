@@ -956,7 +956,7 @@ def test_chat_ce_delay_eval_is_deterministic_baseline():
 
 @pytest.mark.unit
 def test_chat_ce_delay_position_weighting_matches_manual():
-    """max_delay=0: token CE terms scaled by gamma**pos; blanks unweighted."""
+    """max_delay=0: token CE scaled by gamma**pos; each EOC weighted like its last token (1.0 if empty)."""
     B, n_chunks, U, V = 1, 4, 3, 7
     blank = V - 1
     gamma = 0.5
@@ -974,7 +974,10 @@ def test_chat_ce_delay_position_weighting_matches_manual():
     tok = sum(weights[u] * logp[token_chunk_ids[0, u], u, labels[0, u]] for u in range(U))
     counts = torch.bincount(token_chunk_ids[0], minlength=n_chunks)
     prefix = torch.cumsum(counts, dim=0)
-    bl = sum(logp[c, prefix[c], blank] for c in range(n_chunks))
+    # EOC weight = last token's weight in that chunk, else 1.0. Chunks 0,1,2 each
+    # hold one token (u=0,1,2 -> weights[0],weights[1],weights[2]); chunk 3 empty -> 1.0.
+    blank_w = [weights[0], weights[1], weights[2], 1.0]
+    bl = sum(blank_w[c] * logp[c, prefix[c], blank] for c in range(n_chunks))
     expected = float(-(tok + bl))
 
     delayed = ChatExternalAlignerCELoss(
