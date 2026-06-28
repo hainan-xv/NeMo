@@ -105,6 +105,7 @@ def map_word_starts_to_token_chunks(
     T_tr: int,
     U_b: int,
     chunk_size: int,
+    enforce_left_packing: bool = True,
 ) -> Optional[dict]:
     """Map per-word start times (seconds) to a per-token chunk assignment.
 
@@ -119,14 +120,22 @@ def map_word_starts_to_token_chunks(
         audio_dur: utterance duration in seconds.
         T_tr: number of trainee encoder frames for this utterance.
         U_b: number of (real) trainee tokens.
-        chunk_size: encoder frames per chunk (== max tokens per chunk).
+        chunk_size: encoder frames per chunk.
+        enforce_left_packing: when ``True`` (additive-joint Chunkwise-Aligner
+            baseline) a chunk can host at most ``chunk_size`` tokens (tokens are
+            left-packed onto frames) and ``T >= U`` is required. When ``False``
+            (CHAT cross-attention baseline) a chunk pools all its frames into one
+            representation and may host arbitrarily many tokens, so neither
+            constraint applies -- only monotonicity / in-range bucketing.
 
     Returns:
         ``{token_index: chunk}`` of length ``U_b``, or ``None`` if the assignment
-        is infeasible (word-count mismatch, ``T < U``, or a chunk would have to
-        host more tokens than it has frames -- not left-packable).
+        is infeasible (word-count mismatch; or, when ``enforce_left_packing``,
+        ``T < U`` or a chunk would host more tokens than it has frames).
     """
-    if len(word_starts_sec) != len(word_groups) or T_tr < U_b:
+    if len(word_starts_sec) != len(word_groups):
+        return None
+    if enforce_left_packing and T_tr < U_b:
         return None
     audio_dur = max(float(audio_dur), 1e-6)
     n_chunks = (T_tr + chunk_size - 1) // chunk_size
@@ -148,11 +157,13 @@ def map_word_starts_to_token_chunks(
         for ti in group:
             assignment[ti] = chunk
             counts[chunk] += 1
-    # Left-packing feasibility: a chunk cannot host more tokens than frames.
-    for c in range(n_chunks):
-        frames_here = min(chunk_size, T_tr - c * chunk_size)
-        if counts[c] > frames_here:
-            return None
+    # Left-packing feasibility: a chunk cannot host more tokens than frames
+    # (additive-joint baseline only; CHAT cross-attention pools the whole chunk).
+    if enforce_left_packing:
+        for c in range(n_chunks):
+            frames_here = min(chunk_size, T_tr - c * chunk_size)
+            if counts[c] > frames_here:
+                return None
     return assignment
 
 
@@ -278,6 +289,7 @@ class QwenWordForcedAligner:
         label_lens: torch.Tensor,
         target_frame_lengths: torch.Tensor,
         chunk_size: int,
+        enforce_left_packing: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Word-align the batch and bucket each token into a trainee encoder chunk.
 
@@ -363,7 +375,9 @@ class QwenWordForcedAligner:
             audio_dur = int(sig_len_cpu[b]) / float(self.sample_rate)
             starts = [float(getattr(w, 'start_time', 0.0) or 0.0) for w in result]
 
-            assignment = map_word_starts_to_token_chunks(groups, starts, audio_dur, T_tr, U_b, chunk_size)
+            assignment = map_word_starts_to_token_chunks(
+                groups, starts, audio_dur, T_tr, U_b, chunk_size, enforce_left_packing=enforce_left_packing
+            )
             if assignment is None:
                 valid_mask[b] = False
                 continue
@@ -497,6 +511,7 @@ class PrecomputedWordForcedAligner:
         target_frame_lengths: torch.Tensor,
         audio_durations: torch.Tensor,
         chunk_size: int,
+        enforce_left_packing: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Bucket each token into a chunk from precomputed word start times.
 
@@ -544,7 +559,9 @@ class PrecomputedWordForcedAligner:
             T_tr = int(target_frames_cpu[b])
             audio_dur = float(durations_cpu[b])
 
-            assignment = map_word_starts_to_token_chunks(groups, starts, audio_dur, T_tr, U_b, chunk_size)
+            assignment = map_word_starts_to_token_chunks(
+                groups, starts, audio_dur, T_tr, U_b, chunk_size, enforce_left_packing=enforce_left_packing
+            )
             if assignment is None:
                 valid_mask[b] = False
                 continue

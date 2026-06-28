@@ -133,6 +133,7 @@ class ExternalCTCForcedAligner:
         label_lens: torch.Tensor,
         target_frame_lengths: torch.Tensor,
         chunk_size: int,
+        enforce_left_packing: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Force-align labels and bucket each token into a trainee encoder chunk.
 
@@ -193,7 +194,7 @@ class ExternalCTCForcedAligner:
         for b in range(B):
             U_b = int(label_lens[b])
             T_tr = int(target_frame_lengths[b])
-            if U_b == 0 or T_tr < U_b:
+            if U_b == 0 or (enforce_left_packing and T_tr < U_b):
                 valid_mask[b] = False
                 continue
 
@@ -238,12 +239,14 @@ class ExternalCTCForcedAligner:
                 token_chunk_ids[b, :] = -1
                 continue
 
-            # Left-packing feasibility: a chunk cannot host more tokens than frames.
-            for c in range(n_chunks):
-                frames_here = min(chunk_size, T_tr - c * chunk_size)
-                if counts[c] > frames_here:
-                    ok = False
-                    break
+            # Left-packing feasibility: a chunk cannot host more tokens than frames
+            # (additive-joint baseline only; CHAT cross-attention pools the chunk).
+            if enforce_left_packing:
+                for c in range(n_chunks):
+                    frames_here = min(chunk_size, T_tr - c * chunk_size)
+                    if counts[c] > frames_here:
+                        ok = False
+                        break
             if not ok:
                 valid_mask[b] = False
                 token_chunk_ids[b, :] = -1

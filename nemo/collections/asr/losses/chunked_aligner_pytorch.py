@@ -90,6 +90,8 @@ __all__ = [
     'chunked_aligner_nar_loss_bruteforce',
     'ChunkwiseAlignerLoss',
     'chunkwise_aligner_single_path_logprob',
+    'ChatExternalAlignerCELoss',
+    'chat_external_aligner_single_path_logprob',
 ]
 
 # Large finite stand-in for log(0); mirrors the other PyTorch loss references
@@ -473,6 +475,209 @@ class ChunkwiseAlignerLoss(Loss):
                 valids.append(False)
                 continue
             logprob, feasible = self._sample_path_logprob(logp[b], labels[b], token_chunk_ids[b], T_b, U_b)
+            losses.append(-logprob)
+            valids.append(feasible)
+
+        losses = torch.stack(losses)
+        valids_t = torch.tensor(valids, device=losses.device, dtype=torch.bool)
+
+        if self.reduction == 'none':
+            return losses
+
+        # Zero out invalid samples so they never contribute to the (masked) reduction.
+        losses = torch.where(valids_t, losses, torch.zeros_like(losses))
+        label_lens = label_lens.to(losses.device)
+        valid_lens = torch.where(valids_t, label_lens, torch.zeros_like(label_lens))
+
+        if self.reduction == 'sum':
+            return losses.sum()
+        if self.reduction == 'mean_volume':
+            return losses.sum() / valid_lens.sum().clamp(min=1)
+        if self.reduction == 'mean_batch':
+            denom = valids_t.sum().clamp(min=1)
+            return losses.sum() / denom
+        if self.reduction == 'mean':
+            per_sample = torch.div(losses, valid_lens.clamp(min=1))
+            denom = valids_t.sum().clamp(min=1)
+            return per_sample.sum() / denom
+        return losses
+
+
+# ============================================================================
+# CHAT external-alignment cross-entropy baseline (single fixed path, chunk-indexed)
+# ============================================================================
+# This is the external-alignment counterpart for the CHAT (Chunk-wise Attention
+# Transducer, RNNTAttJoint) model. Unlike the additive-joint Chunkwise Aligner
+# above -- whose ``acts`` are FRAME-indexed ``(B, T, U+1, V)`` and which left-packs
+# the tokens of a chunk onto the chunk's left-most FRAMES -- the CHAT joint's
+# cross-attention already pools each chunk's frames into a single per-chunk
+# representation, so its ``acts`` are CHUNK-indexed ``(B, n_chunks, U+1, V)``.
+#
+# In CHAT the chunk axis plays the role of the RNN-T "time" axis: at chunk ``c``
+# the model emits the tokens assigned to that chunk (advancing the predictor
+# state ``u``) and then a single blank to advance to chunk ``c+1``. With an
+# EXTERNAL aligner fixing the per-token chunk assignment, that path is unique, so
+# training reduces to teacher-forced cross-entropy over it -- the standard RNN-T
+# loss restricted to one alignment. Concretely, for sample ``b`` with ``n_b``
+# valid chunks and ``U_b`` tokens whose chunk ids are ``cids`` (non-decreasing,
+# in ``[0, n_b)``):
+#
+#   * token arc  for token ``u``:  ``logp[b, cids[u], u, labels[u]]``
+#   * blank arc  for chunk ``c``:  ``logp[b, c, prefix_incl[c], blank]``  (one per
+#     chunk; ``prefix_incl[c]`` = #tokens assigned to chunks ``<= c``)
+#
+# and the loss is the negative sum of those log-probs. Differences from
+# :class:`ChunkwiseAlignerLoss`: (1) the frame index ``c*C + within`` collapses to
+# the chunk index ``c``; (2) EVERY chunk emits exactly one blank (the chunk axis
+# IS the time axis), not only "not completely filled" chunks; and (3) there is NO
+# left-packing feasibility constraint -- a chunk may host arbitrarily many tokens
+# (the cross-attention pools the whole chunk), so only monotonic, in-range chunk
+# ids are required. The forward is a sum of ``gather`` ops, so autograd provides
+# the backward.
+
+
+def chat_external_aligner_single_path_logprob(
+    acts: torch.Tensor,
+    labels: torch.Tensor,
+    act_lens: torch.Tensor,
+    label_lens: torch.Tensor,
+    token_chunk_ids: torch.Tensor,
+    blank: int,
+) -> torch.Tensor:
+    """Reference single-path log-prob for the CHAT external-alignment path (loop-based).
+
+    ``acts`` are CHUNK-indexed raw logits ``(B, n_chunks, U+1, V)`` (log_softmax is
+    applied internally). ``act_lens[b]`` is the number of valid chunks ``n_b`` and
+    ``token_chunk_ids[b, u]`` the chunk that token ``u`` is emitted in. Returns
+    per-sample ``log P(path | acts)`` of shape ``(B,)``, or ``NEG_INF`` if the
+    assignment is infeasible (out-of-range or non-monotonic chunk ids). Used for
+    correctness tests against :class:`ChatExternalAlignerCELoss`.
+    """
+    logp = torch.log_softmax(acts.float(), dim=-1)
+    B = acts.shape[0]
+
+    out = []
+    for b in range(B):
+        n_b = int(act_lens[b])
+        U_b = int(label_lens[b])
+
+        feasible = U_b >= 1 and n_b >= 1
+        score = 0.0
+        u = 0
+        if feasible:
+            for c in range(n_b):
+                # emit every token assigned to chunk c (left-to-right)
+                while u < U_b and int(token_chunk_ids[b, u]) == c:
+                    score += float(logp[b, c, u, int(labels[b, u])])
+                    u += 1
+                # one blank/EOC per chunk to advance the chunk (time) axis
+                score += float(logp[b, c, u, blank])
+            # any tokens not consumed -> ids were out of range / non-monotonic
+            if u != U_b:
+                feasible = False
+            # all chunk ids must be valid and monotonic non-decreasing
+            cids = [int(token_chunk_ids[b, i]) for i in range(U_b)]
+            if any(c < 0 or c >= n_b for c in cids):
+                feasible = False
+            if any(cids[i] < cids[i - 1] for i in range(1, U_b)):
+                feasible = False
+
+        out.append(torch.tensor(score) if feasible else torch.tensor(NEG_INF))
+
+    return torch.stack(out)
+
+
+class ChatExternalAlignerCELoss(Loss):
+    """Single fixed-path cross-entropy loss for the CHAT external-alignment baseline.
+
+    Scores the SINGLE chunk->token path fixed by an external aligner (via the
+    per-token chunk assignment ``token_chunk_ids``) on the CHAT joint's
+    CHUNK-indexed activations ``acts: (B, n_chunks, U+1, V)`` (raw logits). The
+    forward is a sum of ``gather`` ops, so autograd provides the backward.
+
+    Args:
+        blank: index of the blank / end-of-chunk (EOC) symbol within ``V``.
+        reduction: one of ``'none'``, ``'sum'``, ``'mean'`` (per-sample loss
+            divided by label length, then averaged over valid samples),
+            ``'mean_batch'`` (mean over valid samples) or ``'mean_volume'`` (sum
+            divided by the total number of labels in the valid samples).
+    """
+
+    @property
+    def input_types(self):
+        return {
+            "acts": NeuralType(('B', 'T', 'T', 'D'), LogprobsType()),
+            "labels": NeuralType(('B', 'T'), LabelsType()),
+            "act_lens": NeuralType(tuple('B'), LengthsType()),
+            "label_lens": NeuralType(tuple('B'), LengthsType()),
+            "token_chunk_ids": NeuralType(('B', 'T'), LabelsType()),
+        }
+
+    @property
+    def output_types(self):
+        return {"loss": NeuralType(elements_type=LossType())}
+
+    def __init__(self, blank: int, reduction: str = 'mean_volume'):
+        super().__init__()
+        if reduction not in ('none', 'sum', 'mean', 'mean_batch', 'mean_volume'):
+            raise ValueError(
+                "reduction must be one of "
+                "['none', 'sum', 'mean', 'mean_batch', 'mean_volume'], "
+                f"got '{reduction}'."
+            )
+        self.blank = blank
+        self.reduction = reduction
+
+    def _sample_path_logprob(self, logp_b, labels_b, cids_b, n_b, U_b):
+        """Differentiable log-prob of the fixed CHAT path for one sample.
+
+        ``logp_b`` is ``(n_chunks, U+1, V)`` log-probs. Returns ``(logprob,
+        feasible)`` where ``logprob`` is a scalar tensor (zero when infeasible).
+        """
+        device = logp_b.device
+
+        if U_b == 0 or n_b == 0:
+            return logp_b.new_zeros(()), False
+
+        cids = cids_b[:U_b].long()
+        # In-range, monotonic non-decreasing assignment (no left-packing limit).
+        if cids.min().item() < 0 or cids.max().item() >= n_b:
+            return logp_b.new_zeros(()), False
+        if U_b > 1 and bool((cids[1:] < cids[:-1]).any().item()):
+            return logp_b.new_zeros(()), False
+
+        counts = torch.bincount(cids, minlength=n_b)[:n_b]  # tokens per chunk
+        prefix_incl = torch.cumsum(counts, dim=0)  # tokens emitted through chunk c
+
+        # ---- token arcs: token u emitted at its chunk cids[u], predictor state u ----
+        u_idx = torch.arange(U_b, device=device)
+        tok_logp = logp_b[cids, u_idx, labels_b[:U_b].long()]
+
+        # ---- blank/EOC arcs: one per chunk c at predictor state prefix_incl[c] ----
+        chunk_range = torch.arange(n_b, device=device)
+        bl_logp = logp_b[chunk_range, prefix_incl, self.blank]
+
+        return tok_logp.sum() + bl_logp.sum(), True
+
+    def forward(self, acts, labels, act_lens, label_lens, token_chunk_ids, valid_mask=None):
+        # CPU patch for FP16 (log_softmax on CPU is not implemented for half).
+        if not acts.is_cuda and acts.dtype == torch.float16:
+            acts = acts.float()
+
+        logp = torch.log_softmax(acts, dim=-1)
+        B = acts.shape[0]
+
+        losses = []
+        valids = []
+        for b in range(B):
+            n_b = int(act_lens[b])
+            U_b = int(label_lens[b])
+            externally_valid = True if valid_mask is None else bool(valid_mask[b])
+            if not externally_valid:
+                losses.append(logp.new_zeros(()))
+                valids.append(False)
+                continue
+            logprob, feasible = self._sample_path_logprob(logp[b], labels[b], token_chunk_ids[b], n_b, U_b)
             losses.append(-logprob)
             valids.append(feasible)
 

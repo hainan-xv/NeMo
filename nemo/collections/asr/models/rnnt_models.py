@@ -43,7 +43,7 @@ from nemo.collections.asr.parts.mixins import (
     TranscribeConfig,
     TranscriptionReturnType,
 )
-from nemo.collections.asr.losses.chunked_aligner_pytorch import ChunkwiseAlignerLoss
+from nemo.collections.asr.losses.chunked_aligner_pytorch import ChatExternalAlignerCELoss, ChunkwiseAlignerLoss
 from nemo.collections.asr.parts.numba.rnnt_loss.rnnt_pytorch import ChunkedAlignerLossNumba, ChunkedAlignerNarLossNumba
 from nemo.collections.asr.parts.preprocessing.segment import ChannelSelectorType
 from nemo.collections.asr.parts.submodules.aligner_decoding import AlignerDecoding
@@ -179,17 +179,22 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
         super().__init__(cfg=cfg, trainer=trainer)
         self.loss_type = str(self.cfg.get('loss_type', 'rnnt')).lower()
-        if self.loss_type not in ('rnnt', 'aligner', 'chunked_aligner', 'chunkwise_aligner'):
+        if self.loss_type not in ('rnnt', 'aligner', 'chunked_aligner', 'chunkwise_aligner', 'chat_aligner'):
             raise ValueError(
-                "model.loss_type must be one of ['rnnt', 'aligner', 'chunked_aligner', 'chunkwise_aligner'], "
+                "model.loss_type must be one of "
+                "['rnnt', 'aligner', 'chunked_aligner', 'chunkwise_aligner', 'chat_aligner'], "
                 f"got '{self.loss_type}'."
             )
-        # Frozen external aligner used by the 'chunkwise_aligner' baseline
-        # (lazily built in its setup); kept out of nn.Module child registration.
+        # Frozen external aligner used by the 'chunkwise_aligner' / 'chat_aligner'
+        # baselines (lazily built in its setup); kept out of nn.Module child registration.
         self._external_aligner = None
         # True when the external aligner reads OFFLINE precomputed word alignments
         # (backend='precomputed'); it is keyed by sample_id->file_id instead of audio.
         self._external_aligner_is_precomputed = False
+        # Whether the external alignment must be left-packable onto chunk frames.
+        # True for the additive-joint Chunkwise-Aligner; False for CHAT (the
+        # cross-attention joint pools the whole chunk, so a chunk may host many tokens).
+        self._aligner_enforce_left_packing = True
 
         # Initialize components
         self.preprocessor = EncDecRNNTModel.from_config_dict(self.cfg.preprocessor)
@@ -241,6 +246,8 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 self._setup_chunked_aligner_loss_and_decoding()
             elif self.loss_type == 'chunkwise_aligner':
                 self._setup_chunkwise_aligner_loss_and_decoding()
+            elif self.loss_type == 'chat_aligner':
+                self._setup_chat_aligner_loss_and_decoding()
             else:
                 # Setup RNNT Loss
                 loss_name, loss_kwargs = self.extract_rnnt_loss_cfg(self.cfg.get("loss", None))
@@ -270,10 +277,13 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         else:
             self.spec_warp = None
 
-        # 'aligner' and 'chunked_aligner' use their own decoding objects (set up
-        # above) plus a manual edit-distance WER; only standard RNN-T uses the
-        # RNNTDecoding + WER metric objects here.
-        if self.loss_type == 'rnnt':
+        # 'aligner', 'chunked_aligner' and 'chunkwise_aligner' use their own decoding
+        # objects (set up above) plus a manual edit-distance WER. Standard RNN-T AND
+        # the CHAT external-alignment baseline ('chat_aligner') use the RNNTDecoding +
+        # WER metric objects here: CHAT inference is ordinary greedy/beam RNN-T
+        # decoding over the chunk axis (RNNTDecoding calls the joint's
+        # chunk_encoder_for_decoding), and only the TRAINING loss differs.
+        if self.loss_type in ('rnnt', 'chat_aligner'):
             self.cfg.decoding = self.set_decoding_type_according_to_loss(self.cfg.decoding)
             # Setup decoding objects
             self.decoding = RNNTDecoding(
@@ -1280,23 +1290,34 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         )
 
         # Build the frozen external aligner that fixes the label->chunk path.
+        self._build_external_aligner('chunkwise_aligner')
+        # The additive RNN-T joint left-packs tokens onto chunk frames.
+        self._aligner_enforce_left_packing = True
+
+    def _build_external_aligner(self, owner_loss_type: str):
+        """Construct the frozen external aligner (shared by chunkwise/CHAT baselines).
+
+        Reads ``model.external_aligner`` and instantiates the backend-specific
+        aligner, setting ``self._external_aligner`` and
+        ``self._external_aligner_is_precomputed``. ``owner_loss_type`` is only used
+        for clearer error messages.
+        """
         ext_cfg = self.cfg.get('external_aligner', None)
         if ext_cfg is None:
             raise ValueError(
-                "loss_type='chunkwise_aligner' requires a `model.external_aligner` config block. Use "
-                "`backend: qwen` (word-level, tokenizer-agnostic) with `model_name`, or `backend: ctc` "
-                "(token-level) with `model_path`/`pretrained_name`."
+                f"loss_type='{owner_loss_type}' requires a `model.external_aligner` config block. Use "
+                "`backend: precomputed` (offline word-level, recommended) with `alignments_path`, "
+                "`backend: qwen` (live word-level) with `model_name`, or `backend: ctc` (token-level) "
+                "with `model_path`/`pretrained_name`."
             )
 
-        # 'ctc'  -> token-level forced alignment; external model MUST share the
-        #           trainee tokenizer (legacy behaviour, default for back-compat).
-        # 'qwen' -> word-level forced alignment; all sub-words of a word share the
-        #           word's chunk, so the external tokenizer is irrelevant.
+        # 'precomputed' -> OFFLINE word-level alignment (fastest, recommended).
+        # 'qwen'        -> LIVE word-level forced alignment (tokenizer-agnostic).
+        # 'ctc'         -> token-level forced alignment; external model MUST share
+        #                  the trainee tokenizer (default for back-compat).
         backend = str(ext_cfg.get('backend', 'ctc')).lower()
         self._external_aligner_is_precomputed = False
         if backend in ('precomputed', 'offline', 'precomp'):
-            # Option B: word alignments produced OFFLINE by scripts/asr_aligner/
-            # generate_qwen_word_alignments.py. No qwen_asr/transformers at train time.
             from nemo.collections.asr.parts.submodules.external_word_aligner import PrecomputedWordForcedAligner
 
             tokenizer = getattr(self, 'tokenizer', None)
@@ -1352,6 +1373,42 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 viterbi_device=ext_cfg.get('viterbi_device', None),
             )
 
+    def _setup_chat_aligner_loss_and_decoding(self):
+        """Set up the CHAT external-alignment cross-entropy baseline.
+
+        Architecturally this is the standard CHAT model (cross-attention
+        ``RNNTAttJoint`` + RNN-T prediction net + ordinary greedy/beam RNN-T
+        decoding over the chunk axis). The ONLY difference from a vanilla CHAT
+        model is the TRAINING objective: instead of the full-sum RNN-T loss over
+        every token->chunk alignment, a frozen external aligner FIXES the
+        token->chunk assignment and the model is trained with teacher-forced
+        cross-entropy over that single path (:class:`ChatExternalAlignerCELoss`).
+
+        Decoding / WER reuse the standard RNNTDecoding + WER objects (set up in
+        ``__init__`` for ``loss_type in ('rnnt', 'chat_aligner')``).
+        """
+        if not hasattr(self.joint, 'chunk_size') or self.joint.chunk_size <= 0:
+            raise ValueError(
+                "loss_type='chat_aligner' requires the CHAT cross-attention joint "
+                "(model.joint._target_=nemo.collections.asr.modules.RNNTAttJoint) with a positive "
+                "chunk_size (inferred from the encoder att_context_size, or set model.joint.chunk_size)."
+            )
+        # The aligner buckets tokens by encoder-frame//chunk_size, which must match
+        # the joint's chunk grouping; reuse the joint's chunk_size for both.
+        self.chunk_size = int(self.joint.chunk_size)
+
+        blank_id = self.joint.num_classes_with_blank - 1
+        ext_cfg = self.cfg.get('external_aligner', None)
+        reduction = str(ext_cfg.get('reduction', 'mean_volume')) if ext_cfg is not None else 'mean_volume'
+
+        self.loss = ChatExternalAlignerCELoss(blank=blank_id, reduction=reduction)
+
+        # Build the frozen external aligner that fixes the token->chunk path.
+        self._build_external_aligner('chat_aligner')
+        # CHAT's cross-attention pools the whole chunk, so a chunk may host any
+        # number of tokens (no left-packing onto frames).
+        self._aligner_enforce_left_packing = False
+
     @torch.no_grad()
     def _external_chunk_assignment(
         self,
@@ -1378,6 +1435,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             label_lens=transcript_len,
             target_frame_lengths=encoded_len,
             chunk_size=self.chunk_size,
+            enforce_left_packing=self._aligner_enforce_left_packing,
         )
         n_total = int(valid_mask.numel())
         n_discarded = int((~valid_mask).sum().item())
@@ -1453,6 +1511,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             target_frame_lengths=encoded_len,
             audio_durations=durations,
             chunk_size=self.chunk_size,
+            enforce_left_packing=self._aligner_enforce_left_packing,
         )
         n_total = int(valid_mask.numel())
         n_discarded = int((~valid_mask).sum().item())
@@ -1486,6 +1545,35 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             acts=joint,
             labels=transcript,
             act_lens=encoded_len,
+            label_lens=transcript_len,
+            token_chunk_ids=token_chunk_ids,
+            valid_mask=valid_mask,
+        )
+        if loss_value.dim() > 0:
+            loss_value = loss_value.squeeze()
+        return loss_value
+
+    def _chat_aligner_loss(
+        self,
+        joint: torch.Tensor,
+        transcript: torch.Tensor,
+        transcript_len: torch.Tensor,
+        num_chunks: torch.Tensor,
+        token_chunk_ids: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Single fixed-path cross-entropy loss for the CHAT external-alignment baseline.
+
+        ``joint`` is the CHAT joint output ``[B, n_chunks, U+1, V]`` (chunk-indexed
+        raw logits), ``num_chunks`` the per-utterance valid chunk count
+        (``joint.num_chunks_per_utterance``), and ``token_chunk_ids`` / ``valid_mask``
+        come from the frozen external aligner. The loss slices each sample by
+        ``label_lens`` / ``act_lens`` internally, so no trimming is required.
+        """
+        loss_value = self.loss(
+            acts=joint,
+            labels=transcript,
+            act_lens=num_chunks,
             label_lens=transcript_len,
             token_chunk_ids=token_chunk_ids,
             valid_mask=valid_mask,
@@ -2267,10 +2355,11 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         else:
             encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
 
-        # Chunkwise-Aligner baseline: derive the external label->chunk alignment
-        # while the raw audio is still available (the live aligner needs it).
+        # Chunkwise-Aligner / CHAT external-alignment baselines: derive the external
+        # token->chunk alignment while the raw audio is still available (the live
+        # aligner needs it). Both reuse the same external aligner + assignment.
         chunkwise_assignment = None
-        if self.loss_type == 'chunkwise_aligner':
+        if self.loss_type in ('chunkwise_aligner', 'chat_aligner'):
             if self._external_aligner_is_precomputed:
                 chunkwise_assignment = self._precomputed_chunk_assignment(
                     sample_ids, signal_len, transcript, transcript_len, encoded_len
@@ -2384,12 +2473,21 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         if not self.joint.fuse_loss_wer:
             joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder, encoder_lengths=encoded_len)
             effective_len = getattr(self.joint, 'num_chunks_per_utterance', encoded_len)
-            loss_value = self.loss(
-                log_probs=joint,
-                targets=transcript,
-                input_lengths=effective_len,
-                target_lengths=target_length,
-            )
+            if self.loss_type == 'chat_aligner':
+                # CHAT external-alignment baseline: cross-entropy over the single
+                # token->chunk path fixed by the frozen external aligner (computed
+                # above), instead of the full-sum RNN-T loss.
+                token_chunk_ids, valid_mask, _, _ = chunkwise_assignment
+                loss_value = self._chat_aligner_loss(
+                    joint, transcript, target_length, effective_len, token_chunk_ids, valid_mask
+                )
+            else:
+                loss_value = self.loss(
+                    log_probs=joint,
+                    targets=transcript,
+                    input_lengths=effective_len,
+                    target_lengths=target_length,
+                )
 
             # Add auxiliary losses, if registered
             loss_value = self.add_auxiliary_losses(loss_value)
@@ -2492,11 +2590,11 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         else:
             encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
 
-        # Chunkwise-Aligner baseline: external label->chunk alignment. Computed
-        # unconditionally so the discard ratio is always reported alongside val_wer,
-        # even when compute_eval_loss is off.
+        # Chunkwise-Aligner / CHAT external-alignment baselines: external
+        # token->chunk alignment. Computed unconditionally so the discard ratio is
+        # always reported alongside val_wer, even when compute_eval_loss is off.
         chunkwise_assignment = None
-        if self.loss_type == 'chunkwise_aligner':
+        if self.loss_type in ('chunkwise_aligner', 'chat_aligner'):
             if self._external_aligner_is_precomputed:
                 chunkwise_assignment = self._precomputed_chunk_assignment(
                     sample_ids, signal_len, transcript, transcript_len, encoded_len, dataloader_idx=dataloader_idx
@@ -2557,14 +2655,31 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 decoder, target_length, states = self.decoder(targets=transcript, target_length=transcript_len)
                 joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder, encoder_lengths=encoded_len)
                 effective_len = getattr(self.joint, 'num_chunks_per_utterance', encoded_len)
-                loss_value = self.loss(
-                    log_probs=joint,
-                    targets=transcript,
-                    input_lengths=effective_len,
-                    target_lengths=target_length,
-                )
+                if self.loss_type == 'chat_aligner':
+                    token_chunk_ids, valid_mask, _, _ = chunkwise_assignment
+                    loss_value = self._chat_aligner_loss(
+                        joint, transcript, target_length, effective_len, token_chunk_ids, valid_mask
+                    )
+                else:
+                    loss_value = self.loss(
+                        log_probs=joint,
+                        targets=transcript,
+                        input_lengths=effective_len,
+                        target_lengths=target_length,
+                    )
 
                 tensorboard_logs['val_loss'] = loss_value
+
+            # Report the external-alignment discard ratio (CHAT baseline) as summed
+            # num/denom so multi_validation_epoch_end micro-averages it -> val_discard.
+            if chunkwise_assignment is not None:
+                _, _, n_discarded, n_total = chunkwise_assignment
+                tensorboard_logs['val_discard_num'] = torch.tensor(
+                    float(n_discarded), dtype=torch.float32, device=encoded.device
+                )
+                tensorboard_logs['val_discard_denom'] = torch.tensor(
+                    float(n_total), dtype=torch.float32, device=encoded.device
+                )
 
             if getattr(self, 'multi_target_enabled', False):
                 # One decode -> char / notone / tone error rates. val_wer (char) stays
