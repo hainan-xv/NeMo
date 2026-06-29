@@ -1660,8 +1660,25 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         num_targets = (target_ids != IGNORE_INDEX).long().sum()
 
         if num_targets == 0:
-            logging.warning("Batch %d: num_targets is 0 — skipping (returning zero loss).", batch_idx)
-            return {"skip": True, "loss": torch.tensor(0.0, device=target_ids.device, requires_grad=True)}
+            # DDP-safe no-op step. A fresh ``torch.tensor(0.0, requires_grad=True)``
+            # here is DISCONNECTED from the model graph, so this rank's backward
+            # fires no gradient-reduction hooks while other ranks (whose batches
+            # DO have targets) reduce real gradients. Under multi-node DDP that
+            # desyncs the NCCL collectives and hangs the job (observed as an
+            # ALLREDUCE watchdog timeout). Instead return a zero-valued loss that
+            # is still connected to every trainable parameter — ``logits`` depends
+            # on the LLM, ``embed_tokens`` and ``perception`` — so the reducer sees
+            # the same parameters become ready on every rank. The ``* 0.0`` makes
+            # it a true mathematical no-op (zero gradient contribution).
+            logging.warning(
+                "Batch %d: num_targets is 0 — using a graph-connected zero-loss "
+                "keep-alive (DDP-safe) instead of skipping.",
+                batch_idx,
+            )
+            keepalive = outputs["logits"].sum() * 0.0
+            if self._parallel_heads_enabled and self.parallel_chunk_heads is not None:
+                keepalive = keepalive + sum(p.sum() for p in self.parallel_chunk_heads.parameters()) * 0.0
+            return {"skip": True, "loss": keepalive}
 
         logits = outputs["logits"]
 
