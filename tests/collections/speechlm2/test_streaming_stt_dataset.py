@@ -1861,7 +1861,7 @@ class TestCompactTemplate:
             {"role": "user", "content": "<audio><audio>"},
             {"role": "assistant", "content": "world"},
         ]
-        input_ids, mask = _tokenize_compact_with_assistant_mask(messages, qwen3_tok, write_id, eos_id)
+        input_ids, mask, _ = _tokenize_compact_with_assistant_mask(messages, qwen3_tok, write_id, eos_id)
 
         # Two turns → write_id and eos_id should each appear at least twice.
         assert input_ids.count(write_id) >= 2
@@ -1889,7 +1889,7 @@ class TestCompactTemplate:
             {"role": "user", "content": "<audio>"},
             {"role": "assistant", "content": "X"},
         ]
-        input_ids, mask = _tokenize_compact_with_assistant_mask(messages, qwen3_tok, write_id, eos_id)
+        input_ids, mask, _ = _tokenize_compact_with_assistant_mask(messages, qwen3_tok, write_id, eos_id)
 
         # Final token should be the trailing EOS with mask=1.
         assert input_ids[-1] == eos_id
@@ -1920,7 +1920,7 @@ class TestCompactTemplate:
             {"role": "assistant", "content": "x"},
             {"role": "user", "content": "<audio>"},  # trailing user-only
         ]
-        input_ids, mask = _tokenize_compact_with_assistant_mask(messages, qwen3_tok, write_id, eos_id)
+        input_ids, mask, _ = _tokenize_compact_with_assistant_mask(messages, qwen3_tok, write_id, eos_id)
         # Sequence should end with the audio token of the last user-only turn
         # (not with write/eos). Count: one paired (user+asst) + one orphan user.
         assert input_ids.count(write_id) == 1 + input_ids[
@@ -1937,7 +1937,7 @@ class TestCompactTemplate:
             {"role": "user", "content": "<audio><audio><audio>"},
             {"role": "assistant", "content": "hello world"},
         ]
-        input_ids, mask = _tokenize_compact_with_assistant_mask(messages, qwen3_tok, write_id, eos_id)
+        input_ids, mask, _ = _tokenize_compact_with_assistant_mask(messages, qwen3_tok, write_id, eos_id)
         assert len(input_ids) == len(mask)
         assert all(m in (0, 1) for m in mask)
 
@@ -1965,7 +1965,7 @@ class TestCompactTemplate:
             {"role": "user", "content": "<audio><audio>"},
             {"role": "assistant", "content": ""},  # silent chunk
         ]
-        input_ids, mask = _tokenize_compact_with_assistant_mask(messages, qwen3_tok, write_id, eos_id)
+        input_ids, mask, _ = _tokenize_compact_with_assistant_mask(messages, qwen3_tok, write_id, eos_id)
 
         assert len(input_ids) == len(mask)
 

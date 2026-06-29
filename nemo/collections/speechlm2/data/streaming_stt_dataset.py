@@ -159,6 +159,10 @@ class StreamingSTTBatch:
     cuts: Optional[CutSet] = None
     chunk_anchor_positions: Optional[torch.Tensor] = None
     chunk_target_tokens: Optional[torch.Tensor] = None
+    # (B, L) float per-target-token CE weights, aligned with ``target_tokens``.
+    # Only populated when position-weighting is enabled (delay_weight_gamma != 1.0).
+    # ``None`` => every supervised token has weight 1.0 (legacy uniform CE).
+    target_weights: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -167,6 +171,28 @@ class StreamingSTTDataConfig:
     frame_length_in_secs: float
     chunk_size: int
     num_delay_frames: int = 0
+    # --- Delay-randomized, position-weighted alignment objective ---
+    # Port of the ASR ChatExternalAligner "delay-randomized, position-weighted"
+    # training objective (nemo/collections/asr/losses/chunked_aligner_pytorch.py)
+    # to the streaming SpeechLLM. Two independent, opt-in knobs:
+    #   * random_delay_max_frames > 0: each word's emission is pushed LATER by an
+    #     independent ``Uniform{0..random_delay_max_frames}`` frames (on top of the
+    #     fixed ``num_delay_frames``), made monotonic non-decreasing so word order
+    #     and chunk assignment stay valid. This perturbs which chunk each word is
+    #     emitted in. Sampled fresh on every ``get_batch_data`` call, so combined
+    #     with the model's ``encoder_reuse_k`` (encode once, average K partitions)
+    #     it realizes the "average over K randomly delayed alignments" objective.
+    #     Applied in TRAINING only (eval stays deterministic). 0 => disabled.
+    #   * delay_weight_gamma in (0, 1]: each supervised token's CE term is scaled
+    #     by ``gamma ** p`` where ``p`` is the within-chunk frame position at which
+    #     the word's audio finished (0 = chunk start). A word that finishes late in
+    #     its emission chunk is down-weighted; a word bumped to a later chunk than
+    #     its audio (by delay) is treated as available from frame 0 => weight 1.0.
+    #     1.0 => uniform weights (exact legacy CE). Only the compact template
+    #     emits per-token weights; the standard chat template stays uniform.
+    # Currently effective only on the fixed-chunk, non-projected emission path.
+    random_delay_max_frames: int = 0
+    delay_weight_gamma: float = 1.0
     words_per_group: int = 1
     # Trainable encoder-output subsampling factor (see the model config). With
     # factor > 1 the LLM consumes ``chunk_size // factor`` audio placeholders per
@@ -602,6 +628,9 @@ def get_llm_messages_for_sample(
     project_unaligned_text_to_chunks: bool = False,
     fixed_chunk_group_schedule: Optional[List[int]] = None,
     subsampling_factor: int = 1,
+    random_delay_max_frames: int = 0,
+    delay_weight_gamma: float = 1.0,
+    apply_random_delay: bool = True,
 ) -> List[dict]:
     """
     Get the LLM messages for a sample, using the alignments to determine the turns for the audio and text.
@@ -791,6 +820,37 @@ def get_llm_messages_for_sample(
                 else:
                     messages.append({"role": "assistant", "content": blank_token})
         else:
+            # Precompute each word's emission "ready" frame and its position
+            # weight ONCE (see StreamingSTTDataConfig.random_delay_max_frames /
+            # delay_weight_gamma).
+            #   ready = word_end + num_delay_frames (+ Uniform{0..max} in training),
+            #   made monotonic non-decreasing (running max) so word order and the
+            #   chunk assignment below stay valid.
+            #   weight = gamma ** p, where p is the within-chunk frame position of
+            #   the word's AUDIO end in its emission chunk (clamped to
+            #   [0, chunk_size-1]). A word delayed past its audio chunk has p<=0 ->
+            #   weight 1.0 (it gained a full extra chunk of lookahead).
+            use_delay = bool(apply_random_delay) and int(random_delay_max_frames) > 0
+            use_weight = float(delay_weight_gamma) != 1.0
+            word_ready_frames: list[int] = []
+            word_weights: list[float] = []
+            running_ready = 0
+            for w in alignments:
+                wef = math.ceil(w.end_time / frame_length_in_secs)
+                ready = wef + num_delay_frames
+                if use_delay:
+                    ready += random.randint(0, int(random_delay_max_frames))
+                ready = max(ready, running_ready)  # monotonic non-decreasing
+                running_ready = ready
+                word_ready_frames.append(ready)
+                if use_weight and chunk_size > 0:
+                    emit_chunk_idx = max(0, math.ceil(ready / chunk_size) - 1)
+                    p = wef - emit_chunk_idx * chunk_size
+                    p = min(max(p, 0), chunk_size - 1)
+                    word_weights.append(float(delay_weight_gamma) ** p)
+                else:
+                    word_weights.append(1.0)
+
             word_idx = 0
             word_buffer: list[int] = []
             for start_chunk, end_chunk, group_size in iter_fixed_chunk_groups(
@@ -800,10 +860,7 @@ def get_llm_messages_for_sample(
                 messages.append({"role": "user", "content": audio_tag * audio_tokens(group_size * chunk_size)})
 
                 while word_idx < len(alignments):
-                    word = alignments[word_idx]
-                    word_end_frame = math.ceil(word.end_time / frame_length_in_secs)
-                    ready_frame = word_end_frame + num_delay_frames
-                    if ready_frame <= chunk_end_frame:
+                    if word_ready_frames[word_idx] <= chunk_end_frame:
                         word_buffer.append(word_idx)
                         word_idx += 1
                     else:
@@ -820,7 +877,13 @@ def get_llm_messages_for_sample(
                             content = " ".join(alignments[i].text for i in word_buffer)
                     else:
                         content = " ".join(alignments[i].text for i in word_buffer)
-                    messages.append({"role": "assistant", "content": content})
+                    asst_msg = {"role": "assistant", "content": content}
+                    if use_weight:
+                        # Per-turn weight: the LAST emitted word gates the chunk
+                        # boundary (mirrors the ASR EOC arc taking the last token's
+                        # weight). With words_per_group=1 this is exact.
+                        asst_msg["weight"] = word_weights[word_buffer[-1]]
+                    messages.append(asst_msg)
                     word_buffer = []
                 else:
                     messages.append({"role": "assistant", "content": blank_token})
@@ -836,12 +899,20 @@ def get_llm_messages_for_sample(
                         content = " ".join(alignments[i].text for i in residual_indices)
                 else:
                     content = " ".join(alignments[i].text for i in residual_indices)
+                residual_weight = word_weights[residual_indices[-1]] if use_weight else None
                 if messages[-1]["role"] == "assistant" and messages[-1]["content"] == blank_token:
                     messages[-1]["content"] = content
+                    if residual_weight is not None:
+                        messages[-1]["weight"] = residual_weight
                 elif messages[-1]["role"] == "assistant":
                     messages[-1]["content"] += " " + content
+                    if residual_weight is not None:
+                        messages[-1]["weight"] = residual_weight
                 else:
-                    messages.append({"role": "assistant", "content": content})
+                    asst_msg = {"role": "assistant", "content": content}
+                    if residual_weight is not None:
+                        asst_msg["weight"] = residual_weight
+                    messages.append(asst_msg)
 
     return messages
 
@@ -862,6 +933,9 @@ def get_llm_messages_for_batch(
     project_unaligned_text_to_chunks: bool = False,
     fixed_chunk_group_schedule: Optional[List[int]] = None,
     subsampling_factor: int = 1,
+    random_delay_max_frames: int = 0,
+    delay_weight_gamma: float = 1.0,
+    apply_random_delay: bool = True,
 ) -> List[List[dict]]:
     """
     Get the LLM messages for a batch of samples.
@@ -907,6 +981,9 @@ def get_llm_messages_for_batch(
                 project_unaligned_text_to_chunks=project_unaligned_text_to_chunks,
                 fixed_chunk_group_schedule=fixed_chunk_group_schedule,
                 subsampling_factor=subsampling_factor,
+                random_delay_max_frames=random_delay_max_frames,
+                delay_weight_gamma=delay_weight_gamma,
+                apply_random_delay=apply_random_delay,
             )
         )
     return batch_messages
@@ -1026,8 +1103,18 @@ def _tokenize_compact_with_assistant_mask(
     supervise_im_end_in_loss: bool = False,
     empty_chunk_eos_only: bool = False,
     blank_token: Optional[str] = None,
-) -> tuple[list[int], list[int]]:
-    """Tokenize chat messages in compact format and return (input_ids, assistant_mask).
+    emit_weights: bool = False,
+) -> tuple[list[int], list[int], Optional[list[float]]]:
+    """Tokenize chat messages in compact format and return (input_ids, assistant_mask, assistant_weights).
+
+    ``assistant_weights`` (aligned 1:1 with ``input_ids``) carries each token's CE
+    weight from the assistant message ``weight`` field — applied to that turn's
+    ``write_id`` and content tokens. The closing ``<eos>`` / ``<|im_end|>`` (when
+    supervised) inherits the weight of the token PRIOR to it in the chunk (the
+    last content token), or 1.0 when the chunk emitted no content tokens —
+    mirroring the ASR EOC arc. Non-assistant tokens and empty chunks get weight
+    1.0. Returns ``None`` for the weights when ``emit_weights`` is False (the
+    common, unweighted case).
 
     Compact per-turn layout (no role wrapping between audio and text):
         [system_wrapped] [user_content, <write>, asst_content, <eos>]*K
@@ -1048,6 +1135,11 @@ def _tokenize_compact_with_assistant_mask(
 
     input_ids: list[int] = []
     assistant_mask: list[int] = []
+    assistant_weights: Optional[list[float]] = [] if emit_weights else None
+
+    def _extend_w(n: int, value: float = 1.0) -> None:
+        if assistant_weights is not None:
+            assistant_weights.extend([value] * n)
 
     # --- System section: keep Qwen3-style wrapping ---
     system_msgs = [m for m in messages if m["role"] == "system"]
@@ -1060,6 +1152,7 @@ def _tokenize_compact_with_assistant_mask(
         )
         input_ids.extend(list(system_ids))
         assistant_mask.extend([0] * len(system_ids))
+        _extend_w(len(system_ids))
 
     # --- Per-turn compact encoding ---
     turn_msgs = [m for m in messages if m["role"] != "system"]
@@ -1071,28 +1164,37 @@ def _tokenize_compact_with_assistant_mask(
             user_ids = hf_tok.encode(msg["content"], add_special_tokens=False) if msg["content"] else []
             input_ids.extend(user_ids)
             assistant_mask.extend([0] * len(user_ids))
+            _extend_w(len(user_ids))
             i += 1
             # Pair with following assistant turn if present.
             if i < len(turn_msgs) and turn_msgs[i]["role"] == "assistant":
                 asst = turn_msgs[i]
                 if empty_chunk_eos_only and blank_token is not None and asst["content"] == blank_token:
                     # Empty chunk → bare <eos> (no <blank>). <eos> is always
-                    # supervised here: it is the chunk's only target.
+                    # supervised here: it is the chunk's only target. Weight 1.0.
                     input_ids.append(write_id)
                     assistant_mask.append(1)
                     input_ids.append(eos_id)
                     assistant_mask.append(1)
+                    _extend_w(2)
                 else:
                     asst_ids = hf_tok.encode(asst["content"], add_special_tokens=False) if asst["content"] else []
+                    w = float(asst.get("weight", 1.0))
                     # write_id
                     input_ids.append(write_id)
                     assistant_mask.append(1)
                     # assistant content
                     input_ids.extend(asst_ids)
                     assistant_mask.extend([1] * len(asst_ids))
-                    # eos
+                    # write_id + content carry this turn's weight.
+                    _extend_w(1 + len(asst_ids), w)
+                    # eos / <|im_end|>: when supervised, it inherits the weight of
+                    # the token PRIOR to it in this chunk (the last content token),
+                    # or 1.0 when the chunk emitted no content tokens — mirroring
+                    # the ASR EOC arc taking the last token's weight (1.0 if empty).
                     input_ids.append(eos_id)
                     assistant_mask.append(int(supervise_im_end_in_loss))
+                    _extend_w(1, w if asst_ids else 1.0)
                 i += 1
         else:
             # Orphan assistant (shouldn't normally occur) — treat as standalone asst segment.
@@ -1101,17 +1203,22 @@ def _tokenize_compact_with_assistant_mask(
                 assistant_mask.append(1)
                 input_ids.append(eos_id)
                 assistant_mask.append(1)
+                _extend_w(2)
             else:
                 asst_ids = hf_tok.encode(msg["content"], add_special_tokens=False) if msg["content"] else []
+                w = float(msg.get("weight", 1.0))
                 input_ids.append(write_id)
                 assistant_mask.append(1)
                 input_ids.extend(asst_ids)
                 assistant_mask.extend([1] * len(asst_ids))
+                _extend_w(1 + len(asst_ids), w)
+                # eos / <|im_end|>: weight of the prior content token (1.0 if none).
                 input_ids.append(eos_id)
                 assistant_mask.append(int(supervise_im_end_in_loss))
+                _extend_w(1, w if asst_ids else 1.0)
             i += 1
 
-    return input_ids, assistant_mask
+    return input_ids, assistant_mask, assistant_weights
 
 
 def _tokenize_with_assistant_mask(
@@ -1272,24 +1379,27 @@ def _replace_audio_chunks(
     chunk_ids: list[int],
     chunk_size: int,
     mask: list | None = None,
-) -> list[int] | tuple[list[int], list]:
+    weights: list | None = None,
+) -> list[int] | tuple[list[int], list] | tuple[list[int], list, list]:
     """Replace each occurrence of *chunk_ids* with *chunk_size* copies of ``AUDIO_TOKEN_IDX``.
 
     This handles multi-token audio tags where BPE merges tokens across adjacent
     tags (e.g., ``<audio><audio>`` tokenizes differently from ``encode("<audio>") * 2``).
     By matching the full chunk at once, we avoid the BPE boundary problem.
 
-    When *mask* is provided it is adjusted in sync: each matched span is replaced
-    with *chunk_size* copies of the first element of that span (typically 0 for
-    user-turn content).
+    When *mask* (and optionally *weights*) is provided it is adjusted in sync:
+    each matched span is replaced with *chunk_size* copies of the first element
+    of that span (typically 0/1.0 for user-turn content).
 
     Returns:
-        new_token_ids            when mask is None
-        (new_token_ids, new_mask) when mask is provided
+        new_token_ids                        when mask is None
+        (new_token_ids, new_mask)            when mask is provided, weights is None
+        (new_token_ids, new_mask, new_weights) when mask AND weights are provided
     """
     chunk_len = len(chunk_ids)
     new_ids: list[int] = []
     new_mask: list | None = [] if mask is not None else None
+    new_weights: list | None = [] if weights is not None else None
     i = 0
     n = len(token_ids)
     while i < n:
@@ -1297,13 +1407,21 @@ def _replace_audio_chunks(
             new_ids.extend([AUDIO_TOKEN_IDX] * chunk_size)
             if new_mask is not None:
                 new_mask.extend([mask[i]] * chunk_size)
+            if new_weights is not None:
+                new_weights.extend([weights[i]] * chunk_size)
             i += chunk_len
         else:
             new_ids.append(token_ids[i])
             if new_mask is not None:
                 new_mask.append(mask[i])
+            if new_weights is not None:
+                new_weights.append(weights[i])
             i += 1
-    return (new_ids, new_mask) if mask is not None else new_ids
+    if mask is None:
+        return new_ids
+    if new_weights is not None:
+        return new_ids, new_mask, new_weights
+    return new_ids, new_mask
 
 
 class StreamingSTTDataset(torch.utils.data.Dataset):
@@ -1461,6 +1579,7 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
         alignments: List[List[WordAlignment]],
         text: List[str],
         randomize_fixed_chunk_groups: Optional[bool] = None,
+        apply_random_delay: bool = True,
     ) -> StreamingSTTBatch:
         audio_durations_secs = (audio_lens.float() / self.cfg.sample_rate).tolist()
 
@@ -1524,10 +1643,20 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             project_unaligned_text_to_chunks=self.cfg.project_unaligned_text_to_chunks,
             fixed_chunk_group_schedule=fixed_chunk_group_schedule,
             subsampling_factor=self.subsampling_factor,
+            random_delay_max_frames=int(getattr(self.cfg, "random_delay_max_frames", 0)),
+            delay_weight_gamma=float(getattr(self.cfg, "delay_weight_gamma", 1.0)),
+            apply_random_delay=apply_random_delay,
+        )
+
+        # Per-token CE weights are only produced (and threaded through) when
+        # position-weighting is active AND we use the compact template.
+        emit_weights = (
+            float(getattr(self.cfg, "delay_weight_gamma", 1.0)) != 1.0 and bool(self.cfg.compact_template)
         )
 
         all_input_ids = []
         all_target_ids = []
+        all_target_weights = [] if emit_weights else None
         chunk_word_alignment = []
 
         for sample_idx, messages in enumerate(batch_messages):
@@ -1539,9 +1668,10 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
                     tokenizer=self.tokenizer,
                 )
             )
-            # Tokenize and compute assistant content mask.
+            # Tokenize and compute assistant content mask (+ optional per-token weights).
+            token_weights: Optional[list[float]] = None
             if self.cfg.compact_template:
-                input_ids, assistant_mask = _tokenize_compact_with_assistant_mask(
+                input_ids, assistant_mask, token_weights = _tokenize_compact_with_assistant_mask(
                     messages,
                     self.tokenizer,
                     self._write_id,
@@ -1549,6 +1679,7 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
                     supervise_im_end_in_loss=self.cfg.supervise_im_end_in_loss,
                     empty_chunk_eos_only=bool(getattr(self.cfg, "empty_chunk_eos_only", False)),
                     blank_token=self.cfg.blank_token,
+                    emit_weights=emit_weights,
                 )
             else:
                 input_ids, assistant_mask = _tokenize_with_assistant_mask(
@@ -1574,9 +1705,18 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             if self.audio_chunk_ids is not None and fixed_chunk_group_schedule is None:
                 # Fixed chunking: single pre-computed pattern. The replacement
                 # count is the post-subsampling token count (chunk_size//factor).
-                input_ids, assistant_mask = _replace_audio_chunks(
-                    input_ids, self.audio_chunk_ids, self.audio_tokens_per_chunk, mask=assistant_mask
-                )
+                if token_weights is not None:
+                    input_ids, assistant_mask, token_weights = _replace_audio_chunks(
+                        input_ids,
+                        self.audio_chunk_ids,
+                        self.audio_tokens_per_chunk,
+                        mask=assistant_mask,
+                        weights=token_weights,
+                    )
+                else:
+                    input_ids, assistant_mask = _replace_audio_chunks(
+                        input_ids, self.audio_chunk_ids, self.audio_tokens_per_chunk, mask=assistant_mask
+                    )
             else:
                 # Offline (chunk_size=-1) or dynamic (chunk_size=0): variable audio tag
                 # counts per user turn.  Replace each user turn's audio tags separately.
@@ -1588,9 +1728,14 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
                     if n_tags == 0:
                         continue
                     chunk_ids = hf_tok.encode(self.cfg.audio_tag * n_tags, add_special_tokens=False)
-                    input_ids, assistant_mask = _replace_audio_chunks(
-                        input_ids, chunk_ids, n_tags, mask=assistant_mask
-                    )
+                    if token_weights is not None:
+                        input_ids, assistant_mask, token_weights = _replace_audio_chunks(
+                            input_ids, chunk_ids, n_tags, mask=assistant_mask, weights=token_weights
+                        )
+                    else:
+                        input_ids, assistant_mask = _replace_audio_chunks(
+                            input_ids, chunk_ids, n_tags, mask=assistant_mask
+                        )
 
             # Build targets: next-token prediction with loss only on assistant content.
             # target[i] corresponds to input[i] and holds the token at position i+1.
@@ -1605,6 +1750,12 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             target_mask = assistant_mask[1:] + [0]
             target_ids = [tid if m else IGNORE_INDEX for tid, m in zip(target_ids, target_mask)]
 
+            # Shift per-token weights the same way as the mask so they align with
+            # ``target_ids`` (weight of position i+1). Only meaningful where the
+            # target is supervised; elsewhere it is ignored by the loss.
+            if all_target_weights is not None:
+                target_weights = (token_weights[1:] + [1.0]) if token_weights is not None else [1.0] * len(target_ids)
+
             # Dynamic chunking: train the model to predict at audio positions.
             # Non-final audio frames → target = blank_id ("need more audio")
             # Final audio frame (before user footer) → target = user_footer first token ("ready")
@@ -1618,12 +1769,19 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
 
             all_input_ids.append(torch.tensor(input_ids, dtype=torch.long))
             all_target_ids.append(torch.tensor(target_ids, dtype=torch.long))
+            if all_target_weights is not None:
+                all_target_weights.append(torch.tensor(target_weights, dtype=torch.float))
 
         if self.cfg.chunk_size >= 0:  # fixed chunking or dynamic chunking: right-pad
             input_tokens = right_collate_vectors(all_input_ids, padding_value=self.tokenizer.pad_id)
             target_tokens = right_collate_vectors(all_target_ids, padding_value=IGNORE_INDEX)
             input_token_lens = torch.tensor([len(ids) for ids in all_input_ids], dtype=torch.long)
             target_token_lens = torch.tensor([len(ids) for ids in all_target_ids], dtype=torch.long)
+            target_weights = (
+                right_collate_vectors(all_target_weights, padding_value=0.0)
+                if all_target_weights is not None
+                else None
+            )
         else:  # offline mode: left-pad
             input_tokens = left_collate_vectors(all_input_ids, padding_value=self.tokenizer.pad_id)
             target_tokens = left_collate_vectors(all_target_ids, padding_value=IGNORE_INDEX)
@@ -1633,6 +1791,11 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             )
             target_token_lens = torch.tensor(
                 [target_tokens.shape[1] for _ in range(len(all_target_ids))], dtype=torch.long
+            )
+            target_weights = (
+                left_collate_vectors(all_target_weights, padding_value=0.0)
+                if all_target_weights is not None
+                else None
             )
 
         # --- Parallel chunk heads: build anchor positions + K-slot target slates ---
@@ -1653,6 +1816,7 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             chunk_word_alignment=chunk_word_alignment,
             chunk_anchor_positions=chunk_anchor_positions,
             chunk_target_tokens=chunk_target_tokens,
+            target_weights=target_weights,
         )
 
     # ------------------------------------------------------------------

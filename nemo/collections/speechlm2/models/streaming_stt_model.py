@@ -1699,6 +1699,16 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 ignore_index=IGNORE_INDEX,
             )
 
+        # --- Position weights (delay-randomized / position-weighted objective) ---
+        # ``batch.target_weights`` (when present) holds a per-target-token CE weight
+        # ``gamma ** p`` aligned with ``target_tokens``. ``None`` => uniform (legacy).
+        # Each supervised token contributes ``w * CE`` and the normalizer is the
+        # SUM of weights (so gamma=1/all-ones reduces EXACTLY to the mean CE).
+        if getattr(batch, "target_weights", None) is not None:
+            flat_weights = batch.target_weights.flatten(0, 1).to(per_token_loss.dtype)
+        else:
+            flat_weights = None
+
         # --- Blank vs non-blank loss breakdown ---
         blank_id = self.blank_token_id
         valid_mask = flat_targets != IGNORE_INDEX
@@ -1712,10 +1722,22 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         # Apply blank loss weight (< 1.0 to down-weight easy blank predictions)
         blank_weight = self.core_cfg.blank_loss_weight
         if num_blank > 0 and blank_weight != 1.0 and self.has_blank:
-            effective_num_targets = num_blank * blank_weight + num_nonblank
-            loss = (
-                per_token_loss[is_nonblank].sum() + per_token_loss[is_blank].sum() * blank_weight
-            ) / effective_num_targets
+            if flat_weights is not None:
+                nb_w = flat_weights[is_nonblank]
+                bl_w = flat_weights[is_blank]
+                effective_num_targets = (nb_w.sum() + bl_w.sum() * blank_weight).clamp(min=1e-8)
+                loss = (
+                    (per_token_loss[is_nonblank] * nb_w).sum()
+                    + (per_token_loss[is_blank] * bl_w).sum() * blank_weight
+                ) / effective_num_targets
+            else:
+                effective_num_targets = num_blank * blank_weight + num_nonblank
+                loss = (
+                    per_token_loss[is_nonblank].sum() + per_token_loss[is_blank].sum() * blank_weight
+                ) / effective_num_targets
+        elif flat_weights is not None:
+            w_valid = flat_weights[valid_mask]
+            loss = (per_token_loss[valid_mask] * w_valid).sum() / w_valid.sum().clamp(min=1e-8)
         else:
             loss = per_token_loss.sum() / num_targets
 
@@ -2129,6 +2151,9 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 alignments=alignments,
                 text=batch.text,
                 randomize_fixed_chunk_groups=False,
+                # Keep validation deterministic: no random alignment delay (the
+                # position weighting itself is deterministic and stays active).
+                apply_random_delay=False,
             )
             batch = move_data_to_device(batch, self.device)
 
