@@ -22,6 +22,7 @@ from nemo.core.classes.common import Serialization
 from nemo.core.config import hydra_runner
 from nemo.utils import logging
 from nemo.utils.exp_manager import exp_manager
+from nemo.utils.get_rank import is_global_rank_zero
 from nemo.utils.trainer_utils import resolve_trainer_cfg
 
 torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
@@ -34,7 +35,15 @@ def train(cfg):
     torch.set_float32_matmul_precision("medium")
     trainer = Trainer(**resolve_trainer_cfg(cfg.trainer))
     log_dir = exp_manager(trainer, cfg.get("exp_manager", None))
-    OmegaConf.save(cfg, log_dir / "exp_config.yaml")
+    # Only global rank 0 writes the resolved config. Letting all ranks write the
+    # same file into the shared (Lustre) log_dir races exp_manager's own rank-0
+    # `run_{N}` rename of this exact file, which deadlocks the Lustre MDS: rank 0
+    # wedges in `ptlrpc_set_wait` on the rename while the other ranks pile up in
+    # `rwsem_down_write_slowpath` on the same directory. The stuck ranks never
+    # reach the first NCCL collective, so the job dies with a 600s
+    # `store->get('0')` timeout and leaves un-killable D-state processes.
+    if is_global_rank_zero():
+        OmegaConf.save(cfg, log_dir / "exp_config.yaml")
 
     dataset_cfg = cfg.data.dataset
     with open_dict(dataset_cfg):
