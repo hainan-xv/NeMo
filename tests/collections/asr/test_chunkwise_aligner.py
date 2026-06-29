@@ -989,6 +989,52 @@ def test_chat_ce_delay_position_weighting_matches_manual():
 
 
 @pytest.mark.unit
+def test_chat_ce_fixed_delay_matches_shifted_single_path():
+    """fixed_delay shifts every token by a constant #chunks; single unweighted path."""
+    B, n_chunks, U, V = 2, 8, 4, 9
+    blank = V - 1
+    D = 2
+    acts = torch.randn(B, n_chunks, U + 1, V)
+    labels = torch.randint(0, blank, (B, U))
+    act_lens = torch.tensor([n_chunks, n_chunks])
+    label_lens = torch.tensor([U, U])
+    token_chunk_ids = torch.tensor([[0, 1, 2, 3], [0, 0, 1, 2]])
+
+    # Reference: plain single-path CE on the SHIFTED assignment (clamped < n_chunks).
+    shifted = (token_chunk_ids + D).clamp(max=n_chunks - 1)
+    ref = chat_external_aligner_single_path_logprob(acts, labels, act_lens, label_lens, shifted, blank)
+
+    loss = ChatExternalAlignerCELoss(blank=blank, reduction='none', fixed_delay=D, chunk_size=6)
+    loss.train()
+    val = loss(acts, labels, act_lens, label_lens, token_chunk_ids)
+    for b in range(B):
+        assert math.isclose(float(val[b]), float(-ref[b]), rel_tol=1e-4, abs_tol=1e-4)
+
+    # Deterministic in eval too (no sampling), and same as train.
+    loss.eval()
+    val_eval = loss(acts, labels, act_lens, label_lens, token_chunk_ids)
+    assert torch.allclose(val, val_eval, atol=1e-5)
+
+
+@pytest.mark.unit
+def test_chat_ce_fixed_delay_zero_equals_baseline():
+    """fixed_delay=0 -> plain baseline single-path CE."""
+    B, n_chunks, U, V = 2, 6, 4, 8
+    blank = V - 1
+    acts = torch.randn(B, n_chunks, U + 1, V)
+    labels = torch.randint(0, blank, (B, U))
+    act_lens = torch.tensor([n_chunks, n_chunks])
+    label_lens = torch.tensor([U, U])
+    token_chunk_ids = torch.tensor([[0, 1, 2, 3], [0, 0, 1, 2]])
+
+    base = ChatExternalAlignerCELoss(blank=blank, reduction='none')(acts, labels, act_lens, label_lens, token_chunk_ids)
+    fixed0 = ChatExternalAlignerCELoss(blank=blank, reduction='none', fixed_delay=0)
+    fixed0.train()
+    val = fixed0(acts, labels, act_lens, label_lens, token_chunk_ids)
+    assert torch.allclose(val, base, atol=1e-5)
+
+
+@pytest.mark.unit
 def test_chat_ce_delay_runs_and_is_feasible_with_delays():
     """With max_delay>0 the loss stays finite and monotonic/in-range (smoke)."""
     torch.manual_seed(0)

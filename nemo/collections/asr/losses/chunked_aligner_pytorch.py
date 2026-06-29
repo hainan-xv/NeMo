@@ -627,6 +627,14 @@ class ChatExternalAlignerCELoss(Loss):
     is ``None``) the plain single-path CE is used so the validation loss is
     deterministic.
 
+    Fixed-delay comparison mode (optional)
+    --------------------------------------
+    When ``fixed_delay >= 1`` the loss instead shifts EVERY token by that constant
+    number of chunks (clamped ``< n_chunks``) and scores the single UNWEIGHTED path
+    on the shifted assignment -- a deterministic "delay everything by a fixed
+    amount, no sampling/weighting" baseline. It takes priority over the randomized
+    objective and is applied in both train and eval (deterministic).
+
     Args:
         blank: index of the blank / end-of-chunk (EOC) symbol within ``V``.
         reduction: one of ``'none'``, ``'sum'``, ``'mean'`` (per-sample loss
@@ -642,6 +650,9 @@ class ChatExternalAlignerCELoss(Loss):
         chunk_size: encoder frames per chunk (used to clamp positions).
         stat_log_every: log mean weight / fraction-delayed / mean-delay every this
             many training forwards (rank 0 only; ``<=0`` disables).
+        fixed_delay: if ``>=1``, deterministic constant chunk shift applied to every
+            token (single unweighted path, no sampling); overrides the randomized
+            objective. ``0`` -> disabled.
     """
 
     @property
@@ -667,6 +678,7 @@ class ChatExternalAlignerCELoss(Loss):
         weight_gamma: float = 1.0,
         chunk_size: int = 0,
         stat_log_every: int = 200,
+        fixed_delay: int = 0,
     ):
         super().__init__()
         if reduction not in ('none', 'sum', 'mean', 'mean_batch', 'mean_volume'):
@@ -682,6 +694,7 @@ class ChatExternalAlignerCELoss(Loss):
         self.weight_gamma = float(weight_gamma)
         self.chunk_size = int(chunk_size)
         self.stat_log_every = int(stat_log_every)
+        self.fixed_delay = max(int(fixed_delay), 0)
         self._delay_step = 0  # counts training forwards with the delay objective
 
     def _sample_path_logprob(self, logp_b, labels_b, cids_b, n_b, U_b):
@@ -786,10 +799,16 @@ class ChatExternalAlignerCELoss(Loss):
         logp = torch.log_softmax(acts, dim=-1)
         B = acts.shape[0]
 
-        # Delay-randomized, position-weighted objective: training only, when enabled
-        # and within-chunk positions are available. Otherwise the plain single path
-        # (keeps the validation loss deterministic / comparable to the baseline).
-        use_delay = self.training and self.num_delay_variants >= 1 and token_chunk_pos is not None
+        # Objective selection (priority: fixed-delay > randomized > plain):
+        #   * fixed-delay: deterministic constant chunk shift, single unweighted
+        #     path (no sampling). Applied in train AND eval since it is
+        #     deterministic, so the validation loss reflects the same target.
+        #   * randomized: training only, needs within-chunk positions.
+        #   * plain single path otherwise (e.g. eval of the randomized model).
+        use_fixed = self.fixed_delay >= 1
+        use_delay = (
+            not use_fixed and self.training and self.num_delay_variants >= 1 and token_chunk_pos is not None
+        )
         K = self.num_delay_variants if use_delay else 1
 
         # Running stats over this batch (tokens x variants) for periodic logging.
@@ -808,7 +827,16 @@ class ChatExternalAlignerCELoss(Loss):
                 losses.append(logp.new_zeros(()))
                 valids.append(False)
                 continue
-            if use_delay:
+            if use_fixed:
+                # Shift every (real) token by a constant number of chunks, then
+                # score the single unweighted path on the shifted assignment.
+                shifted = token_chunk_ids[b].clone()
+                if U_b > 0:
+                    shifted[:U_b] = (shifted[:U_b].long() + self.fixed_delay).clamp(max=max(n_b - 1, 0))
+                logprob, feasible = self._sample_path_logprob(logp[b], labels[b], shifted, n_b, U_b)
+                losses.append(-logprob)
+                valids.append(feasible)
+            elif use_delay:
                 acc = logp.new_zeros(())
                 feasible = False
                 for _ in range(K):

@@ -1410,7 +1410,11 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         max_delay = int(delay_cfg.get('max_delay', 0)) if delay_cfg is not None else 0
         weight_gamma = float(delay_cfg.get('weight_gamma', 1.0)) if delay_cfg is not None else 1.0
         stat_log_every = int(delay_cfg.get('log_every', 200)) if delay_cfg is not None else 200
-        self._chat_delay_enabled = num_delay_variants >= 1
+        fixed_delay = int(delay_cfg.get('fixed_delay', 0)) if delay_cfg is not None else 0
+        # The randomized objective needs within-chunk positions; the deterministic
+        # fixed-delay baseline (which takes priority) does not.
+        self._chat_need_positions = fixed_delay < 1 and num_delay_variants >= 1
+        self._chat_delay_enabled = self._chat_need_positions
 
         self.loss = ChatExternalAlignerCELoss(
             blank=blank_id,
@@ -1420,6 +1424,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             weight_gamma=weight_gamma,
             chunk_size=self.chunk_size,
             stat_log_every=stat_log_every,
+            fixed_delay=fixed_delay,
         )
 
         # Build the frozen external aligner that fixes the token->chunk path.
@@ -1427,7 +1432,12 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         # CHAT's cross-attention pools the whole chunk, so a chunk may host any
         # number of tokens (no left-packing onto frames).
         self._aligner_enforce_left_packing = False
-        if self._chat_delay_enabled:
+        if fixed_delay >= 1:
+            logging.info(
+                f"[chat-aligner] FIXED-delay CE enabled: fixed_delay={fixed_delay} chunks "
+                f"(deterministic, single unweighted path; randomization disabled), chunk_size={self.chunk_size}."
+            )
+        elif self._chat_delay_enabled:
             logging.info(
                 f"[chat-aligner] delay-randomized weighted CE enabled: "
                 f"num_variants={num_delay_variants}, max_delay={max_delay}, weight_gamma={weight_gamma}, "
@@ -2425,7 +2435,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         # aligner needs it). Both reuse the same external aligner + assignment.
         chunkwise_assignment = None
         if self.loss_type in ('chunkwise_aligner', 'chat_aligner'):
-            want_pos = self.loss_type == 'chat_aligner' and getattr(self, '_chat_delay_enabled', False)
+            want_pos = self.loss_type == 'chat_aligner' and getattr(self, '_chat_need_positions', False)
             if self._external_aligner_is_precomputed:
                 chunkwise_assignment = self._precomputed_chunk_assignment(
                     sample_ids, signal_len, transcript, transcript_len, encoded_len, return_positions=want_pos
