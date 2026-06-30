@@ -249,6 +249,18 @@ class StreamingSTTDataConfig:
     # Per-block "cut" probability for the blank-continuation augmentation (see
     # the model config). 0.0 disables it. Propagated from the model.
     parallel_cut_prob: float = 0.0
+    # --- Flush token (explicit end-of-audio "dump the tail" control signal) ---
+    # When True, a ``flush_token`` user turn is ALWAYS appended after the last
+    # audio chunk; words deferred (by delay) past the last real chunk are emitted
+    # by the assistant AFTER the flush, otherwise the post-flush assistant turn is
+    # empty and emits only the end-of-utterance <|im_end|>. Propagated from the
+    # model's use_flush / flush_token. flush_truncate_prob > 0 adds a training-only
+    # augmentation that truncates a cut at a random chunk boundary (so the model
+    # learns to flush mid-utterance); the cutoff is shared per batch and bounded
+    # by the shortest cut. Effective on the fixed-chunk path only (chunk_size > 0).
+    use_flush: bool = False
+    flush_token: str = "<flush>"
+    flush_truncate_prob: float = 0.0
 
 
 def decode_with_blank(
@@ -631,6 +643,8 @@ def get_llm_messages_for_sample(
     random_delay_max_frames: int = 0,
     delay_weight_gamma: float = 1.0,
     apply_random_delay: bool = True,
+    use_flush: bool = False,
+    flush_token: str = "<flush>",
 ) -> List[dict]:
     """
     Get the LLM messages for a sample, using the alignments to determine the turns for the audio and text.
@@ -819,6 +833,12 @@ def get_llm_messages_for_sample(
                     )
                 else:
                     messages.append({"role": "assistant", "content": blank_token})
+            if use_flush:
+                # Explicit end-of-audio flush turn. The projected path clamps all
+                # words into valid chunks (no residual), so the post-flush
+                # assistant turn is empty and emits only the EOU <|im_end|>.
+                messages.append({"role": "user", "content": flush_token})
+                messages.append({"role": "assistant", "content": ""})
         else:
             # Precompute each word's emission "ready" frame and its position
             # weight ONCE (see StreamingSTTDataConfig.random_delay_max_frames /
@@ -888,28 +908,43 @@ def get_llm_messages_for_sample(
                 else:
                     messages.append({"role": "assistant", "content": blank_token})
 
+            residual_content: Optional[str] = None
+            residual_weight = None
             if word_idx < len(alignments):
                 residual_indices = list(range(word_idx, len(alignments)))
                 if word_spans and transcript:
                     first_span = word_spans[residual_indices[0]]
                     last_span = word_spans[residual_indices[-1]]
                     if first_span is not None and last_span is not None:
-                        content = transcript[first_span[0] : last_span[1]]
+                        residual_content = transcript[first_span[0] : last_span[1]]
                     else:
-                        content = " ".join(alignments[i].text for i in residual_indices)
+                        residual_content = " ".join(alignments[i].text for i in residual_indices)
                 else:
-                    content = " ".join(alignments[i].text for i in residual_indices)
+                    residual_content = " ".join(alignments[i].text for i in residual_indices)
                 residual_weight = word_weights[residual_indices[-1]] if use_weight else None
+
+            if use_flush:
+                # Explicit end-of-audio flush: feed <flush> as a final user turn,
+                # then emit any residual (delayed past the last chunk) words. With
+                # no residual the post-flush assistant turn is empty and emits only
+                # the EOU <|im_end|>. This replaces the legacy "merge residual into
+                # the last chunk" behavior so the tail is trained behind <flush>.
+                messages.append({"role": "user", "content": flush_token})
+                asst_msg = {"role": "assistant", "content": residual_content if residual_content is not None else ""}
+                if residual_content is not None and residual_weight is not None:
+                    asst_msg["weight"] = residual_weight
+                messages.append(asst_msg)
+            elif residual_content is not None:
                 if messages[-1]["role"] == "assistant" and messages[-1]["content"] == blank_token:
-                    messages[-1]["content"] = content
+                    messages[-1]["content"] = residual_content
                     if residual_weight is not None:
                         messages[-1]["weight"] = residual_weight
                 elif messages[-1]["role"] == "assistant":
-                    messages[-1]["content"] += " " + content
+                    messages[-1]["content"] += " " + residual_content
                     if residual_weight is not None:
                         messages[-1]["weight"] = residual_weight
                 else:
-                    asst_msg = {"role": "assistant", "content": content}
+                    asst_msg = {"role": "assistant", "content": residual_content}
                     if residual_weight is not None:
                         asst_msg["weight"] = residual_weight
                     messages.append(asst_msg)
@@ -936,6 +971,8 @@ def get_llm_messages_for_batch(
     random_delay_max_frames: int = 0,
     delay_weight_gamma: float = 1.0,
     apply_random_delay: bool = True,
+    use_flush: bool = False,
+    flush_token: str = "<flush>",
 ) -> List[List[dict]]:
     """
     Get the LLM messages for a batch of samples.
@@ -984,6 +1021,8 @@ def get_llm_messages_for_batch(
                 random_delay_max_frames=random_delay_max_frames,
                 delay_weight_gamma=delay_weight_gamma,
                 apply_random_delay=apply_random_delay,
+                use_flush=use_flush,
+                flush_token=flush_token,
             )
         )
     return batch_messages
@@ -1518,6 +1557,20 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             self._write_id = None
             self._compact_eos_id = None
 
+        # Flush token: must be a single vocab token (model.__init__ registers it).
+        if getattr(self.cfg, "use_flush", False):
+            flush_ids = self.tokenizer.tokenizer.encode(self.cfg.flush_token, add_special_tokens=False)
+            if len(flush_ids) != 1:
+                raise ValueError(
+                    f"flush_token '{self.cfg.flush_token}' tokenizes into {len(flush_ids)} tokens "
+                    f"{flush_ids}. It must be a single special token added via "
+                    f"tokenizer.add_special_tokens() in the model __init__."
+                )
+            self._flush_id = flush_ids[0]
+            logging.info(f"use_flush enabled: flush_token={self.cfg.flush_token!r} (id={self._flush_id})")
+        else:
+            self._flush_id = None
+
         if self.cfg.supervise_im_end_in_loss:
             hf_tok = self.tokenizer.tokenizer
             if self.cfg.compact_template:
@@ -1601,6 +1654,51 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             audio_lens = torch.tensor(new_lens, dtype=audio_lens.dtype, device=audio_lens.device)
             audio_durations_secs = (audio_lens.float() / self.cfg.sample_rate).tolist()
 
+        # --- Flush truncation augmentation (training only) ---
+        # With prob flush_truncate_prob, replace a cut with a copy truncated at a
+        # chunk boundary so the model learns to flush MID-utterance (not just at
+        # the true end). The cutoff C (in chunks) is sampled ONCE per batch from
+        # [1, n_chunks(shortest cut)] (so every cut has >= C chunks) and applied to
+        # the selected cuts. Truncating = shrink audio_lens to C chunks and keep
+        # only words whose audio fully precedes the cutoff; get_llm_messages then
+        # appends <flush> after chunk C with any boundary-delayed residual. We
+        # copy the outer alignments/text lists so encoder_reuse_k re-calls (which
+        # reuse the caller's lists) are not corrupted.
+        if (
+            apply_random_delay
+            and bool(getattr(self.cfg, "use_flush", False))
+            and float(getattr(self.cfg, "flush_truncate_prob", 0.0)) > 0.0
+            and self.cfg.chunk_size > 0
+            and len(audio_durations_secs) > 0
+        ):
+            chunk_size = self.cfg.chunk_size
+            frame_len = self.cfg.frame_length_in_secs
+            sr = self.cfg.sample_rate
+            n_chunks_per = [max(1, math.ceil(math.ceil(d / frame_len) / chunk_size)) for d in audio_durations_secs]
+            min_chunks = min(n_chunks_per)
+            C = random.randint(1, min_chunks)
+            cutoff_secs = C * chunk_size * frame_len
+            cutoff_samples = int(round(cutoff_secs * sr))
+            new_audio_lens = audio_lens.clone()
+            alignments = [list(a) for a in alignments]
+            text = list(text)
+            changed = False
+            for b in range(len(audio_durations_secs)):
+                if n_chunks_per[b] <= C:
+                    continue  # already at/under the cutoff — truncation is a no-op
+                if random.random() >= self.cfg.flush_truncate_prob:
+                    continue
+                kept = [w for w in alignments[b] if w.end_time <= cutoff_secs]
+                if not kept:
+                    continue  # no complete word in the prefix — skip truncation
+                alignments[b] = kept
+                new_audio_lens[b] = min(int(audio_lens[b].item()), cutoff_samples)
+                text[b] = " ".join(w.text for w in kept)
+                changed = True
+            if changed:
+                audio_lens = new_audio_lens
+                audio_durations_secs = (audio_lens.float() / self.cfg.sample_rate).tolist()
+
         system_prompts = [cut.custom.get(self.cfg.prompt_field, self.cfg.system_prompt) for cut in cuts]
         if randomize_fixed_chunk_groups is None:
             randomize_fixed_chunk_groups = self.randomize_fixed_chunk_groups
@@ -1646,6 +1744,8 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             random_delay_max_frames=int(getattr(self.cfg, "random_delay_max_frames", 0)),
             delay_weight_gamma=float(getattr(self.cfg, "delay_weight_gamma", 1.0)),
             apply_random_delay=apply_random_delay,
+            use_flush=bool(getattr(self.cfg, "use_flush", False)),
+            flush_token=str(getattr(self.cfg, "flush_token", "<flush>")),
         )
 
         # Per-token CE weights are only produced (and threaded through) when

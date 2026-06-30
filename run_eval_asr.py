@@ -399,58 +399,42 @@ def write_manifest(references, predictions, model_id, dataset_path, dataset_name
     return manifest_path
 
 
-def main(args):
+def prepare_dataset(dataset_path, dataset, split, dataset_revision=None, streaming=True, max_eval_samples=None):
+    """Load an ESB / Open-ASR-Leaderboard split, cache its audio as 16 kHz mono, and
+    return ordered eval data.
+
+    Mirrors the (previously inline) loading logic in ``main`` so other drivers (e.g.
+    the multi-model leaderboard comparison) reuse the exact same caching, whisper
+    normalization of references, and duration-sorting. Returns a dict with keys
+    ``audio_filepaths``, ``durations``, ``references`` (normalized), ``references_raw``
+    and ``sample_ids``, all sorted by duration (desc) for efficient batching.
+    """
     data_cache_dir = os.path.join(os.getcwd(), "audio_cache")
-    cache_dir = os.path.join(data_cache_dir, args.dataset, args.split)
+    cache_dir = os.path.join(data_cache_dir, dataset, split)
     os.makedirs(cache_dir, exist_ok=True)
 
-    torch.set_float32_matmul_precision("medium")
-    device = torch.device(f"cuda:{args.device}" if (args.device is not None and args.device >= 0 and torch.cuda.is_available()) else "cpu")
-
-    model, is_multistream = load_model(args.model, device, tokenizer_dir=args.tokenizer_dir)
-    if args.use_cer and hasattr(model, "use_cer"):
-        model.use_cer = True
-    if args.max_symbols_per_step is not None and hasattr(model, "ms_greedy"):
-        model.ms_greedy.max_symbols = args.max_symbols_per_step
-
-    # Optional GPT-LM fusion override (TDT+GPT fusion models only). Setting alpha=0 zeroes the
-    # LM's contribution to the joint logits, so decoding falls back to the TDT-only model -- useful
-    # to measure how much the fused LM actually helps. The LM is still run but multiplied by 0.
-    if getattr(args, "lm_fusion_alpha", None) is not None:
-        joint = getattr(model, "joint", None)
-        if joint is not None and hasattr(joint, "lm_fusion_alpha"):
-            prev = joint.lm_fusion_alpha
-            joint.lm_fusion_alpha = float(args.lm_fusion_alpha)
-            mode = "LM DISABLED (TDT-only)" if joint.lm_fusion_alpha == 0.0 else "LM fusion active"
-            print(f"  LM fusion alpha override: {prev} -> {joint.lm_fusion_alpha}  [{mode}]")
-        else:
-            print(
-                "  WARNING: --lm_fusion_alpha given but model.joint has no 'lm_fusion_alpha' "
-                "(not a TDT+GPT fusion model); ignoring."
-            )
-
-    rev_str = f"@{args.dataset_revision}" if args.dataset_revision else ""
-    print(f"Loading dataset: {args.dataset_path}{rev_str}/{args.dataset} split={args.split}")
+    rev_str = f"@{dataset_revision}" if dataset_revision else ""
+    print(f"Loading dataset: {dataset_path}{rev_str}/{dataset} split={split}")
     load_kwargs = dict(
-        path=args.dataset_path,
-        name=args.dataset,
-        split=args.split,
-        streaming=args.streaming,
+        path=dataset_path,
+        name=dataset,
+        split=split,
+        streaming=streaming,
         token=True,
         trust_remote_code=True,
     )
-    if args.dataset_revision:
-        load_kwargs["revision"] = args.dataset_revision
-    dataset = load_dataset(**load_kwargs)
-    dataset = dataset.cast_column("audio", Audio(decode=False))
+    if dataset_revision:
+        load_kwargs["revision"] = dataset_revision
+    hf_dataset = load_dataset(**load_kwargs)
+    hf_dataset = hf_dataset.cast_column("audio", Audio(decode=False))
 
-    if args.max_eval_samples is not None and args.max_eval_samples > 0:
-        print(f"Subsampling to first {args.max_eval_samples} samples")
-        dataset = dataset.take(args.max_eval_samples)
+    if max_eval_samples is not None and max_eval_samples > 0:
+        print(f"Subsampling to first {max_eval_samples} samples")
+        hf_dataset = hf_dataset.take(max_eval_samples)
 
     print("Downloading and caching audio samples...")
     all_data = {"audio_filepaths": [], "durations": [], "references": [], "references_raw": [], "sample_ids": []}
-    for sample in tqdm(dataset, desc="Processing samples"):
+    for sample in tqdm(hf_dataset, desc="Processing samples"):
         ref_raw = get_text(sample)
         ref = text_normalizer(ref_raw)
         if not ref.strip() or ref.strip() == "ignore time segment in scoring":
@@ -502,6 +486,43 @@ def main(args):
     sorted_idx = sorted(range(len(all_data["durations"])), key=lambda k: all_data["durations"][k], reverse=True)
     for key in all_data:
         all_data[key] = [all_data[key][i] for i in sorted_idx]
+    return all_data
+
+
+def main(args):
+    torch.set_float32_matmul_precision("medium")
+    device = torch.device(f"cuda:{args.device}" if (args.device is not None and args.device >= 0 and torch.cuda.is_available()) else "cpu")
+
+    model, is_multistream = load_model(args.model, device, tokenizer_dir=args.tokenizer_dir)
+    if args.use_cer and hasattr(model, "use_cer"):
+        model.use_cer = True
+    if args.max_symbols_per_step is not None and hasattr(model, "ms_greedy"):
+        model.ms_greedy.max_symbols = args.max_symbols_per_step
+
+    # Optional GPT-LM fusion override (TDT+GPT fusion models only). Setting alpha=0 zeroes the
+    # LM's contribution to the joint logits, so decoding falls back to the TDT-only model -- useful
+    # to measure how much the fused LM actually helps. The LM is still run but multiplied by 0.
+    if getattr(args, "lm_fusion_alpha", None) is not None:
+        joint = getattr(model, "joint", None)
+        if joint is not None and hasattr(joint, "lm_fusion_alpha"):
+            prev = joint.lm_fusion_alpha
+            joint.lm_fusion_alpha = float(args.lm_fusion_alpha)
+            mode = "LM DISABLED (TDT-only)" if joint.lm_fusion_alpha == 0.0 else "LM fusion active"
+            print(f"  LM fusion alpha override: {prev} -> {joint.lm_fusion_alpha}  [{mode}]")
+        else:
+            print(
+                "  WARNING: --lm_fusion_alpha given but model.joint has no 'lm_fusion_alpha' "
+                "(not a TDT+GPT fusion model); ignoring."
+            )
+
+    all_data = prepare_dataset(
+        dataset_path=args.dataset_path,
+        dataset=args.dataset,
+        split=args.split,
+        dataset_revision=args.dataset_revision,
+        streaming=args.streaming,
+        max_eval_samples=args.max_eval_samples,
+    )
 
     n_samples = len(all_data["references"])
     print(f"Total samples: {n_samples}")

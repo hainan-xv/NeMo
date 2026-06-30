@@ -29,6 +29,7 @@ The primary reference is the docstring example in get_llm_messages_for_sample:
 """
 
 import math
+import random
 
 import pytest
 
@@ -398,6 +399,68 @@ class TestGetLlmMessagesForSample:
         asst = [m["content"] for m in msgs if m["role"] == "assistant"]
         # The word should appear, not blank
         assert asst[-1] == "Overflow", f"Expected 'Overflow' but got: {asst}"
+
+
+# ===========================================================================
+# Tests: <flush> token (explicit end-of-audio "dump the tail" control signal)
+# ===========================================================================
+class TestFlushToken:
+    """``use_flush`` appends a ``<flush>`` user turn after the last audio chunk,
+    followed by a final assistant turn carrying any residual (boundary-delayed)
+    words — or empty (EOU only) when there is no residual."""
+
+    FLUSH = "<flush>"
+
+    def test_no_flush_is_default_unchanged(self):
+        """Without use_flush no <flush> turn is emitted (back-compat)."""
+        msgs = _make_messages()
+        assert all(m["content"] != self.FLUSH for m in msgs)
+
+    def test_flush_turn_appended_no_residual(self):
+        """No residual → trailing [user <flush>, assistant ""] and words stay in chunks."""
+        msgs = _make_messages(use_flush=True, flush_token=self.FLUSH)
+        # Last two messages: <flush> user turn then an empty assistant (EOU only).
+        assert msgs[-2] == {"role": "user", "content": self.FLUSH}
+        assert msgs[-1]["role"] == "assistant"
+        assert msgs[-1]["content"] == ""
+        # The real words are still emitted in the audio-chunk turns.
+        chunk_asst = [m["content"] for m in msgs[:-1] if m["role"] == "assistant"]
+        joined = " ".join(c for c in chunk_asst if c != BLANK_TOKEN)
+        assert "Hello" in joined and "World" in joined
+
+    def test_flush_emits_residual_after_flush(self):
+        """A word delayed past the last chunk is emitted AFTER <flush>, not merged."""
+        # Same setup as test_residual_replaces_blank_last_turn (Overflow is residual).
+        alignments = [WordAlignment(text="Overflow", start_time=0.0, end_time=0.20)]
+        msgs = _make_messages(
+            audio_duration_secs=0.08,
+            alignments=alignments,
+            num_delay_frames=0,
+            use_flush=True,
+            flush_token=self.FLUSH,
+        )
+        assert msgs[-2] == {"role": "user", "content": self.FLUSH}
+        assert msgs[-1] == {"role": "assistant", "content": "Overflow"}
+        # The pre-flush audio-chunk assistant turn must NOT contain the residual.
+        pre_flush_asst = [m["content"] for m in msgs[:-2] if m["role"] == "assistant"]
+        assert all("Overflow" not in c for c in pre_flush_asst)
+
+    def test_exactly_one_flush_turn(self):
+        """Exactly one <flush> turn, positioned as the penultimate message."""
+        msgs = _make_messages(use_flush=True, flush_token=self.FLUSH)
+        flush_positions = [i for i, m in enumerate(msgs) if m["content"] == self.FLUSH]
+        assert flush_positions == [len(msgs) - 2]
+
+    def test_flush_custom_token_string(self):
+        """A custom flush token string is used verbatim."""
+        msgs = _make_messages(use_flush=True, flush_token="<eoa>")
+        assert msgs[-2] == {"role": "user", "content": "<eoa>"}
+
+    def test_flush_empty_alignments(self):
+        """No words at all → still a single <flush> + empty EOU assistant."""
+        msgs = _make_messages(alignments=[], use_flush=True, flush_token=self.FLUSH)
+        assert msgs[-2] == {"role": "user", "content": self.FLUSH}
+        assert msgs[-1] == {"role": "assistant", "content": ""}
 
 
 # ===========================================================================
@@ -1909,6 +1972,46 @@ class TestCompactTemplate:
         # System wrapping contains write_id with mask=0 (e.g. <|im_start|>system\n...).
         assert any(mask[p] == 0 for p in write_positions), "system-wrapping write_id should have mask=0"
 
+    def test_tokenize_compact_flush_turn(self, qwen3_hf):
+        """A <flush> user turn encodes as a single mask=0 token; the post-flush
+        assistant content + EOS are supervised (the residual / EOU after flush)."""
+        qwen3_hf.add_special_tokens({"additional_special_tokens": ["<flush>"]})
+
+        class _Wrapper:
+            def __init__(self, hf):
+                self.tokenizer = hf
+
+        qwen3_tok = _Wrapper(qwen3_hf)
+        write_id = qwen3_hf.convert_tokens_to_ids("<|im_start|>")
+        eos_id = qwen3_hf.eos_token_id
+        flush_id = qwen3_hf.convert_tokens_to_ids("<flush>")
+        assert flush_id is not None and flush_id >= 0
+
+        messages = [
+            {"role": "system", "content": "Transcribe."},
+            {"role": "user", "content": "<audio><audio>"},
+            {"role": "assistant", "content": "hello"},
+            {"role": "user", "content": "<flush>"},
+            {"role": "assistant", "content": "world"},
+        ]
+        input_ids, mask, _ = _tokenize_compact_with_assistant_mask(
+            messages, qwen3_tok, write_id, eos_id, supervise_im_end_in_loss=True
+        )
+
+        # The flush token appears exactly once and is a user-side (mask=0) token.
+        flush_positions = [i for i, t in enumerate(input_ids) if t == flush_id]
+        assert len(flush_positions) == 1
+        assert mask[flush_positions[0]] == 0
+
+        # The residual ("world") after <flush> is supervised, and the final EOS
+        # (the EOU) is supervised too (supervise_im_end_in_loss=True).
+        world_ids = qwen3_hf.encode("world", add_special_tokens=False)
+        for wid in world_ids:
+            if wid in input_ids:
+                assert mask[input_ids.index(wid)] == 1
+        assert input_ids[-1] == eos_id
+        assert mask[-1] == 1
+
     def test_tokenize_compact_no_trailing_asst(self, qwen3_tok):
         """A trailing user-only turn (no asst) should not append a write/eos pair."""
         hf = qwen3_tok.tokenizer
@@ -1997,3 +2100,367 @@ class TestCompactTemplate:
         # and decode_with_blank splits on `eos_token_id`. The training sequence's
         # per-turn eos_id plays exactly that role. Verify the trailing token is eos.
         assert input_ids[-1] == eos_id
+
+
+# ===========================================================================
+# Tests: delay-randomized, position-weighted alignment objective
+# ===========================================================================
+# These cover the two opt-in knobs ported from the ASR ChatExternalAligner loss
+# (StreamingSTTDataConfig.random_delay_max_frames / delay_weight_gamma):
+#   * the per-word ``weight`` field attached to assistant messages by
+#     get_llm_messages_for_sample, and
+#   * the random-delay sampling controlled by ``apply_random_delay``.
+# ===========================================================================
+class TestPositionWeighting:
+    """Position weights (``gamma ** p``) emitted on assistant messages."""
+
+    def _asst(self, msgs):
+        return [m for m in msgs if m["role"] == "assistant"]
+
+    def test_default_gamma_emits_no_weight_field(self):
+        """gamma=1.0 (default) must NOT attach any ``weight`` key — this is what
+        makes the model fall back to the exact unweighted mean CE."""
+        msgs = _make_messages(delay_weight_gamma=1.0)
+        assert all("weight" not in m for m in self._asst(msgs))
+
+    def test_gamma_lt_one_attaches_weight_field(self):
+        """gamma<1.0 attaches a ``weight`` to text turns (not to blank turns)."""
+        msgs = _make_messages(delay_weight_gamma=0.9)
+        text_turns = [m for m in self._asst(msgs) if m["content"] != BLANK_TOKEN]
+        blank_turns = [m for m in self._asst(msgs) if m["content"] == BLANK_TOKEN]
+        assert text_turns, "expected at least one text turn"
+        assert all("weight" in m for m in text_turns)
+        # Blank (empty) turns are never down-weighted.
+        assert all("weight" not in m for m in blank_turns)
+
+    def test_weight_value_gamma_pow_p(self):
+        """With chunk_size=10, 'Hello' (end_frame=6) emits in chunk 0 at within-chunk
+        position p=6 → weight == gamma**6."""
+        gamma = 0.9
+        msgs = _make_messages(
+            chunk_size=10,
+            audio_duration_secs=1.0,
+            num_delay_frames=0,
+            delay_weight_gamma=gamma,
+            alignments=[WordAlignment(text="Hello", start_time=0.16, end_time=0.48)],
+        )
+        hello = [m for m in self._asst(msgs) if m["content"] == "Hello"]
+        assert len(hello) == 1, f"expected exactly one 'Hello' turn: {self._asst(msgs)}"
+        assert hello[0]["weight"] == pytest.approx(gamma**6)
+
+    def test_word_delayed_to_later_chunk_gets_weight_one(self):
+        """A word whose (delayed) emission lands in a LATER chunk than its audio end
+        has p<=0 → weight 1.0 (it gained a full extra chunk of lookahead)."""
+        gamma = 0.9
+        # 'Hi' audio ends at frame 2; fixed delay of 10 frames pushes ready to
+        # frame 12 → chunk 1 (chunk_size=10), while audio ended in chunk 0 → p<=0.
+        msgs = _make_messages(
+            chunk_size=10,
+            audio_duration_secs=1.6,  # 20 frames → 2 chunks
+            num_delay_frames=10,
+            delay_weight_gamma=gamma,
+            alignments=[WordAlignment(text="Hi", start_time=0.0, end_time=0.16)],
+        )
+        hi = [m for m in self._asst(msgs) if m["content"] == "Hi"]
+        assert len(hi) == 1, f"expected exactly one 'Hi' turn: {self._asst(msgs)}"
+        assert hi[0]["weight"] == pytest.approx(1.0)
+
+    def test_weight_in_unit_interval(self):
+        """Every emitted weight is in (0, 1]."""
+        msgs = _make_messages(
+            chunk_size=7,
+            audio_duration_secs=2.0,
+            delay_weight_gamma=0.9,
+            alignments=TestWordsPerChunk.FIVE_WORD_ALIGNMENTS,
+        )
+        weights = [m["weight"] for m in self._asst(msgs) if "weight" in m]
+        assert weights, "expected some weighted turns"
+        assert all(0.0 < w <= 1.0 for w in weights)
+
+    def test_multiword_turn_uses_last_word_weight(self):
+        """When a turn emits multiple words (words_per_group>1), the turn weight is
+        the LAST buffered word's weight (documents the per-turn approximation)."""
+        gamma = 0.9
+        msgs = _make_messages(
+            chunk_size=10,
+            audio_duration_secs=2.0,
+            delay_weight_gamma=gamma,
+            words_per_group=2,
+            alignments=TestWordsPerChunk.FIVE_WORD_ALIGNMENTS,
+        )
+        # First grouped turn = "Hello World"; World ends at 0.80s → frame 10 →
+        # emitted in chunk 1 (end=20 with chunk_size=10), p = 10 - 1*10 = 0 → w=1.0.
+        first = next(m for m in self._asst(msgs) if m["content"] == "Hello World")
+        assert "weight" in first
+        # The weight matches World's (last word) position weight, not Hello's.
+        wef_world = math.ceil(0.80 / FRAME_LEN)  # 10
+        emit_chunk = max(0, math.ceil(wef_world / 10) - 1)
+        p = min(max(wef_world - emit_chunk * 10, 0), 10 - 1)
+        assert first["weight"] == pytest.approx(gamma**p)
+
+
+class TestRandomDelay:
+    """Behavior of random_delay_max_frames / apply_random_delay."""
+
+    def _asst(self, msgs):
+        return [m["content"] for m in msgs if m["role"] == "assistant"]
+
+    def test_apply_random_delay_false_ignores_max_frames(self):
+        """apply_random_delay=False must reproduce the no-random-delay messages
+        exactly, even with random_delay_max_frames>0 (used by validation)."""
+        baseline = _make_messages(random_delay_max_frames=0, apply_random_delay=True)
+        no_delay = _make_messages(random_delay_max_frames=5, apply_random_delay=False)
+        assert self._asst(baseline) == self._asst(no_delay)
+
+    def test_random_delay_is_deterministic_under_seed(self):
+        """Seeding the global RNG makes the random delay reproducible."""
+        random.seed(1234)
+        a = self._asst(_make_messages(random_delay_max_frames=4, apply_random_delay=True))
+        random.seed(1234)
+        b = self._asst(_make_messages(random_delay_max_frames=4, apply_random_delay=True))
+        assert a == b
+
+    def test_random_delay_preserves_word_order_and_content(self):
+        """Random delay only shifts WHICH chunk a word lands in — every word must
+        still appear exactly once and in order across many random draws."""
+        words = ["Hello", "World", "How", "Are", "You"]
+        for seed in range(8):
+            random.seed(seed)
+            msgs = _make_messages(
+                chunk_size=2,
+                audio_duration_secs=2.0,
+                random_delay_max_frames=3,
+                apply_random_delay=True,
+                alignments=TestWordsPerChunk.FIVE_WORD_ALIGNMENTS,
+            )
+            emitted = " ".join(a for a in self._asst(msgs) if a != BLANK_TOKEN).split()
+            assert emitted == words, f"seed={seed}: word order/content changed: {emitted}"
+
+    def test_random_delay_only_delays_never_advances(self):
+        """A randomly-delayed word can only be emitted at the same chunk or LATER
+        than with no random delay, never earlier."""
+        align = [WordAlignment(text="W", start_time=0.0, end_time=0.16)]  # end_frame=2
+
+        def first_text_chunk(msgs):
+            idx = 0
+            for m in msgs:
+                if m["role"] == "user":
+                    idx += 1
+                elif m["role"] == "assistant" and m["content"] != BLANK_TOKEN:
+                    return idx - 1
+            return None
+
+        base = first_text_chunk(
+            _make_messages(chunk_size=2, audio_duration_secs=2.0, alignments=align, random_delay_max_frames=0)
+        )
+        for seed in range(8):
+            random.seed(seed)
+            delayed = first_text_chunk(
+                _make_messages(
+                    chunk_size=2,
+                    audio_duration_secs=2.0,
+                    alignments=align,
+                    random_delay_max_frames=4,
+                    apply_random_delay=True,
+                )
+            )
+            assert delayed >= base, f"seed={seed}: random delay moved emission earlier ({delayed} < {base})"
+
+
+# ===========================================================================
+# Tests: compact tokenization with per-token CE weights (emit_weights=True)
+# ===========================================================================
+class TestCompactWeights:
+    """``_tokenize_compact_with_assistant_mask`` per-token weight stream."""
+
+    @pytest.fixture
+    def qwen3_tok(self):
+        try:
+            from transformers import AutoTokenizer as HFAutoTokenizer
+
+            hf_tok = HFAutoTokenizer.from_pretrained("Qwen/Qwen3-1.7B")
+        except Exception:
+            pytest.skip("Qwen3 tokenizer not available")
+
+        class _Wrapper:
+            def __init__(self, hf):
+                self.tokenizer = hf
+
+        return _Wrapper(hf_tok)
+
+    def _markers(self, qwen3_tok):
+        hf = qwen3_tok.tokenizer
+        return hf.convert_tokens_to_ids("<|im_start|>"), hf.eos_token_id
+
+    def test_emit_weights_false_returns_none(self, qwen3_tok):
+        write_id, eos_id = self._markers(qwen3_tok)
+        messages = [
+            {"role": "system", "content": "S."},
+            {"role": "user", "content": "<audio>"},
+            {"role": "assistant", "content": "hello", "weight": 0.5},
+        ]
+        _, _, weights = _tokenize_compact_with_assistant_mask(
+            messages, qwen3_tok, write_id, eos_id, emit_weights=False
+        )
+        assert weights is None
+
+    def test_weights_parallel_to_input_ids(self, qwen3_tok):
+        write_id, eos_id = self._markers(qwen3_tok)
+        messages = [
+            {"role": "system", "content": "S."},
+            {"role": "user", "content": "<audio><audio>"},
+            {"role": "assistant", "content": "hello world", "weight": 0.7},
+        ]
+        input_ids, mask, weights = _tokenize_compact_with_assistant_mask(
+            messages, qwen3_tok, write_id, eos_id, emit_weights=True
+        )
+        assert weights is not None
+        assert len(weights) == len(input_ids) == len(mask)
+        assert all(w > 0.0 for w in weights)
+
+    def test_turn_weight_applied_to_write_and_content(self, qwen3_tok):
+        """write_id and every content token of a turn carry that turn's weight."""
+        write_id, eos_id = self._markers(qwen3_tok)
+        hf = qwen3_tok.tokenizer
+        w = 0.6
+        messages = [
+            {"role": "system", "content": "S."},
+            {"role": "user", "content": "<audio>"},
+            {"role": "assistant", "content": "hello", "weight": w},
+        ]
+        input_ids, mask, weights = _tokenize_compact_with_assistant_mask(
+            messages, qwen3_tok, write_id, eos_id, supervise_im_end_in_loss=True, emit_weights=True
+        )
+        # The inserted write_id is the first write_id with mask=1.
+        write_pos = next(i for i, t in enumerate(input_ids) if t == write_id and mask[i] == 1)
+        assert weights[write_pos] == pytest.approx(w)
+        # Content tokens (between write and eos) carry the same weight.
+        hello_ids = set(hf.encode("hello", add_special_tokens=False))
+        content_pos = [i for i in range(write_pos + 1, len(input_ids)) if input_ids[i] in hello_ids]
+        assert content_pos, "expected hello content tokens"
+        assert all(weights[i] == pytest.approx(w) for i in content_pos)
+
+    def test_eos_inherits_last_content_weight(self, qwen3_tok):
+        """The trailing eos inherits the turn's content weight (non-empty chunk)."""
+        write_id, eos_id = self._markers(qwen3_tok)
+        w = 0.6
+        messages = [
+            {"role": "system", "content": "S."},
+            {"role": "user", "content": "<audio>"},
+            {"role": "assistant", "content": "hello", "weight": w},
+        ]
+        input_ids, mask, weights = _tokenize_compact_with_assistant_mask(
+            messages, qwen3_tok, write_id, eos_id, supervise_im_end_in_loss=True, emit_weights=True
+        )
+        last_eos = max(i for i, t in enumerate(input_ids) if t == eos_id)
+        assert weights[last_eos] == pytest.approx(w)
+
+    def test_system_and_audio_tokens_weight_one(self, qwen3_tok):
+        """Non-assistant (system + user audio) tokens always get weight 1.0.
+
+        The non-assistant region is everything up to the first *inserted* write_id
+        (system wrapping + the first user's audio tokens). The unsupervised trailing
+        eos may inherit the turn weight, but it is mask=0 so the loss ignores it.
+        """
+        write_id, eos_id = self._markers(qwen3_tok)
+        messages = [
+            {"role": "system", "content": "Sys."},
+            {"role": "user", "content": "<audio>"},
+            {"role": "assistant", "content": "hello", "weight": 0.3},
+        ]
+        input_ids, mask, weights = _tokenize_compact_with_assistant_mask(
+            messages, qwen3_tok, write_id, eos_id, emit_weights=True
+        )
+        first_inserted_write = next(i for i, t in enumerate(input_ids) if t == write_id and mask[i] == 1)
+        # System wrapping + first user audio tokens precede the inserted write_id.
+        assert first_inserted_write > 0
+        for i in range(first_inserted_write):
+            assert weights[i] == pytest.approx(1.0), f"non-asst token at {i} should have weight 1.0"
+
+    def test_empty_chunk_weight_one(self, qwen3_tok):
+        """An empty (eos-only) chunk's write/eos carry weight 1.0 even with gamma<1."""
+        write_id, eos_id = self._markers(qwen3_tok)
+        messages = [
+            {"role": "system", "content": "S."},
+            {"role": "user", "content": "<audio>"},
+            {"role": "assistant", "content": BLANK_TOKEN},  # no weight key → empty chunk
+        ]
+        input_ids, mask, weights = _tokenize_compact_with_assistant_mask(
+            messages,
+            qwen3_tok,
+            write_id,
+            eos_id,
+            empty_chunk_eos_only=True,
+            blank_token=BLANK_TOKEN,
+            emit_weights=True,
+        )
+        assert all(w == pytest.approx(1.0) for w in weights)
+
+    def test_gamma_one_turns_yield_all_unit_weights(self, qwen3_tok):
+        """When no turn sets a weight (gamma=1.0 upstream), every weight is 1.0 —
+        the data-level guarantee that the loss reduces to the plain mean CE."""
+        write_id, eos_id = self._markers(qwen3_tok)
+        messages = [
+            {"role": "system", "content": "S."},
+            {"role": "user", "content": "<audio>"},
+            {"role": "assistant", "content": "hello"},  # no weight key
+            {"role": "user", "content": "<audio>"},
+            {"role": "assistant", "content": "world"},  # no weight key
+        ]
+        _, _, weights = _tokenize_compact_with_assistant_mask(
+            messages, qwen3_tok, write_id, eos_id, supervise_im_end_in_loss=True, emit_weights=True
+        )
+        assert all(w == pytest.approx(1.0) for w in weights)
+
+
+# ===========================================================================
+# Tests: _replace_audio_chunks weight threading + weight/target shift
+# ===========================================================================
+class TestReplaceAudioChunksWeights:
+    """The 3-tuple (ids, mask, weights) path of _replace_audio_chunks."""
+
+    AUD = AUDIO_TOKEN_IDX
+
+    def test_weights_replicated_with_chunk(self):
+        chunk_ids = [60, 61, 70, 61, 62]  # BPE-merged 2-tag chunk
+        ids = [1] + chunk_ids + [2]
+        mask = [0] + [0] * 5 + [1]
+        weights = [1.0] + [1.0] * 5 + [0.5]
+        new_ids, new_mask, new_weights = _replace_audio_chunks(
+            ids, chunk_ids, chunk_size=2, mask=mask, weights=weights
+        )
+        assert new_ids == [1, self.AUD, self.AUD, 2]
+        assert new_mask == [0, 0, 0, 1]
+        assert new_weights == [1.0, 1.0, 1.0, 0.5]
+        assert len(new_ids) == len(new_mask) == len(new_weights)
+
+    def test_weights_use_first_element_of_span(self):
+        """Replaced audio span weights copy the FIRST element of the matched span."""
+        chunk_ids = [10, 11]
+        ids = chunk_ids + [99]
+        mask = [0, 0, 1]
+        weights = [0.2, 0.9, 0.5]  # span weights differ; first (0.2) is used
+        _, _, new_weights = _replace_audio_chunks(ids, chunk_ids, chunk_size=3, mask=mask, weights=weights)
+        # 2 BPE tokens → 3 AUDIO copies, all taking weights[0]=0.2; then 0.5.
+        assert new_weights == [0.2, 0.2, 0.2, 0.5]
+
+
+class TestWeightTargetShiftInvariant:
+    """Lock the get_batch_data weight↔target alignment (the [1:] + tail shift)."""
+
+    def _shift(self, token_weights, target_len):
+        # Mirror get_batch_data: target_weights = token_weights[1:] + [1.0].
+        return (token_weights[1:] + [1.0]) if token_weights is not None else [1.0] * target_len
+
+    def test_shifted_weights_align_with_targets(self):
+        token_weights = [1.0, 0.6, 0.6, 0.9, 1.0]
+        target_len = len(token_weights)
+        shifted = self._shift(token_weights, target_len)
+        assert len(shifted) == target_len
+        # weight at target position i corresponds to input weight i+1.
+        assert shifted[:-1] == token_weights[1:]
+        assert shifted[-1] == 1.0
+
+    def test_none_weights_fall_back_to_ones(self):
+        shifted = self._shift(None, 4)
+        assert shifted == [1.0, 1.0, 1.0, 1.0]

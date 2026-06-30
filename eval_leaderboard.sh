@@ -55,9 +55,10 @@ REMOTE_HOST="${REMOTE_HOST:-draco-oci-login-01.draco-oci-iad.nvidia.com}"
 REMOTE_USER="${REMOTE_USER:-hainanx}"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/draco-rno}"
 REMOTE_RESULTS_ROOT="${REMOTE_RESULTS_ROOT:-/lustre/fsw/portfolios/llmservice/users/hainanx/results}"
-# Try these project dirs in order (override with PROJECT=foo). Streaming_SLM_624
-# is the project used by oci/streaming_stt_finetune.sh / oci/sub2.sh.
-PROJECT_CANDIDATES_DEFAULT=("Streaming_SLM_624" "Streaming_SLM_chunk14" "Streaming_SLM")
+# Try these project dirs in order (override with PROJECT=foo). Streaming_SLM_629
+# is the project used by oci/baseline.sh / imend*.sh / imend_rnddelay_posweight*.sh;
+# Streaming_SLM_624 is used by oci/sub2.sh / sub2_llm_scratch.sh.
+PROJECT_CANDIDATES_DEFAULT=("Streaming_SLM_629" "Streaming_SLM_624" "Streaming_SLM_chunk14" "Streaming_SLM")
 SSH_OPTS="-i $SSH_KEY -o StrictHostKeyChecking=no"
 
 # ---------- Local paths (THIS repo) ----------
@@ -71,6 +72,15 @@ fi
 # Force the eval to import nemo from THIS checkout (needed for subsampled models).
 export PYTHONPATH="${NEMO_ROOT}:${PYTHONPATH}"
 export STREAMING_STT_MODEL_ROOT="${NEMO_ROOT}"
+
+# HF token for the gated ESB datasets (hf-audio/esb-datasets-test-only-sorted).
+# Hardcoded in the gitignored ${NEMO_ROOT}/.hf_token (NEVER committed) so the
+# eval works without a `huggingface-cli login`. An existing $HF_TOKEN in the
+# environment takes precedence; this only fills it in when unset.
+if [ -z "${HF_TOKEN:-}" ] && [ -f "${NEMO_ROOT}/.hf_token" ]; then
+    HF_TOKEN="$(tr -d '[:space:]' < "${NEMO_ROOT}/.hf_token")"
+    export HF_TOKEN
+fi
 
 # ---------- Arguments ----------
 # Flags (--last, --gpu/--device N) may appear anywhere; positional args are
@@ -130,6 +140,28 @@ if [ -z "$REMOTE_CKPT_DIR" ]; then
     echo "       Override with PROJECT=<name>." >&2
     exit 1
 fi
+
+# ---------- Helper: prompt before reusing a cached checkpoint ----------
+# Returns 0 -> (re)download, 1 -> reuse the local copy.
+#   FORCE_DOWNLOAD=1 -> always redownload (no prompt)
+#   non-interactive (no TTY) -> reuse (no prompt); set FORCE_DOWNLOAD=1 to override
+prompt_redownload() {
+    local path="$1"
+    if [ "${FORCE_DOWNLOAD:-0}" = "1" ]; then
+        return 0
+    fi
+    if [ ! -t 0 ] && [ ! -e /dev/tty ]; then
+        echo "==> Cached checkpoint found (non-interactive; set FORCE_DOWNLOAD=1 to re-pull): $path"
+        return 1
+    fi
+    local ans=""
+    read -r -p "==> Checkpoint already exists locally ($(du -h "$path" | cut -f1)): ${path}
+    Redownload? [y/N] " ans </dev/tty || ans=""
+    case "$ans" in
+        [Yy] | [Yy][Ee][Ss]) return 0 ;;
+        *) return 1 ;;
+    esac
+}
 
 # ---------- Step 1: pick + download (or average) the checkpoint ----------
 if [ "${RUN_AVERAGING:-0}" = "1" ]; then
@@ -194,7 +226,10 @@ else
             echo "==> USE_LAST=1: finding most recent -last.ckpt on OCI..."
             REMOTE_LIST_CMD="ls -t ${REMOTE_CKPT_DIR}/*-last.ckpt"
         else
-            echo "==> Finding best (non '-last') checkpoint on OCI..."
+            # BEST checkpoint: the recipe saves save_top_k=1 monitored on val_acc
+            # as "step=<N>.ckpt" (no metric in the name) plus a rolling
+            # "step=<N>-last.ckpt". So the single non '-last' snapshot IS the best.
+            echo "==> Finding BEST checkpoint on OCI (top-1 val_acc; non '-last' step=*.ckpt)..."
             REMOTE_LIST_CMD="ls -t ${REMOTE_CKPT_DIR}/*.ckpt 2>/dev/null | grep -v -- '-last\.ckpt$'"
         fi
         CKPT_FILENAME=$(ssh $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}" "${REMOTE_LIST_CMD} | head -1 | xargs -r basename")
@@ -216,13 +251,20 @@ else
     REMOTE_CKPT_PATH="${REMOTE_CKPT_DIR}/${CKPT_FILENAME}"
     LOCAL_CKPT_PATH="${LOCAL_CKPT_DIR}/${EXP_NAME}/${CKPT_FILENAME}"
 
-    # Cache-first: if a non-empty local copy already exists, reuse it (so a full
-    # run right after a QUICK_TEST does NOT re-pull the same checkpoint). Set
-    # FORCE_DOWNLOAD=1 to re-fetch. SKIP_DOWNLOAD=1 is kept as a no-op alias.
-    if [ -f "$LOCAL_CKPT_PATH" ] && [ -s "$LOCAL_CKPT_PATH" ] && [ "${FORCE_DOWNLOAD:-0}" != "1" ]; then
-        echo "==> Reusing cached local checkpoint (FORCE_DOWNLOAD=1 to re-pull): $LOCAL_CKPT_PATH"
-        echo "    ($(du -h "$LOCAL_CKPT_PATH" | cut -f1))"
-    else
+    # Cache-first: if a non-empty local copy already exists, ASK before re-pulling
+    # (default: reuse, so a full run right after a QUICK_TEST does NOT re-download
+    # the same checkpoint). FORCE_DOWNLOAD=1 re-fetches without prompting;
+    # SKIP_DOWNLOAD=1 is kept as a no-op alias.
+    DO_DOWNLOAD=1
+    if [ -f "$LOCAL_CKPT_PATH" ] && [ -s "$LOCAL_CKPT_PATH" ]; then
+        if prompt_redownload "$LOCAL_CKPT_PATH"; then
+            echo "==> Will re-download checkpoint."
+        else
+            echo "==> Reusing cached local checkpoint: $LOCAL_CKPT_PATH ($(du -h "$LOCAL_CKPT_PATH" | cut -f1))"
+            DO_DOWNLOAD=0
+        fi
+    fi
+    if [ "$DO_DOWNLOAD" = "1" ]; then
         echo "==> Downloading checkpoint from OCI..."
         echo "    Remote: ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_CKPT_PATH}"
         echo "    Local:  ${LOCAL_CKPT_PATH}"

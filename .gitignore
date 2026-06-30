@@ -219,3 +219,7 @@ oci/
 # Local-only debug/probe scripts (may reference cluster paths / read tokens from
 # env at runtime). Keep out of git so nothing leaks accidentally.
 probe_alignment.py
+
+# Hardcoded HF token for the eval wrappers (auto-loaded by eval_leaderboard*.sh).
+# NEVER commit: this holds a real Hugging Face access token.
+.hf_token

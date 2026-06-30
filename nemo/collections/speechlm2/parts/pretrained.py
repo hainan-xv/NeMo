@@ -365,6 +365,68 @@ def init_model_from_checkpoint(model: torch.nn.Module, checkpoint_path: str):
     model.load_state_dict(checkpoint_state, strict=True)
 
 
+def warm_start_from_ckpt(model: torch.nn.Module, ckpt_path: str) -> dict:
+    """Initialize ``model`` weights (only) from a Lightning ``.ckpt``.
+
+    This is a WARM START, not a resume: optimizer / scheduler / global-step state
+    is intentionally ignored, so training restarts with the configured LR
+    schedule. Unlike :func:`set_model_dict_for_partial_init` (which drops any
+    shape-mismatched tensor entirely), this is VOCAB-RESIZE AWARE: tensors whose
+    shape differs only in the first (vocabulary) dim — e.g. ``embed_tokens.weight``
+    / ``lm_head.weight`` after a new special token such as ``<flush>`` was added —
+    are copied row-wise for the overlapping rows, leaving any new rows at their
+    freshly-initialized values (the ``<flush>`` row is init'd from ``<|im_end|>``
+    in the model ctor; new tokens are appended at the END of the vocab, so the
+    overlapping rows align exactly). Keys absent in the checkpoint keep their
+    initialization. Returns a small dict of counts (handy for tests/logging).
+
+    Args:
+        model: target module (e.g. the freshly constructed StreamingSTTModel).
+        ckpt_path: path to a Lightning ``.ckpt`` (or a raw state_dict file).
+    """
+    logging.info(f"Warm-starting model weights from checkpoint: {ckpt_path}")
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    src = ckpt.get("state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
+    tgt = model.state_dict()
+    new_sd = {}
+    loaded = resized = skipped = 0
+    for k, t in tgt.items():
+        if k not in src:
+            skipped += 1
+            continue
+        s = src[k]
+        if tuple(s.shape) == tuple(t.shape):
+            new_sd[k] = s
+            loaded += 1
+        elif s.dim() == t.dim() and tuple(s.shape[1:]) == tuple(t.shape[1:]) and s.shape[0] <= t.shape[0]:
+            merged = t.detach().clone()
+            merged[: s.shape[0]] = s.to(dtype=merged.dtype, device=merged.device)
+            new_sd[k] = merged
+            resized += 1
+            logging.info(f"  resized {k}: {tuple(s.shape)} -> {tuple(t.shape)} (copied {s.shape[0]} rows)")
+        else:
+            skipped += 1
+            logging.warning(f"  skip {k}: shape mismatch src{tuple(s.shape)} vs tgt{tuple(t.shape)}")
+    missing, unexpected = model.load_state_dict(new_sd, strict=False)
+    ckpt_unused = len(unexpected) + sum(1 for k in src if k not in tgt)
+    logging.info(
+        "Warm-start done: loaded=%d, resized=%d, skipped(shape/absent)=%d, "
+        "params_not_in_ckpt(kept-init)=%d, ckpt_keys_unused=%d",
+        loaded,
+        resized,
+        skipped,
+        len(missing),
+        ckpt_unused,
+    )
+    return {
+        "loaded": loaded,
+        "resized": resized,
+        "skipped": skipped,
+        "missing": len(missing),
+        "ckpt_unused": ckpt_unused,
+    }
+
+
 def load_pretrained_model(model: torch.nn.Module, checkpoint_path: str):
     """Load a pretrained S2S model from a checkpoint path.
 

@@ -73,6 +73,15 @@ fi
 export PYTHONPATH="${NEMO_ROOT}:${PYTHONPATH}"
 export STREAMING_STT_MODEL_ROOT="${NEMO_ROOT}"
 
+# HF token for the gated ESB datasets (hf-audio/esb-datasets-test-only-sorted).
+# Hardcoded in the gitignored ${NEMO_ROOT}/.hf_token (NEVER committed) so the
+# eval works without a `huggingface-cli login`. An existing $HF_TOKEN in the
+# environment takes precedence; this only fills it in when unset.
+if [ -z "${HF_TOKEN:-}" ] && [ -f "${NEMO_ROOT}/.hf_token" ]; then
+    HF_TOKEN="$(tr -d '[:space:]' < "${NEMO_ROOT}/.hf_token")"
+    export HF_TOKEN
+fi
+
 # ---------- Arguments ----------
 # Flags (--last, --gpu/--device N) may appear anywhere; positional args are
 # still supported: <EXP_NAME> [STEP] [DEVICE_ID].
