@@ -81,8 +81,10 @@ def train(cfg):
     # Optional warm start from another run's checkpoint (weights only; tolerates
     # vocab growth from newly added special tokens such as <flush>). Distinct
     # from exp_manager auto-resume, which restores full training state from THIS
-    # run's exp_dir.
-    init_from_ckpt = cfg.get("init_from_ckpt", None)
+    # run's exp_dir. The path is also accepted via the INIT_FROM_CKPT env var so
+    # it can carry characters Hydra's override parser rejects (e.g. the '=' in
+    # Lightning's "step=44006.ckpt" filenames).
+    init_from_ckpt = cfg.get("init_from_ckpt", None) or os.environ.get("INIT_FROM_CKPT") or None
     if init_from_ckpt:
         warm_start_from_ckpt(model, str(init_from_ckpt))
 
