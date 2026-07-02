@@ -38,6 +38,12 @@ from nemo.collections.speechlm2.parts.utils import to_dataclass
 AUDIO_TOKEN_IDX = -200
 IGNORE_INDEX = -100
 
+# Sentinel for get_batch_data(truncation_plan=...): the default means "sample a
+# fresh flush-truncation plan internally". Passing None (or a list) explicitly
+# overrides that — used by encoder_reuse_k>1 to share ONE plan across the K
+# reused views so they truncate the audio identically.
+_TRUNCATION_AUTO = object()
+
 
 def right_collate_vectors(
     tensors: Iterable[Union[torch.Tensor, np.ndarray]],
@@ -1624,6 +1630,45 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
 
         return self.get_batch_data(cuts, audios, audio_lens, alignments, text)
 
+    def sample_flush_truncation_plan(
+        self, audio_lens: torch.Tensor, apply_random_delay: bool = True
+    ) -> Optional[List[Optional[int]]]:
+        """Sample a per-sample mid-utterance truncation plan for the flush aug.
+
+        Returns ``None`` when the augmentation is inactive (feature off, non-fixed
+        chunking, eval, or empty batch). Otherwise returns a list (len == batch)
+        whose entries are the target chunk count ``C`` for cuts selected to be
+        truncated (each having > C chunks), or ``None`` for cuts left full. A
+        SINGLE shared cutoff ``C`` is drawn per batch from
+        ``[1, n_chunks(shortest cut)]`` (so every cut can be truncated to it);
+        each cut is then independently selected with probability
+        ``flush_truncate_prob``.
+
+        Sampling the plan ONCE and passing it to :meth:`get_batch_data` lets the
+        ``encoder_reuse_k>1`` path truncate the audio identically across all K
+        reused views (the encoder output is shared, so audio / audio-slot counts
+        must match across views — only the delay randomization may differ).
+        """
+        if not (
+            apply_random_delay
+            and bool(getattr(self.cfg, "use_flush", False))
+            and float(getattr(self.cfg, "flush_truncate_prob", 0.0)) > 0.0
+            and self.cfg.chunk_size > 0
+        ):
+            return None
+        durations = (audio_lens.float() / self.cfg.sample_rate).tolist()
+        if not durations:
+            return None
+        chunk_size = self.cfg.chunk_size
+        frame_len = self.cfg.frame_length_in_secs
+        n_chunks_per = [max(1, math.ceil(math.ceil(d / frame_len) / chunk_size)) for d in durations]
+        C = random.randint(1, min(n_chunks_per))
+        prob = float(self.cfg.flush_truncate_prob)
+        plan: List[Optional[int]] = [
+            (C if (n > C and random.random() < prob) else None) for n in n_chunks_per
+        ]
+        return plan if any(p is not None for p in plan) else None
+
     def get_batch_data(
         self,
         cuts: CutSet,
@@ -1633,6 +1678,7 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
         text: List[str],
         randomize_fixed_chunk_groups: Optional[bool] = None,
         apply_random_delay: bool = True,
+        truncation_plan=_TRUNCATION_AUTO,
     ) -> StreamingSTTBatch:
         audio_durations_secs = (audio_lens.float() / self.cfg.sample_rate).tolist()
 
@@ -1655,39 +1701,33 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             audio_durations_secs = (audio_lens.float() / self.cfg.sample_rate).tolist()
 
         # --- Flush truncation augmentation (training only) ---
-        # With prob flush_truncate_prob, replace a cut with a copy truncated at a
-        # chunk boundary so the model learns to flush MID-utterance (not just at
-        # the true end). The cutoff C (in chunks) is sampled ONCE per batch from
-        # [1, n_chunks(shortest cut)] (so every cut has >= C chunks) and applied to
-        # the selected cuts. Truncating = shrink audio_lens to C chunks and keep
-        # only words whose audio fully precedes the cutoff; get_llm_messages then
-        # appends <flush> after chunk C with any boundary-delayed residual. We
-        # copy the outer alignments/text lists so encoder_reuse_k re-calls (which
-        # reuse the caller's lists) are not corrupted.
-        if (
-            apply_random_delay
-            and bool(getattr(self.cfg, "use_flush", False))
-            and float(getattr(self.cfg, "flush_truncate_prob", 0.0)) > 0.0
-            and self.cfg.chunk_size > 0
-            and len(audio_durations_secs) > 0
-        ):
+        # Replace selected cuts with a copy truncated at a chunk boundary so the
+        # model learns to flush MID-utterance (not just at the true end). The plan
+        # (per-sample target chunk count C, or None) is normally sampled here, but
+        # the encoder_reuse_k>1 training path passes a SHARED plan so all K reused
+        # views truncate the audio IDENTICALLY — the encoder output is computed
+        # once and reused, so the views may differ only in delay randomization,
+        # never in the audio / audio-slot count. Truncating = shrink audio_lens to
+        # C chunks and keep only words whose audio fully precedes the cutoff;
+        # get_llm_messages then appends <flush> after chunk C with any
+        # boundary-delayed residual. We copy the outer alignments/text lists so
+        # encoder_reuse_k re-calls (which reuse the caller's lists) are not
+        # corrupted.
+        if truncation_plan is _TRUNCATION_AUTO:
+            truncation_plan = self.sample_flush_truncation_plan(audio_lens, apply_random_delay=apply_random_delay)
+        if truncation_plan:
             chunk_size = self.cfg.chunk_size
             frame_len = self.cfg.frame_length_in_secs
             sr = self.cfg.sample_rate
-            n_chunks_per = [max(1, math.ceil(math.ceil(d / frame_len) / chunk_size)) for d in audio_durations_secs]
-            min_chunks = min(n_chunks_per)
-            C = random.randint(1, min_chunks)
-            cutoff_secs = C * chunk_size * frame_len
-            cutoff_samples = int(round(cutoff_secs * sr))
             new_audio_lens = audio_lens.clone()
             alignments = [list(a) for a in alignments]
             text = list(text)
             changed = False
-            for b in range(len(audio_durations_secs)):
-                if n_chunks_per[b] <= C:
-                    continue  # already at/under the cutoff — truncation is a no-op
-                if random.random() >= self.cfg.flush_truncate_prob:
+            for b, C in enumerate(truncation_plan):
+                if not C:
                     continue
+                cutoff_secs = C * chunk_size * frame_len
+                cutoff_samples = int(round(cutoff_secs * sr))
                 kept = [w for w in alignments[b] if w.end_time <= cutoff_secs]
                 if not kept:
                     continue  # no complete word in the prefix — skip truncation

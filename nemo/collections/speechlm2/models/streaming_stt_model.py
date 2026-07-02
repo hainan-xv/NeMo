@@ -1608,6 +1608,11 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         audio_embs = None
         part_metrics = []
         last_batch = None
+        # Flush-truncation plan is sampled ONCE and shared across the K views: the
+        # encoder output is computed once and reused, so every view must truncate
+        # the audio identically (they may differ only in delay randomization).
+        # Returns None when the augmentation is inactive → no truncation.
+        trunc_plan = self.dataset.sample_flush_truncation_plan(orig.audio_lens)
         for _k in range(K):
             bk = self.dataset.get_batch_data(
                 cuts=orig.cuts,
@@ -1615,6 +1620,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 audio_lens=orig.audio_lens,
                 alignments=alignments,
                 text=orig.text,
+                truncation_plan=trunc_plan,
             )
             bk = move_data_to_device(bk, self.device)
             if audio_embs is None:
@@ -1936,33 +1942,17 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         inline code used, so logging is unchanged.
         """
         loss = metrics["loss"]
-        loss_blank = metrics["loss_blank"]
-        loss_nonblank = metrics["loss_nonblank"]
-        cls_loss_log = metrics["cls_loss_log"]
-        text_only_lm_loss_log = metrics["text_only_lm_loss_log"]
-        text_only_lm_num_targets_log = metrics["text_only_lm_num_targets_log"]
-        num_blank = metrics["num_blank"]
-        num_targets = metrics["num_targets"]
         par_loss_log = metrics["par_loss_log"]
         par_num_slots_log = metrics["par_num_slots_log"]
         inputs = metrics["inputs"]
 
-        B, L = inputs["input_embeds"].shape[:2]
+        B = inputs["input_embeds"].shape[0]
         log_payload = {
             "loss": loss,
-            "loss_blank": loss_blank,
-            "loss_nonblank": loss_nonblank,
-            "loss_chunk_cls": cls_loss_log,
-            "loss_text_only_lm": text_only_lm_loss_log,
-            "text_only_lm_num_targets": text_only_lm_num_targets_log.float(),
-            "blank_ratio": num_blank.float() / num_targets,
             "learning_rate": torch.as_tensor(
                 self.trainer.optimizers[0].param_groups[0]["lr"] if self._trainer is not None else 0
             ),
             "batch_size": float(B),
-            "sequence_length": float(L),
-            "num_targets": num_targets.float(),
-            "target_to_input_ratio": num_targets / (B * L),
         }
         # Only surface the parallel-head metrics when the feature is enabled,
         # so existing runs emit the exact same metric keys as before.
@@ -2101,7 +2091,6 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
 
     def on_validation_epoch_start(self) -> None:
         self._partial_val_losses: dict[str, list] = defaultdict(list)
-        self._partial_accuracies: dict[str, list] = defaultdict(list)
         self._partial_wer_errors: dict[str, list] = defaultdict(list)
         self._partial_wer_words: dict[str, list] = defaultdict(list)
         # Parallel-decode WER accumulators (only populated when parallel heads
@@ -2123,14 +2112,6 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             val_losses.append(val_loss)
         if val_losses:
             self.log("val_loss", torch.stack(val_losses).mean(), on_epoch=True, sync_dist=True)
-
-        accuracies = []
-        for name, accs in self._partial_accuracies.items():
-            val_acc = torch.stack(accs).mean()
-            self.log(f"val_acc_{name}", val_acc, on_epoch=True, sync_dist=True)
-            accuracies.append(val_acc)
-        if accuracies:
-            self.log("val_acc", torch.stack(accuracies).mean(), on_epoch=True, sync_dist=True)
 
         # In parallel-only training the AR decode path is not optimized, so the
         # AR WER is meaningless as the primary monitor. Demote it to
@@ -2199,7 +2180,6 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             self.log("val_aux_macro_acc", torch.stack(macro_accs).mean(), on_epoch=True, sync_dist=True)
 
         self._partial_val_losses.clear()
-        self._partial_accuracies.clear()
         self._partial_wer_errors.clear()
         self._partial_wer_words.clear()
         self._partial_wer_errors_parallel.clear()
@@ -2255,10 +2235,10 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         target_ids = batch.target_tokens
         # Mirror training-time LM-CE masking: when the aux head owns the
         # boundary decision, audio positions are not LM-supervised in
-        # training, so they must also be excluded from val_loss / val_acc —
-        # otherwise val metrics are dominated by positions the LM was never
-        # trained on. If keep_lm_supervision_at_audio is True, the LM IS
-        # supervised at audio positions during training, so don't mask in val.
+        # training, so they must also be excluded from val_loss — otherwise
+        # val metrics are dominated by positions the LM was never trained on.
+        # If keep_lm_supervision_at_audio is True, the LM IS supervised at
+        # audio positions during training, so don't mask in val.
         if aux_active and not self.core_cfg.chunk_classifier_keep_lm_supervision_at_audio:
             audio_mask_for_lm = batch.input_tokens == AUDIO_TOKEN_IDX
             target_ids = torch.where(audio_mask_for_lm, torch.full_like(target_ids, IGNORE_INDEX), target_ids)
@@ -2272,14 +2252,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 ignore_index=IGNORE_INDEX,
             ) / num_targets.clamp(min=1)
 
-        preds = outputs["logits"].argmax(dim=-1).view(-1)
-        refs = target_ids.reshape(-1)
-        preds = preds[refs != IGNORE_INDEX]
-        refs = refs[refs != IGNORE_INDEX]
-        accuracy = preds.eq(refs).float().mean()
-
         self._partial_val_losses[name].append(loss)
-        self._partial_accuracies[name].append(accuracy)
 
         # WER from inference-time decoding (non-teacher-forced). In
         # parallel-only training the AR path is not optimized, so skip the AR
@@ -4281,11 +4254,49 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         if B == 0 or max(n_samples_list) == 0:
             return [""] * B
         device = audios.device
+
         chunk_size = self.core_cfg.chunk_size
         chunks_per_turn = max(int(inference_audio_chunks_per_turn), 1)
         turn_chunk_size = chunk_size * chunks_per_turn
         chunk_samples = math.ceil(chunk_size * self.core_cfg.frame_length_in_secs * self.core_cfg.sample_rate)
         turn_chunk_samples = chunk_samples * chunks_per_turn
+
+        num_chunks_per_stream = [math.ceil(ns / chunk_samples) if ns > 0 else 0 for ns in n_samples_list]
+        num_turns_per_stream = [math.ceil(nc / chunks_per_turn) if nc > 0 else 0 for nc in num_chunks_per_stream]
+
+        if B > 1 and getattr(self, "_inference_use_flush", False) and len(set(num_turns_per_stream)) > 1:
+            # The final <flush> turn depends on the exact KV state immediately
+            # after an utterance's last real audio chunk. A mixed-length batch
+            # would advance shorter streams with zero-audio filler turns while
+            # longer streams continue, then flush all streams from the longest
+            # stream's time. Bucket by equal turn count so each bucket can still
+            # decode batched, but no stream receives post-utterance filler before
+            # its flush.
+            prompts = [system_prompt] * B if isinstance(system_prompt, str) else list(system_prompt)
+            grouped: dict[int, list[int]] = {}
+            for b, n_turns in enumerate(num_turns_per_stream):
+                grouped.setdefault(n_turns, []).append(b)
+
+            results: list[Optional[str]] = [None] * B
+            for indices in grouped.values():
+                sub_audios = audios[indices]
+                sub_lens = [n_samples_list[i] for i in indices]
+                sub_prompts = [prompts[i] for i in indices]
+                sub_results = self._generate_chunked_streaming(
+                    sub_audios,
+                    sub_lens,
+                    sub_prompts,
+                    max_new_tokens,
+                    generation_config,
+                    use_offline_embs=use_offline_embs,
+                    inference_audio_chunks_per_turn=inference_audio_chunks_per_turn,
+                    parallel_chunk_decode=parallel_chunk_decode,
+                    **generation_kwargs,
+                )
+                for i, hyp in zip(indices, sub_results):
+                    results[i] = hyp
+            return [r if r is not None else "" for r in results]
+
         state = self.get_init_streaming_state(system_prompt, device=device, batch_size=B)
 
         offline_emb_chunks_list = None
@@ -4295,8 +4306,6 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 for b in range(B)
             ]
 
-        num_chunks_per_stream = [math.ceil(ns / chunk_samples) if ns > 0 else 0 for ns in n_samples_list]
-        num_turns_per_stream = [math.ceil(nc / chunks_per_turn) if nc > 0 else 0 for nc in num_chunks_per_stream]
         max_turns = max(num_turns_per_stream)
         all_token_ids: list[list[int]] = [[] for _ in range(B)]
 

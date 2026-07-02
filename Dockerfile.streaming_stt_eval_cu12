@@ -1,0 +1,58 @@
+# Derived from the colleague's CUDA 13 streaming-stt-eval image, rebuilt so the
+# CUDA-bound layer targets CUDA 12.8 instead of 13.0. This lets the vLLM eval
+# path run on hosts whose NVIDIA driver only supports CUDA 12.x (e.g. driver
+# 555.42.02 on Ubuntu 20.04, which cannot reach the driver >= 580 that CUDA 13
+# requires). CUDA 12.8 runs on driver 555 via CUDA minor-version compatibility.
+#
+# ONLY the CUDA-bound wheels change:
+#   - torch / torchaudio / torchvision 2.11.0  ->  their +cu128 builds
+#   - flashinfer-jit-cache 0.6.8.post1         ->  its +cu128 build
+# Everything else is inherited unchanged and therefore byte-identical to the
+# base image: vllm 0.21.0 (a CUDA-agnostic cp38-abi3 wheel that just pins
+# torch==2.11.0), the NeMo SALM plugin (nemo.collections.speechlm2.vllm.salm),
+# /opt/heh-nemo (convert branch), /opt/convert, the baked HF model cache and the
+# /workspace/warmup bundle. So convert.sh + b_streaming_infer.py behave the same.
+#
+# Build:
+#   docker build -f Dockerfile.streaming_stt_eval_cu12 \
+#     -t streaming-stt-eval:cu128 .
+ARG BASE_IMAGE=gitlab-master.nvidia.com/dongjig/nemo_containers/streaming-stt-eval:v2
+FROM ${BASE_IMAGE}
+
+# 0) CRITICAL: drop the baked CUDA-13 forward-compat driver libs
+#    (/usr/local/cuda-13.0/compat/libcuda.so.580.95.05). The NVIDIA container
+#    runtime otherwise prefers these 580-series user-mode libs over the host's
+#    real driver and loads them on top of an older host *kernel* module -- which
+#    is unsupported for this driver/GPU combo and fails with CUDA "Error 803:
+#    system has unsupported display driver / cuda driver combination". Removing
+#    them makes the container use the host libcuda that the runtime mounts (e.g.
+#    driver 555 / CUDA 12.5), which our cu128 build runs on via minor-version
+#    compatibility.
+RUN rm -rf /usr/local/cuda-13.0/compat /usr/local/cuda/compat
+
+# 1) torch stack -> CUDA 12.8. The +cu128 local version differs from the base's
+#    +cu130, so pip replaces torch and pulls the matching nvidia-*-cu12 runtime
+#    libraries. --extra-index-url keeps PyPI available for any pure-python deps.
+RUN pip install --no-cache-dir \
+        --extra-index-url https://download.pytorch.org/whl/cu128 \
+        torch==2.11.0+cu128 torchaudio==2.11.0+cu128 torchvision==0.26.0+cu128
+
+# 2) flashinfer precompiled JIT cache -> CUDA 12.8 (must match the torch CUDA).
+#    flashinfer-python / flashinfer-cubin (0.6.8.post1) are CUDA-agnostic and
+#    stay as-is, so --no-deps avoids touching them.
+RUN pip install --no-cache-dir --force-reinstall --no-deps \
+        --index-url https://flashinfer.ai/whl/cu128 \
+        flashinfer-jit-cache==0.6.8.post1+cu128
+
+# 3) Patched converter (rewrites pretrained_llm -> HF repo id, not just asr) +
+#    the Qwen3-1.7B base LLM used by the imend_* / streaming_stt recipes. The base
+#    image only bakes Qwen3-0.6B, so without this, converting a 1.7B checkpoint
+#    would need a network fetch every run. HF_HOME=/opt/hf_cache (set in the base
+#    image) means this caches alongside the baked Qwen3-0.6B + nemotron ASR.
+COPY vllm_convert_patched.sh /workspace/convert_patched.sh
+RUN chmod +x /workspace/convert_patched.sh \
+    && python -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-1.7B')"
+
+# 4) Build-time sanity: imports must succeed on CPU (no GPU during docker build).
+RUN python -c "import torch, vllm; print('OK torch', torch.__version__, '| vllm', vllm.__version__)" \
+    && python -c "import torch; assert torch.version.cuda.startswith('12'), torch.version.cuda; print('CUDA build', torch.version.cuda)"

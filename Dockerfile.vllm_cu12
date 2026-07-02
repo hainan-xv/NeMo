@@ -1,0 +1,50 @@
+# Build vLLM 0.21.0 from source against CUDA 12.8, on top of the cu128 base.
+#
+# Why: the PyPI vLLM 0.21.0 wheel is compiled against CUDA 13 (its _C.abi3.so and
+# bundled flash-attn link libcudart.so.13). cudart 13 is a *major* version ahead
+# of an Ubuntu-20.04 host driver (555 / CUDA 12.5) and fails even cudaFree(0)
+# with error 803/35. torch's cu128 build is only a *minor* bump (12.8 vs 12.5)
+# so it runs via minor-version compatibility -- but vLLM does not. The only way
+# to run vLLM on such a host is to rebuild it against CUDA 12.x.
+#
+# This produces a cudart-12.8 vLLM that runs on driver >= 525, while keeping the
+# rest of the image (NeMo SALM plugin, converters, HF cache) byte-identical.
+#
+# Build (long; sm_86 only to stay tractable):
+#   docker build -f Dockerfile.vllm_cu12 -t streaming-stt-eval:cu128-vllmsrc .
+FROM streaming-stt-eval:cu128
+
+# 1) CUDA 12.8 dev toolkit (nvcc + headers + dev libs) matching the installed
+#    torch cu128. Installs to /usr/local/cuda-12.8, coexisting with cuda-13.
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        cuda-toolkit-12-8 libcudnn9-dev-cuda-12 \
+    && rm -rf /var/lib/apt/lists/*
+
+# 2) Build deps for a no-build-isolation source build (so it uses the already
+#    installed torch 2.11.0+cu128 instead of pulling the cu13 default torch).
+RUN pip install --no-cache-dir \
+        cmake ninja packaging "setuptools>=77" setuptools-scm wheel jinja2 pyyaml regex
+
+# 3) Compile vLLM 0.21.0 from sdist against CUDA 12.8 for the A6000 (sm_86).
+ENV CUDA_HOME=/usr/local/cuda-12.8 \
+    CUDACXX=/usr/local/cuda-12.8/bin/nvcc \
+    PATH=/usr/local/cuda-12.8/bin:/usr/local/bin:/usr/bin:/bin \
+    TORCH_CUDA_ARCH_LIST=8.6 \
+    VLLM_FA_CMAKE_GPU_ARCHES=86-real \
+    MAX_JOBS=16 \
+    NVCC_THREADS=2 \
+    CCACHE_DISABLE=1
+# Install from the sdist FILE (not the "vllm==0.21.0" specifier): the source
+# build stamps a local version "0.21.0+cu128", which pip rejects as inconsistent
+# with an exact "==0.21.0" requirement. Installing from the tarball path skips
+# that check and keeps the +cu128 tag.
+RUN nvcc --version | tail -2 \
+    && curl -fsSL -o /tmp/vllm-0.21.0.tar.gz \
+        https://files.pythonhosted.org/packages/97/bb/8dbba4136f6851470f4324ac665affe55c0b618341ccc42f35a53c5e708e/vllm-0.21.0.tar.gz \
+    && pip uninstall -y vllm \
+    && pip install --no-cache-dir --no-build-isolation --no-deps -v /tmp/vllm-0.21.0.tar.gz \
+    && rm -f /tmp/vllm-0.21.0.tar.gz
+
+# 4) sanity: the rebuilt vLLM must link cudart 12 (not 13).
+RUN python -c "import vllm; print('vllm', vllm.__version__)" \
+    && ldd /usr/local/lib/python3.12/dist-packages/vllm/_C.abi3.so | grep -i cudart

@@ -6,6 +6,10 @@ and reports WER + RTFx.  Results are written in the same format used by
 the open_asr_leaderboard so that ``eval_utils.score_results()`` works.
 
 Usage:
+    # By grid EXP_NAME (auto-downloads the best checkpoint from OCI):
+    python run_eval_sslm.py imend_flush --device 0
+
+    # By local checkpoint path:
     python run_eval_sslm.py \
         --ckpt_path /path/to/step=8000.ckpt \
         --dataset librispeech --split test.clean \
@@ -26,6 +30,7 @@ import logging
 import os
 import time
 import warnings
+import itertools
 
 # ---------------------------------------------------------------------------
 # Quiet mode: this script only emits an on-the-fly results table. Everything
@@ -144,23 +149,52 @@ def _tail_flush_pad_samples(model) -> int:
     return int(round(flush_chunks * chunk_size * frame_len * sr))
 
 
-def transcribe_sslm(model, dloader, system_prompt, max_new_tokens, no_repeat_ngram_size) -> list[str]:
+def transcribe_sslm(model, dloader, system_prompt, max_new_tokens, no_repeat_ngram_size, warmup_decode=False) -> list[str]:
     from transformers import GenerationConfig
-    gen_cfg = GenerationConfig(
-        max_new_tokens=max_new_tokens,
-        do_sample=False,
-        no_repeat_ngram_size=no_repeat_ngram_size,
-    )
+    if max_new_tokens is None:
+        max_new_tokens = int(
+            getattr(model.core_cfg, "max_new_tokens_per_chunk", 10)
+        )
+    # Match training validation decode exactly when no extra decoding constraint is
+    # requested: validation calls model.generate(..., generation_config=None).
+    # Only construct a GenerationConfig for non-default eval-time constraints.
+    gen_cfg = None
+    if no_repeat_ngram_size and no_repeat_ngram_size > 0:
+        gen_cfg = GenerationConfig(
+            do_sample=False,
+            no_repeat_ngram_size=no_repeat_ngram_size,
+        )
 
     pad_samples = _tail_flush_pad_samples(model)
 
-    hyps = []
-    for batch in tqdm(dloader, desc="Transcribing", disable=True):
+    def _prepare_batch(batch):
         audios = batch["audios"]
         audio_lens = batch["audio_lens"]
         if pad_samples > 0:
             audios = torch.nn.functional.pad(audios, (0, pad_samples))
             audio_lens = audio_lens + pad_samples
+        return audios, audio_lens
+
+    iterator = iter(dloader)
+    try:
+        first_batch = next(iterator)
+    except StopIteration:
+        return []
+
+    if warmup_decode:
+        audios, audio_lens = _prepare_batch(first_batch)
+        with torch.inference_mode():
+            _ = model.generate(
+                audios=audios.to(model.device, non_blocking=True),
+                audio_lens=audio_lens.to(model.device, non_blocking=True),
+                system_prompt=system_prompt,
+                max_new_tokens=max_new_tokens,
+                generation_config=gen_cfg,
+            )
+
+    hyps = []
+    for batch in tqdm(itertools.chain([first_batch], iterator), desc="Transcribing", disable=True):
+        audios, audio_lens = _prepare_batch(batch)
         with torch.inference_mode():
             batch_hyps = model.generate(
                 audios=audios.to(model.device, non_blocking=True),
@@ -320,9 +354,13 @@ def dump_nemo_manifest(manifest_path, audio_filepaths, durations, references):
     """
     os.makedirs(os.path.dirname(os.path.abspath(manifest_path)), exist_ok=True)
     with open(manifest_path, "w", encoding="utf-8") as f:
-        for path, dur, ref in zip(audio_filepaths, durations, references):
+        for idx, (path, dur, ref) in enumerate(zip(audio_filepaths, durations, references)):
+            abspath = os.path.abspath(path)
+            # b_streaming_infer.py requires a per-utterance "id"; derive a stable
+            # one from the audio filename (fall back to the row index).
+            utt_id = os.path.splitext(os.path.basename(abspath))[0] or f"utt_{idx}"
             f.write(json.dumps(
-                {"audio_filepath": os.path.abspath(path), "duration": dur, "text": ref},
+                {"id": utt_id, "audio_filepath": abspath, "duration": dur, "text": ref},
                 ensure_ascii=False,
             ) + "\n")
     print("Manifest written to:", os.path.abspath(manifest_path))
@@ -425,6 +463,7 @@ def evaluate_one(model, args, dataset, split):
         system_prompt=args.system_prompt,
         max_new_tokens=args.max_new_tokens,
         no_repeat_ngram_size=args.no_repeat_ngram_size,
+        warmup_decode=args.warmup_decode,
     )
     total_time = time.time() - start
     predictions = [text_normalizer(pred.strip()) for pred in transcriptions]
@@ -444,6 +483,199 @@ def evaluate_one(model, args, dataset, split):
         "wer": wer, "rtfx": rtfx, "time": total_time, "n": n_samples,
         "refs": all_data["references"], "hyps": predictions,
     }
+
+
+# Default to the locally-built CUDA-12.8 image: vLLM 0.21.0 rebuilt from source
+# against cudart 12 (the stock gitlab :v2 image is a CUDA-13 build that fails with
+# "Error 803 / CUDA driver insufficient" on hosts with driver < 580). This image also
+# bakes the patched converter (convert_patched.sh) + Qwen3-1.7B base LLM. Override with
+# --vllm_image (e.g. the gitlab image) when running on a new-enough-driver cluster.
+DEFAULT_VLLM_IMAGE = "streaming-stt-eval:cu128-vllmsrc"
+
+
+def _docker_gpu_args(device):
+    """Docker GPU-passthrough args (list), reused by the convert + decode steps.
+
+    Honors ``$DOCKER_GPU_ARGS`` verbatim when set. Otherwise auto-detects: if the
+    daemon has the legacy ``nvidia`` runtime registered but ``--gpus`` isn't
+    usable (the device-driver plugin is only discovered on a full daemon restart,
+    not a reload), prefer ``--runtime=nvidia``; else fall back to
+    ``--gpus device=<device>``. Callers add ``-e NVIDIA_VISIBLE_DEVICES``.
+    """
+    env = os.environ.get("DOCKER_GPU_ARGS")
+    if env is not None:
+        return env.split()
+    import subprocess
+    try:
+        info = subprocess.run(
+            ["docker", "info", "--format", "{{json .Runtimes}}"],
+            capture_output=True, text=True, timeout=15,
+        ).stdout
+    except Exception:
+        info = ""
+    if '"nvidia"' in info:
+        return ["--runtime=nvidia"]
+    return ["--gpus", f"device={device}"]
+
+
+def _vllm_preflight(device, vllm_image):
+    """Fail fast (with an actionable message) if the vLLM container can't do CUDA
+    compute on this host — most commonly a host-driver / container-CUDA mismatch
+    (CUDA error 803). This avoids a long, confusing convert.sh traceback.
+    """
+    import subprocess
+
+    gpu_args = _docker_gpu_args(device)
+    probe = (
+        "import torch,sys; "
+        "ok=torch.cuda.is_available(); "
+        "print('cuda_avail', ok); "
+        "sys.exit(0 if ok else 42)"
+    )
+    cmd = [
+        "docker", "run", "--rm", *gpu_args,
+        "-e", f"NVIDIA_VISIBLE_DEVICES={device}",
+        "-e", "NVIDIA_DRIVER_CAPABILITIES=compute,utility",
+        vllm_image, "python", "-c", probe,
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode == 0:
+        return
+    out = (proc.stdout or "") + "\n" + (proc.stderr or "")
+    mismatch = "error 803" in out.lower() or "unsupported display driver" in out.lower()
+    msg = [
+        "ERROR: the vLLM container cannot run CUDA compute on this host.",
+    ]
+    if mismatch:
+        msg += [
+            "  Cause: host NVIDIA driver is older than the container's CUDA build",
+            "         (CUDA error 803 = driver / CUDA-runtime mismatch). Forward-compat",
+            "         libs in the image do not bridge this gap.",
+            "  Fixes: run --vllm on a node with a new-enough driver (e.g. the OCI",
+            "         cluster), use a CUDA build of the image matching this host's",
+            "         driver, or upgrade the host driver (machine-wide, disruptive).",
+            "  On THIS box, use the native path (drop --vllm):",
+            "         python run_eval_sslm.py <model> --last --device 0",
+        ]
+    else:
+        msg += ["  Container GPU probe failed; tail of output:", out[-800:]]
+    raise SystemExit("\n".join(msg))
+
+
+def _vllm_convert(ckpt_path, device, vllm_image, force_convert=False):
+    """Convert a Lightning .ckpt to a vLLM model dir via the eval container.
+
+    Mirrors the VLLM path in eval_leaderboard.sh: runs ``/workspace/convert.sh``
+    inside ``vllm_image`` (ckpt dir mounted as both /ckpt and /out) and caches the
+    output next to the ckpt as ``vllm_<ckptname>/``. Returns the vLLM model dir.
+    """
+    import shutil
+    import subprocess
+
+    ckpt_dir = os.path.dirname(os.path.abspath(ckpt_path))
+    ckpt_base = os.path.basename(ckpt_path)
+    # The in-container to_hf.py is a Hydra app, and Hydra parses '=' in an argument
+    # as an override separator -- so a checkpoint literally named 'step=44006.ckpt'
+    # breaks conversion. Expose an '='-free hardlink (fallback: copy) in the same dir
+    # and hand that name to the container instead.
+    safe_base = ckpt_base.replace("=", "_")
+    if safe_base != ckpt_base:
+        safe_src = os.path.join(ckpt_dir, safe_base)
+        if not os.path.exists(safe_src):
+            try:
+                os.link(os.path.join(ckpt_dir, ckpt_base), safe_src)
+            except OSError:
+                shutil.copy2(os.path.join(ckpt_dir, ckpt_base), safe_src)
+        ckpt_base = safe_base
+    vllm_name = f"vllm_{ckpt_base[:-5] if ckpt_base.endswith('.ckpt') else ckpt_base}"
+    vllm_out = os.path.join(ckpt_dir, vllm_name)
+    gpu_args = _docker_gpu_args(device)
+
+    if os.path.isdir(vllm_out) and os.listdir(vllm_out) and not force_convert:
+        print(f"==> Reusing converted vLLM model (use --force_convert to rebuild): {vllm_out}", flush=True)
+        return vllm_out
+
+    print(f"==> Converting checkpoint -> vLLM model dir via {vllm_image}", flush=True)
+    if os.path.isdir(vllm_out):
+        shutil.rmtree(vllm_out)
+    os.makedirs(vllm_out, exist_ok=True)
+    cmd = [
+        "docker", "run", "--rm", *gpu_args,
+        "-e", f"NVIDIA_VISIBLE_DEVICES={device}",
+        "-e", "NVIDIA_DRIVER_CAPABILITIES=compute,utility",
+        "-v", f"{ckpt_dir}:/ckpt",
+        "-v", f"{ckpt_dir}:/out",
+        vllm_image,
+        # Prefer the patched converter (rewrites pretrained_llm /lustre paths -> HF repo
+        # ids and disables torch weights_only) baked into the cu128 image; fall back to
+        # the stock convert.sh for images that don't ship it.
+        "bash", "-c",
+        'S=/workspace/convert_patched.sh; [ -f "$S" ] || S=/workspace/convert.sh; '
+        'exec bash "$S" "$1" "$2"',
+        "_", f"/ckpt/{ckpt_base}", f"/out/{vllm_name}",
+    ]
+    if subprocess.run(cmd).returncode != 0:
+        raise SystemExit("ERROR: vLLM convert failed (see docker output above)")
+    print(f"==> Convert complete: {vllm_out}", flush=True)
+    return vllm_out
+
+
+def evaluate_one_vllm(args, dataset, split, vllm_out):
+    """Materialize one (dataset, split) to wavs + a NeMo manifest and decode it in
+    the vLLM container (``b_streaming_infer.py``). Returns a result dict
+    (``wer``/``time``/``n``) or ``None`` when there are no samples.
+
+    Reuses ``prepare_samples`` so the wavs / references / normalization exactly
+    match the native path; scoring uses the WER reported by the container (same as
+    eval_leaderboard.sh's VLLM path).
+    """
+    import re
+    import subprocess
+
+    all_data = prepare_samples(args, dataset, split)
+    n = len(all_data["references"])
+    if n == 0:
+        return None
+
+    work = os.getcwd()
+    man_dir = os.path.join(work, "manifests")
+    os.makedirs(man_dir, exist_ok=True)
+    man_path = os.path.join(man_dir, f"{dataset}_{split}.json")
+    dump_nemo_manifest(
+        man_path, all_data["audio_filepaths"], all_data["durations"], all_data["references"]
+    )
+    audio_cache = os.path.join(work, "audio_cache")
+    gpu_args = _docker_gpu_args(args.device)
+
+    cmd = [
+        "docker", "run", "--rm", *gpu_args,
+        "-e", f"NVIDIA_VISIBLE_DEVICES={args.device}",
+        "-e", "NVIDIA_DRIVER_CAPABILITIES=compute,utility",
+        "-v", f"{vllm_out}:/model",
+        "-v", f"{man_dir}:/data",
+        "-v", f"{audio_cache}:{audio_cache}",
+        "-e", "B_MODEL=/model",
+        "-e", f"B_MAN=/data/{os.path.basename(man_path)}",
+        args.vllm_image,
+        "python", "/workspace/b_streaming_infer.py",
+    ]
+    start = time.time()
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    elapsed = time.time() - start
+    out = (proc.stdout or "") + "\n" + (proc.stderr or "")
+
+    # b_streaming_infer.py reports the aggregate as "DONE RTFx mean=.. WER (%)=X";
+    # older scripts print "WER: X %". Accept both and take the last (final) value.
+    matches = re.findall(r"WER\s*\(%\)\s*=\s*([\d.]+)", out) or re.findall(
+        r"WER:\s*([\d.]+)\s*%", out
+    )
+    if not matches:
+        raise RuntimeError(
+            f"could not parse WER from vLLM container output (exit={proc.returncode}); "
+            f"tail:\n{out[-1000:]}"
+        )
+    return {"wer": float(matches[-1]), "time": elapsed, "n": n,
+            "refs": all_data["references"], "hyps": []}
 
 
 def main(args):
@@ -466,15 +698,51 @@ def main(args):
     # ---- Datasets to evaluate: one explicit set, or the full ESB suite ----
     datasets = [(args.dataset, args.split)] if args.dataset is not None else list(LEADERBOARD_DATASETS)
 
+    # ---- vLLM backend: convert once, decode each split in the container ----
+    if args.vllm:
+        _vllm_preflight(args.device, args.vllm_image)
+        vllm_out = _vllm_convert(args.ckpt_path, args.device, args.vllm_image, args.force_convert)
+        print(f"\nckpt: {args.ckpt_path}")
+        print(f"backend: vLLM ({args.vllm_image})", flush=True)
+        print(f"{'dataset':<24}{'WER%':>9}{'time(s)':>11}", flush=True)
+        print("-" * 44, flush=True)
+        results = []
+        for dataset, split in datasets:
+            name = f"{dataset}/{split}"
+            try:
+                with _suppress_output():
+                    res = evaluate_one_vllm(args, dataset, split, vllm_out)
+            except Exception as e:
+                print(f"{name:<24}{'ERR':>9}{'':>11}  ({type(e).__name__}: {e})", flush=True)
+                continue
+            if res is None:
+                print(f"{name:<24}{'n/a':>9}{'':>11}  (no samples)", flush=True)
+                continue
+            print(f"{name:<24}{res['wer']:>9.2f}{res['time']:>11.1f}", flush=True)
+            results.append((name, res))
+        if len(results) > 1:
+            avg = sum(r["wer"] for _, r in results) / len(results)
+            print("-" * 44, flush=True)
+            print(f"{'AVERAGE':<24}{avg:>9.2f}", flush=True)
+        return results
+
     with _suppress_output():
         device = torch.device(f"cuda:{args.device}")
+        eval_dtype = torch.float32 if args.dtype == "fp32" else torch.bfloat16
         model = load_model(
             args.ckpt_path, device,
             override_llm=args.pretrained_llm,
             override_asr=args.pretrained_asr,
+            dtype=eval_dtype,
         )
+        # Build the inference token/flush cache now so we can report its status
+        # (the internal logging.info is suppressed by this script's quiet mode).
+        model._ensure_inference_cache()
 
+    cfg_use_flush = bool(getattr(model.core_cfg, "use_flush", False))
+    inf_flush = bool(getattr(model, "_inference_use_flush", False))
     print(f"\nckpt: {args.ckpt_path}")
+    print(f"flush: cfg.use_flush={cfg_use_flush}, inference_flush_active={inf_flush}", flush=True)
     print(f"{'dataset':<24}{'WER%':>9}{'time(s)':>11}", flush=True)
     print("-" * 44, flush=True)
 
@@ -505,9 +773,148 @@ def main(args):
     return results
 
 
+def resolve_ckpt_spec(spec: str, use_last: bool = False) -> str:
+    """Resolve a checkpoint spec to a local ``.ckpt`` path.
+
+    If ``spec`` is an existing local file it is returned unchanged. Otherwise it
+    is treated as a grid EXP_NAME and the checkpoint is downloaded from OCI
+    (draco-oci-iad) into ``<repo>/checkpoints/<EXP_NAME>/``, mirroring
+    ``eval_leaderboard.sh``. By default the BEST snapshot (top-1 val_acc — the
+    single non ``-last`` ``step=*.ckpt``) is fetched.
+
+    Env knobs (all optional):
+        REMOTE_HOST / REMOTE_USER / SSH_KEY / REMOTE_RESULTS_ROOT
+        PROJECT           force the grid project dir (else probe known candidates)
+        USE_LAST=1        pull the rolling ``-last.ckpt`` instead of the best
+        STEP=<N>          pull ``step=<N>.ckpt`` explicitly
+        FORCE_DOWNLOAD=1  re-download even if a local copy is already cached
+    """
+    if os.path.isfile(spec):
+        return spec
+
+    import subprocess
+
+    exp = spec
+    remote_host = os.environ.get("REMOTE_HOST", "draco-oci-login-01.draco-oci-iad.nvidia.com")
+    remote_user = os.environ.get("REMOTE_USER", "hainanx")
+    ssh_key = os.environ.get("SSH_KEY", os.path.expanduser("~/.ssh/draco-rno"))
+    results_root = os.environ.get(
+        "REMOTE_RESULTS_ROOT", "/lustre/fsw/portfolios/llmservice/users/hainanx/results"
+    )
+    ssh_opts = ["-i", ssh_key, "-o", "StrictHostKeyChecking=no"]
+    ssh_target = f"{remote_user}@{remote_host}"
+
+    projects = (
+        [os.environ["PROJECT"]]
+        if os.environ.get("PROJECT")
+        else ["Streaming_SLM_629", "Streaming_SLM_624", "Streaming_SLM_chunk14", "Streaming_SLM"]
+    )
+
+    def _ssh_out(cmd: str) -> str:
+        return subprocess.run(
+            ["ssh", *ssh_opts, ssh_target, cmd], capture_output=True, text=True
+        ).stdout.strip()
+
+    remote_ckpt_dir = ""
+    for proj in projects:
+        candidate = f"{results_root}/{proj}/{exp}/{exp}/checkpoints"
+        if subprocess.run(["ssh", *ssh_opts, ssh_target, f"[ -d '{candidate}' ]"]).returncode == 0:
+            remote_ckpt_dir = candidate
+            print(f"==> Resolved grid project: {proj}", flush=True)
+            break
+    if not remote_ckpt_dir:
+        raise SystemExit(
+            f"ERROR: experiment '{exp}' not found on {ssh_target} under any known project "
+            f"(tried: {', '.join(projects)}). Pass a local .ckpt path or set PROJECT=<name>."
+        )
+
+    step = os.environ.get("STEP", "")
+    use_last = use_last or os.environ.get("USE_LAST", "0") == "1"
+    if step:
+        ckpt_filename = f"step={step}.ckpt"
+    else:
+        import re
+
+        def _best_by_val_wer(names: str) -> str:
+            """Return the checkpoint filename with the lowest val_wer if present."""
+            best_name = ""
+            best_wer = None
+            for name in names.splitlines():
+                m = re.search(r"val_wer=([0-9.]+)", name)
+                if m is None:
+                    continue
+                try:
+                    wer = float(m.group(1).rstrip("."))
+                except ValueError:
+                    continue
+                if best_wer is None or wer < best_wer:
+                    best_name, best_wer = name, wer
+            return best_name
+
+        if use_last:
+            list_cmd = f"ls -t {remote_ckpt_dir}/*-last.ckpt 2>/dev/null | head -1 | xargs -r basename"
+            ckpt_filename = _ssh_out(list_cmd)
+        else:
+            all_cmd = (
+                f"ls -1 {remote_ckpt_dir}/*.ckpt 2>/dev/null | grep -v -- '-last\\.ckpt$' "
+                f"| xargs -r -n1 basename"
+            )
+            all_names = _ssh_out(all_cmd)
+            ckpt_filename = _best_by_val_wer(all_names)
+            if not ckpt_filename:
+                list_cmd = (
+                    f"ls -t {remote_ckpt_dir}/*.ckpt 2>/dev/null | grep -v -- '-last\\.ckpt$' "
+                    f"| head -1 | xargs -r basename"
+                )
+                ckpt_filename = _ssh_out(list_cmd)
+        if not ckpt_filename and not use_last:
+            ckpt_filename = _ssh_out(
+                f"ls -t {remote_ckpt_dir}/*-last.ckpt 2>/dev/null | head -1 | xargs -r basename"
+            )
+        if not ckpt_filename:
+            raise SystemExit(f"ERROR: no checkpoints found in {remote_ckpt_dir}")
+        print(f"==> Grid checkpoint: {ckpt_filename}", flush=True)
+
+    repo_root = os.path.dirname(os.path.abspath(__file__))
+    local_dir = os.path.join(repo_root, "checkpoints", exp)
+    local_path = os.path.join(local_dir, ckpt_filename)
+    remote_path = f"{remote_ckpt_dir}/{ckpt_filename}"
+
+    if (
+        os.path.isfile(local_path)
+        and os.path.getsize(local_path) > 0
+        and os.environ.get("FORCE_DOWNLOAD", "0") != "1"
+    ):
+        print(f"==> Reusing cached checkpoint: {local_path} (set FORCE_DOWNLOAD=1 to re-pull)", flush=True)
+        return local_path
+
+    os.makedirs(local_dir, exist_ok=True)
+    print(f"==> Downloading from grid:\n    {ssh_target}:{remote_path}\n -> {local_path}", flush=True)
+    if subprocess.run(["scp", *ssh_opts, f"{ssh_target}:{remote_path}", local_path]).returncode != 0:
+        # Don't leave a truncated file behind to be "reused" next time.
+        if os.path.isfile(local_path) and os.path.getsize(local_path) == 0:
+            os.remove(local_path)
+        raise SystemExit(f"ERROR: scp failed for {remote_path}")
+    print("==> Download complete", flush=True)
+    return local_path
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="ASR leaderboard eval for StreamingSTTModel")
-    parser.add_argument("--ckpt_path", type=str, required=True, help="Path to Lightning .ckpt file")
+    parser.add_argument(
+        "model",
+        nargs="?",
+        default=None,
+        help="Grid EXP_NAME (auto-downloaded from OCI) OR a local .ckpt path. "
+        "Alternatively pass --ckpt_path.",
+    )
+    parser.add_argument("--ckpt_path", type=str, default=None, help="Path to a local Lightning .ckpt file")
+    parser.add_argument(
+        "--last",
+        action="store_true",
+        help="When auto-downloading by EXP_NAME, fetch the rolling -last.ckpt instead of the best "
+        "(top-1 val_acc) snapshot. Useful for evaluating an in-progress / undertrained run.",
+    )
     parser.add_argument("--pretrained_llm", type=str, default=None,
                         help="Override pretrained_llm (e.g. Qwen/Qwen3-1.7B). Auto-resolved if not set.")
     parser.add_argument("--pretrained_asr", type=str, default=None,
@@ -518,11 +925,19 @@ if __name__ == "__main__":
     parser.add_argument("--split", type=str, default="test")
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--dtype", choices=["bf16", "fp32"], default="bf16",
+                        help="Native inference dtype. fp32 is slower/heavier but avoids BF16 greedy-decode "
+                             "batch/call-order instabilities observed in debugging.")
     parser.add_argument("--max_eval_samples", type=int, default=None)
-    parser.add_argument("--max_new_tokens", type=int, default=64,
-                        help="Max tokens to generate per chunk (streaming) or per utterance (offline).")
-    parser.add_argument("--no_repeat_ngram_size", type=int, default=4,
-                        help="Disallow repeating n-grams during generation to break loops. Set 0 to disable.")
+    parser.add_argument("--max_new_tokens", type=int, default=None,
+                        help="Max tokens to generate per chunk (streaming) or per utterance (offline). "
+                             "Defaults to the checkpoint's model.max_new_tokens_per_chunk, matching val_wer.")
+    parser.add_argument("--no_repeat_ngram_size", type=int, default=0,
+                        help="Disallow repeating n-grams during generation to break loops. Defaults to 0, "
+                             "matching training validation decode.")
+    parser.add_argument("--warmup_decode", action="store_true",
+                        help="Run and discard one single-utterance generate() call before scoring. "
+                             "Useful for diagnosing first-call/lazy-kernel decode differences.")
     parser.add_argument("--system_prompt", type=str, default="Transcribe the audio into text.")
     parser.add_argument("--verbose", action="store_true", help="Print each REF/HYP pair to stdout")
     parser.add_argument("--dump_manifest", type=str, default=None,
@@ -531,5 +946,24 @@ if __name__ == "__main__":
                              "VLLM fast path in eval_leaderboard_ord.sh.")
     parser.add_argument("--no-streaming", dest="streaming", action="store_false")
     parser.set_defaults(streaming=True)
+    parser.add_argument(
+        "--vllm",
+        action="store_true",
+        help="Decode with the vLLM eval container instead of in-process model.generate(): "
+        "convert the ckpt once, then run /workspace/b_streaming_infer.py per split. Requires docker + GPU.",
+    )
+    parser.add_argument("--vllm_image", type=str, default=DEFAULT_VLLM_IMAGE,
+                        help="Container image for the --vllm path.")
+    parser.add_argument("--force_convert", action="store_true",
+                        help="Re-run the ckpt->vLLM conversion even if a cached vLLM dir exists.")
     args = parser.parse_args()
+
+    # Accept the checkpoint as a positional EXP_NAME / path or via --ckpt_path.
+    # A positional model name that isn't a local file is auto-downloaded from the
+    # grid (see resolve_ckpt_spec).
+    spec = args.model or args.ckpt_path
+    if not spec:
+        parser.error("provide a model EXP_NAME (auto-downloaded from grid) or --ckpt_path /path/to.ckpt")
+    args.ckpt_path = resolve_ckpt_spec(spec, use_last=args.last)
+
     main(args)

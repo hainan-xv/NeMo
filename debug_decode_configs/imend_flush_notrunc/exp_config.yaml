@@ -1,0 +1,165 @@
+model:
+  pretrained_llm: /lustre/fsw/portfolios/llmservice/users/heh/pretrained_models/huggingface/Qwen/Qwen3-1.7B
+  pretrained_asr: /lustre/fsw/portfolios/llmservice/users/heh/pretrained_models/huggingface/nvidia/nemotron-speech-streaming-en-0.6b/nemotron-speech-streaming-en-0.6b.nemo
+  load_llm_weights: true
+  load_asr_weights: true
+  sample_rate: 16000
+  blank_token: <blank>
+  frame_length_in_secs: 0.08
+  chunk_size: 7
+  att_context_size:
+  - 70
+  - 6
+  audio_pad_to: 16
+  freeze_speech_encoder: false
+  freeze_modality_adapter: false
+  freeze_modality_proj: false
+  freeze_llm_model: true
+  freeze_llm_head: false
+  freeze_embed_tokens: false
+  freeze_params: []
+  prevent_freeze_params: []
+  lora:
+    task_type: CAUSAL_LM
+    r: 128
+    lora_alpha: 256
+    lora_dropout: 0.01
+  perception:
+    modality_adapter:
+      _target_: nemo.collections.speechlm2.modules.perception.IdentityConnector
+    encoder:
+      sync_max_audio_length: false
+  optimizer:
+    _target_: torch.optim.AdamW
+    lr: 0.0004
+    betas:
+    - 0.9
+    - 0.98
+    weight_decay: 0.001
+    foreach: true
+  lr_scheduler:
+    _target_: nemo.core.optim.lr_scheduler.CosineAnnealing
+    warmup_steps: 2000
+    min_lr: 1.0e-06
+    max_steps: 200000
+  compact_template: true
+  supervise_im_end_in_loss: true
+  encoder_reuse_k: 4
+  use_flush: true
+  flush_truncate_prob: 0.0
+data:
+  dataset:
+    sample_rate: 16000
+    frame_length_in_secs: 0.08
+    chunk_size: 7
+    num_delay_frames: 2
+    audio_tag: <audio>
+    blank_token: <blank>
+    system_role: system
+    system_prompt: Transcribe the audio into text.
+    compact_template: true
+    random_delay_max_frames: 7
+    delay_weight_gamma: 0.9
+    use_flush: true
+    flush_truncate_prob: 0.0
+  train_ds:
+    sample_rate: 16000
+    input_cfg: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/users/dongjig/aligned_amos/full_qwen_prealign/am-os_qwen_aligned_iad_s3_audio.yaml
+    skip_missing_manifest_entries: true
+    manifest_filepath: null
+    seed: 42
+    shuffle: true
+    shard_seed: randomized
+    num_workers: 8
+    force_iterable_dataset: true
+    use_bucketing: true
+    bucket_duration_bins:
+    - 5.6
+    - 7.008
+    - 8.16
+    - 9.2
+    - 10.24
+    - 11.2
+    - 12.2
+    - 14.43
+    - 17.28
+    - 20.18
+    - 24.88
+    - 30.0
+    - 33.0
+    - 39.68
+    bucket_batch_size:
+    - 31
+    - 23
+    - 22
+    - 19
+    - 17
+    - 15
+    - 14
+    - 12
+    - 10
+    - 8
+    - 7
+    - 6
+    - 5
+    - 4
+    max_duration: 41
+    pad_extra_duration: 0.5
+    pad_extra_duration_prob: 1.0
+  validation_ds:
+    datasets:
+      mcv_11_dev:
+        manifest_filepath: /data/canary/canary_v0/manifests/data/ASR/MMLPC/en/val_test/mcv11/mcv11_dev_clean_pcstrip_en_2k.json
+    sample_rate: 16000
+    batch_size: 4
+    num_workers: 4
+    seed: 42
+    shard_seed: randomized
+    shuffle: false
+    pad_extra_duration: 0.5
+    pad_extra_duration_prob: 1.0
+trainer:
+  devices: 8
+  accelerator: gpu
+  num_nodes: 4
+  precision: bf16-true
+  logger: false
+  enable_checkpointing: false
+  use_distributed_sampler: false
+  max_steps: 200000
+  limit_train_batches: 2000
+  val_check_interval: 500
+  log_every_n_steps: 10
+  num_sanity_val_steps: 1
+  gradient_clip_val: 1.0
+  accumulate_grad_batches: 1
+  strategy:
+    _target_: lightning.pytorch.strategies.DDPStrategy
+    gradient_as_bucket_view: true
+    find_unused_parameters: false
+exp_manager:
+  exp_dir: /results/
+  explicit_log_dir: null
+  name: imend_flush_notrunc
+  create_tensorboard_logger: false
+  create_checkpoint_callback: true
+  use_datetime_version: true
+  max_time_per_run: 00:03:55:00
+  resume_from_checkpoint: null
+  resume_if_exists: true
+  resume_ignore_no_checkpoint: true
+  create_wandb_logger: true
+  wandb_logger_kwargs:
+    name: imend_flush_notrunc
+    project: Streaming_SLM_629
+    resume: true
+  checkpoint_callback_params:
+    filename: '{step}-{val_wer:.4f}'
+    monitor: val_wer
+    mode: min
+    every_n_train_steps: null
+    every_n_epochs: null
+    save_top_k: 5
+    always_save_nemo: false
+    save_nemo_on_train_end: false
+    save_last: true
