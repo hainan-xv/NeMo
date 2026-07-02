@@ -1986,13 +1986,20 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 hyps_ar = self._generate_hypotheses_for_wer(batch, parallel=False)
                 ar_refs = refs if refs is not None else [""] * len(hyps_ar)
                 train_wer_ar, _, _ = self._compute_wer_stats(ar_refs, hyps_ar)
+                # NOTE: sync_dist=False on purpose. These periodic train-WER logs
+                # only fire on ``should_log_debug`` steps, but a rank whose
+                # microbatch has num_targets==0 takes the keepalive path and
+                # early-returns before ``_log_train_step`` — so it never joins a
+                # synced collective here. sync_dist=True would then desync the
+                # NCCL allreduce across ranks and hang the job (watchdog timeout
+                # on a NumelIn=1 ALLREDUCE). Keep these as rank-local diagnostics.
                 self.log(
                     "train_wer",
                     torch.tensor(train_wer_ar, device=loss.device),
                     on_step=True,
                     on_epoch=False,
                     logger=True,
-                    sync_dist=True,
+                    sync_dist=False,
                 )
                 if self._parallel_heads_enabled:
                     self.log(
@@ -2001,7 +2008,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                         on_step=True,
                         on_epoch=False,
                         logger=True,
-                        sync_dist=True,
+                        sync_dist=False,
                     )
 
             hyps_par = None
@@ -2010,13 +2017,16 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 hyps_par = self._generate_hypotheses_for_wer(batch, parallel=True)
                 par_refs = refs if refs is not None else [""] * len(hyps_par)
                 train_wer_par, _, _ = self._compute_wer_stats(par_refs, hyps_par)
+                # sync_dist=False: see the note on train_wer above — the
+                # keepalive (num_targets==0) path can skip this collective on
+                # some ranks and hang DDP.
                 self.log(
                     "train_wer_parallel",
                     torch.tensor(train_wer_par, device=loss.device),
                     on_step=True,
                     on_epoch=False,
                     logger=True,
-                    sync_dist=True,
+                    sync_dist=False,
                 )
                 if parallel_only:
                     # Parallel decode IS the primary metric in parallel-only mode.
@@ -2026,7 +2036,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                         on_step=True,
                         on_epoch=False,
                         logger=True,
-                        sync_dist=True,
+                        sync_dist=False,
                     )
 
             if refs:
@@ -2090,7 +2100,6 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
     # ------------------------------------------------------------------
 
     def on_validation_epoch_start(self) -> None:
-        self._partial_val_losses: dict[str, list] = defaultdict(list)
         self._partial_wer_errors: dict[str, list] = defaultdict(list)
         self._partial_wer_words: dict[str, list] = defaultdict(list)
         # Parallel-decode WER accumulators (only populated when parallel heads
@@ -2105,14 +2114,6 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         self._partial_aux_neg_total: dict[str, list] = defaultdict(list)
 
     def on_validation_epoch_end(self) -> None:
-        val_losses = []
-        for name, vals in self._partial_val_losses.items():
-            val_loss = torch.stack(vals).mean()
-            self.log(f"val_loss_{name}", val_loss, on_epoch=True, sync_dist=True)
-            val_losses.append(val_loss)
-        if val_losses:
-            self.log("val_loss", torch.stack(val_losses).mean(), on_epoch=True, sync_dist=True)
-
         # In parallel-only training the AR decode path is not optimized, so the
         # AR WER is meaningless as the primary monitor. Demote it to
         # ``val_wer_ar`` and let the parallel WER own ``val_wer`` (below) so the
@@ -2179,7 +2180,6 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         if macro_accs:
             self.log("val_aux_macro_acc", torch.stack(macro_accs).mean(), on_epoch=True, sync_dist=True)
 
-        self._partial_val_losses.clear()
         self._partial_wer_errors.clear()
         self._partial_wer_words.clear()
         self._partial_wer_errors_parallel.clear()
@@ -2232,28 +2232,6 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             position_ids=inputs.get("position_ids"),
         )
 
-        target_ids = batch.target_tokens
-        # Mirror training-time LM-CE masking: when the aux head owns the
-        # boundary decision, audio positions are not LM-supervised in
-        # training, so they must also be excluded from val_loss — otherwise
-        # val metrics are dominated by positions the LM was never trained on.
-        # If keep_lm_supervision_at_audio is True, the LM IS supervised at
-        # audio positions during training, so don't mask in val.
-        if aux_active and not self.core_cfg.chunk_classifier_keep_lm_supervision_at_audio:
-            audio_mask_for_lm = batch.input_tokens == AUDIO_TOKEN_IDX
-            target_ids = torch.where(audio_mask_for_lm, torch.full_like(target_ids, IGNORE_INDEX), target_ids)
-        num_targets = (target_ids != IGNORE_INDEX).long().sum()
-
-        with loss_parallel():
-            loss = F.cross_entropy(
-                outputs["logits"].flatten(0, 1),
-                target_ids.flatten(0, 1),
-                reduction="sum",
-                ignore_index=IGNORE_INDEX,
-            ) / num_targets.clamp(min=1)
-
-        self._partial_val_losses[name].append(loss)
-
         # WER from inference-time decoding (non-teacher-forced). In
         # parallel-only training the AR path is not optimized, so skip the AR
         # decode entirely (wasteful + its WER is meaningless); the parallel
@@ -2265,16 +2243,8 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             hyps = self._generate_hypotheses_for_wer(batch, parallel=False)
             ar_refs = refs if refs is not None else [""] * len(hyps)
             batch_wer, num_err, num_words = self._compute_wer_stats(ar_refs, hyps)
-            self._partial_wer_errors[name].append(torch.tensor(float(num_err), device=loss.device))
-            self._partial_wer_words[name].append(torch.tensor(float(num_words), device=loss.device))
-            self.log(
-                f"val_wer_step_{name}",
-                torch.tensor(batch_wer, device=loss.device),
-                on_step=True,
-                on_epoch=False,
-                logger=True,
-                sync_dist=True,
-            )
+            self._partial_wer_errors[name].append(torch.tensor(float(num_err), device=self.device))
+            self._partial_wer_words[name].append(torch.tensor(float(num_words), device=self.device))
 
         # Parallel-decode WER from the same batch (only when heads are enabled).
         if self._parallel_heads_enabled:
@@ -2282,18 +2252,10 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             par_refs = refs if refs is not None else [""] * len(hyps_par)
             batch_wer_par, num_err_par, num_words_par = self._compute_wer_stats(par_refs, hyps_par)
             self._partial_wer_errors_parallel[name].append(
-                torch.tensor(float(num_err_par), device=loss.device)
+                torch.tensor(float(num_err_par), device=self.device)
             )
             self._partial_wer_words_parallel[name].append(
-                torch.tensor(float(num_words_par), device=loss.device)
-            )
-            self.log(
-                f"val_wer_parallel_step_{name}",
-                torch.tensor(batch_wer_par, device=loss.device),
-                on_step=True,
-                on_epoch=False,
-                logger=True,
-                sync_dist=True,
+                torch.tensor(float(num_words_par), device=self.device)
             )
 
         # --- Aux chunk classifier: per-class correct/total counts ---
