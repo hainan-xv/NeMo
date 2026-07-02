@@ -203,6 +203,12 @@ results/
 .tmp_cache/
 .mplconfig/
 
+# Eval/validation driver scratch (scripts/speechlm2/run_streaming_stt_training_val.py):
+# materialized input wavs, per-run exp_config/manifests, and the multi-MB
+# leaderboard manifests. All regenerated on demand — never commit them
+# (they bloated sync_to_oci.sh pushes by tens of MB of wav/json blobs).
+debug_decode_configs/
+
 # Model artifacts: NeMo/Lightning checkpoints are multi-GB and exceed GitHub's
 # 100MB file limit, so they must never be committed (a stray *.nemo once
 # bloated a sync push to 2.4GB).
