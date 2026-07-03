@@ -162,9 +162,11 @@ class StreamingSTTModelConfig:
     #
     # Semantics ("frames fixed"): ``chunk_size`` keeps meaning *encoder frames*
     # per chunk (audio duration per chunk is unchanged, alignment/timeline math
-    # stays in 80 ms frames). The LLM then sees ``chunk_size // factor`` audio
-    # tokens per chunk, so ``chunk_size`` MUST be divisible by the factor and
-    # fixed chunking (chunk_size > 0) is required. This is propagated to the
+    # stays in 80 ms frames). The LLM then sees ``ceil(chunk_size / factor)``
+    # audio tokens per chunk. ``chunk_size`` need NOT be divisible by the factor:
+    # when it isn't, each chunk's tail is padded up to a multiple of the factor by
+    # repeating its last frame before subsampling (see _apply_audio_subsampling).
+    # Fixed chunking (chunk_size > 0) is required. This is propagated to the
     # dataset so it emits the matching number of ``<audio>`` placeholders.
     encoder_subsampling_factor: int = 1
     blank_loss_weight: float = 1.0
@@ -630,15 +632,16 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 f"encoder_subsampling_factor={S} requires fixed chunking (chunk_size>0), "
                 f"got chunk_size={self.core_cfg.chunk_size}"
             )
-            assert self.core_cfg.chunk_size % S == 0, (
-                f"chunk_size ({self.core_cfg.chunk_size}) must be divisible by "
-                f"encoder_subsampling_factor ({S})"
-            )
+            # chunk_size need NOT be divisible by S: when it isn't, each chunk's
+            # tail is padded by repeating its last frame up to a multiple of S
+            # (see _apply_audio_subsampling), yielding ceil(chunk_size/S) tokens.
             H = self.llm.config.hidden_size
             self.audio_subsampler = nn.Conv1d(H, H, kernel_size=S, stride=S)
+            _slots = (self.core_cfg.chunk_size + S - 1) // S
+            _note = "" if self.core_cfg.chunk_size % S == 0 else " (tail padded by repeating last frame)"
             logging.info(
                 f"Encoder subsampling enabled: factor={S}, Conv1d(H={H}, kernel=stride={S}); "
-                f"LLM sees {self.core_cfg.chunk_size // S} audio tokens per {self.core_cfg.chunk_size}-frame chunk."
+                f"LLM sees {_slots} audio tokens per {self.core_cfg.chunk_size}-frame chunk{_note}."
             )
         else:
             self.audio_subsampler = None
@@ -871,29 +874,95 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
     # Core: efficient audio-text embedding interleaving
     # ------------------------------------------------------------------
 
+    def _audio_slots_per_chunk(self) -> int:
+        """Number of LLM audio tokens (post-subsampling) per ``chunk_size`` chunk.
+
+        ``ceil(chunk_size / S)`` — when ``chunk_size`` is not divisible by the
+        factor the final sub-frame is formed from a chunk whose tail was padded
+        (see :meth:`_apply_audio_subsampling`). Reduces to ``chunk_size // S`` in
+        the divisible case, and to ``chunk_size`` when subsampling is disabled.
+        """
+        S = self.encoder_subsampling_factor
+        C = int(self.core_cfg.chunk_size)
+        if S <= 1:
+            return C
+        return (C + S - 1) // S
+
+    def _n_audio_slots(self, n_encoder_frames: int) -> int:
+        """Audio-token count for an audio span of ``n_encoder_frames`` frames.
+
+        The span is treated as ``ceil(n_encoder_frames / chunk_size)`` whole
+        chunks, each contributing :meth:`_audio_slots_per_chunk` tokens. This is
+        the single source of truth shared by the turn template, streaming
+        inference and the offline splitter so they all agree with the dataset's
+        per-chunk placeholder count even when ``chunk_size % S != 0``.
+        """
+        n = int(n_encoder_frames)
+        S = self.encoder_subsampling_factor
+        if S <= 1:
+            return n
+        C = int(self.core_cfg.chunk_size)
+        n_chunks = (n + C - 1) // C
+        return n_chunks * self._audio_slots_per_chunk()
+
     def _apply_audio_subsampling(
         self, audio_embs: Tensor, emb_lens: Optional[Tensor] = None
     ) -> tuple[Tensor, Optional[Tensor]]:
         """Optionally shrink the encoder time axis with the trainable Conv1d.
 
-        No-op (identity) when ``encoder_subsampling_factor == 1``. Otherwise the
-        ``(B, T, H)`` input is padded up to a multiple of the factor, run through
-        a ``Conv1d(kernel=stride=S)``, and returned as ``(B, ceil(T/S), H)``.
-        ``emb_lens`` (valid frames per sample) are reduced by ``ceil(len/S)``.
+        No-op (identity) when ``encoder_subsampling_factor == 1``.
+
+        When ``chunk_size`` is DIVISIBLE by the factor ``S`` the whole ``(B, T, H)``
+        input is padded up to a multiple of ``S`` and run through a single
+        ``Conv1d(kernel=stride=S)`` (global, unchanged legacy behavior),
+        returning ``(B, ceil(T/S), H)``.
+
+        When ``chunk_size`` is NOT divisible by ``S`` a global stride-``S`` conv
+        would let sub-frames straddle chunk boundaries and drift out of sync with
+        the dataset's per-chunk placeholders. Instead we reshape into
+        ``chunk_size``-frame chunks and pad EACH chunk's tail to
+        ``ceil(chunk_size/S)*S`` frames by REPEATING its last frame, so every
+        chunk cleanly yields ``ceil(chunk_size/S)`` sub-frames. Output is
+        ``(B, ceil(T/chunk_size) * ceil(chunk_size/S), H)`` — exactly
+        :meth:`_n_audio_slots` ``(T)``.
         """
         if self.audio_subsampler is None:
             return audio_embs, emb_lens
         S = self.encoder_subsampling_factor
+        C = int(self.core_cfg.chunk_size)
         B, T, H = audio_embs.shape
-        pad = (S - (T % S)) % S
-        if pad:
-            audio_embs = F.pad(audio_embs, (0, 0, 0, pad))
-        x = audio_embs.transpose(1, 2)  # (B, H, T)
         w = self.audio_subsampler.weight
-        x = self.audio_subsampler(x.to(w.dtype))
-        x = x.transpose(1, 2).to(audio_embs.dtype)  # (B, ceil(T/S), H)
+
+        if C % S == 0:
+            # Divisible: legacy global subsampling (numerically unchanged).
+            pad = (S - (T % S)) % S
+            if pad:
+                audio_embs = F.pad(audio_embs, (0, 0, 0, pad))
+            x = audio_embs.transpose(1, 2)  # (B, H, T)
+            x = self.audio_subsampler(x.to(w.dtype))
+            x = x.transpose(1, 2).to(audio_embs.dtype)  # (B, ceil(T/S), H)
+            if emb_lens is not None:
+                emb_lens = torch.div(emb_lens + (S - 1), S, rounding_mode="floor")
+            return x, emb_lens
+
+        # Non-divisible: per-chunk subsampling with last-frame tail padding.
+        slots_per_chunk = (C + S - 1) // S
+        chunk_pad = slots_per_chunk * S  # C rounded up to a multiple of S
+        n_chunks = (T + C - 1) // C
+        pad_T = n_chunks * C - T
+        if pad_T:
+            audio_embs = F.pad(audio_embs, (0, 0, 0, pad_T))  # zero tail beyond audio
+        x = audio_embs.reshape(B, n_chunks, C, H)
+        rep = chunk_pad - C
+        if rep:
+            last = x[:, :, -1:, :].expand(B, n_chunks, rep, H)  # repeat each chunk's last frame
+            x = torch.cat([x, last], dim=2)  # (B, n_chunks, chunk_pad, H)
+        x = x.reshape(B * n_chunks, chunk_pad, H).transpose(1, 2)  # (B*nc, H, chunk_pad)
+        x = self.audio_subsampler(x.to(w.dtype))  # (B*nc, H, slots_per_chunk)
+        x = x.transpose(1, 2).reshape(B, n_chunks * slots_per_chunk, H).to(audio_embs.dtype)
         if emb_lens is not None:
-            emb_lens = torch.div(emb_lens + (S - 1), S, rounding_mode="floor")
+            valid_chunks = torch.div(emb_lens + (C - 1), C, rounding_mode="floor")
+            emb_lens = valid_chunks * slots_per_chunk
         return x, emb_lens
 
     def _build_input_embeds(
@@ -2399,9 +2468,9 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
 
         if chunk_size > 0:
             # ``chunk_size`` is in encoder frames; the LLM consumes
-            # ``chunk_size // factor`` audio tokens per chunk when the trainable
-            # subsampler is enabled (factor==1 -> unchanged).
-            n_audio_slots = chunk_size // int(getattr(self.core_cfg, "encoder_subsampling_factor", 1) or 1)
+            # ``ceil(chunk_size / factor)`` audio tokens per chunk when the
+            # trainable subsampler is enabled (factor==1 -> unchanged).
+            n_audio_slots = self._n_audio_slots(chunk_size)
             turn_ids = user_header_ids + [AUDIO_TOKEN_IDX] * n_audio_slots + user_footer_and_asst_header_ids
             self._turn_template_ids = turn_ids
             n_audio = turn_ids.count(AUDIO_TOKEN_IDX)
@@ -3303,7 +3372,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         # chunk_size // factor`` audio tokens (the subsampler already shrank the
         # embeddings above).
         chunk_size = int(inference_chunk_size_frames or self.core_cfg.chunk_size)
-        n_audio_slots = chunk_size // self.encoder_subsampling_factor
+        n_audio_slots = self._n_audio_slots(chunk_size)
         n_frames = audio_chunk_embs.shape[1]
         if n_frames < n_audio_slots:
             audio_chunk_embs = F.pad(audio_chunk_embs, (0, 0, 0, n_audio_slots - n_frames))
@@ -3523,8 +3592,8 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 input_signal_length=torch.tensor([n_samples], device=device),
             )
             offline_embs, _ = self._apply_audio_subsampling(offline_embs)
-        # After subsampling each chunk holds chunk_size // factor audio tokens.
-        slot_size = chunk_size // self.encoder_subsampling_factor
+        # After subsampling each chunk holds ceil(chunk_size / factor) audio tokens.
+        slot_size = self._audio_slots_per_chunk()
         total_frames = offline_embs.shape[1]
         chunks: list[Tensor] = []
         for start in range(0, total_frames, slot_size):

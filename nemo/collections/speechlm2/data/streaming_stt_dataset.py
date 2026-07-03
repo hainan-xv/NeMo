@@ -791,6 +791,11 @@ def get_llm_messages_for_sample(
     else:
         # Fixed chunking: split the audio into equal-sized chunks.
         num_chunks = math.ceil(num_frames / chunk_size) if num_frames > 0 else 0
+        # Audio placeholders per chunk after encoder subsampling: ceil(chunk_size/S).
+        # When chunk_size % S != 0 the model pads each chunk's tail (repeating its
+        # last frame) up to a multiple of S so it still yields this many sub-frames;
+        # the dataset and model MUST agree on this count to stay aligned.
+        slots_per_chunk = (chunk_size + S - 1) // S
         if project_unaligned_text_to_chunks:
             alignment_chunk_ids = assign_fixed_chunk_ids(
                 alignments=alignments,
@@ -818,7 +823,7 @@ def get_llm_messages_for_sample(
             for start_chunk, end_chunk, group_size in iter_fixed_chunk_groups(
                 num_chunks, fixed_chunk_group_schedule
             ):
-                messages.append({"role": "user", "content": audio_tag * audio_tokens(group_size * chunk_size)})
+                messages.append({"role": "user", "content": audio_tag * (group_size * slots_per_chunk)})
                 if transcript:
                     content = "".join(original_chunk_texts[start_chunk:end_chunk])
                 else:
@@ -896,7 +901,7 @@ def get_llm_messages_for_sample(
                 num_chunks, fixed_chunk_group_schedule
             ):
                 chunk_end_frame = end_chunk * chunk_size
-                messages.append({"role": "user", "content": audio_tag * audio_tokens(group_size * chunk_size)})
+                messages.append({"role": "user", "content": audio_tag * (group_size * slots_per_chunk)})
 
                 while word_idx < len(alignments):
                     if word_ready_frames[word_idx] <= chunk_end_frame:
@@ -1520,14 +1525,16 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
                     f"encoder_subsampling_factor={self.subsampling_factor} requires fixed chunking "
                     f"(chunk_size>0), got chunk_size={self.cfg.chunk_size}"
                 )
-            if self.cfg.chunk_size % self.subsampling_factor != 0:
-                raise ValueError(
-                    f"chunk_size ({self.cfg.chunk_size}) must be divisible by "
-                    f"encoder_subsampling_factor ({self.subsampling_factor})"
-                )
-        # Number of audio placeholders the LLM sees per chunk (post-subsampling).
+            # chunk_size need NOT be divisible by the factor: when it isn't, the
+            # model pads each chunk's tail (repeating its last frame) up to a
+            # multiple of the factor, so each chunk yields ceil(chunk_size/factor)
+            # audio tokens. We emit exactly that many placeholders below.
+        # Number of audio placeholders the LLM sees per chunk (post-subsampling):
+        # ceil(chunk_size / factor) (== chunk_size // factor when divisible).
         self.audio_tokens_per_chunk = (
-            self.cfg.chunk_size // self.subsampling_factor if self.cfg.chunk_size > 0 else None
+            (self.cfg.chunk_size + self.subsampling_factor - 1) // self.subsampling_factor
+            if self.cfg.chunk_size > 0
+            else None
         )
 
         if self.cfg.chunk_size > 0:
