@@ -852,10 +852,14 @@ def get_llm_messages_for_sample(
             #   ready = word_end + num_delay_frames (+ Uniform{0..max} in training),
             #   made monotonic non-decreasing (running max) so word order and the
             #   chunk assignment below stay valid.
-            #   weight = gamma ** p, where p is the within-chunk frame position of
-            #   the word's AUDIO end in its emission chunk (clamped to
-            #   [0, chunk_size-1]). A word delayed past its audio chunk has p<=0 ->
-            #   weight 1.0 (it gained a full extra chunk of lookahead).
+            #   weight = gamma ** p, where p is the LOOKAHEAD DEFICIT: chunk_size minus
+            #   the number of REAL audio frames the model hears between the word's audio
+            #   end (`wef`) and where it commits the token (end of the emission chunk),
+            #   measured against the true audio length `num_frames` (NOT the padded chunk
+            #   boundary). >=1 full chunk of real lookahead => p<=0 => weight 1.0; ~0 real
+            #   lookahead => p=chunk_size-1 => max down-weight. Delaying a word into a
+            #   later REAL chunk adds genuine lookahead; delaying it onto a padded tail /
+            #   phantom chunk adds none, so tail words stay down-weighted.
             use_delay = bool(apply_random_delay) and int(random_delay_max_frames) > 0
             use_weight = float(delay_weight_gamma) != 1.0
             word_ready_frames: list[int] = []
@@ -871,8 +875,17 @@ def get_llm_messages_for_sample(
                 word_ready_frames.append(ready)
                 if use_weight and chunk_size > 0:
                     emit_chunk_idx = max(0, math.ceil(ready / chunk_size) - 1)
-                    p = wef - emit_chunk_idx * chunk_size
-                    p = min(max(p, 0), chunk_size - 1)
+                    # Effective right context = REAL audio frames between the word's audio
+                    # end (`wef`) and where the token is committed (end of the emission
+                    # chunk), bounded by the true audio length `num_frames`. Frames beyond
+                    # `num_frames` are padding/flush and provide no real lookahead, so a
+                    # word pushed onto a padded tail / phantom chunk gains nothing and stays
+                    # down-weighted, while a word delayed into a later REAL chunk gets its
+                    # genuine extra lookahead. (For interior chunks this reduces exactly to
+                    # p = wef - emit_chunk_idx * chunk_size.)
+                    emission_end_frame = (emit_chunk_idx + 1) * chunk_size
+                    real_lookahead = min(emission_end_frame, num_frames) - wef
+                    p = min(max(chunk_size - real_lookahead, 0), chunk_size - 1)
                     word_weights.append(float(delay_weight_gamma) ** p)
                 else:
                     word_weights.append(1.0)
