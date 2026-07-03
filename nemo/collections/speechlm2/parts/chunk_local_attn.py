@@ -217,6 +217,101 @@ def build_chunk_local_inference_bias(
     return bias.unsqueeze(1)
 
 
+def build_two_stream_attention_bias(
+    is_audio: torch.Tensor,
+    attention_mask: torch.Tensor,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Build the ``(B, 1, L, L)`` additive bias for the *two-stream* scheme.
+
+    Two-stream ("block audio->text") attention rule (token ``i`` attends to
+    token ``j``)::
+
+        mask[i, j] = (j <= i)                       # causal
+                     AND attention_mask[j] == 1     # key is valid (non-pad)
+                     AND ( NOT is_audio[i]           # text query: attend anything
+                           OR is_audio[j] )          # audio query: audio keys only
+
+    In words: **audio tokens form a pure causal audio encoder** — an audio
+    query attends only to (causally-prior) audio keys, never to text /
+    template / system-prompt tokens. **Text tokens are unrestricted** — a text
+    query attends to every causally-prior valid key of either modality (all
+    past text AND all past audio). This is the mildest possible separation of
+    the two modality streams: it only removes the audio->text attention edges
+    relative to the single-stream causal baseline.
+
+    Args:
+        is_audio: ``(B, L)`` bool, ``True`` at audio-frame positions.
+        attention_mask: ``(B, L)`` ``{0, 1}``, marks valid (non-pad) positions.
+        dtype: dtype of the bias tensor (the LLM's compute dtype).
+
+    Returns:
+        ``bias``: ``(B, 1, L, L)`` with ``0`` at allowed pairs and
+        ``finfo(dtype).min`` at disallowed pairs.
+    """
+    B, L = is_audio.shape
+    device = is_audio.device
+
+    causal = torch.tril(torch.ones((L, L), dtype=torch.bool, device=device))
+    valid_key = attention_mask.to(torch.bool).unsqueeze(1).expand(B, L, L)  # over queries
+    is_audio_q = is_audio.unsqueeze(2).expand(B, L, L)  # query axis
+    is_audio_k = is_audio.unsqueeze(1).expand(B, L, L)  # key axis
+    # audio query -> audio keys only; text query -> any key.
+    modality_ok = (~is_audio_q) | is_audio_k
+
+    allowed = causal.unsqueeze(0) & valid_key & modality_ok  # (B, L, L)
+
+    bias = torch.zeros((B, L, L), dtype=dtype, device=device)
+    bias.masked_fill_(~allowed, torch.finfo(dtype).min)
+    return bias.unsqueeze(1)
+
+
+def build_two_stream_inference_bias(
+    is_audio_history: torch.Tensor,
+    attention_mask_history: torch.Tensor,
+    is_audio_new: torch.Tensor,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Streaming (KV-cache) counterpart of :func:`build_two_stream_attention_bias`.
+
+    New queries attend against a history of cached K/V tokens plus the new
+    tokens themselves, using the same two-stream rule (audio queries see audio
+    keys only; text queries see everything valid and causal).
+
+    Args:
+        is_audio_history: ``(B, L_past)`` bool, is-audio flag per cached token.
+        attention_mask_history: ``(B, L_past)`` ``{0, 1}``, valid cached tokens.
+        is_audio_new: ``(B, L_q)`` bool, is-audio flag per new query token.
+        dtype: dtype of the bias tensor.
+
+    Returns:
+        ``bias``: ``(B, 1, L_q, L_k)`` where ``L_k = L_past + L_q``.
+    """
+    B, L_past = is_audio_history.shape
+    L_q = is_audio_new.shape[1]
+    L_k = L_past + L_q
+    device = is_audio_new.device
+
+    all_is_audio = torch.cat([is_audio_history, is_audio_new], dim=1)  # (B, L_k)
+    new_valid = torch.ones((B, L_q), dtype=attention_mask_history.dtype, device=device)
+    all_valid = torch.cat([attention_mask_history, new_valid], dim=1).to(torch.bool)  # (B, L_k)
+
+    q_abs = torch.arange(L_past, L_past + L_q, device=device).unsqueeze(1)  # (L_q, 1)
+    k_idx = torch.arange(L_k, device=device).unsqueeze(0)  # (1, L_k)
+    causal = k_idx <= q_abs  # (L_q, L_k)
+
+    is_audio_q = is_audio_new.unsqueeze(2).expand(B, L_q, L_k)  # query axis
+    is_audio_k = all_is_audio.unsqueeze(1).expand(B, L_q, L_k)  # key axis
+    modality_ok = (~is_audio_q) | is_audio_k
+    valid_key = all_valid.unsqueeze(1).expand(B, L_q, L_k)
+
+    allowed = causal.unsqueeze(0) & valid_key & modality_ok  # (B, L_q, L_k)
+
+    bias = torch.zeros((B, L_q, L_k), dtype=dtype, device=device)
+    bias.masked_fill_(~allowed, torch.finfo(dtype).min)
+    return bias.unsqueeze(1)
+
+
 def build_chunk_local_position_ids(
     is_audio: torch.Tensor,
     attention_mask: torch.Tensor,

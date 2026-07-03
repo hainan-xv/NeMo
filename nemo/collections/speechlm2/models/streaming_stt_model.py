@@ -48,6 +48,8 @@ from nemo.collections.speechlm2.parts.chunk_local_attn import (
     build_chunk_local_attention_bias,
     build_chunk_local_inference_bias,
     build_chunk_local_position_ids,
+    build_two_stream_attention_bias,
+    build_two_stream_inference_bias,
 )
 from nemo.collections.speechlm2.modules.parallel_chunk_heads import ParallelChunkHeads
 from nemo.collections.speechlm2.parts.hf_hub import HFHubMixin
@@ -210,6 +212,23 @@ class StreamingSTTModelConfig:
     # chunking (``chunk_size > 0``).
     use_chunk_local_audio_attn: bool = False
     num_visible_audio_chunks: int = 1
+    # --- Two-stream ("block audio->text") attention ---
+    # When True, the LLM self-attention is masked into two causal streams:
+    #   * audio tokens attend to (causally-prior) AUDIO tokens only — a pure
+    #     causal speech encoder living inside the shared LLM (audio never peeks
+    #     at text / template / system-prompt tokens);
+    #   * text tokens attend to every causally-prior valid token of EITHER
+    #     modality (all past text AND all past audio) — unchanged vs baseline.
+    # This is the mildest modality separation: it only removes the audio->text
+    # attention edges. The single-sequence interleaved layout and the training
+    # data are UNCHANGED; only the attention bias differs. Implemented on top
+    # of the chunk-local streaming machinery, so it inherits the same
+    # per-modality contiguous RoPE counters (audio and text each start at 0)
+    # and the ``<|im_end|>`` end-of-chunk stop signal. Mutually exclusive with
+    # ``use_chunk_local_audio_attn`` and ``use_modality_position_ids``.
+    # Requires ``supervise_im_end_in_loss=True`` and fixed chunking
+    # (``chunk_size > 0``).
+    use_two_stream_attn: bool = False
     # Auxiliary raw-transcript LM objective. When > 0, training adds a second
     # causal-LM loss over ``batch.text`` only: no audio placeholders, no chat
     # template, no blank token, and no assistant ``<|im_end|>`` control token.
@@ -551,6 +570,34 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 "contiguous RoPE counters (both start at 0). Assistant <|im_end|> supervision is "
                 "required and enabled.",
                 int(self.core_cfg.num_visible_audio_chunks) - 1,
+            )
+        if self.core_cfg.use_two_stream_attn:
+            if self.core_cfg.use_chunk_local_audio_attn:
+                raise ValueError(
+                    "use_two_stream_attn=True is mutually exclusive with "
+                    "use_chunk_local_audio_attn=True"
+                )
+            if self.core_cfg.use_modality_position_ids:
+                raise ValueError(
+                    "use_two_stream_attn=True is mutually exclusive with "
+                    "use_modality_position_ids=True"
+                )
+            if not self.core_cfg.supervise_im_end_in_loss:
+                raise ValueError(
+                    "use_two_stream_attn=True requires supervise_im_end_in_loss=True "
+                    "(<|im_end|> is the end-of-chunk stop signal in the streaming decode "
+                    "path it shares with chunk-local attention)"
+                )
+            if int(self.core_cfg.chunk_size) <= 0:
+                raise ValueError(
+                    "use_two_stream_attn=True currently supports fixed chunking only "
+                    f"(chunk_size > 0), got chunk_size={self.core_cfg.chunk_size}"
+                )
+            logging.info(
+                "Two-stream attention ENABLED: audio tokens form a pure causal audio encoder "
+                "(attend to prior AUDIO only); text tokens attend to all prior text AND audio "
+                "(causal). Audio and text use independent contiguous RoPE counters (both start "
+                "at 0). Assistant <|im_end|> supervision is required and enabled."
             )
 
         # --- LLM ---
@@ -1023,16 +1070,23 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         )
         if self.core_cfg.use_modality_position_ids:
             inputs["position_ids"] = self._build_modality_position_ids(input_tokens, inputs["attention_mask"])
-        if self.core_cfg.use_chunk_local_audio_attn:
+        if self._uses_interleaved_stream_state:
             is_audio = audio_mask
-            chunk_id = build_chunk_ids(is_audio, inputs["attention_mask"])
-            attn_bias_4d = build_chunk_local_attention_bias(
-                chunk_id,
-                is_audio,
-                inputs["attention_mask"],
-                dtype=inputs["input_embeds"].dtype,
-                num_visible_audio_chunks=int(self.core_cfg.num_visible_audio_chunks),
-            )
+            if self.core_cfg.use_two_stream_attn:
+                attn_bias_4d = build_two_stream_attention_bias(
+                    is_audio,
+                    inputs["attention_mask"],
+                    dtype=inputs["input_embeds"].dtype,
+                )
+            else:
+                chunk_id = build_chunk_ids(is_audio, inputs["attention_mask"])
+                attn_bias_4d = build_chunk_local_attention_bias(
+                    chunk_id,
+                    is_audio,
+                    inputs["attention_mask"],
+                    dtype=inputs["input_embeds"].dtype,
+                    num_visible_audio_chunks=int(self.core_cfg.num_visible_audio_chunks),
+                )
             inputs["position_ids"] = build_chunk_local_position_ids(is_audio, inputs["attention_mask"])
             # Keep the 2-D ``attention_mask`` untouched (the aux chunk
             # classifier still consumes it as a (B, L) mask); the LLM forward
@@ -1112,6 +1166,16 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
     # ------------------------------------------------------------------
     # Chunk-local audio attention: per-step inference helpers
     # ------------------------------------------------------------------
+
+    @property
+    def _uses_interleaved_stream_state(self) -> bool:
+        """True when per-token audio/text bookkeeping must be maintained during
+        streaming (position counters, is-audio history, per-step 4-D attention
+        bias). Shared by chunk-local audio attention and the two-stream scheme;
+        the two differ only in the attention-bias rule."""
+        return bool(
+            self.core_cfg.use_chunk_local_audio_attn or self.core_cfg.use_two_stream_attn
+        )
 
     def _build_chunk_local_step_inputs(
         self,
@@ -1194,15 +1258,23 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             chunk_id_history = state.chunk_id_history
             is_audio_history = state.is_audio_history
 
-        attn_bias_4d = build_chunk_local_inference_bias(
-            chunk_id_history=chunk_id_history,
-            is_audio_history=is_audio_history,
-            attention_mask_history=attention_mask_history,
-            chunk_id_new=new_chunk_ids,
-            is_audio_new=new_is_audio,
-            dtype=self.embed_tokens.weight.dtype,
-            num_visible_audio_chunks=int(self.core_cfg.num_visible_audio_chunks),
-        )
+        if self.core_cfg.use_two_stream_attn:
+            attn_bias_4d = build_two_stream_inference_bias(
+                is_audio_history=is_audio_history,
+                attention_mask_history=attention_mask_history,
+                is_audio_new=new_is_audio,
+                dtype=self.embed_tokens.weight.dtype,
+            )
+        else:
+            attn_bias_4d = build_chunk_local_inference_bias(
+                chunk_id_history=chunk_id_history,
+                is_audio_history=is_audio_history,
+                attention_mask_history=attention_mask_history,
+                chunk_id_new=new_chunk_ids,
+                is_audio_new=new_is_audio,
+                dtype=self.embed_tokens.weight.dtype,
+                num_visible_audio_chunks=int(self.core_cfg.num_visible_audio_chunks),
+            )
 
         # Advance per-stream counters; inactive streams freeze in place.
         n_audio_per_row = new_is_audio.long().sum(dim=1)  # (B,)
@@ -2503,6 +2575,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             unsupported = (
                 self.core_cfg.use_modality_position_ids
                 or self.core_cfg.use_chunk_local_audio_attn
+                or self.core_cfg.use_two_stream_attn
                 or (self.parallel_chunk_heads is not None)
             )
             if fid is None or int(fid) < 0:
@@ -2706,12 +2779,18 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         assert self.parallel_chunk_heads is not None, (
             "_parallel_chunk_step_decode called but parallel_chunk_heads is not initialized"
         )
-        # Chunk-local audio attn / sep-pos variants are not yet wired through
-        # the parallel decode path; error early instead of silently mis-decoding.
-        if self.core_cfg.use_chunk_local_audio_attn or self.core_cfg.use_modality_position_ids:
+        # Chunk-local audio attn / two-stream attn / sep-pos variants are not yet
+        # wired through the parallel decode path; error early instead of silently
+        # mis-decoding.
+        if (
+            self.core_cfg.use_chunk_local_audio_attn
+            or self.core_cfg.use_two_stream_attn
+            or self.core_cfg.use_modality_position_ids
+        ):
             raise NotImplementedError(
-                "parallel_chunk_decode is not yet wired through chunk-local audio attention or "
-                "separated modality position IDs. Set parallel_chunk_decode=False for those modes."
+                "parallel_chunk_decode is not yet wired through chunk-local / two-stream audio "
+                "attention or separated modality position IDs. Set parallel_chunk_decode=False "
+                "for those modes."
             )
         device = anchor_hidden.device
         B = anchor_hidden.shape[0]
@@ -2997,7 +3076,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 position_ids = self._build_next_text_position_ids(
                     B, state, token_emb.device, active_mask=feed_mask
                 )
-            elif self.core_cfg.use_chunk_local_audio_attn:
+            elif self._uses_interleaved_stream_state:
                 new_is_audio = torch.zeros(
                     (B, 1), dtype=torch.bool, device=token_emb.device
                 )
@@ -3152,7 +3231,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                     .unsqueeze(0)
                     .expand(batch_size, -1)
                 )
-            elif self.core_cfg.use_chunk_local_audio_attn:
+            elif self._uses_interleaved_stream_state:
                 # System prompt occupies text positions ``[0, sys_len-1]``; audio
                 # counter is still 0 (no audio yet).
                 position_ids = (
@@ -3178,7 +3257,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             position_ids = None
             if self.core_cfg.use_modality_position_ids:
                 position_ids = torch.zeros(batch_size, max_sys_len, dtype=torch.long, device=device)
-            elif self.core_cfg.use_chunk_local_audio_attn:
+            elif self._uses_interleaved_stream_state:
                 position_ids = torch.zeros(batch_size, max_sys_len, dtype=torch.long, device=device)
             for b in range(batch_size):
                 embs = self.embed_tokens(
@@ -3197,7 +3276,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                             dtype=torch.long,
                             device=device,
                         )
-                    else:  # use_chunk_local_audio_attn
+                    else:  # chunk-local / two-stream: text counter from 0
                         position_ids[b, offset:] = torch.arange(
                             0, sys_lens[b], dtype=torch.long, device=device
                         )
@@ -3229,7 +3308,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             chunk_id_counter_init = None
             chunk_id_history_init = None
             is_audio_history_init = None
-        elif self.core_cfg.use_chunk_local_audio_attn:
+        elif self._uses_interleaved_stream_state:
             audio_pos_counter = torch.zeros(batch_size, dtype=torch.long, device=device)
             text_pos_counter = torch.tensor(sys_lens, dtype=torch.long, device=device)
             chunk_id_counter_init = torch.full(
@@ -3402,7 +3481,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         new_is_audio_for_history: Optional[Tensor] = None
         if self.core_cfg.use_modality_position_ids:
             position_ids = self._build_streaming_position_ids(turn_ids_t, audio_mask, state)
-        elif self.core_cfg.use_chunk_local_audio_attn:
+        elif self._uses_interleaved_stream_state:
             (
                 position_ids,
                 attn_bias_4d,
@@ -3528,7 +3607,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                     [state.attention_mask, footer_attention_mask],
                     dim=1,
                 )
-            elif self.core_cfg.use_chunk_local_audio_attn:
+            elif self._uses_interleaved_stream_state:
                 new_is_audio = torch.zeros((B, flen), dtype=torch.bool, device=device)
                 active_t = torch.as_tensor(needs_footer, dtype=torch.long, device=device)
                 (
@@ -4543,6 +4622,12 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             ):
                 raise ValueError(
                     "use_chunk_local_audio_attn=True currently supports fixed-chunk streaming inference only"
+                )
+            if self.core_cfg.use_two_stream_attn and (
+                self.core_cfg.chunk_size <= 0 or use_state_machine_inference
+            ):
+                raise ValueError(
+                    "use_two_stream_attn=True currently supports fixed-chunk streaming inference only"
                 )
 
             if self.core_cfg.chunk_size < 0:

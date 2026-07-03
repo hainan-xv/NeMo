@@ -24,6 +24,7 @@ Usage:
 """
 import argparse
 import contextlib
+import gc
 import io
 import json
 import logging
@@ -450,21 +451,46 @@ def prepare_samples(args, dataset, split):
 def evaluate_one(model, args, dataset, split):
     """Prepare + transcribe + score one (dataset, split). Returns a result dict
     or None when there are no samples. Caller is responsible for any logging;
-    this function is intended to run inside ``_suppress_output()``."""
+    this function is intended to run inside ``_suppress_output()``.
+
+    On CUDA out-of-memory the transcription is retried with the batch size
+    repeatedly halved (down to ``--min_batch_size``, default 1) after freeing GPU
+    memory, so a too-large ``--batch_size`` degrades gracefully instead of
+    crashing. The batch size that finally succeeded is returned as
+    ``result['batch_size']``."""
     all_data = prepare_samples(args, dataset, split)
     n_samples = len(all_data["references"])
     if n_samples == 0:
         return None
 
-    dloader = setup_dloader(all_data["audio_filepaths"], batch_size=args.batch_size)
-    start = time.time()
-    transcriptions = transcribe_sslm(
-        model, dloader,
-        system_prompt=args.system_prompt,
-        max_new_tokens=args.max_new_tokens,
-        no_repeat_ngram_size=args.no_repeat_ngram_size,
-        warmup_decode=args.warmup_decode,
-    )
+    min_bs = max(1, int(getattr(args, "min_batch_size", 1) or 1))
+    bs = max(min_bs, int(args.batch_size))
+    start = None
+    transcriptions = None
+    while True:
+        try:
+            dloader = setup_dloader(all_data["audio_filepaths"], batch_size=bs)
+            start = time.time()
+            transcriptions = transcribe_sslm(
+                model, dloader,
+                system_prompt=args.system_prompt,
+                max_new_tokens=args.max_new_tokens,
+                no_repeat_ngram_size=args.no_repeat_ngram_size,
+                warmup_decode=args.warmup_decode,
+            )
+            break
+        except RuntimeError as e:
+            # Retry on CUDA OOM only; re-raise any other RuntimeError (and OOM at
+            # the minimum batch size, which we can't shrink further).
+            if "out of memory" not in str(e).lower() or bs <= min_bs:
+                raise
+            transcriptions = None
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.reset_peak_memory_stats()
+            bs = max(min_bs, bs // 2)
+
     total_time = time.time() - start
     predictions = [text_normalizer(pred.strip()) for pred in transcriptions]
 
@@ -481,6 +507,7 @@ def evaluate_one(model, args, dataset, split):
     rtfx = round(sum(all_data["durations"]) / total_time, 2)
     return {
         "wer": wer, "rtfx": rtfx, "time": total_time, "n": n_samples,
+        "batch_size": bs,
         "refs": all_data["references"], "hyps": predictions,
     }
 
@@ -758,7 +785,10 @@ def main(args):
         if res is None:
             print(f"{name:<24}{'n/a':>9}{'':>11}  (no samples)", flush=True)
             continue
-        print(f"{name:<24}{res['wer']:>9.2f}{res['time']:>11.1f}", flush=True)
+        bs_note = ""
+        if res.get("batch_size") and res["batch_size"] != args.batch_size:
+            bs_note = f"   bs={res['batch_size']}"  # reduced from the request via OOM backoff
+        print(f"{name:<24}{res['wer']:>9.2f}{res['time']:>11.1f}{bs_note}", flush=True)
         results.append((name, res))
         if args.verbose:
             for i, (ref, hyp) in enumerate(zip(res["refs"], res["hyps"])):
@@ -924,7 +954,11 @@ if __name__ == "__main__":
                         help="Single dataset to evaluate. If omitted, runs the full ESB leaderboard suite.")
     parser.add_argument("--split", type=str, default="test")
     parser.add_argument("--device", type=int, default=0)
-    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--batch_size", type=int, default=64,
+                        help="Starting batch size. On CUDA OOM it is halved and retried "
+                             "(freeing GPU memory each time) down to --min_batch_size.")
+    parser.add_argument("--min_batch_size", type=int, default=1,
+                        help="Lower bound for the OOM batch-size backoff; OOM at this size re-raises.")
     parser.add_argument("--dtype", choices=["bf16", "fp32"], default="bf16",
                         help="Native inference dtype. fp32 is slower/heavier but avoids BF16 greedy-decode "
                              "batch/call-order instabilities observed in debugging.")

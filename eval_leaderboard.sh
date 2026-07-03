@@ -41,6 +41,19 @@ set -o pipefail
 #   USE_LAST         1 -> use -last.ckpt instead of the best snapshot
 #   RUN_AVERAGING    1 -> rsync ALL non '-last' .ckpt snapshots and average their
 #                         state_dicts into <EXP>-averaged.ckpt, then eval that
+#   LOCAL_ONLY_IF_EXIST 1 -> prefer the locally cached checkpoint, but STILL pull
+#                         a newer one from OCI when the grid has progressed. For
+#                         RUN_AVERAGING this reuses the cached average only if the
+#                         grid's current non '-last' set matches what was averaged
+#                         (recorded in <EXP>-averaged.ckpt.inputs); otherwise it
+#                         re-downloads + re-averages the newer set. If the grid is
+#                         unreachable it falls back to the local cache. When no
+#                         local cache exists it downloads normally (never errors
+#                         just for a cache miss).
+#   PREPARE_ONLY     1 -> only resolve/download/average the checkpoint, print
+#                         "PREPARED_CKPT=<path>" and exit (no evaluation). Used by
+#                         eval_leaderboard_qwen0p6.sh to build the model x dataset
+#                         WER table itself.
 #   FORCE_AVERAGE    1 -> recompute the averaged ckpt even if cached
 #   VLLM             1 -> fast path: convert the ckpt + decode in the
 #                         streaming-stt-eval container (vLLM) instead of the
@@ -112,34 +125,36 @@ SKIP_DOWNLOAD="${SKIP_DOWNLOAD:-0}"
 QUICK_TEST="${QUICK_TEST:-0}"
 ONLY="${ONLY:-}"
 MAX_EVAL_SAMPLES="${MAX_EVAL_SAMPLES:-}"
+LOCAL_ONLY_IF_EXIST="${LOCAL_ONLY_IF_EXIST:-0}"
 # vLLM fast path: VLLM=1 converts the ckpt and decodes inside the colleague's
 # streaming-stt-eval container instead of running run_eval_sslm.py in-process.
 VLLM="${VLLM:-0}"
 VLLM_IMAGE="${VLLM_IMAGE:-gitlab-master.nvidia.com/dongjig/nemo_containers/streaming-stt-eval:v2}"
 
-# ---------- Resolve project dir on OCI ----------
-if [ -n "${PROJECT:-}" ]; then
-    PROJECT_CANDIDATES=("$PROJECT")
-else
-    PROJECT_CANDIDATES=("${PROJECT_CANDIDATES_DEFAULT[@]}")
-fi
+# ---------- Lazy OCI project resolver ----------
+# Resolves REMOTE_CKPT_DIR the first time it is actually needed. When
+# LOCAL_ONLY_IF_EXIST reuses a cached checkpoint this is never called, so that
+# path stays fully offline. Returns 0 on success, 1 if the experiment can't be
+# found on the grid (caller decides whether that's fatal).
 REMOTE_CKPT_DIR=""
-for proj in "${PROJECT_CANDIDATES[@]}"; do
-    candidate="${REMOTE_RESULTS_ROOT}/${proj}/${EXP_NAME}/${EXP_NAME}/checkpoints"
-    if ssh $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}" "[ -d '${candidate}' ]" 2>/dev/null; then
-        REMOTE_CKPT_DIR="$candidate"
-        echo "==> Resolved project: ${proj}"
-        break
+resolve_remote() {
+    [ -n "$REMOTE_CKPT_DIR" ] && return 0
+    local cands proj candidate
+    if [ -n "${PROJECT:-}" ]; then
+        cands=("$PROJECT")
+    else
+        cands=("${PROJECT_CANDIDATES_DEFAULT[@]}")
     fi
-done
-if [ -z "$REMOTE_CKPT_DIR" ]; then
-    echo "ERROR: experiment '${EXP_NAME}' not found under any of:" >&2
-    for proj in "${PROJECT_CANDIDATES[@]}"; do
-        echo "       ${REMOTE_RESULTS_ROOT}/${proj}/${EXP_NAME}/${EXP_NAME}/checkpoints" >&2
+    for proj in "${cands[@]}"; do
+        candidate="${REMOTE_RESULTS_ROOT}/${proj}/${EXP_NAME}/${EXP_NAME}/checkpoints"
+        if ssh $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}" "[ -d '${candidate}' ]" 2>/dev/null; then
+            REMOTE_CKPT_DIR="$candidate"
+            echo "==> Resolved project: ${proj}"
+            return 0
+        fi
     done
-    echo "       Override with PROJECT=<name>." >&2
-    exit 1
-fi
+    return 1
+}
 
 # ---------- Helper: prompt before reusing a cached checkpoint ----------
 # Returns 0 -> (re)download, 1 -> reuse the local copy.
@@ -174,11 +189,44 @@ if [ "${RUN_AVERAGING:-0}" = "1" ]; then
     [ -f "$AVG_SCRIPT" ] || { echo "ERROR: averager not found at $AVG_SCRIPT" >&2; exit 1; }
     AVG_DIR="${LOCAL_CKPT_DIR}/${EXP_NAME}/avg_inputs"
     LOCAL_CKPT_PATH="${LOCAL_CKPT_DIR}/${EXP_NAME}/${EXP_NAME}-averaged.ckpt"
+    AVG_MANIFEST="${LOCAL_CKPT_PATH}.inputs"   # basenames that produced the cache
     STEP="averaged"
 
+    # Is there a reusable cached average on disk?
+    CACHED_OK=0
     if [ -f "$LOCAL_CKPT_PATH" ] && [ -s "$LOCAL_CKPT_PATH" ] && [ "${FORCE_AVERAGE:-0}" != "1" ] && [ "${FORCE_DOWNLOAD:-0}" != "1" ]; then
-        echo "==> Reusing cached averaged checkpoint (FORCE_AVERAGE=1 to rebuild): $LOCAL_CKPT_PATH"
-    else
+        CACHED_OK=1
+    fi
+
+    # Decide reuse vs (re)build:
+    #   LOCAL_ONLY_IF_EXIST=1 -> ALWAYS reuse the cache as-is, no grid check.
+    #   default               -> reuse ONLY if the grid's current non '-last' set
+    #                            still matches the cached inputs (recorded in the
+    #                            .inputs sidecar); otherwise pull the newer set and
+    #                            re-average. Grid unreachable -> reuse the cache.
+    REUSE_AVG=0
+    if [ "$CACHED_OK" = "1" ] && [ "$LOCAL_ONLY_IF_EXIST" = "1" ]; then
+        REUSE_AVG=1
+        echo "==> LOCAL_ONLY_IF_EXIST: reusing cached averaged checkpoint (no grid check): $LOCAL_CKPT_PATH"
+    elif [ "$CACHED_OK" = "1" ]; then
+        if resolve_remote; then
+            echo "==> Checking grid for a newer top-k set..."
+            REMOTE_CKPT_FILES=$(ssh $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}" \
+                "ls ${REMOTE_CKPT_DIR}/*.ckpt 2>/dev/null | grep -v -- '-last\.ckpt$' | xargs -r -n1 basename" 2>/dev/null | sort || true)
+            if [ -z "$REMOTE_CKPT_FILES" ]; then
+                echo "    grid empty/unreachable -> reusing cached average: $LOCAL_CKPT_PATH"; REUSE_AVG=1
+            elif [ -f "$AVG_MANIFEST" ] && [ "$(sort "$AVG_MANIFEST")" = "$REMOTE_CKPT_FILES" ]; then
+                echo "    grid set unchanged -> reusing cached average: $LOCAL_CKPT_PATH"; REUSE_AVG=1
+            else
+                echo "    grid has a newer/different top-k set -> re-downloading + re-averaging."
+            fi
+        else
+            echo "==> grid unreachable -> reusing cached average: $LOCAL_CKPT_PATH"; REUSE_AVG=1
+        fi
+    fi
+
+    if [ "$REUSE_AVG" != "1" ]; then
+        resolve_remote || { echo "ERROR: cannot resolve '${EXP_NAME}' on grid and no reusable local average. Override with PROJECT=<name>." >&2; exit 1; }
         echo "==> Listing non '-last' checkpoints on OCI..."
         REMOTE_CKPT_FILES=$(ssh $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}" \
             "ls ${REMOTE_CKPT_DIR}/*.ckpt 2>/dev/null | grep -v -- '-last\.ckpt$' | xargs -r -n1 basename")
@@ -218,9 +266,40 @@ if [ "${RUN_AVERAGING:-0}" = "1" ]; then
         rm -f "$LOCAL_CKPT_PATH"
         python "$AVG_SCRIPT" --output "$LOCAL_CKPT_PATH" "${AVG_INPUTS[@]}"
         [ -f "$LOCAL_CKPT_PATH" ] || { echo "ERROR: averaging did not produce $LOCAL_CKPT_PATH" >&2; exit 1; }
+        # Record exactly which snapshots produced this average so a later default
+        # run can tell whether the grid has moved on (freshness check above).
+        printf '%s\n' "$REMOTE_CKPT_FILES" | sort > "$AVG_MANIFEST"
         echo "==> Average complete ($(du -h "$LOCAL_CKPT_PATH" | cut -f1))"
     fi
 else
+    # ---- Single-checkpoint path ----
+    LOCAL_EXP_DIR="${LOCAL_CKPT_DIR}/${EXP_NAME}"
+    LOCAL_HIT=""
+    # LOCAL_ONLY_IF_EXIST: reuse a cached ckpt as-is (no grid check) when present.
+    if [ "$LOCAL_ONLY_IF_EXIST" = "1" ]; then
+        if [ -n "$STEP" ] && [ -f "${LOCAL_EXP_DIR}/step=${STEP}.ckpt" ]; then
+            LOCAL_HIT="step=${STEP}.ckpt"
+        elif [ -z "$STEP" ]; then
+            shopt -s nullglob
+            _cands=()
+            for f in "$LOCAL_EXP_DIR"/*.ckpt; do
+                case "$(basename "$f")" in
+                    *-last.ckpt) [ "${USE_LAST:-0}" = "1" ] || continue ;;
+                esac
+                _cands+=("$f")
+            done
+            shopt -u nullglob
+            [ "${#_cands[@]}" -gt 0 ] && LOCAL_HIT="$(basename "$(ls -t "${_cands[@]}" | head -1)")"
+        fi
+    fi
+
+    if [ -n "$LOCAL_HIT" ]; then
+        CKPT_FILENAME="$LOCAL_HIT"
+        LOCAL_CKPT_PATH="${LOCAL_EXP_DIR}/${CKPT_FILENAME}"
+        STEP="${CKPT_FILENAME%.ckpt}"; STEP="${STEP#step=}"
+        echo "==> LOCAL_ONLY_IF_EXIST: using cached checkpoint ${LOCAL_CKPT_PATH} ($(du -h "$LOCAL_CKPT_PATH" | cut -f1))"
+    else
+    resolve_remote || { echo "ERROR: experiment '${EXP_NAME}' not found on grid. Override with PROJECT=<name>." >&2; exit 1; }
     if [ -z "$STEP" ]; then
         if [ "${USE_LAST:-0}" = "1" ]; then
             echo "==> USE_LAST=1: finding most recent -last.ckpt on OCI..."
@@ -277,6 +356,13 @@ else
         fi
         echo "==> Download complete ($(du -h "$LOCAL_CKPT_PATH" | cut -f1))"
     fi
+    fi
+fi
+
+# ---------- PREPARE_ONLY: emit the resolved checkpoint path and stop ----------
+if [ "${PREPARE_ONLY:-0}" = "1" ]; then
+    echo "PREPARED_CKPT=${LOCAL_CKPT_PATH}"
+    exit 0
 fi
 
 # ---------- Step 2: evaluate on the leaderboard datasets ----------
