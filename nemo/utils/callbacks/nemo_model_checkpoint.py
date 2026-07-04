@@ -85,6 +85,8 @@ class NeMoModelCheckpoint(ModelCheckpoint):
         # run cleanly when the shared filesystem is wedged (see
         # `_bounded_save_checkpoint`).
         self._consecutive_ckpt_write_failures = 0
+        # Background threads ferrying node-local checkpoints to the shared FS.
+        self._pending_ferries: List = []
 
         # `prefix` is deprecated
         if 'prefix' in kwargs:
@@ -594,86 +596,119 @@ class NeMoModelCheckpoint(ModelCheckpoint):
             self._drop_optimizer_states(trainer, filepath, storage_options)
 
     def _bounded_save_checkpoint(self, trainer, filepath, finalize_fn) -> None:
-        """Synchronous checkpoint save guarded by a wall-clock timeout.
+        """Checkpoint save hardened against a flaky shared filesystem.
 
-        Motivation: on a flaky shared filesystem (e.g. Lustre) rank 0's write can
-        stall for hours. The other ranks reach the post-save collective barrier
-        and, because rank 0 never arrives, the NCCL watchdog eventually tears the
-        entire job down. Simply raising the NCCL timeout does not help — the write
-        may never return.
+        On e.g. Lustre a write can stall for a long time (or forever). Because
+        rank 0's stalled write parks it in uninterruptible I/O while the other
+        ranks reach the post-save barrier, the NCCL watchdog eventually tears the
+        whole job down. Two hardening layers, selected by env vars:
 
-        Strategy: build the checkpoint payload on the main thread (local for DDP,
-        no collectives) and run ONLY the disk write in a worker thread. We wait up
-        to ``NEMO_CKPT_WRITE_TIMEOUT_S`` seconds; if the write has not finished we
-        abandon it and continue. Crucially, every rank always issues the SAME
-        sequence of barriers regardless of the write outcome, so DDP stays in
-        lockstep. On failure we leave the ``-unfinished`` marker in place so a
-        later resume skips the partial file. After ``NEMO_CKPT_MAX_CONSEC_FAILS``
-        consecutive failures (default 4 == a full epoch's worth of evals here) we
-        stop the run cleanly.
+        1. Staging + background ferry (``NEMO_CKPT_STAGING_DIR`` set, recommended):
+           rank 0 writes the checkpoint to *node-local* storage (fast, reliable),
+           then a background thread ferries it to the real shared-FS path via a
+           temp file + atomic rename, clearing the ``-unfinished`` marker only once
+           the shared-FS copy is complete. The flaky write is entirely off the
+           training critical path — training only ever blocks on the fast local
+           write.
 
-        NOTE: we deliberately bypass ``trainer.save_checkpoint`` because in
-        Lightning 2.4 it ends with ``strategy.barrier("Trainer.save_checkpoint")``;
-        issuing that NCCL barrier from a worker thread would be unsafe. We run the
-        write thread-side and keep all barriers on the main thread.
+        2. Time-boxed direct write (``NEMO_CKPT_STAGING_DIR`` unset): rank 0's
+           write to the shared FS runs in a worker thread bounded by
+           ``NEMO_CKPT_WRITE_TIMEOUT_S``; on timeout we abandon it and continue,
+           leaving the ``-unfinished`` marker so resume skips the partial file.
+
+        In both layers every rank issues the SAME sequence of barriers regardless
+        of outcome (so DDP never desyncs), and after ``NEMO_CKPT_MAX_CONSEC_FAILS``
+        consecutive failures (default 4 == one epoch of evals here) — or that many
+        checkpoints piling up un-ferried — we stop the run cleanly.
+
+        NOTE: we bypass ``trainer.save_checkpoint`` because in Lightning 2.4 it
+        ends with ``strategy.barrier("Trainer.save_checkpoint")``; issuing that
+        NCCL barrier from a worker thread would be unsafe. The barriers stay on
+        the main thread; only the disk write is threaded.
         """
         import threading
         import time
 
+        staging_dir = os.environ.get("NEMO_CKPT_STAGING_DIR", "").strip()
         timeout_s = float(os.environ.get("NEMO_CKPT_WRITE_TIMEOUT_S", "90"))
         max_consec = int(os.environ.get("NEMO_CKPT_MAX_CONSEC_FAILS", "4"))
-
-        logging.info(
-            f'Checkpoint save for step {trainer.global_step} started at {datetime.now().isoformat()}'
-            + (f' (write timeout {timeout_s:.0f}s).' if timeout_s > 0 else '.')
-        )
 
         # Build the payload on the main thread (state_dict is local for DDP).
         checkpoint = trainer._checkpoint_connector.dump_checkpoint(self.save_weights_only)
 
-        def _do_barrier(name: str = None):
+        def _barrier():
             if torch.distributed.is_available() and torch.distributed.is_initialized():
                 torch.distributed.barrier()
 
-        # Timeout disabled -> original synchronous behavior (still no worker thread).
-        if timeout_s <= 0:
-            trainer.strategy.save_checkpoint(checkpoint, filepath, storage_options=None)
+        def _threaded_write(target_path, tag):
+            """Run the rank-0 disk write in a worker thread; return True on failure."""
+            res = {"exc": None}
+
+            def _w():
+                try:
+                    trainer.strategy.save_checkpoint(checkpoint, target_path, storage_options=None)
+                except BaseException as e:  # noqa: BLE001 - keep the worker from crashing the process
+                    res["exc"] = e
+
+            t = threading.Thread(target=_w, name=f"nemo-ckpt-{tag}", daemon=True)
+            t.start()
+            t.join(timeout_s if timeout_s > 0 else None)
+            if t.is_alive():
+                logging.error(
+                    f'[checkpoint] step {trainer.global_step}: {tag} write did not finish within '
+                    f'{timeout_s:.0f}s ({target_path}); abandoning and continuing.'
+                )
+                return True
+            if res["exc"] is not None:
+                logging.error(
+                    f'[checkpoint] step {trainer.global_step}: {tag} write failed ({target_path}): '
+                    f'{repr(res["exc"])}. Continuing.'
+                )
+                return True
+            return False
+
+        # ---- Layer 1: stage locally, ferry to the shared FS in the background ----
+        if staging_dir:
+            failed = False
+            if trainer.is_global_zero:
+                run_tag = os.environ.get("SLURM_JOB_ID", "nojob")
+                local_run_dir = os.path.join(staging_dir, "nemo_ckpt_staging", run_tag)
+                local_path = os.path.join(local_run_dir, os.path.basename(filepath))
+                try:
+                    os.makedirs(local_run_dir, exist_ok=True)
+                except Exception as e:  # noqa: BLE001
+                    logging.error(f'[checkpoint] cannot create staging dir {local_run_dir}: {e!r}')
+                logging.info(
+                    f'Checkpoint save for step {trainer.global_step} started at {datetime.now().isoformat()} '
+                    f'(staging to {local_path}, then background ferry to {filepath}).'
+                )
+                failed = _threaded_write(local_path, "local")
+
+            # Barriers identical on all ranks (see NOTE): match the sync path's
+            # strategy.barrier + finalize barrier.
             trainer.strategy.barrier("Trainer.save_checkpoint")
-            finalize_fn()
-            self._consecutive_ckpt_write_failures = 0
+            _barrier()
+
+            if trainer.is_global_zero:
+                if not failed:
+                    self._consecutive_ckpt_write_failures = 0
+                    # Optimistic bookkeeping; resume only ever sees the atomically
+                    # renamed (complete) file, so this is safe.
+                    self._last_global_step_saved = trainer.global_step
+                    self._last_checkpoint_saved = filepath
+                    self._launch_ckpt_ferry(trainer, local_path, filepath, trainer.global_step, max_consec)
+                else:
+                    self._register_ckpt_failure(trainer, max_consec)
             return
 
-        write_result = {"exc": None}
-
-        def _write():
-            try:
-                trainer.strategy.save_checkpoint(checkpoint, filepath, storage_options=None)
-            except BaseException as e:  # noqa: BLE001 - keep the worker from crashing the process
-                write_result["exc"] = e
-
-        t0 = time.time()
-        writer = threading.Thread(target=_write, name="nemo-ckpt-writer", daemon=True)
-        writer.start()
-        writer.join(timeout_s)
-
-        timed_out = writer.is_alive()
-        errored = (not timed_out) and (write_result["exc"] is not None)
-        failed = timed_out or errored
-
-        if timed_out:
-            logging.error(
-                f'[checkpoint] step {trainer.global_step}: write did not finish within {timeout_s:.0f}s '
-                f'({filepath}); abandoning this checkpoint and continuing. Leaving the -unfinished marker '
-                f'so resume ignores the partial file.'
-            )
-        elif errored:
-            logging.error(
-                f'[checkpoint] step {trainer.global_step}: write failed after {time.time() - t0:.1f}s '
-                f'({filepath}): {repr(write_result["exc"])}. Continuing.'
-            )
+        # ---- Layer 2: time-boxed direct write to the shared FS ----
+        logging.info(
+            f'Checkpoint save for step {trainer.global_step} started at {datetime.now().isoformat()}'
+            + (f' (write timeout {timeout_s:.0f}s).' if timeout_s > 0 else '.')
+        )
+        failed = _threaded_write(filepath, "direct")
 
         # Barrier #1: the one Lightning's trainer.save_checkpoint normally emits.
-        # ALL ranks must call it regardless of write outcome to stay in lockstep.
         trainer.strategy.barrier("Trainer.save_checkpoint")
 
         if not failed:
@@ -682,11 +717,13 @@ class NeMoModelCheckpoint(ModelCheckpoint):
             self._consecutive_ckpt_write_failures = 0
             return
 
-        # Failure: match the success path's finalize barrier (barrier #2) so the
-        # collective sequence is identical on every rank, but do NOT clear the
-        # -unfinished marker.
-        _do_barrier("checkpoint-write-failed")
+        # Failure: match the success path's finalize barrier so the collective
+        # sequence is identical on every rank, but keep the -unfinished marker.
+        _barrier()
+        self._register_ckpt_failure(trainer, max_consec)
 
+    def _register_ckpt_failure(self, trainer, max_consec) -> None:
+        """Track consecutive checkpoint-write failures; stop cleanly past the limit."""
         self._consecutive_ckpt_write_failures = getattr(self, "_consecutive_ckpt_write_failures", 0) + 1
         logging.error(
             f'[checkpoint] consecutive write failures: {self._consecutive_ckpt_write_failures}/{max_consec}.'
@@ -700,6 +737,70 @@ class NeMoModelCheckpoint(ModelCheckpoint):
             # Avoid a final .nemo export that would just stall on the same FS.
             self.save_nemo_on_train_end = False
             trainer.should_stop = True
+
+    def _launch_ckpt_ferry(self, trainer, local_path, dest_path, global_step, max_consec) -> None:
+        """Start a background thread copying a node-local checkpoint to the shared FS.
+
+        If too many checkpoints are still waiting to reach the shared FS, that FS
+        is effectively wedged, so we stop the run cleanly (bounding node-local disk
+        usage too).
+        """
+        import threading
+
+        # Drop references to ferries that have already completed.
+        self._pending_ferries = [f for f in getattr(self, "_pending_ferries", []) if f.is_alive()]
+        if len(self._pending_ferries) >= max_consec:
+            logging.error(
+                f'[checkpoint] {len(self._pending_ferries)} checkpoints still waiting to reach the shared FS '
+                f'(>= {max_consec}); it looks wedged — stopping training cleanly.'
+            )
+            self.save_nemo_on_train_end = False
+            trainer.should_stop = True
+
+        t = threading.Thread(
+            target=self._ferry_checkpoint_to_shared_fs,
+            args=(local_path, dest_path, global_step),
+            name=f"nemo-ckpt-ferry-{global_step}",
+            daemon=True,
+        )
+        t.start()
+        self._pending_ferries.append(t)
+
+    def _ferry_checkpoint_to_shared_fs(self, local_path, dest_path, global_step) -> None:
+        """Copy a node-local checkpoint to the shared FS (temp file + atomic rename).
+
+        Runs in a background thread, so a stalled shared-FS write here never blocks
+        training or the DDP collectives. The ``-unfinished`` marker is cleared only
+        after the atomic rename, so resume always sees either a complete file or
+        none.
+        """
+        import shutil
+        import time
+
+        retries = int(os.environ.get("NEMO_CKPT_FERRY_RETRIES", "240"))
+        tmp_path = dest_path + ".ferrytmp"
+        for attempt in range(1, retries + 1):
+            try:
+                shutil.copyfile(local_path, tmp_path)
+                os.replace(tmp_path, dest_path)  # atomic on the same filesystem
+                # dest is now complete; clear the -unfinished marker (rank-0, no barrier).
+                self.remove_checkpoint_unfinished_marker(dest_path)
+                try:
+                    os.remove(local_path)
+                except OSError:
+                    pass
+                logging.info(f'[checkpoint] ferried step {global_step} to {dest_path} (attempt {attempt}).')
+                return
+            except BaseException as e:  # noqa: BLE001
+                logging.warning(
+                    f'[checkpoint] ferry attempt {attempt}/{retries} for step {global_step} ({dest_path}) '
+                    f'failed: {e!r}; retrying.'
+                )
+                time.sleep(min(30.0, 5.0 * attempt))
+        logging.error(
+            f'[checkpoint] gave up ferrying step {global_step} to {dest_path} after {retries} attempts; '
+            f'node-local copy left at {local_path}.'
+        )
 
     def _get_finalize_save_checkpoint_callback(
         self, trainer: 'lightning.pytorch.Trainer', filepath: str, global_step: int  # noqa: F821

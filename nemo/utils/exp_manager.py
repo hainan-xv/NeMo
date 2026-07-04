@@ -667,7 +667,29 @@ def exp_manager(trainer: 'lightning.pytorch.Trainer', cfg: Optional[Union[DictCo
     nemo_testing = get_envbool(NEMO_ENV_VARNAME_TESTING, False)
 
     # Handle logging to file
+    #
+    # On a cluster with a flaky shared filesystem, the per-rank NeMo log lives in
+    # the (shared) exp dir, so EVERY log record is a synchronous write to that
+    # filesystem. A single stalled write parks the rank in uninterruptible I/O
+    # (e.g. Lustre `cl_sync_io_wait`) and, because DDP keeps all ranks in
+    # lockstep, wedges the whole job. Setting NEMO_NODE_LOCAL_LOGDIR redirects
+    # these per-rank logs to node-local storage (e.g. /tmp) so logging never
+    # touches the shared FS. The launcher's stdout/stderr files still capture the
+    # same messages, so nothing is lost from the run's main logs.
+    _local_logdir = os.environ.get('NEMO_NODE_LOCAL_LOGDIR', '').strip()
     log_file = log_dir / f'nemo_log_globalrank-{global_rank}_localrank-{local_rank}.txt'
+    if _local_logdir:
+        try:
+            _run_tag = f"{cfg.name or 'nemo'}_{os.environ.get('SLURM_JOB_ID', 'nojob')}"
+            _local_run_dir = Path(_local_logdir) / _run_tag
+            _local_run_dir.mkdir(parents=True, exist_ok=True)
+            log_file = _local_run_dir / f'nemo_log_globalrank-{global_rank}_localrank-{local_rank}.txt'
+            logging.info(f'Per-rank NeMo log redirected to node-local {log_file} (NEMO_NODE_LOCAL_LOGDIR).')
+        except Exception as _e:
+            logging.warning(
+                f'Could not use NEMO_NODE_LOCAL_LOGDIR={_local_logdir} ({_e}); '
+                f'falling back to {log_file}.'
+            )
     if cfg.log_local_rank_0_only is True and not nemo_testing:
         if local_rank == 0:
             logging.add_file_handler(log_file)
