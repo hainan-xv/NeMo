@@ -80,6 +80,12 @@ class NeMoModelCheckpoint(ModelCheckpoint):
         # is called, the last element is frozen and a new element is added.
         self.deferred_ckpts_to_remove: List[List[str]] = []
 
+        # Number of back-to-back checkpoint writes that stalled/failed. Reset on
+        # every successful write; used by the time-boxed save path to stop the
+        # run cleanly when the shared filesystem is wedged (see
+        # `_bounded_save_checkpoint`).
+        self._consecutive_ckpt_write_failures = 0
+
         # `prefix` is deprecated
         if 'prefix' in kwargs:
             self.prefix = kwargs.pop('prefix')
@@ -568,17 +574,132 @@ class NeMoModelCheckpoint(ModelCheckpoint):
                 storage_options = dict(finalize_fn=finalize_fn)
                 # Each upcoming ckpt removal request will be executed as part of this save finalization
                 self.deferred_ckpts_to_remove.append([])
-            else:
-                storage_options = None
-            logging.info(f'Checkpoint save for step {trainer.global_step} started at {datetime.now().isoformat()}.')
-            trainer.save_checkpoint(filepath, self.save_weights_only, storage_options=storage_options)
-            if self.async_save:
+                logging.info(
+                    f'Checkpoint save for step {trainer.global_step} started at {datetime.now().isoformat()}.'
+                )
+                trainer.save_checkpoint(filepath, self.save_weights_only, storage_options=storage_options)
                 logging.info(f'Scheduled async checkpoint save for {filepath}')
             else:
-                finalize_fn()
+                storage_options = None
+                # Time-boxed synchronous save: on a flaky shared filesystem a
+                # stalled write on rank 0 would otherwise wedge the post-save DDP
+                # barrier until the NCCL watchdog kills the whole job. Instead we
+                # bound the write with a timeout, skip it on failure (keeping the
+                # -unfinished marker so resume ignores the partial file) while all
+                # ranks still step through the same barriers, and stop the run
+                # cleanly after too many consecutive failures.
+                self._bounded_save_checkpoint(trainer, filepath, finalize_fn)
 
         if self.save_last_n_optim_states >= 0 and '-last' in filepath:
             self._drop_optimizer_states(trainer, filepath, storage_options)
+
+    def _bounded_save_checkpoint(self, trainer, filepath, finalize_fn) -> None:
+        """Synchronous checkpoint save guarded by a wall-clock timeout.
+
+        Motivation: on a flaky shared filesystem (e.g. Lustre) rank 0's write can
+        stall for hours. The other ranks reach the post-save collective barrier
+        and, because rank 0 never arrives, the NCCL watchdog eventually tears the
+        entire job down. Simply raising the NCCL timeout does not help — the write
+        may never return.
+
+        Strategy: build the checkpoint payload on the main thread (local for DDP,
+        no collectives) and run ONLY the disk write in a worker thread. We wait up
+        to ``NEMO_CKPT_WRITE_TIMEOUT_S`` seconds; if the write has not finished we
+        abandon it and continue. Crucially, every rank always issues the SAME
+        sequence of barriers regardless of the write outcome, so DDP stays in
+        lockstep. On failure we leave the ``-unfinished`` marker in place so a
+        later resume skips the partial file. After ``NEMO_CKPT_MAX_CONSEC_FAILS``
+        consecutive failures (default 4 == a full epoch's worth of evals here) we
+        stop the run cleanly.
+
+        NOTE: we deliberately bypass ``trainer.save_checkpoint`` because in
+        Lightning 2.4 it ends with ``strategy.barrier("Trainer.save_checkpoint")``;
+        issuing that NCCL barrier from a worker thread would be unsafe. We run the
+        write thread-side and keep all barriers on the main thread.
+        """
+        import threading
+        import time
+
+        timeout_s = float(os.environ.get("NEMO_CKPT_WRITE_TIMEOUT_S", "90"))
+        max_consec = int(os.environ.get("NEMO_CKPT_MAX_CONSEC_FAILS", "4"))
+
+        logging.info(
+            f'Checkpoint save for step {trainer.global_step} started at {datetime.now().isoformat()}'
+            + (f' (write timeout {timeout_s:.0f}s).' if timeout_s > 0 else '.')
+        )
+
+        # Build the payload on the main thread (state_dict is local for DDP).
+        checkpoint = trainer._checkpoint_connector.dump_checkpoint(self.save_weights_only)
+
+        def _do_barrier(name: str = None):
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                torch.distributed.barrier()
+
+        # Timeout disabled -> original synchronous behavior (still no worker thread).
+        if timeout_s <= 0:
+            trainer.strategy.save_checkpoint(checkpoint, filepath, storage_options=None)
+            trainer.strategy.barrier("Trainer.save_checkpoint")
+            finalize_fn()
+            self._consecutive_ckpt_write_failures = 0
+            return
+
+        write_result = {"exc": None}
+
+        def _write():
+            try:
+                trainer.strategy.save_checkpoint(checkpoint, filepath, storage_options=None)
+            except BaseException as e:  # noqa: BLE001 - keep the worker from crashing the process
+                write_result["exc"] = e
+
+        t0 = time.time()
+        writer = threading.Thread(target=_write, name="nemo-ckpt-writer", daemon=True)
+        writer.start()
+        writer.join(timeout_s)
+
+        timed_out = writer.is_alive()
+        errored = (not timed_out) and (write_result["exc"] is not None)
+        failed = timed_out or errored
+
+        if timed_out:
+            logging.error(
+                f'[checkpoint] step {trainer.global_step}: write did not finish within {timeout_s:.0f}s '
+                f'({filepath}); abandoning this checkpoint and continuing. Leaving the -unfinished marker '
+                f'so resume ignores the partial file.'
+            )
+        elif errored:
+            logging.error(
+                f'[checkpoint] step {trainer.global_step}: write failed after {time.time() - t0:.1f}s '
+                f'({filepath}): {repr(write_result["exc"])}. Continuing.'
+            )
+
+        # Barrier #1: the one Lightning's trainer.save_checkpoint normally emits.
+        # ALL ranks must call it regardless of write outcome to stay in lockstep.
+        trainer.strategy.barrier("Trainer.save_checkpoint")
+
+        if not failed:
+            # Success: normal finalizer runs its own barrier and clears the marker.
+            finalize_fn()
+            self._consecutive_ckpt_write_failures = 0
+            return
+
+        # Failure: match the success path's finalize barrier (barrier #2) so the
+        # collective sequence is identical on every rank, but do NOT clear the
+        # -unfinished marker.
+        _do_barrier("checkpoint-write-failed")
+
+        self._consecutive_ckpt_write_failures = getattr(self, "_consecutive_ckpt_write_failures", 0) + 1
+        logging.error(
+            f'[checkpoint] consecutive write failures: {self._consecutive_ckpt_write_failures}/{max_consec}.'
+        )
+        if self._consecutive_ckpt_write_failures >= max_consec:
+            logging.error(
+                f'[checkpoint] {self._consecutive_ckpt_write_failures} consecutive checkpoint-write failures '
+                f'(>= {max_consec}; ~a full epoch of evals). The shared filesystem looks wedged — stopping '
+                f'training cleanly.'
+            )
+            # Avoid a final .nemo export that would just stall on the same FS.
+            self.save_nemo_on_train_end = False
+            trainer.should_stop = True
 
     def _get_finalize_save_checkpoint_callback(
         self, trainer: 'lightning.pytorch.Trainer', filepath: str, global_step: int  # noqa: F821
