@@ -2,7 +2,7 @@
 set -uo pipefail
 
 # ============================================================================
-# Average + leaderboard-eval EVERY Streaming_SLM_Qwen0p6B model, and print a
+# Average + leaderboard-eval EVERY Streaming_SLM_Qwen1p7B model, and print a
 # single clean WER table: one ROW per leaderboard dataset, one COLUMN per model.
 #
 #   dataset                        imend_loss   imend_weighted   imend_rnddelay
@@ -59,7 +59,7 @@ LOCAL_CKPT_DIR="${NEMO_ROOT}/checkpoints"
 LOCAL_ONLY_IF_EXIST="${LOCAL_ONLY_IF_EXIST:-0}"
 [ -f "$EVAL" ] || { echo "ERROR: sibling driver not found at $EVAL" >&2; exit 1; }
 
-PROJECT="Streaming_SLM_Qwen0p6B"
+PROJECT="Streaming_SLM_Qwen1p7B"
 
 # ---------- OCI connection (must match eval_leaderboard.sh) ----------
 REMOTE_HOST="${REMOTE_HOST:-draco-oci-login-01.draco-oci-iad.nvidia.com}"

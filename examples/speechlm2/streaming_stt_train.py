@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import datetime
 import os
 
 import torch
@@ -32,7 +33,15 @@ torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 @hydra_runner(config_path="conf", config_name="streaming_stt")
 def train(cfg):
     OmegaConf.resolve(cfg)
-    torch.distributed.init_process_group(backend="nccl")
+    # Initialise the process group manually (before Trainer sets up DDP) with a
+    # longer-than-default NCCL timeout. Torch's default is 10 min, so a single
+    # rank stalling on a slow Lustre batch trips the watchdog and tears down the
+    # whole job on a 1-element ALLREDUCE. 60 min tolerates transient stalls.
+    # Overridable via ++trainer.strategy.timeout=<seconds>.
+    torch.distributed.init_process_group(
+        backend="nccl",
+        timeout=datetime.timedelta(seconds=int(cfg.trainer.strategy.get("timeout", 3600))),
+    )
     torch.set_float32_matmul_precision("medium")
     trainer = Trainer(**resolve_trainer_cfg(cfg.trainer))
     log_dir = exp_manager(trainer, cfg.get("exp_manager", None))

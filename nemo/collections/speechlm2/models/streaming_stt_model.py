@@ -2180,6 +2180,19 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                         sync_dist=False,
                     )
 
+            # Periodic scalar stats next to the alignment/infer preview: current
+            # loss, train WER (of whichever decode path is primary) and the
+            # last/best validation WER seen so far.
+            train_wer_primary = train_wer_par if parallel_only else train_wer_ar
+            logging.info(
+                "[train] step %d stats: loss=%.4f  train_wer=%s  best_val_wer=%s  last_val_wer=%s",
+                self.global_step,
+                float(loss),
+                ("%.4f" % train_wer_primary) if train_wer_primary is not None else "n/a",
+                ("%.4f" % self._best_val_wer) if getattr(self, "_best_val_wer", None) is not None else "n/a",
+                ("%.4f" % self._last_val_wer) if getattr(self, "_last_val_wer", None) is not None else "n/a",
+            )
+
             if refs:
                 if parallel_only and hyps_par is not None:
                     # Per-utterance breakdown so a single runaway (over-emission)
@@ -2261,6 +2274,10 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         # checkpoint monitor (val_wer) tracks the actually-trained objective.
         parallel_only = bool(self.core_cfg.parallel_only_loss) and self._parallel_heads_enabled
 
+        # Monitored ``val_wer`` (whichever decode path owns it) — captured so the
+        # periodic training-log stats can report the last/best validation WER.
+        monitored_val_wer = None
+
         wers = []
         for name, errs in self._partial_wer_errors.items():
             words = self._partial_wer_words[name]
@@ -2276,6 +2293,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             mean_wer = torch.stack(wers).mean()
             if not parallel_only:
                 self.log("val_wer", mean_wer, on_epoch=True, sync_dist=True)
+                monitored_val_wer = mean_wer
             if self._parallel_heads_enabled:
                 self.log("val_wer_ar", mean_wer, on_epoch=True, sync_dist=True)
 
@@ -2301,6 +2319,16 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 self.log("val_wer_parallel", mean_par, on_epoch=True, sync_dist=True)
                 if parallel_only:
                     self.log("val_wer", mean_par, on_epoch=True, sync_dist=True)
+                    monitored_val_wer = mean_par
+
+        # Remember last/best monitored val_wer so the periodic training log can
+        # surface them next to train_wer/loss. Values are rank-local (fine for a
+        # diagnostic log line; the checkpoint monitor uses the synced value).
+        if monitored_val_wer is not None:
+            self._last_val_wer = float(monitored_val_wer)
+            prev_best = getattr(self, "_best_val_wer", None)
+            if prev_best is None or self._last_val_wer < prev_best:
+                self._best_val_wer = self._last_val_wer
 
         # --- Aux chunk classifier: macro accuracy ---
         # Sum per-class counts across the epoch and compute pos/neg accuracy

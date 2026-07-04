@@ -163,8 +163,8 @@ exp_manager:
 
   checkpoint_callback_params:
     filename: "{step}"
-    monitor: val_acc
-    mode: max
+    monitor: val_wer
+    mode: min
     every_n_train_steps: null
     every_n_epochs: 1
     save_top_k: 1
