@@ -219,6 +219,20 @@ class NeMoModelCheckpoint(ModelCheckpoint):
         if is_global_rank_zero():
             logging.debug("Removing unfinished checkpoints if any...")
             NeMoModelCheckpoint._remove_unfinished_checkpoints(self.dirpath)
+            # Sweep orphaned ferry temp files. A `*.ferrytmp` is a partial copy left
+            # behind when a background ferry (see `_bounded_save_checkpoint`) was killed
+            # mid-write (e.g. job hit the wall-clock limit). At setup() no ferry is
+            # running yet, so any `*.ferrytmp` present is a stale orphan and safe to drop
+            # -- otherwise they pile up (GBs each) across requeues.
+            if self._staging_enabled and self.dirpath:
+                import glob as _glob
+
+                for _stale in _glob.glob(os.path.join(str(self.dirpath), "*.ferrytmp")):
+                    try:
+                        os.remove(_stale)
+                        logging.info(f"[checkpoint] removed orphaned ferry temp file {_stale}.")
+                    except OSError as _e:
+                        logging.warning(f"[checkpoint] could not remove {_stale}: {_e!r}")
         # Ensure that all ranks continue with unfinished checkpoints removed
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
@@ -845,6 +859,11 @@ class NeMoModelCheckpoint(ModelCheckpoint):
                     f'failed: {e!r}; retrying.'
                 )
                 time.sleep(min(30.0, 5.0 * attempt))
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
         logging.error(
             f'[checkpoint] gave up ferrying step {global_step} to {dest_path} after {retries} attempts; '
             f'node-local copy left at {local_path}.'

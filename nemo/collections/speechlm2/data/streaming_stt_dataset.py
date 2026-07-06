@@ -199,6 +199,12 @@ class StreamingSTTDataConfig:
     # Currently effective only on the fixed-chunk, non-projected emission path.
     random_delay_max_frames: int = 0
     delay_weight_gamma: float = 1.0
+    # When True, words that already fall in the LAST chunk are exempt from the
+    # random delay above (they keep delay 0). There is no later chunk to push them
+    # into, so a delay would only defer them into the residual/flush turn; keeping
+    # the tail at its natural emission time avoids that. Only meaningful together
+    # with random_delay_max_frames > 0 (fixed-chunk, non-projected path).
+    random_delay_skip_last_chunk: bool = False
     words_per_group: int = 1
     # Trainable encoder-output subsampling factor (see the model config). With
     # factor > 1 the LLM consumes ``chunk_size // factor`` audio placeholders per
@@ -648,6 +654,7 @@ def get_llm_messages_for_sample(
     subsampling_factor: int = 1,
     random_delay_max_frames: int = 0,
     delay_weight_gamma: float = 1.0,
+    random_delay_skip_last_chunk: bool = False,
     apply_random_delay: bool = True,
     use_flush: bool = False,
     flush_token: str = "<flush>",
@@ -870,11 +877,25 @@ def get_llm_messages_for_sample(
             word_ready_frames: list[int] = []
             word_weights: list[float] = []
             running_ready = 0
+            # Frame at which the LAST chunk begins. A word whose pre-random ready frame
+            # lands beyond this already belongs to the final chunk; with
+            # random_delay_skip_last_chunk we leave those words undelayed (delay 0)
+            # because there is no later chunk to move them into -- delaying them would
+            # only defer the tail into the residual/flush turn.
+            last_chunk_start_frame = (
+                (num_chunks - 1) * chunk_size if (chunk_size > 0 and num_chunks > 0) else None
+            )
             for w in alignments:
                 wef = math.ceil(w.end_time / frame_length_in_secs)
                 ready = wef + num_delay_frames
                 if use_delay:
-                    ready += random.randint(0, int(random_delay_max_frames))
+                    word_in_last_chunk = (
+                        random_delay_skip_last_chunk
+                        and last_chunk_start_frame is not None
+                        and ready > last_chunk_start_frame
+                    )
+                    if not word_in_last_chunk:
+                        ready += random.randint(0, int(random_delay_max_frames))
                 ready = max(ready, running_ready)  # monotonic non-decreasing
                 running_ready = ready
                 word_ready_frames.append(ready)
@@ -994,6 +1015,7 @@ def get_llm_messages_for_batch(
     subsampling_factor: int = 1,
     random_delay_max_frames: int = 0,
     delay_weight_gamma: float = 1.0,
+    random_delay_skip_last_chunk: bool = False,
     apply_random_delay: bool = True,
     use_flush: bool = False,
     flush_token: str = "<flush>",
@@ -1044,6 +1066,7 @@ def get_llm_messages_for_batch(
                 subsampling_factor=subsampling_factor,
                 random_delay_max_frames=random_delay_max_frames,
                 delay_weight_gamma=delay_weight_gamma,
+                random_delay_skip_last_chunk=random_delay_skip_last_chunk,
                 apply_random_delay=apply_random_delay,
                 use_flush=use_flush,
                 flush_token=flush_token,
@@ -1803,6 +1826,7 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             subsampling_factor=self.subsampling_factor,
             random_delay_max_frames=int(getattr(self.cfg, "random_delay_max_frames", 0)),
             delay_weight_gamma=float(getattr(self.cfg, "delay_weight_gamma", 1.0)),
+            random_delay_skip_last_chunk=bool(getattr(self.cfg, "random_delay_skip_last_chunk", False)),
             apply_random_delay=apply_random_delay,
             use_flush=bool(getattr(self.cfg, "use_flush", False)),
             flush_token=str(getattr(self.cfg, "flush_token", "<flush>")),
