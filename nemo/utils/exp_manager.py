@@ -14,6 +14,7 @@
 
 import glob
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -915,6 +916,29 @@ def _filter_out_unfinished_checkpoints(checkpoint_paths: Collection[Union[Path, 
     return res
 
 
+def _select_resume_checkpoint(checkpoint_paths: Collection[Union[Path, str]]):
+    """Pick the checkpoint to resume from among a set of finished candidates.
+
+    Chooses the *furthest-trained* checkpoint, i.e. the one with the highest
+    global step parsed from its ``step=<N>`` filename tag (mtime as tiebreaker).
+    This makes resume robust when the rolling ``-last.ckpt`` on a flaky shared
+    filesystem fails to become durable while an older ``-last`` (or a further
+    top-k checkpoint that resume normally ignores) survives -- so resume never
+    regresses to an earlier step than what is actually on disk.
+    """
+
+    def _key(p):
+        m = re.search(r"step=(\d+)", os.path.basename(str(p)))
+        step = int(m.group(1)) if m else -1
+        try:
+            mtime = os.path.getmtime(str(p))
+        except OSError:
+            mtime = 0.0
+        return (step, mtime)
+
+    return max(checkpoint_paths, key=_key)
+
+
 def check_resume(
     trainer: 'lightning.pytorch.Trainer',
     log_dir: str,
@@ -967,6 +991,10 @@ def check_resume(
         # If we are using S3 checkpointing, we want check_resume to only execute on a single rank
         # to avoid throttling S3.
 
+        # Finished top-k (non -last / non -end) checkpoints found in the default
+        # (non-s3) branch. Considered alongside *last.ckpt when choosing the
+        # furthest-trained checkpoint to resume from.
+        topk_checkpoints: list = []
         if is_global_rank_zero() or not (is_s3_url(dirpath) and is_multistorageclient_url(dirpath)):
             checkpoint_dir_exists = False
             if is_s3_url(dirpath):
@@ -1023,6 +1051,19 @@ def check_resume(
                 last_chkpt_cnt = len(last_checkpoints)
                 last_checkpoints = _filter_out_unfinished_checkpoints(last_checkpoints)
                 finished_last_chkpt_cnt = len(last_checkpoints)
+
+                # Also gather finished top-k checkpoints (everything that is not a
+                # *last.ckpt / *end.ckpt). Resume normally ignores these, but on a
+                # flaky shared FS a top-k may be further along than the surviving
+                # -last, so we include them when choosing the furthest checkpoint.
+                if not last_dist_checkpoints:
+                    _all_finished = _filter_out_unfinished_checkpoints(list(checkpoint_dir.rglob("*.ckpt")))
+                    topk_checkpoints = [
+                        c
+                        for c in _all_finished
+                        if not str(c).endswith("end.ckpt") and not str(c).endswith("last.ckpt")
+                    ]
+
                 if last_chkpt_cnt > 0 and finished_last_chkpt_cnt == 0:
                     raise ValueError(
                         "Last checkpoint is unfinished and cannot be used to resume the training."
@@ -1033,7 +1074,9 @@ def check_resume(
                         " resume from."
                     )
 
-            if not checkpoint_dir_exists or (not len(end_checkpoints) > 0 and not len(last_checkpoints) > 0):
+            if not checkpoint_dir_exists or (
+                not len(end_checkpoints) > 0 and not len(last_checkpoints) > 0 and not len(topk_checkpoints) > 0
+            ):
                 if resume_ignore_no_checkpoint:
                     warn = (
                         f"There were no checkpoints found in checkpoint_dir or no checkpoint "
@@ -1060,14 +1103,25 @@ def check_resume(
                     raise ValueError(
                         f"Found {end_checkpoints[0]} indicating that the last training run has already completed."
                     )
-            elif len(last_checkpoints) > 1:
-                if any([s for s in ['mp_rank', 'tp_rank', 'fsdp_shard'] if s in str(last_checkpoints[0])]):
-                    checkpoint = last_checkpoints[0]
-                    checkpoint = uninject_model_parallel_rank(checkpoint)
-                else:
-                    raise ValueError(f"Multiple checkpoints {last_checkpoints} that matches *last.ckpt.")
+            elif len(last_checkpoints) > 1 and any(
+                s for s in ['mp_rank', 'tp_rank', 'fsdp_shard'] if s in str(last_checkpoints[0])
+            ):
+                # Model-parallel / sharded checkpoints: the multiple "last" entries
+                # are shards of a single logical checkpoint, not distinct steps.
+                checkpoint = uninject_model_parallel_rank(last_checkpoints[0])
             else:
-                checkpoint = last_checkpoints[0]
+                # Resume from the FURTHEST-trained finished checkpoint (highest global
+                # step), considering top-k as well as *last.ckpt. On a flaky shared FS
+                # the rolling -last can fail to become durable while an older -last
+                # survives, and a top-k checkpoint (normally ignored by resume) may be
+                # further along -- picking max-step prevents resume from regressing.
+                candidates = list(last_checkpoints) + list(topk_checkpoints)
+                checkpoint = _select_resume_checkpoint(candidates)
+                if len(candidates) > 1:
+                    logging.info(
+                        f'Multiple resumable checkpoints found ({len(candidates)}); '
+                        f'selected furthest-trained: {checkpoint}'
+                    )
 
     # PTL 2.0 supports ckpt_path instead of resume_from_checkpoint as the trainer flag
     if checkpoint is not None:

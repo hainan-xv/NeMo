@@ -88,6 +88,19 @@ class NeMoModelCheckpoint(ModelCheckpoint):
         # Background threads ferrying node-local checkpoints to the shared FS.
         self._pending_ferries: List = []
 
+        # Node-local staging + background ferry is enabled (see `_bounded_save_checkpoint`).
+        # When staging, a newly saved `-last.ckpt` is not yet durable on the shared FS by
+        # the time PyTorch-Lightning would delete the *previous* `-last.ckpt`. Eagerly
+        # deleting the old one is what caused the durable `-last` to regress to a stale
+        # step whenever the new ferry stalled or was killed at the wall-clock limit. So in
+        # staging mode we keep the previous `-last` and instead prune to the newest
+        # `NEMO_CKPT_KEEP_LAST_N` finished `-last` checkpoints *after* a ferry lands.
+        self._staging_enabled = bool(os.environ.get("NEMO_CKPT_STAGING_DIR", "").strip())
+        try:
+            self._keep_last_n = max(1, int(os.environ.get("NEMO_CKPT_KEEP_LAST_N", "3")))
+        except ValueError:
+            self._keep_last_n = 3
+
         # `prefix` is deprecated
         if 'prefix' in kwargs:
             self.prefix = kwargs.pop('prefix')
@@ -696,9 +709,17 @@ class NeMoModelCheckpoint(ModelCheckpoint):
                     # renamed (complete) file, so this is safe.
                     self._last_global_step_saved = trainer.global_step
                     self._last_checkpoint_saved = filepath
-                    self._launch_ckpt_ferry(trainer, local_path, filepath, trainer.global_step, max_consec)
+                    self._launch_ckpt_ferry(trainer, local_path, filepath, trainer.global_step)
                 else:
-                    self._register_ckpt_failure(trainer, max_consec)
+                    # A node-local write failing is rare and does NOT block training,
+                    # so just skip this checkpoint and continue. Crucially we must NOT
+                    # touch trainer.should_stop here: this branch only runs on rank 0,
+                    # and a one-sided stop desyncs DDP (the exact bug that wedged the
+                    # job at the ferry-backlog limit).
+                    logging.error(
+                        f'[checkpoint] step {trainer.global_step}: node-local staging write failed; '
+                        f'skipping this checkpoint and continuing.'
+                    )
             return
 
         # ---- Layer 2: time-boxed direct write to the shared FS ----
@@ -707,6 +728,15 @@ class NeMoModelCheckpoint(ModelCheckpoint):
             + (f' (write timeout {timeout_s:.0f}s).' if timeout_s > 0 else '.')
         )
         failed = _threaded_write(filepath, "direct")
+
+        # Only rank 0 actually writes, so `failed` is set only there. Reduce it
+        # (MAX) so EVERY rank makes the same success/failure decision below — a
+        # one-sided trainer.should_stop desyncs DDP and wedges the job.
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            dev = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else None
+            flag = torch.tensor([1 if failed else 0], device=dev)
+            torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MAX)
+            failed = bool(flag.item())
 
         # Barrier #1: the one Lightning's trainer.save_checkpoint normally emits.
         trainer.strategy.barrier("Trainer.save_checkpoint")
@@ -738,24 +768,37 @@ class NeMoModelCheckpoint(ModelCheckpoint):
             self.save_nemo_on_train_end = False
             trainer.should_stop = True
 
-    def _launch_ckpt_ferry(self, trainer, local_path, dest_path, global_step, max_consec) -> None:
+    def _launch_ckpt_ferry(self, trainer, local_path, dest_path, global_step) -> None:
         """Start a background thread copying a node-local checkpoint to the shared FS.
 
-        If too many checkpoints are still waiting to reach the shared FS, that FS
-        is effectively wedged, so we stop the run cleanly (bounding node-local disk
-        usage too).
+        A stalled shared-FS write parks its ferry thread in uninterruptible I/O, so
+        such threads can pile up when the FS is flaky. We NEVER stop training for
+        this — a pending ferry does not block the training loop, and stopping here
+        would (a) throw away a healthy run over a transient FS blip and (b) risk a
+        one-sided trainer.should_stop (this runs on rank 0 only) that desyncs DDP.
+
+        Instead we bound the number of in-flight ferries: once too many are
+        outstanding we skip persisting new checkpoints, dropping their node-local
+        copy to reclaim space, until the backlog drains. At worst we miss a few
+        checkpoints during a shared-FS outage; training keeps going.
         """
         import threading
 
+        max_pending = int(os.environ.get("NEMO_CKPT_MAX_PENDING_FERRIES", "6"))
+
         # Drop references to ferries that have already completed.
         self._pending_ferries = [f for f in getattr(self, "_pending_ferries", []) if f.is_alive()]
-        if len(self._pending_ferries) >= max_consec:
-            logging.error(
-                f'[checkpoint] {len(self._pending_ferries)} checkpoints still waiting to reach the shared FS '
-                f'(>= {max_consec}); it looks wedged — stopping training cleanly.'
+        if len(self._pending_ferries) >= max_pending:
+            logging.warning(
+                f'[checkpoint] {len(self._pending_ferries)} ferries still in flight (>= {max_pending}); the '
+                f'shared FS looks backed up. Skipping persistence of step {global_step} and dropping its '
+                f'node-local copy ({local_path}). Training continues.'
             )
-            self.save_nemo_on_train_end = False
-            trainer.should_stop = True
+            try:
+                os.remove(local_path)
+            except OSError:
+                pass
+            return
 
         t = threading.Thread(
             target=self._ferry_checkpoint_to_shared_fs,
@@ -790,6 +833,11 @@ class NeMoModelCheckpoint(ModelCheckpoint):
                 except OSError:
                     pass
                 logging.info(f'[checkpoint] ferried step {global_step} to {dest_path} (attempt {attempt}).')
+                # Now that a fresh `-last.ckpt` is durable on the shared FS, prune older
+                # `-last` checkpoints (kept intact until now so a stalled/killed ferry
+                # could not leave us without a durable last). Rank-0 file ops only.
+                if str(dest_path).endswith("-last.ckpt"):
+                    self._prune_last_checkpoints(self._keep_last_n)
                 return
             except BaseException as e:  # noqa: BLE001
                 logging.warning(
@@ -801,6 +849,43 @@ class NeMoModelCheckpoint(ModelCheckpoint):
             f'[checkpoint] gave up ferrying step {global_step} to {dest_path} after {retries} attempts; '
             f'node-local copy left at {local_path}.'
         )
+
+    def _prune_last_checkpoints(self, keep: int) -> None:
+        """Keep only the newest ``keep`` finished ``*-last.ckpt`` files (by step).
+
+        Used in staging mode where `_should_remove_checkpoint` intentionally does not
+        delete the previous `-last` (so a durable last always survives even if a ferry
+        stalls). This runs from the background ferry thread after a successful landing,
+        so it does plain rank-0 file removals with NO DDP barriers (the barrier-based
+        `_remove_checkpoint` must never be called off the main thread).
+        """
+        import glob as _glob
+        import re as _re
+
+        try:
+            if not is_global_rank_zero() or not self.dirpath:
+                return
+            last_files = _glob.glob(os.path.join(str(self.dirpath), "*-last.ckpt"))
+            # Only consider finished checkpoints (no -unfinished marker).
+            last_files = [p for p in last_files if not self.is_checkpoint_unfinished(p)]
+            if len(last_files) <= keep:
+                return
+
+            def _step(p):
+                m = _re.search(r"step=(\d+)", os.path.basename(p))
+                return int(m.group(1)) if m else -1
+
+            last_files.sort(key=_step, reverse=True)
+            for stale in last_files[keep:]:
+                for path in (stale, self._ema_format_filepath(stale)):
+                    try:
+                        if os.path.exists(path):
+                            os.remove(path)
+                            logging.info(f'[checkpoint] pruned old last checkpoint {path}.')
+                    except OSError as e:
+                        logging.warning(f'[checkpoint] could not prune {path}: {e!r}')
+        except BaseException as e:  # noqa: BLE001
+            logging.warning(f'[checkpoint] pruning old -last checkpoints failed: {e!r}')
 
     def _get_finalize_save_checkpoint_callback(
         self, trainer: 'lightning.pytorch.Trainer', filepath: str, global_step: int  # noqa: F821
@@ -943,6 +1028,18 @@ class NeMoModelCheckpoint(ModelCheckpoint):
             and the resumed from checkpoint is not the last checkpoint
         """
         if previous == current:
+            return False
+        # Staging mode: never eagerly delete the previous `-last.ckpt`. The new one is
+        # only staged node-locally at this point and is ferried to the shared FS in the
+        # background; if we deleted the old (durable) `-last` now and the ferry later
+        # stalled/was killed, the newest durable `-last` would regress to a stale step.
+        # Old `-last` checkpoints are pruned (keeping the newest N) only after a ferry
+        # actually lands -- see `_prune_last_checkpoints`.
+        if (
+            self._staging_enabled
+            and str(current).endswith("-last.ckpt")
+            and str(previous).endswith("-last.ckpt")
+        ):
             return False
         if not _is_local_file_protocol(previous):
             return True
