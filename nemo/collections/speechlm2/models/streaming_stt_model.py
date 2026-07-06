@@ -171,6 +171,29 @@ class StreamingSTTModelConfig:
     # Fixed chunking (chunk_size > 0) is required. This is propagated to the
     # dataset so it emits the matching number of ``<audio>`` placeholders.
     encoder_subsampling_factor: int = 1
+    # --- Regularization on the ENCODER OUTPUT (audio embeddings) before the LLM ---
+    # Applied to the (projected, post-subsampling) audio embeddings inside
+    # `_build_input_embeds`, TRAINING ONLY (skipped in eval/inference via the
+    # `self.training` gate). Motivation: adjacent encoder frames carry redundant
+    # information, so lightly corrupting the audio-embedding stream regularizes a
+    # finite-data, multi-epoch finetune with a trainable audio encoder (text LLMs
+    # skip this because pretraining is ~single-epoch -- a different regime).
+    #
+    #  * audio_embed_dropout > 0: standard (inverted) dropout on the audio
+    #    embeddings -- each element zeroed w.p. p, survivors scaled by 1/(1-p) so the
+    #    expected magnitude is preserved.
+    #  * SpecAugment-style masking: zero whole spans of the audio-embedding stream
+    #    (NOT rescaled), resampled fresh per forward.
+    #      - audio_embed_specaug_time_masks spans of up to
+    #        audio_embed_specaug_time_width contiguous FRAMES (targets redundant
+    #        adjacent frames);
+    #      - audio_embed_specaug_feature_masks spans of up to
+    #        audio_embed_specaug_feature_width hidden DIMS.
+    audio_embed_dropout: float = 0.0
+    audio_embed_specaug_time_masks: int = 0
+    audio_embed_specaug_time_width: int = 0
+    audio_embed_specaug_feature_masks: int = 0
+    audio_embed_specaug_feature_width: int = 0
     blank_loss_weight: float = 1.0
     supervise_im_end_in_loss: bool = False
     project_unaligned_text_to_chunks: bool = False
@@ -1012,6 +1035,61 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             emb_lens = valid_chunks * slots_per_chunk
         return x, emb_lens
 
+    def _regularize_audio_embs(self, audio_embs: Tensor) -> Tensor:
+        """Optionally corrupt the encoder-output embeddings before the LLM.
+
+        Training-only regularization on the (projected, post-subsampling) audio
+        embeddings ``(B, T, H)``: standard dropout and/or SpecAugment-style span
+        zeroing over frames (time) and hidden dims (feature). All no-ops unless the
+        corresponding config knobs are set, so existing models are unchanged. See
+        the ``audio_embed_*`` fields on ``StreamingSTTModelConfig``.
+        """
+        if not self.training or audio_embs is None:
+            return audio_embs
+
+        p = float(getattr(self.core_cfg, "audio_embed_dropout", 0.0) or 0.0)
+        if p > 0.0:
+            audio_embs = F.dropout(audio_embs, p=p, training=True)
+
+        n_time = int(getattr(self.core_cfg, "audio_embed_specaug_time_masks", 0) or 0)
+        n_feat = int(getattr(self.core_cfg, "audio_embed_specaug_feature_masks", 0) or 0)
+        if n_time > 0 or n_feat > 0:
+            audio_embs = self._specaug_audio_embs(audio_embs, n_time, n_feat)
+        return audio_embs
+
+    def _specaug_audio_embs(self, audio_embs: Tensor, n_time: int, n_feat: int) -> Tensor:
+        """SpecAugment-style span masking on ``(B, T, H)`` audio embeddings.
+
+        Zeros ``n_time`` random contiguous frame spans (each up to
+        ``audio_embed_specaug_time_width`` frames) and ``n_feat`` random hidden-dim
+        spans (each up to ``audio_embed_specaug_feature_width`` dims), independently
+        per sample. Masked values are set to 0 (not rescaled), mirroring classic
+        SpecAugment. Sampled fresh on every call.
+        """
+        B, T, H = audio_embs.shape
+        tw = int(getattr(self.core_cfg, "audio_embed_specaug_time_width", 0) or 0)
+        fw = int(getattr(self.core_cfg, "audio_embed_specaug_feature_width", 0) or 0)
+        tw = min(tw, T)
+        fw = min(fw, H)
+        if (n_time <= 0 or tw <= 0) and (n_feat <= 0 or fw <= 0):
+            return audio_embs
+
+        # Build a multiplicative keep-mask so the op is a single out-of-place
+        # multiply (autograd-friendly, no in-place writes on a view).
+        keep = audio_embs.new_ones((B, T, H))
+        for b in range(B):
+            if tw > 0:
+                for _ in range(n_time):
+                    w = int(torch.randint(1, tw + 1, (1,)).item())
+                    t0 = int(torch.randint(0, T - w + 1, (1,)).item())
+                    keep[b, t0 : t0 + w, :] = 0.0
+            if fw > 0:
+                for _ in range(n_feat):
+                    w = int(torch.randint(1, fw + 1, (1,)).item())
+                    f0 = int(torch.randint(0, H - w + 1, (1,)).item())
+                    keep[b, :, f0 : f0 + w] = 0.0
+        return audio_embs * keep
+
     def _build_input_embeds(
         self,
         input_tokens: Tensor,
@@ -1059,6 +1137,9 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             # In the encoder-reuse path (audio_embs is not None) the caller has
             # already applied this, so we only subsample on a fresh encode.
             audio_embs, _audio_emb_lens = self._apply_audio_subsampling(audio_embs, _audio_emb_lens)
+
+        # Regularize the encoder output before it enters the LLM (training only).
+        audio_embs = self._regularize_audio_embs(audio_embs)
 
         # --- interleave & build attention mask ---
         inputs = interleave_embeddings(
