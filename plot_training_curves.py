@@ -131,10 +131,15 @@ def parse_logs(files: list[str]):
                             "last_val_wer": _to_float(m.group(5)),
                             "ts": tsm.group(1) if tsm else None,
                         }
-                    for cm in CKPT_RE.finditer(line):
-                        v = _to_float(cm.group(2))
-                        if v is not None:
-                            val[int(cm.group(1))] = v
+                    # Ignore the warm-start echo (e.g. "Warm-starting ... from
+                    # checkpoint: .../step=65504-val_wer=0.1362.ckpt"): that path is
+                    # the SOURCE run's checkpoint, not a validation of THIS run, so
+                    # parsing it would inject a spurious val point.
+                    if "warm-starting" not in line.lower():
+                        for cm in CKPT_RE.finditer(line):
+                            v = _to_float(cm.group(2))
+                            if v is not None:
+                                val[int(cm.group(1))] = v
                     rm = REACHED_RE.search(line)
                     if rm:
                         v = _to_float(rm.group(2))

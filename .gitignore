@@ -203,6 +203,12 @@ results/
 .tmp_cache/
 .mplconfig/
 
+# Local training-curve/comparison plots produced by plot_training_curves.py and
+# plot_project_comparison.py. Regenerated on demand from cached logs; never commit.
+project_compare*.png
+*_comparison.png
+*_curves.png
+
 # Eval/validation driver scratch (scripts/speechlm2/run_streaming_stt_training_val.py):
 # materialized input wavs, per-run exp_config/manifests, and the multi-MB
 # leaderboard manifests. All regenerated on demand — never commit them
