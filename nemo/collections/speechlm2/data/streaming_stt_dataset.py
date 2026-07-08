@@ -100,7 +100,17 @@ class StreamingSTTDataConfig:
     system_prompt: str = "Transcribe the audio into text."
     prompt_field: str = "system_prompt"
     compact_template: bool = False
-    write_token: str = "<|im_start|>"
+    # ``write_token`` is the start-of-text emit gate with ONE meaning in both
+    # compact and non-compact modes: prepended to non-blank assistant content
+    # only, gated by ``prepend_write_token``. It is LM-supervised — the model
+    # predicts it as the binary emit decision.
+    write_token: str = "<|write|>"
+    # ``end_of_audio_token`` is the compact per-chunk audio->text scaffold anchor
+    # (emitted once per chunk). It is force-fed at inference and NOT LM-supervised
+    # in fixed chunking. Default ``<|im_start|>`` is already in Qwen3's vocab, so
+    # the tokenizer is unchanged for the scaffold role. Compact-only; the
+    # non-compact path uses the chat template's role headers for this boundary.
+    end_of_audio_token: str = "<|im_start|>"
     # When True, prepend ``write_token`` to non-empty assistant content during
     # training data construction. Should match the model's ``prepend_write_token``
     # config. See StreamingSTTModelConfig.prepend_write_token for details.
@@ -613,45 +623,53 @@ def parse_chat_template_ids(hf_tok, last_turn: bool = False) -> tuple[list[int],
     return user_header_ids, user_footer_and_asst_header_ids, asst_footer_ids
 
 
-def build_compact_turn_markers(hf_tok, write_token: str) -> tuple[list[int], list[int], list[int]]:
+def build_compact_turn_markers(hf_tok, end_of_audio_token: str) -> tuple[list[int], list[int], list[int]]:
     """Return the compact-format analogue of ``parse_chat_template_ids``.
 
     Compact format drops the user/assistant role delimiters: turns look like
-    ``<audio>*N <write_token> TEXT <eos>`` with no header before audio and only
-    the ``write_token`` marking the audio→text transition.  The turn-end is
-    the tokenizer's native EOS.
+    ``<audio>*N <end_of_audio_token> TEXT <eos>`` with no header before audio and
+    only the ``end_of_audio_token`` marking the audio→text transition.  The
+    turn-end is the tokenizer's native EOS.
 
-    ``write_token`` should be an existing vocab token the LLM saw pretraining
-    as a turn-boundary marker (e.g. ``"<|im_start|>"`` for Qwen3,
+    ``end_of_audio_token`` should be an existing vocab token the LLM saw
+    pretraining as a turn-boundary marker (e.g. ``"<|im_start|>"`` for Qwen3,
     ``"<start_of_turn>"`` for Gemma).
     """
-    write_ids = hf_tok.encode(write_token, add_special_tokens=False)
-    if len(write_ids) != 1:
+    eoa_ids = hf_tok.encode(end_of_audio_token, add_special_tokens=False)
+    if len(eoa_ids) != 1:
         raise ValueError(
-            f"write_token {write_token!r} must encode to exactly 1 token, got {write_ids}. "
+            f"end_of_audio_token {end_of_audio_token!r} must encode to exactly 1 token, got {eoa_ids}. "
             f"Pick a tokenizer-native turn-boundary token or override via config."
         )
     eos_id = getattr(hf_tok, "eos_token_id", None)
     if eos_id is None:
         raise ValueError("tokenizer.eos_token_id is required for compact_template=True")
-    return [], [write_ids[0]], [eos_id]
+    return [], [eoa_ids[0]], [eos_id]
 
 
 def _tokenize_compact_with_assistant_mask(
     messages: List[dict],
     tokenizer: AutoTokenizer,
-    write_id: int,
+    end_of_audio_id: int,
     eos_id: int,
 ) -> tuple[list[int], list[int]]:
     """Tokenize chat messages in compact format and return (input_ids, assistant_mask).
 
     Compact per-turn layout (no role wrapping between audio and text):
-        [system_wrapped] [user_content, <write>, asst_content, <eos>]*K
+        [system_wrapped] [user_content, <eoa>, asst_content, <eos>]*K
+
+    where ``<eoa>`` is the end-of-audio scaffold anchor and ``asst_content`` may
+    begin with the ``write_token`` emit gate (prepended upstream in
+    ``get_llm_messages_for_sample`` when ``prepend_write_token`` is set).
 
     The system prompt IS still wrapped via ``apply_chat_template`` (Qwen3 system
     block), only the per-turn scaffolding is compacted.  Loss is applied on
-    ``<write>``, assistant content, and ``<eos>`` — mirroring the HF path where
-    the ``<|im_end|>\\n`` footer is trainable.
+    assistant content (incl. the ``write_token`` gate) and ``<eos>``.  The
+    ``<eoa>`` anchor is force-fed at inference and is NOT LM-supervised in fixed
+    chunking (``assistant_mask=0``) — mirroring the non-compact path where the
+    ``<|im_start|>assistant\\n`` boundary header is also untrained.  (For dynamic
+    chunking the boundary IS supervised, but via the audio-position target
+    override in ``get_batch_data``, not this mask.)
     """
     hf_tok = tokenizer.tokenizer
 
@@ -685,10 +703,10 @@ def _tokenize_compact_with_assistant_mask(
             if i < len(turn_msgs) and turn_msgs[i]["role"] == "assistant":
                 asst = turn_msgs[i]
                 asst_ids = hf_tok.encode(asst["content"], add_special_tokens=False) if asst["content"] else []
-                # write_id
-                input_ids.append(write_id)
-                assistant_mask.append(1)
-                # assistant content
+                # <eoa> anchor: force-fed scaffold, not LM-supervised (mask=0).
+                input_ids.append(end_of_audio_id)
+                assistant_mask.append(0)
+                # assistant content (may start with the write_token emit gate)
                 input_ids.extend(asst_ids)
                 assistant_mask.extend([1] * len(asst_ids))
                 # eos
@@ -698,8 +716,8 @@ def _tokenize_compact_with_assistant_mask(
         else:
             # Orphan assistant (shouldn't normally occur) — treat as standalone asst segment.
             asst_ids = hf_tok.encode(msg["content"], add_special_tokens=False) if msg["content"] else []
-            input_ids.append(write_id)
-            assistant_mask.append(1)
+            input_ids.append(end_of_audio_id)
+            assistant_mask.append(0)
             input_ids.extend(asst_ids)
             assistant_mask.extend([1] * len(asst_ids))
             input_ids.append(eos_id)
@@ -853,6 +871,7 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
         # loads YAML strings literally without interpreting backslash escapes.
         self.cfg.blank_token = self.cfg.blank_token.encode().decode('unicode_escape')
         self.cfg.write_token = self.cfg.write_token.encode().decode('unicode_escape')
+        self.cfg.end_of_audio_token = self.cfg.end_of_audio_token.encode().decode('unicode_escape')
 
         # Normalize chunk_size into a list of candidate fixed-chunk sizes for
         # per-batch random selection. A scalar config yields ``None`` (no random
@@ -929,19 +948,19 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
                 )
             self.blank_id = blank_ids[0]
 
-        # Compact template: cache write_id and eos_id. Skip the parse_chat_template_ids
-        # call since we derive the markers directly from config.
+        # Compact template: cache the end-of-audio anchor id and eos_id. Skip the
+        # parse_chat_template_ids call since we derive the markers directly from config.
         if self.cfg.compact_template:
             hf_tok = self.tokenizer.tokenizer
-            _, ufah_ids, af_ids = build_compact_turn_markers(hf_tok, self.cfg.write_token)
-            self._write_id = ufah_ids[0]
+            _, ufah_ids, af_ids = build_compact_turn_markers(hf_tok, self.cfg.end_of_audio_token)
+            self._eoa_id = ufah_ids[0]
             self._compact_eos_id = af_ids[0]
             logging.info(
-                f"compact_template enabled: write_token={self.cfg.write_token!r} "
-                f"(id={self._write_id}), eos_id={self._compact_eos_id}"
+                f"compact_template enabled: end_of_audio_token={self.cfg.end_of_audio_token!r} "
+                f"(id={self._eoa_id}), eos_id={self._compact_eos_id}"
             )
         else:
-            self._write_id = None
+            self._eoa_id = None
             self._compact_eos_id = None
 
         # For dynamic chunking (chunk_size=0): cache the first token of the
@@ -949,8 +968,10 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
         # predicts at the last audio frame of each chunk to signal "ready to transcribe".
         if self.cfg.chunk_size == 0:
             if self.cfg.compact_template:
-                # Compact: boundary target is write_id (<|im_start|> in Qwen3).
-                self._user_footer_first_id = self._write_id
+                # Compact: the boundary target is the end-of-audio anchor
+                # (<|im_start|> by default). write_token is reserved for the
+                # text-emit gate and is never a boundary signal.
+                self._user_footer_first_id = self._eoa_id
             else:
                 hf_tok = self.tokenizer.tokenizer
                 _, user_footer_and_asst_header_ids, _ = parse_chat_template_ids(hf_tok)
@@ -1052,7 +1073,7 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             # Tokenize and compute assistant content mask.
             if self.cfg.compact_template:
                 input_ids, assistant_mask = _tokenize_compact_with_assistant_mask(
-                    messages, self.tokenizer, self._write_id, self._compact_eos_id
+                    messages, self.tokenizer, self._eoa_id, self._compact_eos_id
                 )
             else:
                 input_ids, assistant_mask = _tokenize_with_assistant_mask(messages, self.tokenizer)

@@ -358,6 +358,8 @@ def main(cfg: HfExportConfig) -> None:
         # save_llm_backbone_config(model, cfg.output_dir)
         # _try_prepare_for_vllm(cfg.output_dir, model_cfg)
 
+    logging.info(f"Model saved to {cfg.output_dir}")
+
 
 if __name__ == "__main__":
     main()

@@ -1815,7 +1815,17 @@ class TestCompactTemplate:
     """Tests for the compact chat template feature (Qwen3 tokenizer).
 
     Compact mode drops per-turn role wrapping, yielding
-    ``[system_wrapped] <audio>*N <write> text <eos> <audio>*N <write> text <eos>``.
+    ``[system_wrapped] <audio>*N <eoa> [<write>] text <eos> ...``.
+
+    Post-refactor semantics:
+      - ``<eoa>`` (end_of_audio_token, default ``<|im_start|>``) is a per-chunk
+        audio->text scaffold anchor. It is force-fed at inference and is NOT
+        LM-supervised in fixed chunking (``assistant_mask=0``).
+      - ``<write>`` (write_token) is the start-of-text emit gate. It is prepended
+        to non-blank content only when ``prepend_write_token=True`` and is
+        LM-supervised (``assistant_mask=1``) — the model predicts it as the
+        binary emit decision at the ``<eoa>`` position's logits.
+      - trailing ``<eos>`` is LM-supervised.
     """
 
     @pytest.fixture
@@ -1880,16 +1890,16 @@ class TestCompactTemplate:
                 assert mask[input_ids.index(wid)] == 1
 
     def test_tokenize_compact_assistant_mask(self, qwen3_tok):
-        """Mask=1 on write/text/eos; mask=0 on system wrapping and audio user content."""
+        """Mask=1 on text/eos; mask=0 on the <eoa> scaffold, system wrapping, and audio."""
         hf = qwen3_tok.tokenizer
-        write_id = hf.convert_tokens_to_ids("<|im_start|>")
+        eoa_id = hf.convert_tokens_to_ids("<|im_start|>")
         eos_id = hf.eos_token_id
         messages = [
             {"role": "system", "content": "Sys."},
             {"role": "user", "content": "<audio>"},
             {"role": "assistant", "content": "X"},
         ]
-        input_ids, mask = _tokenize_compact_with_assistant_mask(messages, qwen3_tok, write_id, eos_id)
+        input_ids, mask = _tokenize_compact_with_assistant_mask(messages, qwen3_tok, eoa_id, eos_id)
 
         # Final token should be the trailing EOS with mask=1.
         assert input_ids[-1] == eos_id
@@ -1902,12 +1912,19 @@ class TestCompactTemplate:
             positions = [i for i, t in enumerate(input_ids) if t == aid]
             assert any(mask[p] == 0 for p in positions), f"audio token {aid} should appear with mask=0"
 
-        # At least one write_id occurrence must have mask=1 (the one we inserted).
-        write_positions = [i for i, t in enumerate(input_ids) if t == write_id]
-        assert any(mask[p] == 1 for p in write_positions), "inserted write_id should have mask=1"
+        # The <eoa> scaffold marker sits immediately after the audio run and is
+        # NOT LM-supervised (mask=0). With eoa defaulting to <|im_start|>, it now
+        # shares its id with the system-wrapping token — so EVERY <|im_start|>
+        # occurrence must be mask=0 (no inserted marker is trainable anymore).
+        eoa_positions = [i for i, t in enumerate(input_ids) if t == eoa_id]
+        assert eoa_positions, "expected at least one <eoa>/<|im_start|> occurrence"
+        assert all(mask[p] == 0 for p in eoa_positions), "<eoa> scaffold must have mask=0"
 
-        # System wrapping contains write_id with mask=0 (e.g. <|im_start|>system\n...).
-        assert any(mask[p] == 0 for p in write_positions), "system-wrapping write_id should have mask=0"
+        # The assistant content token "X" must be trainable (mask=1).
+        x_ids = hf.encode("X", add_special_tokens=False)
+        for xid in x_ids:
+            positions = [i for i, t in enumerate(input_ids) if t == xid]
+            assert any(mask[p] == 1 for p in positions), "assistant content must have mask=1"
 
     def test_tokenize_compact_no_trailing_asst(self, qwen3_tok):
         """A trailing user-only turn (no asst) should not append a write/eos pair."""
@@ -1945,13 +1962,12 @@ class TestCompactTemplate:
         """Verify compact_template=True + blank_token="" combination.
 
         When blank_token="", silent chunks produce empty assistant content.
-        Expected shape per silent chunk: ``<audio>*N <|im_start|> <|im_end|>``
-        (adjacent write+eos with no text between). Model learns to emit an
-        immediate close-of-turn for silent chunks. Both write and eos must
-        be trainable (mask=1).
+        Expected shape per silent chunk: ``<audio>*N <eoa> <eos>`` (the <eoa>
+        scaffold then an immediate close-of-turn). Post-refactor the <eoa>
+        marker is NOT trainable (mask=0); only the trailing <eos> is trainable.
         """
         hf = qwen3_tok.tokenizer
-        write_id = hf.convert_tokens_to_ids("<|im_start|>")
+        eoa_id = hf.convert_tokens_to_ids("<|im_start|>")
         eos_id = hf.eos_token_id
         # Mix of silent (empty content) and non-silent chunks — mirrors what
         # get_llm_messages_for_sample produces when blank_token="" is used
@@ -1965,38 +1981,237 @@ class TestCompactTemplate:
             {"role": "user", "content": "<audio><audio>"},
             {"role": "assistant", "content": ""},  # silent chunk
         ]
-        input_ids, mask = _tokenize_compact_with_assistant_mask(messages, qwen3_tok, write_id, eos_id)
+        input_ids, mask = _tokenize_compact_with_assistant_mask(messages, qwen3_tok, eoa_id, eos_id)
 
         assert len(input_ids) == len(mask)
 
-        # Locate the *inserted* write_id positions (mask=1). System-wrapping
-        # write_id occurrences have mask=0.
-        inserted_write_positions = [i for i, t in enumerate(input_ids) if t == write_id and mask[i] == 1]
-        assert len(inserted_write_positions) == 3, "one <|im_start|> per turn (3 turns)"
+        # Locate the *inserted* <eoa> markers: an <|im_start|> immediately preceded
+        # by an audio-tag token (distinguishes them from the system-wrapping one).
+        audio_piece_ids = set(hf.encode("<audio>", add_special_tokens=False))
+        eoa_positions = [
+            i for i, t in enumerate(input_ids) if t == eoa_id and i > 0 and input_ids[i - 1] in audio_piece_ids
+        ]
+        assert len(eoa_positions) == 3, "one <eoa> per turn (3 turns)"
 
-        # For each inserted write, the next token is either:
-        #   - eos_id with mask=1 (silent chunk: <|im_start|><|im_end|> adjacent)
-        #   - a content token with mask=1 (word chunk: <|im_start|> hello ...)
-        # Verify the two silent chunks have immediate <|im_end|> right after <|im_start|>.
+        # The <eoa> scaffold is force-fed, not predicted → mask=0 everywhere.
+        for pos in eoa_positions:
+            assert mask[pos] == 0, "<eoa> scaffold marker must have mask=0"
+
+        # For each silent chunk, <eos> immediately follows <eoa> and IS trainable.
         adjacent_pairs = 0
-        for pos in inserted_write_positions:
+        for pos in eoa_positions:
             if pos + 1 < len(input_ids) and input_ids[pos + 1] == eos_id:
                 adjacent_pairs += 1
-                # Adjacent eos must also be trainable (mask=1).
-                assert mask[pos + 1] == 1, "adjacent <|im_end|> in silent chunk must be trainable"
-        assert adjacent_pairs == 2, "two silent chunks should each produce adjacent <|im_start|><|im_end|>"
+                assert mask[pos + 1] == 1, "adjacent <eos> in silent chunk must be trainable"
+        assert adjacent_pairs == 2, "two silent chunks should each produce adjacent <eoa><eos>"
 
-        # The middle ("hello") chunk: <|im_start|> should NOT be directly followed by <|im_end|>.
-        # Verify at least one hello-content token exists with mask=1 between a write and an eos.
+        # The middle ("hello") chunk: content tokens between <eoa> and <eos> are trainable.
         hello_ids = set(hf.encode("hello", add_special_tokens=False))
         trainable_content = [input_ids[i] for i in range(len(input_ids)) if mask[i] == 1 and input_ids[i] in hello_ids]
         assert len(trainable_content) > 0, "hello content tokens must be trainable"
 
-        # Sanity: state-machine inference separator / decode_with_blank splitter.
-        # When has_blank=False, code appends `self._eos_id` as the chunk separator
-        # and decode_with_blank splits on `eos_token_id`. The training sequence's
-        # per-turn eos_id plays exactly that role. Verify the trailing token is eos.
+        # Sanity: trailing token is the per-turn eos (chunk separator / decode splitter).
         assert input_ids[-1] == eos_id
+
+
+# ===========================================================================
+# Tests: write_token refactor — unified emit gate + dedicated end_of_audio_token
+# ===========================================================================
+class TestCompactWriteTokenRefactor:
+    """Post-refactor contract:
+
+      - ``write_token`` is the start-of-text emit gate with ONE meaning in both
+        compact and non-compact modes: prepended to non-blank assistant content
+        only, gated by ``prepend_write_token``. It is LM-supervised.
+      - ``end_of_audio_token`` (default ``<|im_start|>``) is the compact per-chunk
+        scaffold anchor: force-fed, NOT LM-supervised in fixed chunking (mask=0).
+
+    Compact wire format (gate on):
+        text chunk:  [audio*N] <eoa> <write> Hello <eos>
+        blank chunk: [audio*N] <eoa> <eos>
+    """
+
+    WRITE_TOKEN = "<|write|>"
+
+    @pytest.fixture
+    def qwen3_hf(self):
+        try:
+            from transformers import AutoTokenizer as HFAutoTokenizer
+
+            hf = HFAutoTokenizer.from_pretrained("Qwen/Qwen3-1.7B")
+        except Exception:
+            pytest.skip("Qwen3 tokenizer not available")
+        # The model registers write_token as a new special token at init; mirror
+        # that here so it encodes to a single id (like <blank>, no warm start).
+        if hf.convert_tokens_to_ids(self.WRITE_TOKEN) == hf.unk_token_id:
+            hf.add_special_tokens({"additional_special_tokens": [self.WRITE_TOKEN]})
+        return hf
+
+    @pytest.fixture
+    def qwen3_tok(self, qwen3_hf):
+        class _Wrapper:
+            def __init__(self, hf):
+                self.tokenizer = hf
+
+            def ids_to_tokens(self, ids):
+                return self.tokenizer.convert_ids_to_tokens(ids)
+
+            def tokens_to_text(self, tokens, remove_special_tokens=True):
+                if remove_special_tokens:
+                    tokens = [t for t in tokens if t not in self.tokenizer.all_special_tokens]
+                return self.tokenizer.convert_tokens_to_string(tokens)
+
+        return _Wrapper(qwen3_hf)
+
+    # --- message builder: emit gate is prepend-to-nonblank-only, template-agnostic ---
+
+    def test_prepend_write_token_only_on_nonblank_content(self):
+        """write_token prefixes non-blank assistant turns; blank turns stay bare."""
+        messages = _make_messages(prepend_write_token=True, write_token=self.WRITE_TOKEN)
+        asst = [m["content"] for m in messages if m["role"] == "assistant"]
+        assert any(c == BLANK_TOKEN for c in asst), "expected some blank turns"
+        for c in asst:
+            if c == BLANK_TOKEN:
+                assert not c.startswith(self.WRITE_TOKEN), "blank turn must NOT get a write prefix"
+            else:
+                assert c.startswith(self.WRITE_TOKEN), "non-blank turn must start with write_token"
+
+    def test_prepend_write_token_off_leaves_content_bare(self):
+        messages = _make_messages(prepend_write_token=False, write_token=self.WRITE_TOKEN)
+        asst = [m["content"] for m in messages if m["role"] == "assistant"]
+        assert all(not c.startswith(self.WRITE_TOKEN) for c in asst)
+
+    # --- compact tokenizer: gate-on layout <eoa>(0) <write>(1) text(1) <eos>(1) ---
+
+    def test_compact_gate_on_layout(self, qwen3_tok):
+        hf = qwen3_tok.tokenizer
+        eoa_id = hf.convert_tokens_to_ids("<|im_start|>")
+        write_id = hf.convert_tokens_to_ids(self.WRITE_TOKEN)
+        eos_id = hf.eos_token_id
+        # Message content as produced by get_llm_messages_for_sample with the gate on.
+        messages = [
+            {"role": "system", "content": "S."},
+            {"role": "user", "content": "<audio><audio>"},
+            {"role": "assistant", "content": self.WRITE_TOKEN + "hello"},  # text chunk
+            {"role": "user", "content": "<audio><audio>"},
+            {"role": "assistant", "content": ""},  # blank chunk (blank_token="")
+        ]
+        input_ids, mask = _tokenize_compact_with_assistant_mask(messages, qwen3_tok, eoa_id, eos_id)
+        assert len(input_ids) == len(mask)
+
+        audio_piece_ids = set(hf.encode("<audio>", add_special_tokens=False))
+        eoa_positions = [
+            i for i, t in enumerate(input_ids) if t == eoa_id and i > 0 and input_ids[i - 1] in audio_piece_ids
+        ]
+        assert len(eoa_positions) == 2, "one <eoa> per chunk (2 chunks)"
+
+        # Text chunk: <eoa>(mask 0) -> <write>(mask 1) -> content(mask 1).
+        p_text = eoa_positions[0]
+        assert mask[p_text] == 0, "<eoa> must be mask=0"
+        assert input_ids[p_text + 1] == write_id, "text chunk: <write> immediately follows <eoa>"
+        assert mask[p_text + 1] == 1, "<write> emit gate must be LM-supervised"
+
+        # Blank chunk: <eoa>(mask 0) -> <eos>(mask 1), no <write> between.
+        p_blank = eoa_positions[1]
+        assert mask[p_blank] == 0
+        assert input_ids[p_blank + 1] == eos_id, "blank chunk: <eos> immediately follows <eoa>"
+        assert input_ids[p_blank + 1] != write_id, "blank chunk must NOT contain <write>"
+
+    # --- decode_with_blank strips <write>, never renders <eoa> (absent) ---
+
+    def test_decode_with_blank_strips_write_token(self, qwen3_tok):
+        hf = qwen3_tok.tokenizer
+        write_id = hf.convert_tokens_to_ids(self.WRITE_TOKEN)
+        eos_id = hf.eos_token_id
+        hello_ids = hf.encode("hello", add_special_tokens=False)
+        # Stream as emitted at inference: <write> hello <eos> (no <eoa> — it is
+        # force-fed scaffold, never appended to the generated token stream).
+        ids = [write_id] + hello_ids + [eos_id]
+        text = decode_with_blank(ids, blank_token="", tokenizer=qwen3_tok, write_token=self.WRITE_TOKEN)
+        assert "hello" in text
+        assert self.WRITE_TOKEN not in text
+
+    # --- end-to-end get_batch_data supervision contract ---
+
+    def _make_compact_dataset(self, qwen3_hf, *, prepend_write_token, blank_token, chunk_size=2):
+        from nemo.collections.speechlm2.data.streaming_stt_dataset import StreamingSTTDataset
+
+        if blank_token and qwen3_hf.convert_tokens_to_ids(blank_token) == qwen3_hf.unk_token_id:
+            qwen3_hf.add_special_tokens({"additional_special_tokens": [blank_token]})
+
+        class _Wrapper:
+            def __init__(self, hf):
+                self.tokenizer = hf
+                self.pad_id = hf.pad_token_id if hf.pad_token_id is not None else 0
+
+        cfg = {
+            "sample_rate": 16000,
+            "frame_length_in_secs": FRAME_LEN,
+            "chunk_size": chunk_size,
+            "audio_tag": AUDIO_TAG,
+            "blank_token": blank_token,
+            "compact_template": True,
+            "prepend_write_token": prepend_write_token,
+            "write_token": self.WRITE_TOKEN,
+            "end_of_audio_token": "<|im_start|>",
+        }
+        return StreamingSTTDataset(cfg, _Wrapper(qwen3_hf))
+
+    def test_get_batch_data_eoa_unsupervised_gate_predicts_write(self, qwen3_hf):
+        """<eoa> is force-fed (target IGNORE); the emit decision (write/eos) is
+        predicted AT the <eoa> position via next-token shift."""
+        import torch
+
+        from nemo.collections.speechlm2.data.streaming_stt_dataset import AUDIO_TOKEN_IDX, IGNORE_INDEX
+
+        ds = self._make_compact_dataset(qwen3_hf, prepend_write_token=True, blank_token="<blank>")
+        eoa_id = qwen3_hf.convert_tokens_to_ids("<|im_start|>")
+        write_id = qwen3_hf.convert_tokens_to_ids(self.WRITE_TOKEN)
+
+        audios = torch.zeros(1, 16000)  # 1s -> 13 frames @ 80ms
+        audio_lens = torch.tensor([16000])
+        alignments = [[WordAlignment(text="hello", start_time=0.0, end_time=0.16)]]
+        from types import SimpleNamespace
+
+        batch = ds.get_batch_data([SimpleNamespace(custom={})], audios, audio_lens, alignments, ["hello"])
+        inp = batch.input_tokens[0].tolist()
+        tgt = batch.target_tokens[0].tolist()
+
+        eoa_positions = [i for i, t in enumerate(inp) if t == eoa_id and i > 0 and inp[i - 1] == AUDIO_TOKEN_IDX]
+        assert eoa_positions, "expected inserted <eoa> markers after audio runs"
+
+        for p in eoa_positions:
+            # The <eoa> token itself is never a prediction target (mask=0).
+            assert tgt[p - 1] == IGNORE_INDEX, "position predicting <eoa> must be IGNORE"
+            # The emit decision is predicted at the <eoa> position (next-token shift).
+            assert tgt[p] != IGNORE_INDEX, "emit decision at <eoa> position must be supervised"
+
+        # At least one chunk (the 'hello' chunk) predicts <write> at its <eoa> position.
+        assert any(tgt[p] == write_id for p in eoa_positions), "text chunk must predict <write> as emit gate"
+
+    def test_get_batch_data_gate_off_no_write_token(self, qwen3_hf):
+        """Gate off: no <write> in the stream; <eoa> still mask=0 (unsupervised)."""
+        import torch
+
+        from nemo.collections.speechlm2.data.streaming_stt_dataset import AUDIO_TOKEN_IDX, IGNORE_INDEX
+
+        ds = self._make_compact_dataset(qwen3_hf, prepend_write_token=False, blank_token="")
+        eoa_id = qwen3_hf.convert_tokens_to_ids("<|im_start|>")
+        write_id = qwen3_hf.convert_tokens_to_ids(self.WRITE_TOKEN)
+
+        audios = torch.zeros(1, 16000)
+        audio_lens = torch.tensor([16000])
+        alignments = [[WordAlignment(text="hello", start_time=0.0, end_time=0.16)]]
+        from types import SimpleNamespace
+
+        batch = ds.get_batch_data([SimpleNamespace(custom={})], audios, audio_lens, alignments, ["hello"])
+        inp = batch.input_tokens[0].tolist()
+        tgt = batch.target_tokens[0].tolist()
+
+        assert write_id not in inp, "gate off: <write> must not appear in the stream"
+        eoa_positions = [i for i, t in enumerate(inp) if t == eoa_id and i > 0 and inp[i - 1] == AUDIO_TOKEN_IDX]
+        for p in eoa_positions:
+            assert tgt[p - 1] == IGNORE_INDEX, "<eoa> is unsupervised even with the gate off"
 
 
 # ---------------------------------------------------------------------------

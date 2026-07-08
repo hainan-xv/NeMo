@@ -70,6 +70,8 @@ def main(cfg: StreamingSTTEvalConfig):
             "system_prompt": cfg.system_prompt,
             "compact_template": model.core_cfg.compact_template,
             "write_token": model.core_cfg.write_token,
+            "end_of_audio_token": model.core_cfg.end_of_audio_token,
+            "prepend_write_token": model.core_cfg.prepend_write_token,
         }
     )
     dataset = StreamingSTTDataset(cfg=dataset_cfg, tokenizer=model.tokenizer)

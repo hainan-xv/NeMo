@@ -278,3 +278,72 @@ class TestEncoderAttContext:
         s.core_cfg.att_context_size = None
         StreamingSTTModel._set_encoder_att_context(s, 6)
         assert enc.att_context_size == [70, 7]
+
+
+# ===========================================================================
+# Tests: write_token refactor — unified emit gate + dedicated end_of_audio_token
+# ===========================================================================
+class TestWriteTokenRefactor:
+    """``content_score_mode`` / ``_content_score_token_id`` / boundary marker
+    behavior after unifying ``write_token`` (emit gate) and introducing
+    ``end_of_audio_token`` (compact scaffold anchor, default ``<|im_start|>``)."""
+
+    WRITE_TOKEN = "<|write|>"
+    END_OF_AUDIO_TOKEN = "<|im_start|>"
+
+    def _core_cfg(self, **overrides):
+        cfg = dict(
+            chunk_size=CHUNK_SIZE,
+            audio_tag="<audio>",
+            compact_template=True,
+            write_token=self.WRITE_TOKEN,
+            end_of_audio_token=self.END_OF_AUDIO_TOKEN,
+            blank_token=BLANK_TOKEN,
+            prepend_write_token=True,
+            use_chunk_classifier=False,
+        )
+        cfg.update(overrides)
+        return SimpleNamespace(**cfg)
+
+    def _mock(self, hf_tok, **cfg_overrides):
+        return SimpleNamespace(
+            tokenizer=SimpleNamespace(tokenizer=hf_tok),
+            core_cfg=self._core_cfg(**cfg_overrides),
+            blank_token=cfg_overrides.get("blank_token", BLANK_TOKEN),
+            blank_token_id=hf_tok.convert_tokens_to_ids(BLANK_TOKEN),
+        )
+
+    def test_content_score_mode_binary_in_compact(self, hf_tok):
+        """Fixed + compact + prepend_write_token + blank!='' → 'binary' emit gate."""
+        mock = self._mock(hf_tok, chunk_size=CHUNK_SIZE, compact_template=True, prepend_write_token=True)
+        mode = StreamingSTTModel.content_score_mode.func(mock)
+        assert mode == "binary"
+
+    def test_content_score_mode_blank_only_without_gate(self, hf_tok):
+        """Fixed + compact + no gate + blank!='' → 'blank_only' (unchanged fallback)."""
+        mock = self._mock(hf_tok, chunk_size=CHUNK_SIZE, prepend_write_token=False)
+        assert StreamingSTTModel.content_score_mode.func(mock) == "blank_only"
+
+    def test_content_score_token_id_binary_is_write_token(self, hf_tok):
+        """'binary' mode reads the write_token id (the emit gate)."""
+        mock = self._mock(hf_tok)
+        mock.content_score_mode = "binary"
+        tid = StreamingSTTModel._content_score_token_id.func(mock)
+        assert tid == hf_tok.convert_tokens_to_ids(self.WRITE_TOKEN)
+
+    def test_content_score_token_id_marker_compact_is_end_of_audio(self, hf_tok):
+        """Dynamic + compact 'marker' mode reads the end_of_audio_token id, NOT write_token."""
+        mock = self._mock(hf_tok, chunk_size=0)
+        mock.content_score_mode = "marker"
+        tid = StreamingSTTModel._content_score_token_id.func(mock)
+        assert tid == hf_tok.convert_tokens_to_ids(self.END_OF_AUDIO_TOKEN)
+        assert tid != hf_tok.convert_tokens_to_ids(self.WRITE_TOKEN)
+
+    def test_dynamic_compact_boundary_marker_is_end_of_audio(self, hf_tok):
+        """_ensure_inference_cache: dynamic compact boundary == end_of_audio id."""
+        mock = _make_mock_self(hf_tok, chunk_size=0)
+        mock.core_cfg.compact_template = True
+        mock.core_cfg.end_of_audio_token = self.END_OF_AUDIO_TOKEN
+        mock.core_cfg.write_token = self.WRITE_TOKEN
+        StreamingSTTModel._ensure_inference_cache(mock)
+        assert mock._user_footer_first_id == hf_tok.convert_tokens_to_ids(self.END_OF_AUDIO_TOKEN)
