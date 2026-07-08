@@ -87,6 +87,13 @@ class NeMoModelCheckpoint(ModelCheckpoint):
         self._consecutive_ckpt_write_failures = 0
         # Background threads ferrying node-local checkpoints to the shared FS.
         self._pending_ferries: List = []
+        # `.ferrytmp` paths a *currently running* ferry is actively writing. Used to
+        # tell live temp files apart from dead orphans when sweeping cruft (see
+        # `_sweep_ferry_orphans`); guarded by a lock as ferries run on bg threads.
+        import threading as _threading
+
+        self._active_ferry_tmps: set = set()
+        self._ferry_lock = _threading.Lock()
 
         # Node-local staging + background ferry is enabled (see `_bounded_save_checkpoint`).
         # When staging, a newly saved `-last.ckpt` is not yet durable on the shared FS by
@@ -95,11 +102,13 @@ class NeMoModelCheckpoint(ModelCheckpoint):
         # step whenever the new ferry stalled or was killed at the wall-clock limit. So in
         # staging mode we keep the previous `-last` and instead prune to the newest
         # `NEMO_CKPT_KEEP_LAST_N` finished `-last` checkpoints *after* a ferry lands.
+        # Default 2 == one durable + one fallback: enough to survive a stalled/killed
+        # ferry of the newest `-last` without hoarding many multi-GB copies.
         self._staging_enabled = bool(os.environ.get("NEMO_CKPT_STAGING_DIR", "").strip())
         try:
-            self._keep_last_n = max(1, int(os.environ.get("NEMO_CKPT_KEEP_LAST_N", "3")))
+            self._keep_last_n = max(1, int(os.environ.get("NEMO_CKPT_KEEP_LAST_N", "2")))
         except ValueError:
-            self._keep_last_n = 3
+            self._keep_last_n = 2
 
         # `prefix` is deprecated
         if 'prefix' in kwargs:
@@ -800,6 +809,10 @@ class NeMoModelCheckpoint(ModelCheckpoint):
 
         max_pending = int(os.environ.get("NEMO_CKPT_MAX_PENDING_FERRIES", "6"))
 
+        # Opportunistically sweep dead ferry cruft before launching a new one. Cheap
+        # rank-0 main-thread file ops; only touches temp files no live ferry owns.
+        self._sweep_ferry_orphans()
+
         # Drop references to ferries that have already completed.
         self._pending_ferries = [f for f in getattr(self, "_pending_ferries", []) if f.is_alive()]
         if len(self._pending_ferries) >= max_pending:
@@ -813,6 +826,11 @@ class NeMoModelCheckpoint(ModelCheckpoint):
             except OSError:
                 pass
             return
+
+        # Register this ferry's temp file as live so a concurrent sweep won't yank it
+        # out from under the copy (the thread clears it again when it finishes).
+        with self._ferry_lock:
+            self._active_ferry_tmps.add(dest_path + ".ferrytmp")
 
         t = threading.Thread(
             target=self._ferry_checkpoint_to_shared_fs,
@@ -836,38 +854,44 @@ class NeMoModelCheckpoint(ModelCheckpoint):
 
         retries = int(os.environ.get("NEMO_CKPT_FERRY_RETRIES", "240"))
         tmp_path = dest_path + ".ferrytmp"
-        for attempt in range(1, retries + 1):
-            try:
-                shutil.copyfile(local_path, tmp_path)
-                os.replace(tmp_path, dest_path)  # atomic on the same filesystem
-                # dest is now complete; clear the -unfinished marker (rank-0, no barrier).
-                self.remove_checkpoint_unfinished_marker(dest_path)
-                try:
-                    os.remove(local_path)
-                except OSError:
-                    pass
-                logging.info(f'[checkpoint] ferried step {global_step} to {dest_path} (attempt {attempt}).')
-                # Now that a fresh `-last.ckpt` is durable on the shared FS, prune older
-                # `-last` checkpoints (kept intact until now so a stalled/killed ferry
-                # could not leave us without a durable last). Rank-0 file ops only.
-                if str(dest_path).endswith("-last.ckpt"):
-                    self._prune_last_checkpoints(self._keep_last_n)
-                return
-            except BaseException as e:  # noqa: BLE001
-                logging.warning(
-                    f'[checkpoint] ferry attempt {attempt}/{retries} for step {global_step} ({dest_path}) '
-                    f'failed: {e!r}; retrying.'
-                )
-                time.sleep(min(30.0, 5.0 * attempt))
         try:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except OSError:
-            pass
-        logging.error(
-            f'[checkpoint] gave up ferrying step {global_step} to {dest_path} after {retries} attempts; '
-            f'node-local copy left at {local_path}.'
-        )
+            for attempt in range(1, retries + 1):
+                try:
+                    shutil.copyfile(local_path, tmp_path)
+                    os.replace(tmp_path, dest_path)  # atomic on the same filesystem
+                    # dest is now complete; clear the -unfinished marker (rank-0, no barrier).
+                    self.remove_checkpoint_unfinished_marker(dest_path)
+                    try:
+                        os.remove(local_path)
+                    except OSError:
+                        pass
+                    logging.info(f'[checkpoint] ferried step {global_step} to {dest_path} (attempt {attempt}).')
+                    # Now that a fresh `-last.ckpt` is durable on the shared FS, prune older
+                    # `-last` checkpoints (kept intact until now so a stalled/killed ferry
+                    # could not leave us without a durable last). Rank-0 file ops only.
+                    if str(dest_path).endswith("-last.ckpt"):
+                        self._prune_last_checkpoints(self._keep_last_n)
+                    return
+                except BaseException as e:  # noqa: BLE001
+                    logging.warning(
+                        f'[checkpoint] ferry attempt {attempt}/{retries} for step {global_step} ({dest_path}) '
+                        f'failed: {e!r}; retrying.'
+                    )
+                    time.sleep(min(30.0, 5.0 * attempt))
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
+            logging.error(
+                f'[checkpoint] gave up ferrying step {global_step} to {dest_path} after {retries} attempts; '
+                f'node-local copy left at {local_path}.'
+            )
+        finally:
+            # This ferry no longer owns its temp file, whether it landed, gave up, or
+            # errored out -- so a later sweep is free to reclaim any leftover.
+            with self._ferry_lock:
+                self._active_ferry_tmps.discard(tmp_path)
 
     def _prune_last_checkpoints(self, keep: int) -> None:
         """Keep only the newest ``keep`` finished ``*-last.ckpt`` files (by step).
@@ -905,6 +929,49 @@ class NeMoModelCheckpoint(ModelCheckpoint):
                         logging.warning(f'[checkpoint] could not prune {path}: {e!r}')
         except BaseException as e:  # noqa: BLE001
             logging.warning(f'[checkpoint] pruning old -last checkpoints failed: {e!r}')
+
+    def _sweep_ferry_orphans(self) -> None:
+        """Reclaim background-ferry cruft that no live ferry owns.
+
+        A ``<ckpt>.ferrytmp`` is a partial copy written by a background ferry; it is
+        renamed onto the final path atomically on success and deleted on give-up. But
+        a ferry for an evicted top-k checkpoint, or one whose owning thread died, can
+        leave its temp file (and a now-stale ``-unfinished`` marker) behind for the
+        rest of the run, quietly wasting GBs. ``setup()`` clears these only on the next
+        (re)start, which never happens inside a single long job -- so we also sweep them
+        opportunistically here (from ``_launch_ckpt_ferry``, rank-0 main thread, no DDP
+        barriers). Temp files a *currently running* ferry still owns are left untouched:
+        unlinking one mid-copy would just make that ferry recreate it, and it may still
+        land successfully.
+        """
+        import glob as _glob
+
+        if not self._staging_enabled or not is_global_rank_zero() or not self.dirpath:
+            return
+        try:
+            with self._ferry_lock:
+                active = set(self._active_ferry_tmps)
+            for tmp in _glob.glob(os.path.join(str(self.dirpath), "*.ferrytmp")):
+                if tmp in active:
+                    continue  # a live ferry is still writing this one
+                try:
+                    os.remove(tmp)
+                    logging.info(f'[checkpoint] swept orphaned ferry temp {tmp}.')
+                except OSError as e:
+                    logging.warning(f'[checkpoint] could not sweep {tmp}: {e!r}')
+                    continue
+                # If the final checkpoint never landed, its unfinished marker is stale.
+                dest = tmp[: -len(".ferrytmp")]
+                if not os.path.exists(dest):
+                    marker = self.format_checkpoint_unfinished_marker_path(dest)
+                    try:
+                        if os.path.exists(marker):
+                            os.remove(marker)
+                            logging.info(f'[checkpoint] swept stale unfinished marker {marker}.')
+                    except OSError:
+                        pass
+        except BaseException as e:  # noqa: BLE001
+            logging.warning(f'[checkpoint] ferry-orphan sweep failed: {e!r}')
 
     def _get_finalize_save_checkpoint_callback(
         self, trainer: 'lightning.pytorch.Trainer', filepath: str, global_step: int  # noqa: F821

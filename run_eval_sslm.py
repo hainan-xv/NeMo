@@ -841,7 +841,13 @@ def resolve_ckpt_spec(spec: str, use_last: bool = False) -> str:
     projects = (
         [os.environ["PROJECT"]]
         if os.environ.get("PROJECT")
-        else ["Streaming_SLM_629", "Streaming_SLM_624", "Streaming_SLM_chunk14", "Streaming_SLM"]
+        else [
+            "Streaming_SLM_Qwen1p7B",  # current active project (Qwen3-1.7B runs)
+            "Streaming_SLM_629",
+            "Streaming_SLM_624",
+            "Streaming_SLM_chunk14",
+            "Streaming_SLM",
+        ]
     )
 
     def _ssh_out(cmd: str) -> str:

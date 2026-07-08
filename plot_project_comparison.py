@@ -247,6 +247,14 @@ def main():
     ap.add_argument("--smooth", type=float, default=0.1,
                     help="EMA smoothing for loss/train-WER in (0,1]; 0 disables (default: 0.1)")
     ap.add_argument("--dpi", type=int, default=150, help="PNG resolution (default: 150)")
+    ap.add_argument("--max-step", default=None,
+                    help="truncate every curve to global steps <= this value. Pass an int, "
+                         "'auto' to cap at the SHORTEST selected run's last step, or "
+                         "'auto:<model>' to cap at a SPECIFIC run's last step (handy for "
+                         "comparing a warm-started run against its baseline over equal #steps).")
+    ap.add_argument("--round-step", type=int, default=0,
+                    help="round the effective --max-step cap UP to the nearest multiple of this "
+                         "(e.g. 10000). 0 disables (default: 0).")
     ap.add_argument("--no-fetch", action="store_true", help="use the local cache only; never rsync")
     ap.add_argument("--results-root", default=DEFAULT_RESULTS_ROOT,
                     help=f"remote results root for bare project names (default: {DEFAULT_RESULTS_ROOT})")
@@ -308,9 +316,38 @@ def main():
     if not models:
         sys.exit("error: parsed no usable data from any model.")
 
+    # --- Optional step cap: truncate all curves to a common step budget ---
+    cap = None
+    if args.max_step is not None:
+        def _max_step(tv):
+            tr, va = tv
+            steps = list(tr.keys()) + list(va.keys())
+            return max(steps) if steps else 0
+        ms = str(args.max_step).lower()
+        if ms == "auto":
+            cap = min(_max_step(tv) for tv in models.values())
+        elif ms.startswith("auto:"):
+            ref = args.max_step.split(":", 1)[1]
+            if ref not in models:
+                sys.exit(f"error: --max-step auto:{ref} but '{ref}' is not among plotted models: "
+                         f"{', '.join(models)}")
+            cap = _max_step(models[ref])
+        else:
+            cap = int(args.max_step)
+        if args.round_step and args.round_step > 0 and cap > 0:
+            import math
+            cap = int(math.ceil(cap / args.round_step) * args.round_step)
+        for name, (tr, va) in list(models.items()):
+            tr = {s: v for s, v in tr.items() if s <= cap}
+            va = {s: v for s, v in va.items() if s <= cap}
+            models[name] = (tr, va)
+        print(f"Capped all curves to global step <= {cap}")
+
     out_path = args.output or os.path.join(os.getcwd(), f"{project_name}_comparison.png")
     out_path = os.path.abspath(os.path.expanduser(out_path))
     title = f"{project_name}  —  model comparison ({len(models)} runs)"
+    if cap is not None:
+        title += f"  [first {cap} steps]"
     if plot_comparison(models, out_path, title, args.smooth, args.dpi):
         print(f"Wrote {out_path}")
     else:
