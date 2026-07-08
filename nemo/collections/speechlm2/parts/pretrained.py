@@ -391,10 +391,17 @@ def warm_start_from_ckpt(model: torch.nn.Module, ckpt_path: str) -> dict:
     new_sd = {}
     loaded = resized = skipped = 0
     for k, t in tgt.items():
-        if k not in src:
+        s = src.get(k)
+        if s is None and ".base_layer." in k:
+            # PEFT injects a LoRA adapter by wrapping the original Linear so that
+            # its weight moves from ``<name>.weight`` to ``<name>.base_layer.weight``.
+            # A checkpoint taken BEFORE that adapter existed (e.g. a fully
+            # fine-tuned encoder warm-started into a now-LoRA-adapted encoder)
+            # stores the un-wrapped name, so remap it into the frozen base slot.
+            s = src.get(k.replace(".base_layer.", "."))
+        if s is None:
             skipped += 1
             continue
-        s = src[k]
         if tuple(s.shape) == tuple(t.shape):
             new_sd[k] = s
             loaded += 1

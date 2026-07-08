@@ -238,15 +238,39 @@ if [ "${RUN_AVERAGING:-0}" = "1" ]; then
         # Sync EXACTLY the current non '-last' set, then prune stale local ckpts so
         # we average ONLY these ${NUM_CKPTS}.
         mkdir -p "$AVG_DIR"
-        CKPT_LIST_FILE=$(mktemp)
-        printf '%s\n' "$REMOTE_CKPT_FILES" > "$CKPT_LIST_FILE"
-        RSYNC_OPTS=(-vh --times --partial --files-from="$CKPT_LIST_FILE" -e "ssh $SSH_OPTS")
-        [ "${FORCE_DOWNLOAD:-0}" = "1" ] && RSYNC_OPTS+=(--ignore-times)
-        echo "==> Syncing ${NUM_CKPTS} checkpoint(s) from OCI via rsync..."
-        if ! rsync "${RSYNC_OPTS[@]}" "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_CKPT_DIR}/" "$AVG_DIR/"; then
-            rm -f "$CKPT_LIST_FILE"; echo "ERROR: rsync of averaging checkpoints failed." >&2; exit 1
-        fi
-        rm -f "$CKPT_LIST_FILE"
+        # NOTE: rsync bulk transfer to this host wedges after "file list done"
+        # (0 bytes, and rsync's --timeout doesn't trip because control/keepalive
+        # traffic keeps trickling) even though the source reads fast (~1.2 GB/s)
+        # and a raw `ssh dd` streams reliably (~26 MB/s). So we fetch each
+        # (immutable) checkpoint with a resumable ssh|dd stream: every attempt
+        # appends only the still-missing byte range (skip_bytes=<local size>), so a
+        # stalled/aborted transfer simply resumes on the next attempt instead of
+        # hanging forever. `timeout` bounds each attempt; growth is re-checked so a
+        # wedged connection is torn down and reopened fresh.
+        echo "==> Syncing ${NUM_CKPTS} checkpoint(s) from OCI via resumable ssh stream..."
+        _dl_ok=1
+        while IFS= read -r _base; do
+            [ -n "$_base" ] || continue
+            _rp="${REMOTE_CKPT_DIR}/${_base}"
+            _lp="${AVG_DIR}/${_base}"
+            _rsize=$(ssh $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}" "stat -c %s '$_rp'" 2>/dev/null | tr -dc '0-9')
+            if [ -z "$_rsize" ]; then echo "ERROR: cannot stat remote $_base" >&2; _dl_ok=0; break; fi
+            [ "${FORCE_DOWNLOAD:-0}" = "1" ] && rm -f "$_lp"
+            _file_ok=0
+            for _attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+                _lsize=0; [ -f "$_lp" ] && _lsize=$(stat -c %s "$_lp" 2>/dev/null || echo 0)
+                if [ "$_lsize" -ge "$_rsize" ]; then _file_ok=1; break; fi
+                echo "    ${_base}: attempt ${_attempt}, resuming at ${_lsize}/${_rsize} bytes"
+                timeout 1200 ssh $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}" \
+                    "dd if='$_rp' bs=1M iflag=skip_bytes skip=${_lsize} status=none" >> "$_lp" || true
+                _nsize=0; [ -f "$_lp" ] && _nsize=$(stat -c %s "$_lp" 2>/dev/null || echo 0)
+                [ "$_nsize" -le "$_lsize" ] && { echo "    ${_base}: no progress; reconnecting in 10s"; sleep 10; }
+            done
+            _lsize=0; [ -f "$_lp" ] && _lsize=$(stat -c %s "$_lp" 2>/dev/null || echo 0)
+            [ "$_lsize" -ge "$_rsize" ] && _file_ok=1
+            if [ "$_file_ok" != "1" ]; then echo "ERROR: failed to fully fetch $_base ($_lsize/$_rsize)" >&2; _dl_ok=0; break; fi
+        done <<< "$REMOTE_CKPT_FILES"
+        if [ "$_dl_ok" != "1" ]; then echo "ERROR: checkpoint download failed." >&2; exit 1; fi
 
         AVG_INPUTS=()
         shopt -s nullglob

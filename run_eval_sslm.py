@@ -150,7 +150,8 @@ def _tail_flush_pad_samples(model) -> int:
     return int(round(flush_chunks * chunk_size * frame_len * sr))
 
 
-def transcribe_sslm(model, dloader, system_prompt, max_new_tokens, no_repeat_ngram_size, warmup_decode=False) -> list[str]:
+def transcribe_sslm(model, dloader, system_prompt, max_new_tokens, no_repeat_ngram_size, warmup_decode=False,
+                    inference_audio_chunks_per_turn=1) -> list[str]:
     from transformers import GenerationConfig
     if max_new_tokens is None:
         max_new_tokens = int(
@@ -191,6 +192,7 @@ def transcribe_sslm(model, dloader, system_prompt, max_new_tokens, no_repeat_ngr
                 system_prompt=system_prompt,
                 max_new_tokens=max_new_tokens,
                 generation_config=gen_cfg,
+                inference_audio_chunks_per_turn=inference_audio_chunks_per_turn,
             )
 
     hyps = []
@@ -203,6 +205,7 @@ def transcribe_sslm(model, dloader, system_prompt, max_new_tokens, no_repeat_ngr
                 system_prompt=system_prompt,
                 max_new_tokens=max_new_tokens,
                 generation_config=gen_cfg,
+                inference_audio_chunks_per_turn=inference_audio_chunks_per_turn,
             )
         hyps.extend(batch_hyps)
     return hyps
@@ -477,6 +480,7 @@ def evaluate_one(model, args, dataset, split):
                 max_new_tokens=args.max_new_tokens,
                 no_repeat_ngram_size=args.no_repeat_ngram_size,
                 warmup_decode=args.warmup_decode,
+                inference_audio_chunks_per_turn=args.inference_audio_chunks_per_turn,
             )
             break
         except RuntimeError as e:
@@ -969,6 +973,11 @@ if __name__ == "__main__":
     parser.add_argument("--no_repeat_ngram_size", type=int, default=0,
                         help="Disallow repeating n-grams during generation to break loops. Defaults to 0, "
                              "matching training validation decode.")
+    parser.add_argument("--inference_audio_chunks_per_turn", type=int, default=1,
+                        help="How many audio chunks the decoder consumes per LLM turn (streaming). "
+                             "1 = default single-chunk decode; >1 groups multiple chunks per turn, "
+                             "which lowers WER for models trained with max_audio_chunks_per_turn>1 "
+                             "(e.g. the variable/multi-chunk 'maxChunks4' models).")
     parser.add_argument("--warmup_decode", action="store_true",
                         help="Run and discard one single-utterance generate() call before scoring. "
                              "Useful for diagnosing first-call/lazy-kernel decode differences.")

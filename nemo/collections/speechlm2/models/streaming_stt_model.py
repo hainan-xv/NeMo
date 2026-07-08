@@ -194,6 +194,22 @@ class StreamingSTTModelConfig:
     audio_embed_specaug_time_width: int = 0
     audio_embed_specaug_feature_masks: int = 0
     audio_embed_specaug_feature_width: int = 0
+    # --- Selective LoRA on the SPEECH ENCODER (Conformer) ---
+    # Independent of the LLM LoRA (``cfg.lora``). When lora_encoder=True, LoRA
+    # adapters are injected into the encoder attention projections
+    # (``lora_encoder_target_modules``, default linear_q/linear_v) on the LAST
+    # ``lora_encoder_num_last_layers`` Conformer layers (0 = all layers). Set
+    # ``freeze_speech_encoder=true`` alongside this so the encoder BASE stays
+    # frozen and only the injected ``lora_`` params train. Warm-starting a
+    # fine-tuned encoder still works: warm_start_from_ckpt remaps the pre-adapter
+    # checkpoint keys into PEFT's ``base_layer`` slots. With lora_encoder=False
+    # (default) nothing changes.
+    lora_encoder: bool = False
+    lora_encoder_num_last_layers: int = 0
+    lora_encoder_r: int = 32
+    lora_encoder_alpha: int = 64
+    lora_encoder_dropout: float = 0.0
+    lora_encoder_target_modules: Optional[List[str]] = None
     blank_loss_weight: float = 1.0
     supervise_im_end_in_loss: bool = False
     project_unaligned_text_to_chunks: bool = False
@@ -784,6 +800,12 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             else:
                 unfreeze_module(self.llm.lm_head)
 
+        # --- Selective LoRA on the speech encoder (Conformer) ---
+        # Injected AFTER _apply_freeze_config so the frozen encoder base is kept
+        # frozen and only the freshly-added adapters train.
+        if self.core_cfg.lora_encoder:
+            self._install_encoder_lora()
+
         # The helper dataset is what rebuilds (resampled) batches at train time.
         # Two consumers need it: (1) the online forced aligner, which realigns
         # every step; and (2) offline ``encoder_reuse_k>1``, which resamples K
@@ -841,6 +863,52 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 logging.warning(
                     f"chunk_classifier_init_from_llm: warm-start failed ({e}); " "falling back to random init"
                 )
+
+    def _install_encoder_lora(self) -> None:
+        """Inject LoRA adapters into the last-N Conformer encoder layers.
+
+        The encoder is a NeMo ``ConformerEncoder`` (not an HF ``PreTrainedModel``),
+        so we use PEFT's low-level ``inject_adapter_in_model`` rather than
+        ``get_peft_model`` (which assumes an HF model). The encoder base is frozen
+        and only the injected ``lora_`` params are left trainable, regardless of
+        the installed PEFT version's default requires_grad behavior.
+        """
+        from peft import LoraConfig, inject_adapter_in_model
+
+        encoder = self.perception.encoder
+        layers = getattr(encoder, "layers", None)
+        if layers is None:
+            raise AttributeError(
+                "lora_encoder=True but self.perception.encoder has no `.layers` "
+                "ModuleList; cannot target Conformer layers."
+            )
+        n_layers = len(layers)
+        n_last = int(self.core_cfg.lora_encoder_num_last_layers) or n_layers
+        n_last = max(1, min(n_last, n_layers))
+        layer_ids = list(range(n_layers - n_last, n_layers))
+        targets = list(self.core_cfg.lora_encoder_target_modules or ["linear_q", "linear_v"])
+
+        enc_lora_cfg = LoraConfig(
+            r=int(self.core_cfg.lora_encoder_r),
+            lora_alpha=int(self.core_cfg.lora_encoder_alpha),
+            lora_dropout=float(self.core_cfg.lora_encoder_dropout),
+            target_modules=targets,
+            layers_to_transform=layer_ids,
+            layers_pattern="layers",
+            bias="none",
+        )
+        inject_adapter_in_model(enc_lora_cfg, encoder)
+
+        # Freeze the entire encoder base; train ONLY the injected adapters.
+        for name, p in encoder.named_parameters():
+            p.requires_grad = "lora_" in name
+        n_train = sum(p.numel() for p in encoder.parameters() if p.requires_grad)
+        logging.info(
+            "Encoder LoRA installed: r=%d alpha=%d dropout=%.3g targets=%s on layers %s "
+            "(last %d of %d Conformer layers); trainable encoder params=%d",
+            enc_lora_cfg.r, enc_lora_cfg.lora_alpha, enc_lora_cfg.lora_dropout,
+            targets, layer_ids, n_last, n_layers, n_train,
+        )
 
     def _apply_freeze_config(self) -> None:
         if self.core_cfg.freeze_speech_encoder:
