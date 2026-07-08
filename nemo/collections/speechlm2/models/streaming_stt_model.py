@@ -1977,6 +1977,51 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         self._log_train_step(agg, last_batch, batch_idx)
         return {"loss": loss}
 
+    def _debug_check_token_ranges(self, batch: StreamingSTTBatch, batch_idx: int) -> None:
+        """Opt-in diagnostic: fail LOUDLY (CPU-side) on any out-of-range token/label id.
+
+        A token id fed to the embedding table, or a CE label id, that lies outside
+        ``[0, vocab)`` triggers an *asynchronous* CUDA device-side assert whose
+        reported traceback points at some unrelated later op (e.g. ``move_data_to_device``).
+        Setting ``NEMO_DEBUG_TOKEN_RANGE=1`` runs this cheap range check on the batch
+        BEFORE the GPU kernels, so we can report the EXACT offending id and the sample
+        it came from -- which is what distinguishes a data problem (an id produced by
+        the manifest/aligner that exceeds our tokenizer vocab) from a code bug. This is
+        a no-op unless the env var is set, so normal runs pay nothing.
+        """
+        vocab = int(self.embed_tokens.num_embeddings)
+        texts = getattr(batch, "text", None)
+
+        def _report(kind: str, ids, valid_mask) -> None:
+            if ids is None:
+                return
+            checked = ids[valid_mask]
+            if checked.numel() == 0:
+                return
+            mn = int(checked.min().item())
+            mx = int(checked.max().item())
+            if mn >= 0 and mx < vocab:
+                return  # all in range
+            bad = valid_mask & ((ids < 0) | (ids >= vocab))
+            rows = torch.nonzero(bad.any(dim=1), as_tuple=False).flatten().tolist()
+            offending = torch.unique(ids[bad]).tolist()
+            samples = []
+            for r in rows[:8]:
+                t = texts[r] if (texts is not None and r < len(texts)) else "<no text>"
+                samples.append(f"    row {r}: {t!r}")
+            msg = (
+                f"[token-range] batch {batch_idx}: {kind} id(s) OUT OF RANGE for embedding "
+                f"vocab={vocab} (observed min={mn}, max={mx}). Offending id(s)="
+                f"{offending[:32]} across {len(rows)} sample(s):\n" + "\n".join(samples)
+            )
+            logging.error(msg)
+            raise RuntimeError(msg)
+
+        _report("input_tokens", batch.input_tokens,
+                None if batch.input_tokens is None else (batch.input_tokens != AUDIO_TOKEN_IDX))
+        _report("target_tokens", batch.target_tokens,
+                None if batch.target_tokens is None else (batch.target_tokens != IGNORE_INDEX))
+
     def _partition_forward_loss(
         self,
         batch: StreamingSTTBatch,
@@ -1992,6 +2037,8 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         makes ``encoder_reuse_k`` amortize one encoder pass over K partitions).
         Returns ``{"skip": True, ...}`` for an empty-target batch.
         """
+        if os.environ.get("NEMO_DEBUG_TOKEN_RANGE"):
+            self._debug_check_token_ranges(batch, batch_idx)
         inputs = self._build_input_embeds(
             batch.input_tokens, batch.audios, batch.audio_lens, audio_embs=audio_embs
         )
