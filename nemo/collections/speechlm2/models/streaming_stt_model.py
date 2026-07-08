@@ -885,16 +885,39 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         n_layers = len(layers)
         n_last = int(self.core_cfg.lora_encoder_num_last_layers) or n_layers
         n_last = max(1, min(n_last, n_layers))
-        layer_ids = list(range(n_layers - n_last, n_layers))
-        targets = list(self.core_cfg.lora_encoder_target_modules or ["linear_q", "linear_v"])
+        layer_ids = set(range(n_layers - n_last, n_layers))
+        wanted = set(self.core_cfg.lora_encoder_target_modules or ["linear_q", "linear_v"])
+
+        # Build EXPLICIT fully-qualified target module names for the selected
+        # layers. We do NOT use PEFT's layers_to_transform/layers_pattern: the
+        # encoder is the adapter root, so its submodules are named
+        # "layers.<i>.self_attn.linear_q" (no parent prefix), and PEFT's
+        # layers_pattern regex expects a leading ".layers.<i>." and never matches.
+        # Exact names sidestep that and are robust to the attention class name.
+        full_targets = []
+        for name, mod in encoder.named_modules():
+            if not isinstance(mod, nn.Linear):
+                continue
+            parts = name.split(".")
+            if len(parts) >= 3 and parts[0] == "layers" and parts[1].isdigit():
+                if int(parts[1]) in layer_ids and parts[-1] in wanted:
+                    full_targets.append(name)
+        if not full_targets:
+            attn_linears = sorted({
+                n for n, m in encoder.named_modules()
+                if isinstance(m, nn.Linear) and n.startswith("layers.")
+            })
+            raise ValueError(
+                f"lora_encoder: no Linear modules matching {sorted(wanted)} found in the "
+                f"last {n_last} of {n_layers} encoder layers. Present layer Linears (sample): "
+                f"{attn_linears[:12]}"
+            )
 
         enc_lora_cfg = LoraConfig(
             r=int(self.core_cfg.lora_encoder_r),
             lora_alpha=int(self.core_cfg.lora_encoder_alpha),
             lora_dropout=float(self.core_cfg.lora_encoder_dropout),
-            target_modules=targets,
-            layers_to_transform=layer_ids,
-            layers_pattern="layers",
+            target_modules=full_targets,
             bias="none",
         )
         inject_adapter_in_model(enc_lora_cfg, encoder)
@@ -905,9 +928,9 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         n_train = sum(p.numel() for p in encoder.parameters() if p.requires_grad)
         logging.info(
             "Encoder LoRA installed: r=%d alpha=%d dropout=%.3g targets=%s on layers %s "
-            "(last %d of %d Conformer layers); trainable encoder params=%d",
+            "(last %d of %d Conformer layers, %d target Linears); trainable encoder params=%d",
             enc_lora_cfg.r, enc_lora_cfg.lora_alpha, enc_lora_cfg.lora_dropout,
-            targets, layer_ids, n_last, n_layers, n_train,
+            sorted(wanted), sorted(layer_ids), n_last, n_layers, len(full_targets), n_train,
         )
 
     def _apply_freeze_config(self) -> None:
