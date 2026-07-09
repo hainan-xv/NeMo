@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# Commit the current nemo79 code, push it to GitHub, then update OCI from GitHub.
+set -euo pipefail
+
+BRANCH="${BRANCH:-nemo79}"
+GITHUB_URL="${GITHUB_URL:-https://github.com/hainan-xv/NeMo.git}"
+OCI_HOST="${OCI_HOST:-draco-oci-dc-03.draco-oci-iad.nvidia.com}"
+OCI_USER="${OCI_USER:-hainanx}"
+SSH_KEY="${SSH_KEY:-$HOME/.ssh/draco-rno}"
+OCI_REPO="${OCI_REPO:-/lustre/fsw/portfolios/llmservice/users/hainanx/NeMo79}"
+
+cd "$(dirname "${BASH_SOURCE[0]}")"
+
+current_branch="$(git branch --show-current)"
+if [[ "$current_branch" != "$BRANCH" ]]; then
+  echo "ERROR: expected branch '$BRANCH', found '$current_branch'." >&2
+  exit 1
+fi
+
+# Stage existing tracked changes and the project-owned launch/sync scripts only.
+# Avoid `git add -A`, which could accidentally include local credentials.
+git add -u
+git add .gitignore ord sync_to_oci.sh sync_to_ord.sh
+
+if ! git diff --cached --quiet; then
+  message="${1:-Sync OCI code $(date +%Y%m%d_%H%M%S)}"
+  echo "==> Committing: $message"
+  git commit -m "$message"
+else
+  echo "==> No staged code changes to commit"
+fi
+
+echo "==> Pushing $BRANCH to $GITHUB_URL"
+git push "$GITHUB_URL" "HEAD:$BRANCH"
+
+echo "==> Updating ${OCI_USER}@${OCI_HOST}:$OCI_REPO"
+ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no \
+  "${OCI_USER}@${OCI_HOST}" bash -s -- "$GITHUB_URL" "$BRANCH" "$OCI_REPO" <<'REMOTE'
+set -euo pipefail
+
+url="$1"
+branch="$2"
+repo="$3"
+git_auth=()
+
+# Needed only for a private GitHub repository. The token remains on OCI and is
+# used as a transient HTTP header, never stored in the repository config.
+if [[ -r "$HOME/.github_token" ]]; then
+  github_token="$(tr -d '\r\n' < "$HOME/.github_token")"
+  basic_auth="$(printf 'x-access-token:%s' "$github_token" | base64 | tr -d '\r\n')"
+  git_auth=(-c "http.extraHeader=Authorization: Basic $basic_auth")
+  unset github_token
+fi
+
+if [[ -d "$repo/.git" ]]; then
+  git -C "$repo" "${git_auth[@]}" fetch --force "$url" \
+    "$branch:refs/remotes/github/$branch"
+  git -C "$repo" checkout -B "$branch" "refs/remotes/github/$branch"
+  git -C "$repo" reset --hard "refs/remotes/github/$branch"
+else
+  if [[ -e "$repo" ]]; then
+    backup="${repo}.pre-git.$(date +%Y%m%d_%H%M%S)"
+    echo "Existing non-Git directory moved to $backup"
+    mv "$repo" "$backup"
+  fi
+  mkdir -p "$(dirname "$repo")"
+  git "${git_auth[@]}" clone --branch "$branch" --single-branch "$url" "$repo"
+fi
+
+echo "OCI checkout: $(git -C "$repo" rev-parse --short HEAD)"
+REMOTE
+
+echo "==> OCI is updated at $OCI_REPO"
