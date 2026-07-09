@@ -2731,7 +2731,22 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 )
                 _, scores, words = self.wer.compute()
                 self.wer.reset()
-                tensorboard_logs.update({'training_batch_wer': scores.float() / words})
+                train_wer = scores.float() / torch.clamp(words.float(), min=1.0)
+                tensorboard_logs.update({'training_batch_wer': train_wer})
+                # Emit a plot-friendly stats line for the CHAT external-aligner CE
+                # baseline so plot_training_curves.py / plot_project_comparison.py can
+                # chart loss + train/val WER progression (same text format as the
+                # speechlm streaming_stt model). Only for chat_aligner so generic
+                # RNN-T runs are unaffected.
+                if self.loss_type == 'chat_aligner' and (self.trainer is None or self.trainer.is_global_zero):
+                    logging.info(
+                        "[train] step %d stats: loss=%.4f  train_wer=%.4f  best_val_wer=%s  last_val_wer=%s",
+                        self.trainer.global_step if self.trainer is not None else sample_id,
+                        float(loss_value.detach().float().cpu()),
+                        float(train_wer.detach().float().cpu()),
+                        ("%.4f" % self._best_val_wer) if getattr(self, "_best_val_wer", None) is not None else "n/a",
+                        ("%.4f" % self._last_val_wer) if getattr(self, "_last_val_wer", None) is not None else "n/a",
+                    )
 
         else:
             # If experimental fused Joint-Loss-WER is used
@@ -2987,6 +3002,16 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         wer_num = torch.stack([x['val_wer_num'] for x in outputs]).sum()
         wer_denom = torch.stack([x['val_wer_denom'] for x in outputs]).sum()
         tensorboard_logs = {**val_loss_log, 'val_wer': wer_num.float() / wer_denom}
+        # Track last/best val WER so the CHAT chat_aligner [train] stats line can
+        # report them (parsed by plot_training_curves.py / plot_project_comparison.py).
+        try:
+            _val_wer_scalar = float((wer_num.float() / torch.clamp(wer_denom.float(), min=1.0)).detach().cpu())
+            self._last_val_wer = _val_wer_scalar
+            _prev_best = getattr(self, '_best_val_wer', None)
+            if _prev_best is None or _val_wer_scalar < _prev_best:
+                self._best_val_wer = _val_wer_scalar
+        except Exception:
+            pass
         # Aggregate any additional representation-level error rates (e.g.
         # val_wer_notone / val_wer_tone from the multi-target model), each logged as
         # summed num/denom per step so the epoch value is a proper micro-average.
