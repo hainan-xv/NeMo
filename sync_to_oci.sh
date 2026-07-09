@@ -41,7 +41,9 @@ git push "$REMOTE_URL" "HEAD:$BRANCH"
 echo "==> Updating $BRANCH on OCI: ${OCI_USER}@${OCI_HOST}:${OCI_REPO}"
 ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "${OCI_USER}@${OCI_HOST}" \
     "if [ -d '$OCI_REPO/.git' ]; then \
-         cd '$OCI_REPO' && git fetch '$REMOTE_URL' '$BRANCH' && git checkout '$BRANCH' && git reset --hard FETCH_HEAD; \
+         cd '$OCI_REPO' && rm -f .git/index.lock && rm -f .git/FETCH_HEAD 2>/dev/null || true && \
+         git fetch -f '$REMOTE_URL' +$BRANCH:refs/tmp/oci_sync_head && \
+         git checkout -f '$BRANCH' && git reset --hard refs/tmp/oci_sync_head; \
      else \
          echo 'Repo not found -- cloning (first-time setup)'; \
          mkdir -p \"\$(dirname '$OCI_REPO')\" && git clone --branch '$BRANCH' '$REMOTE_URL' '$OCI_REPO'; \
