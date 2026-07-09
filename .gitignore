@@ -236,3 +236,15 @@ probe_alignment.py
 # NEVER commit: this holds a real Hugging Face access token.
 .hf_token
 .oci_finish_relaunch.*
+
+# --- Local experiment artifacts (untracked; must not be committed by sync_to_oci.sh git add -A) ---
+lora_l2w/
+oracle_results/
+oracle_results_aishell/
+likelihood_results/
+likelihood_results_aishell/
+joint_results_aishell/
+manifests/
+.hf_cache_proto/
+tokenizers/librispeech/
+predictions_*.json
