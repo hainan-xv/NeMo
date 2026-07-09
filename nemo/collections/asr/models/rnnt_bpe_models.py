@@ -526,7 +526,7 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
                 world_size=self.world_size if not config.get("do_transcribe", False) else config.get("world_size"),
                 dataset=LhotseSpeechToTextBpeDataset(
                     tokenizer=self.tokenizer,
-                    return_cuts=config.get("do_transcribe", False),
+                    return_cuts=config.get("do_transcribe", False) or config.get("return_cuts", False),
                     return_sample_id=config.get("return_sample_id", False),
                 ),
                 tokenizer=self.tokenizer,

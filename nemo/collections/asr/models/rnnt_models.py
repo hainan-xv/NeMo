@@ -1311,12 +1311,15 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 "with `model_path`/`pretrained_name`."
             )
 
-        # 'precomputed' -> OFFLINE word-level alignment (fastest, recommended).
+        # 'precomputed' -> OFFLINE word-level alignment from a JSON/JSONL path.
+        # 'prealigned'  -> OFFLINE word-level alignment already stored on Lhotse cuts.
         # 'qwen'        -> LIVE word-level forced alignment (tokenizer-agnostic).
         # 'ctc'         -> token-level forced alignment; external model MUST share
         #                  the trainee tokenizer (default for back-compat).
         backend = str(ext_cfg.get('backend', 'ctc')).lower()
         self._external_aligner_is_precomputed = False
+        self._external_aligner_from_cuts = False
+        self._external_aligner_anchor = str(ext_cfg.get('anchor', 'end'))
         if backend in ('precomputed', 'offline', 'precomp'):
             from nemo.collections.asr.parts.submodules.external_word_aligner import PrecomputedWordForcedAligner
 
@@ -1340,6 +1343,20 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 anchor=str(ext_cfg.get('anchor', 'end')),
             )
             self._external_aligner_is_precomputed = True
+        elif backend in ('prealigned', 'manifest', 'lhotse', 'lhotse_cuts', 'cuts'):
+            tokenizer = getattr(self, 'tokenizer', None)
+            if tokenizer is None:
+                raise ValueError(
+                    "external_aligner.backend='prealigned' requires a sub-word tokenizer model so sub-words "
+                    "can be grouped into words."
+                )
+            self._external_aligner = None
+            self._external_aligner_is_precomputed = True
+            self._external_aligner_from_cuts = True
+            logging.info(
+                "[chunkwise-aligner] Using word alignments directly from Lhotse cut.custom['alignments'] "
+                f"(anchor='{self._external_aligner_anchor}')."
+            )
         elif backend in ('qwen', 'word', 'qwen_word'):
             from nemo.collections.asr.parts.submodules.external_word_aligner import QwenWordForcedAligner
 
@@ -1529,6 +1546,118 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         return file_ids
 
     @torch.no_grad()
+    def _prealigned_cut_chunk_assignment(
+        self,
+        cuts,
+        signal_len: torch.Tensor,
+        transcript: torch.Tensor,
+        transcript_len: torch.Tensor,
+        encoded_len: torch.Tensor,
+        return_positions: bool = False,
+    ):
+        """Chunk assignment from word alignments embedded in Lhotse cut metadata."""
+        from nemo.collections.asr.parts.submodules.external_word_aligner import (
+            group_token_ids_into_words,
+            map_word_starts_to_token_chunks,
+        )
+
+        B = int(transcript.shape[0])
+        U = int(transcript.shape[1])
+        if cuts is None:
+            if not getattr(self, '_warned_no_lhotse_cuts', False):
+                logging.warning(
+                    "loss_type='chat_aligner' with backend='prealigned' needs Lhotse cuts in the batch. "
+                    "Set `model.train_ds.return_cuts=true`. Discarding all samples this step."
+                )
+                self._warned_no_lhotse_cuts = True
+            tci = torch.full((B, U), -1, dtype=torch.long, device=transcript.device)
+            vm = torch.zeros(B, dtype=torch.bool, device=transcript.device)
+            pos = torch.full((B, U), -1, dtype=torch.long, device=transcript.device) if return_positions else None
+            return tci, vm, B, B, pos
+
+        if not isinstance(cuts, (list, tuple)):
+            cuts = list(cuts)
+
+        labels_cpu = transcript.to(torch.long).cpu()
+        label_lens_cpu = transcript_len.to(torch.long).cpu()
+        target_frames_cpu = encoded_len.to(torch.long).cpu()
+        sr = int(self.cfg.get('sample_rate', 16000))
+        durations_cpu = (signal_len.to(torch.float32) / float(sr)).cpu()
+
+        token_chunk_ids = torch.full((B, U), -1, dtype=torch.long)
+        token_chunk_pos = torch.full((B, U), -1, dtype=torch.long)
+        valid_mask = torch.ones(B, dtype=torch.bool)
+        n_missing_logged = getattr(self, '_prealigned_missing_logged', 0)
+
+        for b in range(B):
+            U_b = int(label_lens_cpu[b])
+            cut = cuts[b] if b < len(cuts) else None
+            raw = (getattr(cut, 'custom', None) or {}).get('alignments', []) if cut is not None else []
+            if U_b <= 0 or not raw:
+                valid_mask[b] = False
+                if not raw and n_missing_logged < 20:
+                    logging.warning(
+                        f"[chunkwise-aligner] No cut.custom['alignments'] for cut='{getattr(cut, 'id', None)}'; "
+                        "skipping."
+                    )
+                    n_missing_logged += 1
+                continue
+
+            starts, ends = [], []
+            for item in raw:
+                if not isinstance(item, dict) or 'start_time' not in item:
+                    continue
+                starts.append(float(item['start_time']))
+                ends.append(float(item.get('end_time', item['start_time'])))
+            if not starts:
+                valid_mask[b] = False
+                continue
+
+            ids_b = labels_cpu[b, :U_b].tolist()
+            pieces = [str(p) for p in self.tokenizer.ids_to_tokens(ids_b)]
+            groups = group_token_ids_into_words(pieces)
+            mapped = map_word_starts_to_token_chunks(
+                groups,
+                starts,
+                float(durations_cpu[b]),
+                int(target_frames_cpu[b]),
+                U_b,
+                self.chunk_size,
+                enforce_left_packing=self._aligner_enforce_left_packing,
+                word_ends_sec=ends,
+                anchor=self._external_aligner_anchor,
+                return_positions=return_positions,
+            )
+            if mapped is None:
+                valid_mask[b] = False
+                continue
+            if return_positions:
+                assignment, positions = mapped
+                for ti, chunk in assignment.items():
+                    token_chunk_ids[b, ti] = chunk
+                    token_chunk_pos[b, ti] = positions[ti]
+            else:
+                for ti, chunk in mapped.items():
+                    token_chunk_ids[b, ti] = chunk
+
+        self._prealigned_missing_logged = n_missing_logged
+        if return_positions:
+            return (
+                token_chunk_ids.to(transcript.device),
+                valid_mask.to(transcript.device),
+                int((~valid_mask).sum().item()),
+                int(valid_mask.numel()),
+                token_chunk_pos.to(transcript.device),
+            )
+        return (
+            token_chunk_ids.to(transcript.device),
+            valid_mask.to(transcript.device),
+            int((~valid_mask).sum().item()),
+            int(valid_mask.numel()),
+            None,
+        )
+
+    @torch.no_grad()
     def _precomputed_chunk_assignment(
         self,
         sample_ids,
@@ -1545,6 +1674,11 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         token_chunk_pos)`` where ``token_chunk_pos`` is ``None`` unless
         ``return_positions``.
         """
+        if getattr(self, '_external_aligner_from_cuts', False):
+            return self._prealigned_cut_chunk_assignment(
+                sample_ids, signal_len, transcript, transcript_len, encoded_len, return_positions=return_positions
+            )
+
         B = int(transcript.shape[0])
         U = int(transcript.shape[1])
         if sample_ids is None:
