@@ -1768,6 +1768,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
 
         flat_logits = outputs["logits"].flatten(0, 1)
         flat_targets = target_tokens.flatten(0, 1)
+        flat_targets = self._sanitize_ce_targets(flat_targets, where="text_only_lm")
         num_targets = (flat_targets != IGNORE_INDEX).long().sum()
         if num_targets == 0:
             return zero, num_targets
@@ -1780,6 +1781,33 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 ignore_index=IGNORE_INDEX,
             )
         return per_token_loss.sum() / num_targets, num_targets
+
+    def _sanitize_ce_targets(self, targets: Tensor, batch_idx: int = -1, where: str = "") -> Tensor:
+        """Drop any out-of-range CE target id (map it to ``IGNORE_INDEX``).
+
+        A cross-entropy / ``nll_loss`` target must be either ``IGNORE_INDEX`` or lie
+        in ``[0, vocab)``. A single id outside that range triggers an *asynchronous*
+        CUDA device-side assert (``nll_loss_forward: cur_target >= 0 && cur_target <
+        n_classes``) that kills the whole multi-GPU job with a traceback pointing at
+        some unrelated later op. Such ids come from upstream data/alignment glitches
+        (observed on granary_v2, where a rare sample carries a target token id >=
+        the Qwen vocab). Rather than crash a 16-GPU run on one poisoned token, we set
+        just those positions to ``IGNORE_INDEX`` so they are excluded from the loss,
+        and log a warning naming the offending id(s). The common case (all ids in
+        range) costs one fused comparison + ``.any()`` and returns the tensor as-is.
+        """
+        vocab = int(self.embed_tokens.num_embeddings)
+        bad = (targets != IGNORE_INDEX) & ((targets < 0) | (targets >= vocab))
+        if bool(bad.any()):
+            n = int(bad.sum().item())
+            offending = torch.unique(targets[bad]).tolist()
+            logging.warning(
+                "[ce-sanitize] batch %s %s: %d target id(s) out of range for vocab=%d "
+                "(offending=%s) -> set to IGNORE_INDEX (dropped from loss).",
+                batch_idx, where, n, vocab, offending[:16],
+            )
+            targets = targets.masked_fill(bad, IGNORE_INDEX)
+        return targets
 
     # ------------------------------------------------------------------
     # Parallel chunk heads helpers
@@ -1833,6 +1861,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         # Flatten to (M, H) using only valid anchors, and (M, K) targets.
         flat_hidden = gathered[valid]  # (M, H)
         flat_targets = chunk_targets[valid]  # (M, K)
+        flat_targets = self._sanitize_ce_targets(flat_targets, where="parallel")
 
         # Run parallel heads with the tied lm_head.
         par_logits = self.parallel_chunk_heads(flat_hidden, self.llm.lm_head)  # (M, K, V)
@@ -2099,6 +2128,11 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             # LM head is co-supervised alongside the aux BCE.
         else:
             audio_mask = None
+
+        # Guard against rare out-of-vocab target ids (data glitch) that would
+        # otherwise trip an async CUDA device-side assert in the CE below and kill
+        # the whole job. Do this BEFORE counting targets so the normalizer matches.
+        target_ids = self._sanitize_ce_targets(target_ids, batch_idx, where="ar")
 
         num_targets = (target_ids != IGNORE_INDEX).long().sum()
 

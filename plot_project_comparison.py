@@ -201,6 +201,12 @@ def plot_comparison(models: dict, out_path: str, title: str, smooth: float, dpi:
     ax_vwer.set_title("Validation WER (★ = best)")
     ax_vwer.set_xlabel("global step"); ax_vwer.set_ylabel("WER")
 
+    # Fixed y-axis ranges so runs are visually comparable and outliers (e.g. the
+    # huge warmup-phase WER spikes) don't squash the region we care about.
+    ax_loss.set_ylim(0, 2.0)
+    ax_twer.set_ylim(0, 0.5)
+    ax_vwer.set_ylim(0, 0.5)
+
     for ax, has in ((ax_loss, any_loss), (ax_twer, any_twer), (ax_vwer, any_vwer)):
         ax.grid(True, alpha=0.3)
         if has:
