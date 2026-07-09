@@ -49,7 +49,7 @@ class LhotseSpeechToTextBpeDataset(torch.utils.data.Dataset):
             'sample_id': NeuralType(tuple('B'), LengthsType(), optional=True),
         }
 
-    def __init__(self, tokenizer: TokenizerSpec, return_cuts: bool = False):
+    def __init__(self, tokenizer: TokenizerSpec, return_cuts: bool = False, return_sample_id: bool = False):
         super().__init__()
         self.tokenizer = TokenizerWrapper(tokenizer)
         self.use_ais_get_batch = os.environ.get("USE_AIS_GET_BATCH", "False").lower() == "true"
@@ -69,6 +69,15 @@ class LhotseSpeechToTextBpeDataset(torch.utils.data.Dataset):
             self.load_audio = AudioSamples(fault_tolerant=True)
 
         self.return_cuts = return_cuts
+        self.return_sample_id = return_sample_id
+
+    @staticmethod
+    def _cut_file_id(cut) -> str:
+        if cut.recording is not None and cut.recording.sources:
+            src = cut.recording.sources[0].source
+            if src:
+                return os.path.splitext(os.path.basename(str(src)))[0]
+        return os.path.splitext(os.path.basename(str(cut.id)))[0]
 
     def __getitem__(self, cuts) -> Tuple[torch.Tensor, ...]:
         audio, audio_lens, cuts = self.load_audio(cuts)
@@ -86,4 +95,7 @@ class LhotseSpeechToTextBpeDataset(torch.utils.data.Dataset):
         tokens = collate_vectors(tokens, padding_value=0)
         if self.return_cuts:
             return audio, audio_lens, tokens, token_lens, cuts.drop_in_memory_data()
+        if self.return_sample_id:
+            sample_ids = [self._cut_file_id(c) for c in cuts]
+            return audio, audio_lens, tokens, token_lens, sample_ids
         return audio, audio_lens, tokens, token_lens

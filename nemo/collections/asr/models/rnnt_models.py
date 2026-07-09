@@ -1515,10 +1515,14 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         file_ids = []
         for sid in ids:
             fid = None
-            if get is not None:
+            if isinstance(sid, str):
+                fid = os.path.splitext(os.path.basename(sid))[0]
+            elif get is not None:
                 try:
                     entry = get(int(sid))
-                    fid = getattr(entry, 'audio_file', None) or getattr(entry, 'id', None)
+                    apath = getattr(entry, 'audio_file', None) or getattr(entry, 'id', None)
+                    if apath is not None:
+                        fid = os.path.splitext(os.path.basename(str(apath)))[0]
                 except Exception:
                     fid = None
             file_ids.append(fid)
