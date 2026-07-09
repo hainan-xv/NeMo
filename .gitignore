@@ -192,3 +192,12 @@ node_modules/
 bot_server.*
 audio_logs/
 eval_results/
+
+# Local credentials and editor/runtime state. Grid credentials belong in
+# ~/.github_token, ~/.wandb_token, ~/.hf_token, and ~/.ais_authn_token.
+.*_token
+*.swp
+/.cursor/
+/exp
+/oci/
+/nemo/collections/asr/models/NeMo.code-workspace
