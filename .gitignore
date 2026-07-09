@@ -248,3 +248,6 @@ manifests/
 .hf_cache_proto/
 tokenizers/librispeech/
 predictions_*.json
+.pylibs/
+.hist_bare/
+.hist_rewrite/
