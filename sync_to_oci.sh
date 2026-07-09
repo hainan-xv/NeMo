@@ -13,7 +13,7 @@
 set -euo pipefail
 
 BRANCH="ord_sync_d146_current"
-REMOTE_URL="https://github.com/hainan-xv/NeMo.git"
+REMOTE_URL="http://github.com/hainan-xv/NeMo.git"
 OCI_HOST="${OCI_HOST:-draco-oci-login-01.draco-oci-iad.nvidia.com}"
 OCI_USER="${OCI_USER:-hainanx}"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/draco-rno}"
