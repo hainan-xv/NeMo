@@ -236,6 +236,11 @@ class StreamingSTTModelConfig:
     # Opt-in diagnostics for batch composition and loss decomposition. The
     # aggregate loss and learning rate are always logged.
     log_detailed_train_metrics: bool = False
+    # Opt-in per-step check that input/target token ids are within the embedding
+    # and LM-head vocab ranges. Turns an opaque async CUDA device-side assert
+    # (out-of-range embedding index / cross-entropy target) into a precise Python
+    # error. Adds a per-step CPU sync, so enable only for debugging.
+    debug_validate_tokens: bool = False
     # Validation uses real autoregressive streaming decoding. None chooses the
     # number of frames per chunk for fixed chunking (or 64 otherwise).
     val_max_new_tokens_per_chunk: Optional[int] = None
@@ -700,6 +705,47 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
     # Training
     # ------------------------------------------------------------------
 
+    def _validate_token_ranges(self, batch: StreamingSTTBatch) -> None:
+        """Raise a clear error if any input/target token id is out of range.
+
+        This is the CPU-side equivalent of the device-side asserts that
+        ``embed_tokens`` (index >= num_embeddings) and ``cross_entropy`` (target
+        outside ``[0, n_classes)``) raise asynchronously. Reports the offending
+        ids and the embed vs. LM-head vocab sizes (a mismatch there is a common
+        cause after adding special tokens like ``<blank>``).
+        """
+        embed_vocab = int(self.embed_tokens.num_embeddings)
+        head_vocab = int(getattr(self.llm.lm_head, "out_features", embed_vocab))
+        if embed_vocab != head_vocab:
+            logging.warning(
+                "[debug_validate_tokens] embed vocab (%d) != lm_head vocab (%d); "
+                "targets in [%d,%d) will assert in cross_entropy.",
+                embed_vocab,
+                head_vocab,
+                min(embed_vocab, head_vocab),
+                max(embed_vocab, head_vocab),
+            )
+
+        input_tokens = batch.input_tokens
+        non_audio = input_tokens != AUDIO_TOKEN_IDX
+        bad_input = non_audio & ((input_tokens < 0) | (input_tokens >= embed_vocab))
+        if bool(bad_input.any()):
+            offending = input_tokens[bad_input].unique().tolist()[:10]
+            raise ValueError(
+                f"[debug_validate_tokens] input token id(s) out of embedding range "
+                f"[0,{embed_vocab}): {offending}"
+            )
+
+        target_tokens = batch.target_tokens
+        valid_target = target_tokens != IGNORE_INDEX
+        bad_target = valid_target & ((target_tokens < 0) | (target_tokens >= head_vocab))
+        if bool(bad_target.any()):
+            offending = target_tokens[bad_target].unique().tolist()[:10]
+            raise ValueError(
+                f"[debug_validate_tokens] target token id(s) out of LM-head range "
+                f"[0,{head_vocab}) (ignore_index={IGNORE_INDEX}): {offending}"
+            )
+
     def training_step(self, batch: StreamingSTTBatch, batch_idx: int):
         # Keep frozen modules in eval mode (disables dropout / batch-norm updates).
         for m in (self.perception.preprocessor, self.perception.encoder, self.llm):
@@ -717,6 +763,9 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 text=batch.text,
             )
             batch = move_data_to_device(batch, self.device)
+
+        if self.core_cfg.debug_validate_tokens:
+            self._validate_token_ranges(batch)
 
         inputs = self._build_input_embeds(batch.input_tokens, batch.audios, batch.audio_lens)
         use_aux = self.core_cfg.use_chunk_classifier

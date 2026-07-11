@@ -79,6 +79,9 @@ WARMUP_STEPS=15000
 # Set DEBUG_CUDA=1 to run with CUDA_LAUNCH_BLOCKING=1 so a device-side assert
 # reports the true failing op/line (default 0 = async, fast).
 DEBUG_CUDA="${DEBUG_CUDA:-0}"
+# Set DEBUG_VALIDATE_TOKENS=true to check input/target token ids are in range
+# each step (turns an opaque CUDA assert into a clear Python error). Debug only.
+DEBUG_VALIDATE_TOKENS="${DEBUG_VALIDATE_TOKENS:-false}"
 
 # Pre-aligned Granary train config: alignments are embedded in the cuts, so
 # training reads precomputed word timestamps instead of running the online Qwen
@@ -167,6 +170,7 @@ echo "*******STARTING********" \
     model.freeze_speech_encoder=${FREEZE_SPEECH_ENCODER} \
     model.att_context_size=[70,${LOOKAHEAD}] \
     model.chunk_size=${CHUNK_SIZE} \
+    ++model.debug_validate_tokens=$DEBUG_VALIDATE_TOKENS \
     ++model.restrict_audio_to_own_chunk=true \
     model.optimizer.lr=$LR \
     model.lr_scheduler.warmup_steps=$WARMUP_STEPS \
