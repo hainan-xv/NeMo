@@ -16,6 +16,7 @@ import warnings
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any, List, Optional, Union
 
 import torch
@@ -26,6 +27,13 @@ from omegaconf import DictConfig
 from torch import Tensor, nn
 from torch.distributed.tensor.parallel import loss_parallel
 from transformers import AutoModel, GenerationConfig
+
+try:
+    # Used to build per-stage causal masks when driving the Qwen layer stack
+    # manually for two-stream (last-layer) fusion.
+    from transformers.masking_utils import create_causal_mask
+except Exception:  # noqa: BLE001
+    create_causal_mask = None
 
 from nemo.collections.asr.inference.streaming.buffering.cache_feature_bufferer import BatchedCacheFeatureBufferer
 from nemo.collections.asr.inference.streaming.framing.request import Frame
@@ -212,6 +220,109 @@ def build_training_chunk_restricted_mask(input_tokens: Tensor, pad_id: int, dtyp
     )
 
 
+def _run_decoder_layer(layer, hidden, attn_mask, position_ids, position_embeddings):
+    """Call one HF decoder layer, tolerating tuple/tensor return conventions."""
+    out = layer(
+        hidden,
+        attention_mask=attn_mask,
+        position_ids=position_ids,
+        position_embeddings=position_embeddings,
+        past_key_value=None,
+        use_cache=False,
+    )
+    return out[0] if isinstance(out, tuple) else out
+
+
+def _causal_additive_mask(valid_mask: Tensor, dtype: torch.dtype) -> Tensor:
+    """Build a (B, 1, S, S) additive causal mask honoring a (B, S) key-validity mask.
+
+    Uses ``finfo(dtype).min`` (not ``-inf``) for blocked entries so a fully-blocked
+    query row degrades to uniform attention instead of NaN.
+    """
+    B, S = valid_mask.shape
+    device = valid_mask.device
+    idx = torch.arange(S, device=device)
+    causal = idx[:, None] >= idx[None, :]  # (S, S): key <= query
+    allowed = causal[None] & valid_mask[:, None, :]  # (B, S, S)
+    additive = torch.zeros(B, S, S, dtype=dtype, device=device)
+    additive = additive.masked_fill(~allowed, torch.finfo(dtype).min)
+    return additive.unsqueeze(1)  # (B, 1, S, S)
+
+
+def two_stream_llm_forward(
+    *,
+    layers,
+    norm,
+    rotary_emb,
+    lm_head,
+    inputs_embeds: Tensor,
+    audio_mask: Tensor,
+    valid_mask: Tensor,
+    compute_logits: bool = True,
+) -> dict[str, Tensor]:
+    """Two-stream last-layer fusion over a full (teacher-forced) sequence.
+
+    The text stream (all non-audio, non-pad positions) is packed into a dense,
+    contiguous sequence and run through ``layers[:-1]`` alone, with contiguous
+    text positions and a causal mask. The resulting text hidden states are then
+    scattered back to their original positions and interleaved with the RAW audio
+    encoder embeddings (which never passed through the lower layers). The final
+    layer runs over this full interleaved sequence (original absolute positions,
+    causal mask) so text queries fuse with audio, followed by ``norm`` + ``lm_head``.
+
+    Args:
+        layers: ``nn.ModuleList`` of decoder layers (LoRA-injected linears are fine).
+        norm: final RMSNorm.
+        rotary_emb: rotary embedding module (called as ``rotary_emb(x, position_ids)``).
+        lm_head: LM projection.
+        inputs_embeds: (B, L, H) interleaved embeddings — audio-encoder embeds at
+            audio positions, token embeds at text positions.
+        audio_mask: (B, L) bool, True at audio positions.
+        valid_mask: (B, L) bool, True at non-pad positions.
+        compute_logits: when False, only ``hidden_states`` is returned.
+
+    Returns:
+        dict with ``logits`` (B, L, V) [when ``compute_logits``] and
+        ``hidden_states`` (B, L, H) — the post-norm last hidden state.
+    """
+    device = inputs_embeds.device
+    dtype = inputs_embeds.dtype
+    B, L, H = inputs_embeds.shape
+    text_mask = valid_mask & ~audio_mask  # (B, L)
+
+    # --- Stage 1: pack text into a dense per-row sequence, run layers[:-1] ---
+    n_text = text_mask.long().sum(dim=1)  # (B,)
+    T = int(n_text.max().item()) if L > 0 else 0
+    text_rank = torch.cumsum(text_mask.long(), dim=1) - 1  # (B, L); meaningful at text pos
+    b_idx, l_idx = text_mask.nonzero(as_tuple=True)
+    dst_col = text_rank[b_idx, l_idx]
+
+    packed = inputs_embeds.new_zeros(B, max(T, 1), H)
+    packed[b_idx, dst_col] = inputs_embeds[b_idx, l_idx]
+    text_valid = torch.arange(max(T, 1), device=device)[None, :] < n_text[:, None]  # (B, T)
+    pos1 = torch.arange(max(T, 1), device=device)[None, :].expand(B, max(T, 1))
+    mask1 = _causal_additive_mask(text_valid, dtype)
+    pos_emb1 = rotary_emb(packed, pos1)
+
+    h = packed
+    for layer in layers[:-1]:
+        h = _run_decoder_layer(layer, h, mask1, pos1, pos_emb1)
+
+    # --- Stage 2: scatter text hidden back, interleave raw audio, run last layer ---
+    h_full = inputs_embeds.clone()  # audio positions keep raw encoder embeds
+    h_full[b_idx, l_idx] = h[b_idx, dst_col]
+    pos2 = (torch.cumsum(valid_mask.long(), dim=1) - 1).clamp(min=0)  # (B, L)
+    mask2 = _causal_additive_mask(valid_mask, dtype)
+    pos_emb2 = rotary_emb(h_full, pos2)
+    h_last = _run_decoder_layer(layers[-1], h_full, mask2, pos2, pos_emb2)
+    h_last = norm(h_last)
+
+    ans: dict[str, Tensor] = {"hidden_states": h_last}
+    if compute_logits:
+        ans["logits"] = lm_head(h_last)
+    return ans
+
+
 @dataclass
 class StreamingSTTModelConfig:
     pretrained_llm: str
@@ -257,6 +368,18 @@ class StreamingSTTModelConfig:
     # Applied identically in training and fixed-chunk inference via a custom 4D
     # additive mask. Only valid for chunk_size > 0.
     restrict_audio_to_own_chunk: bool = False
+    # --- Two-stream last-layer fusion (fixed chunking only) ---
+    # When True, the LLM processes the TEXT stream alone through layers[:-1]
+    # (a contiguous text-only sequence with its own causal mask and positions).
+    # Only in the FINAL layer are the audio-encoder frames interleaved back into
+    # the sequence (at their original chunk positions) so text queries can attend
+    # to audio via a single cross-modal layer, before final norm + LM head.
+    # Audio frames therefore never pass through the lower layers, and the text
+    # lower layers see a dense text-only sequence. Applied identically in training
+    # and fixed-chunk streaming inference (two KV caches). Only valid for
+    # chunk_size > 0 and mutually exclusive with use_chunk_classifier /
+    # restrict_audio_to_own_chunk.
+    two_stream_last_layer: bool = False
     # --- Compact template ---
     # Compact template: use a write token to trigger text generation, and the EOS token
     # is automatically generated by the tokenizer.
@@ -321,6 +444,12 @@ class StreamingState:
     is_audio: Optional[Tensor] = None  # (B, seq_len) bool: audio-frame positions
     chunk_id: Optional[Tensor] = None  # (B, seq_len) long: per-chunk id (audio positions)
     n_audio_chunks: int = 0  # number of audio chunks appended so far
+    # Two-stream (last-layer fusion) inference buffers. When two_stream_last_layer
+    # is on, the streaming path does NOT use ``cache``; instead it accumulates
+    # every fed embedding and its audio flag here and recomputes the two-stream
+    # forward over the full sequence each step (guaranteed parity with training).
+    ts_embeds: Optional[Tensor] = None  # (B, seq_len, H) fed embeddings
+    ts_is_audio: Optional[Tensor] = None  # (B, seq_len) bool: audio-frame positions
     batch_size: int = 1
 
     @property
@@ -441,6 +570,44 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 "[restricted-attention] restrict_audio_to_own_chunk=True | chunk_size=%d | "
                 "attn_impl=%s -- text queries attend to all text + only their own chunk's audio; "
                 "audio queries stay causal.",
+                self.core_cfg.chunk_size,
+                self.llm.config._attn_implementation,
+            )
+            logging.info("=" * 72)
+
+        # --- Two-stream last-layer fusion (fixed chunking only) ---
+        if self.core_cfg.two_stream_last_layer:
+            assert self.core_cfg.chunk_size > 0, (
+                "two_stream_last_layer=True requires fixed chunking "
+                f"(chunk_size>0), got chunk_size={self.core_cfg.chunk_size}"
+            )
+            assert not self.core_cfg.use_chunk_classifier, (
+                "two_stream_last_layer is mutually exclusive with use_chunk_classifier "
+                "(the latter requires chunk_size=0)."
+            )
+            assert not self.core_cfg.restrict_audio_to_own_chunk, (
+                "two_stream_last_layer is mutually exclusive with restrict_audio_to_own_chunk."
+            )
+            if create_causal_mask is None:
+                raise ImportError(
+                    "two_stream_last_layer requires transformers.masking_utils.create_causal_mask, "
+                    "which is unavailable in this transformers version."
+                )
+            # We drive the Qwen layer stack manually; sdpa/eager both honor the
+            # boolean/additive masks we build. flash-attention-2 does not.
+            attn_impl = getattr(self.llm.config, "_attn_implementation", None)
+            if attn_impl not in ("eager", "sdpa"):
+                logging.warning(
+                    "two_stream_last_layer needs an sdpa/eager attention backend; "
+                    "found _attn_implementation=%r. Forcing 'sdpa'.",
+                    attn_impl,
+                )
+                self.llm.config._attn_implementation = "sdpa"
+            logging.info("=" * 72)
+            logging.info(
+                "[two-stream] two_stream_last_layer=True | chunk_size=%d | attn_impl=%s "
+                "-- text stream runs through layers[:-1] alone; audio is interleaved only "
+                "in the final layer for cross-modal fusion.",
                 self.core_cfg.chunk_size,
                 self.llm.config._attn_implementation,
             )
@@ -701,6 +868,67 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             ans["cache"] = out["past_key_values"]
         return ans
 
+    def _two_stream_forward(
+        self,
+        input_embeds: Tensor,
+        audio_mask: Tensor,
+        valid_mask: Tensor,
+    ) -> dict[str, Tensor]:
+        """Full-sequence two-stream forward (see :func:`two_stream_llm_forward`).
+
+        ``self.llm.model`` / ``self.llm.lm_head`` resolve through the PEFT wrapper
+        when LoRA is installed, so the injected adapters stay active.
+        """
+        core = self.llm.model  # Qwen3Model (attribute access forwards through PEFT)
+        return two_stream_llm_forward(
+            layers=core.layers,
+            norm=core.norm,
+            rotary_emb=core.rotary_emb,
+            lm_head=self.llm.lm_head,
+            inputs_embeds=input_embeds,
+            audio_mask=audio_mask,
+            valid_mask=valid_mask,
+            compute_logits=True,
+        )
+
+    def _two_stream_infer_step(
+        self,
+        input_embeds: Tensor,
+        input_is_audio: Tensor,
+        state: "StreamingState",
+    ) -> SimpleNamespace:
+        """One streaming forward for two-stream inference (no KV cache).
+
+        Appends ``input_embeds`` / ``input_is_audio`` to the running buffers on
+        ``state`` and recomputes the two-stream forward over the FULL accumulated
+        sequence. This is O(L) layers × O(L) length per step, but guarantees the
+        inference math is byte-for-byte the same as the (tested) training forward
+        — the whole point of the two-stream experiment is a clean train/infer
+        comparison. ``state.attention_mask`` (the running validity mask) must
+        already be extended to cover ``input_embeds`` before this call.
+
+        Returns a ``SimpleNamespace`` mirroring the HF output (``logits`` for the
+        newly appended positions, ``past_key_values=None``).
+        """
+        if state.ts_embeds is None:
+            state.ts_embeds = input_embeds
+            state.ts_is_audio = input_is_audio
+        else:
+            state.ts_embeds = torch.cat([state.ts_embeds, input_embeds], dim=1)
+            state.ts_is_audio = torch.cat([state.ts_is_audio, input_is_audio], dim=1)
+
+        assert state.ts_embeds.shape[1] == state.attention_mask.shape[1], (
+            f"two-stream buffer length {state.ts_embeds.shape[1]} != attention_mask length "
+            f"{state.attention_mask.shape[1]}"
+        )
+        out = self._two_stream_forward(
+            state.ts_embeds,
+            state.ts_is_audio,
+            state.attention_mask.bool(),
+        )
+        q = input_embeds.shape[1]
+        return SimpleNamespace(logits=out["logits"][:, -q:, :], past_key_values=None, hidden_states=None)
+
     # ------------------------------------------------------------------
     # Training
     # ------------------------------------------------------------------
@@ -781,11 +1009,27 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                     "(shape=%s) -- this run uses restricted audio attention.",
                     tuple(attention_mask.shape),
                 )
-        outputs = self.forward(
-            inputs["input_embeds"],
-            attention_mask=attention_mask,
-            output_hidden_states=use_aux,
-        )
+        if self.core_cfg.two_stream_last_layer:
+            two_stream_audio_mask = batch.input_tokens == AUDIO_TOKEN_IDX  # (B, L)
+            two_stream_valid = batch.input_tokens != self.text_pad_id  # (B, L)
+            outputs = self._two_stream_forward(
+                inputs["input_embeds"], two_stream_audio_mask, two_stream_valid
+            )
+            if not getattr(self, "_two_stream_logged", False):
+                self._two_stream_logged = True
+                logging.info(
+                    "[two-stream] applied two-stream last-layer forward in training_step "
+                    "(text stream len<=%d, full len=%d) -- this run fuses audio only in the "
+                    "final layer.",
+                    int(two_stream_valid.sum(dim=1).max().item()),
+                    int(batch.input_tokens.shape[1]),
+                )
+        else:
+            outputs = self.forward(
+                inputs["input_embeds"],
+                attention_mask=attention_mask,
+                output_hidden_states=use_aux,
+            )
 
         target_ids = batch.target_tokens
 
@@ -1478,14 +1722,20 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 )
             else:
                 llm_attention_mask = state.attention_mask
-            out = self.llm(
-                inputs_embeds=token_emb,
-                past_key_values=cache,
-                attention_mask=llm_attention_mask,
-                use_cache=True,
-                return_dict=True,
-            )
-            cache = out.past_key_values
+            if self.core_cfg.two_stream_last_layer:
+                # Generated/filler tokens are all text.
+                text_is_audio = torch.zeros(B, 1, dtype=torch.bool, device=token_emb.device)
+                out = self._two_stream_infer_step(token_emb, text_is_audio, state)
+                cache = None
+            else:
+                out = self.llm(
+                    inputs_embeds=token_emb,
+                    past_key_values=cache,
+                    attention_mask=llm_attention_mask,
+                    use_cache=True,
+                    return_dict=True,
+                )
+                cache = out.past_key_values
             num_feed_steps += 1
 
             if all(finished):
@@ -1576,13 +1826,16 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 torch.tensor(all_sys_ids[0], device=device, dtype=torch.long).unsqueeze(0)
             ).expand(batch_size, -1, -1)
             attention_mask = torch.ones(batch_size, sys_lens[0], dtype=torch.long, device=device)
-            out = self.llm(
-                inputs_embeds=sys_embs,
-                attention_mask=attention_mask,
-                use_cache=True,
-                output_hidden_states=capture_hidden,
-                return_dict=True,
-            )
+            if self.core_cfg.two_stream_last_layer:
+                out = None  # two-stream recomputes from buffers; no KV-cache prefill
+            else:
+                out = self.llm(
+                    inputs_embeds=sys_embs,
+                    attention_mask=attention_mask,
+                    use_cache=True,
+                    output_hidden_states=capture_hidden,
+                    return_dict=True,
+                )
             max_sys_len = sys_lens[0]
         else:
             # Per-sample prompts with different lengths: left-pad and use attention mask
@@ -1599,15 +1852,26 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 offset = max_sys_len - sys_lens[b]
                 sys_embs[b, offset:] = embs
                 attention_mask[b, offset:] = 1
-            out = self.llm(
-                inputs_embeds=sys_embs,
-                attention_mask=attention_mask,
-                use_cache=True,
-                output_hidden_states=capture_hidden,
-                return_dict=True,
-            )
+            if self.core_cfg.two_stream_last_layer:
+                out = None  # two-stream recomputes from buffers; no KV-cache prefill
+            else:
+                out = self.llm(
+                    inputs_embeds=sys_embs,
+                    attention_mask=attention_mask,
+                    use_cache=True,
+                    output_hidden_states=capture_hidden,
+                    return_dict=True,
+                )
 
-        aux_hidden_buffer = out.hidden_states[-1] if capture_hidden else None
+        aux_hidden_buffer = out.hidden_states[-1] if (out is not None and capture_hidden) else None
+
+        # Two-stream inference buffers: seed with the (all-text) system prompt.
+        if self.core_cfg.two_stream_last_layer:
+            ts_embeds = sys_embs.contiguous()
+            ts_is_audio = torch.zeros(batch_size, max_sys_len, dtype=torch.bool, device=device)
+        else:
+            ts_embeds = None
+            ts_is_audio = None
 
         # System-prompt positions are all text (chunk 0); seed per-position
         # bookkeeping only when the chunk-restricted attention mask is enabled.
@@ -1628,7 +1892,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             cache_last_channel_len=cache_last_channel_len,
         )
         return StreamingState(
-            cache=out.past_key_values,
+            cache=(None if out is None else out.past_key_values),
             generated_tokens=[[] for _ in range(batch_size)],
             seq_lens=[max_sys_len] * batch_size,
             audio_cache=audio_cache,
@@ -1638,6 +1902,8 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             is_audio=init_is_audio,
             chunk_id=init_chunk_id,
             n_audio_chunks=0,
+            ts_embeds=ts_embeds,
+            ts_is_audio=ts_is_audio,
             batch_size=batch_size,
         )
 
@@ -1786,13 +2052,16 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             state.n_audio_chunks = new_chunk
         else:
             llm_attention_mask = state.attention_mask
-        out = self.llm(
-            inputs_embeds=input_embeds,
-            past_key_values=state.cache,
-            attention_mask=llm_attention_mask,
-            use_cache=True,
-            return_dict=True,
-        )
+        if self.core_cfg.two_stream_last_layer:
+            out = self._two_stream_infer_step(input_embeds, audio_mask, state)
+        else:
+            out = self.llm(
+                inputs_embeds=input_embeds,
+                past_key_values=state.cache,
+                attention_mask=llm_attention_mask,
+                use_cache=True,
+                return_dict=True,
+            )
         state.cache = out.past_key_values
         for b in range(B):
             state.seq_lens[b] += input_len
@@ -1829,13 +2098,17 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 )
             else:
                 llm_attention_mask = state.attention_mask
-            out = self.llm(
-                inputs_embeds=asst_footer_embs,
-                past_key_values=state.cache,
-                attention_mask=llm_attention_mask,
-                use_cache=True,
-                return_dict=True,
-            )
+            if self.core_cfg.two_stream_last_layer:
+                footer_is_audio = torch.zeros(B, flen, dtype=torch.bool, device=device)
+                out = self._two_stream_infer_step(asst_footer_embs, footer_is_audio, state)
+            else:
+                out = self.llm(
+                    inputs_embeds=asst_footer_embs,
+                    past_key_values=state.cache,
+                    attention_mask=llm_attention_mask,
+                    use_cache=True,
+                    return_dict=True,
+                )
             state.cache = out.past_key_values
             for b in range(B):
                 state.seq_lens[b] += flen
@@ -2037,6 +2310,12 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 ``None`` means no upper bound (default).
             generation_kwargs: Per-call overrides.
         """
+        if self.core_cfg.two_stream_last_layer:
+            raise NotImplementedError(
+                "two_stream_last_layer inference is only wired for the static fixed-chunk "
+                "path (_generate_chunked_streaming). Do not set use_state_machine_inference=True "
+                "with two_stream_last_layer."
+            )
         B = len(n_samples_list)
         if B == 0:
             return []
