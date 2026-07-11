@@ -123,6 +123,7 @@ echo "*******STARTING********" \
 && export HF_TOKEN=${HF_TOKEN} \
 && export HYDRA_FULL_ERROR=1 \
 && export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+&& export TMPDIR=/results/tmp && mkdir -p /results/tmp \
 && export AIS_ENDPOINT=http://asr.iad.oci.aistore.nvidia.com:51080 \
 && export AIS_AUTHN_TOKEN="${AIS_AUTHN_TOKEN}" \
 && export NEMO_DATA_STORE_CACHE_DIR=/lustre/fsw/portfolios/llmservice/users/heh/nemo_cache \
