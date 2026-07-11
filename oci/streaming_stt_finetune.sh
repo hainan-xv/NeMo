@@ -86,11 +86,16 @@ EXP_NAME=${CLUSTER}_${CONFIG_NAME}_lr${LR}_warmup${WARMUP_STEPS}${MODEL_SUFFIX}
 EXP_NAME=baseline
 
 # Directories for manifests, data, etc.
-RESULTS_DIR=${LUSTRE_ACCOUNT_PREFIX}/${USERID}/results/$PROJECT_NAME/$EXP_NAME
+# Write-heavy outputs (results/checkpoints, HF cache, checkpoint temp) go to the
+# nemotron project, which has free quota. The llmservice project that holds the
+# synced code is at its space limit, so writes there fail with EDQUOT. Override
+# the output location with OUTPUT_PREFIX.
+OUTPUT_PREFIX="${OUTPUT_PREFIX:-/lustre/fsw/portfolios/nemotron/users/hainanx}"
+RESULTS_DIR=${OUTPUT_PREFIX}/results/$PROJECT_NAME/$EXP_NAME
 PRETRAINED_MODEL_DIR=${LUSTRE_ACCOUNT_PREFIX}/${OLDUSERID}/pretrained_models
 CHECKPOINT_DIR=${LUSTRE_ACCOUNT_PREFIX}/${OLDUSERID}/checkpoints/
 QUESTIONS_DIR=${LUSTRE_ACCOUNT_PREFIX}/${OLDUSERID}/questions
-HFCACHE=${LUSTRE_ACCOUNT_PREFIX}/${USERID}/hf_cache
+HFCACHE=${OUTPUT_PREFIX}/hf_cache
 DATA_DIR=/lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data
 H_DIR=/lustre/fsw/portfolios/llmservice/users/heh
 HAINAN_DIR=/lustre/fsw/portfolios/llmservice/users/hainanx
@@ -101,8 +106,8 @@ CODE_DIR=${LUSTRE_ACCOUNT_PREFIX}/${USERID}/NeMo79
 # device as the checkpoint destination), not the container's small /tmp.
 OCI_TMP_DIR="${OCI_TMP_DIR:-/results/tmp}"
 
-# Make results dir
-mkdir -p ${RESULTS_DIR}
+# Make results + HF cache dirs (on the nemotron output filesystem)
+mkdir -p ${RESULTS_DIR} ${HFCACHE}
 OUTFILE=${RESULTS_DIR}/slurm-%j-%n.out
 ERRFILE=${RESULTS_DIR}/error-%j-%n.out
 
