@@ -20,7 +20,9 @@ fi
 # Stage existing tracked changes and the project-owned launch/sync scripts only.
 # Avoid `git add -A`, which could accidentally include local credentials.
 git add -u
-git add .gitignore ord sync_to_oci.sh sync_to_ord.sh
+git add .gitignore sync_to_oci.sh sync_to_ord.sh
+# The oci/ dir is gitignored (local scratch scripts); force-add just the launcher.
+git add -f oci/streaming_stt_finetune.sh
 
 if ! git diff --cached --quiet; then
   message="${1:-Sync OCI code $(date +%Y%m%d_%H%M%S)}"

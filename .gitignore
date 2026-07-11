@@ -199,5 +199,7 @@ eval_results/
 *.swp
 /.cursor/
 /exp
+# Local OCI scratch scripts are ignored; the tracked launcher is force-added
+# by sync_to_oci.sh / sync_to_ord.sh (git add -f oci/streaming_stt_finetune.sh).
 /oci/
 /nemo/collections/asr/models/NeMo.code-workspace

@@ -14,17 +14,21 @@
 #SBATCH --output=slurm_out/%x=%j --error=slurm_out/%x=%j
 
 # ============================================================================
-# Streaming SpeechLM (streaming_stt) finetune on ORD.
+# Streaming SpeechLM (streaming_stt) finetune on OCI (draco-oci, IAD).
 #
 # Adapted from NeMo/speechllm_oci/heh_new_with_im_end_loss.sh, with ONE key
 # difference: this launches against MY code instead of the code baked into the
 # container. We mount the git-synced repo (CODE_DIR, kept current via
-# sync_to_ord.sh) at /code, prepend it to PYTHONPATH so `import nemo` resolves
+# sync_to_oci.sh) at /code, prepend it to PYTHONPATH so `import nemo` resolves
 # to /code, and run /code/examples/speechlm2/streaming_stt_train.py directly.
 # The container is used only for the Python/CUDA/deps environment.
+#
+# Submit from an OCI login node (draco-oci-login-01.draco-oci-iad.nvidia.com):
+#   cd /lustre/fsw/portfolios/llmservice/users/hainanx/NeMo79
+#   sbatch oci/streaming_stt_finetune.sh
 # ============================================================================
 
-# Secrets live only in token files on the ORD login node. Each file contains
+# Secrets live only in token files on the OCI login node. Each file contains
 # just the token value on one line and must be readable only by the owner:
 #   chmod 600 ~/.wandb_token ~/.hf_token ~/.ais_authn_token
 read_required_token() {
@@ -45,7 +49,7 @@ fi
 
 # Do not enable xtrace: the command below contains expanded token values.
 mkdir -p slurm_out
-CLUSTER="ord"
+CLUSTER="oci"
 GPUS_PER_NODE=8
 SLURM_ACCOUNT='llmservice'
 OLDUSERID='users/heh'
@@ -88,7 +92,7 @@ HFCACHE=${LUSTRE_ACCOUNT_PREFIX}/${USERID}/hf_cache
 DATA_DIR=/lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data
 H_DIR=/lustre/fsw/portfolios/llmservice/users/heh
 HAINAN_DIR=/lustre/fsw/portfolios/llmservice/users/hainanx
-# MY code (synced via sync_to_ord.sh) -> mounted as /code.
+# MY code (synced via sync_to_oci.sh) -> mounted as /code.
 CODE_DIR=${LUSTRE_ACCOUNT_PREFIX}/${USERID}/NeMo79
 
 # Make results dir

@@ -17,11 +17,13 @@ if [[ "$current_branch" != "$BRANCH" ]]; then
   exit 1
 fi
 
-# Track modifications to existing code plus the project-owned ORD launch/sync
+# Track modifications to existing code plus the project-owned launch/sync
 # scripts. Do not use `git add -A`: unrelated local files and secrets must never
 # be swept into a GitHub commit.
 git add -u
-git add .gitignore ord sync_to_ord.sh
+git add .gitignore sync_to_ord.sh
+# The oci/ dir is gitignored (local scratch scripts); force-add just the launcher.
+git add -f oci/streaming_stt_finetune.sh
 
 if ! git diff --cached --quiet; then
   message="${1:-Sync ORD code $(date +%Y%m%d_%H%M%S)}"
