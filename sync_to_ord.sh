@@ -57,6 +57,9 @@ if [[ -r "$HOME/.github_token" ]]; then
 fi
 
 if [[ -d "$repo/.git" ]]; then
+  # Clear stale lock files left by a previously interrupted git operation
+  # (single-user sync, so no concurrent git process should legitimately hold one).
+  find "$repo/.git" -name '*.lock' -type f -delete 2>/dev/null || true
   git -C "$repo" "${git_auth[@]}" fetch --force "$url" \
     "$branch:refs/remotes/github/$branch"
   git -C "$repo" checkout -B "$branch" "refs/remotes/github/$branch"
