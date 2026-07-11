@@ -113,6 +113,7 @@ H_DIR=/lustre/fsw/portfolios/llmservice/users/heh
 HAINAN_DIR=/lustre/fsw/portfolios/llmservice/users/hainanx
 # MY code (synced via sync_to_oci.sh) -> mounted as /code.
 CODE_DIR=${LUSTRE_ACCOUNT_PREFIX}/${USERID}/NeMo79
+CODE_DIR=/lustre/fsw/portfolios/nemotron/users/hainanx/NeMo79/
 
 # Stage checkpoint/restore temp files on the lustre results filesystem (same
 # device as the checkpoint destination), not the container's small /tmp.
@@ -123,7 +124,9 @@ mkdir -p ${RESULTS_DIR} ${HFCACHE}
 OUTFILE=${RESULTS_DIR}/slurm-%j-%n.out
 ERRFILE=${RESULTS_DIR}/error-%j-%n.out
 
-MOUNTS="--container-mounts=${DATA_DIR}:${DATA_DIR},${H_DIR}:${H_DIR},$HAINAN_DIR:$HAINAN_DIR,$CODE_DIR:/code,$RESULTS_DIR:/results,$DATA_DIR:/data,$PRETRAINED_MODEL_DIR:/pretrained,$CHECKPOINT_DIR:/checkpoints,${QUESTIONS_DIR}:/questions/,${HFCACHE}:/hfcache/"
+DONGJI_DIR=/lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/users/dongjig/aligned_amos/granary_v2_en_pnc_qwen_aligned_filtered
+
+MOUNTS="--container-mounts=${DATA_DIR}:${DATA_DIR},${H_DIR}:${H_DIR},$HAINAN_DIR:$HAINAN_DIR,$CODE_DIR:/code,$RESULTS_DIR:/results,$DATA_DIR:/data,$PRETRAINED_MODEL_DIR:/pretrained,$CHECKPOINT_DIR:/checkpoints,${QUESTIONS_DIR}:/questions/,${HFCACHE}:/hfcache/,$DONGJI_DIR:$DONGJI_DIR"
 
 # SLURM_JOB_NUM_NODES=1
 # GPUS_PER_NODE=1
