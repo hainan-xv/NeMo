@@ -879,17 +879,41 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         ``self.llm.model`` / ``self.llm.lm_head`` resolve through the PEFT wrapper
         when LoRA is installed, so the injected adapters stay active.
         """
-        core = self.llm.model  # Qwen3Model (attribute access forwards through PEFT)
+        layers, norm, rotary_emb, lm_head = self._resolve_llm_core()
         return two_stream_llm_forward(
-            layers=core.layers,
-            norm=core.norm,
-            rotary_emb=core.rotary_emb,
-            lm_head=self.llm.lm_head,
+            layers=layers,
+            norm=norm,
+            rotary_emb=rotary_emb,
+            lm_head=lm_head,
             inputs_embeds=input_embeds,
             audio_mask=audio_mask,
             valid_mask=valid_mask,
             compute_logits=True,
         )
+
+    def _resolve_llm_core(self):
+        """Return ``(layers, norm, rotary_emb, lm_head)`` for the LLM.
+
+        Unwraps the PEFT/LoRA wrapper (``get_base_model()`` returns the underlying
+        ``*ForCausalLM`` with adapters still injected) and then walks down to the
+        decoder body that owns ``layers`` / ``norm`` / ``rotary_emb``. With LoRA
+        installed, ``self.llm.model`` resolves to the ``*ForCausalLM`` (not the
+        decoder), so a naive ``self.llm.model.layers`` fails.
+        """
+        llm = self.llm
+        base = llm.get_base_model() if hasattr(llm, "get_base_model") else llm
+        lm_head = getattr(base, "lm_head", None)
+        if lm_head is None:
+            lm_head = self.llm.lm_head
+        # Descend until we find the module holding the decoder layers.
+        core = base
+        while not hasattr(core, "layers") and hasattr(core, "model"):
+            core = core.model
+        if not hasattr(core, "layers"):
+            raise AttributeError(
+                f"Could not locate decoder layers on LLM of type {type(base).__name__}"
+            )
+        return core.layers, core.norm, core.rotary_emb, lm_head
 
     def _two_stream_infer_step(
         self,
