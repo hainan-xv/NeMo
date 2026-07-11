@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH -A nemotron_speechprod_asr
-#SBATCH -J nemotron_speechprod_asr:streaming-stt-imend-loss
+#SBATCH -J nemotron_speechprod_asr:streaming-stt-baseline
 #SBATCH -p batch_block1,batch_block3,batch_block4
 #SBATCH -N 8
 #SBATCH --gpus-per-node=8
@@ -60,7 +60,7 @@ LUSTRE_ACCOUNT_PREFIX=/lustre/fsw/portfolios/${SLURM_ACCOUNT}
 # the actual NeMo code comes from /code below).
 CONTAINER="gitlab-master.nvidia.com/hainanx/nemo_containers:speechlm_heh"
 
-PROJECT_NAME=Streaming_SLM_chunk14_refactor_2
+PROJECT_NAME=Speechlm79
 
 # Training parameters
 MAX_STEPS=200000
@@ -81,7 +81,7 @@ CONFIG_PATH=/lustre/fsw/portfolios/llmservice/users/heh/scripts/streaming_speech
 CONFIG_NAME=streaming_stt_nss_granary_lora
 
 EXP_NAME=${CLUSTER}_${CONFIG_NAME}_lr${LR}_warmup${WARMUP_STEPS}${MODEL_SUFFIX}
-EXP_NAME=baseline_imend_loss
+EXP_NAME=baseline
 
 # Directories for manifests, data, etc.
 RESULTS_DIR=${LUSTRE_ACCOUNT_PREFIX}/${USERID}/results/$PROJECT_NAME/$EXP_NAME
@@ -131,7 +131,6 @@ echo "*******STARTING********" \
     model.freeze_speech_encoder=${FREEZE_SPEECH_ENCODER} \
     model.att_context_size=[70,${LOOKAHEAD}] \
     model.chunk_size=${CHUNK_SIZE} \
-    ++model.supervise_im_end_in_loss=true \
     model.optimizer.lr=$LR \
     model.lr_scheduler.warmup_steps=$WARMUP_STEPS \
     data.dataset.num_delay_frames=$DELAY \

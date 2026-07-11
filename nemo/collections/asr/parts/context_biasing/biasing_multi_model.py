@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# Defer annotation evaluation so signatures referencing ``nn.Buffer`` (added in
+# torch 2.5) do not fail to import on older torch. The runtime ``nn.Buffer(...)``
+# uses below only execute if these GPU biasing models are instantiated.
+from __future__ import annotations
+
 import abc
 from abc import abstractmethod
 from dataclasses import dataclass, field
