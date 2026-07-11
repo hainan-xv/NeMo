@@ -20,7 +20,6 @@ from lightning import LightningModule
 from omegaconf import DictConfig
 from peft import PeftModel
 from torch import Tensor
-from torch.distributed.fsdp import fully_shard
 from torch.distributed.tensor import Replicate, Shard
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
@@ -48,6 +47,7 @@ from nemo.collections.speechlm2.parts.pretrained import (
     set_model_dict_for_partial_init,
     setup_speech_encoder,
 )
+from nemo.collections.speechlm2.parts.torch_compat import fully_shard
 from nemo.collections.speechlm2.streaming.duplex_stt_inference import DuplexSTTStreamingInference
 from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, NeuralType
 from nemo.utils import logging

@@ -36,14 +36,17 @@ from nemo.collections.speechlm2.data.streaming_stt_dataset import (
     AUDIO_TOKEN_IDX,
     IGNORE_INDEX,
     StreamingSTTBatch,
+    StreamingSTTDataConfig,
     StreamingSTTDataset,
     build_compact_turn_markers,
     decode_with_blank,
+    get_llm_messages_for_sample,
     parse_chat_template_ids,
 )
-from nemo.collections.speechlm2.parts.alignments import ForcedAligner
+from nemo.collections.speechlm2.parts.alignments import ForcedAligner, get_word_alignments_for_batch
 from nemo.collections.speechlm2.parts.hf_hub import HFHubMixin
 from nemo.collections.speechlm2.parts.lora import maybe_install_lora
+from nemo.collections.speechlm2.parts.metrics.wer import WER
 from nemo.collections.speechlm2.parts.optim_setup import configure_optimizers, is_frozen
 from nemo.collections.speechlm2.parts.pretrained import load_pretrained_hf, move_embedding, setup_perception
 from nemo.collections.speechlm2.parts.utils import freeze_module, to_dataclass, unfreeze_module
@@ -124,6 +127,91 @@ def interleave_embeddings(
     return {"input_embeds": embeds, "attention_mask": attention_mask}
 
 
+def audio_positions_and_chunk_ids(input_tokens: Tensor) -> tuple[Tensor, Tensor]:
+    """Identify audio positions and assign a per-chunk id from ``input_tokens``.
+
+    Each contiguous run of ``AUDIO_TOKEN_IDX`` is one chunk. ``chunk_id`` counts
+    those runs (1-based) and only carries meaning at audio positions; text
+    positions inherit the running count but are never compared as audio.
+
+    Returns:
+        ``(is_audio, chunk_id)`` — both ``(B, L)``; ``is_audio`` bool, ``chunk_id`` long.
+    """
+    is_audio = input_tokens == AUDIO_TOKEN_IDX  # (B, L)
+    prev_is_audio = F.pad(is_audio[:, :-1], (1, 0), value=False)
+    run_start = is_audio & ~prev_is_audio
+    chunk_id = torch.cumsum(run_start.long(), dim=1)
+    return is_audio, chunk_id
+
+
+def build_chunk_restricted_mask(
+    key_is_audio: Tensor,
+    key_chunk_id: Tensor,
+    key_valid: Tensor,
+    query_is_audio: Tensor,
+    query_chunk_id: Tensor,
+    query_abs_pos: Tensor,
+    key_abs_pos: Tensor,
+    dtype: torch.dtype,
+) -> Tensor:
+    """Build a 4D additive attention mask enforcing chunk-restricted audio attention.
+
+    A position is allowed to attend iff: it is causal (``key_abs_pos <=
+    query_abs_pos``), the key is not padding, and it is NOT the case that a
+    **text** query attends to an **audio** key from a different chunk. In other
+    words, text (transcription) queries may attend to all text/system tokens and
+    only their own chunk's audio frames; audio queries keep full causal
+    attention. Cross-chunk information therefore flows only through the emitted
+    text.
+
+    A text token's chunk id is the chunk of the audio run it follows (see
+    :func:`audio_positions_and_chunk_ids`), so the transcription emitted after
+    chunk ``k`` is bound to chunk ``k``'s audio.
+
+    All tensors are batched: ``*_is_audio``/``key_valid`` bool, ``*_chunk_id``/
+    ``*_abs_pos`` long. Query tensors are ``(B, Lq)`` and key tensors ``(B, Lk)``.
+
+    Returns:
+        Additive mask ``(B, 1, Lq, Lk)`` with ``0`` where attention is allowed and
+        ``torch.finfo(dtype).min`` where it is blocked.
+    """
+    causal = query_abs_pos[:, :, None] >= key_abs_pos[:, None, :]  # (B, Lq, Lk)
+    valid = key_valid[:, None, :]  # (B, 1, Lk)
+    query_is_text = ~query_is_audio
+    text_to_cross_chunk_audio = (
+        query_is_text[:, :, None]
+        & key_is_audio[:, None, :]
+        & (query_chunk_id[:, :, None] != key_chunk_id[:, None, :])
+    )
+    allowed = causal & valid & ~text_to_cross_chunk_audio  # (B, Lq, Lk)
+
+    additive = torch.zeros_like(allowed, dtype=dtype)
+    additive = additive.masked_fill(~allowed, torch.finfo(dtype).min)
+    return additive.unsqueeze(1)  # (B, 1, Lq, Lk)
+
+
+def build_training_chunk_restricted_mask(input_tokens: Tensor, pad_id: int, dtype: torch.dtype) -> Tensor:
+    """Full-sequence chunk-restricted 4D mask for teacher-forced training.
+
+    ``query`` and ``key`` axes are the same length ``L``; absolute positions are
+    ``0..L-1``.
+    """
+    is_audio, chunk_id = audio_positions_and_chunk_ids(input_tokens)
+    key_valid = input_tokens != pad_id
+    B, L = input_tokens.shape
+    abs_pos = torch.arange(L, device=input_tokens.device).unsqueeze(0).expand(B, L)
+    return build_chunk_restricted_mask(
+        key_is_audio=is_audio,
+        key_chunk_id=chunk_id,
+        key_valid=key_valid,
+        query_is_audio=is_audio,
+        query_chunk_id=chunk_id,
+        query_abs_pos=abs_pos,
+        key_abs_pos=abs_pos,
+        dtype=dtype,
+    )
+
+
 @dataclass
 class StreamingSTTModelConfig:
     pretrained_llm: str
@@ -145,7 +233,25 @@ class StreamingSTTModelConfig:
     frame_length_in_secs: float = 0.08
     blank_loss_weight: float = 1.0
     log_every_n_steps: int = 10
+    # Opt-in diagnostics for batch composition and loss decomposition. The
+    # aggregate loss and learning rate are always logged.
+    log_detailed_train_metrics: bool = False
+    # Validation uses real autoregressive streaming decoding. None chooses the
+    # number of frames per chunk for fixed chunking (or 64 otherwise).
+    val_max_new_tokens_per_chunk: Optional[int] = None
+    # Optional rank-zero autoregressive preview from the training stream.
+    # The interval is measured in optimizer steps, not microbatches.
+    train_decode_every_n_steps: int = 0
+    train_decode_max_new_tokens_per_chunk: Optional[int] = None
     dtype: str = "bfloat16"
+    # --- Chunk-restricted audio attention (fixed chunking only) ---
+    # When True, a TEXT (transcription) query in the LLM may attend to all
+    # text/system tokens but only to its own chunk's audio frames — not to audio
+    # frames of earlier chunks. Audio-frame queries keep full causal attention.
+    # This forces cross-chunk acoustic history to flow through the emitted text.
+    # Applied identically in training and fixed-chunk inference via a custom 4D
+    # additive mask. Only valid for chunk_size > 0.
+    restrict_audio_to_own_chunk: bool = False
     # --- Compact template ---
     # Compact template: use a write token to trigger text generation, and the EOS token
     # is automatically generated by the tokenizer.
@@ -205,6 +311,11 @@ class StreamingState:
     # chunk-boundary classifier when chunk_classifier_use_at_inference is True.
     # None when disabled — keeps the field cheap to always carry on the state.
     aux_hidden_buffer: Optional[Tensor] = None
+    # Per-position bookkeeping for chunk-restricted audio attention. Only
+    # populated when restrict_audio_to_own_chunk is True; otherwise None.
+    is_audio: Optional[Tensor] = None  # (B, seq_len) bool: audio-frame positions
+    chunk_id: Optional[Tensor] = None  # (B, seq_len) long: per-chunk id (audio positions)
+    n_audio_chunks: int = 0  # number of audio chunks appended so far
     batch_size: int = 1
 
     @property
@@ -297,6 +408,27 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         elif self.core_cfg.chunk_classifier_use_at_inference:
             raise ValueError("chunk_classifier_use_at_inference=True requires use_chunk_classifier=True")
 
+        # --- Chunk-restricted audio attention (fixed chunking only) ---
+        if self.core_cfg.restrict_audio_to_own_chunk:
+            assert self.core_cfg.chunk_size > 0, (
+                "restrict_audio_to_own_chunk=True requires fixed chunking "
+                f"(chunk_size>0), got chunk_size={self.core_cfg.chunk_size}"
+            )
+            assert not self.core_cfg.use_chunk_classifier, (
+                "restrict_audio_to_own_chunk is mutually exclusive with use_chunk_classifier "
+                "(the latter requires chunk_size=0)."
+            )
+            # Custom 4D additive masks are only honored by the eager and sdpa
+            # attention backends; flash-attention-2 cannot consume them.
+            attn_impl = getattr(self.llm.config, "_attn_implementation", None)
+            if attn_impl not in ("eager", "sdpa"):
+                logging.warning(
+                    "restrict_audio_to_own_chunk needs a 4D-mask-capable attention backend; "
+                    "found _attn_implementation=%r. Forcing 'sdpa'.",
+                    attn_impl,
+                )
+                self.llm.config._attn_implementation = "sdpa"
+
         self._apply_freeze_config()
 
         # --- LoRA ---
@@ -309,6 +441,13 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             else:
                 unfreeze_module(self.llm.lm_head)
 
+        self.val_system_prompt = (
+            data_cfg.get("system_prompt", "Transcribe the audio into text.")
+            if data_cfg is not None
+            else "Transcribe the audio into text."
+        )
+        self.val_prompt_field = data_cfg.get("prompt_field", "system_prompt") if data_cfg is not None else "system_prompt"
+
         if forced_aligner is not None:
             assert data_cfg is not None, "Dataset config is required for online forced alignment"
             assert dataset_cls is not None, "Dataset class is required for online forced alignment"
@@ -317,6 +456,13 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         else:
             self.forced_aligner = None
             self.dataset = None
+
+        # Standalone dataset config for the rank-zero training preview. In
+        # precomputed mode there is no self.dataset, so keep a resolved copy of
+        # the turn-construction settings to rebuild the reference transcript.
+        self._preview_data_cfg = to_dataclass(StreamingSTTDataConfig, data_cfg) if data_cfg is not None else None
+        if self._preview_data_cfg is not None:
+            self._preview_data_cfg.blank_token = self.blank_token
 
         logging.info("\n" + str(ModelSummary(self, max_depth=2)))
 
@@ -550,6 +696,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
 
         if self.forced_aligner is not None:
             alignments = self.forced_aligner.align(batch.audios, batch.audio_lens, batch.text)
+            self._latest_train_alignments = alignments
             batch = self.dataset.get_batch_data(
                 cuts=batch.cuts,
                 audios=batch.audios,
@@ -561,9 +708,14 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
 
         inputs = self._build_input_embeds(batch.input_tokens, batch.audios, batch.audio_lens)
         use_aux = self.core_cfg.use_chunk_classifier
+        attention_mask = inputs["attention_mask"]
+        if self.core_cfg.restrict_audio_to_own_chunk:
+            attention_mask = build_training_chunk_restricted_mask(
+                batch.input_tokens, self.text_pad_id, inputs["input_embeds"].dtype
+            )
         outputs = self.forward(
             inputs["input_embeds"],
-            attention_mask=inputs["attention_mask"],
+            attention_mask=attention_mask,
             output_hidden_states=use_aux,
         )
 
@@ -669,30 +821,144 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 loss = loss + cls_w * cls_loss
                 cls_loss_log = cls_loss.detach()
                 cls_pos_ratio = num_pos.float() / num_decisions.clamp(min=1).float()
-                self.log_dict(
-                    {"loss_chunk_cls_pos_ratio": cls_pos_ratio},
-                    on_step=True,
-                )
+                if self.core_cfg.log_detailed_train_metrics:
+                    self.log_dict(
+                        {"loss_chunk_cls_pos_ratio": cls_pos_ratio},
+                        on_step=True,
+                    )
 
         B, L = inputs["input_embeds"].shape[:2]
-        self.log_dict(
-            {
-                "loss": loss,
-                "loss_blank": loss_blank,
-                "loss_nonblank": loss_nonblank,
-                "loss_chunk_cls": cls_loss_log,
-                "blank_ratio": num_blank.float() / num_targets,
-                "learning_rate": torch.as_tensor(
-                    self.trainer.optimizers[0].param_groups[0]["lr"] if self._trainer is not None else 0
-                ),
-                "batch_size": float(B),
-                "sequence_length": float(L),
-                "num_targets": num_targets.float(),
-                "target_to_input_ratio": num_targets / (B * L),
-            },
-            on_step=True,
-        )
+        train_metrics = {
+            "loss": loss,
+            "learning_rate": torch.as_tensor(
+                self.trainer.optimizers[0].param_groups[0]["lr"] if self._trainer is not None else 0
+            ),
+        }
+        if self.core_cfg.log_detailed_train_metrics:
+            train_metrics.update(
+                {
+                    "loss_blank": loss_blank,
+                    "loss_nonblank": loss_nonblank,
+                    "loss_chunk_cls": cls_loss_log,
+                    "blank_ratio": num_blank.float() / num_targets,
+                    "sequence_length": float(L),
+                    "num_targets": num_targets.float(),
+                    "target_to_input_ratio": num_targets / (B * L),
+                }
+            )
+        self.log_dict(train_metrics, on_step=True)
         return {"loss": loss}
+
+    @property
+    def train_decode_max_new_tokens_per_chunk(self) -> int:
+        configured = self.core_cfg.train_decode_max_new_tokens_per_chunk
+        if configured is not None:
+            if configured <= 0:
+                raise ValueError("train_decode_max_new_tokens_per_chunk must be positive")
+            return configured
+        if self.core_cfg.chunk_size > 0:
+            return self.core_cfg.chunk_size
+        return 64
+
+    def _training_reference_with_chunk_boundaries(self, batch: StreamingSTTBatch) -> str:
+        """Render the first transcript using the same aligned turns as training.
+
+        Falls back to the plain reference (no chunk separators) whenever
+        alignments are unavailable — e.g. precomputed mode without cuts — so the
+        preview never fails just because it cannot draw boundaries.
+        """
+        alignments = getattr(self, "_latest_train_alignments", None)
+        if alignments is None:
+            if getattr(batch, "cuts", None) is None:
+                return batch.text[0]
+            try:
+                alignments = get_word_alignments_for_batch(cuts=batch.cuts)
+            except Exception:
+                return batch.text[0]
+        if not alignments or alignments[0] is None:
+            return batch.text[0]
+
+        cfg = self.dataset.cfg if self.dataset is not None else self._preview_data_cfg
+        if cfg is None:
+            return batch.text[0]
+        prompts = self._validation_system_prompts(batch)
+        prompt = prompts[0] if isinstance(prompts, list) else prompts
+        messages = get_llm_messages_for_sample(
+            system_role=cfg.system_role,
+            system_prompt=prompt,
+            audio_tag=cfg.audio_tag,
+            blank_token=cfg.blank_token,
+            chunk_size=cfg.chunk_size,
+            num_delay_frames=cfg.num_delay_frames,
+            audio_duration_secs=float(batch.audio_lens[0].item()) / cfg.sample_rate,
+            frame_length_in_secs=cfg.frame_length_in_secs,
+            alignments=alignments[0],
+            transcript=batch.text[0],
+            words_per_group=cfg.words_per_group,
+            chunk_step=cfg.chunk_step,
+        )
+        chunk_text = [
+            "" if message["content"] == cfg.blank_token else message["content"].strip()
+            for message in messages
+            if message["role"] == "assistant"
+        ]
+        return " | ".join(chunk_text)
+
+    def on_train_batch_end(self, outputs, batch: StreamingSTTBatch, batch_idx: int) -> None:
+        """Periodically print a real autoregressive hypothesis for one training utterance."""
+        interval = self.core_cfg.train_decode_every_n_steps
+        if interval <= 0 or self.trainer is None or not self.trainer.is_global_zero:
+            return
+
+        step = int(self.trainer.global_step)
+        if step <= 0 or step % interval != 0 or getattr(self, "_last_train_decode_step", None) == step:
+            return
+        self._last_train_decode_step = step
+
+        if not isinstance(batch, StreamingSTTBatch) or not batch.text:
+            logging.warning("Skipping train autoregressive preview at step %d: unsupported/empty batch", step)
+            return
+
+        prompts = self._validation_system_prompts(batch)
+        prompt = prompts[0] if isinstance(prompts, list) else prompts
+        module_training_states = [(module, module.training) for module in self.modules()]
+        self.eval()
+        try:
+            hyps = self.generate(
+                audios=batch.audios[:1],
+                audio_lens=batch.audio_lens[:1],
+                system_prompt=prompt,
+                max_new_tokens=self.train_decode_max_new_tokens_per_chunk,
+                generation_config=GenerationConfig(do_sample=False),
+                chunk_separator="|",
+            )
+            plain_hyp = " ".join(hyps[0].replace("|", " ").split())
+            preview_wer = WER(normalize=True, verbose=False)
+            preview_wer.update("preview", refs=[batch.text[0]], hyps=[plain_hyp])
+            training_wer = preview_wer.compute()["wer"].to(self.device)
+            self.log(
+                "training_wer",
+                training_wer,
+                on_step=True,
+                on_epoch=False,
+                logger=True,
+                sync_dist=False,
+                rank_zero_only=True,
+            )
+            logging.info(
+                "[train-ar] step %d (WER %.4f, max %d tokens/chunk)\n  ref: `%s`\n  hyp: `%s`",
+                step,
+                training_wer.item(),
+                self.train_decode_max_new_tokens_per_chunk,
+                self._training_reference_with_chunk_boundaries(batch),
+                hyps[0],
+            )
+        except Exception as error:
+            logging.warning("Train autoregressive preview failed at step %d: %s", step, error)
+        finally:
+            self._latest_train_alignments = None
+            for module, was_training in module_training_states:
+                module.training = was_training
 
     def configure_optimizers(self):
         return configure_optimizers(self)
@@ -701,58 +967,57 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
     # Validation
     # ------------------------------------------------------------------
 
+    @property
+    def val_max_new_tokens_per_chunk(self) -> int:
+        """Resolve the autoregressive validation cap."""
+        configured = self.core_cfg.val_max_new_tokens_per_chunk
+        if configured is not None:
+            if configured <= 0:
+                raise ValueError("val_max_new_tokens_per_chunk must be positive")
+            return configured
+        if self.core_cfg.chunk_size > 0:
+            return self.core_cfg.chunk_size
+        return 64
+
+    def _validation_system_prompts(self, batch: StreamingSTTBatch) -> Union[str, List[str]]:
+        if batch.cuts is None:
+            return self.val_system_prompt
+        return [
+            (cut.custom or {}).get(self.val_prompt_field, self.val_system_prompt)
+            for cut in batch.cuts
+        ]
+
     def on_validation_epoch_start(self) -> None:
-        self._partial_val_losses: dict[str, list] = defaultdict(list)
-        self._partial_accuracies: dict[str, list] = defaultdict(list)
-        # Per-class TP/total counts for the aux chunk classifier. Aggregated
-        # across the epoch so macro acc isn't biased by per-batch composition.
-        self._partial_aux_pos_correct: dict[str, list] = defaultdict(list)
-        self._partial_aux_pos_total: dict[str, list] = defaultdict(list)
-        self._partial_aux_neg_correct: dict[str, list] = defaultdict(list)
-        self._partial_aux_neg_total: dict[str, list] = defaultdict(list)
+        self._partial_wer_refs: dict[str, list[str]] = defaultdict(list)
+        self._partial_wer_hyps: dict[str, list[str]] = defaultdict(list)
 
     def on_validation_epoch_end(self) -> None:
-        val_losses = []
-        for name, vals in self._partial_val_losses.items():
-            val_loss = torch.stack(vals).mean()
-            self.log(f"val_loss_{name}", val_loss, on_epoch=True, sync_dist=True)
-            val_losses.append(val_loss)
-        if val_losses:
-            self.log("val_loss", torch.stack(val_losses).mean(), on_epoch=True, sync_dist=True)
+        # Gather decoded strings, then compute true corpus WER on every rank.
+        # Averaging rank-local WERs would be incorrect when ranks see different
+        # numbers of reference words.
+        local_wer_data = {
+            name: {"refs": self._partial_wer_refs[name], "hyps": self._partial_wer_hyps[name]}
+            for name in self._partial_wer_refs
+        }
+        if torch.distributed.is_initialized():
+            gathered_wer_data = [None] * torch.distributed.get_world_size()
+            torch.distributed.all_gather_object(gathered_wer_data, local_wer_data)
+        else:
+            gathered_wer_data = [local_wer_data]
 
-        accuracies = []
-        for name, accs in self._partial_accuracies.items():
-            val_acc = torch.stack(accs).mean()
-            self.log(f"val_acc_{name}", val_acc, on_epoch=True, sync_dist=True)
-            accuracies.append(val_acc)
-        if accuracies:
-            self.log("val_acc", torch.stack(accuracies).mean(), on_epoch=True, sync_dist=True)
+        wer = WER(normalize=True, verbose=False)
+        has_wer_data = False
+        for rank_data in gathered_wer_data:
+            for name, values in rank_data.items():
+                has_wer_data = has_wer_data or bool(values["refs"])
+                wer.update(name, refs=values["refs"], hyps=values["hyps"])
+        if has_wer_data:
+            for metric_name, metric_value in wer.compute().items():
+                log_name = "val_wer" if metric_name == "wer" else f"val_{metric_name}"
+                self.log(log_name, metric_value.to(self.device), on_epoch=True, sync_dist=False)
 
-        # --- Aux chunk classifier: macro accuracy ---
-        # Sum per-class counts across the epoch and compute pos/neg accuracy
-        # once at the end. Macro acc = (pos_acc + neg_acc) / 2 — class-balanced.
-        macro_accs = []
-        for name in self._partial_aux_pos_total.keys():
-            pos_correct = torch.stack(self._partial_aux_pos_correct[name]).sum()
-            pos_total = torch.stack(self._partial_aux_pos_total[name]).sum()
-            neg_correct = torch.stack(self._partial_aux_neg_correct[name]).sum()
-            neg_total = torch.stack(self._partial_aux_neg_total[name]).sum()
-            pos_acc = pos_correct.float() / pos_total.clamp(min=1).float()
-            neg_acc = neg_correct.float() / neg_total.clamp(min=1).float()
-            macro = (pos_acc + neg_acc) / 2
-            self.log(f"val_aux_pos_acc_{name}", pos_acc, on_epoch=True, sync_dist=True)
-            self.log(f"val_aux_neg_acc_{name}", neg_acc, on_epoch=True, sync_dist=True)
-            self.log(f"val_aux_macro_acc_{name}", macro, on_epoch=True, sync_dist=True)
-            macro_accs.append(macro)
-        if macro_accs:
-            self.log("val_aux_macro_acc", torch.stack(macro_accs).mean(), on_epoch=True, sync_dist=True)
-
-        self._partial_val_losses.clear()
-        self._partial_accuracies.clear()
-        self._partial_aux_pos_correct.clear()
-        self._partial_aux_pos_total.clear()
-        self._partial_aux_neg_correct.clear()
-        self._partial_aux_neg_total.clear()
+        self._partial_wer_refs.clear()
+        self._partial_wer_hyps.clear()
 
     def validation_step(self, batch, batch_idx: int):
         # Support multiple validation dataloaders ({name: batch} dict).
@@ -764,113 +1029,27 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             self._eval_step(batch, "val", batch_idx)
 
     def _eval_step(self, batch: StreamingSTTBatch, name: str, batch_idx: int = 0) -> None:
-        if self.forced_aligner is not None:
-            alignments = self.forced_aligner.align(batch.audios, batch.audio_lens, batch.text)
-            batch = self.dataset.get_batch_data(
-                cuts=batch.cuts,
-                audios=batch.audios,
-                audio_lens=batch.audio_lens,
-                alignments=alignments,
-                text=batch.text,
-            )
-            batch = move_data_to_device(batch, self.device)
-
-        inputs = self._build_input_embeds(batch.input_tokens, batch.audios, batch.audio_lens)
-        aux_active = self.core_cfg.use_chunk_classifier and self.has_blank and self._user_footer_first_id is not None
-        outputs = self.forward(
-            inputs["input_embeds"],
-            attention_mask=inputs["attention_mask"],
-            output_hidden_states=aux_active,
+        # Validation is decode-only: unlike teacher-forced loss, autoregressive
+        # WER does not require word alignments or constructed target turns.
+        refs = list(batch.text)
+        hyps = self.generate(
+            audios=batch.audios,
+            audio_lens=batch.audio_lens,
+            system_prompt=self._validation_system_prompts(batch),
+            max_new_tokens=self.val_max_new_tokens_per_chunk,
+            generation_config=GenerationConfig(do_sample=False),
         )
+        self._partial_wer_refs[name].extend(refs)
+        self._partial_wer_hyps[name].extend(hyps)
 
-        target_ids = batch.target_tokens
-        # Mirror training-time LM-CE masking: when the aux head owns the
-        # boundary decision, audio positions are not LM-supervised in
-        # training, so they must also be excluded from val_loss / val_acc —
-        # otherwise val metrics are dominated by positions the LM was never
-        # trained on. If keep_lm_supervision_at_audio is True, the LM IS
-        # supervised at audio positions during training, so don't mask in val.
-        if aux_active and not self.core_cfg.chunk_classifier_keep_lm_supervision_at_audio:
-            audio_mask_for_lm = batch.input_tokens == AUDIO_TOKEN_IDX
-            target_ids = torch.where(audio_mask_for_lm, torch.full_like(target_ids, IGNORE_INDEX), target_ids)
-        num_targets = (target_ids != IGNORE_INDEX).long().sum()
-
-        with loss_parallel():
-            loss = F.cross_entropy(
-                outputs["logits"].flatten(0, 1),
-                target_ids.flatten(0, 1),
-                reduction="sum",
-                ignore_index=IGNORE_INDEX,
-            ) / num_targets.clamp(min=1)
-
-        preds = outputs["logits"].argmax(dim=-1).view(-1)
-        refs = target_ids.reshape(-1)
-        preds = preds[refs != IGNORE_INDEX]
-        refs = refs[refs != IGNORE_INDEX]
-        accuracy = preds.eq(refs).float().mean()
-
-        self._partial_val_losses[name].append(loss)
-        self._partial_accuracies[name].append(accuracy)
-
-        # --- Aux chunk classifier: per-class correct/total counts ---
-        if aux_active:
-            audio_mask = batch.input_tokens == AUDIO_TOKEN_IDX  # (B, L)
-            audio_mask_flat = audio_mask.flatten(0, 1)
-            orig_targets_flat = batch.target_tokens.flatten(0, 1)
-            decision_mask = audio_mask_flat & (orig_targets_flat != IGNORE_INDEX)
-            if decision_mask.any():
-                aux_out = self.chunk_classifier_backbone(
-                    inputs_embeds=outputs["hidden_states"],
-                    attention_mask=inputs["attention_mask"],
-                    return_dict=True,
-                )
-                flat_aux = aux_out.last_hidden_state.flatten(0, 1)
-                cls_logits = self.chunk_classifier_head(flat_aux[decision_mask]).squeeze(-1)
-                cls_targets = orig_targets_flat[decision_mask] == self._user_footer_first_id
-                # Use the configured threshold so val acc reflects what
-                # _generate_dynamic_streaming will actually do at inference.
-                thr = self.core_cfg.chunk_classifier_threshold
-                cls_preds = torch.sigmoid(cls_logits) >= thr
-                correct = cls_preds == cls_targets
-                pos_mask = cls_targets
-                neg_mask = ~cls_targets
-                self._partial_aux_pos_correct[name].append((correct & pos_mask).sum().detach())
-                self._partial_aux_pos_total[name].append(pos_mask.sum().detach())
-                self._partial_aux_neg_correct[name].append((correct & neg_mask).sum().detach())
-                self._partial_aux_neg_total[name].append(neg_mask.sum().detach())
-
-        # Log decoded predictions vs references periodically (first sample in batch).
-        if batch_idx % self.core_cfg.log_every_n_steps == 0:
-            # Decode only positions where the LM head was actually trained.
-            # Important when use_chunk_classifier=True with
-            # keep_lm_supervision_at_audio=False: at audio positions the LM
-            # head is unsupervised and its argmax output is meaningless. Using
-            # the post-masking `target_ids` (audio = IGNORE_INDEX) restricts
-            # the printed `pred` to text positions only, matching what the LM
-            # was actually optimized for. This is teacher-forced argmax —
-            # any LM-head emit threshold is an *inference-time* concept and
-            # does not apply here.
-            sample_target = target_ids[0]
-            sample_logits = outputs["logits"][0]
-            sample_preds = sample_logits.argmax(dim=-1)
-            mask = sample_target != IGNORE_INDEX
-            sample_ref_ids = sample_target[mask].tolist()
-            sample_pred_ids = sample_preds[mask].tolist()
-
-            ref_decoded = decode_with_blank(
-                sample_ref_ids, self.blank_token, self.tokenizer, write_token=self.core_cfg.write_token
-            )
-            pred_decoded = decode_with_blank(
-                sample_pred_ids, self.blank_token, self.tokenizer, write_token=self.core_cfg.write_token
-            )
-            ref_text = batch.text[0] if batch.text else ""
+        if batch_idx % self.core_cfg.log_every_n_steps == 0 and refs and hyps:
             logging.info(
-                "[%s] batch %d\n  gt:         `%s`\n  ref_tokens: `%s`\n  pred:       `%s`",
+                "[%s] autoregressive batch %d (max %d tokens/chunk)\n  ref: `%s`\n  hyp: `%s`",
                 name,
                 batch_idx,
-                ref_text,
-                ref_decoded,
-                pred_decoded,
+                self.val_max_new_tokens_per_chunk,
+                refs[0],
+                hyps[0],
             )
 
     # ------------------------------------------------------------------
@@ -1217,10 +1396,24 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 ],
                 dim=1,
             )
+            # Generated tokens are text. Under the chunk-restricted mask they may
+            # attend to all text but only the current chunk's audio, so extend the
+            # per-position bookkeeping and pass the 4D mask to match training.
+            if self.core_cfg.restrict_audio_to_own_chunk and state.is_audio is not None:
+                new_is_audio = torch.zeros(B, 1, dtype=torch.bool, device=state.attention_mask.device)
+                # Generated transcription belongs to the current (most recent) chunk.
+                new_chunk_id = torch.full(
+                    (B, 1), state.n_audio_chunks, dtype=state.chunk_id.dtype, device=state.attention_mask.device
+                )
+                llm_attention_mask = self._extend_and_build_restricted_mask(
+                    state, new_is_audio, new_chunk_id, token_emb.dtype
+                )
+            else:
+                llm_attention_mask = state.attention_mask
             out = self.llm(
                 inputs_embeds=token_emb,
                 past_key_values=cache,
-                attention_mask=state.attention_mask,
+                attention_mask=llm_attention_mask,
                 use_cache=True,
                 return_dict=True,
             )
@@ -1348,6 +1541,15 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
 
         aux_hidden_buffer = out.hidden_states[-1] if capture_hidden else None
 
+        # System-prompt positions are all text (chunk 0); seed per-position
+        # bookkeeping only when the chunk-restricted attention mask is enabled.
+        if self.core_cfg.restrict_audio_to_own_chunk:
+            init_is_audio = torch.zeros(batch_size, max_sys_len, dtype=torch.bool, device=device)
+            init_chunk_id = torch.zeros(batch_size, max_sys_len, dtype=torch.long, device=device)
+        else:
+            init_is_audio = None
+            init_chunk_id = None
+
         cache_last_channel, cache_last_time, cache_last_channel_len = self.perception.get_initial_cache_state(
             batch_size=batch_size, dtype=dtype, device=device
         )
@@ -1365,7 +1567,40 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             audio_feature_buffer=audio_feature_buffer,
             attention_mask=attention_mask,
             aux_hidden_buffer=aux_hidden_buffer,
+            is_audio=init_is_audio,
+            chunk_id=init_chunk_id,
+            n_audio_chunks=0,
             batch_size=batch_size,
+        )
+
+    def _extend_and_build_restricted_mask(
+        self,
+        state: 'StreamingState',
+        input_is_audio: Tensor,
+        input_chunk_id: Tensor,
+        dtype: torch.dtype,
+    ) -> Tensor:
+        """Append the new positions' audio/chunk bookkeeping and build the 4D mask.
+
+        ``state.attention_mask`` must already be extended to include the new
+        query positions. ``input_is_audio``/``input_chunk_id`` are ``(B, q_len)``.
+        """
+        state.is_audio = torch.cat([state.is_audio, input_is_audio], dim=1)
+        state.chunk_id = torch.cat([state.chunk_id, input_chunk_id], dim=1)
+        B, total = state.attention_mask.shape
+        q_len = input_is_audio.shape[1]
+        device = state.attention_mask.device
+        key_abs = torch.arange(total, device=device).unsqueeze(0).expand(B, total)
+        query_abs = torch.arange(total - q_len, total, device=device).unsqueeze(0).expand(B, q_len)
+        return build_chunk_restricted_mask(
+            key_is_audio=state.is_audio,
+            key_chunk_id=state.chunk_id,
+            key_valid=state.attention_mask.bool(),
+            query_is_audio=input_is_audio,
+            query_chunk_id=input_chunk_id,
+            query_abs_pos=query_abs,
+            key_abs_pos=key_abs,
+            dtype=dtype,
         )
 
     @torch.no_grad()
@@ -1462,10 +1697,31 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             [state.attention_mask, torch.ones(B, input_len, dtype=state.attention_mask.dtype, device=device)],
             dim=1,
         )
+        # Chunk-restricted attention: this turn's audio slots belong to a new
+        # chunk. Text queries emitted for this chunk may only attend to this
+        # chunk's audio (plus all text); audio queries keep full causal access.
+        if self.core_cfg.restrict_audio_to_own_chunk and state.is_audio is not None:
+            carry = state.n_audio_chunks
+            new_chunk = carry + 1
+            input_is_audio = audio_mask  # (B, input_len)
+            # Match the training cumsum: positions before this turn's first audio
+            # frame keep the previous chunk id; the audio run and everything after
+            # it (write token / assistant header) belong to the new chunk.
+            audio_cols = [i for i, t in enumerate(self._turn_template_ids) if t == AUDIO_TOKEN_IDX]
+            first_audio = audio_cols[0] if audio_cols else input_len
+            chunk_ids_row = torch.full((input_len,), carry, dtype=state.chunk_id.dtype, device=device)
+            chunk_ids_row[first_audio:] = new_chunk
+            input_chunk_id = chunk_ids_row.unsqueeze(0).expand(B, input_len)
+            llm_attention_mask = self._extend_and_build_restricted_mask(
+                state, input_is_audio, input_chunk_id, input_embeds.dtype
+            )
+            state.n_audio_chunks = new_chunk
+        else:
+            llm_attention_mask = state.attention_mask
         out = self.llm(
             inputs_embeds=input_embeds,
             past_key_values=state.cache,
-            attention_mask=state.attention_mask,
+            attention_mask=llm_attention_mask,
             use_cache=True,
             return_dict=True,
         )
@@ -1494,10 +1750,21 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 [state.attention_mask, torch.ones(B, flen, dtype=state.attention_mask.dtype, device=device)],
                 dim=1,
             )
+            # Footer tokens are text belonging to the current chunk.
+            if self.core_cfg.restrict_audio_to_own_chunk and state.is_audio is not None:
+                footer_is_audio = torch.zeros(B, flen, dtype=torch.bool, device=device)
+                footer_chunk_id = torch.full(
+                    (B, flen), state.n_audio_chunks, dtype=state.chunk_id.dtype, device=device
+                )
+                llm_attention_mask = self._extend_and_build_restricted_mask(
+                    state, footer_is_audio, footer_chunk_id, asst_footer_embs.dtype
+                )
+            else:
+                llm_attention_mask = state.attention_mask
             out = self.llm(
                 inputs_embeds=asst_footer_embs,
                 past_key_values=state.cache,
-                attention_mask=state.attention_mask,
+                attention_mask=llm_attention_mask,
                 use_cache=True,
                 return_dict=True,
             )
@@ -1659,7 +1926,10 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         )
 
         # 8. Decode tokens to text
-        return [decode_with_blank(toks, self.blank_token, self.tokenizer) for toks in generated_per_stream]
+        return [
+            decode_with_blank(toks, self.blank_token, self.tokenizer, write_token=self.core_cfg.write_token)
+            for toks in generated_per_stream
+        ]
 
     def _generate_dynamic_streaming(
         self,
@@ -1673,6 +1943,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         dynamic_max_chunk_size: Optional[int] = None,
         lm_head_emit_threshold: Optional[float] = None,
         debug_logs: Optional[list] = None,
+        chunk_separator: Optional[str] = None,
         **generation_kwargs,
     ) -> list[str]:
         """Batched dynamic-chunking generation.
@@ -2161,7 +2432,16 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
 
         if log_frames:
             debug_logs.extend(per_stream_frame_logs)
-        return [decode_with_blank(toks, self.blank_token, self.tokenizer) for toks in all_tokens]
+        return [
+            decode_with_blank(
+                toks,
+                self.blank_token,
+                self.tokenizer,
+                replace_blank=chunk_separator,
+                write_token=self.core_cfg.write_token,
+            )
+            for toks in all_tokens
+        ]
 
     @staticmethod
     def _dynamic_finish_generating(
@@ -2195,6 +2475,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         max_new_tokens: int,
         generation_config: Optional[GenerationConfig] = None,
         use_offline_embs: bool = False,
+        chunk_separator: Optional[str] = None,
         **generation_kwargs,
     ) -> list[str]:
         """Chunk-by-chunk streaming generation for B samples in lockstep.
@@ -2233,6 +2514,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         num_chunks_per_stream = [math.ceil(ns / chunk_samples) if ns > 0 else 0 for ns in n_samples_list]
         max_chunks = max(num_chunks_per_stream)
         all_token_ids: list[list[int]] = [[] for _ in range(B)]
+        all_chunk_token_ids: list[list[list[int]]] = [[] for _ in range(B)]
 
         for chunk_i in range(max_chunks):
             # Build B audio chunks (zero-pad finished streams)
@@ -2279,8 +2561,32 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 # Only collect tokens for streams that are still active
                 if chunk_i < num_chunks_per_stream[b]:
                     all_token_ids[b].extend(chunk_tokens[b])
+                    all_chunk_token_ids[b].append(chunk_tokens[b])
 
-        return [decode_with_blank(toks, self.blank_token, self.tokenizer) for toks in all_token_ids]
+        if chunk_separator is not None:
+            return [
+                f" {chunk_separator} ".join(
+                    decode_with_blank(
+                        chunk_tokens,
+                        self.blank_token,
+                        self.tokenizer,
+                        strip_whitespace=True,
+                        write_token=self.core_cfg.write_token,
+                    )
+                    for chunk_tokens in stream_chunks
+                )
+                for stream_chunks in all_chunk_token_ids
+            ]
+
+        return [
+            decode_with_blank(
+                toks,
+                self.blank_token,
+                self.tokenizer,
+                write_token=self.core_cfg.write_token,
+            )
+            for toks in all_token_ids
+        ]
 
     @torch.no_grad()
     def generate(
@@ -2296,6 +2602,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         dynamic_max_chunk_size: Optional[int] = None,
         lm_head_emit_threshold: Optional[float] = None,
         debug_logs: Optional[list] = None,
+        chunk_separator: Optional[str] = None,
         **generation_kwargs,
     ) -> list[str]:
         """
@@ -2313,6 +2620,8 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 the model is allowed to trigger generation (default 0).
             dynamic_max_chunk_size: For dynamic chunking — maximum frames before
                 forcing generation. ``None`` means no upper bound (default).
+            chunk_separator: If set, include this marker at decoded streaming
+                chunk boundaries.
             generation_kwargs: Per-call overrides for generation parameters.
 
         Returns:
@@ -2346,6 +2655,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                     dynamic_max_chunk_size=dynamic_max_chunk_size,
                     lm_head_emit_threshold=lm_head_emit_threshold,
                     debug_logs=debug_logs,
+                    chunk_separator=chunk_separator,
                     **generation_kwargs,
                 )
             else:
@@ -2357,6 +2667,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                     max_new_tokens,
                     generation_config,
                     use_offline_embs=use_offline_embs,
+                    chunk_separator=chunk_separator,
                     **generation_kwargs,
                 )
 

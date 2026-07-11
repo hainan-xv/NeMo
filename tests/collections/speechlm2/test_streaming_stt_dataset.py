@@ -36,6 +36,7 @@ from nemo.collections.speechlm2.data.streaming_stt_dataset import (
     AUDIO_TOKEN_IDX,
     IGNORE_INDEX,
     _replace_audio_chunks,
+    _replace_variable_audio_turns,
     _tokenize_compact_with_assistant_mask,
     _tokenize_with_assistant_mask,
     build_compact_turn_markers,
@@ -43,6 +44,7 @@ from nemo.collections.speechlm2.data.streaming_stt_dataset import (
     decode_with_blank,
     get_llm_messages_for_batch,
     get_llm_messages_for_sample,
+    sample_chunk_size_schedule,
 )
 from nemo.collections.speechlm2.parts.alignments import WordAlignment
 
@@ -820,6 +822,78 @@ class TestGetLlmMessagesForBatch:
         assert batch[0][0] == {"role": SYSTEM_ROLE, "content": "Transcribe in English."}
         assert batch[1][0] == {"role": SYSTEM_ROLE, "content": "Transcribe in French."}
 
+    def test_variable_chunk_schedule_is_shared_across_batch(self):
+        durations = [2 * FRAME_LEN, 5 * FRAME_LEN]
+        batch = get_llm_messages_for_batch(
+            system_role=SYSTEM_ROLE,
+            system_prompt=[SYSTEM_PROMPT, SYSTEM_PROMPT],
+            audio_tag=AUDIO_TAG,
+            blank_token=BLANK_TOKEN,
+            chunk_size=CHUNK_SIZE,
+            num_delay_frames=0,
+            audio_durations_secs=durations,
+            frame_length_in_secs=FRAME_LEN,
+            alignments=[[], []],
+            chunk_sizes=[1, 3, 2],
+        )
+
+        user_sizes = [
+            [message["content"].count(AUDIO_TAG) for message in messages if message["role"] == "user"]
+            for messages in batch
+        ]
+        assert user_sizes == [[1, 3], [1, 3, 2]]
+
+    def test_variable_chunk_boundaries_control_word_emission(self):
+        alignments = [
+            WordAlignment(text="one", start_time=0.0, end_time=2 * FRAME_LEN),
+            WordAlignment(text="two", start_time=2 * FRAME_LEN, end_time=5 * FRAME_LEN),
+        ]
+        messages = _make_messages(
+            audio_duration_secs=5 * FRAME_LEN,
+            alignments=alignments,
+            transcript="one two",
+            chunk_sizes=[1, 3, 2],
+        )
+
+        assistant_text = [message["content"] for message in messages if message["role"] == "assistant"]
+        assert assistant_text == [BLANK_TOKEN, "one", " two"]
+
+    def test_variable_schedule_must_cover_sample(self):
+        with pytest.raises(ValueError, match="cover 1 frames"):
+            _make_messages(audio_duration_secs=3 * FRAME_LEN, alignments=[], chunk_sizes=[1])
+
+    def test_variable_schedule_rejects_non_fixed_modes(self):
+        with pytest.raises(ValueError, match="fixed chunking"):
+            _make_messages(chunk_size=0, chunk_sizes=[1, 2])
+
+
+class TestSampleChunkSizeSchedule:
+
+    class _StubRng:
+        def __init__(self, values):
+            self.values = iter(values)
+
+        def normal(self, mean, std):
+            return next(self.values)
+
+    def test_samples_each_turn_and_clamps_to_positive_integer(self):
+        schedule = sample_chunk_size_schedule(
+            max_num_frames=8,
+            mean=4,
+            std=2,
+            rng=self._StubRng([3.6, -2.0, 2.6]),
+        )
+        assert schedule == [4, 1, 3]
+
+    def test_zero_std_preserves_fixed_chunking(self):
+        schedule = sample_chunk_size_schedule(
+            max_num_frames=5,
+            mean=2,
+            std=0,
+            rng=self._StubRng([]),
+        )
+        assert schedule == [2, 2, 2]
+
 
 # ===========================================================================
 # Tests: _replace_audio_chunks
@@ -885,6 +959,28 @@ class TestReplaceAudioChunks:
         result = _replace_audio_chunks([1, 2, 3], [100, 100], chunk_size=2)
         assert result == [1, 2, 3]
 
+    def test_variable_turns_produce_exact_audio_slot_count(self):
+        messages = _make_messages(
+            audio_duration_secs=5 * FRAME_LEN,
+            alignments=[],
+            chunk_sizes=[1, 3, 2],
+        )
+        hf_tokenizer = _MockHFTokenizer()
+        input_ids, assistant_mask = _tokenize_with_assistant_mask(
+            messages, _MockNemoTokenizer(hf_tokenizer)
+        )
+
+        input_ids, assistant_mask = _replace_variable_audio_turns(
+            input_ids,
+            assistant_mask,
+            messages,
+            AUDIO_TAG,
+            hf_tokenizer,
+        )
+
+        assert input_ids.count(AUDIO_TOKEN_IDX) == 6
+        assert len(input_ids) == len(assistant_mask)
+
 
 # ===========================================================================
 # Tests: token positions (full pipeline through mock tokenizer)
@@ -912,6 +1008,54 @@ class TestTokenPositions:
         input_ids, _, _ = _run_pipeline(msgs, _MockHFTokenizerMultiToken())
         num_chunks = 7
         assert input_ids.count(AUDIO_TOKEN_IDX) == num_chunks * CHUNK_SIZE
+
+    @pytest.mark.parametrize(
+        "word_end_frames",
+        [
+            [],  # every chunk is blank
+            [1, 3, 5, 7],  # every chunk emits text
+            [2, 6],  # mixed blank and text chunks
+        ],
+    )
+    def test_explicit_blank_sequence_is_never_shorter(self, word_end_frames):
+        """A dedicated blank adds one token per silent turn; it never shortens the sequence."""
+        alignments = [
+            WordAlignment(
+                text=f"word{index}",
+                start_time=max(0, end_frame - 1) * FRAME_LEN,
+                end_time=end_frame * FRAME_LEN,
+            )
+            for index, end_frame in enumerate(word_end_frames)
+        ]
+        common = dict(
+            audio_duration_secs=8 * FRAME_LEN,
+            alignments=alignments,
+            transcript=None,
+        )
+        with_blank = _make_messages(blank_token=BLANK_TOKEN, **common)
+        without_blank = _make_messages(blank_token="", **common)
+
+        hf_tokenizer = _MockHFTokenizer()
+        nemo_tokenizer = _MockNemoTokenizer(hf_tokenizer)
+        with_blank_ids, _ = _tokenize_compact_with_assistant_mask(
+            with_blank,
+            nemo_tokenizer,
+            write_id=hf_tokenizer.HEADER_START,
+            eos_id=hf_tokenizer.eos_token_id,
+        )
+        without_blank_ids, _ = _tokenize_compact_with_assistant_mask(
+            without_blank,
+            nemo_tokenizer,
+            write_id=hf_tokenizer.HEADER_START,
+            eos_id=hf_tokenizer.eos_token_id,
+        )
+
+        num_silent_turns = sum(
+            message["role"] == "assistant" and message["content"] == BLANK_TOKEN
+            for message in with_blank
+        )
+        assert len(with_blank_ids) >= len(without_blank_ids)
+        assert len(with_blank_ids) - len(without_blank_ids) == num_silent_turns
 
     def test_no_audio_token_at_assistant_position(self):
         msgs = _make_messages()

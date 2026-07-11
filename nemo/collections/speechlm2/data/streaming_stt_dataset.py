@@ -77,6 +77,10 @@ class StreamingSTTDataConfig:
     sample_rate: int
     frame_length_in_secs: float
     chunk_size: int
+    # Training-only fixed-chunk augmentation. A positive value samples a
+    # batch-shared per-turn schedule from N(chunk_size, chunk_size_std).
+    chunk_size_std: float = 0.0
+    chunk_size_seed: int = 42
     num_delay_frames: int = 0
     words_per_group: int = 1
     audio_tag: str = "<audio>"
@@ -237,6 +241,7 @@ def get_llm_messages_for_sample(
     transcript: Optional[str] = None,
     words_per_group: int = 1,
     chunk_step: int = 1,
+    chunk_sizes: Optional[List[int]] = None,
 ) -> List[dict]:
     """
     Get the LLM messages for a sample, using the alignments to determine the turns for the audio and text.
@@ -308,6 +313,11 @@ def get_llm_messages_for_sample(
     # Pre-compute word character spans if transcript is provided.
     word_spans = compute_word_spans(alignments, transcript, preserve_leading_whitespace=True) if transcript else None
 
+    if chunk_sizes is not None and chunk_size <= 0:
+        raise ValueError("chunk_sizes can only be used with fixed chunking (chunk_size > 0)")
+    if chunk_sizes is not None and any(size <= 0 for size in chunk_sizes):
+        raise ValueError("all chunk_sizes must be positive")
+
     if chunk_size == 0:
         # Dynamic chunking: one user turn per word group, sized to word boundary.
         # The model learns to predict when to stop listening via audio-position targets.
@@ -361,16 +371,31 @@ def get_llm_messages_for_sample(
         if prev_end_frame < num_frames:
             messages.append({"role": "user", "content": audio_tag * (num_frames - prev_end_frame)})
     else:
-        # Fixed chunking: split the audio into equal-sized chunks.
-        num_chunks = math.ceil(num_frames / chunk_size) if num_frames > 0 else 0
+        # Fixed chunking, optionally with a variable per-turn schedule.
+        if chunk_sizes is None:
+            num_chunks = math.ceil(num_frames / chunk_size) if num_frames > 0 else 0
+            sample_chunk_sizes = [chunk_size] * num_chunks
+        else:
+            sample_chunk_sizes = []
+            covered_frames = 0
+            for size in chunk_sizes:
+                if covered_frames >= num_frames:
+                    break
+                sample_chunk_sizes.append(size)
+                covered_frames += size
+            if covered_frames < num_frames:
+                raise ValueError(
+                    f"chunk_sizes cover {covered_frames} frames, but the sample requires {num_frames}"
+                )
 
         word_idx = 0
         word_buffer: list[int] = []  # indices of words buffered for words_per_group grouping
-        for chunk_i in range(num_chunks):
-            chunk_end_frame = (chunk_i + 1) * chunk_size
+        chunk_end_frame = 0
+        for chunk_i, current_chunk_size in enumerate(sample_chunk_sizes):
+            chunk_end_frame += current_chunk_size
 
             # User turn: one audio tag per frame in the chunk
-            messages.append({"role": "user", "content": audio_tag * chunk_size})
+            messages.append({"role": "user", "content": audio_tag * current_chunk_size})
 
             # Collect indices of words whose end_time (in frames) + delay <= chunk_end_frame
             while word_idx < len(alignments):
@@ -384,7 +409,7 @@ def get_llm_messages_for_sample(
                     break
 
             # Emit words when buffer reaches words_per_group, or at the last chunk
-            is_last_chunk = chunk_i == num_chunks - 1
+            is_last_chunk = chunk_i == len(sample_chunk_sizes) - 1
             if word_buffer and (len(word_buffer) >= words_per_group or is_last_chunk):
                 if word_spans and transcript:
                     first_span = word_spans[word_buffer[0]]
@@ -436,6 +461,7 @@ def get_llm_messages_for_batch(
     transcripts: Optional[List[str]] = None,
     words_per_group: int = 1,
     chunk_step: int = 1,
+    chunk_sizes: Optional[List[int]] = None,
 ) -> List[List[dict]]:
     """
     Get the LLM messages for a batch of samples.
@@ -478,9 +504,34 @@ def get_llm_messages_for_batch(
                 transcript=transcript,
                 words_per_group=words_per_group,
                 chunk_step=chunk_step,
+                chunk_sizes=chunk_sizes,
             )
         )
     return batch_messages
+
+
+def sample_chunk_size_schedule(
+    max_num_frames: int,
+    mean: float,
+    std: float,
+    rng: np.random.Generator,
+) -> List[int]:
+    """Sample positive integer chunk sizes until they cover ``max_num_frames``."""
+    if max_num_frames < 0:
+        raise ValueError("max_num_frames must be non-negative")
+    if mean <= 0:
+        raise ValueError("chunk-size mean must be positive")
+    if std < 0:
+        raise ValueError("chunk-size standard deviation must be non-negative")
+
+    schedule = []
+    covered_frames = 0
+    while covered_frames < max_num_frames:
+        sampled = mean if std == 0 else rng.normal(mean, std)
+        size = max(1, int(round(float(sampled))))
+        schedule.append(size)
+        covered_frames += size
+    return schedule
 
 
 def parse_chat_template_ids(hf_tok, last_turn: bool = False) -> tuple[list[int], list[int], list[int]]:
@@ -784,6 +835,27 @@ def _replace_audio_chunks(
     return (new_ids, new_mask) if mask is not None else new_ids
 
 
+def _replace_variable_audio_turns(
+    input_ids: list[int],
+    assistant_mask: list[int],
+    messages: List[dict],
+    audio_tag: str,
+    hf_tokenizer,
+) -> tuple[list[int], list[int]]:
+    """Replace each variable-size user audio turn with matching audio slots."""
+    for message in messages:
+        if message["role"] != "user":
+            continue
+        n_tags = message["content"].count(audio_tag)
+        if n_tags == 0:
+            continue
+        chunk_ids = hf_tokenizer.encode(audio_tag * n_tags, add_special_tokens=False)
+        input_ids, assistant_mask = _replace_audio_chunks(
+            input_ids, chunk_ids, n_tags, mask=assistant_mask
+        )
+    return input_ids, assistant_mask
+
+
 class StreamingSTTDataset(torch.utils.data.Dataset):
     """
     Dataset for StreamingSTTModel.
@@ -801,6 +873,11 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
         self.defer_get_batch = defer_get_batch
         self.tokenizer = tokenizer
         self.cfg: StreamingSTTDataConfig = to_dataclass(StreamingSTTDataConfig, cfg)
+        if self.cfg.chunk_size_std < 0:
+            raise ValueError("chunk_size_std must be non-negative")
+        if self.cfg.chunk_size_std > 0 and self.cfg.chunk_size <= 0:
+            raise ValueError("chunk_size_std > 0 requires fixed chunking (chunk_size > 0)")
+        self._chunk_rngs: dict[int, np.random.Generator] = {}
         # Unescape Python escape sequences (e.g. "\\n" → "\n") because Hydra/OmegaConf
         # loads YAML strings literally without interpreting backslash escapes.
         self.cfg.blank_token = self.cfg.blank_token.encode().decode('unicode_escape')
@@ -811,7 +888,7 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
         # "<audio><audio>" tokenizes differently from encode("<audio>") * 2).
         # When chunk_size=-1 (offline mode), audio_chunk_ids is computed per sample
         # in get_batch_data because num_frames varies per sample.
-        if self.cfg.chunk_size > 0:
+        if self.cfg.chunk_size > 0 and self.cfg.chunk_size_std == 0:
             audio_chunk_str = self.cfg.audio_tag * self.cfg.chunk_size
             self.audio_chunk_ids = self.tokenizer.tokenizer.encode(audio_chunk_str, add_special_tokens=False)
         else:
@@ -871,6 +948,20 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
         else:
             self._user_footer_first_id = None
 
+    def _get_chunk_rng(self) -> np.random.Generator:
+        """Return a deterministic RNG unique to this rank/worker."""
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is not None:
+            key = worker_info.id
+            seed = worker_info.seed
+        else:
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            key = -(rank + 1)
+            seed = self.cfg.chunk_size_seed + rank
+        if key not in self._chunk_rngs:
+            self._chunk_rngs[key] = np.random.default_rng(seed % (2**32))
+        return self._chunk_rngs[key]
+
     def __getitem__(self, cuts: CutSet) -> StreamingSTTBatch | None:
         try:
             audios, audio_lens, cuts = collate_audio(cuts, fault_tolerant=True)
@@ -924,6 +1015,18 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             audio_durations_secs = (audio_lens.float() / self.cfg.sample_rate).tolist()
 
         system_prompts = [cut.custom.get(self.cfg.prompt_field, self.cfg.system_prompt) for cut in cuts]
+        chunk_sizes = None
+        if self.cfg.chunk_size_std > 0:
+            max_num_frames = max(
+                (math.ceil(duration / self.cfg.frame_length_in_secs) for duration in audio_durations_secs),
+                default=0,
+            )
+            chunk_sizes = sample_chunk_size_schedule(
+                max_num_frames=max_num_frames,
+                mean=self.cfg.chunk_size,
+                std=self.cfg.chunk_size_std,
+                rng=self._get_chunk_rng(),
+            )
 
         batch_messages = get_llm_messages_for_batch(
             system_role=self.cfg.system_role,
@@ -938,6 +1041,7 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             transcripts=text,
             words_per_group=self.cfg.words_per_group,
             chunk_step=K,
+            chunk_sizes=chunk_sizes,
         )
 
         all_input_ids = []
@@ -952,28 +1056,24 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             else:
                 input_ids, assistant_mask = _tokenize_with_assistant_mask(messages, self.tokenizer)
 
-            # Replace each audio chunk token sequence with chunk_size AUDIO_TOKEN_IDX markers.
-            # We match the full chunk (audio_tag * chunk_size) as a unit because BPE
-            # may merge tokens across adjacent audio tags.
+            # Replace each audio chunk token sequence with AUDIO_TOKEN_IDX markers.
+            # Fixed-size training uses one cached BPE pattern; variable chunking
+            # encodes and replaces each user turn separately.
             if self.audio_chunk_ids is not None:
                 # Fixed chunking: single pre-computed pattern
                 input_ids, assistant_mask = _replace_audio_chunks(
                     input_ids, self.audio_chunk_ids, self.cfg.chunk_size, mask=assistant_mask
                 )
             else:
-                # Offline (chunk_size=-1) or dynamic (chunk_size=0): variable audio tag
-                # counts per user turn.  Replace each user turn's audio tags separately.
-                hf_tok = self.tokenizer.tokenizer
-                for msg in messages:
-                    if msg["role"] != "user":
-                        continue
-                    n_tags = msg["content"].count(self.cfg.audio_tag)
-                    if n_tags == 0:
-                        continue
-                    chunk_ids = hf_tok.encode(self.cfg.audio_tag * n_tags, add_special_tokens=False)
-                    input_ids, assistant_mask = _replace_audio_chunks(
-                        input_ids, chunk_ids, n_tags, mask=assistant_mask
-                    )
+                # Variable fixed, offline, or dynamic chunking: replace each
+                # user turn according to its actual audio-tag count.
+                input_ids, assistant_mask = _replace_variable_audio_turns(
+                    input_ids,
+                    assistant_mask,
+                    messages,
+                    self.cfg.audio_tag,
+                    self.tokenizer.tokenizer,
+                )
 
             # Build targets: next-token prediction with loss only on assistant content.
             # target[i] corresponds to input[i] and holds the token at position i+1.
@@ -1020,4 +1120,5 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             target_tokens=target_tokens,
             target_token_lens=target_token_lens,
             text=text,
+            cuts=cuts,
         )

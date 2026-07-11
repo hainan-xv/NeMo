@@ -17,7 +17,6 @@ from lightning import LightningModule
 from omegaconf import DictConfig, OmegaConf
 from peft import PeftModel
 from torch import Tensor
-from torch.distributed.fsdp import fully_shard
 from torch.distributed.tensor import Replicate, Shard
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
@@ -42,6 +41,7 @@ from nemo.collections.speechlm2.parts.optim_setup import configure_optimizers, i
 from nemo.collections.speechlm2.parts.precision import fp32_precision
 from nemo.collections.speechlm2.parts.pretrained import load_pretrained_hf, setup_audio_codec, setup_speech_encoder
 from nemo.collections.speechlm2.parts.text_utils import tokens_to_str
+from nemo.collections.speechlm2.parts.torch_compat import fully_shard
 from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, NeuralType
 from nemo.utils import logging
 

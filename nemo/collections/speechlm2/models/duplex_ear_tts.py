@@ -24,7 +24,6 @@ import torch.nn.functional as F
 from lightning import LightningModule
 from omegaconf import DictConfig
 from peft import PeftModel
-from torch.distributed.fsdp import fully_shard
 from torch.distributed.tensor import Replicate, Shard
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
@@ -43,6 +42,7 @@ from nemo.collections.speechlm2.modules.ear_tts_vae_codec import RVQVAEModel
 from nemo.collections.speechlm2.parts.hf_hub import HFHubMixin
 from nemo.collections.speechlm2.parts.metrics.asr_bleu import ASRBLEU
 from nemo.collections.speechlm2.parts.metrics.asr_cer_wer import Intelligibility
+from nemo.collections.speechlm2.parts.torch_compat import fully_shard
 from nemo.collections.speechlm2.parts.metrics.results_logger import ResultsLogger
 from nemo.collections.speechlm2.parts.metrics.secs import SECS
 from nemo.collections.speechlm2.parts.optim_setup import (
