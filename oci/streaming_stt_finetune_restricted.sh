@@ -65,8 +65,8 @@ CONTAINER="/lustre/fsw/portfolios/llmservice/users/heh/containers/nemo-26.02-str
 PROJECT_NAME=Speechlm79
 
 # Training parameters
-MAX_STEPS=200000
-VAL_CHECK_INTERVAL=2000
+MAX_STEPS=500000
+VAL_CHECK_INTERVAL=8000
 DELAY=1
 LOOKAHEAD=13
 CHUNK_SIZE=14 # 1.12s chunk
