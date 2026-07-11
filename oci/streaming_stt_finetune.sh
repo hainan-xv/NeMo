@@ -113,6 +113,7 @@ H_DIR=/lustre/fsw/portfolios/llmservice/users/heh
 HAINAN_DIR=/lustre/fsw/portfolios/llmservice/users/hainanx
 # MY code (synced via sync_to_oci.sh) -> mounted as /code.
 CODE_DIR=${LUSTRE_ACCOUNT_PREFIX}/${USERID}/NeMo79
+CODE_DIR=/lustre/fsw/portfolios/nemotron/users/hainanx/NeMo79/
 
 # Stage checkpoint/restore temp files on the lustre results filesystem (same
 # device as the checkpoint destination), not the container's small /tmp.
