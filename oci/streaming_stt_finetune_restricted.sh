@@ -154,6 +154,8 @@ echo "*******STARTING********" \
     ++exp_manager.name=$EXP_NAME \
     ++exp_manager.wandb_logger_kwargs.name=${EXP_NAME} \
     ++exp_manager.wandb_logger_kwargs.project=${PROJECT_NAME} \
+    ++exp_manager.checkpoint_callback_params.monitor=val_wer \
+    ++exp_manager.checkpoint_callback_params.mode=min \
     ++trainer.strategy.find_unused_parameters=false \
     ++model.perception.encoder.sync_max_audio_length=false \
 
