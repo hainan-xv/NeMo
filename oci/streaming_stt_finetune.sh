@@ -59,6 +59,8 @@ LUSTRE_ACCOUNT_PREFIX=/lustre/fsw/portfolios/${SLURM_ACCOUNT}
 # Latest container with the current SpeechLM deps (we only use its environment;
 # the actual NeMo code comes from /code below).
 CONTAINER="gitlab-master.nvidia.com/hainanx/nemo_containers:speechlm_heh"
+CONTAINER="/lustre/fsw/portfolios/llmservice/users/heh/containers/nemo-26.02-streaming-speechlm.sqsh"
+
 
 PROJECT_NAME=Speechlm79
 
