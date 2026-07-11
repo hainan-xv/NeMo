@@ -428,6 +428,18 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                     attn_impl,
                 )
                 self.llm.config._attn_implementation = "sdpa"
+            # Distinctive banner so it is obvious in the logs (a) that this
+            # checkout's code is running and (b) that the restricted-attention
+            # mask is active for this run.
+            logging.info("=" * 72)
+            logging.info(
+                "[restricted-attention] restrict_audio_to_own_chunk=True | chunk_size=%d | "
+                "attn_impl=%s -- text queries attend to all text + only their own chunk's audio; "
+                "audio queries stay causal.",
+                self.core_cfg.chunk_size,
+                self.llm.config._attn_implementation,
+            )
+            logging.info("=" * 72)
 
         self._apply_freeze_config()
 
@@ -713,6 +725,13 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             attention_mask = build_training_chunk_restricted_mask(
                 batch.input_tokens, self.text_pad_id, inputs["input_embeds"].dtype
             )
+            if not getattr(self, "_restricted_mask_logged", False):
+                self._restricted_mask_logged = True
+                logging.info(
+                    "[restricted-attention] applied 4D chunk-restricted mask in training_step "
+                    "(shape=%s) -- this run uses restricted audio attention.",
+                    tuple(attention_mask.shape),
+                )
         outputs = self.forward(
             inputs["input_embeds"],
             attention_mask=attention_mask,
