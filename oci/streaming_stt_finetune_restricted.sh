@@ -128,7 +128,7 @@ echo "*******STARTING********" \
 && export HYDRA_FULL_ERROR=1 \
 && export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 && export TMPDIR=/results/tmp && mkdir -p /results/tmp \
-&& echo "=== staging check: TMPDIR=$TMPDIR ===" && (df -h /tmp "$TMPDIR" 2>&1 || true) && (lfs quota -h -u "$(whoami)" "$TMPDIR" 2>&1 || true) \
+&& echo "=== staging check: TMPDIR=\$TMPDIR ===" && (df -h /tmp "\$TMPDIR" 2>&1 || true) && (lfs quota -h -u "\$(whoami)" "\$TMPDIR" 2>&1 || true) \
 && export AIS_ENDPOINT=http://asr.iad.oci.aistore.nvidia.com:51080 \
 && export AIS_AUTHN_TOKEN="${AIS_AUTHN_TOKEN}" \
 && export NEMO_DATA_STORE_CACHE_DIR=/lustre/fsw/portfolios/llmservice/users/heh/nemo_cache \
