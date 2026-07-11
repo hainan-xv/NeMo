@@ -83,12 +83,11 @@ DEBUG_CUDA="${DEBUG_CUDA:-0}"
 # each step (turns an opaque CUDA assert into a clear Python error). Debug only.
 DEBUG_VALIDATE_TOKENS="${DEBUG_VALIDATE_TOKENS:-false}"
 
-# Pre-aligned Granary train config: alignments are embedded in the cuts, so
-# training reads precomputed word timestamps instead of running the online Qwen
-# forced aligner every step (much faster). Setting this also removes the
-# forced_aligner from the recipe below. Set TRAIN_INPUT_CFG="" to fall back to
-# the recipe's online-alignment config.
-TRAIN_INPUT_CFG="${TRAIN_INPUT_CFG:-/lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/users/dongjig/aligned_amos/granary_v2_en_pnc_qwen_aligned_filtered/granary_v2_en_pnc_qwen_aligned_filtered_safe_iad_s3_audio.yaml}"
+# Data source. Default (empty) uses the recipe's known-good data + online Qwen
+# forced aligner (slower but reliable). To use the faster pre-aligned Granary
+# config (alignments embedded in the cuts, online aligner removed), set:
+#   TRAIN_INPUT_CFG=/lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/users/dongjig/aligned_amos/granary_v2_en_pnc_qwen_aligned_filtered/granary_v2_en_pnc_qwen_aligned_filtered_safe_iad_s3_audio.yaml
+TRAIN_INPUT_CFG="${TRAIN_INPUT_CFG:-}"
 if [[ -n "$TRAIN_INPUT_CFG" ]]; then
   PREALIGN_OVERRIDES=("~forced_aligner" "data.train_ds.input_cfg=$TRAIN_INPUT_CFG")
 else
