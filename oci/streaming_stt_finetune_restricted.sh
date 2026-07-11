@@ -97,6 +97,10 @@ HAINAN_DIR=/lustre/fsw/portfolios/llmservice/users/hainanx
 # MY code (synced via sync_to_oci.sh) -> mounted as /code.
 CODE_DIR=${LUSTRE_ACCOUNT_PREFIX}/${USERID}/NeMo79
 
+# Stage checkpoint/restore temp files on the lustre results filesystem (same
+# device as the checkpoint destination), not the container's small /tmp.
+OCI_TMP_DIR="${OCI_TMP_DIR:-/results/tmp}"
+
 # Make results dir
 mkdir -p ${RESULTS_DIR}
 OUTFILE=${RESULTS_DIR}/slurm-%j-%n.out
@@ -127,8 +131,7 @@ echo "*******STARTING********" \
 && export HF_TOKEN=${HF_TOKEN} \
 && export HYDRA_FULL_ERROR=1 \
 && export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-&& export TMPDIR=/results/tmp && mkdir -p /results/tmp \
-&& echo "=== staging check: TMPDIR=\$TMPDIR ===" && (df -h /tmp "\$TMPDIR" 2>&1 || true) && (lfs quota -h -u "\$(whoami)" "\$TMPDIR" 2>&1 || true) \
+&& export TMPDIR=${OCI_TMP_DIR} && mkdir -p ${OCI_TMP_DIR} && echo "staging TMPDIR=\$TMPDIR" \
 && export AIS_ENDPOINT=http://asr.iad.oci.aistore.nvidia.com:51080 \
 && export AIS_AUTHN_TOKEN="${AIS_AUTHN_TOKEN}" \
 && export NEMO_DATA_STORE_CACHE_DIR=/lustre/fsw/portfolios/llmservice/users/heh/nemo_cache \
