@@ -76,6 +76,18 @@ FREEZE_SPEECH_ENCODER=false
 LR=0.0004
 WARMUP_STEPS=15000
 
+# Pre-aligned Granary train config: alignments are embedded in the cuts, so
+# training reads precomputed word timestamps instead of running the online Qwen
+# forced aligner every step (much faster). Setting this also removes the
+# forced_aligner from the recipe below. Set TRAIN_INPUT_CFG="" to fall back to
+# the recipe's online-alignment config.
+TRAIN_INPUT_CFG="${TRAIN_INPUT_CFG:-/lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/users/dongjig/aligned_amos/granary_v2_en_pnc_qwen_aligned_filtered/granary_v2_en_pnc_qwen_aligned_filtered_safe_iad_s3_audio.yaml}"
+if [[ -n "$TRAIN_INPUT_CFG" ]]; then
+  PREALIGN_OVERRIDES=("~forced_aligner" "data.train_ds.input_cfg=$TRAIN_INPUT_CFG")
+else
+  PREALIGN_OVERRIDES=()
+fi
+
 MODEL_SUFFIX=_n${SLURM_JOB_NUM_NODES}_FrzAE${FREEZE_SPEECH_ENCODER}_delay${DELAY}_la${LOOKAHEAD}_chunk${CHUNK_SIZE}_r8_t1
 
 # Config file (heh's shared recipe dir; mounted read-only via H_DIR below).
@@ -146,6 +158,7 @@ echo "*******STARTING********" \
     model.optimizer.lr=$LR \
     model.lr_scheduler.warmup_steps=$WARMUP_STEPS \
     data.dataset.num_delay_frames=$DELAY \
+    ${PREALIGN_OVERRIDES[@]} \
     ++trainer.limit_train_batches=$VAL_CHECK_INTERVAL \
     ++trainer.val_check_interval=$VAL_CHECK_INTERVAL \
     trainer.max_steps=$MAX_STEPS \
