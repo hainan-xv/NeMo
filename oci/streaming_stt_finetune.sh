@@ -76,6 +76,10 @@ FREEZE_SPEECH_ENCODER=false
 LR=0.0004
 WARMUP_STEPS=15000
 
+# Set DEBUG_CUDA=1 to run with CUDA_LAUNCH_BLOCKING=1 so a device-side assert
+# reports the true failing op/line (default 0 = async, fast).
+DEBUG_CUDA="${DEBUG_CUDA:-0}"
+
 # Pre-aligned Granary train config: alignments are embedded in the cuts, so
 # training reads precomputed word timestamps instead of running the online Qwen
 # forced aligner every step (much faster). Setting this also removes the
@@ -146,6 +150,7 @@ echo "*******STARTING********" \
 && export HF_HOME="/hfcache/" \
 && export HF_TOKEN=${HF_TOKEN} \
 && export HYDRA_FULL_ERROR=1 \
+&& export CUDA_LAUNCH_BLOCKING=${DEBUG_CUDA} \
 && export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 && export TMPDIR=${OCI_TMP_DIR} && mkdir -p ${OCI_TMP_DIR} && echo "staging TMPDIR=\$TMPDIR" \
 && export AIS_ENDPOINT=http://asr.iad.oci.aistore.nvidia.com:51080 \
