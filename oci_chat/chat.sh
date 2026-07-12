@@ -96,10 +96,11 @@ EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-16}"
 SAVE_TOP_K="${SAVE_TOP_K:-5}"
 PRECISION="${PRECISION:-bf16}"
 
-# Optional encoder warm-start (streaming FastConformer encoder weights).
-# INIT_ENCODER_MODE: scratch (default) | local (.nemo on lustre) | hf (download).
-INIT_ENCODER_MODE="${INIT_ENCODER_MODE:-scratch}"
-PRETRAINED_MODEL_DIR="${LUSTRE_ACCOUNT_PREFIX}/${OLDUSERID}/pretrained_models"
+# Encoder warm-start from the nemotron streaming FastConformer encoder weights.
+# INIT_ENCODER_MODE: local (default, .nemo on lustre) | hf (download) | scratch.
+INIT_ENCODER_MODE="${INIT_ENCODER_MODE:-local}"
+# My own pretrained_models dir on lustre (where the nemotron .nemo was downloaded).
+PRETRAINED_MODEL_DIR="${PRETRAINED_MODEL_DIR:-${LUSTRE_ACCOUNT_PREFIX}/${USERID}/pretrained_models}"
 INIT_ENCODER_BASENAME="${INIT_ENCODER_BASENAME:-nemotron-speech-streaming-en-0.6b.nemo}"
 INIT_ENCODER_HOST="${PRETRAINED_MODEL_DIR}/${INIT_ENCODER_BASENAME}"
 INIT_ENCODER_CONTAINER="/pretrained/${INIT_ENCODER_BASENAME}"
