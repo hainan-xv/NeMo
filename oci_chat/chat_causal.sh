@@ -72,7 +72,9 @@ LUSTRE_ACCOUNT_PREFIX=/lustre/fsw/portfolios/${SLURM_ACCOUNT}
 # environment; the actual NeMo code comes from /code below).
 CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/llmservice/users/heh/containers/nemo-26.02-streaming-speechlm.sqsh}"
 
-PROJECT_NAME="${PROJECT_NAME:-Speechlm79}"
+# Dedicated project for the CHAT models (separate wandb project + results space
+# from the SpeechLM models in Speechlm79).
+PROJECT_NAME="${PROJECT_NAME:-Chat79}"
 
 # ---------------------------------------------------------------------------
 # Strictly-causal CHAT model + training hyper-parameters
