@@ -97,6 +97,9 @@ MAX_DURATION="${MAX_DURATION:-20.0}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-16}"
 SAVE_TOP_K="${SAVE_TOP_K:-5}"
 PRECISION="${PRECISION:-bf16}"
+# RNNT loss reduction: mean_batch | mean | sum | mean_volume.
+# mean_volume sums all losses and divides by total target length (longer samples weigh more).
+RNNT_REDUCTION="${RNNT_REDUCTION:-mean_volume}"
 
 # Encoder warm-start from the nemotron streaming FastConformer encoder weights.
 # INIT_ENCODER_MODE: local (default, .nemo on lustre) | hf (download) | scratch.
@@ -202,6 +205,7 @@ echo "*******STARTING CHAT (FastConformer-Large RNNT) - Granary 2.0********" \
     model.encoder.att_context_size=${ATT_CONTEXT} \
     model.skip_nan_grad=true \
     model.compute_eval_loss=false \
+    ++model.rnnt_reduction=${RNNT_REDUCTION} \
     ++model.train_ds.use_lhotse=true \
     ++model.train_ds.input_cfg=${TRAIN_INPUT_CFG} \
     model.train_ds.manifest_filepath=null \
