@@ -162,7 +162,10 @@ esac
 GRANARY2_CFG=/lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/users/dongjig/aligned_amos/granary_v2_en_pnc_qwen_aligned_filtered/granary_v2_en_pnc_qwen_aligned_filtered_safe_iad_s3_audio.yaml
 TRAIN_INPUT_CFG="${TRAIN_INPUT_CFG:-$GRANARY2_CFG}"
 
-VAL_MANIFEST="${VAL_MANIFEST:-[/lustre/fs12/portfolios/llmservice/projects/llmservice_nemo_speechlm/users/dongjig/input_cfg/dev/multilingual_leaderboard_dev/multilingual_leaderboard_dev_20h.json]}"
+# English dev set: same as the SpeechLM baseline (streaming_stt_nss_granary_lora
+# recipe's validation_ds -> mcv_11_dev). Matches the English Granary training.
+# Path is under the /data mount (= $DATA_DIR), same as the recipe.
+VAL_MANIFEST="${VAL_MANIFEST:-[/data/canary/canary_v0/manifests/data/ASR/MMLPC/en/val_test/mcv11/mcv11_dev_clean_pcstrip_en_2k.json]}"
 
 # English 1024 BPE SentencePiece tokenizer (same vocab used by the other CHAT
 # ASR launchers). Point TOKENIZER_DIR at the directory containing tokenizer.model.
