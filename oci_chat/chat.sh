@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH -A nemotron_speechprod_asr
-#SBATCH -J nemotron_speechprod_asr:chat-fclarge-rnnt-g2
+#SBATCH -J nemotron_speechprod_asr:chat-nemotron06b-rnnt-g2
 #SBATCH -p batch_block1,batch_block3,batch_block4
 #SBATCH -N 8
 #SBATCH --gpus-per-node=8
@@ -16,8 +16,10 @@
 # ============================================================================
 # OCI launcher for the CHAT (Chunk-wise Attention Transducer) ASR model.
 #
-# Model: FastConformer-Large (17 layers, d_model=512, 8 heads, ~115M) RNNT with
-# the cross-attention joint (RNNTAttJoint). Uses the config added with the CHAT
+# Model: Cache-Aware FastConformer RNNT with the cross-attention joint
+# (RNNTAttJoint). The encoder matches nemotron-speech-streaming-en-0.6b
+# (24 layers, d_model=1024, 128 mel-bins, ~600M) so it is warm-started from that
+# checkpoint's encoder by default. Uses the config added with the CHAT
 # model support:
 #   examples/asr/conf/fastconformer/cache_aware_streaming/
 #       fastconformer_chat_transducer_bpe_streaming.yaml
@@ -138,7 +140,7 @@ VAL_MANIFEST="${VAL_MANIFEST:-[/lustre/fs12/portfolios/llmservice/projects/llmse
 ST_TOKENIZERS_ROOT="${ST_TOKENIZERS_ROOT:-${LUSTRE_ACCOUNT_PREFIX}/${USERID}/Workplace/multilingual/tokenizers/en}"
 TOKENIZER_DIR="${TOKENIZER_DIR:-${ST_TOKENIZERS_ROOT}/tokenizer_spe_bpe_v1024}"
 
-EXP_NAME="${EXP_NAME:-${CLUSTER}_chat_fclarge_rnnt_g2_ctx${CTX_TAG}_lr${LR}_n${SLURM_JOB_NUM_NODES}}"
+EXP_NAME="${EXP_NAME:-${CLUSTER}_chat_nemotron06b_rnnt_g2_ctx${CTX_TAG}_lr${LR}_n${SLURM_JOB_NUM_NODES}}"
 
 # Write-heavy outputs (results/checkpoints, HF cache, checkpoint temp) go to the
 # nemotron project, which has free quota. Override with OUTPUT_PREFIX.

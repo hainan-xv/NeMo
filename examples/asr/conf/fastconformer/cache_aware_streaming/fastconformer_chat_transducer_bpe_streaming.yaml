@@ -8,6 +8,9 @@
 #   - chunk_size is auto-inferred from encoder att_context_size (right_context + 1)
 #     or can be set explicitly via model.joint.chunk_size
 #   - fuse_loss_wer is disabled (not yet supported for CHAT)
+#   - encoder matches nemotron-speech-streaming-en-0.6b (24 layers, d_model=1024,
+#     128 mel-bins, no bias, no input scaling) so it can be warm-started from that
+#     checkpoint's encoder weights.
 
 name: "FastConformer-CHAT-Transducer-BPE-Streaming"
 
@@ -68,7 +71,7 @@ model:
     window_size: 0.025
     window_stride: 0.01
     window: "hann"
-    features: 80
+    features: 128  # matches nemotron-speech-streaming-en-0.6b encoder (num_mel_bins=128)
     n_fft: 512
     frame_splicing: 1
     dither: 0.00001
@@ -81,13 +84,16 @@ model:
     freq_width: 27
     time_width: 0.05
 
+  # Encoder architecture matches nemotron-speech-streaming-en-0.6b (Cache-Aware
+  # FastConformer, 24 layers, d_model=1024, ~600M) so the encoder can be
+  # warm-started from that checkpoint. See oci_chat/chat.sh (INIT_ENCODER_MODE).
   encoder:
     _target_: nemo.collections.asr.modules.ConformerEncoder
     feat_in: ${model.preprocessor.features}
     feat_out: -1
-    n_layers: 17
-    d_model: 512
-    use_bias: True
+    n_layers: 24
+    d_model: 1024
+    use_bias: false
 
     # Sub-sampling parameters
     subsampling: dw_striding
@@ -108,7 +114,7 @@ model:
     att_context_style: chunked_limited
     att_context_probs: null
 
-    xscaling: true
+    xscaling: false
     pos_emb_max_len: 5000
 
     # Convolution module's params
