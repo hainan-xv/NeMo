@@ -14,10 +14,12 @@
 #SBATCH --output=slurm_out/%x=%j --error=slurm_out/%x=%j
 
 # ============================================================================
-# OCI launcher for the CHAT (Chunk-wise Attention Transducer) ASR model.
+# OCI launcher for the CHAT (Chunk-wise Attention Transducer) ASR model, trained
+# JOINTLY with an auxiliary CTC loss (hybrid RNNT-CTC model).
 #
-# Model: Cache-Aware FastConformer RNNT with the cross-attention joint
-# (RNNTAttJoint). The encoder matches nemotron-speech-streaming-en-0.6b
+# Model: Cache-Aware FastConformer with the cross-attention joint (RNNTAttJoint)
+# + an aux CTC head. Loss = (1-ctc_weight)*CHAT + ctc_weight*CTC (both mean_volume,
+# ctc_weight=0.3). The encoder matches nemotron-speech-streaming-en-0.6b
 # (24 layers, d_model=1024, 128 mel-bins, ~600M) so it is warm-started from that
 # checkpoint's encoder by default. Uses the config added with the CHAT
 # model support:
@@ -97,9 +99,15 @@ MAX_DURATION="${MAX_DURATION:-20.0}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-16}"
 SAVE_TOP_K="${SAVE_TOP_K:-5}"
 PRECISION="${PRECISION:-bf16}"
-# RNNT loss reduction: mean_batch | mean | sum | mean_volume.
+# RNNT (CHAT) loss reduction: mean_batch | mean | sum | mean_volume.
 # mean_volume sums all losses and divides by total target length (longer samples weigh more).
 RNNT_REDUCTION="${RNNT_REDUCTION:-mean_volume}"
+
+# Joint CTC + CHAT (RNNT) training via the hybrid RNNT-CTC model. The CTC head is
+# an aux ConvASR decoder on the (unchunked) encoder output. total_loss =
+# (1 - ctc_weight) * chat_loss + ctc_weight * ctc_loss. Both use mean_volume.
+CTC_LOSS_WEIGHT="${CTC_LOSS_WEIGHT:-0.3}"
+CTC_REDUCTION="${CTC_REDUCTION:-mean_volume}"
 
 # Encoder warm-start from the nemotron streaming FastConformer encoder weights.
 # INIT_ENCODER_MODE: local (default, .nemo on lustre) | hf (download) | scratch.
@@ -146,7 +154,9 @@ VAL_MANIFEST="${VAL_MANIFEST:-[/data/canary/canary_v0/manifests/data/ASR/MMLPC/e
 ST_TOKENIZERS_ROOT="${ST_TOKENIZERS_ROOT:-${LUSTRE_ACCOUNT_PREFIX}/${USERID}/Workplace/multilingual/tokenizers/en}"
 TOKENIZER_DIR="${TOKENIZER_DIR:-${ST_TOKENIZERS_ROOT}/tokenizer_spe_bpe_v1024}"
 
-EXP_NAME="${EXP_NAME:-${CLUSTER}_chat_nemotron06b_rnnt_g2_ctx${CTX_TAG}_lr${LR}_n${SLURM_JOB_NUM_NODES}}"
+# NOTE: this run is now a hybrid CTC+CHAT model (extra CTC decoder), so it uses a
+# distinct EXP_NAME and will NOT resume the earlier pure-RNNT checkpoints.
+EXP_NAME="${EXP_NAME:-${CLUSTER}_chat_nemotron06b_hybctc${CTC_LOSS_WEIGHT}_g2_ctx${CTX_TAG}_lr${LR}_n${SLURM_JOB_NUM_NODES}}"
 
 # Write-heavy outputs (results/checkpoints, HF cache, checkpoint temp) go to the
 # nemotron project, which has free quota. Override with OUTPUT_PREFIX.
@@ -199,8 +209,8 @@ echo "*******STARTING CHAT (FastConformer-Large RNNT) - Granary 2.0********" \
 && export AIS_ENDPOINT=http://asr.iad.oci.aistore.nvidia.com:51080 \
 && export AIS_AUTHN_TOKEN="${AIS_AUTHN_TOKEN}" \
 && export NEMO_DATA_STORE_CACHE_DIR=/lustre/fsw/portfolios/llmservice/users/heh/nemo_cache \
-&& echo "Starting training (running MY code at /code, CHAT model, GRANARY 2.0 data)" \
-&& python /code/examples/asr/asr_transducer/speech_to_text_rnnt_bpe.py \
+&& echo "Starting training (running MY code at /code, hybrid CTC+CHAT model, GRANARY 2.0 data)" \
+&& python /code/examples/asr/asr_hybrid_transducer_ctc/speech_to_text_hybrid_rnnt_ctc_bpe.py \
     --config-path=${CONFIG_PATH} \
     --config-name=${CONFIG_NAME} \
     name=${EXP_NAME} \
@@ -209,6 +219,14 @@ echo "*******STARTING CHAT (FastConformer-Large RNNT) - Granary 2.0********" \
     model.skip_nan_grad=true \
     model.compute_eval_loss=false \
     ++model.rnnt_reduction=${RNNT_REDUCTION} \
+    ++model.aux_ctc.ctc_loss_weight=${CTC_LOSS_WEIGHT} \
+    ++model.aux_ctc.ctc_reduction=${CTC_REDUCTION} \
+    ++model.aux_ctc.use_cer=false \
+    ++model.aux_ctc.decoder._target_=nemo.collections.asr.modules.ConvASRDecoder \
+    ++model.aux_ctc.decoder.feat_in=null \
+    ++model.aux_ctc.decoder.num_classes=-1 \
+    ++model.aux_ctc.decoder.vocabulary=[] \
+    ++model.aux_ctc.decoding.strategy=greedy \
     ++model.train_ds.use_lhotse=true \
     ++model.train_ds.input_cfg=${TRAIN_INPUT_CFG} \
     model.train_ds.manifest_filepath=null \

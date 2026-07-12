@@ -407,9 +407,13 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin, ASRT
         # If fused Joint-Loss-WER is not used
         if not self.joint.fuse_loss_wer:
             # Compute full joint and loss
-            joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder)
+            joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder, encoder_lengths=encoded_len)
+            # For CHAT (RNNTAttJoint) the joint chunks the encoder internally; the
+            # RNNT loss input length is then the number of chunks per utterance.
+            # Falls back to encoded_len for standard joints.
+            effective_len = getattr(self.joint, 'num_chunks_per_utterance', encoded_len)
             loss_value = self.loss(
-                log_probs=joint, targets=transcript, input_lengths=encoded_len, target_lengths=target_length
+                log_probs=joint, targets=transcript, input_lengths=effective_len, target_lengths=target_length
             )
 
             # Add auxiliary losses, if registered
@@ -541,10 +545,12 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin, ASRT
         if not self.joint.fuse_loss_wer:
             if self.compute_eval_loss:
                 decoder, target_length, states = self.decoder(targets=transcript, target_length=transcript_len)
-                joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder)
+                joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder, encoder_lengths=encoded_len)
+                # CHAT: use per-utterance chunk counts as the RNNT loss length.
+                effective_len = getattr(self.joint, 'num_chunks_per_utterance', encoded_len)
 
                 loss_value = self.loss(
-                    log_probs=joint, targets=transcript, input_lengths=encoded_len, target_lengths=target_length
+                    log_probs=joint, targets=transcript, input_lengths=effective_len, target_lengths=target_length
                 )
                 tensorboard_logs['val_loss'] = loss_value
 

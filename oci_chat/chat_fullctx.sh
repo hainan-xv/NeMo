@@ -14,30 +14,32 @@
 #SBATCH --output=slurm_out/%x=%j --error=slurm_out/%x=%j
 
 # ============================================================================
-# OCI launcher for the FULL-CONTEXT CHAT (Chunk-wise Attention Transducer) model.
+# OCI launcher for the FULL-CONTEXT CHAT (Chunk-wise Attention Transducer) model,
+# trained JOINTLY with an auxiliary CTC loss (hybrid RNNT-CTC model).
 #
-# This is the full-context (offline) variant of oci_chat/chat.sh. The encoder
-# runs with wide, symmetric attention and non-causal operations, while the CHAT
-# cross-attention joint still processes the encoder output in fixed-size chunks:
-#   - att_context_size    = [70,70]   (wide symmetric context, regular style)
-#   - att_context_style   = regular   (not chunked_limited)
+# Full-context (offline) variant of oci_chat/chat.sh. The encoder runs with
+# unlimited attention and non-causal operations; the CHAT cross-attention joint
+# still processes the encoder output in fixed-size chunks; and an aux CTC head is
+# trained jointly:
+#   - att_context_size    = [-1,-1]   (unlimited / full context, regular style)
 #   - causal_downsampling = false     (non-causal subsampling)
 #   - conv_context_size   = null      (non-causal symmetric convolution)
+#   - conv_norm_type      = batch_norm; preprocessor.normalize = per_feature
 #   - joint.chunk_size    = ${CHAT_CHUNK_SIZE} (default 14; set explicitly since
 #                           it can no longer be inferred from a chunked encoder)
+#   - loss = (1-ctc_weight)*CHAT + ctc_weight*CTC (both mean_volume, ctc_weight=0.3)
 #
-# The encoder architecture is unchanged from chat.sh (matches
-# nemotron-speech-streaming-en-0.6b), so it is still warm-started from that
-# checkpoint's encoder by default (making an op causal/non-causal or widening
-# the attention window does not change weight shapes).
+# The encoder architecture matches parakeet-tdt-0.6b-v2 (non-causal FastConformer,
+# 24 layers, d_model=1024, 128 mel, batch_norm conv), so it is warm-started from
+# that checkpoint's encoder by default (INIT_ENCODER_MODE=local).
 #
 # Model config:
 #   examples/asr/conf/fastconformer/cache_aware_streaming/
 #       fastconformer_chat_transducer_bpe_streaming.yaml
-# (the streaming/causal knobs are overridden below for full-context training).
+# (the streaming/causal knobs + CTC head are overridden below).
 #
-# Data: pre-aligned Granary v2.0 (same manifest as oci/baseline_granary2.sh),
-# loaded through lhotse (input_cfg). Runs MY code (git-synced repo at /code).
+# Data: pre-aligned Granary v2.0 train + English mcv11 dev (same as the SpeechLM
+# baseline oci/baseline_granary2.sh), loaded through lhotse. Runs MY code at /code.
 #
 # Submit from an OCI login node:
 #   ./sync_to_oci.sh
@@ -84,11 +86,15 @@ PROJECT_NAME="${PROJECT_NAME:-Speechlm79}"
 CONFIG_PATH="${CONFIG_PATH:-/code/examples/asr/conf/fastconformer/cache_aware_streaming}"
 CONFIG_NAME="${CONFIG_NAME:-fastconformer_chat_transducer_bpe_streaming}"
 
-# Full-context encoder knobs (override the streaming/causal config defaults).
-ATT_CONTEXT="${ATT_CONTEXT:-[70,70]}"              # wide symmetric attention context [left,right]
-ATT_CONTEXT_STYLE="${ATT_CONTEXT_STYLE:-regular}"  # regular (not chunked_limited) for full context
+# Full-context encoder knobs. The encoder is configured to match
+# parakeet-tdt-0.6b-v2 (non-causal FastConformer, batch_norm conv, per-feature
+# mel normalization, unlimited attention) so its encoder loads cleanly.
+ATT_CONTEXT="${ATT_CONTEXT:-[-1,-1]}"              # [-1,-1] = unlimited (full) context
+ATT_CONTEXT_STYLE="${ATT_CONTEXT_STYLE:-regular}"  # regular attention for full context
 CAUSAL_DOWNSAMPLING="${CAUSAL_DOWNSAMPLING:-false}" # non-causal subsampling
 CONV_CONTEXT_SIZE="${CONV_CONTEXT_SIZE:-null}"      # null -> symmetric (non-causal) convolution
+CONV_NORM_TYPE="${CONV_NORM_TYPE:-batch_norm}"      # parakeet-tdt uses batch_norm (config default is layer_norm)
+NORMALIZE="${NORMALIZE:-per_feature}"               # parakeet-tdt uses per-feature mel normalization
 CTX_TAG="$(echo "${ATT_CONTEXT}" | tr -d '[] ' | tr ',' '_')"
 
 # CHAT joint chunk size. In full-context mode the encoder is no longer chunked,
@@ -107,34 +113,27 @@ MAX_DURATION="${MAX_DURATION:-20.0}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-16}"
 SAVE_TOP_K="${SAVE_TOP_K:-5}"
 PRECISION="${PRECISION:-bf16}"
-# RNNT loss reduction: mean_batch | mean | sum | mean_volume.
+# RNNT (CHAT) loss reduction: mean_batch | mean | sum | mean_volume.
 # mean_volume sums all losses and divides by total target length (longer samples weigh more).
 RNNT_REDUCTION="${RNNT_REDUCTION:-mean_volume}"
 
-# Encoder warm-start from the nemotron streaming FastConformer encoder weights.
+# Joint CTC + CHAT (RNNT) training via the hybrid RNNT-CTC model. The CTC head is
+# an aux ConvASR decoder on the (unchunked) encoder output. total_loss =
+# (1 - ctc_weight) * chat_loss + ctc_weight * ctc_loss. Both use mean_volume.
+CTC_LOSS_WEIGHT="${CTC_LOSS_WEIGHT:-0.3}"
+CTC_REDUCTION="${CTC_REDUCTION:-mean_volume}"
+
+# Encoder warm-start from parakeet-tdt-0.6b-v2 (non-causal offline FastConformer
+# whose encoder architecture matches this full-context model, so the whole
+# encoder incl. pre_encode.out loads cleanly -- no exclusions needed).
 # INIT_ENCODER_MODE: local (default, .nemo on lustre) | hf (download) | scratch.
 INIT_ENCODER_MODE="${INIT_ENCODER_MODE:-local}"
-# My own pretrained_models dir on lustre (where the nemotron .nemo was downloaded).
+# My own pretrained_models dir on lustre (where the parakeet .nemo was downloaded).
 PRETRAINED_MODEL_DIR="${PRETRAINED_MODEL_DIR:-${LUSTRE_ACCOUNT_PREFIX}/${USERID}/pretrained_models}"
-INIT_ENCODER_BASENAME="${INIT_ENCODER_BASENAME:-nemotron-speech-streaming-en-0.6b.nemo}"
+INIT_ENCODER_BASENAME="${INIT_ENCODER_BASENAME:-parakeet-tdt-0.6b-v2.nemo}"
 INIT_ENCODER_HOST="${PRETRAINED_MODEL_DIR}/${INIT_ENCODER_BASENAME}"
 INIT_ENCODER_CONTAINER="/pretrained/${INIT_ENCODER_BASENAME}"
-INIT_ENCODER_NAME="${INIT_ENCODER_NAME:-nvidia/nemotron-speech-streaming-en-0.6b}"
-
-# Non-causal subsampling changes the encoder.pre_encode.out projection shape
-# relative to the (causal) nemotron checkpoint (frequency dim 16 vs 17), so that
-# single layer cannot be warm-started. Exclude it from the init so the rest of
-# the encoder still loads and only that small projection trains from scratch.
-# (No exclusion is needed when subsampling is kept causal.)
-if [[ "${CAUSAL_DOWNSAMPLING}" == "true" ]]; then
-  INIT_ENCODER_EXCLUDE_NEMO=""
-  INIT_ENCODER_EXCLUDE_HF=""
-  INIT_ENCODER_EXCLUDE_DESC=""
-else
-  INIT_ENCODER_EXCLUDE_NEMO=" +init_from_nemo_model.streaming_enc.exclude=[pre_encode.out]"
-  INIT_ENCODER_EXCLUDE_HF=" +init_from_pretrained_model.streaming_enc.exclude=[pre_encode.out]"
-  INIT_ENCODER_EXCLUDE_DESC=" (excluding pre_encode.out: non-causal subsampling)"
-fi
+INIT_ENCODER_NAME="${INIT_ENCODER_NAME:-nvidia/parakeet-tdt-0.6b-v2}"
 
 case "${INIT_ENCODER_MODE}" in
   scratch|none|off)
@@ -146,12 +145,12 @@ case "${INIT_ENCODER_MODE}" in
     if [ ! -f "${INIT_ENCODER_HOST}" ]; then
       echo "ERROR: INIT_ENCODER_MODE=local but ${INIT_ENCODER_HOST} not found." >&2; exit 1
     fi
-    INIT_ENCODER_OVERRIDE="+init_from_nemo_model.streaming_enc.path=${INIT_ENCODER_CONTAINER} +init_from_nemo_model.streaming_enc.include=[encoder]${INIT_ENCODER_EXCLUDE_NEMO}"
-    INIT_ENCODER_DESC="${INIT_ENCODER_CONTAINER}${INIT_ENCODER_EXCLUDE_DESC}"
+    INIT_ENCODER_OVERRIDE="+init_from_nemo_model.streaming_enc.path=${INIT_ENCODER_CONTAINER} +init_from_nemo_model.streaming_enc.include=[encoder]"
+    INIT_ENCODER_DESC="${INIT_ENCODER_CONTAINER}"
     ;;
   hf|pretrained)
-    INIT_ENCODER_OVERRIDE="+init_from_pretrained_model.streaming_enc.name=${INIT_ENCODER_NAME} +init_from_pretrained_model.streaming_enc.include=[encoder]${INIT_ENCODER_EXCLUDE_HF}"
-    INIT_ENCODER_DESC="${INIT_ENCODER_NAME}${INIT_ENCODER_EXCLUDE_DESC}"
+    INIT_ENCODER_OVERRIDE="+init_from_pretrained_model.streaming_enc.name=${INIT_ENCODER_NAME} +init_from_pretrained_model.streaming_enc.include=[encoder]"
+    INIT_ENCODER_DESC="${INIT_ENCODER_NAME}"
     ;;
   *) echo "ERROR: unknown INIT_ENCODER_MODE='${INIT_ENCODER_MODE}'" >&2; exit 1 ;;
 esac
@@ -172,7 +171,9 @@ VAL_MANIFEST="${VAL_MANIFEST:-[/data/canary/canary_v0/manifests/data/ASR/MMLPC/e
 ST_TOKENIZERS_ROOT="${ST_TOKENIZERS_ROOT:-${LUSTRE_ACCOUNT_PREFIX}/${USERID}/Workplace/multilingual/tokenizers/en}"
 TOKENIZER_DIR="${TOKENIZER_DIR:-${ST_TOKENIZERS_ROOT}/tokenizer_spe_bpe_v1024}"
 
-EXP_NAME="${EXP_NAME:-${CLUSTER}_chat_fullctx_nemotron06b_rnnt_g2_ctx${CTX_TAG}_chunk${CHAT_CHUNK_SIZE}_lr${LR}_n${SLURM_JOB_NUM_NODES}}"
+# Hybrid CTC+CHAT full-context model warm-started from parakeet-tdt-0.6b-v2.
+# Distinct EXP_NAME so it does not resume older/incompatible checkpoints.
+EXP_NAME="${EXP_NAME:-${CLUSTER}_chat_fullctx_parakeet_hybctc${CTC_LOSS_WEIGHT}_g2_ctx${CTX_TAG}_chunk${CHAT_CHUNK_SIZE}_lr${LR}_n${SLURM_JOB_NUM_NODES}}"
 
 # Write-heavy outputs (results/checkpoints, HF cache, checkpoint temp) go to the
 # nemotron project, which has free quota. Override with OUTPUT_PREFIX.
@@ -203,9 +204,10 @@ MOUNTS="--container-mounts=${SPEECHLM_PROJECT_DIR}:${SPEECHLM_PROJECT_DIR},${H_D
 # export CUDA_VISIBLE_DEVICES=0
 
 read -r -d '' cmd <<EOF
-echo "*******STARTING CHAT FULL-CONTEXT (FastConformer RNNT) - Granary 2.0********" \
+echo "*******STARTING HYBRID CTC+CHAT FULL-CONTEXT (FastConformer) - Granary 2.0********" \
 && echo "*** CONFIG: ${CONFIG_NAME} | ATT_CONTEXT=${ATT_CONTEXT} style=${ATT_CONTEXT_STYLE} ***" \
-&& echo "*** FULL-CTX: causal_downsampling=${CAUSAL_DOWNSAMPLING} conv_context_size=${CONV_CONTEXT_SIZE} | CHAT chunk_size=${CHAT_CHUNK_SIZE} ***" \
+&& echo "*** FULL-CTX: causal_downsampling=${CAUSAL_DOWNSAMPLING} conv=${CONV_CONTEXT_SIZE}/${CONV_NORM_TYPE} normalize=${NORMALIZE} | CHAT chunk_size=${CHAT_CHUNK_SIZE} ***" \
+&& echo "*** LOSS: CHAT(rnnt) + CTC(weight=${CTC_LOSS_WEIGHT}), both reduction=${RNNT_REDUCTION}/${CTC_REDUCTION} ***" \
 && echo "*** DATA: Granary 2.0 pre-aligned (lhotse) -> ${TRAIN_INPUT_CFG} ***" \
 && echo "*** ENCODER init: ${INIT_ENCODER_DESC} ***" \
 && nvidia-smi \
@@ -226,8 +228,8 @@ echo "*******STARTING CHAT FULL-CONTEXT (FastConformer RNNT) - Granary 2.0******
 && export AIS_ENDPOINT=http://asr.iad.oci.aistore.nvidia.com:51080 \
 && export AIS_AUTHN_TOKEN="${AIS_AUTHN_TOKEN}" \
 && export NEMO_DATA_STORE_CACHE_DIR=/lustre/fsw/portfolios/llmservice/users/heh/nemo_cache \
-&& echo "Starting training (running MY code at /code, CHAT full-context model, GRANARY 2.0 data)" \
-&& python /code/examples/asr/asr_transducer/speech_to_text_rnnt_bpe.py \
+&& echo "Starting training (running MY code at /code, hybrid CTC+CHAT full-context model, GRANARY 2.0 data)" \
+&& python /code/examples/asr/asr_hybrid_transducer_ctc/speech_to_text_hybrid_rnnt_ctc_bpe.py \
     --config-path=${CONFIG_PATH} \
     --config-name=${CONFIG_NAME} \
     name=${EXP_NAME} \
@@ -236,10 +238,20 @@ echo "*******STARTING CHAT FULL-CONTEXT (FastConformer RNNT) - Granary 2.0******
     model.encoder.att_context_style=${ATT_CONTEXT_STYLE} \
     model.encoder.causal_downsampling=${CAUSAL_DOWNSAMPLING} \
     model.encoder.conv_context_size=${CONV_CONTEXT_SIZE} \
+    model.encoder.conv_norm_type=${CONV_NORM_TYPE} \
+    model.preprocessor.normalize=${NORMALIZE} \
     ++model.joint.chunk_size=${CHAT_CHUNK_SIZE} \
     model.skip_nan_grad=true \
     model.compute_eval_loss=false \
     ++model.rnnt_reduction=${RNNT_REDUCTION} \
+    ++model.aux_ctc.ctc_loss_weight=${CTC_LOSS_WEIGHT} \
+    ++model.aux_ctc.ctc_reduction=${CTC_REDUCTION} \
+    ++model.aux_ctc.use_cer=false \
+    ++model.aux_ctc.decoder._target_=nemo.collections.asr.modules.ConvASRDecoder \
+    ++model.aux_ctc.decoder.feat_in=null \
+    ++model.aux_ctc.decoder.num_classes=-1 \
+    ++model.aux_ctc.decoder.vocabulary=[] \
+    ++model.aux_ctc.decoding.strategy=greedy \
     ++model.train_ds.use_lhotse=true \
     ++model.train_ds.input_cfg=${TRAIN_INPUT_CFG} \
     model.train_ds.manifest_filepath=null \
