@@ -120,6 +120,22 @@ INIT_ENCODER_BASENAME="${INIT_ENCODER_BASENAME:-nemotron-speech-streaming-en-0.6
 INIT_ENCODER_HOST="${PRETRAINED_MODEL_DIR}/${INIT_ENCODER_BASENAME}"
 INIT_ENCODER_CONTAINER="/pretrained/${INIT_ENCODER_BASENAME}"
 INIT_ENCODER_NAME="${INIT_ENCODER_NAME:-nvidia/nemotron-speech-streaming-en-0.6b}"
+
+# Non-causal subsampling changes the encoder.pre_encode.out projection shape
+# relative to the (causal) nemotron checkpoint (frequency dim 16 vs 17), so that
+# single layer cannot be warm-started. Exclude it from the init so the rest of
+# the encoder still loads and only that small projection trains from scratch.
+# (No exclusion is needed when subsampling is kept causal.)
+if [[ "${CAUSAL_DOWNSAMPLING}" == "true" ]]; then
+  INIT_ENCODER_EXCLUDE_NEMO=""
+  INIT_ENCODER_EXCLUDE_HF=""
+  INIT_ENCODER_EXCLUDE_DESC=""
+else
+  INIT_ENCODER_EXCLUDE_NEMO=" +init_from_nemo_model.streaming_enc.exclude=[pre_encode.out]"
+  INIT_ENCODER_EXCLUDE_HF=" +init_from_pretrained_model.streaming_enc.exclude=[pre_encode.out]"
+  INIT_ENCODER_EXCLUDE_DESC=" (excluding pre_encode.out: non-causal subsampling)"
+fi
+
 case "${INIT_ENCODER_MODE}" in
   scratch|none|off)
     echo "INIT_ENCODER_MODE=scratch: training encoder from scratch (no checkpoint)."
@@ -130,12 +146,12 @@ case "${INIT_ENCODER_MODE}" in
     if [ ! -f "${INIT_ENCODER_HOST}" ]; then
       echo "ERROR: INIT_ENCODER_MODE=local but ${INIT_ENCODER_HOST} not found." >&2; exit 1
     fi
-    INIT_ENCODER_OVERRIDE="+init_from_nemo_model.streaming_enc.path=${INIT_ENCODER_CONTAINER} +init_from_nemo_model.streaming_enc.include=[encoder]"
-    INIT_ENCODER_DESC="${INIT_ENCODER_CONTAINER}"
+    INIT_ENCODER_OVERRIDE="+init_from_nemo_model.streaming_enc.path=${INIT_ENCODER_CONTAINER} +init_from_nemo_model.streaming_enc.include=[encoder]${INIT_ENCODER_EXCLUDE_NEMO}"
+    INIT_ENCODER_DESC="${INIT_ENCODER_CONTAINER}${INIT_ENCODER_EXCLUDE_DESC}"
     ;;
   hf|pretrained)
-    INIT_ENCODER_OVERRIDE="+init_from_pretrained_model.streaming_enc.name=${INIT_ENCODER_NAME} +init_from_pretrained_model.streaming_enc.include=[encoder]"
-    INIT_ENCODER_DESC="${INIT_ENCODER_NAME}"
+    INIT_ENCODER_OVERRIDE="+init_from_pretrained_model.streaming_enc.name=${INIT_ENCODER_NAME} +init_from_pretrained_model.streaming_enc.include=[encoder]${INIT_ENCODER_EXCLUDE_HF}"
+    INIT_ENCODER_DESC="${INIT_ENCODER_NAME}${INIT_ENCODER_EXCLUDE_DESC}"
     ;;
   *) echo "ERROR: unknown INIT_ENCODER_MODE='${INIT_ENCODER_MODE}'" >&2; exit 1 ;;
 esac
