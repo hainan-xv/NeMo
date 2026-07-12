@@ -191,6 +191,9 @@ echo "*******STARTING********" \
     ++exp_manager.checkpoint_callback_params.mode=min \
     ++trainer.strategy.find_unused_parameters=false \
     ++model.perception.encoder.sync_max_audio_length=false \
+    ++model.compact_template=true \
+    ++data.dataset.compact_template=true \
+    ++model.debug_validate_tokens=true \
 
 
 EOF
