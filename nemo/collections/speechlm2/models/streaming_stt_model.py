@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import math
+import os
 import warnings
 from collections import defaultdict
 from copy import deepcopy
@@ -34,6 +35,11 @@ try:
     from transformers.masking_utils import create_causal_mask
 except Exception:  # noqa: BLE001
     create_causal_mask = None
+
+try:
+    from transformers.cache_utils import DynamicCache
+except Exception:  # noqa: BLE001
+    DynamicCache = None
 
 from nemo.collections.asr.inference.streaming.buffering.cache_feature_bufferer import BatchedCacheFeatureBufferer
 from nemo.collections.asr.inference.streaming.framing.request import Frame
@@ -323,6 +329,117 @@ def two_stream_llm_forward(
     return ans
 
 
+def _run_decoder_layer_cached(layer, hidden, attn_mask, position_ids, position_embeddings, cache, cache_position):
+    """Call one HF decoder layer with a KV cache (incremental decode)."""
+    out = layer(
+        hidden,
+        attention_mask=attn_mask,
+        position_ids=position_ids,
+        position_embeddings=position_embeddings,
+        past_key_values=cache,
+        use_cache=True,
+        cache_position=cache_position,
+    )
+    return out[0] if isinstance(out, tuple) else out
+
+
+def _block_causal_additive_mask(q_len: int, past_len: int, dtype: torch.dtype, device, batch: int) -> Tensor:
+    """(batch, 1, q_len, past_len+q_len) additive causal mask for a new block.
+
+    New query ``i`` (0-based within the block) may attend to all ``past_len``
+    cached keys plus new keys ``0..i``. No padding (two-stream fixed-chunk
+    inference uses a shared, fully-valid sequence). ``finfo.min`` for blocked.
+    """
+    kv = past_len + q_len
+    qi = torch.arange(q_len, device=device)
+    kj = torch.arange(kv, device=device)
+    allowed = kj[None, :] <= (past_len + qi)[:, None]  # (q_len, kv)
+    additive = torch.zeros(q_len, kv, dtype=dtype, device=device)
+    additive = additive.masked_fill(~allowed, torch.finfo(dtype).min)
+    return additive[None, None].expand(batch, 1, q_len, kv).contiguous()
+
+
+def two_stream_cached_step(
+    *,
+    layers,
+    norm,
+    rotary_emb,
+    lm_head,
+    input_embeds: Tensor,
+    input_is_audio: Tensor,
+    text_cache,
+    last_cache,
+    text_len: int,
+    full_len: int,
+    compute_logits: bool = True,
+) -> tuple[Optional[Tensor], int, int]:
+    """Incremental (KV-cached) two-stream step — the fast counterpart of
+    :func:`two_stream_llm_forward`.
+
+    Only the TEXT columns of the new block are pushed through ``layers[:-1]``
+    (advancing ``text_cache`` with contiguous text positions); the raw audio
+    columns skip the lower layers entirely. The final layer then runs over ALL
+    new columns (advancing ``last_cache`` at absolute positions), fusing text and
+    audio, followed by ``norm`` + ``lm_head``. This reproduces the full-recompute
+    forward exactly (causal), at O(1) layer-passes per new token instead of a
+    full re-forward.
+
+    Assumes a batch-uniform audio/text column pattern (true for the static
+    fixed-chunk path, where all streams process the same turn template in
+    lockstep) and no left padding (shared system prompt).
+
+    Args:
+        input_embeds: (B, q, H) new block — audio-encoder embeds at audio
+            columns, token embeds at text columns.
+        input_is_audio: (B, q) bool (uniform across the batch dim).
+        text_cache / last_cache: ``DynamicCache`` for ``layers[:-1]`` / ``layers[-1]``.
+        text_len / full_len: positions already cached in each.
+
+    Returns:
+        ``(logits (B, q, V) | None, new_text_len, new_full_len)``.
+    """
+    device = input_embeds.device
+    dtype = input_embeds.dtype
+    B, q, H = input_embeds.shape
+    col_is_audio = input_is_audio[0]  # (q,)
+    assert bool((input_is_audio == col_is_audio.unsqueeze(0)).all()), (
+        "two_stream_cached_step requires a batch-uniform audio/text pattern"
+    )
+    text_cols = (~col_is_audio).nonzero(as_tuple=True)[0]  # (t,)
+    t = int(text_cols.numel())
+
+    # --- Stage 1: lower layers over the new TEXT columns only ---
+    if t > 0:
+        text_block = input_embeds.index_select(1, text_cols)  # (B, t, H)
+        text_positions = torch.arange(text_len, text_len + t, device=device)
+        pos_ids_text = text_positions.unsqueeze(0).expand(B, t)
+        mask_text = _block_causal_additive_mask(t, text_len, dtype, device, B)
+        pos_emb_text = rotary_emb(text_block, pos_ids_text)
+        h = text_block
+        for layer in layers[:-1]:
+            h = _run_decoder_layer_cached(layer, h, mask_text, pos_ids_text, pos_emb_text, text_cache, text_positions)
+        text_hidden = h  # (B, t, H)
+        new_text_len = text_len + t
+    else:
+        text_hidden = None
+        new_text_len = text_len
+
+    # --- Stage 2: last layer over ALL new columns (interleave raw audio) ---
+    last_input = input_embeds.clone()
+    if t > 0:
+        last_input.index_copy_(1, text_cols, text_hidden)
+    full_positions = torch.arange(full_len, full_len + q, device=device)
+    pos_ids_full = full_positions.unsqueeze(0).expand(B, q)
+    mask_full = _block_causal_additive_mask(q, full_len, dtype, device, B)
+    pos_emb_full = rotary_emb(last_input, pos_ids_full)
+    h_last = _run_decoder_layer_cached(layers[-1], last_input, mask_full, pos_ids_full, pos_emb_full, last_cache, full_positions)
+    h_last = norm(h_last)
+    new_full_len = full_len + q
+
+    logits = lm_head(h_last) if compute_logits else None
+    return logits, new_text_len, new_full_len
+
+
 @dataclass
 class StreamingSTTModelConfig:
     pretrained_llm: str
@@ -448,8 +565,16 @@ class StreamingState:
     # is on, the streaming path does NOT use ``cache``; instead it accumulates
     # every fed embedding and its audio flag here and recomputes the two-stream
     # forward over the full sequence each step (guaranteed parity with training).
-    ts_embeds: Optional[Tensor] = None  # (B, seq_len, H) fed embeddings
-    ts_is_audio: Optional[Tensor] = None  # (B, seq_len) bool: audio-frame positions
+    ts_embeds: Optional[Tensor] = None  # (B, seq_len, H) fed embeddings [recompute path]
+    ts_is_audio: Optional[Tensor] = None  # (B, seq_len) bool: audio-frame positions [recompute path]
+    # Two KV caches for the fast (incremental) two-stream path. ``ts_text_cache``
+    # holds the text stream through layers[:-1] (text positions only); ``ts_last_cache``
+    # holds the final layer over the full interleaved sequence. Counters track how
+    # many positions each cache already holds.
+    ts_text_cache: Any = None  # DynamicCache for layers[:-1]
+    ts_last_cache: Any = None  # DynamicCache for layers[-1]
+    ts_text_len: int = 0
+    ts_full_len: int = 0
     batch_size: int = 1
 
     @property
@@ -593,6 +718,17 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                     "two_stream_last_layer requires transformers.masking_utils.create_causal_mask, "
                     "which is unavailable in this transformers version."
                 )
+            # Inference uses the fast incremental (two-KV-cache) stepper by
+            # default. Set NEMO_TWO_STREAM_RECOMPUTE=1 to fall back to the slow
+            # full-recompute path (parity reference; e.g. for per-sample prompts
+            # or debugging).
+            self._two_stream_use_cache = os.environ.get("NEMO_TWO_STREAM_RECOMPUTE", "0") != "1"
+            if self._two_stream_use_cache and DynamicCache is None:
+                logging.warning(
+                    "two_stream_last_layer: DynamicCache unavailable; falling back to the "
+                    "slow full-recompute inference path."
+                )
+                self._two_stream_use_cache = False
             # We drive the Qwen layer stack manually; sdpa/eager both honor the
             # boolean/additive masks we build. flash-attention-2 does not.
             attn_impl = getattr(self.llm.config, "_attn_implementation", None)
@@ -916,6 +1052,41 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         return core.layers, core.norm, core.rotary_emb, lm_head
 
     def _two_stream_infer_step(
+        self,
+        input_embeds: Tensor,
+        input_is_audio: Tensor,
+        state: "StreamingState",
+    ) -> SimpleNamespace:
+        """Dispatch a two-stream streaming forward: fast KV-cached path by
+        default, slow full-recompute path when ``_two_stream_use_cache`` is off."""
+        if getattr(self, "_two_stream_use_cache", True):
+            return self._two_stream_infer_step_cached(input_embeds, input_is_audio, state)
+        return self._two_stream_infer_step_recompute(input_embeds, input_is_audio, state)
+
+    def _two_stream_infer_step_cached(
+        self,
+        input_embeds: Tensor,
+        input_is_audio: Tensor,
+        state: "StreamingState",
+    ) -> SimpleNamespace:
+        """Fast incremental two-stream step using the two KV caches on ``state``."""
+        layers, norm, rotary_emb, lm_head = self._resolve_llm_core()
+        logits, state.ts_text_len, state.ts_full_len = two_stream_cached_step(
+            layers=layers,
+            norm=norm,
+            rotary_emb=rotary_emb,
+            lm_head=lm_head,
+            input_embeds=input_embeds,
+            input_is_audio=input_is_audio,
+            text_cache=state.ts_text_cache,
+            last_cache=state.ts_last_cache,
+            text_len=state.ts_text_len,
+            full_len=state.ts_full_len,
+            compute_logits=True,
+        )
+        return SimpleNamespace(logits=logits, past_key_values=None, hidden_states=None)
+
+    def _two_stream_infer_step_recompute(
         self,
         input_embeds: Tensor,
         input_is_audio: Tensor,
@@ -1889,13 +2060,41 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
 
         aux_hidden_buffer = out.hidden_states[-1] if (out is not None and capture_hidden) else None
 
-        # Two-stream inference buffers: seed with the (all-text) system prompt.
+        # Two-stream inference: seed state with the (all-text) system prompt.
+        ts_embeds = None
+        ts_is_audio = None
+        ts_text_cache = None
+        ts_last_cache = None
+        ts_text_len = 0
+        ts_full_len = 0
         if self.core_cfg.two_stream_last_layer:
-            ts_embeds = sys_embs.contiguous()
-            ts_is_audio = torch.zeros(batch_size, max_sys_len, dtype=torch.bool, device=device)
-        else:
-            ts_embeds = None
-            ts_is_audio = None
+            sys_is_audio = torch.zeros(batch_size, max_sys_len, dtype=torch.bool, device=device)
+            if getattr(self, "_two_stream_use_cache", True):
+                if needs_padding:
+                    raise NotImplementedError(
+                        "Fast two-stream inference (KV-cached) requires a shared system prompt "
+                        "(no left-padding). Use a single system_prompt string, or set "
+                        "NEMO_TWO_STREAM_RECOMPUTE=1 for the slow per-sample-prompt path."
+                    )
+                ts_text_cache = DynamicCache()
+                ts_last_cache = DynamicCache()
+                layers, _norm, _rotary, _lm_head = self._resolve_llm_core()
+                _logits, ts_text_len, ts_full_len = two_stream_cached_step(
+                    layers=layers,
+                    norm=_norm,
+                    rotary_emb=_rotary,
+                    lm_head=_lm_head,
+                    input_embeds=sys_embs,
+                    input_is_audio=sys_is_audio,
+                    text_cache=ts_text_cache,
+                    last_cache=ts_last_cache,
+                    text_len=0,
+                    full_len=0,
+                    compute_logits=False,
+                )
+            else:
+                ts_embeds = sys_embs.contiguous()
+                ts_is_audio = sys_is_audio
 
         # System-prompt positions are all text (chunk 0); seed per-position
         # bookkeeping only when the chunk-restricted attention mask is enabled.
@@ -1928,6 +2127,10 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             n_audio_chunks=0,
             ts_embeds=ts_embeds,
             ts_is_audio=ts_is_audio,
+            ts_text_cache=ts_text_cache,
+            ts_last_cache=ts_last_cache,
+            ts_text_len=ts_text_len,
+            ts_full_len=ts_full_len,
             batch_size=batch_size,
         )
 
