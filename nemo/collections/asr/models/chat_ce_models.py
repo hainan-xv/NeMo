@@ -50,11 +50,15 @@ class EncDecRNNTBPEModelChatCE(EncDecRNNTBPEModel):
             frame_length_in_secs = float(window_stride) * float(subsampling_factor)
             chat_ce_cfg = self.cfg.get("chat_ce", None)
             num_delay_frames = 0 if chat_ce_cfg is None else int(chat_ce_cfg.get("num_delay_frames", 0))
-            chunk_size = int(getattr(self.joint, "chunk_size", -1))
+            # Read chunk_size from the config (not self.joint): the training dataloader is
+            # set up inside ModelPT.__init__ BEFORE the joint module is created.
+            joint_cfg = self.cfg.get("joint", None)
+            chunk_size = int(joint_cfg.get("chunk_size", -1)) if joint_cfg is not None else -1
             if chunk_size <= 0:
                 raise ValueError(
-                    "EncDecRNNTBPEModelChatCE requires a positive joint.chunk_size; "
-                    "set model.joint.chunk_size explicitly."
+                    "EncDecRNNTBPEModelChatCE requires a positive model.joint.chunk_size set "
+                    "explicitly (the training dataloader maps word timestamps to chunks before "
+                    "the joint module is built, so it cannot be inferred here)."
                 )
             logging.info(
                 f"ChatCE training dataloader: chunk_size={chunk_size}, "
