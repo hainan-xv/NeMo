@@ -2337,6 +2337,151 @@ class RNNTAttJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMix
 
         return res
 
+    @staticmethod
+    def _build_forced_paths(token_chunk_idx, targets, target_lengths, num_chunks, blank):
+        """
+        Build the single (forced) monotonic transducer path for each utterance from a
+        per-token chunk assignment.
+
+        For token i assigned to chunk c_i (non-decreasing), the path emits blanks to
+        advance the chunk index up to c_i, then emits token i (staying at chunk c_i),
+        and finally trailing blanks to consume any remaining chunks. This is the
+        standard RNNT alignment path, but fixed by the external alignment instead of
+        summed over all paths.
+
+        Returns padded tensors (all shape [B, P]):
+            path_t: chunk index at each path step
+            path_u: decoder prefix length (index into the [U+1] decoder outputs)
+            path_tgt: target symbol at each step (token id, or blank)
+            path_mask: 1.0 for real steps, 0.0 for padding
+        """
+        batch_size = token_chunk_idx.size(0)
+        tci = token_chunk_idx.cpu().tolist()
+        tgt = targets.cpu().tolist()
+        tls = target_lengths.cpu().tolist()
+        ncs = num_chunks.cpu().tolist()
+
+        all_t, all_u, all_tg = [], [], []
+        max_p = 1
+        for b in range(batch_size):
+            u_len = int(tls[b])
+            n_chunk = max(int(ncs[b]), 1)
+            pt, pu, ptg = [], [], []
+            t = 0
+            for i in range(u_len):
+                c = int(tci[b][i])
+                c = min(max(c, t), n_chunk - 1)  # enforce monotonic + clamp into range
+                while t < c:  # advance chunks with blanks (decoder prefix = i)
+                    pt.append(t)
+                    pu.append(i)
+                    ptg.append(blank)
+                    t += 1
+                pt.append(c)  # emit token i at chunk c using decoder prefix i
+                pu.append(i)
+                ptg.append(int(tgt[b][i]))
+            while t < n_chunk:  # trailing blanks (decoder prefix = u_len)
+                pt.append(t)
+                pu.append(u_len)
+                ptg.append(blank)
+                t += 1
+            all_t.append(pt)
+            all_u.append(pu)
+            all_tg.append(ptg)
+            max_p = max(max_p, len(pt))
+
+        path_t = torch.zeros(batch_size, max_p, dtype=torch.long)
+        path_u = torch.zeros(batch_size, max_p, dtype=torch.long)
+        path_tgt = torch.full((batch_size, max_p), blank, dtype=torch.long)
+        path_mask = torch.zeros(batch_size, max_p, dtype=torch.float)
+        for b in range(batch_size):
+            p = len(all_t[b])
+            if p == 0:
+                continue
+            path_t[b, :p] = torch.tensor(all_t[b], dtype=torch.long)
+            path_u[b, :p] = torch.tensor(all_u[b], dtype=torch.long)
+            path_tgt[b, :p] = torch.tensor(all_tg[b], dtype=torch.long)
+            path_mask[b, :p] = 1.0
+        return path_t, path_u, path_tgt, path_mask
+
+    def chat_ce_loss(
+        self,
+        encoder_outputs: torch.Tensor,
+        decoder_outputs: torch.Tensor,
+        encoder_lengths: torch.Tensor,
+        targets: torch.Tensor,
+        target_lengths: torch.Tensor,
+        token_chunk_idx: torch.Tensor,
+        reduction: str = "mean_volume",
+    ) -> torch.Tensor:
+        """
+        Alignment-guided cross-entropy loss for the CHAT joint.
+
+        Instead of summing over all monotonic alignments (RNNT forward-backward, which
+        materializes the [B, T, U, V] joint tensor), this evaluates the joint ONLY at
+        the positions of the single forced path implied by ``token_chunk_idx`` (each
+        target token is assigned to the chunk containing its word-ending timestamp),
+        and applies token-level cross-entropy over that path (token + blank steps).
+
+        Args:
+            encoder_outputs: [B, D_enc, T] encoder output (channel-first, as in forward()).
+            decoder_outputs: [B, D_pred, U+1] prediction-network output (channel-first).
+            encoder_lengths: [B] valid encoder frame lengths.
+            targets: [B, U] target token ids.
+            target_lengths: [B] valid target lengths.
+            token_chunk_idx: [B, U] chunk index assigned to each target token.
+            reduction: 'mean_volume' (default) | 'mean_batch' | 'sum' | 'mean'.
+        """
+        if self.chunk_size <= 0:
+            raise ValueError("chat_ce_loss requires joint.chunk_size > 0 (set model.joint.chunk_size).")
+
+        device = encoder_outputs.device
+        blank = self.num_classes_with_blank - 1
+
+        # Chunk the encoder output exactly like the CHAT joint does for the RNNT path.
+        enc = encoder_outputs.transpose(1, 2)  # [B, T, D_enc]
+        chunked, chunk_lengths = chunk_concat_audio(enc, encoder_lengths, self.chunk_size)
+        num_chunks = (chunk_lengths != 0).sum(dim=1)  # [B]
+
+        f = self.project_encoder(chunked)  # [B, nc, chunk_size * joint_hidden]
+        batch_size, nc, _ = f.shape
+        f = f.reshape(batch_size, nc, self.chunk_size, self.joint_hidden)  # [B, nc, C, H]
+
+        g = self.project_prednet(decoder_outputs.transpose(1, 2))  # [B, U+1, H]
+
+        path_t, path_u, path_tgt, path_mask = self._build_forced_paths(
+            token_chunk_idx, targets, target_lengths, num_chunks, blank
+        )
+        path_t = path_t.to(device)
+        path_u = path_u.to(device)
+        path_tgt = path_tgt.to(device)
+        path_mask = path_mask.to(device)
+        path_len = path_t.size(1)
+
+        bidx = torch.arange(batch_size, device=device).unsqueeze(1).expand(batch_size, path_len)
+        f_path = f[bidx, path_t]  # [B, P, C, H]
+        g_path = g[bidx, path_u]  # [B, P, H]
+        flen_path = chunk_lengths.to(device)[bidx, path_t]  # [B, P]
+
+        # Evaluate the joint only at path positions: fold P into the batch dim and use
+        # T=U=1 so cross_attention produces one distribution per step (no [T, U] grid).
+        f_step = f_path.reshape(batch_size * path_len, 1, self.chunk_size, self.joint_hidden)
+        g_step = g_path.reshape(batch_size * path_len, 1, self.joint_hidden)
+        sizes_step = flen_path.reshape(batch_size * path_len, 1)
+        attended = self.cross_attention(f_step, g_step, sizes_step)  # [B*P, 1, 1, H]
+        logits = self.joint_net(attended).reshape(batch_size, path_len, -1).float()  # [B, P, V+1]
+
+        logp = torch.log_softmax(logits, dim=-1)
+        nll = -logp.gather(dim=-1, index=path_tgt.unsqueeze(-1)).squeeze(-1)  # [B, P]
+        nll = nll * path_mask
+
+        if reduction == "mean_volume":
+            return nll.sum() / target_lengths.to(device).sum().clamp(min=1)
+        if reduction == "mean_batch":
+            return nll.sum(dim=1).mean()
+        if reduction == "sum":
+            return nll.sum()
+        return nll.sum() / path_mask.sum().clamp(min=1)  # 'mean' over path steps
+
     def _joint_net_modules(self, num_classes, pred_n_hidden, enc_n_hidden, joint_n_hidden, activation, dropout):
         """
         Prepare the trainable modules of the Joint Network
