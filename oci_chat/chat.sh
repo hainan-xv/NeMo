@@ -151,8 +151,14 @@ if [ -z "$INIT_CKPT" ] || [ ! -f "$INIT_CKPT" ]; then
     echo "       Set SRC_EXP_NAME=<ctc-joint exp name> or INIT_CKPT=<full path> explicitly." >&2
     exit 1
 fi
-INIT_OVERRIDE="+init_from_ptl_ckpt=${INIT_CKPT}"
+# Checkpoint filenames contain '=' (e.g. step=NNNN-...), which Hydra cannot parse
+# in an override value. Symlink to an '='-free path and point the override there.
+mkdir -p "${RESULTS_DIR}"
+SAFE_INIT_CKPT="${RESULTS_DIR}/init_from_ctc.ckpt"
+ln -sf "${INIT_CKPT}" "${SAFE_INIT_CKPT}"
+INIT_OVERRIDE="+init_from_ptl_ckpt=${SAFE_INIT_CKPT}"
 echo "==> Pure-RNNT run; initializing from CTC-joint checkpoint: ${INIT_CKPT}"
+echo "    (via '='-free symlink: ${SAFE_INIT_CKPT})"
 
 CHECKPOINT_DIR=${LUSTRE_ACCOUNT_PREFIX}/${OLDUSERID}/checkpoints/
 HFCACHE=${OUTPUT_PREFIX}/hf_cache
