@@ -15,12 +15,15 @@
 
 # ============================================================================
 # OCI launcher for the FULL-CONTEXT CHAT (Chunk-wise Attention Transducer) model,
-# trained JOINTLY with an auxiliary CTC loss (hybrid RNNT-CTC model).
+# trained with the PURE RNNT (CHAT) loss -- no CTC.
+#
+# This warm-starts from the LAST checkpoint of the corresponding full-context
+# CTC-joint run (encoder+decoder+joint are loaded; the auxiliary CTC head is
+# dropped), to test whether the CTC joint training helped.
 #
 # Full-context (offline) variant of oci_chat/chat.sh. The encoder runs with
 # unlimited attention and non-causal operations; the CHAT cross-attention joint
-# still processes the encoder output in fixed-size chunks; and an aux CTC head is
-# trained jointly:
+# still processes the encoder output in fixed-size chunks:
 #   - att_context_size    = [-1,-1]   (unlimited / full context, regular style)
 #   - causal_downsampling = false     (non-causal subsampling)
 #   - conv_context_size   = null      (non-causal symmetric convolution)
@@ -119,43 +122,11 @@ PRECISION="${PRECISION:-bf16}"
 # mean_volume sums all losses and divides by total target length (longer samples weigh more).
 RNNT_REDUCTION="${RNNT_REDUCTION:-mean_volume}"
 
-# Joint CTC + CHAT (RNNT) training via the hybrid RNNT-CTC model. The CTC head is
-# an aux ConvASR decoder on the (unchunked) encoder output. total_loss =
-# (1 - ctc_weight) * chat_loss + ctc_weight * ctc_loss. Both use mean_volume.
-CTC_LOSS_WEIGHT="${CTC_LOSS_WEIGHT:-0.3}"
-CTC_REDUCTION="${CTC_REDUCTION:-mean_volume}"
-
-# Encoder warm-start from parakeet-tdt-0.6b-v2 (non-causal offline FastConformer
-# whose encoder architecture matches this full-context model, so the whole
-# encoder incl. pre_encode.out loads cleanly -- no exclusions needed).
-# INIT_ENCODER_MODE: local (default, .nemo on lustre) | hf (download) | scratch.
-INIT_ENCODER_MODE="${INIT_ENCODER_MODE:-local}"
-# My own pretrained_models dir on lustre (where the parakeet .nemo was downloaded).
-PRETRAINED_MODEL_DIR="${PRETRAINED_MODEL_DIR:-${LUSTRE_ACCOUNT_PREFIX}/${USERID}/pretrained_models}"
-INIT_ENCODER_BASENAME="${INIT_ENCODER_BASENAME:-parakeet-tdt-0.6b-v2.nemo}"
-INIT_ENCODER_HOST="${PRETRAINED_MODEL_DIR}/${INIT_ENCODER_BASENAME}"
-INIT_ENCODER_CONTAINER="/pretrained/${INIT_ENCODER_BASENAME}"
-INIT_ENCODER_NAME="${INIT_ENCODER_NAME:-nvidia/parakeet-tdt-0.6b-v2}"
-
-case "${INIT_ENCODER_MODE}" in
-  scratch|none|off)
-    echo "INIT_ENCODER_MODE=scratch: training encoder from scratch (no checkpoint)."
-    INIT_ENCODER_OVERRIDE=""
-    INIT_ENCODER_DESC="scratch"
-    ;;
-  local|nemo)
-    if [ ! -f "${INIT_ENCODER_HOST}" ]; then
-      echo "ERROR: INIT_ENCODER_MODE=local but ${INIT_ENCODER_HOST} not found." >&2; exit 1
-    fi
-    INIT_ENCODER_OVERRIDE="+init_from_nemo_model.streaming_enc.path=${INIT_ENCODER_CONTAINER} +init_from_nemo_model.streaming_enc.include=[encoder]"
-    INIT_ENCODER_DESC="${INIT_ENCODER_CONTAINER}"
-    ;;
-  hf|pretrained)
-    INIT_ENCODER_OVERRIDE="+init_from_pretrained_model.streaming_enc.name=${INIT_ENCODER_NAME} +init_from_pretrained_model.streaming_enc.include=[encoder]"
-    INIT_ENCODER_DESC="${INIT_ENCODER_NAME}"
-    ;;
-  *) echo "ERROR: unknown INIT_ENCODER_MODE='${INIT_ENCODER_MODE}'" >&2; exit 1 ;;
-esac
+# This run trains PURE RNNT (CHAT) loss -- no CTC. It warm-starts from the last
+# checkpoint of the corresponding full-context CTC-joint run (encoder+decoder+joint
+# load; the CTC head is ignored via strict=False). SRC_CTC_WEIGHT is only used to
+# locate that source run's folder (see SRC_EXP_NAME below).
+SRC_CTC_WEIGHT="${SRC_CTC_WEIGHT:-0.3}"
 
 # ---------------------------------------------------------------------------
 # Data (Granary 2.0 pre-aligned, same as oci/baseline_granary2.sh) + tokenizer
@@ -173,14 +144,29 @@ VAL_MANIFEST="${VAL_MANIFEST:-[/data/canary/canary_v0/manifests/data/ASR/MMLPC/e
 ST_TOKENIZERS_ROOT="${ST_TOKENIZERS_ROOT:-${LUSTRE_ACCOUNT_PREFIX}/${USERID}/Workplace/multilingual/tokenizers/en}"
 TOKENIZER_DIR="${TOKENIZER_DIR:-${ST_TOKENIZERS_ROOT}/tokenizer_spe_bpe_v1024}"
 
-# Hybrid CTC+CHAT full-context model warm-started from parakeet-tdt-0.6b-v2.
-# Distinct EXP_NAME so it does not resume older/incompatible checkpoints.
-EXP_NAME="${EXP_NAME:-${CLUSTER}_chat_fullctx_parakeet_hybctc${CTC_LOSS_WEIGHT}_g2_ctx${CTX_TAG}_chunk${CHAT_CHUNK_SIZE}_lr${LR}_n${SLURM_JOB_NUM_NODES}}"
+# Pure-RNNT (no CTC) continuation, warm-started from the full-context CTC-joint
+# checkpoint. Distinct EXP_NAME/folder so it does not collide with that run.
+EXP_NAME="${EXP_NAME:-${CLUSTER}_chat_fullctx_parakeet_rnntonly_fromhyb_g2_ctx${CTX_TAG}_chunk${CHAT_CHUNK_SIZE}_lr${LR}_n${SLURM_JOB_NUM_NODES}}"
 
 # Write-heavy outputs (results/checkpoints, HF cache, checkpoint temp) go to the
 # nemotron project, which has free quota. Override with OUTPUT_PREFIX.
 OUTPUT_PREFIX="${OUTPUT_PREFIX:-/lustre/fsw/portfolios/nemotron/users/hainanx}"
 RESULTS_DIR=${OUTPUT_PREFIX}/results/$PROJECT_NAME/$EXP_NAME
+
+# Resolve the full-context CTC-joint run's last checkpoint to warm-start from
+# (loads encoder+decoder+joint; the CTC head is ignored). Override SRC_EXP_NAME
+# (the CTC-joint experiment name) or INIT_CKPT (a full path) as needed.
+SRC_EXP_NAME="${SRC_EXP_NAME:-${CLUSTER}_chat_fullctx_parakeet_hybctc${SRC_CTC_WEIGHT}_g2_ctx${CTX_TAG}_chunk${CHAT_CHUNK_SIZE}_lr${LR}_n${SLURM_JOB_NUM_NODES}}"
+SRC_CKPT_DIR="${OUTPUT_PREFIX}/results/${PROJECT_NAME}/${SRC_EXP_NAME}/${SRC_EXP_NAME}/checkpoints"
+INIT_CKPT="${INIT_CKPT:-$(ls -t ${SRC_CKPT_DIR}/*-last.ckpt 2>/dev/null | head -1)}"
+if [ -z "$INIT_CKPT" ] || [ ! -f "$INIT_CKPT" ]; then
+    echo "ERROR: no *-last.ckpt found for the CTC-joint model under: ${SRC_CKPT_DIR}" >&2
+    echo "       Set SRC_EXP_NAME=<ctc-joint exp name> or INIT_CKPT=<full path> explicitly." >&2
+    exit 1
+fi
+INIT_OVERRIDE="+init_from_ptl_ckpt=${INIT_CKPT}"
+echo "==> Pure-RNNT full-context run; initializing from CTC-joint checkpoint: ${INIT_CKPT}"
+
 CHECKPOINT_DIR=${LUSTRE_ACCOUNT_PREFIX}/${OLDUSERID}/checkpoints/
 HFCACHE=${OUTPUT_PREFIX}/hf_cache
 SPEECHLM_PROJECT_DIR=/lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm
@@ -206,12 +192,12 @@ MOUNTS="--container-mounts=${SPEECHLM_PROJECT_DIR}:${SPEECHLM_PROJECT_DIR},${H_D
 # export CUDA_VISIBLE_DEVICES=0
 
 read -r -d '' cmd <<EOF
-echo "*******STARTING HYBRID CTC+CHAT FULL-CONTEXT (FastConformer) - Granary 2.0********" \
+echo "*******STARTING FULL-CONTEXT CHAT (FastConformer RNNT, pure - no CTC) - Granary 2.0********" \
 && echo "*** CONFIG: ${CONFIG_NAME} | ATT_CONTEXT=${ATT_CONTEXT} style=${ATT_CONTEXT_STYLE} ***" \
 && echo "*** FULL-CTX: causal_downsampling=${CAUSAL_DOWNSAMPLING} conv=${CONV_CONTEXT_SIZE}/${CONV_NORM_TYPE} normalize=${NORMALIZE} | CHAT chunk_size=${CHAT_CHUNK_SIZE} ***" \
-&& echo "*** LOSS: CHAT(rnnt) + CTC(weight=${CTC_LOSS_WEIGHT}), both reduction=${RNNT_REDUCTION}/${CTC_REDUCTION} ***" \
+&& echo "*** LOSS: pure CHAT(rnnt), reduction=${RNNT_REDUCTION} ***" \
 && echo "*** DATA: Granary 2.0 pre-aligned (lhotse) -> ${TRAIN_INPUT_CFG} ***" \
-&& echo "*** ENCODER init: ${INIT_ENCODER_DESC} ***" \
+&& echo "*** INIT: ${INIT_CKPT} (from CTC-joint run; CTC head dropped) ***" \
 && nvidia-smi \
 && export WANDB_API_KEY=${WANDB} \
 && cd /code \
@@ -230,12 +216,12 @@ echo "*******STARTING HYBRID CTC+CHAT FULL-CONTEXT (FastConformer) - Granary 2.0
 && export AIS_ENDPOINT=http://asr.iad.oci.aistore.nvidia.com:51080 \
 && export AIS_AUTHN_TOKEN="${AIS_AUTHN_TOKEN}" \
 && export NEMO_DATA_STORE_CACHE_DIR=/lustre/fsw/portfolios/llmservice/users/heh/nemo_cache \
-&& echo "Starting training (running MY code at /code, hybrid CTC+CHAT full-context model, GRANARY 2.0 data)" \
-&& python /code/examples/asr/asr_hybrid_transducer_ctc/speech_to_text_hybrid_rnnt_ctc_bpe.py \
+&& echo "Starting training (running MY code at /code, pure CHAT-RNNT full-context from CTC-joint ckpt, GRANARY 2.0 data)" \
+&& python /code/examples/asr/asr_transducer/speech_to_text_rnnt_bpe.py \
     --config-path=${CONFIG_PATH} \
     --config-name=${CONFIG_NAME} \
     name=${EXP_NAME} \
-    ${INIT_ENCODER_OVERRIDE} \
+    ${INIT_OVERRIDE} \
     model.encoder.att_context_size=${ATT_CONTEXT} \
     model.encoder.att_context_style=${ATT_CONTEXT_STYLE} \
     model.encoder.causal_downsampling=${CAUSAL_DOWNSAMPLING} \
@@ -246,14 +232,6 @@ echo "*******STARTING HYBRID CTC+CHAT FULL-CONTEXT (FastConformer) - Granary 2.0
     model.skip_nan_grad=true \
     model.compute_eval_loss=false \
     ++model.rnnt_reduction=${RNNT_REDUCTION} \
-    ++model.aux_ctc.ctc_loss_weight=${CTC_LOSS_WEIGHT} \
-    ++model.aux_ctc.ctc_reduction=${CTC_REDUCTION} \
-    ++model.aux_ctc.use_cer=false \
-    ++model.aux_ctc.decoder._target_=nemo.collections.asr.modules.ConvASRDecoder \
-    ++model.aux_ctc.decoder.feat_in=null \
-    ++model.aux_ctc.decoder.num_classes=-1 \
-    ++model.aux_ctc.decoder.vocabulary=[] \
-    ++model.aux_ctc.decoding.strategy=greedy \
     ++model.train_ds.use_lhotse=true \
     ++model.train_ds.input_cfg=${TRAIN_INPUT_CFG} \
     model.train_ds.manifest_filepath=null \
