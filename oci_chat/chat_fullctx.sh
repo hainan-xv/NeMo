@@ -2,7 +2,7 @@
 #SBATCH -A nemotron_speechprod_asr
 #SBATCH -J nemotron_speechprod_asr:chat-fullctx-nemotron06b-rnnt-g2
 #SBATCH -p batch_block1,batch_block3,batch_block4
-#SBATCH -N 8
+#SBATCH -N 4
 #SBATCH --gpus-per-node=8
 #SBATCH -t 04:00:00            # wall time
 #SBATCH --time-min 04:00:00
@@ -110,7 +110,7 @@ MAX_STEPS="${MAX_STEPS:-500000}"
 LIMIT_TRAIN_BATCHES="${LIMIT_TRAIN_BATCHES:-6000}"
 EVALS_PER_EPOCH="${EVALS_PER_EPOCH:-1}"
 VAL_CHECK_INTERVAL=$(( LIMIT_TRAIN_BATCHES / EVALS_PER_EPOCH ))
-LR="${LR:-5.0}"                       # NoamAnnealing peak scale (config default)
+LR="${LR:-1.0}"                       # NoamAnnealing peak scale (config default)
 WARMUP_STEPS="${WARMUP_STEPS:-15000}"
 BATCH_DURATION="${BATCH_DURATION:-120}"
 NUM_BUCKETS="${NUM_BUCKETS:-30}"
@@ -191,7 +191,7 @@ mkdir -p ${RESULTS_DIR} ${HFCACHE}
 OUTFILE=${RESULTS_DIR}/slurm-%j-%n.out
 ERRFILE=${RESULTS_DIR}/error-%j-%n.out
 
-MOUNTS="--container-mounts=${SPEECHLM_PROJECT_DIR}:${SPEECHLM_PROJECT_DIR},${H_DIR}:${H_DIR},$HAINAN_DIR:$HAINAN_DIR,$CODE_DIR:/code,$RESULTS_DIR:/results,$DATA_DIR:/data,$PRETRAINED_MODEL_DIR:/pretrained,$CHECKPOINT_DIR:/checkpoints,${HFCACHE}:/hfcache/,${TOKENIZER_DIR}:/tokenizers,/lustre/fsw:/lustre/fsw,/lustre/fs12:/lustre/fs12"
+MOUNTS="--container-mounts=${SPEECHLM_PROJECT_DIR}:${SPEECHLM_PROJECT_DIR},${H_DIR}:${H_DIR},$HAINAN_DIR:$HAINAN_DIR,$CODE_DIR:/code,$RESULTS_DIR:/results,$DATA_DIR:/data,$CHECKPOINT_DIR:/checkpoints,${HFCACHE}:/hfcache/,${TOKENIZER_DIR}:/tokenizers,/lustre/fsw:/lustre/fsw,/lustre/fs12:/lustre/fs12"
 
 # SLURM_JOB_NUM_NODES=1
 # GPUS_PER_NODE=1
