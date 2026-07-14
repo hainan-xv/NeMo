@@ -157,7 +157,8 @@ RESULTS_DIR=${OUTPUT_PREFIX}/results/$PROJECT_NAME/$EXP_NAME
 # (loads encoder+decoder+joint; the CTC head is ignored). Override SRC_EXP_NAME
 # (the CTC-joint experiment name) or INIT_CKPT (a full path) as needed.
 SRC_EXP_NAME="${SRC_EXP_NAME:-${CLUSTER}_chat_fullctx_parakeet_hybctc${SRC_CTC_WEIGHT}_g2_ctx${CTX_TAG}_chunk${CHAT_CHUNK_SIZE}_lr${LR}_n${SLURM_JOB_NUM_NODES}}"
-SRC_CKPT_DIR="${OUTPUT_PREFIX}/results/${PROJECT_NAME}/${SRC_EXP_NAME}/${SRC_EXP_NAME}/checkpoints"
+SRC_EXP_NAME=oci_chat_fullctx_parakeet_hybctc0.3_g2_ctx-1_-1_chunk14_lr5.0_n8
+SRC_CKPT_DIR="${OUTPUT_PREFIX}/results/${PROJECT_NAME}/${SRC_EXP_NAME}/${SRC_EXP_NAME}/${SRC_EXP_NAME}/checkpoints"
 INIT_CKPT="${INIT_CKPT:-$(ls -t ${SRC_CKPT_DIR}/*-last.ckpt 2>/dev/null | head -1)}"
 if [ -z "$INIT_CKPT" ] || [ ! -f "$INIT_CKPT" ]; then
     echo "ERROR: no *-last.ckpt found for the CTC-joint model under: ${SRC_CKPT_DIR}" >&2
