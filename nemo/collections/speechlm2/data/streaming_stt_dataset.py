@@ -24,7 +24,7 @@ import torch.nn.functional as F
 import torch.utils.data
 from lhotse import CutSet
 from lhotse.dataset.collation import collate_audio
-from omegaconf import DictConfig
+from omegaconf import DictConfig, ListConfig
 from torch.nn import CrossEntropyLoss
 from torch.nn.utils.rnn import pad_sequence
 
@@ -70,15 +70,23 @@ class StreamingSTTBatch:
     target_token_lens: Optional[torch.Tensor] = None
     text: Optional[List[str]] = None
     cuts: Optional[CutSet] = None
+    # Fixed-chunk size (frames) used to build THIS batch. For multi chunk-size
+    # training it is the per-batch drawn value; the model uses it to match the
+    # encoder look-ahead. None for dynamic/offline or when unset.
+    chunk_size: Optional[int] = None
 
 
 @dataclass
 class StreamingSTTDataConfig:
     sample_rate: int
     frame_length_in_secs: float
-    chunk_size: int
+    # ``> 0`` fixed chunking, ``0`` dynamic, ``< 0`` offline. May also be a list
+    # of positive ints (e.g. [2,4,7,10,14,28]) for multi chunk-size training:
+    # one size is drawn per batch (uniform). Mutually exclusive with chunk_size_std.
+    chunk_size: Union[int, List[int]]
     # Training-only fixed-chunk augmentation. A positive value samples a
     # batch-shared per-turn schedule from N(chunk_size, chunk_size_std).
+    # Ignored when ``chunk_size`` is a list (the list takes precedence).
     chunk_size_std: float = 0.0
     chunk_size_seed: int = 42
     num_delay_frames: int = 0
@@ -875,24 +883,55 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
         self.cfg: StreamingSTTDataConfig = to_dataclass(StreamingSTTDataConfig, cfg)
         if self.cfg.chunk_size_std < 0:
             raise ValueError("chunk_size_std must be non-negative")
-        if self.cfg.chunk_size_std > 0 and self.cfg.chunk_size <= 0:
+        if (
+            self.cfg.chunk_size_std > 0
+            and isinstance(self.cfg.chunk_size, int)
+            and self.cfg.chunk_size <= 0
+        ):
             raise ValueError("chunk_size_std > 0 requires fixed chunking (chunk_size > 0)")
         self._chunk_rngs: dict[int, np.random.Generator] = {}
         # Unescape Python escape sequences (e.g. "\\n" → "\n") because Hydra/OmegaConf
         # loads YAML strings literally without interpreting backslash escapes.
         self.cfg.blank_token = self.cfg.blank_token.encode().decode('unicode_escape')
 
-        # Tokenize the full audio chunk string (audio_tag * chunk_size) to get
-        # its token ID sequence.  We must encode the full chunk as a single string
-        # because BPE may merge tokens across adjacent audio tags (e.g.,
-        # "<audio><audio>" tokenizes differently from encode("<audio>") * 2).
-        # When chunk_size=-1 (offline mode), audio_chunk_ids is computed per sample
-        # in get_batch_data because num_frames varies per sample.
-        if self.cfg.chunk_size > 0 and self.cfg.chunk_size_std == 0:
-            audio_chunk_str = self.cfg.audio_tag * self.cfg.chunk_size
-            self.audio_chunk_ids = self.tokenizer.tokenizer.encode(audio_chunk_str, add_special_tokens=False)
+        # Normalize chunk_size: a list (e.g. [2,4,7,10,14,28]) enables multi
+        # chunk-size training (one drawn per batch). A scalar keeps the original
+        # single fixed/dynamic/offline mode.
+        cs = self.cfg.chunk_size
+        if isinstance(cs, (list, tuple, ListConfig)):
+            self._chunk_size_candidates = [int(x) for x in cs]
+            if not self._chunk_size_candidates or any(x <= 0 for x in self._chunk_size_candidates):
+                raise ValueError(
+                    f"All chunk sizes in a list must be positive (fixed chunking), "
+                    f"got {self._chunk_size_candidates}"
+                )
+            logging.info(f"Multi chunk-size training enabled: candidates={self._chunk_size_candidates}")
         else:
-            self.audio_chunk_ids = None
+            self._chunk_size_candidates = None
+
+        # Tokenize the full audio chunk string (audio_tag * chunk_size) to get
+        # its token ID sequence, one entry per positive fixed-chunk size. We must
+        # encode the full chunk as a single string because BPE may merge tokens
+        # across adjacent audio tags (e.g., "<audio><audio>" tokenizes differently
+        # from encode("<audio>") * 2). When chunk_size <= 0 (offline/dynamic) or
+        # chunk_size_std > 0 (Gaussian), sizes vary per turn and are encoded on
+        # demand in get_batch_data.
+        if self._chunk_size_candidates is not None:
+            positive_sizes = self._chunk_size_candidates
+        elif isinstance(cs, int) and cs > 0 and self.cfg.chunk_size_std == 0:
+            positive_sizes = [cs]
+        else:
+            positive_sizes = []
+        self._audio_chunk_ids_by_size: dict[int, list[int]] = {
+            size: self.tokenizer.tokenizer.encode(self.cfg.audio_tag * size, add_special_tokens=False)
+            for size in positive_sizes
+        }
+        # Back-compat scalar attribute for the single-fixed-size (non-list) path.
+        self.audio_chunk_ids = (
+            self._audio_chunk_ids_by_size.get(cs)
+            if (self._chunk_size_candidates is None and isinstance(cs, int) and cs > 0 and self.cfg.chunk_size_std == 0)
+            else None
+        )
 
         # blank_token is part of the LLM output vocabulary — it must be a single
         # special token, otherwise loss is dominated by multi-token blanks and
@@ -996,12 +1035,21 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
     ) -> StreamingSTTBatch:
         audio_durations_secs = (audio_lens.float() / self.cfg.sample_rate).tolist()
 
+        # Multi chunk-size: draw ONE fixed size per batch (uniform) from the
+        # candidate list; otherwise use the scalar config value. Reuses the
+        # seeded chunk RNG for reproducibility. This ``chunk_size`` scalar is used
+        # everywhere below in place of the (possibly list) self.cfg.chunk_size.
+        if self._chunk_size_candidates is not None:
+            chunk_size = int(self._get_chunk_rng().choice(self._chunk_size_candidates))
+        else:
+            chunk_size = self.cfg.chunk_size
+
         # K-step alignment (dynamic chunking only): pad each waveform up to a
         # multiple of K frames so the encoder produces exactly that many
         # embeddings, matching the K-snapped segment lengths the dataset will
         # construct below. K=1 → no-op.
         K = max(int(getattr(self.cfg, "chunk_step", 1)), 1)
-        if K > 1 and self.cfg.chunk_size == 0:
+        if K > 1 and chunk_size == 0:
             new_lens = []
             for dur in audio_durations_secs:
                 num_frames = math.ceil(dur / self.cfg.frame_length_in_secs)
@@ -1016,14 +1064,16 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
 
         system_prompts = [cut.custom.get(self.cfg.prompt_field, self.cfg.system_prompt) for cut in cuts]
         chunk_sizes = None
-        if self.cfg.chunk_size_std > 0:
+        # Gaussian per-turn schedule (our augmentation) — mutually exclusive with
+        # the multi chunk-size candidate list (which takes precedence).
+        if self._chunk_size_candidates is None and self.cfg.chunk_size_std > 0:
             max_num_frames = max(
                 (math.ceil(duration / self.cfg.frame_length_in_secs) for duration in audio_durations_secs),
                 default=0,
             )
             chunk_sizes = sample_chunk_size_schedule(
                 max_num_frames=max_num_frames,
-                mean=self.cfg.chunk_size,
+                mean=chunk_size,
                 std=self.cfg.chunk_size_std,
                 rng=self._get_chunk_rng(),
             )
@@ -1033,7 +1083,7 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             system_prompt=system_prompts,
             audio_tag=self.cfg.audio_tag,
             blank_token=self.cfg.blank_token,
-            chunk_size=self.cfg.chunk_size,
+            chunk_size=chunk_size,
             num_delay_frames=self.cfg.num_delay_frames,
             audio_durations_secs=audio_durations_secs,
             frame_length_in_secs=self.cfg.frame_length_in_secs,
@@ -1057,12 +1107,16 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
                 input_ids, assistant_mask = _tokenize_with_assistant_mask(messages, self.tokenizer)
 
             # Replace each audio chunk token sequence with AUDIO_TOKEN_IDX markers.
-            # Fixed-size training uses one cached BPE pattern; variable chunking
-            # encodes and replaces each user turn separately.
-            if self.audio_chunk_ids is not None:
-                # Fixed chunking: single pre-computed pattern
+            # Fixed-size training uses one cached BPE pattern (per drawn size when
+            # multi chunk-size); variable chunking encodes each user turn separately.
+            if self._chunk_size_candidates is not None:
+                audio_chunk_ids = self._audio_chunk_ids_by_size[chunk_size]
+            else:
+                audio_chunk_ids = self.audio_chunk_ids
+            if audio_chunk_ids is not None:
+                # Fixed chunking: single pre-computed pattern for this batch's size
                 input_ids, assistant_mask = _replace_audio_chunks(
-                    input_ids, self.audio_chunk_ids, self.cfg.chunk_size, mask=assistant_mask
+                    input_ids, audio_chunk_ids, chunk_size, mask=assistant_mask
                 )
             else:
                 # Variable fixed, offline, or dynamic chunking: replace each
@@ -1085,7 +1139,7 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             # Dynamic chunking: train the model to predict at audio positions.
             # Non-final audio frames → target = blank_id ("need more audio")
             # Final audio frame (before user footer) → target = user_footer first token ("ready")
-            if self.cfg.chunk_size == 0:
+            if chunk_size == 0:
                 user_footer_id = self._user_footer_first_id
                 for i in range(len(input_ids)):
                     if input_ids[i] != AUDIO_TOKEN_IDX:
@@ -1096,7 +1150,7 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             all_input_ids.append(torch.tensor(input_ids, dtype=torch.long))
             all_target_ids.append(torch.tensor(target_ids, dtype=torch.long))
 
-        if self.cfg.chunk_size >= 0:  # fixed chunking or dynamic chunking: right-pad
+        if chunk_size >= 0:  # fixed chunking or dynamic chunking: right-pad
             input_tokens = right_collate_vectors(all_input_ids, padding_value=self.tokenizer.pad_id)
             target_tokens = right_collate_vectors(all_target_ids, padding_value=IGNORE_INDEX)
             input_token_lens = torch.tensor([len(ids) for ids in all_input_ids], dtype=torch.long)
@@ -1121,4 +1175,5 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             target_token_lens=target_token_lens,
             text=text,
             cuts=cuts,
+            chunk_size=(chunk_size if isinstance(chunk_size, int) and chunk_size > 0 else None),
         )
