@@ -66,6 +66,12 @@ model:
   perception:
     modality_adapter:
       _target_: nemo.collections.speechlm2.modules.perception.IdentityConnector
+    encoder:
+      # REQUIRED for decode-based val_wer: the cache-aware encoder otherwise
+      # all-reduces the max audio length on every forward, and our streaming
+      # validation decode issues a data-dependent number of forwards per rank,
+      # which desyncs DDP and hangs. Disabling it makes per-rank decode independent.
+      sync_max_audio_length: false
 
   optimizer:
     _target_: torch.optim.AdamW
