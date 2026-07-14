@@ -144,6 +144,7 @@ RESULTS_DIR=${OUTPUT_PREFIX}/results/$PROJECT_NAME/$EXP_NAME
 # encoder+decoder+joint; the CTC head is ignored). Override SRC_EXP_NAME (the
 # CTC-joint experiment name) or INIT_CKPT (a full path) as needed.
 SRC_EXP_NAME="${SRC_EXP_NAME:-${CLUSTER}_chat_nemotron06b_hybctc${SRC_CTC_WEIGHT}_g2_ctx${CTX_TAG}_lr${LR}_n8}"
+SRC_EXP_NAME=oci_chat_nemotron06b_hybctc0.3_g2_ctx70_13_lr5.0_n8
 SRC_CKPT_DIR="${OUTPUT_PREFIX}/results/${PROJECT_NAME}/${SRC_EXP_NAME}/${SRC_EXP_NAME}/${SRC_EXP_NAME}/checkpoints"
 INIT_CKPT="${INIT_CKPT:-$(ls -t ${SRC_CKPT_DIR}/*-last.ckpt 2>/dev/null | head -1)}"
 if [ -z "$INIT_CKPT" ] || [ ! -f "$INIT_CKPT" ]; then
