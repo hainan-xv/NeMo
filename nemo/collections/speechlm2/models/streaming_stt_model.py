@@ -489,6 +489,12 @@ class StreamingSTTModelConfig:
     # Validation uses real autoregressive streaming decoding. None chooses the
     # number of frames per chunk for fixed chunking (or 64 otherwise).
     val_max_new_tokens_per_chunk: Optional[int] = None
+    # For multi chunk-size training, decode validation at THIS fixed chunk size
+    # (encoder frames) instead of the longest candidate. The longest candidate's
+    # look-ahead (chunk-1) can be an unsupported/slow cache-aware streaming config
+    # and stall the decode. None -> 14 if it's a candidate, else the longest.
+    # Ignored for scalar-chunk configs (they decode at their single chunk_size).
+    val_chunk_size: Optional[int] = None
     # Optional rank-zero autoregressive preview from the training stream.
     # The interval is measured in optimizer steps, not microbatches.
     train_decode_every_n_steps: int = 0
@@ -1688,13 +1694,30 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         # Validation is decode-only: unlike teacher-forced loss, autoregressive
         # WER does not require word alignments or constructed target turns.
         refs = list(batch.text)
-        hyps = self.generate(
-            audios=batch.audios,
-            audio_lens=batch.audio_lens,
-            system_prompt=self._validation_system_prompts(batch),
-            max_new_tokens=self.val_max_new_tokens_per_chunk,
-            generation_config=GenerationConfig(do_sample=False),
-        )
+        # Multi chunk-size: decode validation at a fixed, well-supported chunk
+        # (default 14) instead of the longest candidate, whose look-ahead
+        # (chunk-1) may be an unsupported/slow streaming config that stalls the
+        # decode. All inference paths read self._chunk_size_repr, so pin it for
+        # the duration of this decode and restore afterwards.
+        _override_repr = None
+        _saved_repr = getattr(self, "_chunk_size_repr", None)
+        if getattr(self, "_chunk_size_candidates", None):
+            vcs = self.core_cfg.val_chunk_size
+            if vcs is None:
+                vcs = 14 if 14 in self._chunk_size_candidates else max(self._chunk_size_candidates)
+            _override_repr = int(vcs)
+            self._chunk_size_repr = _override_repr
+        try:
+            hyps = self.generate(
+                audios=batch.audios,
+                audio_lens=batch.audio_lens,
+                system_prompt=self._validation_system_prompts(batch),
+                max_new_tokens=self.val_max_new_tokens_per_chunk,
+                generation_config=GenerationConfig(do_sample=False),
+            )
+        finally:
+            if _override_repr is not None:
+                self._chunk_size_repr = _saved_repr
         self._partial_wer_refs[name].extend(refs)
         self._partial_wer_hyps[name].extend(hyps)
 
