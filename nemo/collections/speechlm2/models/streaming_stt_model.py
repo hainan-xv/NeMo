@@ -494,6 +494,13 @@ class StreamingSTTModelConfig:
     chunk_size: Union[int, List[int]]
     audio_tag: str = "<audio>"
     att_context_size: Optional[List[int]] = None
+    # When True (default), the encoder's attention look-ahead is coupled to the
+    # per-batch LLM chunk size as [att_context_size[0], chunk_size - 1] (multi
+    # chunk-size training). When False, the encoder keeps a FIXED look-ahead of
+    # ``att_context_size`` regardless of the chunk size the dataset drew — e.g.
+    # set att_context_size=[70, 0] for a strictly-causal encoder while the LLM
+    # still trains on variable chunk sizes.
+    couple_encoder_lookahead_to_chunk: bool = True
     audio_pad_to: Optional[int] = None
     sample_rate: int = 16000
     frame_length_in_secs: float = 0.08
@@ -691,6 +698,12 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 "Multi chunk-size training enabled: candidates=%s, inference default=%d",
                 self._chunk_size_candidates,
                 self._chunk_size_repr,
+            )
+        if self.core_cfg.att_context_size is not None and not self.core_cfg.couple_encoder_lookahead_to_chunk:
+            logging.info(
+                "FIXED encoder look-ahead: att_context_size=%s (decoupled from LLM chunk size%s)",
+                list(self.core_cfg.att_context_size),
+                "; strictly causal" if int(self.core_cfg.att_context_size[1]) == 0 else "",
             )
 
         # --- LLM ---
@@ -1208,32 +1221,43 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         return self._chunk_size_repr
 
     def _set_encoder_att_context(self, chunk_size: Optional[int], recompute_streaming: bool = False) -> None:
-        """Match the Conformer encoder's attention look-ahead to ``chunk_size``.
+        """Set the Conformer encoder's attention look-ahead.
 
-        Left context is taken from ``att_context_size[0]`` (fixed); the right
-        context (look-ahead) is set to ``chunk_size - 1``. No-op for dynamic (0)
-        / offline (<0) chunking or when ``att_context_size`` is unset. This is
-        the per-batch "contexts" coupling used for multi chunk-size training.
+        Two modes, selected by ``couple_encoder_lookahead_to_chunk``:
+          * coupled (default): match the look-ahead to the per-batch LLM chunk
+            size as ``[att_context_size[0], chunk_size - 1]`` (multi chunk-size
+            "contexts" training). No-op for dynamic (0) / offline (<0) chunking.
+          * fixed: pin the encoder to the configured ``att_context_size`` (e.g.
+            ``[70, 0]`` for a strictly-causal encoder) regardless of the chunk
+            size the dataset drew.
+        No-op when ``att_context_size`` is unset.
 
         Args:
             chunk_size: fixed-chunk size in encoder frames (per-batch for
-                training; resolved single size for inference).
+                training; resolved single size for inference). Only used in the
+                coupled mode.
             recompute_streaming: also recompute the cache-aware streaming config
                 (needed for streaming inference buffer/cache sizing). Leave False
                 during training (the non-cached forward only reads att_context_size).
         """
-        # Only couple look-ahead to chunk size in multi chunk-size mode; scalar
-        # configs keep their configured att_context_size untouched.
-        if not getattr(self, "_chunk_size_candidates", None):
+        if self.core_cfg.att_context_size is None:
             return
-        if chunk_size is None or int(chunk_size) <= 0 or self.core_cfg.att_context_size is None:
-            return
-        left = int(self.core_cfg.att_context_size[0])
-        new_ctx = [left, int(chunk_size) - 1]
+        if self.core_cfg.couple_encoder_lookahead_to_chunk:
+            # Only couple look-ahead to chunk size in multi chunk-size mode; scalar
+            # configs keep their configured att_context_size untouched.
+            if not getattr(self, "_chunk_size_candidates", None):
+                return
+            if chunk_size is None or int(chunk_size) <= 0:
+                return
+            left = int(self.core_cfg.att_context_size[0])
+            new_ctx = [left, int(chunk_size) - 1]
+        else:
+            # Fixed encoder look-ahead, independent of the LLM chunk size.
+            new_ctx = [int(x) for x in self.core_cfg.att_context_size]
         encoder = self.perception.encoder
         # Set att_context_size directly (not set_default_att_context_size) so the
         # encoder's training forward does not randomly pick a look-ahead and
-        # override this per-batch value.
+        # override this value.
         encoder.att_context_size = new_ctx
         if recompute_streaming:
             encoder.setup_streaming_params()
