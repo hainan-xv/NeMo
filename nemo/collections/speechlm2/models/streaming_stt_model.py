@@ -2804,6 +2804,15 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         # Turn template embedding the audio-slot count for this call's chunk size.
         turn_template_ids = self._build_turn_template_ids(chunk_size)
         state = self.get_init_streaming_state(system_prompt, device=device, batch_size=B)
+        # Size the audio feature buffer for THIS call's chunk_size (which may be a
+        # chunk_size_override differing from the config chunk_size). Without this,
+        # get_init_streaming_state builds the buffer for the config default, and a
+        # larger override chunk overflows it ("Frame size exceeds buffer size").
+        # Mirrors the dynamic-streaming path in _generate_dynamic_streaming.
+        state.audio_feature_buffer = self.get_audio_feature_buffer(
+            batch_size=B,
+            chunk_size_override=chunk_size,
+        )
 
         offline_emb_chunks_list = None
         if use_offline_embs:
