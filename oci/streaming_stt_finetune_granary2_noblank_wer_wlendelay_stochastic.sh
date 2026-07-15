@@ -103,6 +103,16 @@ CONFIG_NAME=streaming_stt_granary2_lora_noblank_wer
 
 EXP_NAME=granary2_noblank_wer_wlendelay_stochastic
 
+# Warm start: full-state resume from the most recent checkpoint of the FIXED
+# word-length-delay run (same recipe/architecture). This restores weights +
+# optimizer + LR scheduler + global step, so the stochastic run CONTINUES from
+# where the fixed-delay run left off (no fresh LR warmup). Because the recipe
+# sets resume_if_exists=true + resume_ignore_no_checkpoint=true, this init
+# checkpoint is only used on the FIRST launch; after any preemption the run
+# resumes from its OWN -last.ckpt instead. Override the source run with SRC_EXP,
+# or point at an exact file with INIT_CKPT_HOST.
+SRC_EXP="${SRC_EXP:-granary2_noblank_wer_wlendelay}"
+
 # Directories for manifests, data, etc.
 # Write-heavy outputs (results/checkpoints, HF cache, checkpoint temp) go to the
 # nemotron project, which has free quota. The llmservice project that holds the
@@ -134,7 +144,28 @@ DONGJI_DIR=/lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/u
 # The recipe's validation manifest lives under dongjig's steve_val dir.
 DONGJI_ROOT=/lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/users/dongjig
 
-MOUNTS="--container-mounts=${DATA_DIR}:${DATA_DIR},${H_DIR}:${H_DIR},$HAINAN_DIR:$HAINAN_DIR,$CODE_DIR:/code,$RESULTS_DIR:/results,$DATA_DIR:/data,$PRETRAINED_MODEL_DIR:/pretrained,$CHECKPOINT_DIR:/checkpoints,${QUESTIONS_DIR}:/questions/,${HFCACHE}:/hfcache/,$DONGJI_ROOT:$DONGJI_ROOT"
+# Resolve the fixed-delay run's most-recent checkpoint (host path) at submit
+# time. Prefer the rolling *-last.ckpt (latest full training state); fall back
+# to the newest *.ckpt. Its directory is mounted read-only into /init_ckpt.
+SRC_CKPT_DIR_HOST="${OUTPUT_PREFIX}/results/${PROJECT_NAME}/${SRC_EXP}/${SRC_EXP}/checkpoints"
+if [[ -z "${INIT_CKPT_HOST:-}" ]]; then
+    INIT_CKPT_HOST=$(ls -t "${SRC_CKPT_DIR_HOST}"/*-last.ckpt 2>/dev/null | head -1)
+    if [[ -z "${INIT_CKPT_HOST}" ]]; then
+        INIT_CKPT_HOST=$(ls -t "${SRC_CKPT_DIR_HOST}"/*.ckpt 2>/dev/null | head -1)
+    fi
+fi
+if [[ -z "${INIT_CKPT_HOST}" || ! -f "${INIT_CKPT_HOST}" ]]; then
+    echo "ERROR: no init checkpoint found under ${SRC_CKPT_DIR_HOST}" >&2
+    echo "       Train the fixed-delay run first, set SRC_EXP=<run>, or set" >&2
+    echo "       INIT_CKPT_HOST=/abs/path/to/checkpoint.ckpt to override." >&2
+    exit 1
+fi
+INIT_CKPT_DIR_HOST=$(dirname "${INIT_CKPT_HOST}")
+INIT_CKPT_BASENAME=$(basename "${INIT_CKPT_HOST}")
+INIT_CKPT_CONTAINER="/init_ckpt/${INIT_CKPT_BASENAME}"
+echo "==> Warm start (full resume) from: ${INIT_CKPT_HOST}"
+
+MOUNTS="--container-mounts=${DATA_DIR}:${DATA_DIR},${H_DIR}:${H_DIR},$HAINAN_DIR:$HAINAN_DIR,$CODE_DIR:/code,$RESULTS_DIR:/results,$DATA_DIR:/data,$PRETRAINED_MODEL_DIR:/pretrained,$CHECKPOINT_DIR:/checkpoints,${QUESTIONS_DIR}:/questions/,${HFCACHE}:/hfcache/,$DONGJI_ROOT:$DONGJI_ROOT,${INIT_CKPT_DIR_HOST}:/init_ckpt:ro"
 
 # SLURM_JOB_NUM_NODES=1
 # GPUS_PER_NODE=1
@@ -145,6 +176,7 @@ echo "*******STARTING********" \
 && echo "---------------" \
 && echo "*** RECIPE: ${CONFIG_NAME} (granary2, no-blank, multi chunk-size [2,4,7,10,14,28]) ***" \
 && echo "*** ALIGNMENT: STOCHASTIC word-length delay ~ Binomial(${WORD_DELAY_MAX}, sigmoid((${WORD_DELAY_MIDPOINT}-n_letters)/${WORD_DELAY_SLOPE})) -- fixed num_delay_frames ignored ***" \
+&& echo "*** WARM START (full resume): ${INIT_CKPT_CONTAINER} (from ${SRC_EXP}) -- only on first launch; own -last.ckpt after preemption ***" \
 && echo "*** MONITOR: val_wer (min) -- our code replaces val_acc ***" \
 && echo "*** SEED: ${LHOTSE_RND_SEED} ***" \
 && nvidia-smi \
@@ -199,6 +231,7 @@ echo "*******STARTING********" \
     ++exp_manager.checkpoint_callback_params.monitor=val_wer \
     ++exp_manager.checkpoint_callback_params.mode=min \
     ++exp_manager.checkpoint_callback_params.save_top_k=5 \
+    ++exp_manager.resume_from_checkpoint=${INIT_CKPT_CONTAINER} \
     ++model.perception.encoder.sync_max_audio_length=false \
 
 
