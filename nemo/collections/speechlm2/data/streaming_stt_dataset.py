@@ -90,6 +90,10 @@ class StreamingSTTDataConfig:
     chunk_size_std: float = 0.0
     chunk_size_seed: int = 42
     num_delay_frames: int = 0
+    # When True, ignore the scalar num_delay_frames and delay each word by a
+    # WORD-LENGTH-dependent amount (see word_length_delay_frames): longer words
+    # get less delay. Fixed/dynamic chunking only.
+    use_word_length_delay: bool = False
     words_per_group: int = 1
     audio_tag: str = "<audio>"
     blank_token: str = "<blank>"
@@ -236,6 +240,24 @@ def compute_word_spans(
     return spans
 
 
+def word_length_delay_frames(text: str) -> int:
+    """Word-length-dependent emission delay (in encoder frames).
+
+    Longer words carry more acoustic evidence, so they can be emitted with less
+    delay. Test-of-concept handwritten rule (edit the thresholds here as needed):
+        < 4 letters -> 3 frames; == 4 -> 2; == 5 -> 1; >= 6 -> 0.
+    "Letters" = alphabetic characters only (punctuation / whitespace ignored).
+    """
+    n_letters = sum(1 for c in text if c.isalpha())
+    if n_letters < 4:
+        return 3
+    if n_letters < 5:
+        return 2
+    if n_letters < 6:
+        return 1
+    return 0
+
+
 def get_llm_messages_for_sample(
     system_role: str,
     system_prompt: str,
@@ -250,6 +272,7 @@ def get_llm_messages_for_sample(
     words_per_group: int = 1,
     chunk_step: int = 1,
     chunk_sizes: Optional[List[int]] = None,
+    use_word_length_delay: bool = False,
 ) -> List[dict]:
     """
     Get the LLM messages for a sample, using the alignments to determine the turns for the audio and text.
@@ -346,7 +369,8 @@ def get_llm_messages_for_sample(
             # UP to the next multiple of K. num_frames here is already K-padded
             # (caller guarantees this), so the clamp keeps things K-aligned.
             last_word = alignments[word_buffer[-1]]
-            group_end_frame = math.ceil(last_word.end_time / frame_length_in_secs) + num_delay_frames
+            _delay = word_length_delay_frames(last_word.text) if use_word_length_delay else num_delay_frames
+            group_end_frame = math.ceil(last_word.end_time / frame_length_in_secs) + _delay
             if K > 1:
                 group_end_frame = ((group_end_frame + K - 1) // K) * K
             group_end_frame = min(group_end_frame, num_frames)
@@ -409,7 +433,8 @@ def get_llm_messages_for_sample(
             while word_idx < len(alignments):
                 word = alignments[word_idx]
                 word_end_frame = math.ceil(word.end_time / frame_length_in_secs)
-                ready_frame = word_end_frame + num_delay_frames
+                _delay = word_length_delay_frames(word.text) if use_word_length_delay else num_delay_frames
+                ready_frame = word_end_frame + _delay
                 if ready_frame <= chunk_end_frame:
                     word_buffer.append(word_idx)
                     word_idx += 1
@@ -470,6 +495,7 @@ def get_llm_messages_for_batch(
     words_per_group: int = 1,
     chunk_step: int = 1,
     chunk_sizes: Optional[List[int]] = None,
+    use_word_length_delay: bool = False,
 ) -> List[List[dict]]:
     """
     Get the LLM messages for a batch of samples.
@@ -513,6 +539,7 @@ def get_llm_messages_for_batch(
                 words_per_group=words_per_group,
                 chunk_step=chunk_step,
                 chunk_sizes=chunk_sizes,
+                use_word_length_delay=use_word_length_delay,
             )
         )
     return batch_messages
@@ -1092,6 +1119,7 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             words_per_group=self.cfg.words_per_group,
             chunk_step=K,
             chunk_sizes=chunk_sizes,
+            use_word_length_delay=self.cfg.use_word_length_delay,
         )
 
         all_input_ids = []
