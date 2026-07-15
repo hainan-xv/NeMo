@@ -176,7 +176,7 @@ exp_manager:
     resume: true
 
   checkpoint_callback_params:
-    filename: "{step}"
+    filename: "{step}-{val_wer:.4f}"
     monitor: val_wer         # our code: autoregressive-decode WER (was val_acc)
     mode: min                # was max (for val_acc)
     every_n_train_steps: null
