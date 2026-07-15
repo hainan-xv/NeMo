@@ -231,7 +231,7 @@ echo "*******STARTING********" \
     ++exp_manager.checkpoint_callback_params.monitor=val_wer \
     ++exp_manager.checkpoint_callback_params.mode=min \
     ++exp_manager.checkpoint_callback_params.save_top_k=5 \
-    ++exp_manager.resume_from_checkpoint=${INIT_CKPT_CONTAINER} \
+    ++exp_manager.resume_from_checkpoint=\"${INIT_CKPT_CONTAINER}\" \
     ++model.perception.encoder.sync_max_audio_length=false \
 
 
