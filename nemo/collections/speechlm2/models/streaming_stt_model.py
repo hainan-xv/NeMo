@@ -264,17 +264,23 @@ def two_stream_llm_forward(
     inputs_embeds: Tensor,
     audio_mask: Tensor,
     valid_mask: Tensor,
+    num_fusion_layers: int = 1,
     compute_logits: bool = True,
 ) -> dict[str, Tensor]:
     """Two-stream last-layer fusion over a full (teacher-forced) sequence.
 
     The text stream (all non-audio, non-pad positions) is packed into a dense,
-    contiguous sequence and run through ``layers[:-1]`` alone, with contiguous
-    text positions and a causal mask. The resulting text hidden states are then
-    scattered back to their original positions and interleaved with the RAW audio
-    encoder embeddings (which never passed through the lower layers). The final
-    layer runs over this full interleaved sequence (original absolute positions,
-    causal mask) so text queries fuse with audio, followed by ``norm`` + ``lm_head``.
+    contiguous sequence and run through the lower ``layers[:-num_fusion_layers]``
+    alone, with contiguous text positions and a causal mask. The resulting text
+    hidden states are then scattered back to their original positions and
+    interleaved with the RAW audio encoder embeddings (which never passed through
+    the lower layers). The top ``num_fusion_layers`` layers run over this full
+    interleaved sequence (original absolute positions, causal mask) so text
+    queries fuse with audio, followed by ``norm`` + ``lm_head``.
+
+    ``num_fusion_layers=1`` (default) fuses only in the final layer. Larger values
+    move the interleave point earlier (e.g. num_fusion_layers=4 interleaves at
+    layer n-4, so the last 4 layers are cross-modal).
 
     Args:
         layers: ``nn.ModuleList`` of decoder layers (LoRA-injected linears are fine).
@@ -310,18 +316,24 @@ def two_stream_llm_forward(
     mask1 = _causal_additive_mask(text_valid, dtype)
     pos_emb1 = rotary_emb(packed, pos1)
 
+    n_layers = len(layers)
+    n_fusion = max(1, min(int(num_fusion_layers), n_layers))
+    text_layers = layers[: n_layers - n_fusion]
+    fusion_layers = layers[n_layers - n_fusion:]
+
     h = packed
-    for layer in layers[:-1]:
+    for layer in text_layers:
         h = _run_decoder_layer(layer, h, mask1, pos1, pos_emb1)
 
-    # --- Stage 2: scatter text hidden back, interleave raw audio, run last layer ---
+    # --- Stage 2: scatter text hidden back, interleave raw audio, run fusion layers ---
     h_full = inputs_embeds.clone()  # audio positions keep raw encoder embeds
     h_full[b_idx, l_idx] = h[b_idx, dst_col]
     pos2 = (torch.cumsum(valid_mask.long(), dim=1) - 1).clamp(min=0)  # (B, L)
     mask2 = _causal_additive_mask(valid_mask, dtype)
     pos_emb2 = rotary_emb(h_full, pos2)
-    h_last = _run_decoder_layer(layers[-1], h_full, mask2, pos2, pos_emb2)
-    h_last = norm(h_last)
+    for layer in fusion_layers:
+        h_full = _run_decoder_layer(layer, h_full, mask2, pos2, pos_emb2)
+    h_last = norm(h_full)
 
     ans: dict[str, Tensor] = {"hidden_states": h_last}
     if compute_logits:
@@ -371,6 +383,7 @@ def two_stream_cached_step(
     last_cache,
     text_len: int,
     full_len: int,
+    num_fusion_layers: int = 1,
     compute_logits: bool = True,
 ) -> tuple[Optional[Tensor], int, int]:
     """Incremental (KV-cached) two-stream step — the fast counterpart of
@@ -408,7 +421,12 @@ def two_stream_cached_step(
     text_cols = (~col_is_audio).nonzero(as_tuple=True)[0]  # (t,)
     t = int(text_cols.numel())
 
-    # --- Stage 1: lower layers over the new TEXT columns only ---
+    n_layers = len(layers)
+    n_fusion = max(1, min(int(num_fusion_layers), n_layers))
+    text_layers = layers[: n_layers - n_fusion]
+    fusion_layers = layers[n_layers - n_fusion:]
+
+    # --- Stage 1: lower (text-only) layers over the new TEXT columns only ---
     if t > 0:
         text_block = input_embeds.index_select(1, text_cols)  # (B, t, H)
         text_positions = torch.arange(text_len, text_len + t, device=device)
@@ -416,7 +434,7 @@ def two_stream_cached_step(
         mask_text = _block_causal_additive_mask(t, text_len, dtype, device, B)
         pos_emb_text = rotary_emb(text_block, pos_ids_text)
         h = text_block
-        for layer in layers[:-1]:
+        for layer in text_layers:
             h = _run_decoder_layer_cached(layer, h, mask_text, pos_ids_text, pos_emb_text, text_cache, text_positions)
         text_hidden = h  # (B, t, H)
         new_text_len = text_len + t
@@ -424,7 +442,7 @@ def two_stream_cached_step(
         text_hidden = None
         new_text_len = text_len
 
-    # --- Stage 2: last layer over ALL new columns (interleave raw audio) ---
+    # --- Stage 2: fusion layers over ALL new columns (interleave raw audio) ---
     last_input = input_embeds.clone()
     if t > 0:
         last_input.index_copy_(1, text_cols, text_hidden)
@@ -432,8 +450,11 @@ def two_stream_cached_step(
     pos_ids_full = full_positions.unsqueeze(0).expand(B, q)
     mask_full = _block_causal_additive_mask(q, full_len, dtype, device, B)
     pos_emb_full = rotary_emb(last_input, pos_ids_full)
-    h_last = _run_decoder_layer_cached(layers[-1], last_input, mask_full, pos_ids_full, pos_emb_full, last_cache, full_positions)
-    h_last = norm(h_last)
+    for layer in fusion_layers:
+        last_input = _run_decoder_layer_cached(
+            layer, last_input, mask_full, pos_ids_full, pos_emb_full, last_cache, full_positions
+        )
+    h_last = norm(last_input)
     new_full_len = full_len + q
 
     logits = lm_head(h_last) if compute_logits else None
@@ -520,6 +541,11 @@ class StreamingSTTModelConfig:
     # chunk_size > 0 and mutually exclusive with use_chunk_classifier /
     # restrict_audio_to_own_chunk.
     two_stream_last_layer: bool = False
+    # Number of TOP LLM layers that process the interleaved (text+audio) sequence
+    # under two-stream fusion. 1 (default) fuses only in the final layer; larger
+    # moves the interleave point earlier (e.g. 4 -> interleave at layer n-4, so the
+    # last 4 layers are cross-modal). Must be >= 1 and leave >= 1 text-only layer.
+    two_stream_num_fusion_layers: int = 1
     # --- Full fine-tuning of the top of the LLM stack (no LoRA) ---
     # When > 0 AND the LLM body is otherwise frozen (freeze_llm_model=True),
     # unfreeze the last N decoder layers so they train with full-rank weight
@@ -779,6 +805,13 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             assert not self.core_cfg.restrict_audio_to_own_chunk, (
                 "two_stream_last_layer is mutually exclusive with restrict_audio_to_own_chunk."
             )
+            # Number of top layers that process the interleaved sequence.
+            _n_llm_layers = int(self.llm.config.num_hidden_layers)
+            self._two_stream_num_fusion_layers = int(self.core_cfg.two_stream_num_fusion_layers)
+            assert 1 <= self._two_stream_num_fusion_layers < _n_llm_layers, (
+                f"two_stream_num_fusion_layers must be in [1, {_n_llm_layers - 1}] "
+                f"(need >=1 text-only layer), got {self._two_stream_num_fusion_layers}"
+            )
             if create_causal_mask is None:
                 raise ImportError(
                     "two_stream_last_layer requires transformers.masking_utils.create_causal_mask, "
@@ -807,11 +840,14 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 self.llm.config._attn_implementation = "sdpa"
             logging.info("=" * 72)
             logging.info(
-                "[two-stream] two_stream_last_layer=True | chunk_size=%d | attn_impl=%s "
-                "-- text stream runs through layers[:-1] alone; audio is interleaved only "
-                "in the final layer for cross-modal fusion.",
+                "[two-stream] two_stream_last_layer=True | num_fusion_layers=%d/%d | chunk_size=%d "
+                "| attn_impl=%s -- text stream runs through the lower layers alone; audio is "
+                "interleaved into the top %d layer(s) for cross-modal fusion.",
+                self._two_stream_num_fusion_layers,
+                int(self.llm.config.num_hidden_layers),
                 self._chunk_size_repr,
                 self.llm.config._attn_implementation,
+                self._two_stream_num_fusion_layers,
             )
             logging.info("=" * 72)
 
@@ -1133,6 +1169,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             inputs_embeds=input_embeds,
             audio_mask=audio_mask,
             valid_mask=valid_mask,
+            num_fusion_layers=getattr(self, "_two_stream_num_fusion_layers", 1),
             compute_logits=True,
         )
 
@@ -1232,6 +1269,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             last_cache=state.ts_last_cache,
             text_len=state.ts_text_len,
             full_len=state.ts_full_len,
+            num_fusion_layers=getattr(self, "_two_stream_num_fusion_layers", 1),
             compute_logits=True,
         )
         return SimpleNamespace(logits=logits, past_key_values=None, hidden_states=None)
@@ -2262,6 +2300,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                     last_cache=ts_last_cache,
                     text_len=0,
                     full_len=0,
+                    num_fusion_layers=getattr(self, "_two_stream_num_fusion_layers", 1),
                     compute_logits=False,
                 )
             else:
