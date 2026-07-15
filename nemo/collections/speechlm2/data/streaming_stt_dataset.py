@@ -94,6 +94,17 @@ class StreamingSTTDataConfig:
     # WORD-LENGTH-dependent amount (see word_length_delay_frames): longer words
     # get less delay. Fixed/dynamic chunking only.
     use_word_length_delay: bool = False
+    # When True (and use_word_length_delay is True), sample the per-word delay
+    # stochastically as Binomial(word_delay_max, sigmoid((midpoint - n_letters)/slope))
+    # instead of using the fixed table. Shorter words get a higher expected delay.
+    word_length_delay_stochastic: bool = False
+    word_delay_max: int = 3
+    word_delay_midpoint: float = 4.5
+    word_delay_slope: float = 1.0
+    # Seed for the (rank/worker-local) RNG used to draw stochastic word delays;
+    # kept separate from chunk_size_seed so enabling this does not perturb the
+    # chunk-size augmentation stream.
+    word_delay_seed: int = 1234
     words_per_group: int = 1
     audio_tag: str = "<audio>"
     blank_token: str = "<blank>"
@@ -258,6 +269,57 @@ def word_length_delay_frames(text: str) -> int:
     return 0
 
 
+def sample_word_length_delay_frames(
+    text: str,
+    rng: np.random.Generator,
+    max_delay: int = 3,
+    midpoint: float = 4.5,
+    slope: float = 1.0,
+) -> int:
+    """Stochastic word-length-dependent emission delay (in encoder frames).
+
+    Instead of a fixed schedule, the delay of each word is sampled from
+        delay ~ Binomial(n=max_delay, p),   p = sigmoid((midpoint - n_letters) / slope)
+    where ``n_letters`` is the alphabetic-character count of the word. ``p`` is a
+    per-word "keep-delaying" probability that decreases smoothly with word length,
+    so the *expected* delay ``max_delay * p`` is high for short words and low for
+    long ones, while the full range {0, ..., max_delay} keeps non-zero mass for
+    augmentation diversity. With midpoint=4.5, slope=1.0, max_delay=3 the mean
+    delay is roughly: 2 letters -> 2.8, 3 -> 2.5, 4 -> 1.9, 5 -> 1.1, 6 -> 0.6,
+    7 -> 0.2 frames (compare the fixed table's 3/2/1/0).
+
+    delay >= 0 always, so a word is never emitted before its acoustic end, and
+    because words are consumed in index order (see ``get_llm_messages_for_sample``)
+    output order — i.e. token monotonicity — is preserved regardless of the draw.
+    """
+    n_letters = sum(1 for c in text if c.isalpha())
+    p = 1.0 / (1.0 + math.exp((n_letters - midpoint) / slope))
+    return int(rng.binomial(int(max_delay), p))
+
+
+def _resolve_word_delay(
+    word_text: str,
+    num_delay_frames: int,
+    use_word_length_delay: bool,
+    stochastic: bool,
+    rng: Optional[np.random.Generator],
+    max_delay: int,
+    midpoint: float,
+    slope: float,
+) -> int:
+    """Pick the emission delay (in frames) for one word.
+
+    Priority: word-length delay (stochastic if enabled and an RNG is available,
+    otherwise the fixed table) when ``use_word_length_delay`` is set, else the
+    scalar ``num_delay_frames``.
+    """
+    if not use_word_length_delay:
+        return num_delay_frames
+    if stochastic and rng is not None:
+        return sample_word_length_delay_frames(word_text, rng, max_delay, midpoint, slope)
+    return word_length_delay_frames(word_text)
+
+
 def get_llm_messages_for_sample(
     system_role: str,
     system_prompt: str,
@@ -273,6 +335,11 @@ def get_llm_messages_for_sample(
     chunk_step: int = 1,
     chunk_sizes: Optional[List[int]] = None,
     use_word_length_delay: bool = False,
+    word_length_delay_stochastic: bool = False,
+    word_delay_max: int = 3,
+    word_delay_midpoint: float = 4.5,
+    word_delay_slope: float = 1.0,
+    delay_rng: Optional[np.random.Generator] = None,
 ) -> List[dict]:
     """
     Get the LLM messages for a sample, using the alignments to determine the turns for the audio and text.
@@ -369,7 +436,16 @@ def get_llm_messages_for_sample(
             # UP to the next multiple of K. num_frames here is already K-padded
             # (caller guarantees this), so the clamp keeps things K-aligned.
             last_word = alignments[word_buffer[-1]]
-            _delay = word_length_delay_frames(last_word.text) if use_word_length_delay else num_delay_frames
+            _delay = _resolve_word_delay(
+                last_word.text,
+                num_delay_frames,
+                use_word_length_delay,
+                word_length_delay_stochastic,
+                delay_rng,
+                word_delay_max,
+                word_delay_midpoint,
+                word_delay_slope,
+            )
             group_end_frame = math.ceil(last_word.end_time / frame_length_in_secs) + _delay
             if K > 1:
                 group_end_frame = ((group_end_frame + K - 1) // K) * K
@@ -433,7 +509,16 @@ def get_llm_messages_for_sample(
             while word_idx < len(alignments):
                 word = alignments[word_idx]
                 word_end_frame = math.ceil(word.end_time / frame_length_in_secs)
-                _delay = word_length_delay_frames(word.text) if use_word_length_delay else num_delay_frames
+                _delay = _resolve_word_delay(
+                    word.text,
+                    num_delay_frames,
+                    use_word_length_delay,
+                    word_length_delay_stochastic,
+                    delay_rng,
+                    word_delay_max,
+                    word_delay_midpoint,
+                    word_delay_slope,
+                )
                 ready_frame = word_end_frame + _delay
                 if ready_frame <= chunk_end_frame:
                     word_buffer.append(word_idx)
@@ -496,6 +581,11 @@ def get_llm_messages_for_batch(
     chunk_step: int = 1,
     chunk_sizes: Optional[List[int]] = None,
     use_word_length_delay: bool = False,
+    word_length_delay_stochastic: bool = False,
+    word_delay_max: int = 3,
+    word_delay_midpoint: float = 4.5,
+    word_delay_slope: float = 1.0,
+    delay_rng: Optional[np.random.Generator] = None,
 ) -> List[List[dict]]:
     """
     Get the LLM messages for a batch of samples.
@@ -540,6 +630,11 @@ def get_llm_messages_for_batch(
                 chunk_step=chunk_step,
                 chunk_sizes=chunk_sizes,
                 use_word_length_delay=use_word_length_delay,
+                word_length_delay_stochastic=word_length_delay_stochastic,
+                word_delay_max=word_delay_max,
+                word_delay_midpoint=word_delay_midpoint,
+                word_delay_slope=word_delay_slope,
+                delay_rng=delay_rng,
             )
         )
     return batch_messages
@@ -917,6 +1012,7 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
         ):
             raise ValueError("chunk_size_std > 0 requires fixed chunking (chunk_size > 0)")
         self._chunk_rngs: dict[int, np.random.Generator] = {}
+        self._delay_rngs: dict[int, np.random.Generator] = {}
         # Unescape Python escape sequences (e.g. "\\n" → "\n") because Hydra/OmegaConf
         # loads YAML strings literally without interpreting backslash escapes.
         self.cfg.blank_token = self.cfg.blank_token.encode().decode('unicode_escape')
@@ -1028,6 +1124,21 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             self._chunk_rngs[key] = np.random.default_rng(seed % (2**32))
         return self._chunk_rngs[key]
 
+    def _get_delay_rng(self) -> np.random.Generator:
+        """RNG for stochastic word-length delays, rank/worker-local and seeded
+        independently from the chunk-size RNG."""
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is not None:
+            key = worker_info.id
+            seed = worker_info.seed + self.cfg.word_delay_seed
+        else:
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            key = -(rank + 1)
+            seed = self.cfg.word_delay_seed + rank
+        if key not in self._delay_rngs:
+            self._delay_rngs[key] = np.random.default_rng(seed % (2**32))
+        return self._delay_rngs[key]
+
     def __getitem__(self, cuts: CutSet) -> StreamingSTTBatch | None:
         try:
             audios, audio_lens, cuts = collate_audio(cuts, fault_tolerant=True)
@@ -1120,6 +1231,15 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             chunk_step=K,
             chunk_sizes=chunk_sizes,
             use_word_length_delay=self.cfg.use_word_length_delay,
+            word_length_delay_stochastic=self.cfg.word_length_delay_stochastic,
+            word_delay_max=self.cfg.word_delay_max,
+            word_delay_midpoint=self.cfg.word_delay_midpoint,
+            word_delay_slope=self.cfg.word_delay_slope,
+            delay_rng=(
+                self._get_delay_rng()
+                if (self.cfg.use_word_length_delay and self.cfg.word_length_delay_stochastic)
+                else None
+            ),
         )
 
         all_input_ids = []
