@@ -27,6 +27,14 @@ Usage::
         inputs=/data/test.jsonl \
         simulate_streaming=true
 
+    # Long-form: segment each recording into <=30s windows, decode segments in
+    # batches of 16, and concatenate transcripts per recording:
+    python streaming_stt_generate.py \
+        pretrained_name=nvidia/streaming-stt-v1 \
+        inputs=/data/longform.jsonl \
+        max_segment_duration=30 \
+        max_concurrent_segments=16
+
 The model's ``generate()`` method returns ``list[str]`` directly.
 """
 
@@ -65,6 +73,65 @@ class ToAudio(torch.utils.data.Dataset):
     def __getitem__(self, cuts: CutSet):
         audios, audio_lens = cuts.load_audio(collate=True)
         return {"cuts": cuts, "audios": audios, "audio_lens": audio_lens}
+
+
+def compute_segment_spans(cut, max_segment_duration: float, method: str = "fixed") -> list[tuple[float, float]]:
+    """Compute (offset, duration) spans (seconds) tiling one recording for segmentation.
+
+    Each returned span is at most ``max_segment_duration`` seconds. This is the single
+    extension point for segmentation strategy: to add Silero VAD later, add a
+    ``method == "silero_vad"`` branch that loads the cut's audio, runs the VAD, and
+    returns speech-based spans (merging/splitting so each stays <= max_segment_duration).
+    The rest of the pipeline is agnostic to how spans are produced.
+
+    Args:
+        cut: a lhotse cut representing a whole recording.
+        max_segment_duration: maximum segment length in seconds.
+        method: "fixed" = even contiguous windows (no external dependencies).
+    """
+    if method == "fixed":
+        total = cut.duration
+        n = max(1, math.ceil(total / max_segment_duration))
+        seg_len = total / n  # even split so every window is <= max_segment_duration, no tiny tail
+        spans = []
+        for i in range(n):
+            offset = i * seg_len
+            duration = (total - offset) if i == n - 1 else seg_len
+            spans.append((offset, duration))
+        return spans
+    raise ValueError(
+        f"Unknown seg_method={method!r}. Supported: 'fixed'. "
+        f"To add VAD, implement a new branch in compute_segment_spans() that returns "
+        f"(offset, duration) spans each <= max_segment_duration."
+    )
+
+
+def segment_cutset(cuts, max_segment_duration: float, method: str = "fixed"):
+    """Split each recording into <= max_segment_duration windows for long-form inference.
+
+    Returns:
+        (segments, seg_meta):
+          - ``segments``: a CutSet of truncated cuts, each tagged with
+            ``parent_id`` / ``seg_index`` / ``seg_start`` custom attrs and a stable
+            id ``f"{parent_id}__seg{i:04d}"``.
+          - ``seg_meta``: dict mapping parent recording id -> ordered list of
+            ``(seg_index, seg_id, seg_start_secs)``. This is the source of truth for
+            regrouping (robust to padding, which preserves ids but may drop attrs).
+    """
+    segments = []
+    seg_meta: dict[str, list[tuple[int, str, float]]] = {}
+    for cut in cuts:
+        entries = []
+        for i, (offset, duration) in enumerate(compute_segment_spans(cut, max_segment_duration, method=method)):
+            seg_id = f"{cut.id}__seg{i:04d}"
+            seg = cut.truncate(offset=offset, duration=duration, preserve_id=False).with_id(seg_id)
+            seg.parent_id = cut.id
+            seg.seg_index = i
+            seg.seg_start = offset
+            segments.append(seg)
+            entries.append((i, seg_id, offset))
+        seg_meta[cut.id] = entries
+    return CutSet.from_cuts(segments), seg_meta
 
 
 @dataclass
@@ -131,6 +198,22 @@ class StreamingSTTEvalConfig:
     # audio chunk it was generated from. Format matches the GT manifest:
     #   [{"text": "...", "start_time": float_s, "end_time": float_s}, ...]
     save_alignments: bool = True
+    # --- Long-form segmentation -------------------------------------------
+    # When ``max_segment_duration`` is set (> 0), each input recording is split into
+    # windows of at most this many seconds; inference runs per segment and the
+    # segment transcripts are concatenated back into one hypothesis per
+    # recording. This keeps every decode within the model's training length,
+    # which is essential for long-form audio far longer than the model saw in
+    # training (otherwise the decoder goes out-of-distribution and truncates).
+    max_segment_duration: Optional[float] = None
+    # How many segments to batch together per generate() call. 0 -> use batch_size.
+    # Because segments are bounded by max_segment_duration, padding is bounded too, so
+    # this can be pushed high to speed up inference within GPU-memory limits.
+    max_concurrent_segments: int = 0
+    # Segmentation strategy. "fixed" = even contiguous windows (no deps).
+    # Extensible: add "silero_vad" by implementing its spans in
+    # ``compute_segment_spans`` — the rest of the pipeline is method-agnostic.
+    seg_method: str = "fixed"
     generation_config: StreamingSTTGenerationConfig = field(default_factory=StreamingSTTGenerationConfig)
 
 
@@ -167,10 +250,33 @@ def main(cfg: StreamingSTTEvalConfig):
     if sample_cut.sampling_rate != model.sampling_rate:
         logging.info(f"Resampling cuts from {sample_cut.sampling_rate} to {model.sampling_rate} Hz")
         cuts = CutSet.from_cuts(c.resample(model.sampling_rate) for c in cuts)
+
+    # Long-form segmentation: split each recording into <= max_segment_duration
+    # windows, decode each independently, then concatenate transcripts per
+    # recording afterwards (reduction step below). ``ref_cuts`` holds the full
+    # recordings (source of references + output order); ``seg_meta`` maps each
+    # recording id -> its ordered segments; ``seg_start_by_id`` gives per-segment
+    # start offsets (used to globalize per-word alignment timestamps).
+    seg_mode = cfg.max_segment_duration is not None and cfg.max_segment_duration > 0
+    ref_cuts = cuts
+    seg_meta: dict[str, list[tuple[int, str, float]]] = {}
+    seg_start_by_id: dict[str, float] = {}
+    if seg_mode:
+        ref_cuts = list(cuts)  # materialize full recordings (re-iterated for refs/order)
+        cuts, seg_meta = segment_cutset(ref_cuts, cfg.max_segment_duration, method=cfg.seg_method)
+        seg_start_by_id = {sid: off for entries in seg_meta.values() for (_, sid, off) in entries}
+        max_cuts = cfg.max_concurrent_segments or cfg.batch_size
+        logging.info(
+            f"Segmentation ON (method={cfg.seg_method}, max_segment_duration={cfg.max_segment_duration}s): "
+            f"{len(ref_cuts)} recordings -> {len(cuts)} segments; max_concurrent_segments={max_cuts}"
+        )
+    else:
+        max_cuts = cfg.batch_size
+
     cuts = cuts.sort_by_duration()
     cuts = cuts.map(partial(pad_extra_duration, extra_duration=cfg.pad_extra_duration))
-    sampler = lhotse.dataset.DynamicCutSampler(cuts, max_cuts=cfg.batch_size)
-    num_batches = math.ceil(len(cuts) / cfg.batch_size)
+    sampler = lhotse.dataset.DynamicCutSampler(cuts, max_cuts=max_cuts)
+    num_batches = math.ceil(len(cuts) / max_cuts)
     dloader = torch.utils.data.DataLoader(
         dataset=ToAudio(),
         sampler=sampler,
@@ -181,14 +287,16 @@ def main(cfg: StreamingSTTEvalConfig):
     _normalizer_key = cfg.use_normalizer.lower() if isinstance(cfg.use_normalizer, str) else cfg.use_normalizer
     normalizer = {"english": EnglishTextNormalizer(), "basic": BasicTextNormalizer()}.get(_normalizer_key, lambda x: x)
 
-    refs = []
-    hyps = []
     input_durations = []
     infer_durations = []
-    # Per-cut diagnostic lists, ordered to match `cuts` after `sort_by_duration`.
-    cut_alignments: Optional[list[list[dict]]] = [] if cfg.save_alignments else None
-    cut_content_scores: list[list[float]] = []
-    cut_pred_text_annotated: list[str] = []
+    # Results keyed by cut id (a "cut" is a segment in seg_mode, else a whole
+    # recording). Keying by id decouples accumulation from batch/sort order and
+    # lets us regroup segments per recording afterwards. Hypotheses are stored
+    # RAW (un-normalized); normalization happens once in the reduction step.
+    hyp_by_id: dict[str, str] = {}
+    align_by_id: dict[str, list[dict]] = {}
+    content_score_by_id: dict[str, list[float]] = {}
+    annotated_by_id: dict[str, str] = {}
     content_score_mode: Optional[str] = None
 
     # Optional per-frame debug log file (one record per LISTENING frame per
@@ -232,38 +340,90 @@ def main(cfg: StreamingSTTEvalConfig):
 
         if result.content_score_mode is not None:
             content_score_mode = result.content_score_mode
-        if result.content_scores is not None:
-            cut_content_scores.extend(result.content_scores)
-        if result.pred_text_annotated is not None:
-            cut_pred_text_annotated.extend(result.pred_text_annotated)
+
+        # Accumulate raw per-cut results keyed by id (segment id in seg_mode).
+        for i, cut in enumerate(batch["cuts"]):
+            hyp_by_id[cut.id] = result.texts[i].strip()
+            if cfg.save_alignments and result.pred_alignments is not None:
+                al = result.pred_alignments[i]
+                if seg_mode:
+                    # Shift per-word timestamps from segment-local to recording-global.
+                    off = seg_start_by_id.get(cut.id, 0.0)
+                    al = [{**w, "start_time": w["start_time"] + off, "end_time": w["end_time"] + off} for w in al]
+                align_by_id[cut.id] = al
+            if result.content_scores is not None and i < len(result.content_scores):
+                content_score_by_id[cut.id] = result.content_scores[i]
+            if result.pred_text_annotated is not None and i < len(result.pred_text_annotated):
+                annotated_by_id[cut.id] = result.pred_text_annotated[i]
 
         batch_duration = sum(c.duration for c in batch["cuts"])
-        batch_refs = [normalizer(cut.supervisions[0].text) for cut in batch["cuts"]]
-        batch_hyps = [normalizer(h.strip()) for h in result.texts]
-
         if cfg.verbose:
-            batch_wer, _, nins, ndel, nsub = word_error_rate_detail(batch_hyps, batch_refs)
+            batch_hyps = [normalizer(h.strip()) for h in result.texts]
             batch_rtfx = batch_duration / batch_infer_duration
             logging.info("--------------------------------")
-            logging.info(
-                f"Batch {batch_idx}: "
-                f"WER={batch_wer:.2%} [ins={nins:.2%} del={ndel:.2%} sub={nsub:.2%}] "
-                f"RTFx={batch_rtfx:.1f}"
-            )
-            for ref, hyp in zip(batch_refs, batch_hyps):
-                logging.info(f"\n[REF]\t`{ref}`\n[HYP]\t`{hyp}`\n")
+            if seg_mode:
+                # No meaningful per-segment reference; log hyps only (corpus WER printed at the end).
+                logging.info(f"Batch {batch_idx}: {len(batch_hyps)} segments RTFx={batch_rtfx:.1f}")
+                for cut, hyp in zip(batch["cuts"], batch_hyps):
+                    logging.info(f"\n[SEG {cut.id}]\t`{hyp}`\n")
+            else:
+                batch_refs = [normalizer(cut.supervisions[0].text) for cut in batch["cuts"]]
+                batch_wer, _, nins, ndel, nsub = word_error_rate_detail(batch_hyps, batch_refs)
+                logging.info(
+                    f"Batch {batch_idx}: "
+                    f"WER={batch_wer:.2%} [ins={nins:.2%} del={ndel:.2%} sub={nsub:.2%}] "
+                    f"RTFx={batch_rtfx:.1f}"
+                )
+                for ref, hyp in zip(batch_refs, batch_hyps):
+                    logging.info(f"\n[REF]\t`{ref}`\n[HYP]\t`{hyp}`\n")
             logging.info("--------------------------------")
 
-        refs.extend(batch_refs)
-        hyps.extend(batch_hyps)
-        if cut_alignments is not None and result.pred_alignments is not None:
-            cut_alignments.extend(result.pred_alignments)
         input_durations.append(batch_duration)
         infer_durations.append(batch_infer_duration)
 
     if debug_log_writer is not None:
         debug_log_writer.close()
 
+    # --- Reduce per-cut results to one (ref, hyp, ...) per recording ---
+    # In seg_mode: concatenate each recording's segment hypotheses (ordered by
+    # seg_index) and its offset-adjusted alignments; the reference is the full
+    # recording supervision. In normal mode: one recording == one cut.
+    # Each entry: (id, duration, ref, hyp, alignments|None, content_scores|None, annotated|None).
+    reduced: list[tuple] = []
+    if seg_mode:
+        for rec in ref_cuts:
+            segs = sorted(seg_meta.get(rec.id, []), key=lambda t: t[0])
+            hyp_raw = " ".join(hyp_by_id.get(sid, "") for _, sid, _ in segs).strip()
+            alignments = None
+            if cfg.save_alignments:
+                alignments = [w for _, sid, _ in segs for w in align_by_id.get(sid, [])]
+            reduced.append(
+                (
+                    rec.id,
+                    rec.duration,
+                    normalizer(rec.supervisions[0].text),
+                    normalizer(hyp_raw),
+                    alignments,
+                    None,
+                    None,
+                )
+            )
+    else:
+        for cut in cuts:
+            reduced.append(
+                (
+                    cut.id,
+                    cut.duration,
+                    normalizer(cut.supervisions[0].text),
+                    normalizer(hyp_by_id.get(cut.id, "")),
+                    align_by_id.get(cut.id) if cfg.save_alignments else None,
+                    content_score_by_id.get(cut.id),
+                    annotated_by_id.get(cut.id),
+                )
+            )
+
+    refs = [r[2] for r in reduced]
+    hyps = [r[3] for r in reduced]
     wer, _, nins, ndel, nsub = word_error_rate_detail(hypotheses=hyps, references=refs, use_cer=False)
     rtfx = sum(input_durations) / sum(infer_durations)
     logging.info(f"WER: {wer:.2%} [ins={nins:.2%} del={ndel:.2%} sub={nsub:.2%}]")
@@ -274,34 +434,36 @@ def main(cfg: StreamingSTTEvalConfig):
         with open(log_file, "a") as f:
             f.write(f"======{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}======\n")
             f.write(f"Input: {cfg.inputs}\n")
+            if seg_mode:
+                f.write(f"Segmentation: method={cfg.seg_method} max_segment_duration={cfg.max_segment_duration}s\n")
             f.write(f"WER: {wer:.2%} [ins={nins:.2%} del={ndel:.2%} sub={nsub:.2%}]\n")
             f.write(f"RTFx: {rtfx:.1f}\n")
             f.write(f"=============================================\n\n")
         with SequentialJsonlWriter(cfg.output_manifest) as writer:
-            for idx, (cut, ref, hyp) in enumerate(zip(cuts, refs, hyps)):
-                wer, _, nins, ndel, nsub = word_error_rate_detail(hypotheses=[hyp], references=[ref], use_cer=False)
+            for rec_id, duration, ref, hyp, alignments, content_scores, annotated in reduced:
+                uwer, _, unins, undel, unsub = word_error_rate_detail(
+                    hypotheses=[hyp], references=[ref], use_cer=False
+                )
                 record = {
-                    "id": cut.id,
-                    "duration": cut.duration,
+                    "id": rec_id,
+                    "duration": duration,
                     "text": ref,
                     "pred_text": hyp,
-                    "wer": wer,
-                    "ins": nins,
-                    "del": ndel,
-                    "sub": nsub,
+                    "wer": uwer,
+                    "ins": unins,
+                    "del": undel,
+                    "sub": unsub,
                 }
-                # Per-word predicted timestamps (same schema as the GT
-                # manifest's `alignments` field: text / start_time / end_time,
-                # in seconds). Stored as `pred_alignments` to mirror the
-                # `pred_text` / `text` naming convention. Words from the
-                # same chunk share that chunk's audio span.
-                if cut_alignments is not None and idx < len(cut_alignments):
-                    record["pred_alignments"] = cut_alignments[idx]
-                if idx < len(cut_content_scores):
-                    record["content_scores"] = cut_content_scores[idx]
+                # Per-word predicted timestamps (same schema as the GT manifest's
+                # `alignments` field: text / start_time / end_time, in seconds).
+                # In seg_mode these are already shifted to recording-global time.
+                if alignments is not None:
+                    record["pred_alignments"] = alignments
+                if content_scores is not None:
+                    record["content_scores"] = content_scores
                     record["content_score_mode"] = content_score_mode
-                if idx < len(cut_pred_text_annotated):
-                    record["pred_text_annotated"] = cut_pred_text_annotated[idx]
+                if annotated is not None:
+                    record["pred_text_annotated"] = annotated
                 writer.write(record)
 
 
