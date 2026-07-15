@@ -1735,27 +1735,22 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         # Multi chunk-size: decode validation at a fixed, well-supported chunk
         # (default 14) instead of the longest candidate, whose look-ahead
         # (chunk-1) may be an unsupported/slow streaming config that stalls the
-        # decode. All inference paths read self._chunk_size_repr, so pin it for
-        # the duration of this decode and restore afterwards.
-        _override_repr = None
-        _saved_repr = getattr(self, "_chunk_size_repr", None)
+        # decode. generate(chunk_size_override=...) pins the size and rebuilds the
+        # turn template for it (then restores).
+        val_chunk = None
         if getattr(self, "_chunk_size_candidates", None):
-            vcs = self.core_cfg.val_chunk_size
-            if vcs is None:
-                vcs = 14 if 14 in self._chunk_size_candidates else max(self._chunk_size_candidates)
-            _override_repr = int(vcs)
-            self._chunk_size_repr = _override_repr
-        try:
-            hyps = self.generate(
-                audios=batch.audios,
-                audio_lens=batch.audio_lens,
-                system_prompt=self._validation_system_prompts(batch),
-                max_new_tokens=self.val_max_new_tokens_per_chunk,
-                generation_config=GenerationConfig(do_sample=False),
-            )
-        finally:
-            if _override_repr is not None:
-                self._chunk_size_repr = _saved_repr
+            val_chunk = self.core_cfg.val_chunk_size
+            if val_chunk is None:
+                val_chunk = 14 if 14 in self._chunk_size_candidates else max(self._chunk_size_candidates)
+            val_chunk = int(val_chunk)
+        hyps = self.generate(
+            audios=batch.audios,
+            audio_lens=batch.audio_lens,
+            system_prompt=self._validation_system_prompts(batch),
+            max_new_tokens=self.val_max_new_tokens_per_chunk,
+            generation_config=GenerationConfig(do_sample=False),
+            chunk_size_override=val_chunk,
+        )
         self._partial_wer_refs[name].extend(refs)
         self._partial_wer_hyps[name].extend(hyps)
 
@@ -3388,6 +3383,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         lm_head_emit_threshold: Optional[float] = None,
         debug_logs: Optional[list] = None,
         chunk_separator: Optional[str] = None,
+        chunk_size_override: Optional[int] = None,
         **generation_kwargs,
     ) -> list[str]:
         """
@@ -3407,58 +3403,78 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 forcing generation. ``None`` means no upper bound (default).
             chunk_separator: If set, include this marker at decoded streaming
                 chunk boundaries.
+            chunk_size_override: Decode at this fixed chunk size (encoder frames)
+                instead of the config default. For multi chunk-size models the
+                default is the longest candidate; pass e.g. 2/4/7/... to measure a
+                specific latency. Ignored for dynamic/offline configs.
             generation_kwargs: Per-call overrides for generation parameters.
 
         Returns:
             List of transcription strings, one per sample.
         """
-        self._ensure_inference_cache()
-
-        # Multi chunk-size: decode at a single resolved chunk size (longest by
-        # default) and match the encoder's streaming look-ahead to it. No-op for
-        # scalar / dynamic / offline configs.
-        self._set_encoder_att_context(self._resolve_inference_chunk_size(), recompute_streaming=True)
-
-        with move_embedding(self):
-            B = audios.shape[0]
-            n_samples_list = [int(audio_lens[b].item()) for b in range(B)]
-
-            if self._chunk_size_repr < 0:
-                results = self._generate_offline(
-                    audios,
-                    n_samples_list,
-                    system_prompt,
-                    max_new_tokens,
-                    generation_config,
-                    **generation_kwargs,
+        # Resolve the decode chunk size (override > longest-candidate/scalar) and
+        # pin it: every inference path reads self._chunk_size_repr. For fixed
+        # chunking also rebuild the turn template for this size (its audio-slot
+        # count == chunk size). Restore both afterwards so a later call at a
+        # different size (e.g. training val vs a sweep) is unaffected.
+        cs = self._resolve_inference_chunk_size(chunk_size_override)
+        saved_repr = getattr(self, "_chunk_size_repr", None)
+        saved_template = getattr(self, "_turn_template_ids", None)
+        self._chunk_size_repr = cs
+        try:
+            self._ensure_inference_cache()  # size-independent ids (header/footer/eos)
+            if cs > 0:
+                self._turn_template_ids = (
+                    list(self._user_header_ids)
+                    + [AUDIO_TOKEN_IDX] * cs
+                    + list(self._user_footer_and_asst_header_ids)
                 )
-            elif self._chunk_size_repr == 0 or use_state_machine_inference:
-                # Dynamic chunking (chunk_size=0) or state machine inference opted in for chunk_size > 0.
-                # Note that for chunk_size > 0, use_state_machine_inference is not recommended.
-                results = self._generate_dynamic_streaming(
-                    audios,
-                    n_samples_list,
-                    system_prompt,
-                    max_new_tokens,
-                    generation_config,
-                    dynamic_min_chunk_size=dynamic_min_chunk_size,
-                    dynamic_max_chunk_size=dynamic_max_chunk_size,
-                    lm_head_emit_threshold=lm_head_emit_threshold,
-                    debug_logs=debug_logs,
-                    chunk_separator=chunk_separator,
-                    **generation_kwargs,
-                )
-            else:
-                # Static chunking (chunk_size > 0): bulk prefill + auto-regressive decode.
-                results = self._generate_chunked_streaming(
-                    audios,
-                    n_samples_list,
-                    system_prompt,
-                    max_new_tokens,
-                    generation_config,
-                    use_offline_embs=use_offline_embs,
-                    chunk_separator=chunk_separator,
-                    **generation_kwargs,
-                )
+            # Match the encoder's streaming look-ahead to the decode chunk size.
+            self._set_encoder_att_context(cs, recompute_streaming=True)
+
+            with move_embedding(self):
+                B = audios.shape[0]
+                n_samples_list = [int(audio_lens[b].item()) for b in range(B)]
+
+                if cs < 0:
+                    results = self._generate_offline(
+                        audios,
+                        n_samples_list,
+                        system_prompt,
+                        max_new_tokens,
+                        generation_config,
+                        **generation_kwargs,
+                    )
+                elif cs == 0 or use_state_machine_inference:
+                    # Dynamic chunking (chunk_size=0) or state machine inference opted in for chunk_size > 0.
+                    # Note that for chunk_size > 0, use_state_machine_inference is not recommended.
+                    results = self._generate_dynamic_streaming(
+                        audios,
+                        n_samples_list,
+                        system_prompt,
+                        max_new_tokens,
+                        generation_config,
+                        dynamic_min_chunk_size=dynamic_min_chunk_size,
+                        dynamic_max_chunk_size=dynamic_max_chunk_size,
+                        lm_head_emit_threshold=lm_head_emit_threshold,
+                        debug_logs=debug_logs,
+                        chunk_separator=chunk_separator,
+                        **generation_kwargs,
+                    )
+                else:
+                    # Static chunking (chunk_size > 0): bulk prefill + auto-regressive decode.
+                    results = self._generate_chunked_streaming(
+                        audios,
+                        n_samples_list,
+                        system_prompt,
+                        max_new_tokens,
+                        generation_config,
+                        use_offline_embs=use_offline_embs,
+                        chunk_separator=chunk_separator,
+                        **generation_kwargs,
+                    )
+        finally:
+            self._chunk_size_repr = saved_repr
+            self._turn_template_ids = saved_template
 
         return results

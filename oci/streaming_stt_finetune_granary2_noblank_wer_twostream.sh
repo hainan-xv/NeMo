@@ -196,6 +196,7 @@ echo "*******STARTING********" \
     ++exp_manager.wandb_logger_kwargs.project=${PROJECT_NAME} \
     ++exp_manager.checkpoint_callback_params.monitor=val_wer \
     ++exp_manager.checkpoint_callback_params.mode=min \
+    ++exp_manager.checkpoint_callback_params.save_top_k=5 \
     ++model.perception.encoder.sync_max_audio_length=false \
 
 

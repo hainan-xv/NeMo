@@ -181,6 +181,6 @@ exp_manager:
     mode: min                # was max (for val_acc)
     every_n_train_steps: null
     every_n_epochs: 1
-    save_top_k: 1
+    save_top_k: 5
     always_save_nemo: false
     save_nemo_on_train_end: false
