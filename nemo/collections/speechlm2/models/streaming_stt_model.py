@@ -3487,13 +3487,23 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                     )
                 else:
                     # Static chunking (chunk_size > 0): bulk prefill + auto-regressive decode.
+                    # When the encoder look-ahead is DECOUPLED from the LLM chunk size
+                    # (couple_encoder_lookahead_to_chunk=False), the cache-aware streaming
+                    # encode is mis-sized: setup_streaming_params derives valid_out_len /
+                    # chunk_size from att_context_size[1] (e.g. 0 for a strictly-causal
+                    # encoder), but the loop feeds cs-frame chunks — so the streamed
+                    # embeddings are misaligned. For a fixed (esp. strictly-causal)
+                    # encoder the OFFLINE forward is what training used and is identical
+                    # to true streaming (right-context <= 0 => no future leakage), so use
+                    # offline embeddings here to keep inference consistent with training.
+                    _use_offline = use_offline_embs or not self.core_cfg.couple_encoder_lookahead_to_chunk
                     results = self._generate_chunked_streaming(
                         audios,
                         n_samples_list,
                         system_prompt,
                         max_new_tokens,
                         generation_config,
-                        use_offline_embs=use_offline_embs,
+                        use_offline_embs=_use_offline,
                         chunk_separator=chunk_separator,
                         **generation_kwargs,
                     )
