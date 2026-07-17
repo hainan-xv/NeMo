@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH -A nemotron_speechprod_asr
-#SBATCH -J nemotron_speechprod_asr:chat-fullctx-nemotron06b-rnnt-g2
+#SBATCH -J nemotron_speechprod_asr:chat-fullctx-parakeet-rnnt-g2
 #SBATCH -p batch_block1,batch_block3,batch_block4
 #SBATCH -N 4
 #SBATCH --gpus-per-node=8
@@ -17,9 +17,8 @@
 # OCI launcher for the FULL-CONTEXT CHAT (Chunk-wise Attention Transducer) model,
 # trained with the PURE RNNT (CHAT) loss -- no CTC.
 #
-# This warm-starts from the LAST checkpoint of the corresponding full-context
-# CTC-joint run (encoder+decoder+joint are loaded; the auxiliary CTC head is
-# dropped), to test whether the CTC joint training helped.
+# Default -N 4 (32 GPUs): same as oci_chat/tdt.sh; fewer nodes reduces AIS/lustre
+# contention + idle-GPU risk. Override with: sbatch -N 8 oci_chat/chat_fullctx.sh
 #
 # Full-context (offline) variant of oci_chat/chat.sh. The encoder runs with
 # unlimited attention and non-causal operations; the CHAT cross-attention joint
@@ -30,19 +29,20 @@
 #   - conv_norm_type      = batch_norm; preprocessor.normalize = per_feature
 #   - joint.chunk_size    = ${CHAT_CHUNK_SIZE} (default 14; set explicitly since
 #                           it can no longer be inferred from a chunked encoder)
-#   - loss = (1-ctc_weight)*CHAT + ctc_weight*CTC (both mean_volume, ctc_weight=0.3)
+#   - loss = pure CHAT RNNT (mean_volume), no CTC
 #
-# The encoder architecture matches parakeet-tdt-0.6b-v2 (non-causal FastConformer,
-# 24 layers, d_model=1024, 128 mel, batch_norm conv), so it is warm-started from
-# that checkpoint's encoder by default (INIT_ENCODER_MODE=local).
+# Training hyper-parameters match oci_chat/tdt.sh (LR, warmup, precision, lhotse
+# bucketing, num_workers, AIS batch fetch, Granary 2.0 data, parakeet tokenizer).
+#
+# Warm-start: by default loads the FULL parakeet-tdt-0.6b-v2 .nemo (encoder +
+# decoder + joint where shapes match; strict=False). Override with
+# INIT_FROM=ctc_joint to resume from a prior CHAT CTC-joint PTL checkpoint instead.
 #
 # Model config:
 #   examples/asr/conf/fastconformer/cache_aware_streaming/
 #       fastconformer_chat_transducer_bpe_streaming.yaml
-# (the streaming/causal knobs + CTC head are overridden below).
 #
-# Data: pre-aligned Granary v2.0 train + English mcv11 dev (same as the SpeechLM
-# baseline oci/baseline_granary2.sh), loaded through lhotse. Runs MY code at /code.
+# Runs MY code (git-synced repo mounted at /code), not the container's NeMo.
 #
 # Submit from an OCI login node:
 #   ./sync_to_oci.sh
@@ -81,12 +81,11 @@ LUSTRE_ACCOUNT_PREFIX=/lustre/fsw/portfolios/${SLURM_ACCOUNT}
 # environment; the actual NeMo code comes from /code below).
 CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/llmservice/users/heh/containers/nemo-26.02-streaming-speechlm.sqsh}"
 
-# Dedicated project for the CHAT models (separate wandb project + results space
-# from the SpeechLM models in Speechlm79).
+# Dedicated project for the CHAT models (separate wandb project + results space).
 PROJECT_NAME="${PROJECT_NAME:-Chat79}"
 
 # ---------------------------------------------------------------------------
-# CHAT full-context model + training hyper-parameters
+# CHAT full-context model + training hyper-parameters (aligned with tdt.sh)
 # ---------------------------------------------------------------------------
 CONFIG_PATH="${CONFIG_PATH:-/code/examples/asr/conf/fastconformer/cache_aware_streaming}"
 CONFIG_NAME="${CONFIG_NAME:-fastconformer_chat_transducer_bpe_streaming}"
@@ -98,7 +97,7 @@ ATT_CONTEXT="${ATT_CONTEXT:-[-1,-1]}"              # [-1,-1] = unlimited (full) 
 ATT_CONTEXT_STYLE="${ATT_CONTEXT_STYLE:-regular}"  # regular attention for full context
 CAUSAL_DOWNSAMPLING="${CAUSAL_DOWNSAMPLING:-false}" # non-causal subsampling
 CONV_CONTEXT_SIZE="${CONV_CONTEXT_SIZE:-null}"      # null -> symmetric (non-causal) convolution
-CONV_NORM_TYPE="${CONV_NORM_TYPE:-batch_norm}"      # parakeet-tdt uses batch_norm (config default is layer_norm)
+CONV_NORM_TYPE="${CONV_NORM_TYPE:-batch_norm}"      # parakeet-tdt uses batch_norm
 NORMALIZE="${NORMALIZE:-per_feature}"               # parakeet-tdt uses per-feature mel normalization
 CTX_TAG="$(echo "${ATT_CONTEXT}" | tr -d '[] ' | tr ',' '_')"
 
@@ -110,69 +109,107 @@ MAX_STEPS="${MAX_STEPS:-500000}"
 LIMIT_TRAIN_BATCHES="${LIMIT_TRAIN_BATCHES:-6000}"
 EVALS_PER_EPOCH="${EVALS_PER_EPOCH:-1}"
 VAL_CHECK_INTERVAL=$(( LIMIT_TRAIN_BATCHES / EVALS_PER_EPOCH ))
-LR="${LR:-1.0}"                       # NoamAnnealing peak scale (config default)
-WARMUP_STEPS="${WARMUP_STEPS:-15000}"
+# Continuing from a strong checkpoint -> modest peak LR + warmup (same as tdt.sh).
+LR="${LR:-1e-4}"
+WARMUP_STEPS="${WARMUP_STEPS:-5000}"
 BATCH_DURATION="${BATCH_DURATION:-120}"
 NUM_BUCKETS="${NUM_BUCKETS:-30}"
 MAX_DURATION="${MAX_DURATION:-20.0}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-16}"
 SAVE_TOP_K="${SAVE_TOP_K:-5}"
-PRECISION="${PRECISION:-bf16}"
+PRECISION="${PRECISION:-bf16-mixed}"
+# DataLoader workers per rank. Granary audio is served over AIS; too few workers
+# leaves GPUs waiting and triggers cluster "idle GPU" alerts even while W&B
+# still shows loss moving (steps are just slow / bursty).
+NUM_WORKERS="${NUM_WORKERS:-8}"
+# Batch AIS audio fetch (Lhotse>=1.32). Big win vs per-cut HTTP GETs.
+USE_AIS_GET_BATCH="${USE_AIS_GET_BATCH:-true}"
 # RNNT (CHAT) loss reduction: mean_batch | mean | sum | mean_volume.
-# mean_volume sums all losses and divides by total target length (longer samples weigh more).
 RNNT_REDUCTION="${RNNT_REDUCTION:-mean_volume}"
+# IMPORTANT: parakeet-matched encoder uses batch_norm. Lightning `bf16`
+# (bf16-true) casts BN to bf16 and commonly produces Inf loss at step 0.
+# Use bf16-mixed (or 32) instead. Override with PRECISION=32 if needed.
 
-# This run trains PURE RNNT (CHAT) loss -- no CTC. It warm-starts from the last
-# checkpoint of the corresponding full-context CTC-joint run (encoder+decoder+joint
-# load; the CTC head is ignored via strict=False). SRC_CTC_WEIGHT is only used to
-# locate that source run's folder (see SRC_EXP_NAME below).
+# ---------------------------------------------------------------------------
+# parakeet-tdt-0.6b-v2 checkpoint + tokenizer (same paths as tdt.sh)
+# ---------------------------------------------------------------------------
+PRETRAINED_MODEL_DIR="${PRETRAINED_MODEL_DIR:-/lustre/fs12/portfolios/llmservice/projects/llmservice_nemo_speechlm/users/hainanx/pretrained_models}"
+PARAKEET_BASENAME="${PARAKEET_BASENAME:-parakeet-tdt-0.6b-v2.nemo}"
+PARAKEET_NEMO_HOST="${PRETRAINED_MODEL_DIR}/${PARAKEET_BASENAME}"
+PARAKEET_NEMO_CONTAINER="/pretrained/${PARAKEET_BASENAME}"
+if [ ! -f "${PARAKEET_NEMO_HOST}" ]; then
+    echo "ERROR: parakeet checkpoint not found at ${PARAKEET_NEMO_HOST}" >&2
+    echo "       Copy parakeet-tdt-0.6b-v2.nemo there or set PARAKEET_NEMO_HOST/PRETRAINED_MODEL_DIR." >&2
+    exit 1
+fi
+
+# Tokenizer: EXACT tokenizer packaged inside parakeet-tdt-0.6b-v2.nemo.
+TOKENIZER_DIR="${TOKENIZER_DIR:-${PRETRAINED_MODEL_DIR}/${PARAKEET_BASENAME%.nemo}_tokenizer}"
+if [ ! -f "${TOKENIZER_DIR}/tokenizer.model" ]; then
+    echo "==> Extracting parakeet tokenizer into ${TOKENIZER_DIR}"
+    mkdir -p "${TOKENIZER_DIR}"
+    _tok_tmp="$(mktemp -d)"
+    tar --no-same-owner -xf "${PARAKEET_NEMO_HOST}" -C "${_tok_tmp}"
+    cp "${_tok_tmp}"/*tokenizer.model "${TOKENIZER_DIR}/tokenizer.model"
+    cp "${_tok_tmp}"/*vocab.txt        "${TOKENIZER_DIR}/vocab.txt"        2>/dev/null || true
+    cp "${_tok_tmp}"/*tokenizer.vocab  "${TOKENIZER_DIR}/tokenizer.vocab"  2>/dev/null || true
+    rm -rf "${_tok_tmp}"
+fi
+if [ ! -f "${TOKENIZER_DIR}/tokenizer.model" ]; then
+    echo "ERROR: failed to extract tokenizer.model into ${TOKENIZER_DIR}" >&2
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Warm-start: parakeet .nemo (default) or prior CHAT CTC-joint PTL checkpoint
+# ---------------------------------------------------------------------------
+INIT_FROM="${INIT_FROM:-parakeet}"
 SRC_CTC_WEIGHT="${SRC_CTC_WEIGHT:-0.3}"
-
-# ---------------------------------------------------------------------------
-# Data (Granary 2.0 pre-aligned, same as oci/baseline_granary2.sh) + tokenizer
-# ---------------------------------------------------------------------------
-GRANARY2_CFG=/lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/users/dongjig/aligned_amos/granary_v2_en_pnc_qwen_aligned_filtered/granary_v2_en_pnc_qwen_aligned_filtered_safe_iad_s3_audio.yaml
-TRAIN_INPUT_CFG="${TRAIN_INPUT_CFG:-$GRANARY2_CFG}"
-
-# English dev set: same as the SpeechLM baseline (streaming_stt_nss_granary_lora
-# recipe's validation_ds -> mcv_11_dev). Matches the English Granary training.
-# Path is under the /data mount (= $DATA_DIR), same as the recipe.
-VAL_MANIFEST="${VAL_MANIFEST:-[/data/canary/canary_v0/manifests/data/ASR/MMLPC/en/val_test/mcv11/mcv11_dev_clean_pcstrip_en_2k.json]}"
-
-# English 1024 BPE SentencePiece tokenizer (same vocab used by the other CHAT
-# ASR launchers). Point TOKENIZER_DIR at the directory containing tokenizer.model.
-ST_TOKENIZERS_ROOT="${ST_TOKENIZERS_ROOT:-${LUSTRE_ACCOUNT_PREFIX}/${USERID}/Workplace/multilingual/tokenizers/en}"
-TOKENIZER_DIR="${TOKENIZER_DIR:-${ST_TOKENIZERS_ROOT}/tokenizer_spe_bpe_v1024}"
-
-# Pure-RNNT (no CTC) continuation, warm-started from the full-context CTC-joint
-# checkpoint. Distinct EXP_NAME/folder so it does not collide with that run.
-EXP_NAME="${EXP_NAME:-${CLUSTER}_chat_fullctx_parakeet_rnntonly_fromhyb_g2_ctx${CTX_TAG}_chunk${CHAT_CHUNK_SIZE}_lr${LR}_n${SLURM_JOB_NUM_NODES}}"
 
 # Write-heavy outputs (results/checkpoints, HF cache, checkpoint temp) go to the
 # nemotron project, which has free quota. Override with OUTPUT_PREFIX.
 OUTPUT_PREFIX="${OUTPUT_PREFIX:-/lustre/fsw/portfolios/nemotron/users/hainanx}"
-RESULTS_DIR=${OUTPUT_PREFIX}/results/$PROJECT_NAME/$EXP_NAME
 
-# Resolve the full-context CTC-joint run's last checkpoint to warm-start from
-# (loads encoder+decoder+joint; the CTC head is ignored). Override SRC_EXP_NAME
-# (the CTC-joint experiment name) or INIT_CKPT (a full path) as needed.
-SRC_EXP_NAME="${SRC_EXP_NAME:-${CLUSTER}_chat_fullctx_parakeet_hybctc${SRC_CTC_WEIGHT}_g2_ctx${CTX_TAG}_chunk${CHAT_CHUNK_SIZE}_lr${LR}_n${SLURM_JOB_NUM_NODES}}"
-SRC_EXP_NAME=oci_chat_fullctx_parakeet_hybctc0.3_g2_ctx-1_-1_chunk14_lr5.0_n8
-SRC_CKPT_DIR="${OUTPUT_PREFIX}/results/${PROJECT_NAME}/${SRC_EXP_NAME}/${SRC_EXP_NAME}/${SRC_EXP_NAME}/checkpoints"
-INIT_CKPT="${INIT_CKPT:-$(ls -t ${SRC_CKPT_DIR}/*-last.ckpt 2>/dev/null | head -1)}"
-if [ -z "$INIT_CKPT" ] || [ ! -f "$INIT_CKPT" ]; then
-    echo "ERROR: no *-last.ckpt found for the CTC-joint model under: ${SRC_CKPT_DIR}" >&2
-    echo "       Set SRC_EXP_NAME=<ctc-joint exp name> or INIT_CKPT=<full path> explicitly." >&2
-    exit 1
-fi
-# Checkpoint filenames contain '=' (e.g. step=NNNN-...), which Hydra cannot parse
-# in an override value. Symlink to an '='-free path and point the override there.
+EXP_NAME="${EXP_NAME:-${CLUSTER}_chat_fullctx_parakeet_rnnt_g2_ctx${CTX_TAG}_chunk${CHAT_CHUNK_SIZE}_lr${LR}_${PRECISION}_n${SLURM_JOB_NUM_NODES}}"
+RESULTS_DIR=${OUTPUT_PREFIX}/results/$PROJECT_NAME/$EXP_NAME
 mkdir -p "${RESULTS_DIR}"
-SAFE_INIT_CKPT="${RESULTS_DIR}/init_from_ctc.ckpt"
-ln -sf "${INIT_CKPT}" "${SAFE_INIT_CKPT}"
-INIT_OVERRIDE="+init_from_ptl_ckpt=${SAFE_INIT_CKPT}"
-echo "==> Pure-RNNT full-context run; initializing from CTC-joint checkpoint: ${INIT_CKPT}"
-echo "    (via '='-free symlink: ${SAFE_INIT_CKPT})"
+
+case "${INIT_FROM}" in
+  parakeet|nemo|pretrained)
+    INIT_OVERRIDE="+init_from_nemo_model=${PARAKEET_NEMO_CONTAINER}"
+    INIT_DESC="${PARAKEET_NEMO_CONTAINER} (FULL model: encoder+decoder+joint, strict=False)"
+    ;;
+  ctc_joint|ctc|ptl)
+    SRC_EXP_NAME="${SRC_EXP_NAME:-${CLUSTER}_chat_fullctx_parakeet_hybctc${SRC_CTC_WEIGHT}_g2_ctx${CTX_TAG}_chunk${CHAT_CHUNK_SIZE}_lr${LR}_n${SLURM_JOB_NUM_NODES}}"
+    SRC_CKPT_DIR="${OUTPUT_PREFIX}/results/${PROJECT_NAME}/${SRC_EXP_NAME}/${SRC_EXP_NAME}/${SRC_EXP_NAME}/checkpoints"
+    INIT_CKPT="${INIT_CKPT:-$(ls -t ${SRC_CKPT_DIR}/*-last.ckpt 2>/dev/null | head -1)}"
+    if [ -z "$INIT_CKPT" ] || [ ! -f "$INIT_CKPT" ]; then
+        echo "ERROR: no *-last.ckpt found for the CTC-joint model under: ${SRC_CKPT_DIR}" >&2
+        echo "       Set SRC_EXP_NAME=<ctc-joint exp name> or INIT_CKPT=<full path> explicitly." >&2
+        exit 1
+    fi
+    # Checkpoint filenames contain '=' (e.g. step=NNNN-...), which Hydra cannot parse
+    # in an override value. Symlink to an '='-free path and point the override there.
+    SAFE_INIT_CKPT="${RESULTS_DIR}/init_from_ctc.ckpt"
+    ln -sf "${INIT_CKPT}" "${SAFE_INIT_CKPT}"
+    INIT_OVERRIDE="+init_from_ptl_ckpt=${SAFE_INIT_CKPT}"
+    INIT_DESC="${INIT_CKPT} (from CTC-joint run; CTC head dropped)"
+    ;;
+  *)
+    echo "ERROR: unknown INIT_FROM='${INIT_FROM}' (use parakeet or ctc_joint)" >&2
+    exit 1
+    ;;
+esac
+echo "==> INIT_FROM=${INIT_FROM}: ${INIT_DESC}"
+
+# ---------------------------------------------------------------------------
+# Data (Granary 2.0 pre-aligned train + English mcv11 dev, same as tdt.sh)
+# ---------------------------------------------------------------------------
+GRANARY2_CFG=/lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/users/dongjig/aligned_amos/granary_v2_en_pnc_qwen_aligned_filtered/granary_v2_en_pnc_qwen_aligned_filtered_safe_iad_s3_audio.yaml
+TRAIN_INPUT_CFG="${TRAIN_INPUT_CFG:-$GRANARY2_CFG}"
+
+# English dev set: same as the SpeechLM baseline / tdt.sh.
+VAL_MANIFEST="${VAL_MANIFEST:-[/data/canary/canary_v0/manifests/data/ASR/MMLPC/en/val_test/mcv11/mcv11_dev_clean_pcstrip_en_2k.json]}"
 
 CHECKPOINT_DIR=${LUSTRE_ACCOUNT_PREFIX}/${OLDUSERID}/checkpoints/
 HFCACHE=${OUTPUT_PREFIX}/hf_cache
@@ -192,20 +229,23 @@ mkdir -p ${RESULTS_DIR} ${HFCACHE}
 OUTFILE=${RESULTS_DIR}/slurm-%j-%n.out
 ERRFILE=${RESULTS_DIR}/error-%j-%n.out
 
-MOUNTS="--container-mounts=${SPEECHLM_PROJECT_DIR}:${SPEECHLM_PROJECT_DIR},${H_DIR}:${H_DIR},$HAINAN_DIR:$HAINAN_DIR,$CODE_DIR:/code,$RESULTS_DIR:/results,$DATA_DIR:/data,$CHECKPOINT_DIR:/checkpoints,${HFCACHE}:/hfcache/,${TOKENIZER_DIR}:/tokenizers,/lustre/fsw:/lustre/fsw,/lustre/fs12:/lustre/fs12"
+MOUNTS="--container-mounts=${SPEECHLM_PROJECT_DIR}:${SPEECHLM_PROJECT_DIR},${H_DIR}:${H_DIR},$HAINAN_DIR:$HAINAN_DIR,$CODE_DIR:/code,$RESULTS_DIR:/results,$DATA_DIR:/data,$PRETRAINED_MODEL_DIR:/pretrained,$CHECKPOINT_DIR:/checkpoints,${HFCACHE}:/hfcache/,${TOKENIZER_DIR}:/tokenizers,/lustre/fsw:/lustre/fsw,/lustre/fs12:/lustre/fs12"
 
 # SLURM_JOB_NUM_NODES=1
 # GPUS_PER_NODE=1
 # export CUDA_VISIBLE_DEVICES=0
 
 read -r -d '' cmd <<EOF
-echo "*******STARTING FULL-CONTEXT CHAT (FastConformer RNNT, pure - no CTC) - Granary 2.0********" \
+echo "*******FULL-CONTEXT CHAT (FastConformer RNNT, pure - no CTC) - Granary 2.0********" \
 && echo "*** CONFIG: ${CONFIG_NAME} | ATT_CONTEXT=${ATT_CONTEXT} style=${ATT_CONTEXT_STYLE} ***" \
 && echo "*** FULL-CTX: causal_downsampling=${CAUSAL_DOWNSAMPLING} conv=${CONV_CONTEXT_SIZE}/${CONV_NORM_TYPE} normalize=${NORMALIZE} | CHAT chunk_size=${CHAT_CHUNK_SIZE} ***" \
 && echo "*** LOSS: pure CHAT(rnnt), reduction=${RNNT_REDUCTION} ***" \
+&& echo "*** INIT: ${INIT_DESC} ***" \
+&& echo "*** TOKENIZER: /tokenizers (extracted from the parakeet .nemo) ***" \
+&& echo "*** PRECISION: ${PRECISION} (use bf16-mixed/32 with batch_norm; bf16-true often -> Inf) ***" \
 && echo "*** DATA: Granary 2.0 pre-aligned (lhotse) -> ${TRAIN_INPUT_CFG} ***" \
-&& echo "*** INIT: ${INIT_CKPT} (from CTC-joint run; CTC head dropped) ***" \
-&& nvidia-smi \
+&& echo "*** RANK DIAG: SLURM_PROCID=\${SLURM_PROCID:-?} SLURM_LOCALID=\${SLURM_LOCALID:-?} SLURM_NTASKS=\${SLURM_NTASKS:-?} CUDA_VISIBLE_DEVICES=\${CUDA_VISIBLE_DEVICES:-?} ***" \
+&& nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used --format=csv,noheader \
 && export WANDB_API_KEY=${WANDB} \
 && cd /code \
 && git rev-parse HEAD \
@@ -219,11 +259,12 @@ echo "*******STARTING FULL-CONTEXT CHAT (FastConformer RNNT, pure - no CTC) - Gr
 && export TOKENIZERS_PARALLELISM=false \
 && export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 && export LHOTSE_AUDIO_DURATION_MISMATCH_TOLERANCE=0.3 \
-&& export TMPDIR=${OCI_TMP_DIR} && mkdir -p ${OCI_TMP_DIR} && echo "staging TMPDIR=\$TMPDIR" \
+&& export USE_AIS_GET_BATCH=${USE_AIS_GET_BATCH} \
+&& export TMPDIR=${OCI_TMP_DIR} && mkdir -p ${OCI_TMP_DIR} && echo "staging TMPDIR=\$TMPDIR USE_AIS_GET_BATCH=\$USE_AIS_GET_BATCH" \
 && export AIS_ENDPOINT=http://asr.iad.oci.aistore.nvidia.com:51080 \
 && export AIS_AUTHN_TOKEN="${AIS_AUTHN_TOKEN}" \
 && export NEMO_DATA_STORE_CACHE_DIR=/lustre/fsw/portfolios/llmservice/users/heh/nemo_cache \
-&& echo "Starting training (running MY code at /code, pure CHAT-RNNT full-context from CTC-joint ckpt, GRANARY 2.0 data)" \
+&& echo "Starting training (running MY code at /code, pure CHAT-RNNT full-context, GRANARY 2.0 data)" \
 && python /code/examples/asr/asr_transducer/speech_to_text_rnnt_bpe.py \
     --config-path=${CONFIG_PATH} \
     --config-name=${CONFIG_NAME} \
@@ -248,13 +289,14 @@ echo "*******STARTING FULL-CONTEXT CHAT (FastConformer RNNT, pure - no CTC) - Gr
     ++model.train_ds.use_bucketing=true \
     ++model.train_ds.num_buckets=${NUM_BUCKETS} \
     ++model.train_ds.use_start_end_token=false \
+    ++model.train_ds.text_field=text \
     model.train_ds.max_duration=${MAX_DURATION} \
-    model.train_ds.num_workers=4 \
+    model.train_ds.num_workers=${NUM_WORKERS} \
     model.train_ds.shuffle=true \
     model.train_ds.pin_memory=true \
     model.validation_ds.manifest_filepath=${VAL_MANIFEST} \
     model.validation_ds.batch_size=${EVAL_BATCH_SIZE} \
-    model.validation_ds.num_workers=4 \
+    model.validation_ds.num_workers=${NUM_WORKERS} \
     model.validation_ds.pin_memory=true \
     ++model.validation_ds.use_start_end_token=false \
     model.tokenizer.dir="/tokenizers" \
