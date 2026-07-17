@@ -886,6 +886,9 @@ class TestStreamingTransformerEncoder:
             ("rel_pos", 2, 4, 4, 1, True),  # rolling: chunk > left
             ("rel_pos", 3, 2, 4, 2, True),  # batched
             ("no_pos", 3, 2, 4, 1, True),  # no positional encoding
+            ("rope", 3, 2, 4, 1, True),  # rotary position embedding (warm-up)
+            ("rope", 2, 4, 4, 1, True),  # rotary position embedding (rolling)
+            ("rope", 3, 2, 4, 1, False),  # rope with FeatureStacking subsampling
             ("rel_pos", -1, 2, 4, 1, True),  # full (unbounded) cache
             ("rel_pos", 3, 2, 4, 1, False),  # with FeatureStacking subsampling (aligned chunks)
         ],

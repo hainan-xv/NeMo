@@ -304,20 +304,26 @@ class MultiHeadAttention(nn.Module):
 
         The cache stores raw (position-agnostic) layer inputs, so each scheme applies its own
         transform here over the concatenated span — keeping the cache format scheme-agnostic.
-        This is where a future ``rope`` scheme would rotate ``q``/``k`` by their absolute
-        positions (``pos_offset + local_index``) and return ``score_mod=None``; ``rel_pos``
-        instead leaves ``q``/``k`` in place (folding ``pos_bias_u`` into ``q``) and returns a
-        relative-position ``score_mod``.
+        ``rope`` rotates ``q``/``k`` in place (its rotation depends only on the query/key
+        position *difference*, so streaming needs no explicit position offset) and returns
+        ``score_mod=None``; ``rel_pos`` leaves ``q``/``k`` in place (folding ``pos_bias_u`` into
+        ``q``) and returns a relative-position ``score_mod``.
         """
         if self.self_attention_model == "rel_pos":
             return self._build_streaming_rel_pos_score_mod(q, pos_emb, num_cur, num_kv)
+        if self._uses_rope:
+            # RoPE.forward handles ``num_kv > num_cur`` directly: keys rotate from position 0,
+            # queries from ``num_kv - num_cur`` (= cache length), so the query/key position
+            # difference matches the full-sequence forward exactly — streaming is exact.
+            q, k = self.rope(q, k)
+            return q, k, None
         if self.self_attention_model == "no_pos":
             return q, k, None
         # abs_pos bakes absolute positions into the embeddings before the blocks, which does
-        # not compose with a running KV cache without a position offset; deferred like rope.
+        # not compose with a running KV cache without a position offset; deferred.
         raise NotImplementedError(
             f"Cache-aware streaming is not implemented for self_attention_model="
-            f"'{self.self_attention_model}'. Supported streaming schemes: 'rel_pos', 'no_pos'."
+            f"'{self.self_attention_model}'. Supported streaming schemes: 'rel_pos', 'rope', 'no_pos'."
         )
 
     def _build_streaming_rel_pos_score_mod(self, q, pos_emb, num_cur, num_kv):
@@ -821,8 +827,9 @@ class StreamingTransformerEncoder(TransformerEncoder, StreamingEncoder):
     ``att_context_size=[chunk_size, 0]`` for exact causal streaming.
 
     The cache stores raw (position-agnostic) per-layer inputs; the positional scheme is applied per
-    step in :meth:`MultiHeadAttention._apply_streaming_position`, so a future ``rope`` scheme drops
-    in without changing the cache format. Streaming currently supports ``rel_pos`` and ``no_pos``.
+    step in :meth:`MultiHeadAttention._apply_streaming_position`, keeping the cache format
+    scheme-agnostic. Streaming supports ``rel_pos``, ``rope``, and ``no_pos`` (``abs_pos`` is not
+    supported for streaming).
 
     Args:
         att_context_size: ``[left, right]`` window in encoder (post-subsampling) frames. ``left``
@@ -949,13 +956,24 @@ class StreamingTransformerEncoder(TransformerEncoder, StreamingEncoder):
         L = cache_last_channel.shape[2]  # padded cache size (== left for rolling; grows for full)
         num_kv = L + C
 
-        # 2. Positional prep (once). Apply xscale to the current chunk via pos_enc; the length-C
-        #    pos_emb it returns is discarded — the streaming attention needs pos_emb for ``num_kv``.
+        # 2. Positional prep (once). Extend positional buffers to cover the [cache | current]
+        #    span, then apply this scheme's pre-block step (mirroring ``forward_internal``):
+        #    rope rotates Q/K inside attention (only xscale + dropout here); rel_pos needs an
+        #    additive pos_emb of length ``num_kv``; abs_pos bakes positions into ``x`` (and is
+        #    rejected downstream for streaming); no_pos does nothing.
         if self.pos_enc is not None:
             self.update_max_seq_length(seq_length=num_kv, device=x.device)
+        if self.self_attention_model == "rope":
+            if self.xscale:
+                x = x * self.xscale
+            x = self.dropout_pre_encoder(x)
+            pos_emb = None
+        elif self.pos_enc is not None:
             x, _ = self.pos_enc(x=x)
+            pos_emb = self._streaming_pos_emb(num_kv, x) if self.self_attention_model == "rel_pos" else None
+        else:  # no_pos
+            pos_emb = None
         x = self.embed_norm(x)
-        pos_emb = self._streaming_pos_emb(num_kv, x) if self.self_attention_model == "rel_pos" else None
 
         # 3. Streaming layers with the shared block mask; collect each layer's updated cache.
         block_mask = self._build_streaming_block_mask(cache_last_channel_len, length, L, C, left, right, x.device)
