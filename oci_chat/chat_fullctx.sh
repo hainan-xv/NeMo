@@ -105,6 +105,11 @@ CTX_TAG="$(echo "${ATT_CONTEXT}" | tr -d '[] ' | tr ',' '_')"
 # so this can't be inferred from att_context_size and must be set explicitly.
 CHAT_CHUNK_SIZE="${CHAT_CHUNK_SIZE:-14}"
 
+# Prediction network RNN layers. Parakeet-tdt-0.6b-v2's decoder has 2 LSTM layers
+# (config default here is 1). Match it to 2 so the whole decoder loads from the
+# parakeet .nemo (with strict=False a 1-layer decoder would silently drop layer 1).
+PRED_RNN_LAYERS="${PRED_RNN_LAYERS:-2}"
+
 MAX_STEPS="${MAX_STEPS:-500000}"
 LIMIT_TRAIN_BATCHES="${LIMIT_TRAIN_BATCHES:-6000}"
 EVALS_PER_EPOCH="${EVALS_PER_EPOCH:-1}"
@@ -176,8 +181,13 @@ mkdir -p "${RESULTS_DIR}"
 
 case "${INIT_FROM}" in
   parakeet|nemo|pretrained)
-    INIT_OVERRIDE="+init_from_nemo_model=${PARAKEET_NEMO_CONTAINER}"
-    INIT_DESC="${PARAKEET_NEMO_CONTAINER} (FULL model: encoder+decoder+joint, strict=False)"
+    # Load ONLY encoder + decoder from parakeet. The CHAT RNNT joint has 1025
+    # outputs (1024 vocab + blank) while parakeet's TDT joint has 1030
+    # (+5 durations), so the joint cannot be loaded -- it is trained from scratch.
+    # The dict form of init_from_nemo_model + include filter does a partial load
+    # (load_part_of_state_dict) instead of a strict full load.
+    INIT_OVERRIDE="+init_from_nemo_model.parakeet.path=${PARAKEET_NEMO_CONTAINER} +init_from_nemo_model.parakeet.include=[encoder,decoder]"
+    INIT_DESC="${PARAKEET_NEMO_CONTAINER} (encoder+decoder only; joint trained from scratch)"
     ;;
   ctc_joint|ctc|ptl)
     SRC_EXP_NAME="${SRC_EXP_NAME:-${CLUSTER}_chat_fullctx_parakeet_hybctc${SRC_CTC_WEIGHT}_g2_ctx${CTX_TAG}_chunk${CHAT_CHUNK_SIZE}_lr${LR}_n${SLURM_JOB_NUM_NODES}}"
@@ -276,6 +286,7 @@ echo "*******FULL-CONTEXT CHAT (FastConformer RNNT, pure - no CTC) - Granary 2.0
     model.encoder.conv_context_size=${CONV_CONTEXT_SIZE} \
     model.encoder.conv_norm_type=${CONV_NORM_TYPE} \
     model.preprocessor.normalize=${NORMALIZE} \
+    model.decoder.prednet.pred_rnn_layers=${PRED_RNN_LAYERS} \
     ++model.joint.chunk_size=${CHAT_CHUNK_SIZE} \
     model.skip_nan_grad=true \
     model.compute_eval_loss=false \
