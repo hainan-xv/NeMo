@@ -791,13 +791,16 @@ class GreedyBatchedRNNTInfer(_GreedyRNNTInfer, WithOptionalCudaGraphs):
 
             inseq = encoder_output  # [B, T, D]
 
-            hypotheses = self._greedy_decode(
-                inseq,
-                logitlen,
-                device=inseq.device,
-                partial_hypotheses=partial_hypotheses,
-                chunk_frame_lengths=chunk_frame_lengths,
-            )
+            # Only forward chunk_frame_lengths when set. Frame-looping / masked /
+            # CUDA-graph backends do not accept this CHAT-only kwarg (passing None
+            # still raises TypeError).
+            decode_kwargs = {
+                "device": inseq.device,
+                "partial_hypotheses": partial_hypotheses,
+            }
+            if chunk_frame_lengths is not None:
+                decode_kwargs["chunk_frame_lengths"] = chunk_frame_lengths
+            hypotheses = self._greedy_decode(inseq, logitlen, **decode_kwargs)
 
             # Pack the hypotheses results
             packed_result = pack_hypotheses(hypotheses, logitlen)
@@ -2622,6 +2625,7 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
         encoder_output: torch.Tensor,
         encoded_lengths: torch.Tensor,
         partial_hypotheses: Optional[List[rnnt_utils.Hypothesis]] = None,
+        chunk_frame_lengths: Optional[torch.Tensor] = None,
     ):
         """Returns a list of hypotheses given an input batch of the encoder hidden embedding.
         Output token is generated auto-regressively.
@@ -2630,10 +2634,14 @@ class GreedyTDTInfer(_GreedyRNNTInfer):
             encoder_output: A tensor of size (batch, features, timesteps).
             encoded_lengths: list of int representing the length of each sequence
                 output sequence.
+            chunk_frame_lengths: accepted for API compatibility with the CHAT decode path;
+                must be None for TDT.
 
         Returns:
             packed list containing batch number of sentences (Hypotheses).
         """
+        if chunk_frame_lengths is not None:
+            raise NotImplementedError("CHAT mode (chunk_frame_lengths) is not supported by GreedyTDTInfer.")
         # Preserve decoder and joint training state
         decoder_training_state = self.decoder.training
         joint_training_state = self.joint.training
@@ -2937,6 +2945,7 @@ class GreedyBatchedTDTInfer(_GreedyRNNTInfer, WithOptionalCudaGraphs):
         encoder_output: torch.Tensor,
         encoded_lengths: torch.Tensor,
         partial_hypotheses: Optional[List[rnnt_utils.Hypothesis]] = None,
+        chunk_frame_lengths: Optional[torch.Tensor] = None,
     ):
         """Returns a list of hypotheses given an input batch of the encoder hidden embedding.
         Output token is generated auto-regressively.
@@ -2945,10 +2954,14 @@ class GreedyBatchedTDTInfer(_GreedyRNNTInfer, WithOptionalCudaGraphs):
             encoder_output: A tensor of size (batch, features, timesteps).
             encoded_lengths: list of int representing the length of each sequence
                 output sequence.
+            chunk_frame_lengths: accepted for API compatibility with the CHAT decode path;
+                must be None for TDT.
 
         Returns:
             packed list containing batch number of sentences (Hypotheses).
         """
+        if chunk_frame_lengths is not None:
+            raise NotImplementedError("CHAT mode (chunk_frame_lengths) is not supported by GreedyBatchedTDTInfer.")
         # Preserve decoder and joint training state
         decoder_training_state = self.decoder.training
         joint_training_state = self.joint.training

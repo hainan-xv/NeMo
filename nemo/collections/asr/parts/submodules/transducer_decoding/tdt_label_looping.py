@@ -319,6 +319,7 @@ class GreedyBatchedTDTLabelLoopingComputer(GreedyBatchedLabelLoopingComputerBase
         encoder_output_length: torch.Tensor,
         prev_batched_state: Optional[BatchedLabelLoopingState] = None,
         multi_biasing_ids: Optional[torch.Tensor] = None,
+        chunk_frame_lengths: Optional[torch.Tensor] = None,
     ) -> tuple[rnnt_utils.BatchedHyps, Optional[rnnt_utils.BatchedAlignments], BatchedLabelLoopingState]:
         """
         Pure PyTorch implementation
@@ -328,7 +329,13 @@ class GreedyBatchedTDTLabelLoopingComputer(GreedyBatchedLabelLoopingComputerBase
             encoder_output_length: lengths of the utterances in `encoder_output`
             prev_batched_state: previous batched decoding state
             multi_biasing_ids: optional tensor [Batch] with ids of multi-biasing models
+            chunk_frame_lengths: accepted for API compatibility with the label-looping base /
+                CHAT RNNT path; must be None for TDT (CHAT joint is not supported here).
         """
+        if chunk_frame_lengths is not None:
+            raise NotImplementedError(
+                "CHAT mode (chunk_frame_lengths) is not supported by TDT label-looping decoding."
+            )
         batch_size, max_time, _unused = encoder_output.shape
         device = encoder_output.device
         self._move_fusion_models_to_device(device=device)
@@ -736,6 +743,7 @@ class GreedyBatchedTDTLabelLoopingComputer(GreedyBatchedLabelLoopingComputerBase
         encoder_output_length: torch.Tensor,
         prev_batched_state: Optional[BatchedLabelLoopingState] = None,
         multi_biasing_ids: Optional[torch.Tensor] = None,
+        chunk_frame_lengths: Optional[torch.Tensor] = None,
     ) -> tuple[rnnt_utils.BatchedHyps, Optional[rnnt_utils.BatchedAlignments], BatchedLabelLoopingState]:
         """
         Implementation with CUDA graphs.
@@ -745,7 +753,13 @@ class GreedyBatchedTDTLabelLoopingComputer(GreedyBatchedLabelLoopingComputerBase
             encoder_output_length: lengths of the utterances in `encoder_output`
             prev_batched_state: previous batched decoding state
             multi_biasing_ids: optional tensor [Batch] with ids of multi-biasing models
+            chunk_frame_lengths: accepted for API compatibility with the label-looping base /
+                CHAT RNNT path; must be None for TDT (CHAT joint is not supported here).
         """
+        if chunk_frame_lengths is not None:
+            raise NotImplementedError(
+                "CHAT mode (chunk_frame_lengths) is not supported by TDT label-looping decoding."
+            )
         assert self.cuda_graphs_mode is not None
         device = encoder_output.device
 
