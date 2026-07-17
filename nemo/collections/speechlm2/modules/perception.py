@@ -21,6 +21,7 @@ from transformers.models.bert.modeling_bert import BertEncoder
 
 from nemo.collections.asr.models import ASRModel
 from nemo.collections.asr.modules.conformer_encoder import ConformerEncoder, ConformerMultiLayerFeatureExtractor
+from nemo.collections.asr.modules.transformer_encoder import StreamingTransformerEncoder
 from nemo.collections.asr.parts.mixins import TranscribeConfig
 from nemo.collections.asr.parts.mixins.streaming import StreamingEncoder
 from nemo.core import Exportable, NeuralModule, typecheck
@@ -192,7 +193,7 @@ class AudioPerceptionModule(NeuralModule, Exportable):
             encoder_emb, encoded_len = self.encoder_multilayer(
                 audio_signal=processed_signal, length=processed_signal_length
             )
-        elif isinstance(self.encoder, ConformerEncoder):
+        elif isinstance(self.encoder, (ConformerEncoder, StreamingTransformerEncoder)):
             if streaming:
                 encoder_outputs = self.encoder.cache_aware_stream_step(
                     processed_signal=processed_signal,

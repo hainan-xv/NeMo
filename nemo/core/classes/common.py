@@ -155,6 +155,16 @@ def _is_target_allowed(target: str) -> bool:
                             return True
             return False
 
+    # ``@experimental`` (and other ``wrapt``-based decorators) replace the target with a
+    # proxy. ``issubclass(proxy, ...)`` in the class checks below raises ``TypeError`` on
+    # such a proxy, which would otherwise reject an otherwise-legitimate decorated target
+    # (e.g. an ``@experimental`` ``nn.Module``). Unwrap to the real object first. This is
+    # gated on genuine ``wrapt`` proxy types — not any object exposing ``__wrapped__`` — and
+    # ``target`` already passed the trusted-prefix allow-list above, so it does not widen
+    # what may be instantiated (the identity checks still run on the unwrapped class).
+    while isinstance(obj, (wrapt.FunctionWrapper, wrapt.ObjectProxy)):
+        obj = obj.__wrapped__
+
     # If it's a class: allow only subclasses of safe bases
     if isinstance(obj, type):
         if target.startswith("nemo.core.config.") and is_dataclass(obj):

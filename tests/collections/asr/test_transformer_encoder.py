@@ -18,9 +18,12 @@ import torch
 
 from nemo.collections.asr.modules.transformer_encoder import (
     FeatureStacking,
+    StreamingTransformerEncoder,
     TransformerEncoder,
     TransformerEncoderConfig,
+    _make_sliding_window_mod,
 )
+from nemo.collections.asr.parts.mixins.streaming import StreamingEncoder
 
 
 class TestTransformerEncoderConfig:
@@ -579,6 +582,27 @@ class TestSelfAttentionModel:
         assert not torch.isnan(out).any()
 
     @pytest.mark.unit
+    def test_base_build_mask_mod_unchanged(self):
+        """The refactored ``_build_mask_mod`` hook must preserve the base full/causal masks."""
+        full = TransformerEncoder(feat_in=80, d_model=64, n_heads=4, n_layers=1, attn_mode="full")
+        causal = TransformerEncoder(feat_in=80, d_model=64, n_heads=4, n_layers=1, attn_mode="causal")
+        length = torch.tensor([4, 4], dtype=torch.int64)
+
+        def allowed(mod, q, kv):
+            return bool(mod(torch.tensor(0), torch.tensor(0), torch.tensor(q), torch.tensor(kv)))
+
+        full_mod = full._build_mask_mod(length)
+        causal_mod = causal._build_mask_mod(length)
+        # Full: any valid (non-pad) key is attendable, including future keys.
+        assert allowed(full_mod, 1, 3)
+        assert allowed(full_mod, 3, 1)
+        # Padding (kv >= length) is masked in both.
+        assert not allowed(full_mod, 1, 4)
+        # Causal: future keys are masked, past/present allowed.
+        assert allowed(causal_mod, 3, 1)
+        assert not allowed(causal_mod, 1, 3)
+
+    @pytest.mark.unit
     def test_rel_pos_broadcasts_when_T_differs_from_n_heads(self):
         """Regression test for the Transformer-XL bias broadcasting.
 
@@ -603,3 +627,282 @@ class TestSelfAttentionModel:
 
         assert out.shape == (B, 64, T // 4)
         assert not torch.isnan(out).any()
+
+
+class TestSlidingWindowMod:
+    """Unit tests for the ``_make_sliding_window_mod`` FlexAttention mask factory."""
+
+    @staticmethod
+    def _allowed(mod, q, kv):
+        return bool(mod(torch.tensor(0), torch.tensor(0), torch.tensor(q), torch.tensor(kv)))
+
+    @pytest.mark.unit
+    def test_bounded_window(self):
+        """left=2, right=1 -> query q attends to kv in [q - 2, q + 1]."""
+        mod = _make_sliding_window_mod(2, 1)
+        assert self._allowed(mod, 5, 3)  # lower edge
+        assert self._allowed(mod, 5, 5)  # self
+        assert self._allowed(mod, 5, 6)  # upper edge (look-ahead)
+        assert not self._allowed(mod, 5, 2)  # beyond left context
+        assert not self._allowed(mod, 5, 7)  # beyond right context
+
+    @pytest.mark.unit
+    def test_unlimited_left_is_causal(self):
+        """left<0, right=0 -> unlimited past, no look-ahead (causal)."""
+        mod = _make_sliding_window_mod(-1, 0)
+        assert self._allowed(mod, 5, 0)  # far past allowed
+        assert self._allowed(mod, 5, 5)  # self allowed
+        assert not self._allowed(mod, 5, 6)  # future masked
+
+    @pytest.mark.unit
+    def test_unlimited_right_only_left_bound(self):
+        """right<0, left=1 -> unlimited future, only one frame of past."""
+        mod = _make_sliding_window_mod(1, -1)
+        assert self._allowed(mod, 5, 4)  # one frame back allowed
+        assert self._allowed(mod, 5, 99)  # far future allowed
+        assert not self._allowed(mod, 5, 3)  # two frames back masked
+
+
+class TestStreamingTransformerEncoder:
+    """Tests for the sliding-window streaming encoder and its cache-aware interface."""
+
+    @pytest.mark.unit
+    def test_satisfies_streaming_encoder_interface(self):
+        enc = StreamingTransformerEncoder(feat_in=80, d_model=64, n_heads=4, n_layers=2)
+        # Must pass the isinstance(encoder, StreamingEncoder) gate in AudioPerceptionModule.
+        assert isinstance(enc, StreamingEncoder)
+        assert isinstance(enc, TransformerEncoder)
+        for method in ("cache_aware_stream_step", "get_initial_cache_state", "setup_streaming_params"):
+            assert callable(getattr(enc, method))
+
+    @pytest.mark.unit
+    def test_streaming_cfg_tracks_att_context(self):
+        """``streaming_cfg`` is (re)built from ``att_context_size`` — the left context sizes the
+        rolling cache; FeatureStacking needs no pre-encode overlap."""
+        enc = StreamingTransformerEncoder(feat_in=80, d_model=64, n_heads=4, n_layers=2, att_context_size=[7, 0])
+        assert enc.streaming_cfg.pre_encode_cache_size == 0
+        assert enc.streaming_cfg.last_channel_cache_size == 7
+        # Retuning the window rebuilds the cfg.
+        enc.set_default_att_context_size([12, 0])
+        assert enc.streaming_cfg.last_channel_cache_size == 12
+
+    @pytest.mark.unit
+    def test_initial_cache_state_shapes(self):
+        """A rolling cache pre-allocates ``left`` frames per layer (padded); ``cache_last_time`` is
+        a zero-width placeholder (no conv) and valid length starts at 0."""
+        d_model, n_layers, left, B = 64, 3, 7, 2
+        enc = StreamingTransformerEncoder(
+            feat_in=80, d_model=d_model, n_heads=4, n_layers=n_layers, att_context_size=[left, 0]
+        )
+        clc, clt, clcl = enc.get_initial_cache_state(batch_size=B)
+        assert clc.shape == (n_layers, B, left, d_model)
+        assert clt.shape == (n_layers, B, 0)
+        assert clcl.shape == (B,)
+        assert clcl.sum().item() == 0
+        # A full cache (left < 0) starts empty and grows.
+        enc.set_default_att_context_size([-1, 0])
+        clc_full, _, _ = enc.get_initial_cache_state(batch_size=B)
+        assert clc_full.shape == (n_layers, B, 0, d_model)
+
+    @pytest.mark.unit
+    def test_default_att_context_size_is_full(self):
+        enc = StreamingTransformerEncoder(feat_in=80, d_model=64, n_heads=4, n_layers=2)
+        assert enc.att_context_size == [-1, -1]
+
+    @pytest.mark.unit
+    def test_set_default_att_context_size(self):
+        enc = StreamingTransformerEncoder(feat_in=80, d_model=64, n_heads=4, n_layers=2, att_context_size=[70, 1])
+        assert enc.att_context_size == [70, 1]
+        # StreamingSTTModel retunes the look-ahead per chunk by reassigning this attribute.
+        enc.set_default_att_context_size([70, 5])
+        assert enc.att_context_size == [70, 5]
+
+    @pytest.mark.unit
+    def test_invalid_att_context_size_raises(self):
+        with pytest.raises(ValueError, match=r"\[left, right\] pair"):
+            StreamingTransformerEncoder(feat_in=80, d_model=64, n_heads=4, n_layers=2, att_context_size=[1, 2, 3])
+
+    @pytest.mark.unit
+    def test_attn_mode_kwarg_is_ignored(self):
+        """Unlike the base (which rejects it), the streaming encoder swallows ``attn_mode``."""
+        enc = StreamingTransformerEncoder(
+            feat_in=80, d_model=64, n_heads=4, n_layers=2, attn_mode="sliding_window", att_context_size=[3, 0]
+        )
+        assert enc.attn_mode == "sliding_window"
+        assert enc.att_context_size == [3, 0]
+
+    @pytest.mark.unit
+    def test_forward_cpu_shape(self):
+        enc = StreamingTransformerEncoder(
+            feat_in=128, d_model=64, n_heads=4, n_layers=2, drop_rate=0.0, att_context_size=[10, 1]
+        )
+        enc.eval()
+
+        B, C, T = 2, 128, 200
+        x = torch.randn(B, C, T)
+        lengths = torch.tensor([T, 160])
+
+        with torch.no_grad():
+            out, out_lengths = enc(audio_signal=x, length=lengths)
+
+        assert out.shape == (B, 64, T // 4)
+        assert out_lengths.tolist() == [T // 4, 160 // 4]
+        assert not torch.isnan(out).any()
+
+    @pytest.mark.unit
+    def test_sliding_window_limits_receptive_field(self):
+        """With a single layer and window [1, 1], output at frame i must be invariant to
+        input changes outside [i - 1, i + 1]. Uses ``bypass_pre_encode`` + ``no_pos`` so
+        frame indices map 1:1 and no positional mixing obscures the receptive field."""
+        B, T, d_model = 1, 8, 64
+        enc = StreamingTransformerEncoder(
+            feat_in=d_model,
+            d_model=d_model,
+            n_heads=4,
+            n_layers=1,
+            drop_rate=0.0,
+            dropout_pre_encoder=0.0,
+            dropout_emb=0.0,
+            self_attention_model="no_pos",
+            att_context_size=[1, 1],
+        )
+        enc.eval()
+
+        x = torch.randn(B, T, d_model)
+        length = torch.tensor([T], dtype=torch.int64)
+        x_perturbed = x.clone()
+        x_perturbed[:, 5, :] = torch.randn(d_model)  # change only frame 5
+
+        with torch.no_grad():
+            out, _ = enc(audio_signal=x, length=length, bypass_pre_encode=True)
+            out_perturbed, _ = enc(audio_signal=x_perturbed, length=length, bypass_pre_encode=True)
+
+        # out is (B, d_model, T). Frame 2's window {1, 2, 3} excludes frame 5 -> unchanged.
+        assert torch.allclose(out[:, :, 2], out_perturbed[:, :, 2], atol=1e-6)
+        # Frame 4's window {3, 4, 5} includes frame 5 -> must change.
+        assert not torch.allclose(out[:, :, 4], out_perturbed[:, :, 4], atol=1e-6)
+
+    @pytest.mark.unit
+    def test_full_window_attends_everywhere(self):
+        """Contrast to the windowed case: att_context_size [-1, -1] is full attention, so a
+        distant perturbation *does* reach every output frame."""
+        B, T, d_model = 1, 8, 64
+        enc = StreamingTransformerEncoder(
+            feat_in=d_model,
+            d_model=d_model,
+            n_heads=4,
+            n_layers=1,
+            drop_rate=0.0,
+            dropout_pre_encoder=0.0,
+            dropout_emb=0.0,
+            self_attention_model="no_pos",
+            att_context_size=[-1, -1],
+        )
+        enc.eval()
+
+        x = torch.randn(B, T, d_model)
+        length = torch.tensor([T], dtype=torch.int64)
+        x_perturbed = x.clone()
+        x_perturbed[:, 5, :] = torch.randn(d_model)
+
+        with torch.no_grad():
+            out, _ = enc(audio_signal=x, length=length, bypass_pre_encode=True)
+            out_perturbed, _ = enc(audio_signal=x_perturbed, length=length, bypass_pre_encode=True)
+
+        assert not torch.allclose(out[:, :, 2], out_perturbed[:, :, 2], atol=1e-6)
+
+    @staticmethod
+    def _stream_sequence(enc, x, chunk_len, n_chunks, batch_size, bypass_pre_encode):
+        """Feed ``x`` through the cache-aware streaming path chunk by chunk and return the
+        concatenated encoder output ``(B, D, T')``. ``x`` is ``(B, T, d_model)`` when
+        ``bypass_pre_encode`` else ``(B, feat_in, T_in)``; ``chunk_len`` is in input frames."""
+        clc, clt, clcl = enc.get_initial_cache_state(batch_size=batch_size, dtype=x.dtype, device=x.device)
+        outs = []
+        for c in range(n_chunks):
+            if bypass_pre_encode:
+                chunk = x[:, c * chunk_len : (c + 1) * chunk_len, :]
+            else:
+                chunk = x[:, :, c * chunk_len : (c + 1) * chunk_len]
+            chunk_frames = chunk.shape[1] if bypass_pre_encode else chunk.shape[2]
+            clen = torch.tensor([chunk_frames] * batch_size, dtype=torch.int64)
+            enc_out, _, clc, clt, clcl = enc.cache_aware_stream_step(
+                processed_signal=chunk,
+                processed_signal_length=clen,
+                cache_last_channel=clc,
+                cache_last_time=clt,
+                cache_last_channel_len=clcl,
+                bypass_pre_encode=bypass_pre_encode,
+            )
+            outs.append(enc_out)
+        return torch.cat(outs, dim=2), clcl
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "sam, left, chunk, n_chunks, batch, bypass",
+        [
+            ("rel_pos", 3, 2, 4, 1, True),  # warm-up: cache fills over several chunks (chunk < left)
+            ("rel_pos", 2, 4, 4, 1, True),  # rolling: chunk > left
+            ("rel_pos", 3, 2, 4, 2, True),  # batched
+            ("no_pos", 3, 2, 4, 1, True),  # no positional encoding
+            ("rel_pos", -1, 2, 4, 1, True),  # full (unbounded) cache
+            ("rel_pos", 3, 2, 4, 1, False),  # with FeatureStacking subsampling (aligned chunks)
+        ],
+    )
+    def test_streaming_matches_full_forward(self, sam, left, chunk, n_chunks, batch, bypass):
+        """The defining guarantee: causal chunk-by-chunk streaming with the KV cache must equal the
+        full-sequence causal forward. Requires ``right == 0`` (a frame never needs a future frame)."""
+        torch.manual_seed(0)
+        d_model, sub, feat_in = 64, 4, 32
+        enc = StreamingTransformerEncoder(
+            feat_in=feat_in if not bypass else d_model,
+            d_model=d_model,
+            n_heads=4,
+            n_layers=2,
+            drop_rate=0.0,
+            dropout_pre_encoder=0.0,
+            dropout_emb=0.0,
+            self_attention_model=sam,
+            subsampling_factor=sub,
+            att_context_size=[left, 0],
+        )
+        enc.eval()
+
+        if bypass:
+            x = torch.randn(batch, chunk * n_chunks, d_model)
+            chunk_len = chunk
+            in_len = x.shape[1]
+        else:
+            # ``chunk`` encoder frames == ``chunk * sub`` input frames; keep chunks aligned to the
+            # subsampling factor so each chunk subsamples independently (matches the full forward).
+            x = torch.randn(batch, feat_in, chunk * sub * n_chunks)
+            chunk_len = chunk * sub
+            in_len = x.shape[2]
+        lengths = torch.tensor([in_len] * batch, dtype=torch.int64)
+
+        with torch.no_grad():
+            full_out, _ = enc(audio_signal=x, length=lengths, bypass_pre_encode=bypass)
+            stream_out, final_valid_len = self._stream_sequence(enc, x, chunk_len, n_chunks, batch, bypass)
+
+        assert stream_out.shape == full_out.shape
+        assert torch.allclose(full_out, stream_out, atol=1e-5)
+        # Valid cache length saturates at ``left`` for a rolling cache (whole utterance for full).
+        expected = chunk * n_chunks if left < 0 else min(chunk * n_chunks, left)
+        assert final_valid_len.tolist() == [expected] * batch
+
+    @pytest.mark.unit
+    def test_streaming_abs_pos_not_implemented(self):
+        """``abs_pos`` streaming is intentionally unsupported (no position offset in the cache)."""
+        enc = StreamingTransformerEncoder(
+            feat_in=64, d_model=64, n_heads=4, n_layers=1, self_attention_model="abs_pos", att_context_size=[3, 0]
+        )
+        enc.eval()
+        clc, clt, clcl = enc.get_initial_cache_state(batch_size=1)
+        with torch.no_grad(), pytest.raises(NotImplementedError, match="Cache-aware streaming"):
+            enc.cache_aware_stream_step(
+                processed_signal=torch.randn(1, 2, 64),
+                processed_signal_length=torch.tensor([2]),
+                cache_last_channel=clc,
+                cache_last_time=clt,
+                cache_last_channel_len=clcl,
+                bypass_pre_encode=True,
+            )

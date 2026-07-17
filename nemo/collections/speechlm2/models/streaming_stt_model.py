@@ -31,6 +31,7 @@ from transformers import AutoModel, GenerationConfig
 from nemo.collections.asr.inference.streaming.buffering.cache_feature_bufferer import BatchedCacheFeatureBufferer
 from nemo.collections.asr.inference.streaming.framing.request import Frame
 from nemo.collections.asr.inference.utils.context_manager import CacheAwareContext
+from nemo.collections.asr.modules.transformer_encoder import StreamingTransformerEncoder
 from nemo.collections.common.data.utils import move_data_to_device
 from nemo.collections.common.tokenizers import AutoTokenizer
 from nemo.collections.speechlm2.data.streaming_stt_dataset import (
@@ -1230,11 +1231,19 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         )
 
     def _set_encoder_att_context(self, chunk_size: Optional[int], recompute_streaming: bool = False) -> None:
-        """Match the Conformer encoder's attention look-ahead to ``chunk_size``.
+        """Match the encoder's attention look-ahead to ``chunk_size``.
 
-        The left context is taken from ``att_context_size[0]`` (fixed) and the
-        right context (look-ahead) is set to ``chunk_size - 1``.  No-op for
-        dynamic (0) / offline (<0) chunking or when ``att_context_size`` is unset.
+        The left context is taken from ``att_context_size[0]`` (fixed). The right context
+        (look-ahead) depends on the encoder:
+
+        - A causal cache-aware encoder (:class:`StreamingTransformerEncoder`) uses **no**
+          look-ahead (``right = 0``). Its rolling KV cache makes chunk-by-chunk streaming exact
+          only when ``right == 0`` (a frame never needs a future frame), and training therefore
+          also uses the ``right = 0`` window so it matches inference.
+        - The Conformer looks ahead to the chunk end (``right = chunk_size - 1``,
+          ``chunked_limited`` style).
+
+        No-op for dynamic (0) / offline (<0) chunking or when ``att_context_size`` is unset.
 
         Note: the encoder's right-context is an architectural look-ahead. In
         dynamic chunking the K-step (``dynamic_chunk_step``) is an FSM-level
@@ -1251,8 +1260,11 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         if chunk_size is None or chunk_size <= 0 or self.core_cfg.att_context_size is None:
             return
         left = int(self.core_cfg.att_context_size[0])
-        new_ctx = [left, int(chunk_size) - 1]
         encoder = self.perception.encoder
+        # Causal cache-aware encoders stream exactly only with no look-ahead; the Conformer
+        # instead looks ahead to the chunk end (chunked_limited style).
+        right = 0 if isinstance(encoder, StreamingTransformerEncoder) else int(chunk_size) - 1
+        new_ctx = [left, right]
         # Set att_context_size directly (rather than set_default_att_context_size)
         # to avoid per-batch "not among supported look-aheads" warnings and to
         # keep att_context_size_all length 1 — otherwise the encoder's training

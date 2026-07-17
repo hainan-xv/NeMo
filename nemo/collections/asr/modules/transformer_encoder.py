@@ -20,6 +20,7 @@ import torch
 import torch.nn as nn
 from torch.nn.attention.flex_attention import and_masks, create_block_mask, flex_attention
 
+from nemo.collections.asr.parts.mixins.streaming import StreamingEncoder
 from nemo.collections.asr.parts.submodules.multi_head_attention import (
     PositionalEncoding,
     RelPositionalEncoding,
@@ -109,6 +110,28 @@ def _make_causal_mod():
         return q_idx >= kv_idx
 
     return causal
+
+
+def _make_sliding_window_mod(left, right):
+    """Sliding-window (local) attention.
+
+    Query ``q_idx`` may attend only to keys within ``[q_idx - left, q_idx + right]``.
+    A negative bound removes the limit on that side (``left < 0`` -> unlimited left
+    context; ``right < 0`` -> unlimited right context / look-ahead). Callers are expected
+    to pass at least one non-negative bound — when both are negative the window is
+    unbounded (full attention) and this mod should be skipped entirely.
+    """
+
+    def sliding_window(b, h, q_idx, kv_idx):
+        # ``left`` / ``right`` are Python ints known at trace time, so these branches are
+        # resolved once when FlexAttention traces the mask, not per element.
+        if left >= 0 and right >= 0:
+            return (kv_idx >= q_idx - left) & (kv_idx <= q_idx + right)
+        if left >= 0:
+            return kv_idx >= q_idx - left
+        return kv_idx <= q_idx + right
+
+    return sliding_window
 
 
 _SUPPORTED_ATTENTION_MODES = ("full", "causal")
@@ -249,6 +272,102 @@ class MultiHeadAttention(nn.Module):
         out = out.transpose(1, 2).contiguous().view(B, T, self.d_model)
         return self.out_proj(out)
 
+    def _apply_streaming_position(self, q, k, pos_emb, num_cur, num_kv):
+        """Positional handling for the cache-aware streaming path — the single extension point.
+
+        Given the current-frame queries ``q`` ``(B, H, num_cur, D)`` and the concatenated
+        ``[cache | current]`` keys ``k`` ``(B, H, num_kv, D)``, apply this attention's
+        positional scheme and return ``(q, k, score_mod)`` for ``flex_attention``.
+
+        The cache stores raw (position-agnostic) layer inputs, so each scheme applies its own
+        transform here over the concatenated span — keeping the cache format scheme-agnostic.
+        This is where a future ``rope`` scheme would rotate ``q``/``k`` by their absolute
+        positions (``pos_offset + local_index``) and return ``score_mod=None``; ``rel_pos``
+        instead leaves ``q``/``k`` in place (folding ``pos_bias_u`` into ``q``) and returns a
+        relative-position ``score_mod``.
+        """
+        if self.self_attention_model == "rel_pos":
+            return self._build_streaming_rel_pos_score_mod(q, pos_emb, num_cur, num_kv)
+        if self.self_attention_model == "no_pos":
+            return q, k, None
+        # abs_pos bakes absolute positions into the embeddings before the blocks, which does
+        # not compose with a running KV cache without a position offset; deferred like rope.
+        raise NotImplementedError(
+            f"Cache-aware streaming is not implemented for self_attention_model="
+            f"'{self.self_attention_model}'. Supported streaming schemes: 'rel_pos', 'no_pos'."
+        )
+
+    def _build_streaming_rel_pos_score_mod(self, q, pos_emb, num_cur, num_kv):
+        """Transformer-XL relative-position ``score_mod`` for the streaming (cached) attention.
+
+        Same (b)+(d) bias and (c) query-rewrite as :meth:`_build_rel_pos_score_mod`, but for a
+        rectangular ``num_cur`` (queries) x ``num_kv`` (keys) block instead of a square one.
+        The concatenated ``[cache | current]`` sequence is positionally contiguous, so key
+        index ``k`` sits at position ``k`` and current-query ``j`` sits at position
+        ``(num_kv - num_cur) + j``; their relative distance maps into the length-``num_kv``
+        ``pos_emb`` (``2*num_kv - 1`` entries, index 0 = most-positive rel-pos) at
+        ``i = num_cur - 1 - j + k``. The bias is gathered directly (no square ``rel_shift``),
+        which keeps it correct for ``num_cur != num_kv`` and easy to generalize.
+
+        Returns ``(q_with_bias_u, k, score_mod)``.
+        """
+        H, D = self.n_heads, self.head_dim
+        device = q.device
+        # pos_emb: (1, 2*num_kv - 1, d_model) -> p: (1, H, 2*num_kv - 1, D)
+        p = self.linear_pos(pos_emb).view(pos_emb.size(0), -1, H, D).transpose(1, 2)
+        bias_u = self.pos_bias_u.view(1, H, 1, D).to(dtype=q.dtype)
+        bias_v = self.pos_bias_v.view(1, H, 1, D).to(dtype=q.dtype)
+        # (b)+(d): (Q + v) @ R^T over all relative-position entries, then gather per (j, k).
+        all_bd = torch.matmul(q + bias_v, p.transpose(-2, -1))  # (B, H, num_cur, 2*num_kv - 1)
+        j = torch.arange(num_cur, device=device).view(num_cur, 1)
+        k = torch.arange(num_kv, device=device).view(1, num_kv)
+        rel_idx = num_cur - 1 - j + k  # (num_cur, num_kv), values in [0, num_cur + num_kv - 2]
+        rows = torch.arange(num_cur, device=device).view(num_cur, 1).expand(num_cur, num_kv)
+        rel_pos_bias = all_bd[:, :, rows, rel_idx] * (D**-0.5)  # (B, H, num_cur, num_kv)
+
+        def score_mod(score, b, h, q_idx, kv_idx):
+            return score + rel_pos_bias[b, h, q_idx, kv_idx]
+
+        # Matrix c: fold u @ K^T into FlexAttention by rewriting Q as (Q + u).
+        return q + bias_u, None, score_mod
+
+    def forward_streaming(self, kv_normed, num_cur, block_mask, pos_emb):
+        """Cache-aware attention: keys/values from the whole ``[cache | current]`` span,
+        queries from the current frames only.
+
+        Args:
+            kv_normed: ``(B, num_kv, d_model)`` layer-normed ``[cache | current]`` inputs, with
+                the current frames as the last ``num_cur`` positions.
+            num_cur: number of current-chunk frames (the query count).
+            block_mask: FlexAttention ``BlockMask`` over ``(num_cur, num_kv)``.
+            pos_emb: relative-position embedding for length ``num_kv`` (``rel_pos`` only).
+
+        Returns:
+            ``(B, num_cur, d_model)`` attention output for the current frames.
+        """
+        B, num_kv, _ = kv_normed.shape
+        H, D = self.n_heads, self.head_dim
+
+        # One fused projection over the concatenated span; slice Q to the current frames.
+        # ``w_qkv`` is linear, so ``q_all[:, :, -num_cur:]`` equals projecting only the current
+        # frames, while K/V cover cache + current.
+        qkv = self.w_qkv(kv_normed).view(B, num_kv, 3, H, D).permute(2, 0, 3, 1, 4)
+        q_all, k, v = qkv.unbind(0)
+        q = q_all[:, :, num_kv - num_cur :, :]
+
+        if self.qk_norm:
+            q = self.q_norm(q).to(v.dtype)
+            k = self.k_norm(k).to(v.dtype)
+
+        q, k_mod, score_mod = self._apply_streaming_position(q, k, pos_emb, num_cur, num_kv)
+        if k_mod is not None:
+            k = k_mod
+
+        attn_fn = flex_attention_compiled if q.is_cuda else flex_attention
+        out = attn_fn(q, k, v, block_mask=block_mask, score_mod=score_mod)
+        out = out.transpose(1, 2).contiguous().view(B, num_cur, self.d_model)
+        return self.out_proj(out)
+
 
 class TransformerBlock(nn.Module):
     def __init__(self, cfg: TransformerEncoderConfig):
@@ -263,6 +382,39 @@ class TransformerBlock(nn.Module):
         x = x + self.drop(self.attn(self.norm1(x), block_mask=block_mask, pos_emb=pos_emb))
         x = x + self.drop(self.ffn(self.norm2(x)))
         return x
+
+    def forward_streaming(self, x_cur, cache_in, block_mask, pos_emb, left):
+        """Cache-aware streaming forward for one chunk.
+
+        Args:
+            x_cur: ``(B, C, d_model)`` current-chunk layer input (pre-norm residual stream).
+            cache_in: ``(B, L, d_model)`` cached layer inputs from previous chunks (padded to
+                ``L``; validity is enforced by ``block_mask``).
+            block_mask: FlexAttention ``BlockMask`` over ``(C, L + C)``.
+            pos_emb: relative-position embedding for length ``L + C`` (``rel_pos`` only).
+            left: rolling-cache size in frames (``left >= 0``), or ``< 0`` to grow the cache
+                unbounded (full cache). Determines how many layer-input frames to retain.
+
+        Returns:
+            ``(x_out, new_cache)`` — the current-chunk output ``(B, C, d_model)`` and this
+            layer's updated input cache.
+        """
+        C = x_cur.shape[1]
+        # K/V source is the layer input over [cache | current]; Q is the current frames only.
+        # LayerNorm is position-wise, so norm1([cache | cur]) == [norm1(cache) | norm1(cur)].
+        kv_in = torch.cat([cache_in, x_cur], dim=1)
+        attn_out = self.attn.forward_streaming(self.norm1(kv_in), C, block_mask, pos_emb)
+        x = x_cur + self.drop(attn_out)
+        x = x + self.drop(self.ffn(self.norm2(x)))
+        # Update cache with this layer's *inputs* (kv_in), keeping the last ``left`` frames
+        # (rolling) or all of them (full cache when left < 0). ``left == 0`` keeps nothing.
+        if left < 0:
+            new_cache = kv_in
+        elif left == 0:
+            new_cache = kv_in[:, :0]
+        else:
+            new_cache = kv_in[:, -left:]
+        return x, new_cache
 
 
 @experimental
@@ -517,10 +669,7 @@ class TransformerEncoder(nn.Module):
         x = self.embed_norm(x)
 
         B, T, _ = x.shape
-        if self.attn_mode == "causal":
-            mask_mod = and_masks(_make_causal_mod(), _make_padding_mod(length))
-        else:
-            mask_mod = _make_padding_mod(length)
+        mask_mod = self._build_mask_mod(length)
         block_mask = create_block_mask(mask_mod, B=B, H=1, Q_LEN=T, KV_LEN=T, device=x.device)
         # For ``abs_pos`` the positional information is already baked into ``x``, so we don't
         # need to thread ``pos_emb`` through each layer; only ``rel_pos`` consumes it.
@@ -534,6 +683,21 @@ class TransformerEncoder(nn.Module):
         x = x.transpose(1, 2)  # (B, T, D) -> (B, D, T)
         length = length.to(dtype=torch.int64)
         return x, length
+
+    def _build_mask_mod(self, length):
+        """Build the FlexAttention ``mask_mod`` shared by every layer in this forward.
+
+        Returns a callable ``(b, h, q_idx, kv_idx) -> bool`` that selects which keys each
+        query may attend to. The base encoder supports padding-only masking (``attn_mode
+        == "full"``) and additionally causal masking (``attn_mode == "causal"``). Subclasses
+        (e.g. :class:`StreamingTransformerEncoder`) override this to inject other attention
+        patterns such as a sliding window; the single overridable hook keeps
+        ``forward_internal`` agnostic to the masking scheme.
+        """
+        pad_mod = _make_padding_mod(length)
+        if self.attn_mode == "causal":
+            return and_masks(_make_causal_mod(), pad_mod)
+        return pad_mod
 
     def update_max_seq_length(self, seq_length: int, device):
         """
@@ -565,3 +729,222 @@ class TransformerEncoder(nn.Module):
 
     def unfreeze(self, partial: bool = False) -> None:
         unfreeze(self, partial=partial)
+
+
+@dataclass
+class _StreamingTransformerCfg:
+    """Cache-aware streaming config read by ``StreamingSTTModel`` / ``AudioPerceptionModule``.
+
+    ``pre_encode_cache_size = 0``: ``FeatureStacking`` subsampling is non-overlapping, so no
+    input-feature overlap is required between chunks (chunks must align to
+    ``subsampling_factor``). ``last_channel_cache_size``: rolling attention-cache size in encoder
+    frames (= left context); ``< 0`` denotes an unbounded (full) cache that grows with the stream.
+    """
+
+    pre_encode_cache_size: int = 0
+    last_channel_cache_size: int = 0
+
+
+@experimental
+class StreamingTransformerEncoder(TransformerEncoder, StreamingEncoder):
+    """``TransformerEncoder`` with sliding-window attention and cache-aware streaming.
+
+    Adds two things on top of the base FlexAttention :class:`TransformerEncoder`:
+
+    1. **Sliding-window (local) attention** — a bounded ``[left, right]`` window (in encoder
+       frames) in the full-sequence (training) forward, so each frame attends to only ``left``
+       past and ``right`` future frames.
+    2. **Cache-aware streaming** — a rolling KV cache of the last ``left`` layer-input frames, so
+       chunked inference reproduces the full causal forward without re-encoding history. Implements
+       the real :class:`StreamingEncoder` interface consumed by ``StreamingSTTModel`` /
+       ``AudioPerceptionModule`` (``cache_aware_stream_step`` / ``get_initial_cache_state`` /
+       ``setup_streaming_params``), reusing the Conformer ``cache_last_channel`` cache plumbing.
+
+    Streaming is **exact** for a causal window (``right == 0``): a frame never needs a future
+    frame, so a rolling cache of ``left`` past frames suffices and chunk-by-chunk streaming matches
+    the full forward. With ``right > 0`` the current chunk still supplies in-chunk look-ahead, but
+    frames near a chunk boundary lose the look-ahead that crossed it in training — use
+    ``att_context_size=[chunk_size, 0]`` for exact causal streaming.
+
+    The cache stores raw (position-agnostic) per-layer inputs; the positional scheme is applied per
+    step in :meth:`MultiHeadAttention._apply_streaming_position`, so a future ``rope`` scheme drops
+    in without changing the cache format. Streaming currently supports ``rel_pos`` and ``no_pos``.
+
+    Args:
+        att_context_size: ``[left, right]`` window in encoder (post-subsampling) frames. ``left``
+            also sets the rolling-cache size; ``left < 0`` uses an unbounded (full) cache that grows
+            with the stream (bounded memory only for finite ``left``). ``right`` should be ``0`` for
+            exact causal streaming. Default ``(-1, -1)`` is full bidirectional attention (no
+            streaming benefit — set a finite causal window to stream).
+        *args, **kwargs: Forwarded to :class:`TransformerEncoder` (``attn_mode`` is managed
+            internally and ignored).
+    """
+
+    def __init__(self, *args, att_context_size=(-1, -1), **kwargs):
+        # This encoder's attention pattern is governed by ``att_context_size``; drop any
+        # caller-provided ``attn_mode`` so it never reaches (and fails) the base's
+        # supported-mode validation, then run the base with a valid placeholder mode.
+        kwargs.pop("attn_mode", None)
+        super().__init__(*args, attn_mode="full", **kwargs)
+        self.streaming_cfg = None
+        self.set_default_att_context_size(att_context_size)
+        # Purely a label for introspection/logging: ``_build_mask_mod`` below fully
+        # overrides the base's mask selection, so ``attn_mode`` is never consulted here.
+        self.attn_mode = "sliding_window"
+
+    def set_default_att_context_size(self, att_context_size) -> None:
+        """Set the ``[left, right]`` attention window (in encoder frames) and refresh streaming cfg.
+
+        A negative bound means unlimited context on that side. Named to mirror
+        ``ConformerEncoder.set_default_att_context_size`` so streaming inference code that calls this
+        method works uniformly across encoder types.
+        """
+        if len(att_context_size) != 2:
+            raise ValueError(f"att_context_size must be a [left, right] pair, but got {att_context_size}.")
+        self.att_context_size = list(att_context_size)
+        self.setup_streaming_params()
+
+    def _build_mask_mod(self, length):
+        left, right = self.att_context_size
+        pad_mod = _make_padding_mod(length)
+        if left < 0 and right < 0:
+            # Unbounded on both sides -> full (padding-only) attention.
+            return pad_mod
+        return and_masks(_make_sliding_window_mod(left, right), pad_mod)
+
+    # ------------------------------------------------------------------ #
+    # Cache-aware streaming interface (StreamingEncoder)
+    # ------------------------------------------------------------------ #
+    def setup_streaming_params(self, **kwargs) -> None:
+        """(Re)build ``streaming_cfg`` from the current ``att_context_size``.
+
+        The rolling attention cache holds ``left`` frames; ``FeatureStacking`` subsampling is
+        non-overlapping so no pre-encode overlap is needed (``pre_encode_cache_size = 0``).
+        """
+        self.streaming_cfg = _StreamingTransformerCfg(
+            pre_encode_cache_size=0,
+            last_channel_cache_size=self.att_context_size[0],
+        )
+
+    def get_initial_cache_state(self, batch_size=1, dtype=None, device=None, max_dim=0):
+        """Empty KV cache. ``cache_last_channel`` is ``(n_layers, B, cache_size, d_model)`` of
+        per-layer inputs (padded to ``left`` for a rolling cache; length ``0`` — grows — for a full
+        cache or ``left == 0``). ``cache_last_time`` is an unused zero-width placeholder (no conv)."""
+        if dtype is None:
+            dtype = next(self.parameters()).dtype
+        if device is None:
+            device = next(self.parameters()).device
+        left = self.att_context_size[0]
+        cache_size = left if left > 0 else 0
+        cache_last_channel = torch.zeros(
+            self.n_layers, batch_size, cache_size, self.d_model, dtype=dtype, device=device
+        )
+        cache_last_time = torch.zeros(self.n_layers, batch_size, 0, dtype=dtype, device=device)
+        cache_last_channel_len = torch.zeros(batch_size, dtype=torch.int64, device=device)
+        return cache_last_channel, cache_last_time, cache_last_channel_len
+
+    def cache_aware_stream_step(
+        self,
+        processed_signal,
+        processed_signal_length=None,
+        cache_last_channel=None,
+        cache_last_time=None,
+        cache_last_channel_len=None,
+        keep_all_outputs=True,
+        drop_extra_pre_encoded=None,
+        bypass_pre_encode=False,
+    ):
+        """Encode one chunk with the rolling KV cache. Returns the Conformer-compatible 5-tuple
+        ``(encoded, encoded_len, cache_last_channel, cache_last_time, cache_last_channel_len)``."""
+        encoded, encoded_len, new_cache_last_channel, new_cache_last_channel_len = self._streaming_step(
+            processed_signal, processed_signal_length, cache_last_channel, cache_last_channel_len, bypass_pre_encode
+        )
+        # This (convolution-free) encoder has no time cache; pass ``cache_last_time`` through as-is.
+        return encoded, encoded_len, new_cache_last_channel, cache_last_time, new_cache_last_channel_len
+
+    def _streaming_step(self, audio_signal, length, cache_last_channel, cache_last_channel_len, bypass_pre_encode):
+        # 1. Pre-encode (subsample) the current chunk. FeatureStacking is non-overlapping, so a
+        #    chunk aligned to ``subsampling_factor`` subsamples independently and matches the full
+        #    forward exactly (no pre-encode cache needed).
+        if length is None:
+            length = audio_signal.new_full(
+                (audio_signal.size(0),),
+                audio_signal.size(1) if bypass_pre_encode else audio_signal.size(-1),
+                dtype=torch.int64,
+                device=audio_signal.device,
+            )
+        if not bypass_pre_encode:
+            if isinstance(self.pre_encode, FeatureStacking):
+                x, length = self.pre_encode(audio_signal, length)
+            else:
+                x = torch.transpose(audio_signal, 1, 2)
+            if isinstance(self.pre_encode, nn.Linear):
+                x = self.pre_encode(x)
+            elif not isinstance(self.pre_encode, FeatureStacking):
+                x, length = self.pre_encode(x=x, lengths=length)
+        else:
+            x = audio_signal
+        length = length.to(torch.int64)
+
+        B, C, _ = x.shape
+        if cache_last_channel is None:
+            cache_last_channel, _, cache_last_channel_len = self.get_initial_cache_state(
+                batch_size=B, dtype=x.dtype, device=x.device
+            )
+        left, right = self.att_context_size
+        L = cache_last_channel.shape[2]  # padded cache size (== left for rolling; grows for full)
+        num_kv = L + C
+
+        # 2. Positional prep (once). Apply xscale to the current chunk via pos_enc; the length-C
+        #    pos_emb it returns is discarded — the streaming attention needs pos_emb for ``num_kv``.
+        if self.pos_enc is not None:
+            self.update_max_seq_length(seq_length=num_kv, device=x.device)
+            x, _ = self.pos_enc(x=x)
+        x = self.embed_norm(x)
+        pos_emb = self._streaming_pos_emb(num_kv, x) if self.self_attention_model == "rel_pos" else None
+
+        # 3. Streaming layers with the shared block mask; collect each layer's updated cache.
+        block_mask = self._build_streaming_block_mask(cache_last_channel_len, length, L, C, left, right, x.device)
+        new_caches = []
+        for i, layer in enumerate(self.layers):
+            x, new_cache_l = layer.forward_streaming(x, cache_last_channel[i], block_mask, pos_emb, left)
+            new_caches.append(new_cache_l)
+        new_cache_last_channel = torch.stack(new_caches, dim=0)
+
+        x = self.final_norm(x)
+        if self.out_proj is not None:
+            x = self.out_proj(x)
+        x = x.transpose(1, 2)  # (B, C, D) -> (B, D, C)
+
+        new_cache_len = cache_last_channel_len + length
+        if left >= 0:
+            new_cache_len = torch.clamp(new_cache_len, max=left)
+        return x, length, new_cache_last_channel, new_cache_len.to(torch.int64)
+
+    def _streaming_pos_emb(self, num_kv, ref):
+        """Relative-position embedding ``(1, 2*num_kv - 1, d_model)`` for the concatenated
+        ``[cache | current]`` span. ``RelPositionalEncoding.forward`` returns ``(scaled_x, pos_emb)``;
+        feed a zero dummy of length ``num_kv`` and keep only ``pos_emb`` (deterministic in eval)."""
+        dummy = ref.new_zeros(1, num_kv, self.d_model)
+        _, pos_emb = self.pos_enc(x=dummy)
+        return pos_emb
+
+    def _build_streaming_block_mask(self, cache_valid_len, cur_len, L, C, left, right, device):
+        """FlexAttention block mask over ``(C, L + C)`` for the cache-aware step.
+
+        The ``[cache | current]`` sequence is positionally contiguous: key index ``k`` sits at
+        position ``k`` and current-query ``j`` at position ``L + j``. Valid keys are the last
+        ``cache_valid_len`` cache frames (right-aligned in ``[0, L)``) plus the first ``cur_len``
+        current frames, intersected with the ``[left, right]`` window around each query.
+        """
+        num_kv = L + C
+
+        def mask_mod(b, h, q_idx, kv_idx):
+            ok = (kv_idx >= L - cache_valid_len[b]) & (kv_idx < L + cur_len[b])
+            if right >= 0:
+                ok = ok & (kv_idx <= q_idx + L + right)
+            if left >= 0:
+                ok = ok & (kv_idx >= q_idx + L - left)
+            return ok
+
+        return create_block_mask(mask_mod, B=cache_valid_len.shape[0], H=1, Q_LEN=C, KV_LEN=num_kv, device=device)
