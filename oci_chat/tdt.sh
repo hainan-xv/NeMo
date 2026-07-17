@@ -2,7 +2,7 @@
 #SBATCH -A nemotron_speechprod_asr
 #SBATCH -J nemotron_speechprod_asr:tdt-parakeet06bv2-g2
 #SBATCH -p batch_block1,batch_block3,batch_block4
-#SBATCH -N 8
+#SBATCH -N 4
 #SBATCH --gpus-per-node=8
 #SBATCH -t 04:00:00            # wall time
 #SBATCH --time-min 04:00:00
@@ -16,6 +16,10 @@
 # ============================================================================
 # OCI launcher to REPRODUCE parakeet-tdt-0.6b-v2 and continue training on
 # Granary v2.0.
+#
+# Default -N 4 (32 GPUs): fine-tuning from a strong checkpoint does not need
+# 64 GPUs, and fewer nodes reduces AIS/lustre contention + idle-GPU risk.
+# Override with: sbatch -N 8 oci_chat/tdt.sh
 #
 # This is a plain offline (full-context) FastConformer-XL TDT model
 # (EncDecRNNTBPEModel with the TDT loss), NOT a CHAT/streaming model. It is used
@@ -102,6 +106,12 @@ MAX_DURATION="${MAX_DURATION:-20.0}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-16}"
 SAVE_TOP_K="${SAVE_TOP_K:-5}"
 PRECISION="${PRECISION:-bf16-mixed}"
+# DataLoader workers per rank. Granary audio is served over AIS; too few workers
+# leaves GPUs waiting and triggers cluster "idle GPU" alerts even while W&B
+# still shows loss moving (steps are just slow / bursty).
+NUM_WORKERS="${NUM_WORKERS:-8}"
+# Batch AIS audio fetch (Lhotse>=1.32). Big win vs per-cut HTTP GETs.
+USE_AIS_GET_BATCH="${USE_AIS_GET_BATCH:-true}"
 # TDT loss reduction: mean_volume | mean_batch | sum | mean.
 RNNT_REDUCTION="${RNNT_REDUCTION:-mean_volume}"
 # IMPORTANT: parakeet-tdt uses batch_norm in the encoder. Lightning `bf16`
@@ -189,7 +199,8 @@ echo "*******REPRODUCE parakeet-tdt-0.6b-v2 (offline FastConformer TDT) - Granar
 && echo "*** TOKENIZER: /tokenizers (extracted from the parakeet .nemo) ***" \
 && echo "*** PRECISION: ${PRECISION} (use bf16-mixed/32 with batch_norm; bf16-true often -> Inf) ***" \
 && echo "*** DATA: Granary 2.0 pre-aligned (lhotse) -> ${TRAIN_INPUT_CFG} ***" \
-&& nvidia-smi \
+&& echo "*** RANK DIAG: SLURM_PROCID=\${SLURM_PROCID:-?} SLURM_LOCALID=\${SLURM_LOCALID:-?} SLURM_NTASKS=\${SLURM_NTASKS:-?} CUDA_VISIBLE_DEVICES=\${CUDA_VISIBLE_DEVICES:-?} ***" \
+&& nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used --format=csv,noheader \
 && export WANDB_API_KEY=${WANDB} \
 && cd /code \
 && git rev-parse HEAD \
@@ -203,7 +214,8 @@ echo "*******REPRODUCE parakeet-tdt-0.6b-v2 (offline FastConformer TDT) - Granar
 && export TOKENIZERS_PARALLELISM=false \
 && export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 && export LHOTSE_AUDIO_DURATION_MISMATCH_TOLERANCE=0.3 \
-&& export TMPDIR=${OCI_TMP_DIR} && mkdir -p ${OCI_TMP_DIR} && echo "staging TMPDIR=\$TMPDIR" \
+&& export USE_AIS_GET_BATCH=${USE_AIS_GET_BATCH} \
+&& export TMPDIR=${OCI_TMP_DIR} && mkdir -p ${OCI_TMP_DIR} && echo "staging TMPDIR=\$TMPDIR USE_AIS_GET_BATCH=\$USE_AIS_GET_BATCH" \
 && export AIS_ENDPOINT=http://asr.iad.oci.aistore.nvidia.com:51080 \
 && export AIS_AUTHN_TOKEN="${AIS_AUTHN_TOKEN}" \
 && export NEMO_DATA_STORE_CACHE_DIR=/lustre/fsw/portfolios/llmservice/users/heh/nemo_cache \
@@ -228,12 +240,12 @@ echo "*******REPRODUCE parakeet-tdt-0.6b-v2 (offline FastConformer TDT) - Granar
     ++model.train_ds.text_field=text \
     ++model.joint.num_extra_outputs=5 \
     model.train_ds.max_duration=${MAX_DURATION} \
-    model.train_ds.num_workers=4 \
+    model.train_ds.num_workers=${NUM_WORKERS} \
     model.train_ds.shuffle=true \
     model.train_ds.pin_memory=true \
     model.validation_ds.manifest_filepath=${VAL_MANIFEST} \
     model.validation_ds.batch_size=${EVAL_BATCH_SIZE} \
-    model.validation_ds.num_workers=4 \
+    model.validation_ds.num_workers=${NUM_WORKERS} \
     model.validation_ds.pin_memory=true \
     ++model.validation_ds.use_start_end_token=false \
     model.tokenizer.dir="/tokenizers" \
