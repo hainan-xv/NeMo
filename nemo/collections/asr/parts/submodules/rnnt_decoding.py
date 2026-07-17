@@ -715,7 +715,9 @@ class AbstractRNNTDecoding(ConfidenceMixin):
                 List of best hypotheses
                     Look at rnnt_utils.Hypothesis for more information.
         """
-        # CHAT mode: chunk encoder output for cross-attention decoding
+        # CHAT mode: chunk encoder output for cross-attention decoding.
+        # Only pass chunk_frame_lengths when the joint actually provides it —
+        # TDT / plain RNNT greedy decoders do not accept this kwarg.
         chunk_frame_lengths = None
         chunk_encoder_fn = getattr(self.joint, 'chunk_encoder_for_decoding', None)
         if chunk_encoder_fn is not None:
@@ -723,12 +725,14 @@ class AbstractRNNTDecoding(ConfidenceMixin):
 
         # Compute hypotheses
         with torch.inference_mode():
-            hypotheses_list = self.decoding(
-                encoder_output=encoder_output,
-                encoded_lengths=encoded_lengths,
-                partial_hypotheses=partial_hypotheses,
-                chunk_frame_lengths=chunk_frame_lengths,
-            )  # type: [List[Hypothesis]]
+            decoding_kwargs = {
+                "encoder_output": encoder_output,
+                "encoded_lengths": encoded_lengths,
+                "partial_hypotheses": partial_hypotheses,
+            }
+            if chunk_frame_lengths is not None:
+                decoding_kwargs["chunk_frame_lengths"] = chunk_frame_lengths
+            hypotheses_list = self.decoding(**decoding_kwargs)  # type: [List[Hypothesis]]
 
             # extract the hypotheses
             hypotheses_list = hypotheses_list[0]  # type: List[Hypothesis]
