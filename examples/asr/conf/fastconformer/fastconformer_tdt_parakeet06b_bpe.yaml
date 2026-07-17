@@ -39,7 +39,9 @@ model:
     pin_memory: true
     max_duration: 40.0
     min_duration: 0.1
-    text_field: answer
+    # Granary / ASR manifests use "text". "answer" is for AED/SpeechLM-style data
+    # and would yield empty transcripts (Inf mean_volume loss) if used here.
+    text_field: text
     is_tarred: false
     tarred_audio_filepaths: null
     shuffle_n: 2048
@@ -157,7 +159,9 @@ model:
       activation: "relu"
       dropout: 0.2
     # TDT: extra duration logits in addition to the token logits.
-    num_extra_outputs: ${model.model_defaults.num_tdt_durations}
+    # Keep this a concrete int (not only an interpolation) so joint out-dim is
+    # guaranteed to be V+1+5=1030 and pretrained joint.joint_net.2 can load.
+    num_extra_outputs: 5
 
   decoding:
     # Greedy(-batch) decoding is recommended for TDT models.

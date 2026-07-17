@@ -101,9 +101,12 @@ NUM_BUCKETS="${NUM_BUCKETS:-30}"
 MAX_DURATION="${MAX_DURATION:-20.0}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-16}"
 SAVE_TOP_K="${SAVE_TOP_K:-5}"
-PRECISION="${PRECISION:-bf16}"
+PRECISION="${PRECISION:-bf16-mixed}"
 # TDT loss reduction: mean_volume | mean_batch | sum | mean.
 RNNT_REDUCTION="${RNNT_REDUCTION:-mean_volume}"
+# IMPORTANT: parakeet-tdt uses batch_norm in the encoder. Lightning `bf16`
+# (bf16-true) casts BN to bf16 and commonly produces Inf loss at step 0.
+# Use bf16-mixed (or 32) instead. Override with PRECISION=32 if needed.
 
 # ---------------------------------------------------------------------------
 # Warm-start: the FULL parakeet-tdt-0.6b-v2 model (encoder + decoder + joint)
@@ -149,7 +152,7 @@ TRAIN_INPUT_CFG="${TRAIN_INPUT_CFG:-$GRANARY2_CFG}"
 # English dev set (same as the SpeechLM baseline / CHAT launchers).
 VAL_MANIFEST="${VAL_MANIFEST:-[/data/canary/canary_v0/manifests/data/ASR/MMLPC/en/val_test/mcv11/mcv11_dev_clean_pcstrip_en_2k.json]}"
 
-EXP_NAME="${EXP_NAME:-${CLUSTER}_tdt_parakeet06bv2_g2_lr${LR}_n${SLURM_JOB_NUM_NODES}}"
+EXP_NAME="${EXP_NAME:-${CLUSTER}_tdt_parakeet06bv2_g2_lr${LR}_${PRECISION}_n${SLURM_JOB_NUM_NODES}}"
 
 # Write-heavy outputs (results/checkpoints, HF cache, checkpoint temp) go to the
 # nemotron project, which has free quota. Override with OUTPUT_PREFIX.
@@ -184,6 +187,7 @@ echo "*******REPRODUCE parakeet-tdt-0.6b-v2 (offline FastConformer TDT) - Granar
 && echo "*** CONFIG: ${CONFIG_NAME} (arch mirrors parakeet-tdt-0.6b-v2) ***" \
 && echo "*** INIT: ${PARAKEET_NEMO_CONTAINER} (FULL model: encoder+decoder+joint) ***" \
 && echo "*** TOKENIZER: /tokenizers (extracted from the parakeet .nemo) ***" \
+&& echo "*** PRECISION: ${PRECISION} (use bf16-mixed/32 with batch_norm; bf16-true often -> Inf) ***" \
 && echo "*** DATA: Granary 2.0 pre-aligned (lhotse) -> ${TRAIN_INPUT_CFG} ***" \
 && nvidia-smi \
 && export WANDB_API_KEY=${WANDB} \
@@ -221,6 +225,8 @@ echo "*******REPRODUCE parakeet-tdt-0.6b-v2 (offline FastConformer TDT) - Granar
     ++model.train_ds.use_bucketing=true \
     ++model.train_ds.num_buckets=${NUM_BUCKETS} \
     ++model.train_ds.use_start_end_token=false \
+    ++model.train_ds.text_field=text \
+    ++model.joint.num_extra_outputs=5 \
     model.train_ds.max_duration=${MAX_DURATION} \
     model.train_ds.num_workers=4 \
     model.train_ds.shuffle=true \
