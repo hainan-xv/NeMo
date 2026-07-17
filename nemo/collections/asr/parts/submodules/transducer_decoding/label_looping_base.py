@@ -311,18 +311,22 @@ class GreedyBatchedLabelLoopingComputerBase(WithOptionalCudaGraphs, ABC):
                 # disable CUDA graphs if Mixed Precision is used due to incorrect behavior
                 with torch.amp.autocast(device_type="cuda", enabled=False):
                     # TODO(vbataev): fix issue with mixed precision, remove this restriction
+                    # Do not pass chunk_frame_lengths=None: TDT impls do not accept this kwarg.
                     return self.cuda_graphs_impl(
                         encoder_output=x,
                         encoder_output_length=out_len,
                         prev_batched_state=prev_batched_state,
                         multi_biasing_ids=multi_biasing_ids,
-                        chunk_frame_lengths=chunk_frame_lengths,
                     )
 
-        return self.torch_impl(
-            encoder_output=x,
-            encoder_output_length=out_len,
-            prev_batched_state=prev_batched_state,
-            multi_biasing_ids=multi_biasing_ids,
-            chunk_frame_lengths=chunk_frame_lengths,
-        )
+        # Only forward chunk_frame_lengths when present. TDT's torch_impl does not
+        # accept this CHAT-only kwarg (passing None still raises TypeError).
+        torch_kwargs = {
+            "encoder_output": x,
+            "encoder_output_length": out_len,
+            "prev_batched_state": prev_batched_state,
+            "multi_biasing_ids": multi_biasing_ids,
+        }
+        if chunk_frame_lengths is not None:
+            torch_kwargs["chunk_frame_lengths"] = chunk_frame_lengths
+        return self.torch_impl(**torch_kwargs)
