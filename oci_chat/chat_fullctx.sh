@@ -115,6 +115,10 @@ LIMIT_TRAIN_BATCHES="${LIMIT_TRAIN_BATCHES:-6000}"
 EVALS_PER_EPOCH="${EVALS_PER_EPOCH:-1}"
 VAL_CHECK_INTERVAL=$(( LIMIT_TRAIN_BATCHES / EVALS_PER_EPOCH ))
 # Continuing from a strong checkpoint -> modest peak LR + warmup (same as tdt.sh).
+# NOTE: the CHAT streaming config uses NoamAnnealing (where `lr` is only a
+# multiplier: eff_lr = lr * d_model^-0.5 * min(step^-0.5, step*warmup^-1.5),
+# so lr=1e-4 -> peak ~4e-8). We override the scheduler to CosineAnnealing below
+# (matching tdt.sh) so LR here is the *actual* peak LR.
 LR="${LR:-1e-4}"
 WARMUP_STEPS="${WARMUP_STEPS:-5000}"
 BATCH_DURATION="${BATCH_DURATION:-120}"
@@ -313,6 +317,8 @@ echo "*******FULL-CONTEXT CHAT (FastConformer RNNT, pure - no CTC) - Granary 2.0
     model.tokenizer.dir="/tokenizers" \
     model.tokenizer.type=bpe \
     model.optim.lr=${LR} \
+    model.optim.sched.name=CosineAnnealing \
+    ~model.optim.sched.d_model \
     model.optim.sched.warmup_steps=${WARMUP_STEPS} \
     ++trainer.use_distributed_sampler=false \
     ++trainer.limit_train_batches=${LIMIT_TRAIN_BATCHES} \
