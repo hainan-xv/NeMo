@@ -1213,6 +1213,16 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         encoded = outputs.pop('encoded')
         encoded_len = outputs.pop('encoded_len')
 
+        # Chunked-Aligner uses its own chunked greedy decoder, which returns
+        # (texts, token_ids) instead of the standard RNN-T hypotheses.
+        if getattr(self, 'loss_type', 'rnnt') == 'chunked_aligner':
+            texts, token_ids = self.decoding.decode_encoder_output(encoded, encoded_len)
+            del encoded, encoded_len
+            return [
+                Hypothesis(score=0.0, y_sequence=torch.tensor(ids, dtype=torch.long), text=text)
+                for text, ids in zip(texts, token_ids)
+            ]
+
         hyp = self.decoding.rnnt_decoder_predictions_tensor(
             encoded,
             encoded_len,
