@@ -88,15 +88,6 @@ CHUNK_SIZE="${CHUNK_SIZE:-8}"
 # Chunked-aligner loss reduction: mean_volume | mean_batch | sum | mean.
 CA_REDUCTION="${CA_REDUCTION:-mean_volume}"
 
-# Stochastic AR/NAR training (HAINAN decoder masking): probability of zeroing the
-# decoder (prediction-net) contribution to the joint, independently per output
-# position u, during TRAINING only. -1.0 disables it (pure AR); e.g. 0.5 yields a
-# stochastically autoregressive / non-autoregressive model. Inference is unchanged
-# (standard AR chunked greedy decode).
-MASKING_PROB="${MASKING_PROB:--1.0}"
-# Tag the experiment name when decoder masking is on.
-MASK_TAG="$(awk -v p="${MASKING_PROB}" 'BEGIN{ if (p+0 > 0) printf "_mask%s", p }')"
-
 MAX_STEPS="${MAX_STEPS:-500000}"
 LIMIT_TRAIN_BATCHES="${LIMIT_TRAIN_BATCHES:-6000}"
 EVALS_PER_EPOCH="${EVALS_PER_EPOCH:-1}"
@@ -165,7 +156,7 @@ TRAIN_INPUT_CFG="${TRAIN_INPUT_CFG:-$GRANARY2_CFG}"
 # English dev set (same as the SpeechLM baseline / CHAT launchers).
 VAL_MANIFEST="${VAL_MANIFEST:-[/data/canary/canary_v0/manifests/data/ASR/MMLPC/en/val_test/mcv11/mcv11_dev_clean_pcstrip_en_2k.json]}"
 
-EXP_NAME="${EXP_NAME:-${CLUSTER}_chunked_aligner_parakeet_g2_chunk${CHUNK_SIZE}${MASK_TAG}_lr${LR}_${PRECISION}_n${SLURM_JOB_NUM_NODES}}"
+EXP_NAME="${EXP_NAME:-${CLUSTER}_chunked_aligner_parakeet_g2_chunk${CHUNK_SIZE}_lr${LR}_${PRECISION}_n${SLURM_JOB_NUM_NODES}}"
 
 # Write-heavy outputs (results/checkpoints, HF cache, checkpoint temp) go to the
 # nemotron project, which has free quota. Override with OUTPUT_PREFIX.
@@ -193,7 +184,7 @@ MOUNTS="--container-mounts=${SPEECHLM_PROJECT_DIR}:${SPEECHLM_PROJECT_DIR},${H_D
 
 read -r -d '' cmd <<EOF
 echo "*******Chunked-Aligner (AR) - Granary 2.0********" \
-&& echo "*** CONFIG: ${CONFIG_NAME} (loss_type=chunked_aligner, chunk_size=${CHUNK_SIZE}, joint.masking_prob=${MASKING_PROB}) ***" \
+&& echo "*** CONFIG: ${CONFIG_NAME} (loss_type=chunked_aligner, chunk_size=${CHUNK_SIZE}) ***" \
 && echo "*** INIT: ${PARAKEET_NEMO_CONTAINER} (encoder+decoder only; joint trained from scratch) ***" \
 && echo "*** TOKENIZER: /tokenizers (extracted from the parakeet .nemo) ***" \
 && echo "*** PRECISION: ${PRECISION} (use bf16-mixed/32 with batch_norm; bf16-true often -> Inf) ***" \
@@ -227,7 +218,6 @@ echo "*******Chunked-Aligner (AR) - Granary 2.0********" \
     ++model.loss_type=chunked_aligner \
     ++model.chunked_aligner.chunk_size=${CHUNK_SIZE} \
     ++model.chunked_aligner.reduction=${CA_REDUCTION} \
-    ++model.joint.masking_prob=${MASKING_PROB} \
     model.skip_nan_grad=true \
     model.compute_eval_loss=false \
     ++model.train_ds.use_lhotse=true \
