@@ -363,6 +363,123 @@ def tdt_loss_gpu(
     return True
 
 
+def multistream_tdt_loss_gpu(
+    label_acts: torch.Tensor,
+    duration_acts: torch.Tensor,
+    labels: torch.Tensor,
+    input_lengths: torch.Tensor,
+    label_lengths: torch.Tensor,
+    costs: torch.Tensor,
+    label_grads: torch.Tensor,
+    duration_grads: torch.Tensor,
+    blank_label: int,
+    durations: list,
+    maxK: int,
+    clamp: float,
+    num_threads: int,
+):
+    """Wrapper for the multistream TDT loss CUDA kernels.
+
+    Args:
+        label_acts: ALREADY per-stream log-softmaxed log-probs, shape [B, T, U, V]
+            (V is the label part width, blank included).
+        duration_acts: ALREADY log-softmaxed duration log-probs, shape [B, T, U, D].
+        labels: target indices of shape [B, U, K] (absolute indices into the label
+            part); each of the K streams contributes one index per label position.
+        input_lengths: acoustic lengths [B].
+        label_lengths: target lengths [B].
+        costs: zero vector [B], updated in-place with the per-sample -logP.
+        label_grads: zero tensor like ``label_acts`` (or None for scoring only).
+        duration_grads: zero tensor like ``duration_acts`` (or None).
+        blank_label: index of the blank token in the label part.
+        durations: supported TDT durations, must include 0 and 1.
+        maxK: number of parallel streams (== labels.shape[-1]).
+        clamp: gradient clamp; <= 0 disables.
+        num_threads: number of OMP threads.
+    """
+    minibatch_size = label_acts.shape[0]
+    maxT = label_acts.shape[1]
+    maxU = label_acts.shape[2]
+    alphabet_size = label_acts.shape[3]
+
+    if hasattr(cuda, 'external_stream'):
+        stream = cuda.external_stream(torch.cuda.current_stream(label_acts.device).cuda_stream)
+    else:
+        stream = cuda.default_stream()
+
+    if num_threads < 0:
+        num_threads = multiprocessing.cpu_count()
+
+    num_threads = max(1, num_threads)
+
+    gpu_size, status = rnnt_helper.get_workspace_size(maxT, maxU, minibatch_size, gpu=True)
+
+    if status != global_constants.RNNTStatus.RNNT_STATUS_SUCCESS:
+        raise RuntimeError("Invalid parameter passed when calculating working space memory")
+
+    cuda.select_device(label_acts.device.index)
+    gpu_workspace = torch.zeros(gpu_size, device=label_acts.device, dtype=label_acts.dtype, requires_grad=False)
+
+    tdt_workspace = torch.zeros(len(durations), device=label_acts.device, dtype=torch.long, requires_grad=False)
+
+    for i in range(0, len(durations)):
+        tdt_workspace[i] = durations[i]
+
+    ### VIEW TENSORS AS VECTORS FOR POINTER INDEXING ###
+    label_acts, label_acts_shape = rnnt_helper.flatten_tensor(label_acts)
+    duration_acts, duration_acts_shape = rnnt_helper.flatten_tensor(duration_acts)
+
+    wrapper = gpu_rnnt.GPUMultistreamTDT(
+        num_durations=len(durations),
+        maxK=maxK,
+        minibatch=minibatch_size,
+        maxT=maxT,
+        maxU=maxU,
+        alphabet_size=alphabet_size,
+        workspace=gpu_workspace,
+        tdt_workspace=tdt_workspace,
+        blank=blank_label,
+        clamp=clamp,
+        num_threads=num_threads,
+        stream=stream,
+    )
+
+    if label_grads is None:
+        status = wrapper.score_forward(
+            label_acts=label_acts.data,
+            duration_acts=duration_acts.data,
+            costs=costs.data,
+            pad_labels=labels.data,
+            label_lengths=label_lengths.data,
+            input_lengths=input_lengths.data,
+        )
+
+        if status != global_constants.RNNTStatus.RNNT_STATUS_SUCCESS:
+            raise RuntimeError("Could not calculate forward scores")
+
+    else:
+        ### FLATTEN GRAD TENSOR ###
+        label_grads, label_grads_shape = rnnt_helper.flatten_tensor(label_grads)
+        duration_grads, duration_grads_shape = rnnt_helper.flatten_tensor(duration_grads)
+
+        status = wrapper.cost_and_grad(
+            label_acts=label_acts.data,
+            duration_acts=duration_acts.data,
+            label_grads=label_grads.data,
+            duration_grads=duration_grads.data,
+            costs=costs.data,
+            pad_labels=labels.data,
+            label_lengths=label_lengths.data,
+            input_lengths=input_lengths.data,
+        )
+
+        if status != global_constants.RNNTStatus.RNNT_STATUS_SUCCESS:
+            raise RuntimeError("Could not calculate forward scores")
+
+    del gpu_workspace, tdt_workspace, wrapper
+    return True
+
+
 def multiblank_rnnt_loss_gpu(
     acts: torch.Tensor,
     labels: torch.Tensor,
@@ -480,4 +597,203 @@ def multiblank_rnnt_loss_gpu(
             raise RuntimeError("Could not calculate forward scores")
 
     del gpu_workspace, big_blank_workspace, wrapper
+    return True
+
+
+def chunked_aligner_loss_gpu(
+    acts: torch.Tensor,
+    labels: torch.Tensor,
+    input_lengths: torch.Tensor,
+    label_lengths: torch.Tensor,
+    costs: torch.Tensor,
+    grads: torch.Tensor,
+    blank_label: int,
+    chunk_size: int,
+    clamp: float,
+    num_threads: int,
+):
+    """Wrapper for the Chunked-Aligner loss CUDA kernels.
+
+    Args:
+        acts: ALREADY log_softmaxed activations of shape [B, T, U, V] (V includes
+            the blank / end-of-chunk symbol). The log_softmax Jacobian is handled
+            in PyTorch by autograd (see ``ChunkedAlignerLossNumba``).
+        labels: target indices of shape [B, U - 1].
+        input_lengths: acoustic lengths [B].
+        label_lengths: target lengths [B].
+        costs: zero vector [B], updated in-place with the per-sample ``-logP``.
+        grads: zero tensor like ``acts`` (or ``None`` for scoring only).
+        blank_label: index of the blank / end-of-chunk symbol.
+        chunk_size: number of encoder frames per chunk.
+        clamp: gradient clamp; <= 0 disables.
+        num_threads: number of OMP threads.
+    """
+    minibatch_size = acts.shape[0]
+    maxT = acts.shape[1]
+    maxU = acts.shape[2]
+    alphabet_size = acts.shape[3]
+
+    if hasattr(cuda, 'external_stream'):
+        stream = cuda.external_stream(torch.cuda.current_stream(acts.device).cuda_stream)
+    else:
+        stream = cuda.default_stream()
+
+    if num_threads < 0:
+        num_threads = multiprocessing.cpu_count()
+
+    num_threads = max(1, num_threads)
+
+    gpu_size, status = rnnt_helper.get_workspace_size(maxT, maxU, minibatch_size, gpu=True)
+
+    if status != global_constants.RNNTStatus.RNNT_STATUS_SUCCESS:
+        raise RuntimeError("Invalid parameter passed when calculating working space memory")
+
+    cuda.select_device(acts.device.index)
+    gpu_workspace = torch.zeros(gpu_size, device=acts.device, dtype=acts.dtype, requires_grad=False)
+
+    ### VIEW TENSORS AS VECTORS FOR POINTER INDEXING ###
+    acts, acts_shape = rnnt_helper.flatten_tensor(acts)
+
+    wrapper = gpu_rnnt.GPUChunkedAligner(
+        minibatch=minibatch_size,
+        maxT=maxT,
+        maxU=maxU,
+        alphabet_size=alphabet_size,
+        workspace=gpu_workspace,
+        blank=blank_label,
+        chunk_size=chunk_size,
+        clamp=clamp,
+        num_threads=num_threads,
+        stream=stream,
+    )
+
+    if grads is None:
+        status = wrapper.score_forward(
+            acts=acts.data,
+            costs=costs.data,
+            pad_labels=labels.data,
+            label_lengths=label_lengths.data,
+            input_lengths=input_lengths.data,
+        )
+
+        if status != global_constants.RNNTStatus.RNNT_STATUS_SUCCESS:
+            raise RuntimeError("Could not calculate forward scores")
+
+    else:
+        ### FLATTEN GRAD TENSOR ###
+        grads, grads_shape = rnnt_helper.flatten_tensor(grads)
+
+        status = wrapper.cost_and_grad(
+            acts=acts.data,
+            grads=grads.data,
+            costs=costs.data,
+            pad_labels=labels.data,
+            label_lengths=label_lengths.data,
+            input_lengths=input_lengths.data,
+        )
+
+        if status != global_constants.RNNTStatus.RNNT_STATUS_SUCCESS:
+            raise RuntimeError("Could not calculate forward scores")
+
+    del gpu_workspace, wrapper
+    return True
+def chunked_aligner_nar_loss_gpu(
+    acts: torch.Tensor,
+    labels: torch.Tensor,
+    input_lengths: torch.Tensor,
+    label_lengths: torch.Tensor,
+    costs: torch.Tensor,
+    grads: torch.Tensor,
+    blank_label: int,
+    chunk_size: int,
+    clamp: float,
+    num_threads: int,
+):
+    """Wrapper for the non-autoregressive (NAR) Chunked-Aligner loss CUDA kernels.
+
+    Args:
+        acts: ALREADY log_softmaxed per-frame activations of shape [B, T, V] (V
+            includes the blank / end-of-chunk symbol). No predictor / joint axis.
+            The log_softmax Jacobian is handled in PyTorch by autograd
+            (see ``ChunkedAlignerNarLossNumba``).
+        labels: target indices of shape [B, U - 1].
+        input_lengths: acoustic lengths [B].
+        label_lengths: target lengths [B].
+        costs: zero vector [B], updated in-place with the per-sample ``-logP``.
+        grads: zero tensor like ``acts`` ([B, T, V]) or ``None`` for scoring only.
+        blank_label: index of the blank / end-of-chunk symbol.
+        chunk_size: number of encoder frames per chunk.
+        clamp: gradient clamp; <= 0 disables.
+        num_threads: number of OMP threads.
+    """
+    minibatch_size = acts.shape[0]
+    maxT = acts.shape[1]
+    alphabet_size = acts.shape[2]
+    # The alpha/beta DP tables are [B, T, U] with U = max_label_len + 1.
+    maxU = int(label_lengths.max().item()) + 1
+
+    if hasattr(cuda, 'external_stream'):
+        stream = cuda.external_stream(torch.cuda.current_stream(acts.device).cuda_stream)
+    else:
+        stream = cuda.default_stream()
+
+    if num_threads < 0:
+        num_threads = multiprocessing.cpu_count()
+
+    num_threads = max(1, num_threads)
+
+    gpu_size, status = rnnt_helper.get_workspace_size(maxT, maxU, minibatch_size, gpu=True)
+
+    if status != global_constants.RNNTStatus.RNNT_STATUS_SUCCESS:
+        raise RuntimeError("Invalid parameter passed when calculating working space memory")
+
+    cuda.select_device(acts.device.index)
+    gpu_workspace = torch.zeros(gpu_size, device=acts.device, dtype=acts.dtype, requires_grad=False)
+
+    ### VIEW TENSORS AS VECTORS FOR POINTER INDEXING ###
+    acts, acts_shape = rnnt_helper.flatten_tensor(acts)
+
+    wrapper = gpu_rnnt.GPUChunkedAligner(
+        minibatch=minibatch_size,
+        maxT=maxT,
+        maxU=maxU,
+        alphabet_size=alphabet_size,
+        workspace=gpu_workspace,
+        blank=blank_label,
+        chunk_size=chunk_size,
+        clamp=clamp,
+        num_threads=num_threads,
+        stream=stream,
+        nar=True,
+    )
+
+    if grads is None:
+        status = wrapper.score_forward(
+            acts=acts.data,
+            costs=costs.data,
+            pad_labels=labels.data,
+            label_lengths=label_lengths.data,
+            input_lengths=input_lengths.data,
+        )
+
+        if status != global_constants.RNNTStatus.RNNT_STATUS_SUCCESS:
+            raise RuntimeError("Could not calculate forward scores")
+
+    else:
+        ### FLATTEN GRAD TENSOR ###
+        grads, grads_shape = rnnt_helper.flatten_tensor(grads)
+
+        status = wrapper.cost_and_grad(
+            acts=acts.data,
+            grads=grads.data,
+            costs=costs.data,
+            pad_labels=labels.data,
+            label_lengths=label_lengths.data,
+            input_lengths=input_lengths.data,
+        )
+
+        if status != global_constants.RNNTStatus.RNNT_STATUS_SUCCESS:
+            raise RuntimeError("Could not calculate forward scores")
+
+    del gpu_workspace, wrapper
     return True

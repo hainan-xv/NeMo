@@ -805,3 +805,366 @@ class GPUTDT(GPURNNT):
         durations = self.tdt_workspace[: self.num_durations]
 
         return used_offset, (denom, alphas, betas, llForward, llBackward, durations)
+
+
+class GPUMultistreamTDT(GPUTDT):
+    """Launch CUDA kernels for the multistream TDT loss.
+
+    Unlike :class:`GPUTDT`, the activation tensors handed to this wrapper are
+    expected to be ALREADY normalized log-probs (per-stream log_softmax for the
+    label part, log_softmax for durations). No `denom`/`sigma` is applied inside
+    the kernels; the log_softmax Jacobian is handled in PyTorch (see
+    `MultistreamTDTLossNumba`). A non-blank emission factorizes into ``maxK``
+    parallel streams whose target log-probs are summed, so ``labels`` is a 3D
+    tensor of shape ``[B, U, K]`` of absolute indices into the label part.
+    """
+
+    def __init__(
+        self,
+        num_durations: int,
+        maxK: int,
+        minibatch: int,
+        maxT: int,
+        maxU: int,
+        alphabet_size: int,
+        workspace,
+        tdt_workspace,
+        blank: int,
+        clamp: float,
+        num_threads: int,
+        stream,
+    ):
+        super().__init__(
+            sigma=0.0,
+            omega=0.0,
+            num_durations=num_durations,
+            minibatch=minibatch,
+            maxT=maxT,
+            maxU=maxU,
+            alphabet_size=alphabet_size,
+            workspace=workspace,
+            tdt_workspace=tdt_workspace,
+            blank=blank,
+            fastemit_lambda=0.0,
+            clamp=clamp,
+            num_threads=num_threads,
+            stream=stream,
+        )
+        self.maxK_ = maxK
+
+    def compute_cost_and_score(
+        self,
+        label_acts: torch.Tensor,
+        duration_acts: torch.Tensor,
+        label_grads: Optional[torch.Tensor],
+        duration_grads: Optional[torch.Tensor],
+        costs: torch.Tensor,
+        labels: torch.Tensor,
+        label_lengths: torch.Tensor,
+        input_lengths: torch.Tensor,
+    ) -> global_constants.RNNTStatus:
+        training = label_grads is not None
+
+        if training:
+            label_grads *= 0.0
+            duration_grads *= 0.0
+
+        _, (denom, alphas, betas, llForward, llBackward, durations) = self._prepare_workspace()
+
+        # `label_acts` are already per-stream log-probs, so the multistream kernels
+        # never read `denom` (no internal log_softmax). The workspace is allocated
+        # with torch.zeros, so no explicit zeroing is required.
+
+        gpu_rnnt_kernel.multistream_tdt_compute_alphas_kernel[self.minibatch_, self.maxU_, self.stream_, 0](
+            label_acts,
+            duration_acts,
+            alphas,
+            llForward,
+            input_lengths,
+            label_lengths,
+            labels,
+            self.minibatch_,
+            self.maxT_,
+            self.maxU_,
+            self.maxK_,
+            self.alphabet_size_,
+            self.blank_,
+            durations,
+            self.num_durations,
+        )
+
+        if training:
+            gpu_rnnt_kernel.multistream_tdt_compute_betas_kernel[self.minibatch_, self.maxU_, self.stream_, 0](
+                label_acts,
+                duration_acts,
+                betas,
+                llBackward,
+                input_lengths,
+                label_lengths,
+                labels,
+                self.minibatch_,
+                self.maxT_,
+                self.maxU_,
+                self.maxK_,
+                self.alphabet_size_,
+                self.blank_,
+                durations,
+                self.num_durations,
+            )
+
+            grad_blocks_per_grid = self.minibatch_ * self.maxT_ * self.maxU_
+            grad_threads_per_block = gpu_rnnt_kernel.GPU_RNNT_THREAD_SIZE
+            gpu_rnnt_kernel.multistream_tdt_compute_grad_kernel[
+                grad_blocks_per_grid, grad_threads_per_block, self.stream_, 0
+            ](
+                label_grads,
+                duration_grads,
+                label_acts,
+                duration_acts,
+                alphas,
+                betas,
+                llForward,
+                input_lengths,
+                label_lengths,
+                labels,
+                self.minibatch_,
+                self.maxT_,
+                self.maxU_,
+                self.maxK_,
+                self.alphabet_size_,
+                self.blank_,
+                durations,
+                self.num_durations,
+                self.clamp_,
+            )
+
+        threadsperblock = min(costs.shape[0], 32)
+        blockspergrid = (costs.shape[0] + (threadsperblock - 1)) // threadsperblock
+        rnnt_helper.compute_costs_data[blockspergrid, threadsperblock, self.stream_, 0](
+            llForward, costs, self.fastemit_lambda_
+        )
+        self.stream_.synchronize()
+
+        return global_constants.RNNTStatus.RNNT_STATUS_SUCCESS
+
+
+class GPUChunkedAligner:
+    """Launch CUDA kernels for the Chunked-Aligner loss.
+
+    Unlike :class:`GPURNNT`, the activation tensor handed to this wrapper is
+    expected to be ALREADY normalized log-probs (a single ``log_softmax`` done in
+    PyTorch). No ``denom`` is computed inside the kernels; the log_softmax
+    Jacobian is handled in PyTorch by autograd (see ``ChunkedAlignerLossNumba``).
+    The kernels therefore compute the gradient w.r.t. the log-probs directly,
+    which is just the negative expected count of the arcs consuming each entry.
+    """
+
+    def __init__(
+        self,
+        minibatch: int,
+        maxT: int,
+        maxU: int,
+        alphabet_size: int,
+        workspace,
+        blank: int,
+        chunk_size: int,
+        clamp: float,
+        num_threads: int,
+        stream,
+        nar: bool = False,
+    ):
+        """
+        Args:
+            minibatch: batch size.
+            maxT: maximum acoustic length (T in the log-probs tensor).
+            maxU: maximum predictor length (max_label_len + 1).
+            alphabet_size: vocabulary size V (blank included).
+            workspace: flat float buffer used for alphas/betas/log-likelihoods.
+            blank: index of the blank / end-of-chunk symbol.
+            chunk_size: number of encoder frames per chunk.
+            clamp: gradient clamp value; <= 0 disables clamping.
+            num_threads: number of OMP threads (numba).
+            stream: numba CUDA stream.
+            nar: if True, use the non-autoregressive kernels (``acts`` is [B, T, V]
+                with no predictor axis); otherwise the AR kernels (``acts`` is
+                [B, T, U, V]).
+        """
+        self.minibatch_ = minibatch
+        self.maxT_ = maxT
+        self.maxU_ = maxU
+        self.alphabet_size_ = alphabet_size
+        self.gpu_workspace = cuda.as_cuda_array(workspace)
+        self.blank_ = blank
+        self.chunk_size_ = chunk_size
+        self.clamp_ = abs(clamp)
+        self.num_threads_ = num_threads
+        self.stream_ = stream
+        self.nar_ = nar
+
+        if num_threads > 0:
+            numba.set_num_threads(min(multiprocessing.cpu_count(), num_threads))
+            self.num_threads_ = numba.get_num_threads()
+        else:
+            self.num_threads_ = numba.get_num_threads()
+
+    def compute_cost_and_score(
+        self,
+        acts: torch.Tensor,
+        grads: Optional[torch.Tensor],
+        costs: torch.Tensor,
+        labels: torch.Tensor,
+        label_lengths: torch.Tensor,
+        input_lengths: torch.Tensor,
+    ) -> global_constants.RNNTStatus:
+        training = grads is not None
+
+        if training:
+            grads *= 0.0  # zero grads
+
+        _, (alphas, betas, llForward, llBackward) = self._prepare_workspace()
+
+        alphas_kernel = (
+            gpu_rnnt_kernel.chunked_aligner_nar_compute_alphas_kernel
+            if self.nar_
+            else gpu_rnnt_kernel.chunked_aligner_compute_alphas_kernel
+        )
+        betas_kernel = (
+            gpu_rnnt_kernel.chunked_aligner_nar_compute_betas_kernel
+            if self.nar_
+            else gpu_rnnt_kernel.chunked_aligner_compute_betas_kernel
+        )
+
+        # `acts` are already log-probs, so no log_softmax / denom is needed.
+        alphas_kernel[self.minibatch_, self.maxU_, self.stream_, 0](
+            acts,
+            alphas,
+            llForward,
+            input_lengths,
+            label_lengths,
+            labels,
+            self.minibatch_,
+            self.maxT_,
+            self.maxU_,
+            self.alphabet_size_,
+            self.blank_,
+            self.chunk_size_,
+        )
+
+        if training:
+            betas_kernel[self.minibatch_, self.maxU_, self.stream_, 0](
+                acts,
+                betas,
+                llBackward,
+                input_lengths,
+                label_lengths,
+                labels,
+                self.minibatch_,
+                self.maxT_,
+                self.maxU_,
+                self.alphabet_size_,
+                self.blank_,
+                self.chunk_size_,
+            )
+
+            grad_threads_per_block = gpu_rnnt_kernel.GPU_RNNT_THREAD_SIZE
+            if self.nar_:
+                # NAR grads are [B, T, V]: one block per (b, t), accumulating over u.
+                grad_blocks_per_grid = self.minibatch_ * self.maxT_
+                gpu_rnnt_kernel.chunked_aligner_nar_compute_grad_kernel[
+                    grad_blocks_per_grid, grad_threads_per_block, self.stream_, 0
+                ](
+                    grads,
+                    acts,
+                    alphas,
+                    betas,
+                    llForward,
+                    input_lengths,
+                    label_lengths,
+                    labels,
+                    self.minibatch_,
+                    self.maxT_,
+                    self.maxU_,
+                    self.alphabet_size_,
+                    self.blank_,
+                    self.chunk_size_,
+                    self.clamp_,
+                )
+            else:
+                grad_blocks_per_grid = self.minibatch_ * self.maxT_ * self.maxU_
+                gpu_rnnt_kernel.chunked_aligner_compute_grad_kernel[
+                    grad_blocks_per_grid, grad_threads_per_block, self.stream_, 0
+                ](
+                    grads,
+                    acts,
+                    alphas,
+                    betas,
+                    llForward,
+                    input_lengths,
+                    label_lengths,
+                    labels,
+                    self.minibatch_,
+                    self.maxT_,
+                    self.maxU_,
+                    self.alphabet_size_,
+                    self.blank_,
+                    self.chunk_size_,
+                    self.clamp_,
+                )
+
+        # Copy negated log-likelihood into the costs vector (fastemit_lambda = 0).
+        threadsperblock = min(costs.shape[0], 32)
+        blockspergrid = (costs.shape[0] + (threadsperblock - 1)) // threadsperblock
+        rnnt_helper.compute_costs_data[blockspergrid, threadsperblock, self.stream_, 0](llForward, costs, 0.0)
+        self.stream_.synchronize()
+
+        return global_constants.RNNTStatus.RNNT_STATUS_SUCCESS
+
+    def cost_and_grad(
+        self,
+        acts: torch.Tensor,
+        grads: torch.Tensor,
+        costs: torch.Tensor,
+        pad_labels: torch.Tensor,
+        label_lengths: torch.Tensor,
+        input_lengths: torch.Tensor,
+    ):
+        if (
+            acts is None
+            or grads is None
+            or costs is None
+            or pad_labels is None
+            or label_lengths is None
+            or input_lengths is None
+        ):
+            return global_constants.RNNTStatus.RNNT_STATUS_INVALID_VALUE
+
+        return self.compute_cost_and_score(acts, grads, costs, pad_labels, label_lengths, input_lengths)
+
+    def score_forward(
+        self,
+        acts: torch.Tensor,
+        costs: torch.Tensor,
+        pad_labels: torch.Tensor,
+        label_lengths: torch.Tensor,
+        input_lengths: torch.Tensor,
+    ):
+        if acts is None or costs is None or pad_labels is None or label_lengths is None or input_lengths is None:
+            return global_constants.RNNTStatus.RNNT_STATUS_INVALID_VALUE
+
+        return self.compute_cost_and_score(acts, None, costs, pad_labels, label_lengths, input_lengths)
+
+    def _prepare_workspace(self) -> Tuple[int, Tuple[torch.Tensor, ...]]:
+        """Slice the flat workspace into alphas, betas and log-likelihood buffers."""
+        used_offset = 0
+
+        alphas = self.gpu_workspace[used_offset : used_offset + self.maxT_ * self.maxU_ * self.minibatch_]
+        used_offset += self.maxT_ * self.maxU_ * self.minibatch_
+        betas = self.gpu_workspace[used_offset : used_offset + self.maxT_ * self.maxU_ * self.minibatch_]
+        used_offset += self.maxT_ * self.maxU_ * self.minibatch_
+
+        llForward = self.gpu_workspace[used_offset : used_offset + self.minibatch_]
+        used_offset += self.minibatch_
+        llBackward = self.gpu_workspace[used_offset : used_offset + self.minibatch_]
+        used_offset += self.minibatch_
+
+        return used_offset, (alphas, betas, llForward, llBackward)

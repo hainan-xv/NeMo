@@ -34,7 +34,15 @@ from torch.nn import Module
 from nemo.collections.asr.parts.numba.rnnt_loss import rnnt
 from nemo.collections.asr.parts.numba.rnnt_loss.utils.cpu_utils import cpu_rnnt
 
-__all__ = ['rnnt_loss', 'RNNTLossNumba', 'MultiblankRNNTLossNumba', 'TDTLossNumba']
+__all__ = [
+    'rnnt_loss',
+    'RNNTLossNumba',
+    'MultiblankRNNTLossNumba',
+    'TDTLossNumba',
+    'MultistreamTDTLossNumba',
+    'ChunkedAlignerLossNumba',
+    'ChunkedAlignerNarLossNumba',
+]
 
 
 class _RNNTNumba(Function):
@@ -583,6 +591,441 @@ class TDTLossNumba(Module):
         )
 
 
+class _MultistreamTDTNumba(Function):
+    """Numba autograd Function for the multistream TDT loss.
+
+    Inputs ``label_logp`` and ``dur_logp`` are expected to be already-normalized
+    log-probs (per-stream log_softmax / log_softmax). The CUDA kernels compute the
+    loss and the gradient w.r.t. these log-probs; the surrounding log_softmax
+    Jacobian is handled by autograd in :class:`MultistreamTDTLossNumba.forward`.
+    """
+
+    @staticmethod
+    def forward(ctx, label_logp, dur_logp, labels, act_lens, label_lens, blank, durations, maxK, reduction, clamp):
+        is_cuda = label_logp.is_cuda
+        if not is_cuda:
+            raise ValueError("MultistreamTDTLossNumba is only implemented for CUDA tensors.")
+        if clamp < 0:
+            raise ValueError("`clamp` must be 0.0 or positive float value.")
+
+        label_grads = torch.zeros_like(label_logp) if label_logp.requires_grad else None
+        duration_grads = torch.zeros_like(dur_logp) if dur_logp.requires_grad else None
+        minibatch_size = label_logp.size(0)
+        costs = torch.zeros(minibatch_size, device=label_logp.device, dtype=label_logp.dtype)
+
+        rnnt.multistream_tdt_loss_gpu(
+            label_logp,
+            dur_logp,
+            labels=labels,
+            input_lengths=act_lens,
+            label_lengths=label_lens,
+            costs=costs,
+            label_grads=label_grads,
+            duration_grads=duration_grads,
+            blank_label=blank,
+            durations=durations,
+            maxK=maxK,
+            clamp=clamp,
+            num_threads=0,
+        )
+
+        if reduction in ['sum', 'mean']:
+            costs = costs.sum().unsqueeze_(-1)
+            if reduction == 'mean':
+                costs /= minibatch_size
+                if label_grads is not None:
+                    label_grads /= minibatch_size
+                    duration_grads /= minibatch_size
+
+        ctx.save_for_backward(label_grads, duration_grads)
+        return costs
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        label_grads, duration_grads = ctx.saved_tensors
+        if grad_output is not None and label_grads is not None:
+            grad_output = grad_output.view(-1, 1, 1, 1).to(label_grads)
+            # Out-of-place to keep the saved tensors immutable (safe under
+            # gradcheck's double-backward, gradient checkpointing, etc.).
+            return (
+                label_grads * grad_output,
+                duration_grads * grad_output,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        return (None,) * 10
+
+
+class MultistreamTDTLossNumba(Module):
+    """Multistream TDT loss (CUDA / Numba).
+
+    The label part of the joint output is partitioned into ``len(dividers) - 1``
+    streams (by ``dividers``); a non-blank emission is the product (sum in log
+    space) of one target per stream. The last stream owns the shared blank
+    (``dividers[-1] == blank + 1``). Durations occupy the trailing ``len(durations)``
+    columns of ``acts``.
+
+    Parameters:
+        blank: blank index inside the label part.
+        durations: list of TDT durations (must include 0 and 1).
+        dividers: stream boundaries within the label part (e.g. ``[0, num_cap,
+            num_cap + num_spell + 1]`` for a cap+spelling 2-stream model).
+        reduction: 'none' | 'sum' | 'mean'.
+        sigma: logit under-normalization subtracted from the label log-probs.
+        clamp: gradient clamp; <= 0 disables.
+    """
+
+    def __init__(
+        self,
+        blank,
+        durations=None,
+        dividers=None,
+        reduction='sum',
+        sigma: float = 0.0,
+        clamp: float = -1,
+        stream_weights=None,
+    ):
+        super(MultistreamTDTLossNumba, self).__init__()
+        if dividers is None or len(dividers) < 2:
+            raise ValueError("`dividers` must be a list with at least 2 entries marking the stream boundaries.")
+        if dividers[-1] != blank + 1:
+            raise ValueError(f"Expected dividers[-1] ({dividers[-1]}) == blank + 1 ({blank + 1}).")
+        if stream_weights is not None and len(stream_weights) != len(dividers) - 1:
+            raise ValueError(
+                f"`stream_weights` must have one entry per stream ({len(dividers) - 1}), got {len(stream_weights)}."
+            )
+        self.blank = blank
+        self.durations = durations if durations is not None else []
+        self.dividers = list(dividers)
+        self.reduction = reduction
+        self.sigma = float(sigma)
+        self.clamp = float(clamp) if clamp > 0 else 0.0
+        # None (or all-ones) => unweighted path (no extra multiply).
+        self.stream_weights = tuple(float(w) for w in stream_weights) if stream_weights is not None else None
+        self.loss = _MultistreamTDTNumba.apply
+
+    def forward(self, acts, labels, act_lens, label_lens):
+        """
+        acts: [B, T, U, V + D] raw joint output (label part then durations).
+        labels: [B, U, K] target indices (K stream targets per label position).
+        act_lens: [B] acoustic lengths.
+        label_lens: [B] label lengths.
+        """
+        n_dur = len(self.durations)
+        label_acts = acts[..., :-n_dur]
+        dur_acts = acts[..., -n_dur:]
+
+        # per-stream log_softmax (- sigma) on the label part; log_softmax on durations.
+        # These ops are differentiable, so autograd chains the softmax Jacobian onto
+        # the gradients returned by the kernel.
+        parts = []
+        for i in range(len(self.dividers) - 1):
+            parts.append(
+                torch.log_softmax(label_acts[..., self.dividers[i] : self.dividers[i + 1]], dim=-1) - self.sigma
+            )
+        label_logp = torch.cat(parts, dim=-1)
+
+        # Per-stream weighting: scale each stream's log-prob by its weight so the kernel's
+        # emission score becomes sum_k w_k * logp_k (blank inherits the last stream's weight).
+        # This multiply is differentiable, so autograd chains the weight onto the kernel's
+        # gradients (which are w.r.t. the weighted log-probs).
+        if self.stream_weights is not None:
+            from nemo.collections.asr.losses.rnnt_pytorch import build_stream_weight_vector
+
+            w_vec = build_stream_weight_vector(self.dividers, self.stream_weights, label_logp.device, label_logp.dtype)
+            if w_vec is not None:
+                label_logp = label_logp * w_vec
+
+        label_logp = label_logp.contiguous()
+        dur_logp = torch.log_softmax(dur_acts, dim=-1).contiguous()
+
+        labels = labels.to(torch.int64).contiguous()
+        act_lens = act_lens.to(torch.int64).contiguous()
+        label_lens = label_lens.to(torch.int64).contiguous()
+
+        return self.loss(
+            label_logp,
+            dur_logp,
+            labels,
+            act_lens,
+            label_lens,
+            self.blank,
+            list(self.durations),
+            labels.shape[-1],
+            self.reduction,
+            self.clamp,
+        )
+
+
+class _ChunkedAlignerNumba(Function):
+    """Numba autograd Function for the Chunked-Aligner loss.
+
+    The input ``log_probs`` is expected to be already-normalized log-probs (a
+    single ``log_softmax``). The CUDA kernels compute the loss and the gradient
+    w.r.t. these log-probs; the surrounding log_softmax Jacobian is handled by
+    autograd in :class:`ChunkedAlignerLossNumba.forward`.
+    """
+
+    @staticmethod
+    def forward(ctx, log_probs, labels, act_lens, label_lens, blank, chunk_size, reduction, clamp):
+        is_cuda = log_probs.is_cuda
+        if not is_cuda:
+            raise ValueError("ChunkedAlignerLossNumba is only implemented for CUDA tensors.")
+        if clamp < 0:
+            raise ValueError("`clamp` must be 0.0 or positive float value.")
+
+        certify_inputs(log_probs, labels, act_lens, label_lens)
+
+        grads = torch.zeros_like(log_probs) if log_probs.requires_grad else None
+        minibatch_size = log_probs.size(0)
+        costs = torch.zeros(minibatch_size, device=log_probs.device, dtype=log_probs.dtype)
+
+        rnnt.chunked_aligner_loss_gpu(
+            log_probs,
+            labels=labels,
+            input_lengths=act_lens,
+            label_lengths=label_lens,
+            costs=costs,
+            grads=grads,
+            blank_label=blank,
+            chunk_size=chunk_size,
+            clamp=clamp,
+            num_threads=0,
+        )
+
+        if reduction in ['sum', 'mean', 'mean_volume']:
+            costs = costs.sum().unsqueeze_(-1)
+            denom = 1.0
+            if reduction == 'mean':
+                # mean over the batch (total sequence NLL averaged over utterances).
+                denom = float(minibatch_size)
+            elif reduction == 'mean_volume':
+                # per-token: batch-summed NLL divided by the total number of labels,
+                # so the value is comparable to a per-token cross-entropy (~ln V).
+                denom = float(label_lens.sum().clamp(min=1).item())
+            if denom != 1.0:
+                costs /= denom
+                if grads is not None:
+                    grads /= denom
+
+        ctx.save_for_backward(grads)
+        return costs
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        grad = ctx.saved_tensors[0]
+        if grad_output is not None and grad is not None:
+            grad_output = grad_output.view(-1, 1, 1, 1).to(grad)
+            # Out-of-place to keep the saved tensor immutable (safe under
+            # gradient checkpointing, double-backward, etc.).
+            return grad * grad_output, None, None, None, None, None, None, None
+        return (None,) * 8
+
+
+class ChunkedAlignerLossNumba(Module):
+    """Chunked-Aligner loss (CUDA / Numba).
+
+    Alignment-free, full-sum training objective for the streaming Chunked
+    Aligner. Within a fixed-size encoder chunk the model self-transduces the
+    chunk's tokens onto its left-most frames (the diagonal one-to-one joint),
+    while the blank symbol acts as an end-of-chunk (EOC) signal that advances to
+    the next chunk. The loss sums over every way to distribute the label sequence
+    across chunks, so no external timestamps / forced alignment are needed. See
+    ``nemo/collections/asr/losses/chunked_aligner_pytorch.py`` for the reference
+    loop implementation and full derivation.
+
+    Args:
+        blank: index of the blank / end-of-chunk symbol within ``V``.
+        chunk_size: number of encoder frames per chunk ``C`` (also the maximum
+            number of tokens a chunk can emit in this variant).
+        reduction: one of ``'none'``, ``'sum'``, ``'mean'`` (total sequence NLL
+            averaged over the batch) or ``'mean_volume'`` (batch-summed NLL divided
+            by the total number of labels -> a per-token value comparable to a
+            cross-entropy loss, ~ln V at init).
+        clamp: gradient clamp; <= 0 disables.
+    """
+
+    def __init__(self, blank, chunk_size, reduction='sum', clamp: float = -1):
+        super(ChunkedAlignerLossNumba, self).__init__()
+        if chunk_size < 1:
+            raise ValueError(f"chunk_size must be >= 1, got {chunk_size}.")
+        if reduction not in ('none', 'sum', 'mean', 'mean_volume'):
+            raise ValueError(
+                f"reduction must be one of ['none', 'sum', 'mean', 'mean_volume'], got '{reduction}'."
+            )
+        self.blank = blank
+        self.chunk_size = chunk_size
+        self.reduction = reduction
+        self.clamp = float(clamp) if clamp > 0 else 0.0
+        self.loss = _ChunkedAlignerNumba.apply
+
+    def forward(self, acts, labels, act_lens, label_lens):
+        """
+        acts: [B, T, U, V] raw joint logits (blank/EOC included).
+        labels: [B, U - 1] target token ids.
+        act_lens: [B] acoustic lengths.
+        label_lens: [B] label lengths.
+        """
+        # The Numba CUDA kernels support float32 / float16 but not bfloat16 (and
+        # under bf16/fp16 autocast the joint emits a reduced-precision tensor).
+        # Cast bf16 -> fp32 so the kernel always sees a supported dtype; autograd
+        # chains the cast + log_softmax Jacobian back to the original dtype.
+        if acts.dtype not in (torch.float32, torch.float16):
+            acts = acts.float()
+        # log_softmax is differentiable, so autograd chains its Jacobian onto the
+        # gradients returned by the kernel (which are w.r.t. the log-probs).
+        log_probs = torch.log_softmax(acts, dim=-1).contiguous()
+
+        labels = labels.to(torch.int64).contiguous()
+        act_lens = act_lens.to(torch.int64).contiguous()
+        label_lens = label_lens.to(torch.int64).contiguous()
+
+        return self.loss(
+            log_probs,
+            labels,
+            act_lens,
+            label_lens,
+            self.blank,
+            self.chunk_size,
+            self.reduction,
+            self.clamp,
+        )
+
+
+class _ChunkedAlignerNarNumba(Function):
+    """Numba autograd Function for the non-autoregressive Chunked-Aligner loss.
+
+    Like :class:`_ChunkedAlignerNumba` but the activations are per-frame log-probs
+    ``log_probs: [B, T, V]`` (no predictor / joint axis). The CUDA kernels compute
+    the loss and the gradient w.r.t. these per-frame log-probs (summed over the
+    predictor states); the surrounding log_softmax Jacobian is handled by autograd
+    in :class:`ChunkedAlignerNarLossNumba.forward`.
+    """
+
+    @staticmethod
+    def forward(ctx, log_probs, labels, act_lens, label_lens, blank, chunk_size, reduction, clamp):
+        is_cuda = log_probs.is_cuda
+        if not is_cuda:
+            raise ValueError("ChunkedAlignerNarLossNumba is only implemented for CUDA tensors.")
+        if clamp < 0:
+            raise ValueError("`clamp` must be 0.0 or positive float value.")
+
+        certify_inputs_nar(log_probs, labels, act_lens, label_lens)
+
+        grads = torch.zeros_like(log_probs) if log_probs.requires_grad else None
+        minibatch_size = log_probs.size(0)
+        costs = torch.zeros(minibatch_size, device=log_probs.device, dtype=log_probs.dtype)
+
+        rnnt.chunked_aligner_nar_loss_gpu(
+            log_probs,
+            labels=labels,
+            input_lengths=act_lens,
+            label_lengths=label_lens,
+            costs=costs,
+            grads=grads,
+            blank_label=blank,
+            chunk_size=chunk_size,
+            clamp=clamp,
+            num_threads=0,
+        )
+
+        if reduction in ['sum', 'mean', 'mean_volume']:
+            costs = costs.sum().unsqueeze_(-1)
+            denom = 1.0
+            if reduction == 'mean':
+                denom = float(minibatch_size)
+            elif reduction == 'mean_volume':
+                denom = float(label_lens.sum().clamp(min=1).item())
+            if denom != 1.0:
+                costs /= denom
+                if grads is not None:
+                    grads /= denom
+
+        ctx.save_for_backward(grads)
+        return costs
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        grad = ctx.saved_tensors[0]
+        if grad_output is not None and grad is not None:
+            # grads are [B, T, V]; broadcast the upstream scalar over (T, V).
+            grad_output = grad_output.view(-1, 1, 1).to(grad)
+            return grad * grad_output, None, None, None, None, None, None, None
+        return (None,) * 8
+
+
+class ChunkedAlignerNarLossNumba(Module):
+    """Non-autoregressive Chunked-Aligner loss (CUDA / Numba).
+
+    Same alignment-free, full-sum objective as :class:`ChunkedAlignerLossNumba`,
+    but with no prediction network and no joint: the activations are per-frame
+    logits ``[B, T, V]`` produced by a projection head. Removing the predictor
+    axis ``U`` from the activation tensor (and the joint matmul) is a large
+    training-memory win. The CUDA kernels share the AR alpha/beta DP; only the
+    activation reads drop the ``u`` index and the gradient is accumulated over the
+    predictor states for each frame. See
+    ``nemo/collections/asr/losses/chunked_aligner_pytorch.py``
+    (:class:`ChunkedAlignerNarLossPytorch`) for the reference implementation.
+
+    Args:
+        blank: index of the blank / end-of-chunk symbol within ``V``.
+        chunk_size: number of encoder frames per chunk ``C`` (also the maximum
+            number of tokens a chunk can emit in this variant).
+        reduction: one of ``'none'``, ``'sum'``, ``'mean'`` (total sequence NLL
+            averaged over the batch) or ``'mean_volume'`` (batch-summed NLL divided
+            by the total number of labels -> a per-token value).
+        clamp: gradient clamp; <= 0 disables.
+    """
+
+    def __init__(self, blank, chunk_size, reduction='sum', clamp: float = -1):
+        super(ChunkedAlignerNarLossNumba, self).__init__()
+        if chunk_size < 1:
+            raise ValueError(f"chunk_size must be >= 1, got {chunk_size}.")
+        if reduction not in ('none', 'sum', 'mean', 'mean_volume'):
+            raise ValueError(
+                f"reduction must be one of ['none', 'sum', 'mean', 'mean_volume'], got '{reduction}'."
+            )
+        self.blank = blank
+        self.chunk_size = chunk_size
+        self.reduction = reduction
+        self.clamp = float(clamp) if clamp > 0 else 0.0
+        self.loss = _ChunkedAlignerNarNumba.apply
+
+    def forward(self, acts, labels, act_lens, label_lens):
+        """
+        acts: [B, T, V] raw per-frame logits (blank/EOC included).
+        labels: [B, U - 1] target token ids.
+        act_lens: [B] acoustic lengths.
+        label_lens: [B] label lengths.
+        """
+        if acts.dtype not in (torch.float32, torch.float16):
+            acts = acts.float()
+        # log_softmax is differentiable; autograd chains its Jacobian onto the
+        # gradients returned by the kernel (which are w.r.t. the log-probs).
+        log_probs = torch.log_softmax(acts, dim=-1).contiguous()
+
+        labels = labels.to(torch.int64).contiguous()
+        act_lens = act_lens.to(torch.int64).contiguous()
+        label_lens = label_lens.to(torch.int64).contiguous()
+
+        return self.loss(
+            log_probs,
+            labels,
+            act_lens,
+            label_lens,
+            self.blank,
+            self.chunk_size,
+            self.reduction,
+            self.clamp,
+        )
+
+
 def check_type(var, t, name):
     if var.dtype is not t:
         raise TypeError("{} must be {}".format(name, t))
@@ -632,3 +1075,36 @@ def certify_inputs(log_probs, labels, lengths, label_lengths):
         raise ValueError(f"Input length mismatch! Given T: {T}, Expected max T from input lengths: {max_T}")
     if U != max_U + 1:
         raise ValueError(f"Output length mismatch! Given U: {U}, Expected max U from target lengths: {max_U} + 1")
+
+
+def certify_inputs_nar(log_probs, labels, lengths, label_lengths):
+    """Input validation for the non-autoregressive Chunked-Aligner (acts [B, T, V])."""
+    check_type(labels, torch.int64, "labels")
+    check_type(label_lengths, torch.int64, "label_lengths")
+    check_type(lengths, torch.int64, "lengths")
+    check_contiguous(log_probs, "log_probs")
+    check_contiguous(labels, "labels")
+    check_contiguous(label_lengths, "label_lengths")
+    check_contiguous(lengths, "lengths")
+
+    if lengths.shape[0] != log_probs.shape[0]:
+        raise ValueError(
+            f"Must have a length per example. "
+            f"Given lengths dim: {lengths.shape[0]}, "
+            f"Log probs dim : {log_probs.shape[0]}"
+        )
+    if label_lengths.shape[0] != log_probs.shape[0]:
+        raise ValueError(
+            "Must have a label length per example. "
+            f"Given label lengths dim : {label_lengths.shape[0]}, "
+            f"Log probs dim : {log_probs.shape[0]}"
+        )
+
+    check_dim(log_probs, 3, "log_probs")
+    check_dim(labels, 2, "labels")
+    check_dim(lengths, 1, "lenghts")
+    check_dim(label_lengths, 1, "label_lenghts")
+    max_T = torch.max(lengths)
+    T = log_probs.shape[1]
+    if T != max_T:
+        raise ValueError(f"Input length mismatch! Given T: {T}, Expected max T from input lengths: {max_T}")

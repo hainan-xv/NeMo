@@ -244,28 +244,32 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
 
         super().__init__(cfg=cfg, trainer=trainer)
 
-        self.cfg.decoding = self.set_decoding_type_according_to_loss(self.cfg.decoding)
-        # Setup decoding object
-        self.decoding = RNNTBPEDecoding(
-            decoding_cfg=self.cfg.decoding,
-            decoder=self.decoder,
-            joint=self.joint,
-            tokenizer=self.tokenizer,
-        )
+        # The Chunked-Aligner variant builds its own (tokenizer-aware) decoding + WER
+        # in the base __init__ (ChunkedAlignerDecoding); keep those instead of the
+        # standard RNN-T BPE decoding.
+        if getattr(self, 'loss_type', 'rnnt') != 'chunked_aligner':
+            self.cfg.decoding = self.set_decoding_type_according_to_loss(self.cfg.decoding)
+            # Setup decoding object
+            self.decoding = RNNTBPEDecoding(
+                decoding_cfg=self.cfg.decoding,
+                decoder=self.decoder,
+                joint=self.joint,
+                tokenizer=self.tokenizer,
+            )
 
-        # Setup wer object
-        self.wer = WER(
-            decoding=self.decoding,
-            batch_dim_index=0,
-            use_cer=self._cfg.get('use_cer', False),
-            log_prediction=self._cfg.get('log_prediction', True),
-            dist_sync_on_step=True,
-        )
+            # Setup wer object
+            self.wer = WER(
+                decoding=self.decoding,
+                batch_dim_index=0,
+                use_cer=self._cfg.get('use_cer', False),
+                log_prediction=self._cfg.get('log_prediction', True),
+                dist_sync_on_step=True,
+            )
 
-        # Setup fused Joint step if flag is set
-        if self.joint.fuse_loss_wer:
-            self.joint.set_loss(self.loss)
-            self.joint.set_wer(self.wer)
+            # Setup fused Joint step if flag is set
+            if self.joint.fuse_loss_wer:
+                self.joint.set_loss(self.loss)
+                self.joint.set_wer(self.wer)
 
     def change_vocabulary(
         self,
