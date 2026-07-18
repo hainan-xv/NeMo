@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH -A nemotron_speechprod_asr
-#SBATCH -J nemotron_speechprod_asr:chunked-aligner-parakeet-g2
+#SBATCH -J nemotron_speechprod_asr:tdt-hainan-parakeet06bv2-g2
 #SBATCH -p batch_block1,batch_block3,batch_block4
 #SBATCH -N 4
 #SBATCH --gpus-per-node=8
@@ -14,31 +14,55 @@
 #SBATCH --output=slurm_out/%x=%j --error=slurm_out/%x=%j
 
 # ============================================================================
-# OCI launcher for the streaming Chunked-Aligner (AR) on Granary v2.0.
+# HAINAN (stochastic AR/NAR) variant of the parakeet-tdt-0.6b-v2 reproduction.
 #
-# This is an EncDecRNNTBPEModel with model.loss_type=chunked_aligner: the
-# alignment-free full-sum chunked-aligner objective. Within each chunk of
-# CHUNK_SIZE encoder frames the tokens are left-packed onto the chunk's leading
-# frames, and the blank symbol doubles as an end-of-chunk (EOC) signal that
-# advances to the next chunk. Same encoder / prediction net / joint as a standard
-# RNN-T model -- only the loss + a chunked greedy decoder differ.
+# Identical to oci_chat/tdt.sh, but enables the HAINAN decoder-masking regularizer
+# (model.joint.masking_prob): during TRAINING the decoder (prediction-net)
+# contribution to the joint is randomly zeroed, independently per output position
+# u, with probability MASKING_PROB (default 0.5). Masked positions must be
+# predicted from the encoder alone (NAR); unmasked positions use the AR history,
+# so the model trains to work both autoregressively and non-autoregressively.
+# Inference is unchanged (standard AR TDT greedy decode).
 #
-# Architecture mirrors parakeet-tdt-0.6b-v2 (128 mel, 24-layer d_model=1024
-# FastConformer, dw_striding 8x, batch_norm; RNNTDecoder pred_rnn_layers=2), so we
-# warm-start the ENCODER + DECODER from the released parakeet-tdt-0.6b-v2.nemo and
-# train the JOINT from scratch. The joint output space is V+1 (vocab + blank/EOC)
-# and does not match parakeet's TDT joint (V+1+5), so the joint cannot be loaded.
+# Override the masking probability with e.g.: MASKING_PROB=0.3 sbatch oci_chat/tdt_hainan.sh
 #
-# Default -N 4 (32 GPUs). Override with: sbatch -N 8 oci_chat/chunked_aligner.sh
+# ---------------------------------------------------------------------------
+# OCI launcher to REPRODUCE parakeet-tdt-0.6b-v2 and continue training on
+# Granary v2.0.
+#
+# Default -N 4 (32 GPUs): fine-tuning from a strong checkpoint does not need
+# 64 GPUs, and fewer nodes reduces AIS/lustre contention + idle-GPU risk.
+# Override with: sbatch -N 8 oci_chat/tdt.sh
+#
+# This is a plain offline (full-context) FastConformer-XL TDT model
+# (EncDecRNNTBPEModel with the TDT loss), NOT a CHAT/streaming model. It is used
+# as the reference/baseline: warm-start the WHOLE model (encoder + decoder +
+# joint) from the released parakeet-tdt-0.6b-v2.nemo and keep training on the
+# same Granary v2.0 data the CHAT launchers use.
+#
+# Key reproduction choices:
+#   - Architecture: examples/asr/conf/fastconformer/
+#       fastconformer_tdt_parakeet06b_bpe.yaml -- every architecture field is
+#       copied from parakeet-tdt-0.6b-v2's own model_config.yaml (128 mel,
+#       24-layer d_model=1024 FastConformer, dw_striding 8x, use_bias=false,
+#       xscaling=false, conv_kernel=9 batch_norm; RNNTDecoder pred_rnn_layers=2;
+#       TDT joint num_extra_outputs=5; loss_name=tdt sigma=0.02 omega=0.1).
+#   - Weights: +init_from_nemo_model=<parakeet .nemo> (str form -> loads the FULL
+#       state dict: encoder + decoder + joint, strict=False).
+#   - Tokenizer: the EXACT 1024-BPE SentencePiece tokenizer that ships inside
+#       parakeet-tdt-0.6b-v2.nemo. It is extracted from the .nemo on the login
+#       node (below) and mounted at /tokenizers, so we don't depend on any
+#       external tokenizer directory.
 #
 # Runs MY code (git-synced repo mounted at /code), not the container's NeMo.
 #
 # Prereq: parakeet-tdt-0.6b-v2.nemo must live at ${PARAKEET_NEMO_HOST} on OCI
-# lustre (see PRETRAINED_MODEL_DIR below).
+# lustre (see PRETRAINED_MODEL_DIR below):
+#   /lustre/fs12/portfolios/llmservice/projects/llmservice_nemo_speechlm/users/hainanx/pretrained_models/parakeet-tdt-0.6b-v2.nemo
 #
 # Submit from an OCI login node:
 #   ./sync_to_oci.sh
-#   sbatch oci_chat/chunked_aligner.sh
+#   sbatch oci_chat/tdt.sh
 # ============================================================================
 
 # Secrets live only in token files on the OCI login node. Each file contains
@@ -77,31 +101,16 @@ CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/llmservice/users/heh/containers/n
 PROJECT_NAME="${PROJECT_NAME:-Chat79}"
 
 # ---------------------------------------------------------------------------
-# Chunked-Aligner model + training hyper-parameters
+# parakeet-tdt-0.6b-v2 (offline FastConformer TDT) model + training hyper-params
 # ---------------------------------------------------------------------------
 CONFIG_PATH="${CONFIG_PATH:-/code/examples/asr/conf/fastconformer}"
-CONFIG_NAME="${CONFIG_NAME:-fastconformer_chunked_aligner_parakeet06b_bpe}"
-
-# Number of encoder frames per chunk C (= max tokens emitted per chunk). At 8x
-# subsampling / 10ms hop that is ~80ms per frame, so CHUNK_SIZE=8 ~ 640ms chunks.
-CHUNK_SIZE="${CHUNK_SIZE:-8}"
-# Chunked-aligner loss reduction: mean_volume | mean_batch | sum | mean.
-CA_REDUCTION="${CA_REDUCTION:-mean_volume}"
-
-# Stochastic AR/NAR training (HAINAN decoder masking): probability of zeroing the
-# decoder (prediction-net) contribution to the joint, independently per output
-# position u, during TRAINING only. -1.0 disables it (pure AR); e.g. 0.5 yields a
-# stochastically autoregressive / non-autoregressive model. Inference is unchanged
-# (standard AR chunked greedy decode).
-MASKING_PROB="${MASKING_PROB:--1.0}"
-# Tag the experiment name when decoder masking is on.
-MASK_TAG="$(awk -v p="${MASKING_PROB}" 'BEGIN{ if (p+0 > 0) printf "_mask%s", p }')"
+CONFIG_NAME="${CONFIG_NAME:-fastconformer_tdt_parakeet06b_bpe}"
 
 MAX_STEPS="${MAX_STEPS:-500000}"
 LIMIT_TRAIN_BATCHES="${LIMIT_TRAIN_BATCHES:-6000}"
 EVALS_PER_EPOCH="${EVALS_PER_EPOCH:-1}"
 VAL_CHECK_INTERVAL=$(( LIMIT_TRAIN_BATCHES / EVALS_PER_EPOCH ))
-# Warm-started encoder/decoder + a from-scratch joint -> modest peak LR + warmup.
+# Continuing from a converged checkpoint -> modest peak LR + warmup.
 LR="${LR:-1e-4}"
 WARMUP_STEPS="${WARMUP_STEPS:-5000}"
 BATCH_DURATION="${BATCH_DURATION:-120}"
@@ -111,16 +120,24 @@ EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-16}"
 SAVE_TOP_K="${SAVE_TOP_K:-5}"
 PRECISION="${PRECISION:-bf16-mixed}"
 # DataLoader workers per rank. Granary audio is served over AIS; too few workers
-# leaves GPUs waiting and triggers cluster "idle GPU" alerts.
+# leaves GPUs waiting and triggers cluster "idle GPU" alerts even while W&B
+# still shows loss moving (steps are just slow / bursty).
 NUM_WORKERS="${NUM_WORKERS:-8}"
 # Batch AIS audio fetch (Lhotse>=1.32). Big win vs per-cut HTTP GETs.
 USE_AIS_GET_BATCH="${USE_AIS_GET_BATCH:-true}"
-# IMPORTANT: the parakeet encoder uses batch_norm. Lightning `bf16` (bf16-true)
-# casts BN to bf16 and commonly produces Inf loss at step 0. Use bf16-mixed (or
-# 32). Override with PRECISION=32 if needed.
+# TDT loss reduction: mean_volume | mean_batch | sum | mean.
+RNNT_REDUCTION="${RNNT_REDUCTION:-mean_volume}"
+# HAINAN stochastic AR/NAR: probability of masking the decoder (prediction-net)
+# contribution to the joint, per output position, during TRAINING only. Default
+# 0.5 (the HAINAN default); set -1.0 to disable (pure AR).
+MASKING_PROB="${MASKING_PROB:-0.5}"
+MASK_TAG="$(awk -v p="${MASKING_PROB}" 'BEGIN{ if (p+0 > 0) printf "_mask%s", p }')"
+# IMPORTANT: parakeet-tdt uses batch_norm in the encoder. Lightning `bf16`
+# (bf16-true) casts BN to bf16 and commonly produces Inf loss at step 0.
+# Use bf16-mixed (or 32) instead. Override with PRECISION=32 if needed.
 
 # ---------------------------------------------------------------------------
-# Warm-start: ENCODER + DECODER only from parakeet-tdt-0.6b-v2 (joint from scratch)
+# Warm-start: the FULL parakeet-tdt-0.6b-v2 model (encoder + decoder + joint)
 # ---------------------------------------------------------------------------
 PRETRAINED_MODEL_DIR="${PRETRAINED_MODEL_DIR:-/lustre/fs12/portfolios/llmservice/projects/llmservice_nemo_speechlm/users/hainanx/pretrained_models}"
 PARAKEET_BASENAME="${PARAKEET_BASENAME:-parakeet-tdt-0.6b-v2.nemo}"
@@ -131,14 +148,12 @@ if [ ! -f "${PARAKEET_NEMO_HOST}" ]; then
     echo "       Copy parakeet-tdt-0.6b-v2.nemo there or set PARAKEET_NEMO_HOST/PRETRAINED_MODEL_DIR." >&2
     exit 1
 fi
-# Load ONLY encoder + decoder from parakeet. The chunked-aligner joint has V+1
-# outputs (vs parakeet's TDT V+1+5), so it cannot be loaded and is trained from
-# scratch. The dict form of init_from_nemo_model + include does a partial load.
-INIT_OVERRIDE="+init_from_nemo_model.parakeet.path=${PARAKEET_NEMO_CONTAINER} +init_from_nemo_model.parakeet.include=[encoder,decoder]"
+# Load the entire state dict (encoder + decoder + joint) from the .nemo.
+INIT_OVERRIDE="+init_from_nemo_model=${PARAKEET_NEMO_CONTAINER}"
 
 # ---------------------------------------------------------------------------
-# Tokenizer: EXACT tokenizer packaged inside parakeet-tdt-0.6b-v2.nemo (so the
-# warm-started decoder embedding table matches). Extract once on the login node.
+# Tokenizer: EXACT tokenizer packaged inside parakeet-tdt-0.6b-v2.nemo.
+# Extract it once (on the login node) into a stable dir and mount at /tokenizers.
 # ---------------------------------------------------------------------------
 TOKENIZER_DIR="${TOKENIZER_DIR:-${PRETRAINED_MODEL_DIR}/${PARAKEET_BASENAME%.nemo}_tokenizer}"
 if [ ! -f "${TOKENIZER_DIR}/tokenizer.model" ]; then
@@ -157,7 +172,7 @@ if [ ! -f "${TOKENIZER_DIR}/tokenizer.model" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Data (Granary 2.0 train + English mcv11 dev, same as the CHAT / TDT runs)
+# Data (Granary 2.0 pre-aligned train + English mcv11 dev, same as the CHAT runs)
 # ---------------------------------------------------------------------------
 GRANARY2_CFG=/lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/users/dongjig/aligned_amos/granary_v2_en_pnc_qwen_aligned_filtered/granary_v2_en_pnc_qwen_aligned_filtered_safe_iad_s3_audio.yaml
 TRAIN_INPUT_CFG="${TRAIN_INPUT_CFG:-$GRANARY2_CFG}"
@@ -165,7 +180,7 @@ TRAIN_INPUT_CFG="${TRAIN_INPUT_CFG:-$GRANARY2_CFG}"
 # English dev set (same as the SpeechLM baseline / CHAT launchers).
 VAL_MANIFEST="${VAL_MANIFEST:-[/data/canary/canary_v0/manifests/data/ASR/MMLPC/en/val_test/mcv11/mcv11_dev_clean_pcstrip_en_2k.json]}"
 
-EXP_NAME="${EXP_NAME:-${CLUSTER}_chunked_aligner_parakeet_g2_chunk${CHUNK_SIZE}${MASK_TAG}_lr${LR}_${PRECISION}_n${SLURM_JOB_NUM_NODES}}"
+EXP_NAME="${EXP_NAME:-${CLUSTER}_tdt_hainan_parakeet06bv2_g2${MASK_TAG}_lr${LR}_${PRECISION}_n${SLURM_JOB_NUM_NODES}}"
 
 # Write-heavy outputs (results/checkpoints, HF cache, checkpoint temp) go to the
 # nemotron project, which has free quota. Override with OUTPUT_PREFIX.
@@ -191,13 +206,18 @@ ERRFILE=${RESULTS_DIR}/error-%j-%n.out
 
 MOUNTS="--container-mounts=${SPEECHLM_PROJECT_DIR}:${SPEECHLM_PROJECT_DIR},${H_DIR}:${H_DIR},$HAINAN_DIR:$HAINAN_DIR,$CODE_DIR:/code,$RESULTS_DIR:/results,$DATA_DIR:/data,$PRETRAINED_MODEL_DIR:/pretrained,$CHECKPOINT_DIR:/checkpoints,${HFCACHE}:/hfcache/,${TOKENIZER_DIR}:/tokenizers,/lustre/fsw:/lustre/fsw,/lustre/fs12:/lustre/fs12"
 
+# SLURM_JOB_NUM_NODES=1
+# GPUS_PER_NODE=1
+# export CUDA_VISIBLE_DEVICES=0
+
 read -r -d '' cmd <<EOF
-echo "*******Chunked-Aligner (AR) - Granary 2.0********" \
-&& echo "*** CONFIG: ${CONFIG_NAME} (loss_type=chunked_aligner, chunk_size=${CHUNK_SIZE}, joint.masking_prob=${MASKING_PROB}) ***" \
-&& echo "*** INIT: ${PARAKEET_NEMO_CONTAINER} (encoder+decoder only; joint trained from scratch) ***" \
+echo "*******REPRODUCE parakeet-tdt-0.6b-v2 (offline FastConformer TDT) - Granary 2.0********" \
+&& echo "*** CONFIG: ${CONFIG_NAME} (arch mirrors parakeet-tdt-0.6b-v2) ***" \
+&& echo "*** HAINAN: stochastic AR/NAR joint.masking_prob=${MASKING_PROB} (training only) ***" \
+&& echo "*** INIT: ${PARAKEET_NEMO_CONTAINER} (FULL model: encoder+decoder+joint) ***" \
 && echo "*** TOKENIZER: /tokenizers (extracted from the parakeet .nemo) ***" \
 && echo "*** PRECISION: ${PRECISION} (use bf16-mixed/32 with batch_norm; bf16-true often -> Inf) ***" \
-&& echo "*** DATA: Granary 2.0 (lhotse) -> ${TRAIN_INPUT_CFG} ***" \
+&& echo "*** DATA: Granary 2.0 pre-aligned (lhotse) -> ${TRAIN_INPUT_CFG} ***" \
 && echo "*** RANK DIAG: SLURM_PROCID=\${SLURM_PROCID:-?} SLURM_LOCALID=\${SLURM_LOCALID:-?} SLURM_NTASKS=\${SLURM_NTASKS:-?} CUDA_VISIBLE_DEVICES=\${CUDA_VISIBLE_DEVICES:-?} ***" \
 && nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used --format=csv,noheader \
 && export WANDB_API_KEY=${WANDB} \
@@ -218,18 +238,15 @@ echo "*******Chunked-Aligner (AR) - Granary 2.0********" \
 && export AIS_ENDPOINT=http://asr.iad.oci.aistore.nvidia.com:51080 \
 && export AIS_AUTHN_TOKEN="${AIS_AUTHN_TOKEN}" \
 && export NEMO_DATA_STORE_CACHE_DIR=/lustre/fsw/portfolios/llmservice/users/heh/nemo_cache \
-&& echo "Starting training (running MY code at /code, Chunked-Aligner AR, GRANARY 2.0 data)" \
+&& echo "Starting training (running MY code at /code, parakeet-tdt-0.6b-v2 reproduction, GRANARY 2.0 data)" \
 && python /code/examples/asr/asr_transducer/speech_to_text_rnnt_bpe.py \
     --config-path=${CONFIG_PATH} \
     --config-name=${CONFIG_NAME} \
     name=${EXP_NAME} \
     ${INIT_OVERRIDE} \
-    ++model.loss_type=chunked_aligner \
-    ++model.chunked_aligner.chunk_size=${CHUNK_SIZE} \
-    ++model.chunked_aligner.reduction=${CA_REDUCTION} \
-    ++model.joint.masking_prob=${MASKING_PROB} \
     model.skip_nan_grad=true \
     model.compute_eval_loss=false \
+    ++model.rnnt_reduction=${RNNT_REDUCTION} \
     ++model.train_ds.use_lhotse=true \
     ++model.train_ds.input_cfg=${TRAIN_INPUT_CFG} \
     model.train_ds.manifest_filepath=null \
@@ -240,6 +257,8 @@ echo "*******Chunked-Aligner (AR) - Granary 2.0********" \
     ++model.train_ds.num_buckets=${NUM_BUCKETS} \
     ++model.train_ds.use_start_end_token=false \
     ++model.train_ds.text_field=text \
+    ++model.joint.num_extra_outputs=5 \
+    ++model.joint.masking_prob=${MASKING_PROB} \
     model.train_ds.max_duration=${MAX_DURATION} \
     model.train_ds.num_workers=${NUM_WORKERS} \
     model.train_ds.shuffle=true \
@@ -279,5 +298,7 @@ echo "*******Chunked-Aligner (AR) - Granary 2.0********" \
 EOF
 
 srun -o $OUTFILE -e $ERRFILE --container-image="$CONTAINER" $MOUNTS bash -c "${cmd}"
+
+# bash -c "${cmd}"
 
 set +x
