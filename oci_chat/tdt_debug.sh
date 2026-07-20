@@ -232,7 +232,7 @@ echo "*******REPRODUCE parakeet-tdt-0.6b-v2 (offline FastConformer TDT) - Granar
 && git rev-parse HEAD \
 && export PYTHONPATH="/code/.:\${PYTHONPATH}" \
 && python -c "import nemo, nemo.collections.asr; print('USING NeMo FROM:', nemo.__file__)" \
-&& pip show torch \
+&& python -c "import torch; print('torch:', torch.__version__)" \
 && export OMP_NUM_THREADS=1 \
 && export HF_HOME="/hfcache/" \
 && export HF_TOKEN=${HF_TOKEN} \
