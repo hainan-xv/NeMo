@@ -167,16 +167,24 @@ def build_chunk_restricted_mask(
     query_abs_pos: Tensor,
     key_abs_pos: Tensor,
     dtype: torch.dtype,
+    restrict_audio_queries: bool = False,
 ) -> Tensor:
     """Build a 4D additive attention mask enforcing chunk-restricted audio attention.
 
     A position is allowed to attend iff: it is causal (``key_abs_pos <=
     query_abs_pos``), the key is not padding, and it is NOT the case that a
-    **text** query attends to an **audio** key from a different chunk. In other
-    words, text (transcription) queries may attend to all text/system tokens and
-    only their own chunk's audio frames; audio queries keep full causal
-    attention. Cross-chunk information therefore flows only through the emitted
-    text.
+    query attends to an **audio** key from a different chunk. In other words,
+    text (transcription) queries may attend to all text/system tokens and only
+    their own chunk's audio frames. Cross-chunk information therefore flows only
+    through the emitted text.
+
+    ``restrict_audio_queries`` controls whether the cross-chunk-audio block also
+    applies to **audio** queries:
+      * ``False`` (default): only **text** queries are restricted; audio queries
+        keep full causal attention (``restrict_audio_to_own_chunk`` behavior).
+      * ``True``: **every** query (text and audio) is barred from a different
+        chunk's audio, so each chunk's audio is independent of every other
+        chunk's audio (``restrict_audio_cross_chunk`` behavior).
 
     A text token's chunk id is the chunk of the audio run it follows (see
     :func:`audio_positions_and_chunk_ids`), so the transcription emitted after
@@ -191,24 +199,26 @@ def build_chunk_restricted_mask(
     """
     causal = query_abs_pos[:, :, None] >= key_abs_pos[:, None, :]  # (B, Lq, Lk)
     valid = key_valid[:, None, :]  # (B, 1, Lk)
-    query_is_text = ~query_is_audio
-    text_to_cross_chunk_audio = (
-        query_is_text[:, :, None]
-        & key_is_audio[:, None, :]
-        & (query_chunk_id[:, :, None] != key_chunk_id[:, None, :])
+    cross_chunk_audio = key_is_audio[:, None, :] & (
+        query_chunk_id[:, :, None] != key_chunk_id[:, None, :]
     )
-    allowed = causal & valid & ~text_to_cross_chunk_audio  # (B, Lq, Lk)
+    if not restrict_audio_queries:
+        # Only text queries are barred from cross-chunk audio; audio queries stay causal.
+        cross_chunk_audio = cross_chunk_audio & (~query_is_audio)[:, :, None]
+    allowed = causal & valid & ~cross_chunk_audio  # (B, Lq, Lk)
 
     additive = torch.zeros_like(allowed, dtype=dtype)
     additive = additive.masked_fill(~allowed, torch.finfo(dtype).min)
     return additive.unsqueeze(1)  # (B, 1, Lq, Lk)
 
 
-def build_training_chunk_restricted_mask(input_tokens: Tensor, pad_id: int, dtype: torch.dtype) -> Tensor:
+def build_training_chunk_restricted_mask(
+    input_tokens: Tensor, pad_id: int, dtype: torch.dtype, restrict_audio_queries: bool = False
+) -> Tensor:
     """Full-sequence chunk-restricted 4D mask for teacher-forced training.
 
     ``query`` and ``key`` axes are the same length ``L``; absolute positions are
-    ``0..L-1``.
+    ``0..L-1``. See :func:`build_chunk_restricted_mask` for ``restrict_audio_queries``.
     """
     is_audio, chunk_id = audio_positions_and_chunk_ids(input_tokens)
     key_valid = input_tokens != pad_id
@@ -223,6 +233,7 @@ def build_training_chunk_restricted_mask(input_tokens: Tensor, pad_id: int, dtyp
         query_abs_pos=abs_pos,
         key_abs_pos=abs_pos,
         dtype=dtype,
+        restrict_audio_queries=restrict_audio_queries,
     )
 
 
@@ -536,6 +547,16 @@ class StreamingSTTModelConfig:
     # Applied identically in training and fixed-chunk inference via a custom 4D
     # additive mask. Only valid for chunk_size > 0.
     restrict_audio_to_own_chunk: bool = False
+    # Strict superset of restrict_audio_to_own_chunk: when True, NO query (text
+    # OR audio) may attend to a different chunk's audio frames — audio queries
+    # are also barred from earlier chunks' audio (not just text queries). This
+    # makes each chunk's audio representation independent of every other chunk's
+    # audio, so the LLM models p(text_k | text_<k, audio_k): predict the current
+    # chunk's tokens from the text history plus only this chunk's audio. Enables
+    # the same restricted-attention machinery as restrict_audio_to_own_chunk;
+    # the two are equivalent for text queries and differ only for audio queries.
+    # Only valid for chunk_size > 0.
+    restrict_audio_cross_chunk: bool = False
     # --- Two-stream last-layer fusion (fixed chunking only) ---
     # When True, the LLM processes the TEXT stream alone through layers[:-1]
     # (a contiguous text-only sequence with its own causal mask and positions).
@@ -773,13 +794,19 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             raise ValueError("chunk_classifier_use_at_inference=True requires use_chunk_classifier=True")
 
         # --- Chunk-restricted audio attention (fixed chunking only) ---
-        if self.core_cfg.restrict_audio_to_own_chunk:
+        if self.core_cfg.restrict_audio_to_own_chunk and self.core_cfg.restrict_audio_cross_chunk:
+            raise ValueError(
+                "restrict_audio_to_own_chunk and restrict_audio_cross_chunk are mutually "
+                "exclusive (the latter is a strict superset of the former); enable only one."
+            )
+        if self.chunk_restricted_attention_enabled:
+            _mode = "restrict_audio_cross_chunk" if self.restrict_audio_queries else "restrict_audio_to_own_chunk"
             assert self._chunk_size_repr > 0, (
-                "restrict_audio_to_own_chunk=True requires fixed chunking "
+                f"{_mode}=True requires fixed chunking "
                 f"(chunk_size>0), got chunk_size={self._chunk_size_repr}"
             )
             assert not self.core_cfg.use_chunk_classifier, (
-                "restrict_audio_to_own_chunk is mutually exclusive with use_chunk_classifier "
+                f"{_mode} is mutually exclusive with use_chunk_classifier "
                 "(the latter requires chunk_size=0)."
             )
             # Custom 4D additive masks are only honored by the eager and sdpa
@@ -787,21 +814,29 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             attn_impl = getattr(self.llm.config, "_attn_implementation", None)
             if attn_impl not in ("eager", "sdpa"):
                 logging.warning(
-                    "restrict_audio_to_own_chunk needs a 4D-mask-capable attention backend; "
+                    "%s needs a 4D-mask-capable attention backend; "
                     "found _attn_implementation=%r. Forcing 'sdpa'.",
+                    _mode,
                     attn_impl,
                 )
                 self.llm.config._attn_implementation = "sdpa"
             # Distinctive banner so it is obvious in the logs (a) that this
             # checkout's code is running and (b) that the restricted-attention
             # mask is active for this run.
+            _audio_query_desc = (
+                "audio queries ALSO attend only to their own chunk's audio (models "
+                "p(text_k | text_<k, audio_k))."
+                if self.restrict_audio_queries
+                else "audio queries stay causal."
+            )
             logging.info("=" * 72)
             logging.info(
-                "[restricted-attention] restrict_audio_to_own_chunk=True | chunk_size=%d | "
-                "attn_impl=%s -- text queries attend to all text + only their own chunk's audio; "
-                "audio queries stay causal.",
+                "[restricted-attention] %s=True | chunk_size=%d | "
+                "attn_impl=%s -- text queries attend to all text + only their own chunk's audio; %s",
+                _mode,
                 self._chunk_size_repr,
                 self.llm.config._attn_implementation,
+                _audio_query_desc,
             )
             logging.info("=" * 72)
 
@@ -815,8 +850,9 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 "two_stream_last_layer is mutually exclusive with use_chunk_classifier "
                 "(the latter requires chunk_size=0)."
             )
-            assert not self.core_cfg.restrict_audio_to_own_chunk, (
-                "two_stream_last_layer is mutually exclusive with restrict_audio_to_own_chunk."
+            assert not self.chunk_restricted_attention_enabled, (
+                "two_stream_last_layer is mutually exclusive with restrict_audio_to_own_chunk / "
+                "restrict_audio_cross_chunk."
             )
             # Number of top layers that process the interleaved sequence.
             _n_llm_layers = int(self.llm.config.num_hidden_layers)
@@ -1081,6 +1117,23 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
     @property
     def has_blank(self) -> bool:
         return self.blank_token != ""
+
+    @property
+    def chunk_restricted_attention_enabled(self) -> bool:
+        """True when either chunk-restricted audio-attention variant is active.
+
+        ``restrict_audio_to_own_chunk`` restricts text queries only;
+        ``restrict_audio_cross_chunk`` additionally restricts audio queries
+        (strict superset). Both share the same 4D-mask machinery; the only
+        difference is the ``restrict_audio_queries`` flag threaded into the mask
+        builders (see :attr:`restrict_audio_queries`).
+        """
+        return bool(self.core_cfg.restrict_audio_to_own_chunk or self.core_cfg.restrict_audio_cross_chunk)
+
+    @property
+    def restrict_audio_queries(self) -> bool:
+        """Whether audio queries (not just text) are barred from cross-chunk audio."""
+        return bool(self.core_cfg.restrict_audio_cross_chunk)
 
     # ------------------------------------------------------------------
     # Core: efficient audio-text embedding interleaving
@@ -1410,9 +1463,12 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         inputs = self._build_input_embeds(batch.input_tokens, batch.audios, batch.audio_lens)
         use_aux = self.core_cfg.use_chunk_classifier
         attention_mask = inputs["attention_mask"]
-        if self.core_cfg.restrict_audio_to_own_chunk:
+        if self.chunk_restricted_attention_enabled:
             attention_mask = build_training_chunk_restricted_mask(
-                batch.input_tokens, self.text_pad_id, inputs["input_embeds"].dtype
+                batch.input_tokens,
+                self.text_pad_id,
+                inputs["input_embeds"].dtype,
+                restrict_audio_queries=self.restrict_audio_queries,
             )
             if not getattr(self, "_restricted_mask_logged", False):
                 self._restricted_mask_logged = True
@@ -2135,7 +2191,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             # Generated tokens are text. Under the chunk-restricted mask they may
             # attend to all text but only the current chunk's audio, so extend the
             # per-position bookkeeping and pass the 4D mask to match training.
-            if self.core_cfg.restrict_audio_to_own_chunk and state.is_audio is not None:
+            if self.chunk_restricted_attention_enabled and state.is_audio is not None:
                 new_is_audio = torch.zeros(B, 1, dtype=torch.bool, device=state.attention_mask.device)
                 # Generated transcription belongs to the current (most recent) chunk.
                 new_chunk_id = torch.full(
@@ -2328,7 +2384,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
 
         # System-prompt positions are all text (chunk 0); seed per-position
         # bookkeeping only when the chunk-restricted attention mask is enabled.
-        if self.core_cfg.restrict_audio_to_own_chunk:
+        if self.chunk_restricted_attention_enabled:
             init_is_audio = torch.zeros(batch_size, max_sys_len, dtype=torch.bool, device=device)
             init_chunk_id = torch.zeros(batch_size, max_sys_len, dtype=torch.long, device=device)
         else:
@@ -2392,6 +2448,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             query_abs_pos=query_abs,
             key_abs_pos=key_abs,
             dtype=dtype,
+            restrict_audio_queries=self.restrict_audio_queries,
         )
 
     @torch.no_grad()
@@ -2491,7 +2548,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         # Chunk-restricted attention: this turn's audio slots belong to a new
         # chunk. Text queries emitted for this chunk may only attend to this
         # chunk's audio (plus all text); audio queries keep full causal access.
-        if self.core_cfg.restrict_audio_to_own_chunk and state.is_audio is not None:
+        if self.chunk_restricted_attention_enabled and state.is_audio is not None:
             carry = state.n_audio_chunks
             new_chunk = carry + 1
             input_is_audio = audio_mask  # (B, input_len)
@@ -2545,7 +2602,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 dim=1,
             )
             # Footer tokens are text belonging to the current chunk.
-            if self.core_cfg.restrict_audio_to_own_chunk and state.is_audio is not None:
+            if self.chunk_restricted_attention_enabled and state.is_audio is not None:
                 footer_is_audio = torch.zeros(B, flen, dtype=torch.bool, device=device)
                 footer_chunk_id = torch.full(
                     (B, flen), state.n_audio_chunks, dtype=state.chunk_id.dtype, device=device

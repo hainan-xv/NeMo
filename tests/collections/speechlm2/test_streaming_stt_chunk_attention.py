@@ -116,3 +116,97 @@ def test_inference_incremental_mask_matches_training():
 
     expected = train_mask[:, :, q_start:q_end, :kv_end]
     assert torch.equal(incremental, expected)
+
+
+# ---------------------------------------------------------------------------
+# Strict variant: restrict_audio_cross_chunk (restrict_audio_queries=True).
+# NO query (text OR audio) may attend to another chunk's audio. Models
+# p(text_k | text_<k, audio_k).
+# ---------------------------------------------------------------------------
+
+
+def test_strict_audio_query_blocks_previous_chunk_audio():
+    input_tokens = torch.tensor([SEQ], dtype=torch.long)
+    mask = build_training_chunk_restricted_mask(input_tokens, PAD, torch.float32, restrict_audio_queries=True)
+    assert mask.shape == (1, 1, len(SEQ), len(SEQ))
+
+    # Query = chunk-2 audio (index 7): cross-chunk audio is now blocked too.
+    assert _blocked(mask[0, 0, 7, 2])  # chunk-1 audio -> BLOCKED (was allowed in non-strict)
+    assert _blocked(mask[0, 0, 9, 4])  # chunk-1 audio -> BLOCKED
+    # But audio may still attend to all prior text and its own chunk's audio.
+    assert _allowed(mask[0, 0, 7, 0])  # system text -> allowed
+    assert _allowed(mask[0, 0, 7, 5])  # text turn 1 -> allowed
+    assert _allowed(mask[0, 0, 7, 7])  # self -> allowed
+    assert _allowed(mask[0, 0, 9, 7])  # same-chunk earlier audio frame -> allowed
+    assert _blocked(mask[0, 0, 7, 8])  # future -> causal block
+
+
+def test_strict_text_query_matches_nonstrict():
+    """Text queries are restricted identically in both variants (audio queries differ)."""
+    input_tokens = torch.tensor([SEQ], dtype=torch.long)
+    strict = build_training_chunk_restricted_mask(input_tokens, PAD, torch.float32, restrict_audio_queries=True)
+
+    # Chunk-2 transcription text (index 10): own chunk audio only, same as non-strict.
+    assert _blocked(strict[0, 0, 10, 2])  # chunk-1 audio blocked
+    assert _allowed(strict[0, 0, 10, 7])  # chunk-2 audio (own) allowed
+    assert _allowed(strict[0, 0, 10, 0])  # system text allowed
+    assert _allowed(strict[0, 0, 10, 5])  # text turn 1 allowed
+    assert _allowed(strict[0, 0, 10, 10])  # self allowed
+    assert _blocked(strict[0, 0, 10, 11])  # future text causal block
+
+
+def test_strict_only_differs_on_audio_query_cross_chunk_audio():
+    """Strict and non-strict masks differ EXACTLY at audio-query x cross-chunk-audio-key cells."""
+    input_tokens = torch.tensor([SEQ], dtype=torch.long)
+    nonstrict = build_training_chunk_restricted_mask(input_tokens, PAD, torch.float32)
+    strict = build_training_chunk_restricted_mask(input_tokens, PAD, torch.float32, restrict_audio_queries=True)
+
+    is_audio, chunk_id = audio_positions_and_chunk_ids(input_tokens)
+    diff = ~torch.isclose(nonstrict, strict)  # (1, 1, L, L)
+    for q in range(len(SEQ)):
+        for k in range(len(SEQ)):
+            if bool(diff[0, 0, q, k]):
+                # Only audio-query -> different-chunk audio-key cells may differ,
+                # and only when causal (q >= k).
+                assert bool(is_audio[0, q]) and bool(is_audio[0, k])
+                assert int(chunk_id[0, q]) != int(chunk_id[0, k])
+                assert q >= k
+                # Non-strict allowed it; strict blocks it.
+                assert _allowed(nonstrict[0, 0, q, k]) and _blocked(strict[0, 0, q, k])
+    # There is at least one such differing cell in this layout (chunk2 audio -> chunk1 audio).
+    assert bool(diff.any())
+
+
+def test_strict_padding_key_blocked_everywhere():
+    input_tokens = torch.tensor([SEQ], dtype=torch.long)
+    mask = build_training_chunk_restricted_mask(input_tokens, PAD, torch.float32, restrict_audio_queries=True)
+    for query in range(len(SEQ)):
+        assert _blocked(mask[0, 0, query, 12])
+
+
+def test_strict_inference_incremental_mask_matches_training():
+    """Incremental (key-cache) construction must equal the full-sequence training mask (strict)."""
+    input_tokens = torch.tensor([SEQ], dtype=torch.long)
+    train_mask = build_training_chunk_restricted_mask(input_tokens, PAD, torch.float32, restrict_audio_queries=True)
+
+    is_audio, chunk_id = audio_positions_and_chunk_ids(input_tokens)
+    key_valid = input_tokens != PAD
+
+    kv_end = 12
+    q_start, q_end = 7, 12
+    abs_pos = torch.arange(len(SEQ)).unsqueeze(0)
+
+    incremental = build_chunk_restricted_mask(
+        key_is_audio=is_audio[:, :kv_end],
+        key_chunk_id=chunk_id[:, :kv_end],
+        key_valid=key_valid[:, :kv_end],
+        query_is_audio=is_audio[:, q_start:q_end],
+        query_chunk_id=chunk_id[:, q_start:q_end],
+        query_abs_pos=abs_pos[:, q_start:q_end],
+        key_abs_pos=abs_pos[:, :kv_end],
+        dtype=torch.float32,
+        restrict_audio_queries=True,
+    )
+
+    expected = train_mask[:, :, q_start:q_end, :kv_end]
+    assert torch.equal(incremental, expected)
