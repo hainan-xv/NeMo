@@ -22,6 +22,25 @@ from lhotse.dataset.collation import collate_vectors
 from nemo.collections.common.tokenizers.aggregate_tokenizer import TokenizerWrapper
 from nemo.collections.common.tokenizers.tokenizer_spec import TokenizerSpec
 from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, NeuralType
+from nemo.utils import logging
+
+
+def _toklog_is_rank0() -> bool:
+    """True on global rank 0 (or when rank is unknown) -- used to throttle debug logs."""
+    for var in ("RANK", "SLURM_PROCID", "LOCAL_RANK"):
+        val = os.environ.get(var)
+        if val is not None:
+            return val == "0"
+    return True
+
+
+# Opt-in training-time tokenization debug logging. Set NEMO_LOG_TOKENIZATION=N to
+# log the original text + token ids + subword pieces + <unk> count for the first N
+# supervisions seen (rank 0 only), so tokenizer/text mismatches are easy to spot
+# (e.g. characters that fall back to <unk>). 0 (default) disables it entirely.
+_TOKLOG_CAP = int(os.environ.get("NEMO_LOG_TOKENIZATION", "0") or 0)
+_TOKLOG_ON = _TOKLOG_CAP > 0 and _toklog_is_rank0()
+_toklog_seen = 0
 
 
 class LhotseSpeechToTextBpeDataset(torch.utils.data.Dataset):
@@ -70,8 +89,48 @@ class LhotseSpeechToTextBpeDataset(torch.utils.data.Dataset):
 
         self.return_cuts = return_cuts
 
+    def _debug_log_tokenization(self, cuts) -> None:
+        """Log original text -> token ids -> subword pieces -> #<unk> for a few samples.
+
+        Enabled by NEMO_LOG_TOKENIZATION=N (rank 0, first N supervisions). Helps
+        confirm how often transcripts fall back to <unk> and on which characters.
+        """
+        global _toklog_seen
+        for c in cuts:
+            for s in c.supervisions:
+                if _toklog_seen >= _TOKLOG_CAP:
+                    return
+                text = s.text or ""
+                ids = s.tokens if getattr(s, "tokens", None) is not None else self.tokenizer(text, s.language)
+                ids = ids.tolist() if torch.is_tensor(ids) else list(ids)
+                try:
+                    pieces = self.tokenizer._tokenizer.ids_to_tokens(ids)
+                except Exception:  # noqa: BLE001 - best-effort debug decode
+                    pieces = None
+                n_unk = sum(1 for p in (pieces or []) if p == "<unk>")
+                _toklog_seen += 1
+                logging.info(
+                    "[tok-debug %d/%d] lang=%s n_tok=%d n_unk=%d\n  TEXT  : %r\n  PIECES: %s\n  IDS   : %s",
+                    _toklog_seen,
+                    _TOKLOG_CAP,
+                    getattr(s, "language", None),
+                    len(ids),
+                    n_unk,
+                    text,
+                    " ".join(pieces) if pieces else "(ids_to_tokens unavailable)",
+                    ids,
+                )
+                if n_unk:
+                    logging.warning(
+                        "[tok-debug] ^ %d <unk> token(s): the tokenizer cannot represent some character(s) "
+                        "in this transcript (they will be trained/decoded as <unk>).",
+                        n_unk,
+                    )
+
     def __getitem__(self, cuts) -> Tuple[torch.Tensor, ...]:
         audio, audio_lens, cuts = self.load_audio(cuts)
+        if _TOKLOG_ON and _toklog_seen < _TOKLOG_CAP:
+            self._debug_log_tokenization(cuts)
         tokens = [
             torch.cat(
                 [
