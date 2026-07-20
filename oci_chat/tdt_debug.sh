@@ -155,8 +155,11 @@ if [ ! -f "${PARAKEET_NEMO_HOST}" ]; then
     echo "       Copy parakeet-tdt-0.6b-v2.nemo there or set PARAKEET_NEMO_HOST/PRETRAINED_MODEL_DIR." >&2
     exit 1
 fi
-# Load the entire state dict (encoder + decoder + joint) from the .nemo.
-INIT_OVERRIDE="+init_from_nemo_model=${PARAKEET_NEMO_CONTAINER}"
+# DEBUG: do NOT warm-start from the parakeet .nemo. This diagnostic run only needs
+# to tokenize transcripts (dataloader), not real weights -- and skipping the load
+# avoids extracting the ~2.5GB .nemo tarball into a temp dir (which triggered
+# "Disk quota exceeded"). The tokenizer is still extracted from the .nemo above.
+INIT_OVERRIDE=""
 
 # ---------------------------------------------------------------------------
 # Tokenizer: EXACT tokenizer packaged inside parakeet-tdt-0.6b-v2.nemo.
@@ -290,6 +293,8 @@ echo "*******REPRODUCE parakeet-tdt-0.6b-v2 (offline FastConformer TDT) - Granar
     trainer.log_every_n_steps=20 \
     exp_manager.exp_dir=/results/${EXP_NAME} \
     exp_manager.name=${EXP_NAME} \
+    ++exp_manager.create_checkpoint_callback=false \
+    ++exp_manager.checkpoint_callback_params.always_save_nemo=false \
     exp_manager.create_wandb_logger=true \
     exp_manager.create_tensorboard_logger=false \
     exp_manager.wandb_logger_kwargs.name=${EXP_NAME} \
