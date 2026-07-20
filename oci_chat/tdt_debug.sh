@@ -21,8 +21,9 @@
 #
 # Differences vs oci_chat/tdt.sh:
 #   * -N 1 (single node; this is a diagnostic run, not a full training job)
-#   * NEMO_LOG_TOKENIZATION=${NEMO_LOG_TOKENIZATION:-200}: logs the first N
-#     supervisions (rank 0) via LhotseSpeechToTextBpeDataset._debug_log_tokenization
+#   * NEMO_LOG_TOKENIZATION=${NEMO_LOG_TOKENIZATION:-200}: logs up to N transcripts
+#     that CONTAIN an <unk> token (rank 0), via
+#     LhotseSpeechToTextBpeDataset._debug_log_tokenization
 #   * EXP_NAME contains "debug" so results/logs never collide with a real run
 #
 # Inspect the tokenization in the run log:

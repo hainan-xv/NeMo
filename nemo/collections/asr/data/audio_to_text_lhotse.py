@@ -35,9 +35,9 @@ def _toklog_is_rank0() -> bool:
 
 
 # Opt-in training-time tokenization debug logging. Set NEMO_LOG_TOKENIZATION=N to
-# log the original text + token ids + subword pieces + <unk> count for the first N
-# supervisions seen (rank 0 only), so tokenizer/text mismatches are easy to spot
-# (e.g. characters that fall back to <unk>). 0 (default) disables it entirely.
+# log the original text + subword pieces + token ids for up to N transcripts that
+# CONTAIN an <unk> token (rank 0 only), so tokenizer/text mismatches are easy to
+# spot (which characters fall back to <unk>). 0 (default) disables it entirely.
 _TOKLOG_CAP = int(os.environ.get("NEMO_LOG_TOKENIZATION", "0") or 0)
 _TOKLOG_ON = _TOKLOG_CAP > 0 and _toklog_is_rank0()
 _toklog_seen = 0
@@ -90,26 +90,48 @@ class LhotseSpeechToTextBpeDataset(torch.utils.data.Dataset):
         self.return_cuts = return_cuts
 
     def _debug_log_tokenization(self, cuts) -> None:
-        """Log original text -> token ids -> subword pieces -> #<unk> for a few samples.
+        """Log original text -> subword pieces -> token ids for transcripts that hit <unk>.
 
-        Enabled by NEMO_LOG_TOKENIZATION=N (rank 0, first N supervisions). Helps
-        confirm how often transcripts fall back to <unk> and on which characters.
+        Enabled by NEMO_LOG_TOKENIZATION=N (rank 0). Only ONE in every transcript that
+        actually contains an <unk> token is logged (up to N total), so the log shows
+        exactly which characters the tokenizer cannot represent.
         """
         global _toklog_seen
+        tok = self.tokenizer._tokenizer
+        # Resolve the <unk> id once (best-effort; cached on the instance).
+        unk_id = getattr(self, "_toklog_unk_id", None)
+        if unk_id is None:
+            try:
+                unk_id = int(tok.token_to_id("<unk>"))
+            except Exception:  # noqa: BLE001
+                unk_id = -1
+            self._toklog_unk_id = unk_id
+
         for c in cuts:
             for s in c.supervisions:
                 if _toklog_seen >= _TOKLOG_CAP:
                     return
                 text = s.text or ""
-                ids = s.tokens if getattr(s, "tokens", None) is not None else self.tokenizer(text, s.language)
-                ids = ids.tolist() if torch.is_tensor(ids) else list(ids)
+                raw = s.tokens if getattr(s, "tokens", None) is not None else self.tokenizer(text, s.language)
+                # Plain python ints (avoids np.int64 clutter and sentencepiece type errors).
+                ids = [int(x) for x in (raw.tolist() if torch.is_tensor(raw) else raw)]
+
                 try:
-                    pieces = self.tokenizer._tokenizer.ids_to_tokens(ids)
+                    pieces = tok.ids_to_tokens(ids)
                 except Exception:  # noqa: BLE001 - best-effort debug decode
                     pieces = None
-                n_unk = sum(1 for p in (pieces or []) if p == "<unk>")
+
+                if unk_id is not None and unk_id >= 0:
+                    n_unk = sum(1 for i in ids if i == unk_id)
+                else:
+                    n_unk = sum(1 for p in (pieces or []) if p == "<unk>")
+
+                # Only surface transcripts that actually use <unk>.
+                if n_unk == 0:
+                    continue
+
                 _toklog_seen += 1
-                logging.info(
+                logging.warning(
                     "[tok-debug %d/%d] lang=%s n_tok=%d n_unk=%d\n  TEXT  : %r\n  PIECES: %s\n  IDS   : %s",
                     _toklog_seen,
                     _TOKLOG_CAP,
@@ -117,15 +139,9 @@ class LhotseSpeechToTextBpeDataset(torch.utils.data.Dataset):
                     len(ids),
                     n_unk,
                     text,
-                    " ".join(pieces) if pieces else "(ids_to_tokens unavailable)",
+                    " ".join(pieces) if pieces else "(pieces unavailable)",
                     ids,
                 )
-                if n_unk:
-                    logging.warning(
-                        "[tok-debug] ^ %d <unk> token(s): the tokenizer cannot represent some character(s) "
-                        "in this transcript (they will be trained/decoded as <unk>).",
-                        n_unk,
-                    )
 
     def __getitem__(self, cuts) -> Tuple[torch.Tensor, ...]:
         audio, audio_lens, cuts = self.load_audio(cuts)
