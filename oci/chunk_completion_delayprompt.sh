@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH -A nemotron_speechprod_asr
-#SBATCH -J nemotron_speechprod_asr:streaming-stt-chunkcompletion
+#SBATCH -J nemotron_speechprod_asr:streaming-stt-chunkcompletion-delayprompt
 #SBATCH -p batch_block1,batch_block3,batch_block4
 #SBATCH -N 8
 #SBATCH --gpus-per-node=8
@@ -81,7 +81,10 @@ PROJECT_NAME=Speechlm79
 # Training parameters (match the granary2 no-blank launcher overrides).
 MAX_STEPS=200000
 VAL_CHECK_INTERVAL=2000
-DELAY=3
+# DELAY=-1 activates multi-delay-prompt training (the recipe's delay_prompts:
+# per batch the dataset samples one of delays 0/2/4 with its matching prompt).
+# Set a fixed delay >=0 to disable and train a single-latency model instead.
+DELAY=-1
 LR=0.0001
 WARMUP_STEPS=10000
 COMPACT_TEMPLATE=true
@@ -99,9 +102,9 @@ DEBUG_VALIDATE_TOKENS="${DEBUG_VALIDATE_TOKENS:-false}"
 
 # Config: OUR chunk-completion recipe, shipped in the synced repo at /code.
 CONFIG_PATH=/code/examples/speechlm2/conf/
-CONFIG_NAME=streaming_stt_granary2_lora_chunkcompletion
+CONFIG_NAME=streaming_stt_granary2_lora_chunkcompletion_delayprompt
 
-EXP_NAME=granary2_chunkcompletion
+EXP_NAME=granary2_chunkcompletion_delayprompt
 
 # Directories for manifests, data, etc.
 # Write-heavy outputs (results/checkpoints, HF cache, checkpoint temp) go to the

@@ -80,13 +80,25 @@ data:
     sample_rate: ${model.sample_rate}
     frame_length_in_secs: ${model.frame_length_in_secs}
     chunk_size: ${model.chunk_size}
-    num_delay_frames: 3
+    num_delay_frames: -1  # -1 activates multi-delay-prompt training (samples delay_prompts below per batch)
     audio_tag: "<audio>"
     blank_token: ${model.blank_token}
     compact_template: ${model.compact_template}
     system_role: system
-    # Concrete "text completion for a chunk of audio" framing.
-    system_prompt: "You are doing streaming speech recognition. Given the transcript so far and the representation of the next audio chunk, output the words spoken in that chunk."
+    # Canonical prompt (also used as the validation prompt via model.val_system_prompt);
+    # set to the medium-latency (delay=2) framing so val is in-distribution.
+    system_prompt: "You are doing streaming speech recognition. Given the transcript so far and the next audio chunk, output the words spoken in that chunk. You may wait a little to gather more context before emitting, trading a small delay for better accuracy."
+    # Multi-delay-prompt training: each batch samples one (delay, prompt) pair.
+    # The delay sets num_delay_frames (how far past a word's end it becomes
+    # "ready") and the prompt states the latency/accuracy trade-off in natural
+    # language, so at inference you pick the prompt for the latency you want.
+    delay_prompts:
+      - delay: 0
+        prompt: "You are doing streaming speech recognition. Given the transcript so far and the next audio chunk, output the words spoken in that chunk. Emit the words as soon as possible, minimizing latency."
+      - delay: 2
+        prompt: "You are doing streaming speech recognition. Given the transcript so far and the next audio chunk, output the words spoken in that chunk. You may wait a little to gather more context before emitting, trading a small delay for better accuracy."
+      - delay: 4
+        prompt: "You are doing streaming speech recognition. Given the transcript so far and the next audio chunk, output the words spoken in that chunk. Wait until you are confident before emitting, prioritizing accuracy over latency."
 
   # Decode-only val_wer runs generate() on raw audio; pin a single fixed size.
   val_dataset_overrides:
@@ -147,7 +159,7 @@ trainer:
 exp_manager:
   exp_dir: null
   explicit_log_dir: null
-  name: streaming_stt_granary2_chunkcompletion
+  name: streaming_stt_granary2_chunkcompletion_delayprompt
   create_tensorboard_logger: true
   create_checkpoint_callback: true
   use_datetime_version: true
