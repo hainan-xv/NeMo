@@ -1,0 +1,189 @@
+# ============================================================================
+# StreamingSTT — chunk-local audio variant of the Granary 2.0 LoRA no-blank
+# recipe (OUR code).
+#
+# Identical to streaming_stt_granary2_lora_noblank_wer.yaml EXCEPT it turns on
+#   model.restrict_audio_cross_chunk: true
+# which restricts the LLM's attention so that NO query (text OR audio) may
+# attend to a different chunk's audio frames. The LLM therefore predicts each
+# chunk's tokens from the text history plus only that chunk's audio —
+# p(text_k | text_<k, audio_k) — instead of attending back over all past audio.
+#
+# The Nemotron cache-aware encoder keeps its [70, 1] left context, so each
+# chunk's frame embeddings still "know the past" acoustically; only the LLM's
+# cross-chunk audio attention is removed. This is a strict superset of
+# restrict_audio_to_own_chunk (which restricts text queries only).
+#
+# Everything else (LLM, encoder, LoRA, data, dev set, optimizer, scheduler,
+# trainer) matches streaming_stt_granary2_lora_noblank_wer.yaml.
+#
+# Absolute grid paths (pretrained models, data configs) resolve on OCI where
+# those trees are mounted; run via our /code checkout.
+# ============================================================================
+
+# Pre-aligned Granary 2.0 data => the online forced aligner is disabled (left
+# commented, mirroring heh's granary2 recipe).
+# forced_aligner:
+#   _target_: nemo.collections.speechlm2.modules.qwen_forced_aligner.QwenForcedAligner
+#   pretrained_model: /lustre/fsw/portfolios/llmservice/users/heh/pretrained_models/huggingface/Qwen/Qwen3-ForcedAligner-0.6B
+#   language: "English"
+
+model:
+  pretrained_llm: /lustre/fsw/portfolios/llmservice/users/heh/pretrained_models/huggingface/Qwen/Qwen3-1.7B
+  pretrained_asr: /lustre/fsw/portfolios/llmservice/users/heh/pretrained_models/huggingface/nvidia/nemotron-speech-streaming-en-0.6b/nemotron-speech-streaming-en-0.6b.nemo
+  load_llm_weights: true
+  load_asr_weights: true
+
+  sample_rate: 16000
+  blank_token: ""            # no-blank: empty chunks emit <|im_end|>
+  frame_length_in_secs: 0.08
+  chunk_size: [2, 4, 7, 10, 14, 28]   # multi chunk-size: one drawn per batch
+  att_context_size: [70, 1]  # left 70; right (lookahead) is set per batch to chunk-1
+  audio_pad_to: 0
+
+  # Compact template (baked in; heh set this via a launcher override).
+  compact_template: true
+
+  # Chunk-local audio: NO query (text or audio) attends to another chunk's
+  # audio. The LLM models p(text_k | text_<k, audio_k). Requires fixed chunking
+  # (chunk_size > 0; the multi chunk-size list above qualifies) and a 4D-mask-
+  # capable attention backend (sdpa / eager; forced to sdpa if needed).
+  restrict_audio_cross_chunk: true
+
+  freeze_speech_encoder: false
+  freeze_modality_adapter: false
+  freeze_modality_proj: false
+  freeze_llm_model: true
+  freeze_llm_head: false
+  freeze_embed_tokens: false
+
+  freeze_params: []
+  prevent_freeze_params: []
+
+  lora:
+    task_type: CAUSAL_LM
+    r: 128
+    lora_alpha: 256
+    lora_dropout: 0.01
+
+  perception:
+    modality_adapter:
+      _target_: nemo.collections.speechlm2.modules.perception.IdentityConnector
+    encoder:
+      # REQUIRED for decode-based val_wer: the cache-aware encoder otherwise
+      # all-reduces the max audio length on every forward, and our streaming
+      # validation decode issues a data-dependent number of forwards per rank,
+      # which desyncs DDP and hangs. Disabling it makes per-rank decode independent.
+      sync_max_audio_length: false
+
+  optimizer:
+    _target_: torch.optim.AdamW
+    lr: 1e-4                 # heh's launcher override (recipe default was 5e-4)
+    betas: [0.9, 0.98]
+    weight_decay: 1e-3
+    foreach: true
+
+  lr_scheduler:
+    _target_: nemo.core.optim.lr_scheduler.CosineAnnealing
+    warmup_steps: 10000      # heh's launcher override (recipe default was 1000)
+    min_lr: 1e-6
+    max_steps: ${trainer.max_steps}
+
+data:
+  # --- StreamingSTTDataset config ---
+  dataset:
+    sample_rate: ${model.sample_rate}
+    frame_length_in_secs: ${model.frame_length_in_secs}
+    chunk_size: ${model.chunk_size}
+    num_delay_frames: 3      # heh's launcher override (recipe default was 1)
+    audio_tag: "<audio>"
+    blank_token: ${model.blank_token}
+    compact_template: ${model.compact_template}
+    system_role: system
+    system_prompt: "Transcribe the audio into text."
+
+  # Build the val dataset at a single fixed size (decode-only val_wer uses raw
+  # audio via generate(), which decodes at the longest size by default).
+  val_dataset_overrides:
+    chunk_size: 14
+
+  # --- Lhotse dataloader config ---
+  train_ds:
+    sample_rate: ${data.dataset.sample_rate}
+    input_cfg: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/users/dongjig/aligned_amos/granary_v2_en_pnc_qwen_aligned_filtered/granary_v2_en_pnc_qwen_aligned_filtered_safe_iad_s3_audio.yaml
+    skip_missing_manifest_entries: true
+    manifest_filepath: null
+    seed: 42
+    shuffle: true
+    shard_seed: "randomized"
+    num_workers: 8
+    force_iterable_dataset: true
+    use_bucketing: true
+    bucket_duration_bins: [4.32,6.0,7.04,7.92,8.8,9.6,10.4,11.12,11.89,12.66,13.47,14.8,16.92,20.0,22.4,29.44,35.0,39.6]
+    bucket_batch_size: [38,29,25,22,20,18,17,15,14,13,12,11,10,8,7,6,5,4]
+    max_duration: 54
+    pad_extra_duration: 0.5
+    pad_extra_duration_prob: 1.0
+
+  validation_ds:
+    datasets:
+      mcv_11_dev:
+        manifest_filepath: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/users/dongjig/aligned_amos/steve_val_mmlpc_mcv11_2k/mcv11_dev_clean_pcstrip_en_2k_qwen_aligned.json
+    sample_rate: ${data.dataset.sample_rate}
+    batch_size: 4
+    num_workers: 4
+    seed: 42
+    shard_seed: "randomized"
+    shuffle: false
+    pad_extra_duration: 0.5
+    pad_extra_duration_prob: 1.0
+
+trainer:
+  devices: -1
+  accelerator: gpu
+  num_nodes: 1
+  precision: bf16-true
+  logger: false
+  enable_checkpointing: false
+  use_distributed_sampler: false
+  max_steps: 200000          # heh's launcher override (recipe default was 100000)
+  limit_train_batches: 2000
+  val_check_interval: ${trainer.limit_train_batches}
+  log_every_n_steps: 10
+  num_sanity_val_steps: 1
+  gradient_clip_val: 1.0
+  accumulate_grad_batches: 1
+  strategy:
+    _target_: lightning.pytorch.strategies.DDPStrategy
+    gradient_as_bucket_view: true
+    find_unused_parameters: true
+
+
+exp_manager:
+  exp_dir: null
+  explicit_log_dir: null
+  name: streaming_stt_granary2_chunklocal
+  create_tensorboard_logger: true
+  create_checkpoint_callback: true
+  use_datetime_version: true
+  max_time_per_run: "00:03:50:00"
+
+  resume_from_checkpoint: null
+  resume_if_exists: true
+  resume_ignore_no_checkpoint: true
+
+  create_wandb_logger: false
+  wandb_logger_kwargs:
+    name: ${exp_manager.name}
+    project: null
+    resume: true
+
+  checkpoint_callback_params:
+    filename: "{step}-{val_wer:.4f}"
+    monitor: val_wer         # our code: autoregressive-decode WER (was val_acc)
+    mode: min                # was max (for val_acc)
+    every_n_train_steps: null
+    every_n_epochs: 1
+    save_top_k: 5
+    always_save_nemo: false
+    save_nemo_on_train_end: false
