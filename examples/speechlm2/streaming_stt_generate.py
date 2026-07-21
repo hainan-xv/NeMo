@@ -86,6 +86,11 @@ class StreamingSTTGenerationConfig:
 @dataclass
 class StreamingSTTEvalConfig:
     pretrained_name: str = ""
+    # Dotted path of the model class to load with ``from_pretrained``. Use
+    # nemo.collections.speechlm2.models.chunk_completion_model.ChunkCompletionSTTModel
+    # for chunk-completion checkpoints (its spine/branch streaming decode); the
+    # default is the interleaved StreamingSTTModel.
+    model_class: str = "nemo.collections.speechlm2.models.StreamingSTTModel"
     inputs: str = ""
     batch_size: int = 64
     num_workers: int = 4
@@ -104,6 +109,11 @@ class StreamingSTTEvalConfig:
     )
     dynamic_min_chunk_size: int = 0  # dynamic chunking: min frames before allowing generation
     dynamic_max_chunk_size: Optional[int] = None  # dynamic chunking: max frames before forcing generation
+    # Decode at this fixed chunk size (encoder frames), overriding the model
+    # config default. For multi chunk-size models the default is the longest
+    # candidate; set e.g. 2/4/7/10/14/28 to measure a specific latency. None keeps
+    # the model default. Ignored for dynamic/offline configs.
+    chunk_size: Optional[int] = None
     # When set, LM-head boundary decision uses a probability threshold:
     # emit when p(user_footer_first_id) ≥ threshold (instead of argmax). Useful
     # to recover boundaries where the LM is moderately confident but loses
@@ -134,7 +144,11 @@ def main(cfg: StreamingSTTEvalConfig):
     else:
         logging.warning("Random seed not set, results will not be deterministic")
 
-    model = StreamingSTTModel.from_pretrained(cfg.pretrained_name)
+    from nemo.utils.model_utils import import_class_by_path
+
+    model_cls = import_class_by_path(cfg.model_class)
+    logging.info(f"Loading model class {cfg.model_class} from {cfg.pretrained_name}")
+    model = model_cls.from_pretrained(cfg.pretrained_name)
     model = model.eval().to(getattr(torch, cfg.dtype)).to(cfg.device)
 
     cuts = guess_parse_cutset(cfg.inputs)
@@ -189,6 +203,7 @@ def main(cfg: StreamingSTTEvalConfig):
             dynamic_min_chunk_size=cfg.dynamic_min_chunk_size,
             dynamic_max_chunk_size=cfg.dynamic_max_chunk_size,
             lm_head_emit_threshold=cfg.lm_head_emit_threshold,
+            chunk_size_override=cfg.chunk_size,
             debug_logs=batch_debug_logs,
         )
         batch_infer_duration = perf_counter() - ts

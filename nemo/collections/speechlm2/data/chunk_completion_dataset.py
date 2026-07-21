@@ -111,6 +111,51 @@ class ChunkCompletionSTTDataset(StreamingSTTDataset):
             f"eot_id={self.eot_id}"
         )
 
+        # --- Multi-delay-prompt training ---
+        # ACTIVATION: set num_delay_frames = -1. Then each batch samples one
+        # (delay, prompt) entry uniformly from delay_prompts and trains the whole
+        # batch with that entry's delay + natural-language instruction. Any
+        # num_delay_frames >= 0 keeps the classic fixed-delay behavior
+        # (backward compatible); delay_prompts is then ignored.
+        self._delay_prompts = None
+        _dp = getattr(self.cfg, "delay_prompts", None)
+        if _dp:
+            parsed = []
+            for e in _dp:
+                delay = int(e["delay"])
+                prompt = str(e["prompt"])
+                if delay < 0:
+                    raise ValueError(f"delay_prompts entry has negative delay: {delay}")
+                parsed.append({"delay": delay, "prompt": prompt})
+            self._delay_prompts = parsed or None
+
+        self._multi_delay = int(self.cfg.num_delay_frames) == -1
+        if self._multi_delay:
+            if not self._delay_prompts:
+                raise ValueError(
+                    "num_delay_frames=-1 activates multi-delay-prompt training, but "
+                    "data.dataset.delay_prompts is empty/unset. Provide a list of "
+                    "{delay, prompt} entries (e.g. delays 0/2/4)."
+                )
+            logging.info(
+                "ChunkCompletionSTTDataset: multi-delay-prompt training (num_delay_frames=-1) over "
+                + ", ".join(f"delay={p['delay']}" for p in self._delay_prompts)
+                + " (one sampled per batch)."
+            )
+        elif self._delay_prompts:
+            logging.warning(
+                "ChunkCompletionSTTDataset: delay_prompts are set but num_delay_frames=%d (not -1); "
+                "multi-delay-prompt training is DISABLED. Set num_delay_frames=-1 to enable it.",
+                int(self.cfg.num_delay_frames),
+            )
+
+    def _sample_delay_prompt(self, rng):
+        """Sample one (num_delay_frames, prompt) uniformly, or None if disabled."""
+        if not self._delay_prompts:
+            return None
+        entry = self._delay_prompts[int(rng.integers(len(self._delay_prompts)))]
+        return entry["delay"], entry["prompt"]
+
     def _messages_to_chunks(self, messages: List[dict]) -> List[ChunkSpec]:
         """Parse alternating user(audio)/assistant(words) turns into ChunkSpecs.
 
@@ -158,7 +203,14 @@ class ChunkCompletionSTTDataset(StreamingSTTDataset):
         else:
             chunk_size = int(self.cfg.chunk_size)
 
-        system_prompts = [cut.custom.get(self.cfg.prompt_field, self.cfg.system_prompt) for cut in cuts]
+        # Multi-delay-prompt (num_delay_frames=-1): sample ONE (delay, prompt) for
+        # the whole batch. Otherwise use the fixed scalar delay + per-cut prompt.
+        if self._multi_delay:
+            num_delay_frames, forced_prompt = self._sample_delay_prompt(self._get_chunk_rng())
+            system_prompts = [forced_prompt] * len(cuts)
+        else:
+            num_delay_frames = self.cfg.num_delay_frames
+            system_prompts = [cut.custom.get(self.cfg.prompt_field, self.cfg.system_prompt) for cut in cuts]
 
         batch_messages = get_llm_messages_for_batch(
             system_role=self.cfg.system_role,
@@ -166,7 +218,7 @@ class ChunkCompletionSTTDataset(StreamingSTTDataset):
             audio_tag=self.cfg.audio_tag,
             blank_token=self.cfg.blank_token,
             chunk_size=chunk_size,
-            num_delay_frames=self.cfg.num_delay_frames,
+            num_delay_frames=num_delay_frames,
             audio_durations_secs=audio_durations_secs,
             frame_length_in_secs=self.cfg.frame_length_in_secs,
             alignments=alignments,

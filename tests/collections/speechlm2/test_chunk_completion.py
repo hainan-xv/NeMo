@@ -28,6 +28,7 @@ import torch
 from nemo.collections.speechlm2.data.streaming_stt_dataset import AUDIO_TOKEN_IDX, IGNORE_INDEX
 from nemo.collections.speechlm2.parts.chunk_completion import (
     ChunkSpec,
+    batched_stream_decode_chunk_completion,
     build_chunk_completion_mask,
     build_packed_chunk_example,
     build_separate_chunk_examples,
@@ -214,6 +215,35 @@ def test_messages_to_chunks_explicit_blank_sentinel():
     assert [c.audio_len for c in chunks] == [2, 1]
     assert chunks[0].target_ids == []
     assert chunks[1].target_ids == [ord(c) for c in "hi"]
+
+
+def _cc_dataset_class():
+    from nemo.collections.speechlm2.data.chunk_completion_dataset import ChunkCompletionSTTDataset
+
+    return ChunkCompletionSTTDataset
+
+
+def test_delay_prompt_sampling_pairs_and_covers_all():
+    import numpy as np
+
+    ds = object.__new__(_cc_dataset_class())  # bypass heavy __init__
+    ds._delay_prompts = [{"delay": 0, "prompt": "A"}, {"delay": 2, "prompt": "B"}, {"delay": 4, "prompt": "C"}]
+    valid = {(0, "A"), (2, "B"), (4, "C")}
+    rng = np.random.default_rng(0)
+    seen = set()
+    for _ in range(200):
+        got = ds._sample_delay_prompt(rng)
+        assert got in valid  # delay stays paired with its own prompt
+        seen.add(got)
+    assert seen == valid  # all three settings get sampled
+
+
+def test_delay_prompt_disabled_returns_none():
+    import numpy as np
+
+    ds = object.__new__(_cc_dataset_class())
+    ds._delay_prompts = None
+    assert ds._sample_delay_prompt(np.random.default_rng(0)) is None
 
 
 def test_collate_shapes_and_padding():
@@ -409,3 +439,44 @@ def test_stream_decode_matches_forced_packed():
         assert pred[idx_k[:u]].tolist() == words, f"chunk {k}: stream words != packed argmax"
         if u < max_new:  # terminated on eot -> that decision must reproduce
             assert int(pred[idx_k[u]]) == EOT, f"chunk {k}: expected eot at terminating position"
+
+
+@torch.no_grad()
+def test_batched_decode_matches_per_utterance():
+    """Batched chunk-synchronous decode must equal per-utterance stream decode.
+
+    Different utterances have different #chunks, chunk lengths, and (greedy) word
+    counts, exercising left-padding, per-stream position_ids, and finished-stream
+    masking. Left-padding + per-row cumsum positions must reproduce each stream's
+    standalone greedy output exactly.
+    """
+    model = _tiny_qwen3()
+    H = model.config.hidden_size
+    embed = model.get_input_embeddings()
+    pad_id = 0
+    chunk_size = 2
+    max_new = 4
+
+    torch.manual_seed(999)
+    instrs = [[5, 6, 7], [8, 9], [10, 11, 12, 13]]
+    # Different total frame counts -> different #chunks (3, 1, 4 chunks).
+    frames_list = [torch.randn(6, H), torch.randn(2, H), torch.randn(7, H)]
+
+    # Per-utterance reference.
+    ref = []
+    for instr, frames in zip(instrs, frames_list):
+        per_chunk = stream_decode_chunk_completion(
+            llm=model, embed_tokens=embed, instruction_ids=instr, frames=frames,
+            chunk_size=chunk_size, vision_start_id=VS, vision_end_id=VE, eot_id=EOT,
+            max_new_tokens=max_new,
+        )
+        ref.append([t for chunk in per_chunk for t in chunk])
+
+    # Batched.
+    got = batched_stream_decode_chunk_completion(
+        llm=model, embed_tokens=embed, instruction_ids_list=instrs, frames_list=frames_list,
+        chunk_size=chunk_size, vision_start_id=VS, vision_end_id=VE, eot_id=EOT, pad_id=pad_id,
+        max_new_tokens=max_new,
+    )
+
+    assert got == ref, f"batched decode diverged from per-utterance:\n batched={got}\n per-utt={ref}"

@@ -90,6 +90,14 @@ class StreamingSTTDataConfig:
     chunk_size_std: float = 0.0
     chunk_size_seed: int = 42
     num_delay_frames: int = 0
+    # Multi-delay-prompt training (ChunkCompletionSTTDataset): a list of
+    # {delay: int, prompt: str} entries. When set, each batch samples ONE entry
+    # uniformly; num_delay_frames is set to that entry's delay and the
+    # instruction/system prompt to its prompt for the whole batch. This teaches
+    # the model to trade latency for accuracy via the prompt (e.g. delay 0 =
+    # "emit ASAP", 4 = "wait until confident"). None disables (use scalar
+    # num_delay_frames + system_prompt as before).
+    delay_prompts: Optional[List] = None
     # When True, ignore the scalar num_delay_frames and delay each word by a
     # WORD-LENGTH-dependent amount (see word_length_delay_frames): longer words
     # get less delay. Fixed/dynamic chunking only.

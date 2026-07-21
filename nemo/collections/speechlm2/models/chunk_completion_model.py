@@ -42,8 +42,8 @@ from nemo.collections.speechlm2.data.chunk_completion_dataset import ChunkComple
 from nemo.collections.speechlm2.data.streaming_stt_dataset import IGNORE_INDEX
 from nemo.collections.speechlm2.models.streaming_stt_model import StreamingSTTModel
 from nemo.collections.speechlm2.parts.chunk_completion import (
+    batched_stream_decode_chunk_completion,
     build_chunk_completion_mask,
-    stream_decode_chunk_completion,
 )
 from nemo.collections.speechlm2.parts.optim_setup import is_frozen
 from nemo.utils import logging
@@ -54,9 +54,19 @@ class ChunkCompletionSTTModel(StreamingSTTModel):
 
     audio_open_token: str = "<|vision_start|>"
     audio_close_token: str = "<|vision_end|>"
+    # Sub-batch size for the encoder pass during generate(). Encoding the whole
+    # (possibly large) eval batch of long clips at once overflows 32-bit CUDA
+    # indexing in the subsampling conv; encoding in sub-batches keeps each conv
+    # tensor bounded. The LLM decode is still fully batched across the whole batch.
+    encode_batch_size: int = 8
 
-    def __init__(self, cfg: dict, *args, dataset_cls=ChunkCompletionSTTDataset, **kwargs) -> None:
-        super().__init__(cfg, *args, dataset_cls=dataset_cls, **kwargs)
+    def __init__(self, cfg: dict, forced_aligner=None, data_cfg=None, dataset_cls=ChunkCompletionSTTDataset) -> None:
+        # NOTE: keep this signature identical to StreamingSTTModel.__init__ (no
+        # *args/**kwargs). huggingface_hub's PyTorchModelHubMixin.from_pretrained
+        # inspects the __init__ signature; a **kwargs here makes it expand the
+        # whole saved config (att_context_size, chunk_size, ...) into keyword
+        # args, which then break super().__init__.
+        super().__init__(cfg, forced_aligner=forced_aligner, data_cfg=data_cfg, dataset_cls=dataset_cls)
 
         hf_tok = self.tokenizer.tokenizer
         self._cc_vision_start_id = hf_tok.convert_tokens_to_ids(self.audio_open_token)
@@ -180,31 +190,36 @@ class ChunkCompletionSTTModel(StreamingSTTModel):
             raise ValueError(f"chunk-completion generate requires a positive chunk size, got {cs}")
         self._set_encoder_att_context(cs)
 
-        audio_embs, audio_emb_lens = self.perception(
-            input_signal=audios, input_signal_length=audio_lens
-        )  # (B, T_enc, H), (B,)
-        B = audio_embs.shape[0]
-
+        B = audios.shape[0]
         if isinstance(system_prompt, str):
             system_prompt = [system_prompt] * B
 
-        hyps: List[str] = []
-        for b in range(B):
-            n_frames = int(audio_emb_lens[b].item())
-            frames = audio_embs[b, :n_frames]  # (n_frames, H)
-            instruction_ids = self.tokenizer.text_to_ids(system_prompt[b] + "\n")
-            emitted_per_chunk = stream_decode_chunk_completion(
-                llm=self.llm,
-                embed_tokens=self.embed_tokens,
-                instruction_ids=instruction_ids,
-                frames=frames,
-                chunk_size=cs,
-                vision_start_id=self._cc_vision_start_id,
-                vision_end_id=self._cc_vision_end_id,
-                eot_id=self._cc_eot_id,
-                max_new_tokens=max_new_tokens,
-                device=self.device,
-            )
-            flat = [tok for chunk in emitted_per_chunk for tok in chunk]
-            hyps.append(self.tokenizer.ids_to_text(flat) if flat else "")
-        return hyps
+        # --- 1) Encode audio in sub-batches -> per-utterance frame tensors ---
+        # A single full-batch encode of long, length-sorted clips overflows 32-bit
+        # CUDA indexing in the subsampling conv; sub-batching keeps it bounded.
+        enc_bs = max(1, int(self.encode_batch_size))
+        frames_list: List[Tensor] = []
+        for i in range(0, B, enc_bs):
+            sl = audio_lens[i : i + enc_bs]
+            max_len = int(sl.max().item())
+            sig = audios[i : i + enc_bs, :max_len]
+            emb, emb_len = self.perception(input_signal=sig, input_signal_length=sl)  # (b, T_enc, H)
+            for j in range(emb.shape[0]):
+                frames_list.append(emb[j, : int(emb_len[j].item())].clone())
+
+        # --- 2) Batched chunk-synchronous streaming decode ---
+        instruction_ids_list = [self.tokenizer.text_to_ids(system_prompt[b] + "\n") for b in range(B)]
+        emitted = batched_stream_decode_chunk_completion(
+            llm=self.llm,
+            embed_tokens=self.embed_tokens,
+            instruction_ids_list=instruction_ids_list,
+            frames_list=frames_list,
+            chunk_size=cs,
+            vision_start_id=self._cc_vision_start_id,
+            vision_end_id=self._cc_vision_end_id,
+            eot_id=self._cc_eot_id,
+            pad_id=self.text_pad_id,
+            max_new_tokens=max_new_tokens,
+            device=self.device,
+        )
+        return [self.tokenizer.ids_to_text(ids) if ids else "" for ids in emitted]

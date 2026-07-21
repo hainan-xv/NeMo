@@ -203,3 +203,17 @@ eval_results/
 # by sync_to_oci.sh / sync_to_ord.sh (git add -f oci/streaming_stt_finetune.sh).
 /oci/
 /nemo/collections/asr/models/NeMo.code-workspace
+
+# Unpublished paper draft — do NOT commit before submission (leak risk).
+/paper/
+# LaTeX build artifacts (in case a paper is built elsewhere in the tree).
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.synctex.gz
+*.toc
+*.out
+*.lof
+*.lot

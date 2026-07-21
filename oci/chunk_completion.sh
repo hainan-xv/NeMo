@@ -81,7 +81,10 @@ PROJECT_NAME=Speechlm79
 # Training parameters (match the granary2 no-blank launcher overrides).
 MAX_STEPS=200000
 VAL_CHECK_INTERVAL=2000
-DELAY=3
+# DELAY=-1 activates multi-delay-prompt training (the recipe's delay_prompts:
+# per batch the dataset samples one of delays 0/2/4 with its matching prompt).
+# Set a fixed delay >=0 to disable and train a single-latency model instead.
+DELAY=-1
 LR=0.0001
 WARMUP_STEPS=10000
 COMPACT_TEMPLATE=true

@@ -500,3 +500,155 @@ def stream_decode_chunk_completion(
         emitted_per_chunk.append(words)
 
     return emitted_per_chunk
+
+
+@torch.no_grad()
+def batched_stream_decode_chunk_completion(
+    llm,
+    embed_tokens: Callable[[Tensor], Tensor],
+    instruction_ids_list: List[List[int]],
+    frames_list: List[Tensor],
+    chunk_size: int,
+    vision_start_id: int,
+    vision_end_id: int,
+    eot_id: int,
+    pad_id: int,
+    max_new_tokens: int = 64,
+    device: Optional[torch.device] = None,
+) -> List[List[int]]:
+    """Batched greedy chunk-completion decode for B utterances at once.
+
+    Chunk-synchronous: for chunk index ``k`` every still-active stream is decoded
+    together. For each stream the model sees, per chunk, the *plain-text history*
+    plus only that chunk's audio -- exactly the training conditioning
+    ``p(words_k | text_history_<k, audio_k)`` -- built as::
+
+        [instruction] [emitted words so far] <vs> [audio_k frames] <ve> -> words
+
+    Because the history is compact text (not audio), re-prefilling it each chunk
+    is cheap; this avoids the fragile variable-length KV surgery a persistent
+    per-stream spine cache would need across a batch, while keeping ``position_ids``
+    contiguous per stream (identical to training). Equivalent to running
+    :func:`stream_decode_chunk_completion` on each utterance independently (see
+    the batched-parity test).
+
+    Args:
+        llm / embed_tokens: as in :func:`stream_decode_chunk_completion`.
+        instruction_ids_list: per-utterance instruction token ids.
+        frames_list: per-utterance ``(T_enc_b, H)`` encoder frame embeddings.
+        chunk_size: encoder frames per chunk.
+        vision_start_id / vision_end_id / eot_id / pad_id: delimiter / end / pad ids.
+        max_new_tokens: max words decoded per chunk per stream.
+
+    Returns:
+        ``B`` lists of emitted token ids (flattened across chunks; ``eot`` excluded).
+    """
+    B = len(frames_list)
+    if B == 0:
+        return []
+    if device is None:
+        device = frames_list[0].device
+    H = frames_list[0].shape[-1]
+    dtype = embed_tokens(torch.zeros(1, 1, dtype=torch.long, device=device)).dtype
+
+    n_frames = [int(f.shape[0]) for f in frames_list]
+    num_chunks = [math.ceil(n / chunk_size) if n > 0 else 0 for n in n_frames]
+    max_chunks = max(num_chunks) if B else 0
+
+    emitted: List[List[int]] = [[] for _ in range(B)]
+
+    for k in range(max_chunks):
+        active = [b for b in range(B) if k < num_chunks[b]]
+        if not active:
+            break
+        na = len(active)
+
+        # --- build per-stream prefill: instr + emitted + <vs> audio_k <ve> ---
+        seqs: List[List[int]] = []
+        chunk_frames: List[Tensor] = []
+        for b in active:
+            fr = frames_list[b][k * chunk_size : (k + 1) * chunk_size].to(device=device, dtype=dtype)
+            c = int(fr.shape[0])
+            toks = (
+                list(instruction_ids_list[b])
+                + list(emitted[b])
+                + [vision_start_id]
+                + [AUDIO_TOKEN_IDX] * c
+                + [vision_end_id]
+            )
+            seqs.append(toks)
+            chunk_frames.append(fr)
+
+        L = max(len(s) for s in seqs)
+        max_c = max(int(fr.shape[0]) for fr in chunk_frames)
+
+        # Left-pad so every row's last position is the <ve> (shared query column).
+        input_tokens = torch.full((na, L), pad_id, dtype=torch.long, device=device)
+        for i, s in enumerate(seqs):
+            input_tokens[i, L - len(s) :] = torch.tensor(s, dtype=torch.long, device=device)
+
+        audio_embs = torch.zeros(na, max_c, H, dtype=dtype, device=device)
+        for i, fr in enumerate(chunk_frames):
+            audio_embs[i, : fr.shape[0]] = fr
+
+        # Interleave audio into the AUDIO_TOKEN_IDX slots (per-row cumsum gather).
+        audio_mask = input_tokens == AUDIO_TOKEN_IDX
+        text_tokens = input_tokens.where(~audio_mask, torch.zeros_like(input_tokens))
+        text_embeds = embed_tokens(text_tokens)
+        frame_idx = audio_mask.long().cumsum(dim=1) - 1
+        gather_idx = frame_idx.clamp(min=0).unsqueeze(-1).expand(na, L, H)
+        audio_at = torch.gather(audio_embs, dim=1, index=gather_idx)
+        embeds = torch.where(audio_mask.unsqueeze(-1), audio_at, text_embeds)
+
+        valid = input_tokens != pad_id  # (na, L) bool
+        position_ids = (valid.long().cumsum(dim=1) - 1).clamp(min=0)
+
+        out = llm(
+            inputs_embeds=embeds,
+            attention_mask=valid.long(),
+            position_ids=position_ids,
+            use_cache=True,
+            return_dict=True,
+        )
+        cache = out.past_key_values
+        logits = out.logits[:, -1]  # <ve> position -> predicts first word
+        cur_pos = position_ids[:, -1] + 1  # (na,)
+        attn_running = valid.long()
+
+        finished = [False] * na
+        words: List[List[int]] = [[] for _ in range(na)]
+        for _ in range(max_new_tokens):
+            nxt = logits.argmax(dim=-1)  # (na,)
+            for i in range(na):
+                if finished[i]:
+                    continue
+                tid = int(nxt[i].item())
+                if tid == eot_id:
+                    finished[i] = True
+                else:
+                    words[i].append(tid)
+            if all(finished):
+                break
+            # Feed the next token (eot for finished rows; ignored downstream).
+            feed = nxt.clone()
+            for i in range(na):
+                if finished[i]:
+                    feed[i] = eot_id
+            temb = embed_tokens(feed.unsqueeze(1))  # (na, 1, H)
+            attn_running = torch.cat([attn_running, torch.ones(na, 1, dtype=attn_running.dtype, device=device)], dim=1)
+            out = llm(
+                inputs_embeds=temb,
+                attention_mask=attn_running,
+                position_ids=cur_pos.unsqueeze(1),
+                past_key_values=cache,
+                use_cache=True,
+                return_dict=True,
+            )
+            cache = out.past_key_values
+            cur_pos = cur_pos + 1
+            logits = out.logits[:, -1]
+
+        for i, b in enumerate(active):
+            emitted[b].extend(words[i])
+
+    return emitted
