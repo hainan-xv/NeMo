@@ -286,18 +286,24 @@ def main(cfg: StreamingSTTEvalConfig):
         with SequentialJsonlWriter(cfg.output_manifest) as writer:
             for cut, ref, hyp in zip(cuts, refs, hyps):
                 wer, _, nins, ndel, nsub = word_error_rate_detail(hypotheses=[hyp], references=[ref], use_cer=False)
-                writer.write(
-                    {
-                        "id": cut.id,
-                        "duration": cut.duration,
-                        "text": ref,
-                        "pred_text": hyp,
-                        "wer": wer,
-                        "ins": nins,
-                        "del": ndel,
-                        "sub": nsub,
-                    }
-                )
+                record = {
+                    "id": cut.id,
+                    "duration": cut.duration,
+                    "text": ref,
+                    "pred_text": hyp,
+                    "wer": wer,
+                    "ins": nins,
+                    "del": ndel,
+                    "sub": nsub,
+                }
+                # Carry through any per-utterance tag from the input manifest
+                # (e.g. dataset_key, used by pooled multi-dataset eval to reduce
+                # per-dataset WER). cut.custom survives resample/pad/sort and is
+                # exposed on MixedCut too, so this is robust to pad_extra_duration.
+                custom = getattr(cut, "custom", None) or {}
+                if "dataset_key" in custom:
+                    record["dataset_key"] = custom["dataset_key"]
+                writer.write(record)
 
 
 if __name__ == "__main__":

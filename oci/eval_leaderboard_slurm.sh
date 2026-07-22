@@ -17,11 +17,17 @@
 # Parallel Open-ASR-Leaderboard eval for a SpeechLM model, ON OCI: one node,
 # work BALANCED across 8 GPUs. Instead of one dataset per GPU (imbalanced, since
 # datasets differ hugely in size), we POOL every utterance across all datasets,
-# shuffle with a fixed seed, and give each GPU an even 1/8 slice. Each shard
-# writes a dataset-tagged generations JSONL; a final --aggregate reduce step
-# pools them by dataset and reports per-dataset WER (identical to non-sharded WER
-# since it's additive over utterances). Total time ~= sum(all)/8 instead of the
-# single largest dataset.
+# shuffle with a fixed seed, and give each GPU an even 1/8 slice. Total wall time
+# ~= sum(all)/8 instead of the single largest dataset.
+#
+# DEFAULT DECODE BACKEND = heh (BACKEND=heh): the checkpoint is converted ONCE to
+# HF format (examples/speechlm2/to_hf.py) and each GPU decodes its shard with
+# heh's engine examples/speechlm2/streaming_stt_generate.py (state-machine
+# inference, pad_extra_duration, etc. — exact parity with the local heh runs).
+# scripts/leaderboard_heh_shards.py builds the pooled per-shard NeMo manifests
+# (tagging each utt with dataset_key) and reduces the shard generations into
+# per-dataset WER. Set BACKEND=sslm to instead use the in-process driver
+# scripts/speechlm_leaderboard_eval.py (pooled-shard mode, tqdm progress bars).
 #
 # Uses the TRACKED, offline driver scripts/speechlm_leaderboard_eval.py (synced
 # to /code), which reads a PRE-STAGED wav/manifest cache on lustre (no HF
@@ -40,14 +46,23 @@
 #   CACHE_DIR         pre-staged leaderboard cache root on lustre
 #                     (default /lustre/fsw/portfolios/llmservice/users/hainanx/leaderboard_cache)
 #   PROJECT           results project dir (default Speechlm79)
+#   BACKEND           heh (default) | sslm
 #   MODEL_CLASS       model class (default ChunkCompletionSTTModel)
 #   SYSTEM_PROMPT     decode prompt (match the model's training prompt!)
 #   CHUNK_SIZE        decode chunk size override (encoder frames)
-#   BATCH_SIZE        per-dataset batch size (default 32; OOM auto-halves)
-#   MAX_NEW_TOKENS    per-chunk decode cap (default 64)
-#   USE_LAST=1        eval the rolling -last.ckpt (default: best non-last by mtime)
-#   STEP=<n>          eval step=<n>.ckpt explicitly
-#   CKPT=<path>       eval this exact .ckpt (overrides EXP resolution)
+#   BATCH_SIZE        per-shard batch size (default 32; sslm OOM auto-halves)
+#   MAX_NEW_TOKENS    per-chunk decode cap (default 64; heh uses HEH_MAX_NEW_TOKENS)
+#   HEH_MAX_NEW_TOKENS / HEH_USE_STATE_MACHINE / HEH_USE_OFFLINE_EMBS /
+#   HEH_PAD_DURATION  heh decode knobs (defaults mirror the local heh runs:
+#                     256 / true / false / 0.5)
+#   FORCE_CONVERT=1   rebuild the HF model even if one is cached (heh backend)
+#   RUN_AVERAGING     1 (default) -> average the top-k non-last ckpts into
+#                     <CKPT_DIR>/<EXP>-averaged.ckpt (stored in the model folder,
+#                     reused across runs); 0 -> use a single checkpoint.
+#   FORCE_AVERAGE=1   recompute the averaged ckpt even if it's cached
+#   USE_LAST=1        eval the rolling -last.ckpt (disables averaging)
+#   STEP=<n>          eval step=<n>.ckpt explicitly (disables averaging)
+#   CKPT=<path>       eval this exact .ckpt (overrides EXP resolution; disables averaging)
 #   DATASETS          space-separated 'name:split' list (default: full 8-set suite)
 #   SHUFFLE_SEED      seed for the pooled global shuffle (default 1234)
 #   MAX_EVAL_SAMPLES  cap samples per dataset (fast smoke test)
@@ -67,12 +82,25 @@ CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/llmservice/users/heh/containers/n
 
 PROJECT="${PROJECT:-Speechlm79}"
 EXP_NAME="${1:-${EXP_NAME:-granary2_chunkcompletion}}"
+BACKEND="${BACKEND:-heh}"
 MODEL_CLASS="${MODEL_CLASS:-nemo.collections.speechlm2.models.chunk_completion_model.ChunkCompletionSTTModel}"
 SYSTEM_PROMPT="${SYSTEM_PROMPT:-Transcribe the audio into text.}"
 CHUNK_SIZE="${CHUNK_SIZE:-}"
 BATCH_SIZE="${BATCH_SIZE:-32}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-64}"
 MAX_EVAL_SAMPLES="${MAX_EVAL_SAMPLES:-0}"
+# heh decode knobs (mirror the local heh runs). Only used when BACKEND=heh.
+HEH_MAX_NEW_TOKENS="${HEH_MAX_NEW_TOKENS:-256}"
+HEH_USE_STATE_MACHINE="${HEH_USE_STATE_MACHINE:-true}"
+HEH_USE_OFFLINE_EMBS="${HEH_USE_OFFLINE_EMBS:-false}"
+HEH_PAD_DURATION="${HEH_PAD_DURATION:-0.5}"
+FORCE_CONVERT="${FORCE_CONVERT:-0}"
+# Checkpoint averaging (DEFAULT ON): average the top-k (non '-last') checkpoints
+# — the ones exp_manager keeps by val_wer — into <CKPT_DIR>/<EXP>-averaged.ckpt,
+# stored in the model folder and REUSED on later runs. FORCE_AVERAGE=1 recomputes
+# it. Setting CKPT=/STEP=/USE_LAST=1 selects a specific ckpt and disables averaging.
+RUN_AVERAGING="${RUN_AVERAGING:-1}"
+FORCE_AVERAGE="${FORCE_AVERAGE:-0}"
 USE_LAST="${USE_LAST:-0}"
 STEP="${STEP:-}"
 CKPT="${CKPT:-}"
@@ -91,24 +119,73 @@ fi
 OUTPUT_PREFIX="${OUTPUT_PREFIX:-/lustre/fsw/portfolios/nemotron/users/hainanx}"
 CKPT_DIR="${OUTPUT_PREFIX}/results/${PROJECT}/${EXP_NAME}/${EXP_NAME}/checkpoints"
 
+# A specific-checkpoint request wins over (and disables) averaging.
+if [[ -n "$CKPT" || -n "$STEP" || "$USE_LAST" == "1" ]]; then
+    RUN_AVERAGING=0
+fi
+
 # ---- Resolve the checkpoint on lustre (no rsync; it's already here) ----
-if [[ -z "$CKPT" ]]; then
-    if [[ -n "$STEP" ]]; then
-        CKPT="${CKPT_DIR}/step=${STEP}.ckpt"
-    elif [[ "$USE_LAST" == "1" ]]; then
-        CKPT="$(ls -t "${CKPT_DIR}"/*-last.ckpt 2>/dev/null | head -1)"
+# NEED_AVG=1 means the averaged .ckpt must be (re)computed inside the container
+# below; AVG_INPUTS_QUOTED holds the single-quoted inputs for that step.
+NEED_AVG=0
+AVG_INPUTS_QUOTED=""
+if [[ "$RUN_AVERAGING" == "1" ]]; then
+    # Average exactly the top-k non-last snapshots exp_manager keeps by val_wer.
+    AVG_CKPT="${CKPT_DIR}/${EXP_NAME}-averaged.ckpt"
+    mapfile -t _AVG_IN < <(ls -t "${CKPT_DIR}"/*.ckpt 2>/dev/null | grep -v -- '-last\.ckpt$' | grep -v -- '-averaged\.ckpt$')
+    if [[ ${#_AVG_IN[@]} -eq 0 ]]; then
+        echo "ERROR: RUN_AVERAGING=1 but no non-last checkpoints under ${CKPT_DIR}." >&2
+        exit 1
+    fi
+    for f in "${_AVG_IN[@]}"; do AVG_INPUTS_QUOTED+=" '${f}'"; done
+    CKPT="$AVG_CKPT"
+    if [[ "$FORCE_AVERAGE" == "1" || ! -f "$AVG_CKPT" ]]; then
+        NEED_AVG=1
+        echo "==> Averaging ${#_AVG_IN[@]} checkpoint(s) -> ${AVG_CKPT} (computed in-container below)."
     else
-        CKPT="$(ls -t "${CKPT_DIR}"/*.ckpt 2>/dev/null | grep -v -- '-last\.ckpt$' | head -1)"
-        [[ -z "$CKPT" ]] && CKPT="$(ls -t "${CKPT_DIR}"/*-last.ckpt 2>/dev/null | head -1)"
+        echo "==> Reusing cached averaged checkpoint: ${AVG_CKPT}"
+    fi
+else
+    if [[ -z "$CKPT" ]]; then
+        if [[ -n "$STEP" ]]; then
+            CKPT="${CKPT_DIR}/step=${STEP}.ckpt"
+        elif [[ "$USE_LAST" == "1" ]]; then
+            CKPT="$(ls -t "${CKPT_DIR}"/*-last.ckpt 2>/dev/null | head -1)"
+        else
+            CKPT="$(ls -t "${CKPT_DIR}"/*.ckpt 2>/dev/null | grep -v -- '-last\.ckpt$' | grep -v -- '-averaged\.ckpt$' | head -1)"
+            [[ -z "$CKPT" ]] && CKPT="$(ls -t "${CKPT_DIR}"/*-last.ckpt 2>/dev/null | head -1)"
+        fi
     fi
 fi
-if [[ -z "$CKPT" || ! -f "$CKPT" ]]; then
-    echo "ERROR: could not resolve a checkpoint under ${CKPT_DIR} (set CKPT=, STEP=, or USE_LAST=1)." >&2
+# Validate now unless the ckpt is produced by the in-container averaging step.
+if [[ "$NEED_AVG" != "1" && ( -z "$CKPT" || ! -f "$CKPT" ) ]]; then
+    echo "ERROR: could not resolve a checkpoint under ${CKPT_DIR} (set CKPT=, STEP=, USE_LAST=1, or RUN_AVERAGING=1)." >&2
     exit 1
 fi
 
-RESULTS_DIR="${OUTPUT_PREFIX}/results/${PROJECT}/${EXP_NAME}/leaderboard_eval$( [[ -n "$CHUNK_SIZE" ]] && echo "_chunk${CHUNK_SIZE}" )"
+# When the averaged weights are (re)computed, any cached HF conversion of the
+# same-named averaged ckpt is stale -> force a rebuild.
+[[ "$NEED_AVG" == "1" ]] && FORCE_CONVERT=1
+
+# Timestamp the eval folder so every run is a distinct, self-contained dir.
+RUN_TS="$(date +%Y%m%d_%H%M%S)"
+RESULTS_DIR="${OUTPUT_PREFIX}/results/${PROJECT}/${EXP_NAME}/leaderboard_eval$( [[ -n "$CHUNK_SIZE" ]] && echo "_chunk${CHUNK_SIZE}" )_${BACKEND}_${RUN_TS}"
 mkdir -p "$RESULTS_DIR"
+# Pooled shard manifests are cheap + depend on seed/datasets, so keep them in the
+# timestamped run dir (fresh each run).
+SHARD_DIR="${RESULTS_DIR}/shards"; mkdir -p "$SHARD_DIR"
+# The HF conversion depends only on the (averaged) checkpoint, not on the decode
+# config, so cache it per-ckpt OUTSIDE the timestamped dir and reuse across runs
+# (rebuilt when FORCE_CONVERT=1, incl. after the averaged weights are recomputed).
+CKPT_STEM="$(basename "${CKPT%.ckpt}")"
+HF_CKPT_DIR="${OUTPUT_PREFIX}/results/${PROJECT}/${EXP_NAME}/hf_model_${CKPT_STEM}"
+# The exp config (with a top-level model:) sits next to the checkpoints dir on
+# lustre; to_hf.py needs it to instantiate the model class.
+EXP_CFG="${CKPT_DIR%/checkpoints}/exp_config.yaml"
+if [[ "$BACKEND" == "heh" && ! -f "$EXP_CFG" ]]; then
+    echo "ERROR: heh backend needs the exp config at ${EXP_CFG} (set BACKEND=sslm to skip conversion)." >&2
+    exit 1
+fi
 HFCACHE="${OUTPUT_PREFIX}/hf_cache"; mkdir -p "$HFCACHE"
 CODE_DIR="${CODE_DIR:-/lustre/fsw/portfolios/nemotron/users/hainanx/NeMo79/}"
 H_DIR=/lustre/fsw/portfolios/llmservice/users/heh
@@ -122,8 +199,133 @@ MOUNTS="--container-mounts=${CODE_DIR}:/code,${H_DIR}:${H_DIR},${HFCACHE}:/hfcac
 
 NGPU=8
 
+# ---- Record this run's configuration under the (timestamped) eval folder ----
+{
+    echo "# SpeechLM leaderboard eval run config"
+    echo "timestamp:            ${RUN_TS}"
+    echo "exp_name:             ${EXP_NAME}"
+    echo "project:              ${PROJECT}"
+    echo "backend:              ${BACKEND}"
+    echo "model_class:          ${MODEL_CLASS}"
+    echo "checkpoint:           ${CKPT}"
+    echo "run_averaging:        ${RUN_AVERAGING}"
+    echo "force_average:        ${FORCE_AVERAGE}"
+    echo "averaged_recomputed:  ${NEED_AVG}"
+    if [[ "$RUN_AVERAGING" == "1" ]]; then
+        echo "averaged_num_inputs:  ${#_AVG_IN[@]}"
+        echo "averaged_inputs:"
+        for f in "${_AVG_IN[@]}"; do echo "  - ${f}"; done
+    fi
+    echo "hf_model_dir:         ${HF_CKPT_DIR}"
+    echo "force_convert:        ${FORCE_CONVERT}"
+    echo "system_prompt:        \"${SYSTEM_PROMPT}\""
+    echo "chunk_size:           ${CHUNK_SIZE:-<model default>}"
+    echo "batch_size:           ${BATCH_SIZE}"
+    echo "max_new_tokens:       ${MAX_NEW_TOKENS}"
+    if [[ "$BACKEND" == "heh" ]]; then
+        echo "heh_max_new_tokens:   ${HEH_MAX_NEW_TOKENS}"
+        echo "heh_use_state_machine: ${HEH_USE_STATE_MACHINE}"
+        echo "heh_use_offline_embs: ${HEH_USE_OFFLINE_EMBS}"
+        echo "heh_pad_duration:     ${HEH_PAD_DURATION}"
+    fi
+    echo "num_gpus:             ${NGPU}"
+    echo "shuffle_seed:         ${SHUFFLE_SEED}"
+    echo "max_eval_samples:     ${MAX_EVAL_SAMPLES}"
+    echo "datasets:             ${DATASETS_CSV}"
+    echo "cache_dir:            ${CACHE_DIR}"
+    echo "results_dir:          ${RESULTS_DIR}"
+} > "${RESULTS_DIR}/run_config.yaml"
+echo "==> Wrote run config: ${RESULTS_DIR}/run_config.yaml"
+
+# In-container averaging step (empty unless the averaged ckpt must be computed).
+# Paths are single-quoted so Hydra/argparse handle best-ckpt names containing '='.
+AVG_CLAUSE=""
+if [[ "$NEED_AVG" == "1" ]]; then
+    AVG_CLAUSE="&& echo '==> Averaging ${#_AVG_IN[@]} checkpoints -> ${CKPT}' && python /code/scripts/average_sslm_ckpts.py --output '${CKPT}'${AVG_INPUTS_QUOTED} "
+fi
+
+if [[ "$BACKEND" == "heh" ]]; then
+# ===== heh backend: convert ckpt -> HF once, then decode each shard with =====
+# =====             streaming_stt_generate.py (state-machine inference). =====
 read -r -d '' cmd <<EOF
-echo "*******SpeechLM leaderboard eval (1 node, pooled shards balanced over ${NGPU} GPUs)********" \
+echo "*******SpeechLM leaderboard eval (heh engine, pooled shards over ${NGPU} GPUs)********" \
+&& echo "*** EXP=${EXP_NAME} | MODEL_CLASS=${MODEL_CLASS} ***" \
+&& echo "*** CKPT=${CKPT} ***" \
+&& echo "*** CACHE_DIR=${CACHE_DIR} | CHUNK_SIZE=${CHUNK_SIZE:-<default>} | BATCH_SIZE=${BATCH_SIZE} | SEED=${SHUFFLE_SEED} ***" \
+&& echo "*** heh: max_tok=${HEH_MAX_NEW_TOKENS} state_machine=${HEH_USE_STATE_MACHINE} offline=${HEH_USE_OFFLINE_EMBS} pad=${HEH_PAD_DURATION}s ***" \
+&& nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader \
+&& cd /code \
+&& git rev-parse HEAD \
+&& export PYTHONPATH="/code/.:\${PYTHONPATH}" \
+&& export OMP_NUM_THREADS=1 \
+&& export HF_HOME="/hfcache/" \
+&& export HF_TOKEN=${HF_TOKEN} \
+&& export HF_HUB_OFFLINE=1 \
+&& export TOKENIZERS_PARALLELISM=false \
+&& export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+&& export HYDRA_FULL_ERROR=1 \
+&& export TMPDIR=${OCI_TMP_DIR} && mkdir -p ${OCI_TMP_DIR} \
+&& python -c "import nemo, nemo.collections.speechlm2; print('NeMo:', nemo.__file__)" \
+${AVG_CLAUSE} \
+&& echo "==> Patching exp config for to_hf ..." \
+&& python /code/scripts/patch_exp_config.py "${EXP_CFG}" "${SHARD_DIR}/exp_config.local.yaml" "${CKPT}" \
+&& if [ "${FORCE_CONVERT}" = "1" ] || [ ! -f "${HF_CKPT_DIR}/config.json" ]; then \
+      echo "==> Converting ckpt -> HF format: ${HF_CKPT_DIR}"; \
+      rm -rf "${HF_CKPT_DIR}"; \
+      CUDA_VISIBLE_DEVICES=0 python /code/examples/speechlm2/to_hf.py \
+        class_path="${MODEL_CLASS}" \
+        ckpt_path="'${CKPT}'" \
+        ckpt_config="'${SHARD_DIR}/exp_config.local.yaml'" \
+        output_dir="'${HF_CKPT_DIR}'" \
+        weights_only=false; \
+   else echo "==> Reusing existing HF model: ${HF_CKPT_DIR}"; fi \
+&& [ -f "${HF_CKPT_DIR}/config.json" ] || { echo "ERROR: to_hf.py did not produce ${HF_CKPT_DIR}/config.json"; exit 1; } \
+&& echo "==> Building ${NGPU} pooled shard manifests (seed=${SHUFFLE_SEED}) ..." \
+&& python /code/scripts/leaderboard_heh_shards.py build \
+      --cache_dir "${CACHE_DIR}" \
+      --datasets "${DATASETS_CSV}" \
+      --out_dir "${SHARD_DIR}" \
+      --num_shards ${NGPU} \
+      --shuffle_seed ${SHUFFLE_SEED} \
+      --max_eval_samples ${MAX_EVAL_SAMPLES} \
+&& rm -f ${SHARD_DIR}/shard*_of*.generations.jsonl \
+&& echo "Fanning ${NGPU} shards across ${NGPU} GPUs with the heh engine..." \
+&& pids=() \
+&& for gpu in \$(seq 0 \$(( ${NGPU} - 1 ))); do \
+      log="${RESULTS_DIR}/shard_\${gpu}.log"; \
+      man="${SHARD_DIR}/shard\${gpu}_of${NGPU}.json"; \
+      gen="${SHARD_DIR}/shard\${gpu}_of${NGPU}.generations.jsonl"; \
+      echo "  [gpu \$gpu] \${man} -> \${log}"; \
+      CUDA_VISIBLE_DEVICES=\$gpu python /code/examples/speechlm2/streaming_stt_generate.py \
+        pretrained_name="'${HF_CKPT_DIR}'" \
+        model_class="${MODEL_CLASS}" \
+        inputs="'\${man}'" \
+        batch_size=${BATCH_SIZE} \
+        max_new_tokens=${HEH_MAX_NEW_TOKENS} \
+        system_prompt="'${SYSTEM_PROMPT}'" \
+        use_offline_embs=${HEH_USE_OFFLINE_EMBS} \
+        use_state_machine_inference=${HEH_USE_STATE_MACHINE} \
+        pad_extra_duration=${HEH_PAD_DURATION} \
+        output_manifest="'\${gen}'" \
+        verbose=false \
+        device=cuda \
+        ${CHUNK_SIZE:+chunk_size=${CHUNK_SIZE}} \
+        > "\${log}" 2>&1 & \
+      pids+=(\$!); \
+   done \
+&& fail=0 && for p in "\${pids[@]}"; do wait "\$p" || fail=1; done \
+&& echo "" \
+&& echo "==================== Leaderboard WER (heh) ====================" \
+&& python /code/scripts/leaderboard_heh_shards.py aggregate --out_dir "${SHARD_DIR}" 2>&1 | tee "${RESULTS_DIR}/aggregate.log" \
+&& echo "" \
+&& echo "Per-shard logs: ${RESULTS_DIR} | manifests+generations: ${SHARD_DIR}" \
+&& exit \$fail
+EOF
+
+else
+# ===== sslm backend: in-process pooled-shard driver (tqdm bars, OOM backoff) =====
+read -r -d '' cmd <<EOF
+echo "*******SpeechLM leaderboard eval (sslm in-process, pooled shards over ${NGPU} GPUs)********" \
 && echo "*** EXP=${EXP_NAME} | MODEL_CLASS=${MODEL_CLASS} ***" \
 && echo "*** CKPT=${CKPT} ***" \
 && echo "*** CACHE_DIR=${CACHE_DIR} | CHUNK_SIZE=${CHUNK_SIZE:-<default>} | BATCH_SIZE=${BATCH_SIZE} | SEED=${SHUFFLE_SEED} ***" \
@@ -140,6 +342,7 @@ echo "*******SpeechLM leaderboard eval (1 node, pooled shards balanced over ${NG
 && export HYDRA_FULL_ERROR=1 \
 && export TMPDIR=${OCI_TMP_DIR} && mkdir -p ${OCI_TMP_DIR} \
 && python -c "import nemo, nemo.collections.speechlm2; print('NeMo:', nemo.__file__)" \
+${AVG_CLAUSE} \
 && echo "Pooled datasets: ${DATASETS_CSV}" \
 && echo "Fanning ${NGPU} balanced shards across ${NGPU} GPUs (seed=${SHUFFLE_SEED})..." \
 && rm -f ${RESULTS_DIR}/shard*_of*.generations.jsonl \
@@ -173,6 +376,7 @@ echo "*******SpeechLM leaderboard eval (1 node, pooled shards balanced over ${NG
 && echo "Per-shard logs + generations under: ${RESULTS_DIR}" \
 && exit \$fail
 EOF
+fi
 
 srun -o "$OUTFILE" -e "$ERRFILE" --container-image="$CONTAINER" $MOUNTS bash -c "${cmd}"
 
