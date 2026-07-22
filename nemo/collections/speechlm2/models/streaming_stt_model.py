@@ -557,6 +557,13 @@ class StreamingSTTModelConfig:
     # the two are equivalent for text queries and differ only for audio queries.
     # Only valid for chunk_size > 0.
     restrict_audio_cross_chunk: bool = False
+    # --- Chunk-completion audio history window (ChunkCompletionSTTModel only) ---
+    # Number M of PREVIOUS chunks whose audio is also included in each chunk's
+    # branch window, so a word split across a chunk boundary is fully visible.
+    # 0 = only the current chunk's audio (original behavior). Kept in the MODEL
+    # config (not just data) so ChunkCompletionSTTModel.generate can rebuild the
+    # window at inference after from_pretrained.
+    audio_history_chunks: int = 0
     # --- Two-stream last-layer fusion (fixed chunking only) ---
     # When True, the LLM processes the TEXT stream alone through layers[:-1]
     # (a contiguous text-only sequence with its own causal mask and positions).

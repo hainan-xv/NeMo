@@ -1,0 +1,183 @@
+# ============================================================================
+# Chunk-completion streaming SpeechLM — Granary 2.0, LoRA, no-blank, val_wer.
+#
+# Same data / model / optimizer / trainer as
+#   streaming_stt_granary2_lora_noblank_wer.yaml
+# but trained with the CHUNK-COMPLETION objective (run via
+# examples/speechlm2/chunk_completion_train.py -> ChunkCompletionSTTModel +
+# ChunkCompletionSTTDataset). Instead of one interleaved audio-text-audio-text
+# causal stream, each utterance is packed as a pure-text spine (the history)
+# plus one branch per chunk (its audio + the words it reveals). The model is
+# trained to *extract the words carried by each new audio chunk, given the
+# transcript so far* -- p(words_k | text_history_<k, audio_k). Each chunk's audio
+# is wrapped in Qwen's in-vocab <|vision_start|> / <|vision_end|> delimiters (no
+# embedding resize); silent chunks emit <|im_end|>.
+#
+# The multi chunk-size list, att_context [70,1] (look-ahead = chunk-1 per batch),
+# LoRA, IdentityConnector, pre-aligned Granary 2.0 data, and val_wer monitor are
+# all inherited from the no-blank recipe. The only deliberate change is the
+# system prompt, reworded to the concrete "extract the words" framing.
+# ============================================================================
+
+model:
+  pretrained_llm: /lustre/fsw/portfolios/llmservice/users/heh/pretrained_models/huggingface/Qwen/Qwen3-1.7B
+  pretrained_asr: /lustre/fsw/portfolios/llmservice/users/heh/pretrained_models/huggingface/nvidia/nemotron-speech-streaming-en-0.6b/nemotron-speech-streaming-en-0.6b.nemo
+  load_llm_weights: true
+  load_asr_weights: true
+
+  sample_rate: 16000
+  blank_token: ""            # no-blank: silent chunks emit <|im_end|>
+  frame_length_in_secs: 0.08
+  chunk_size: [2, 4, 7, 10, 14, 28]   # multi chunk-size: one drawn per batch
+  att_context_size: [70, 1]  # left 70; right (lookahead) is set per batch to chunk-1
+  audio_pad_to: 0
+
+  # Compact template flag is irrelevant to the chunk-completion layout (it builds
+  # its own spine+branch structure), but kept for config compatibility.
+  compact_template: true
+
+  # Audio history window: each chunk's branch also sees the previous chunk's
+  # audio, so a word split across a chunk boundary is fully visible. Kept in the
+  # model config so generate() rebuilds the same window after from_pretrained.
+  audio_history_chunks: 1
+
+  freeze_speech_encoder: false
+  freeze_modality_adapter: false
+  freeze_modality_proj: false
+  freeze_llm_model: true
+  freeze_llm_head: false
+  freeze_embed_tokens: false
+
+  freeze_params: []
+  prevent_freeze_params: []
+
+  lora:
+    task_type: CAUSAL_LM
+    r: 128
+    lora_alpha: 256
+    lora_dropout: 0.01
+
+  perception:
+    modality_adapter:
+      _target_: nemo.collections.speechlm2.modules.perception.IdentityConnector
+    encoder:
+      # Per-rank-independent decode (see the no-blank recipe): the cache-aware
+      # encoder otherwise all-reduces max audio length every forward, desyncing
+      # the data-dependent streaming validation decode across ranks.
+      sync_max_audio_length: false
+
+  optimizer:
+    _target_: torch.optim.AdamW
+    lr: 1e-4
+    betas: [0.9, 0.98]
+    weight_decay: 1e-3
+    foreach: true
+
+  lr_scheduler:
+    _target_: nemo.core.optim.lr_scheduler.CosineAnnealing
+    warmup_steps: 10000
+    min_lr: 1e-6
+    max_steps: ${trainer.max_steps}
+
+data:
+  # --- ChunkCompletionSTTDataset config ---
+  dataset:
+    sample_rate: ${model.sample_rate}
+    frame_length_in_secs: ${model.frame_length_in_secs}
+    chunk_size: ${model.chunk_size}
+    num_delay_frames: 3
+    # Match the model's audio window, and train recovery of a dropped history word
+    # from the (now-visible) previous chunk's audio (30% of eligible chunks).
+    audio_history_chunks: ${model.audio_history_chunks}
+    history_word_recovery_prob: 0.3
+    audio_tag: "<audio>"
+    blank_token: ${model.blank_token}
+    compact_template: ${model.compact_template}
+    system_role: system
+    # Concrete "text completion for a chunk of audio" framing.
+    system_prompt: "You are doing streaming speech recognition. Given the transcript so far and the representation of the next audio chunk, output the words spoken in that chunk."
+
+  # Decode-only val_wer runs generate() on raw audio; pin a single fixed size.
+  val_dataset_overrides:
+    chunk_size: 14
+
+  # --- Lhotse dataloader config ---
+  train_ds:
+    sample_rate: ${data.dataset.sample_rate}
+    input_cfg: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/users/dongjig/aligned_amos/granary_v2_en_pnc_qwen_aligned_filtered/granary_v2_en_pnc_qwen_aligned_filtered_safe_iad_s3_audio.yaml
+    skip_missing_manifest_entries: true
+    manifest_filepath: null
+    seed: 42
+    shuffle: true
+    shard_seed: "randomized"
+    num_workers: 8
+    force_iterable_dataset: true
+    use_bucketing: true
+    bucket_duration_bins: [4.32,6.0,7.04,7.92,8.8,9.6,10.4,11.12,11.89,12.66,13.47,14.8,16.92,20.0,22.4,29.44,35.0,39.6]
+    bucket_batch_size: [38,29,25,22,20,18,17,15,14,13,12,11,10,8,7,6,5,4]
+    max_duration: 54
+    pad_extra_duration: 0.5
+    pad_extra_duration_prob: 1.0
+
+  validation_ds:
+    datasets:
+      mcv_11_dev:
+        manifest_filepath: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/users/dongjig/aligned_amos/steve_val_mmlpc_mcv11_2k/mcv11_dev_clean_pcstrip_en_2k_qwen_aligned.json
+    sample_rate: ${data.dataset.sample_rate}
+    batch_size: 4
+    num_workers: 4
+    seed: 42
+    shard_seed: "randomized"
+    shuffle: false
+    pad_extra_duration: 0.5
+    pad_extra_duration_prob: 1.0
+
+trainer:
+  devices: -1
+  accelerator: gpu
+  num_nodes: 1
+  precision: bf16-true
+  logger: false
+  enable_checkpointing: false
+  use_distributed_sampler: false
+  max_steps: 200000
+  limit_train_batches: 2000
+  val_check_interval: ${trainer.limit_train_batches}
+  log_every_n_steps: 10
+  num_sanity_val_steps: 1
+  gradient_clip_val: 1.0
+  accumulate_grad_batches: 1
+  strategy:
+    _target_: lightning.pytorch.strategies.DDPStrategy
+    gradient_as_bucket_view: true
+    find_unused_parameters: true
+
+
+exp_manager:
+  exp_dir: null
+  explicit_log_dir: null
+  name: streaming_stt_granary2_chunkcompletion_hist1
+  create_tensorboard_logger: true
+  create_checkpoint_callback: true
+  use_datetime_version: true
+  max_time_per_run: "00:03:50:00"
+
+  resume_from_checkpoint: null
+  resume_if_exists: true
+  resume_ignore_no_checkpoint: true
+
+  create_wandb_logger: false
+  wandb_logger_kwargs:
+    name: ${exp_manager.name}
+    project: null
+    resume: true
+
+  checkpoint_callback_params:
+    filename: "{step}-{val_wer:.4f}"
+    monitor: val_wer
+    mode: min
+    every_n_train_steps: null
+    every_n_epochs: 1
+    save_top_k: 5
+    always_save_nemo: false
+    save_nemo_on_train_end: false

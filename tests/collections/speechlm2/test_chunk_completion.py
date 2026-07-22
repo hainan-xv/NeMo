@@ -441,6 +441,138 @@ def test_stream_decode_matches_forced_packed():
             assert int(pred[idx_k[u]]) == EOT, f"chunk {k}: expected eot at terminating position"
 
 
+def _embed_by_frame_index(model, input_ids: torch.Tensor, audio_frame_index: torch.Tensor, global_frames: torch.Tensor):
+    """Embed text ids and fill each audio slot by its GLOBAL frame index (gather).
+
+    Mirrors ChunkCompletionSTTModel._build_input_embeds_indexed, used for the
+    windowed (audio_history_chunks>0) parity where frames are reused across branches.
+    """
+    ids = input_ids.clone()
+    is_audio = input_ids == AUDIO_TOKEN_IDX
+    ids[is_audio] = 0
+    emb = model.get_input_embeddings()(ids)  # (L, H)
+    if is_audio.any():
+        emb = emb.clone()
+        emb[is_audio] = global_frames[audio_frame_index[is_audio]].to(emb.dtype)
+    return emb
+
+
+# ---------------------------------------------------------------------------
+# Audio history window (audio_history_chunks > 0)
+# ---------------------------------------------------------------------------
+
+
+def test_windowed_frame_index_structure():
+    # chunk1: 2 frames [20,21]; chunk2: 3 frames [30]; chunk3: 2 frames [40].
+    chunks = [ChunkSpec(2, [20, 21]), ChunkSpec(3, [30]), ChunkSpec(2, [40])]
+    ex = build_packed_chunk_example(INSTR, chunks, VS, VE, EOT, audio_history_chunks=1)
+    # Global frame layout: chunk1=frames[0,1]; chunk2=frames[2,3,4]; chunk3=frames[5,6].
+    # Branch 2's window = chunks 1..2 -> global frames [0,1,2,3,4].
+    b2 = (ex.seg_ids == 2).nonzero(as_tuple=True)[0]
+    fidx_b2 = ex.audio_frame_index[b2][ex.is_audio[b2]].tolist()
+    assert fidx_b2 == [0, 1, 2, 3, 4]
+    # Branch 1 (initial) has no previous chunk -> window is just chunk 1 (no pad).
+    b1 = (ex.seg_ids == 1).nonzero(as_tuple=True)[0]
+    fidx_b1 = ex.audio_frame_index[b1][ex.is_audio[b1]].tolist()
+    assert fidx_b1 == [0, 1]
+    # Branch 3's window = chunks 2..3 -> global frames [2,3,4,5,6].
+    b3 = (ex.seg_ids == 3).nonzero(as_tuple=True)[0]
+    fidx_b3 = ex.audio_frame_index[b3][ex.is_audio[b3]].tolist()
+    assert fidx_b3 == [2, 3, 4, 5, 6]
+    # Non-audio positions carry -1.
+    assert int(ex.audio_frame_index[ex.seg_ids == 0].max()) == -1
+
+
+@torch.no_grad()
+def test_parity_windowed_packed_vs_separate():
+    """With an audio history window, packed branch logits must still equal the
+    standalone example that uses the SAME windowed audio."""
+    model = _tiny_qwen3()
+    H = model.config.hidden_size
+    instruction = [5, 6, 7]
+    chunks = [ChunkSpec(2, [20, 21]), ChunkSpec(3, [30]), ChunkSpec(2, [40, 41])]
+    M = 1
+    total_frames = sum(c.audio_len for c in chunks)
+    torch.manual_seed(2024)
+    global_frames = torch.randn(total_frames, H)
+
+    packed = build_packed_chunk_example(instruction, chunks, VS, VE, EOT, audio_history_chunks=M)
+    valid = torch.ones_like(packed.input_ids, dtype=torch.bool)
+    mask = build_chunk_completion_mask(
+        packed.seg_ids[None], packed.position_ids[None], packed.prefix_len[None], valid[None], torch.float32
+    )
+    packed_emb = _embed_by_frame_index(model, packed.input_ids, packed.audio_frame_index, global_frames)
+    packed_logits = model(
+        inputs_embeds=packed_emb[None], attention_mask=mask, position_ids=packed.position_ids[None]
+    ).logits[0]
+
+    separate = build_separate_chunk_examples(instruction, chunks, VS, VE, EOT, audio_history_chunks=M)
+    for k, sep in enumerate(separate, start=1):
+        sep_emb = _embed_by_frame_index(model, sep.input_ids, sep.audio_frame_index, global_frames)
+        sep_logits = model(inputs_embeds=sep_emb[None]).logits[0]
+        idx = (packed.seg_ids == k).nonzero(as_tuple=True)[0]
+        torch.testing.assert_close(packed_logits[idx], sep_logits[sep.branch_start :], atol=1e-4, rtol=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# History-word recovery
+# ---------------------------------------------------------------------------
+
+
+def test_recovery_layout():
+    # chunk1 "one two" (last word "two"=[21]); chunk2 "three"=[30].
+    chunks = [ChunkSpec(2, [20, 21], last_word_ids=[21]), ChunkSpec(2, [30], last_word_ids=[30])]
+    ex = build_packed_chunk_example(
+        INSTR, chunks, VS, VE, EOT, audio_history_chunks=1, recover_prev=[False, True]
+    )
+    # Spine = INSTR(2) + [20,21] + [30]; prefix for chunk2 normally = 2+2 = 4.
+    # Recovery drops chunk1's last word (1 token) -> branch2 prefix_len = 3.
+    b2 = (ex.seg_ids == 2).nonzero(as_tuple=True)[0]
+    assert (ex.prefix_len[b2] == 3).all()
+    # Branch2 target predicts [recovered "two"(21), "three"(30), eot].
+    supervised = ex.target_ids != IGNORE_INDEX
+    b2_targets = ex.target_ids[b2][supervised[b2]].tolist()
+    assert b2_targets == [21, 30, EOT]
+    # Branch1 is untouched (prefix 2, predicts "one two" + eot).
+    b1 = (ex.seg_ids == 1).nonzero(as_tuple=True)[0]
+    assert (ex.prefix_len[b1] == 2).all()
+    assert ex.target_ids[b1][supervised[b1]].tolist() == [20, 21, EOT]
+
+
+@torch.no_grad()
+def test_parity_windowed_recovery_packed_vs_separate():
+    model = _tiny_qwen3()
+    H = model.config.hidden_size
+    instruction = [5, 6]
+    chunks = [ChunkSpec(2, [20, 21], last_word_ids=[21]), ChunkSpec(3, [30, 31], last_word_ids=[31])]
+    recover = [False, True]
+    M = 1
+    total_frames = sum(c.audio_len for c in chunks)
+    torch.manual_seed(77)
+    global_frames = torch.randn(total_frames, H)
+
+    packed = build_packed_chunk_example(
+        instruction, chunks, VS, VE, EOT, audio_history_chunks=M, recover_prev=recover
+    )
+    valid = torch.ones_like(packed.input_ids, dtype=torch.bool)
+    mask = build_chunk_completion_mask(
+        packed.seg_ids[None], packed.position_ids[None], packed.prefix_len[None], valid[None], torch.float32
+    )
+    packed_emb = _embed_by_frame_index(model, packed.input_ids, packed.audio_frame_index, global_frames)
+    packed_logits = model(
+        inputs_embeds=packed_emb[None], attention_mask=mask, position_ids=packed.position_ids[None]
+    ).logits[0]
+
+    separate = build_separate_chunk_examples(
+        instruction, chunks, VS, VE, EOT, audio_history_chunks=M, recover_prev=recover
+    )
+    for k, sep in enumerate(separate, start=1):
+        sep_emb = _embed_by_frame_index(model, sep.input_ids, sep.audio_frame_index, global_frames)
+        sep_logits = model(inputs_embeds=sep_emb[None]).logits[0]
+        idx = (packed.seg_ids == k).nonzero(as_tuple=True)[0]
+        torch.testing.assert_close(packed_logits[idx], sep_logits[sep.branch_start :], atol=1e-4, rtol=1e-4)
+
+
 @torch.no_grad()
 def test_batched_decode_matches_per_utterance():
     """Batched chunk-synchronous decode must equal per-utterance stream decode.
@@ -480,3 +612,36 @@ def test_batched_decode_matches_per_utterance():
     )
 
     assert got == ref, f"batched decode diverged from per-utterance:\n batched={got}\n per-utt={ref}"
+
+
+@torch.no_grad()
+def test_batched_decode_matches_per_utterance_windowed():
+    """Same batched==per-utterance equivalence, but with an audio history window
+    (audio_history_chunks=1) so each branch's audio spans two chunks."""
+    model = _tiny_qwen3()
+    H = model.config.hidden_size
+    embed = model.get_input_embeddings()
+    pad_id = 0
+    chunk_size = 2
+    max_new = 4
+    M = 1
+
+    torch.manual_seed(555)
+    instrs = [[5, 6, 7], [8, 9], [10, 11, 12, 13]]
+    frames_list = [torch.randn(6, H), torch.randn(2, H), torch.randn(7, H)]
+
+    ref = []
+    for instr, frames in zip(instrs, frames_list):
+        per_chunk = stream_decode_chunk_completion(
+            llm=model, embed_tokens=embed, instruction_ids=instr, frames=frames,
+            chunk_size=chunk_size, vision_start_id=VS, vision_end_id=VE, eot_id=EOT,
+            max_new_tokens=max_new, audio_history_chunks=M,
+        )
+        ref.append([t for chunk in per_chunk for t in chunk])
+
+    got = batched_stream_decode_chunk_completion(
+        llm=model, embed_tokens=embed, instruction_ids_list=instrs, frames_list=frames_list,
+        chunk_size=chunk_size, vision_start_id=VS, vision_end_id=VE, eot_id=EOT, pad_id=pad_id,
+        max_new_tokens=max_new, audio_history_chunks=M,
+    )
+    assert got == ref, f"windowed batched decode diverged:\n batched={got}\n per-utt={ref}"

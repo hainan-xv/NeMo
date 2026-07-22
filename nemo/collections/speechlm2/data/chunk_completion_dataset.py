@@ -64,6 +64,10 @@ class ChunkCompletionBatch:
     prefix_len: Optional[torch.Tensor] = None
     target_tokens: Optional[torch.Tensor] = None
     is_audio: Optional[torch.Tensor] = None
+    # (B, T) global encoder-frame index each audio slot maps to (-1 elsewhere).
+    # Set only when audio_history_chunks > 0 (windowed audio reuses frames across
+    # branches, so the model gathers by this index instead of the cumsum fill).
+    audio_frame_index: Optional[torch.Tensor] = None
     valid: Optional[torch.Tensor] = None
     text: Optional[List[str]] = None
     cuts: Optional[object] = None
@@ -149,6 +153,29 @@ class ChunkCompletionSTTDataset(StreamingSTTDataset):
                 int(self.cfg.num_delay_frames),
             )
 
+        # --- Audio history window + history-word recovery ---
+        self._audio_history_chunks = max(int(getattr(self.cfg, "audio_history_chunks", 0) or 0), 0)
+        self._history_word_recovery_prob = float(getattr(self.cfg, "history_word_recovery_prob", 0.0) or 0.0)
+        if not (0.0 <= self._history_word_recovery_prob <= 1.0):
+            raise ValueError(
+                f"history_word_recovery_prob must be in [0, 1], got {self._history_word_recovery_prob}"
+            )
+        if self._history_word_recovery_prob > 0.0 and self._audio_history_chunks < 1:
+            raise ValueError(
+                "history_word_recovery_prob > 0 requires audio_history_chunks >= 1 "
+                "(the recovered word's audio must be in the branch window)."
+            )
+        if self._audio_history_chunks > 0:
+            logging.info(
+                "ChunkCompletionSTTDataset: audio_history_chunks=%d%s",
+                self._audio_history_chunks,
+                (
+                    f" | history_word_recovery_prob={self._history_word_recovery_prob}"
+                    if self._history_word_recovery_prob > 0.0
+                    else ""
+                ),
+            )
+
     def _sample_delay_prompt(self, rng):
         """Sample one (num_delay_frames, prompt) uniformly, or None if disabled."""
         if not self._delay_prompts:
@@ -156,13 +183,35 @@ class ChunkCompletionSTTDataset(StreamingSTTDataset):
         entry = self._delay_prompts[int(rng.integers(len(self._delay_prompts)))]
         return entry["delay"], entry["prompt"]
 
-    def _messages_to_chunks(self, messages: List[dict]) -> List[ChunkSpec]:
+    def _last_word_ids(self, content: str, target_ids: List[int]) -> List[int]:
+        """Token ids of just the LAST word of ``content`` (a trailing slice of
+        ``target_ids``), for history-word recovery.
+
+        Splits off the final whitespace-delimited word and locates its tokens by
+        the length of the tokenized head (byte-level BPE keeps word boundaries at
+        spaces, so ``len(tok(head))`` tokens form the prefix). Falls back to the
+        whole thing on any boundary mismatch (conservative — recovers more).
+        """
+        c = content.rstrip()
+        if not c.strip():
+            return []
+        head, sep, _tail = c.rpartition(" ")
+        if sep == "" or head.strip() == "":
+            return list(target_ids)  # single word -> whole chunk text is one word
+        prefix_ids = self.tokenizer.text_to_ids(head)
+        n_prefix = len(prefix_ids)
+        if 0 < n_prefix < len(target_ids):
+            return list(target_ids[n_prefix:])
+        return list(target_ids)
+
+    def _messages_to_chunks(self, messages: List[dict], compute_last_word: bool = False) -> List[ChunkSpec]:
         """Parse alternating user(audio)/assistant(words) turns into ChunkSpecs.
 
         ``messages[0]`` is the system prompt (used as the instruction elsewhere).
         Each user turn's content is ``audio_tag`` repeated once per frame; the
         following assistant turn holds the words revealed by that chunk (or the
-        blank sentinel / empty string for a silent chunk).
+        blank sentinel / empty string for a silent chunk). When ``compute_last_word``
+        is True, each ChunkSpec also gets its last word's tokens (for recovery).
         """
         chunks: List[ChunkSpec] = []
         audio_tag = self.cfg.audio_tag
@@ -184,8 +233,22 @@ class ChunkCompletionSTTDataset(StreamingSTTDataset):
             if words == self.cfg.blank_token:
                 words = ""
             target_ids = self.tokenizer.text_to_ids(words) if words.strip() else []
-            chunks.append(ChunkSpec(audio_len=audio_len, target_ids=target_ids))
+            last_word_ids = (
+                self._last_word_ids(words, target_ids) if (compute_last_word and target_ids) else []
+            )
+            chunks.append(ChunkSpec(audio_len=audio_len, target_ids=target_ids, last_word_ids=last_word_ids))
         return chunks
+
+    def _sample_recover_flags(self, chunks: List[ChunkSpec], rng) -> Optional[List[bool]]:
+        """Per-chunk recovery flags: True where we drop the previous chunk's last
+        word and recover it. None when recovery is disabled."""
+        if self._history_word_recovery_prob <= 0.0:
+            return None
+        flags: List[bool] = []
+        for kc, _ch in enumerate(chunks):
+            eligible = kc >= 1 and len(chunks[kc - 1].last_word_ids) > 0
+            flags.append(bool(eligible and rng.random() < self._history_word_recovery_prob))
+        return flags
 
     def get_batch_data(
         self,
@@ -238,9 +301,11 @@ class ChunkCompletionSTTDataset(StreamingSTTDataset):
             ),
         )
 
+        recover_on = self._history_word_recovery_prob > 0.0
         examples = []
         for messages, sysp in zip(batch_messages, system_prompts):
-            chunks = self._messages_to_chunks(messages)
+            chunks = self._messages_to_chunks(messages, compute_last_word=recover_on)
+            recover_prev = self._sample_recover_flags(chunks, self._get_chunk_rng()) if recover_on else None
             # Instruction/history separator: a newline keeps the first history word
             # from BPE-merging into the instruction text.
             instruction_ids = self.tokenizer.text_to_ids(sysp + "\n")
@@ -251,6 +316,8 @@ class ChunkCompletionSTTDataset(StreamingSTTDataset):
                     vision_start_id=self.vision_start_id,
                     vision_end_id=self.vision_end_id,
                     eot_id=self.eot_id,
+                    audio_history_chunks=self._audio_history_chunks,
+                    recover_prev=recover_prev,
                 )
             )
 
@@ -265,6 +332,9 @@ class ChunkCompletionSTTDataset(StreamingSTTDataset):
             prefix_len=packed.prefix_len,
             target_tokens=packed.target_ids,
             is_audio=packed.is_audio,
+            # Only carry the explicit frame index when the window spans >1 chunk;
+            # for M=0 the model keeps the (byte-identical) cumsum interleave path.
+            audio_frame_index=(packed.audio_frame_index if self._audio_history_chunks > 0 else None),
             valid=packed.valid,
             text=text,
             cuts=cuts,

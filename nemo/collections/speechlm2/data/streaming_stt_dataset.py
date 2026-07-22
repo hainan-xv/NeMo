@@ -98,6 +98,16 @@ class StreamingSTTDataConfig:
     # "emit ASAP", 4 = "wait until confident"). None disables (use scalar
     # num_delay_frames + system_prompt as before).
     delay_prompts: Optional[List] = None
+    # --- Chunk-completion audio history window (ChunkCompletionSTTDataset) ---
+    # Number M of PREVIOUS chunks whose audio is included in each chunk's branch
+    # window (a word split across a boundary is then fully visible). 0 = current
+    # chunk only. Should match model.audio_history_chunks.
+    audio_history_chunks: int = 0
+    # History-word recovery regularization (requires audio_history_chunks >= 1).
+    # With this probability, a chunk DROPS the previous chunk's last word from its
+    # history and must recover it (prepended to its target) from the now-visible
+    # previous-chunk audio. Trains robustness to a missing history word. 0 = off.
+    history_word_recovery_prob: float = 0.0
     # When True, ignore the scalar num_delay_frames and delay each word by a
     # WORD-LENGTH-dependent amount (see word_length_delay_frames): longer words
     # get less delay. Fixed/dynamic chunking only.

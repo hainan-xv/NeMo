@@ -71,10 +71,14 @@ class ChunkSpec:
         audio_len: number of encoder audio frames in this chunk (``C_k``).
         target_ids: token ids of the words revealed by this chunk (``w_k``); may
             be empty for a silent chunk (the branch then only emits ``eot_id``).
+        last_word_ids: token ids of just this chunk's LAST word (a trailing slice
+            of ``target_ids``). Only needed for history-word-recovery
+            regularization; empty otherwise.
     """
 
     audio_len: int
     target_ids: List[int] = field(default_factory=list)
+    last_word_ids: List[int] = field(default_factory=list)
 
 
 @dataclass
@@ -94,6 +98,12 @@ class PackedChunkExample:
         target_ids: (T,) next-token targets; ``IGNORE_INDEX`` everywhere except
             the branch positions that predict the chunk's words + end-of-turn.
         is_audio: (T,) True at audio-frame positions.
+        audio_frame_index: (T,) global encoder-frame index each audio position
+            maps to (``-1`` at non-audio positions). With ``audio_history_chunks>0``
+            a branch's window spans multiple chunks and frames are reused across
+            branches, so the fill is an explicit gather by this index rather than a
+            positional cumsum. For ``audio_history_chunks==0`` it is exactly
+            ``0,1,2,...`` (i.e. equivalent to the cumsum fill).
         spine_len: number of spine tokens ``P`` (spine occupies ``input_ids[:P]``).
     """
 
@@ -103,6 +113,7 @@ class PackedChunkExample:
     prefix_len: Tensor
     target_ids: Tensor
     is_audio: Tensor
+    audio_frame_index: Tensor
     spine_len: int
 
 
@@ -113,6 +124,8 @@ def build_packed_chunk_example(
     vision_end_id: int,
     eot_id: int,
     supervise_eot: bool = True,
+    audio_history_chunks: int = 0,
+    recover_prev: Optional[List[bool]] = None,
 ) -> PackedChunkExample:
     """Build the packed spine+branch layout for one utterance.
 
@@ -132,20 +145,36 @@ def build_packed_chunk_example(
         supervise_eot: if True, the branch predicts ``eot_id`` after its last
             word (so the model learns to stop); the ``eot`` position itself is
             never supervised.
+        audio_history_chunks: number ``M`` of PREVIOUS chunks whose audio is also
+            included in each branch's window. Branch ``k`` then wraps the frames of
+            chunks ``[max(0, k-M) .. k]`` (fewer for early chunks; no padding). ``0``
+            = original behavior (only the current chunk's audio).
+        recover_prev: optional per-chunk bool list. When ``recover_prev[k]`` is
+            True (requires ``M>=1`` and a non-empty previous-chunk last word),
+            branch ``k`` DROPS the previous chunk's last word from its history and
+            prepends it to its target, so the model learns to recover a missing
+            history word from the (now-visible) previous chunk's audio. The spine
+            and all OTHER branches (incl. the one that normally emits that word)
+            are unchanged.
 
     Returns:
         PackedChunkExample.
     """
     m = len(instruction_ids)
+    M = max(int(audio_history_chunks), 0)
 
     # --- spine: instruction followed by all chunk words, in order ---
     spine_ids: List[int] = list(instruction_ids)
     prefix_lens: List[int] = []  # history-prefix length per chunk
+    frame_starts: List[int] = []  # global encoder-frame index where each chunk begins
     running = m
+    running_frames = 0
     for ch in chunks:
         prefix_lens.append(running)
+        frame_starts.append(running_frames)
         spine_ids.extend(ch.target_ids)
         running += len(ch.target_ids)
+        running_frames += ch.audio_len
     P = len(spine_ids)
 
     input_ids: List[int] = list(spine_ids)
@@ -154,38 +183,56 @@ def build_packed_chunk_example(
     prefix_len: List[int] = [0] * P
     target_ids: List[int] = [IGNORE_INDEX] * P  # spine is context only, no loss
     is_audio: List[bool] = [False] * P
+    audio_frame_index: List[int] = [-1] * P
 
     # --- branches ---
-    for k, ch in enumerate(chunks, start=1):
-        pref = prefix_lens[k - 1]
-        # branch tokens: <vs> [audio*C] <ve> w_k... <eot>
-        branch_tokens: List[int] = [vision_start_id] + [AUDIO_TOKEN_IDX] * ch.audio_len + [vision_end_id]
-        branch_is_audio: List[bool] = [False] + [True] * ch.audio_len + [False]
-        # target words + end-of-turn
-        branch_tokens.extend(ch.target_ids)
-        branch_is_audio.extend([False] * len(ch.target_ids))
+    for kc, ch in enumerate(chunks):  # kc: 0-based chunk index
+        k = kc + 1  # 1-based branch/segment id
+        pref = prefix_lens[kc]
+
+        # Audio window = frames of chunks [max(0, kc-M) .. kc] (global indices).
+        win_start = frame_starts[max(0, kc - M)]
+        win_end = frame_starts[kc] + ch.audio_len
+        window_frames = list(range(win_start, win_end))
+        window_len = len(window_frames)
+
+        # History-word recovery: drop the previous chunk's last word from THIS
+        # branch's history and recover it. Requires M>=1 (prev chunk in window)
+        # and a non-empty previous-chunk last word.
+        do_recover = (
+            recover_prev is not None
+            and kc >= 1
+            and recover_prev[kc]
+            and M >= 1
+            and len(chunks[kc - 1].last_word_ids) > 0
+        )
+        if do_recover:
+            dropped = list(chunks[kc - 1].last_word_ids)
+            pref = pref - len(dropped)  # exclude the dropped word's spine tokens
+            branch_words = dropped + list(ch.target_ids)
+        else:
+            branch_words = list(ch.target_ids)
+
+        # branch tokens: <vs> [window audio] <ve> [branch_words] <eot>
+        branch_tokens: List[int] = [vision_start_id] + [AUDIO_TOKEN_IDX] * window_len + [vision_end_id]
+        branch_is_audio: List[bool] = [False] + [True] * window_len + [False]
+        branch_frame_idx: List[int] = [-1] + window_frames + [-1]
+        branch_tokens.extend(branch_words)
+        branch_is_audio.extend([False] * len(branch_words))
+        branch_frame_idx.extend([-1] * len(branch_words))
         branch_tokens.append(eot_id)
         branch_is_audio.append(False)
+        branch_frame_idx.append(-1)
 
-        # next-token targets within the branch: the token AFTER <ve> is the first
-        # word (or eot if empty); each word predicts the next word; the last word
-        # predicts eot. <vs>/audio/eot positions are not supervised.
+        # Next-token targets: <ve> predicts branch_words[0]; word i predicts word
+        # i+1; the last word predicts eot. <vs>/audio/eot are not supervised.
         n_bt = len(branch_tokens)
-        branch_targets: List[int] = [IGNORE_INDEX] * n_bt
-        # index of <ve> within the branch = 1 (vs) + audio_len
-        ve_idx = 1 + ch.audio_len
-        # positions ve_idx .. ve_idx + len(w_k) predict w_k[0..], then eot
-        for j, tok in enumerate(ch.target_ids):
-            branch_targets[ve_idx + j] = tok  # predicted by the previous position
-        # shift: target at position i is input at i+1 -> rebuild as next-token
-        # We assembled branch_targets as "token at this position"; convert to
-        # next-token form (target[i] = token that should follow input[i]).
         next_targets: List[int] = [IGNORE_INDEX] * n_bt
-        # words: predicted starting right after <ve>
-        first_word_pos = ve_idx  # <ve> position predicts first word
-        for j, tok in enumerate(ch.target_ids):
+        ve_idx = 1 + window_len  # index of <ve> within the branch
+        first_word_pos = ve_idx  # <ve> position predicts the first (recovered/normal) word
+        for j, tok in enumerate(branch_words):
             next_targets[first_word_pos + j] = tok
-        last_word_pos = first_word_pos + len(ch.target_ids)  # position that predicts eot
+        last_word_pos = first_word_pos + len(branch_words)  # predicts eot
         if supervise_eot:
             next_targets[last_word_pos] = eot_id
 
@@ -197,6 +244,7 @@ def build_packed_chunk_example(
         prefix_len.extend([pref] * n_bt)
         target_ids.extend(next_targets)
         is_audio.extend(branch_is_audio)
+        audio_frame_index.extend(branch_frame_idx)
 
     return PackedChunkExample(
         input_ids=torch.tensor(input_ids, dtype=torch.long),
@@ -205,6 +253,7 @@ def build_packed_chunk_example(
         prefix_len=torch.tensor(prefix_len, dtype=torch.long),
         target_ids=torch.tensor(target_ids, dtype=torch.long),
         is_audio=torch.tensor(is_audio, dtype=torch.bool),
+        audio_frame_index=torch.tensor(audio_frame_index, dtype=torch.long),
         spine_len=P,
     )
 
@@ -276,6 +325,7 @@ class BatchedPackedChunk:
     prefix_len: Tensor  # (B, T)
     target_ids: Tensor  # (B, T)
     is_audio: Tensor  # (B, T)
+    audio_frame_index: Tensor  # (B, T) global encoder-frame index at audio positions, -1 elsewhere
     valid: Tensor  # (B, T) bool, False at right-padding
     spine_lens: Tensor  # (B,)
 
@@ -304,6 +354,7 @@ def collate_packed_chunk_examples(
     prefix_len = _pad([e.prefix_len for e in examples], 0, torch.long)
     target_ids = _pad([e.target_ids for e in examples], IGNORE_INDEX, torch.long)
     is_audio = _pad([e.is_audio for e in examples], False, torch.bool)
+    audio_frame_index = _pad([e.audio_frame_index for e in examples], -1, torch.long)
 
     valid = torch.zeros((B, T), dtype=torch.bool)
     for i, e in enumerate(examples):
@@ -318,6 +369,7 @@ def collate_packed_chunk_examples(
         prefix_len=prefix_len,
         target_ids=target_ids,
         is_audio=is_audio,
+        audio_frame_index=audio_frame_index,
         valid=valid,
         spine_lens=spine_lens,
     )
@@ -327,13 +379,14 @@ def collate_packed_chunk_examples(
 class SeparateChunkExample:
     """One standalone per-chunk example (the reference formulation).
 
-    ``[instruction w_1..w_{k-1}] <vs> audio_k <ve> w_k <eot>`` with plain causal
-    attention and contiguous positions ``0..len-1``.
+    ``[instruction w_1..w_{k-1}] <vs> audio_window <ve> w_k <eot>`` with plain
+    causal attention and contiguous positions ``0..len-1``.
     """
 
     input_ids: Tensor  # (L,)
     target_ids: Tensor  # (L,)
     is_audio: Tensor  # (L,)
+    audio_frame_index: Tensor  # (L,) global encoder-frame index at audio positions, -1 elsewhere
     # index range [branch_start, L) of this example's branch (audio + words + eot)
     branch_start: int
 
@@ -345,37 +398,71 @@ def build_separate_chunk_examples(
     vision_end_id: int,
     eot_id: int,
     supervise_eot: bool = True,
+    audio_history_chunks: int = 0,
+    recover_prev: Optional[List[bool]] = None,
 ) -> List[SeparateChunkExample]:
     """Build the naive per-chunk examples used as a correctness oracle.
 
     Each chunk becomes an independent standard-causal example whose history is
-    the *plain text* ``instruction + w_1..w_{k-1}``. The packed builder must
-    reproduce these branches' logits exactly (see the parity test).
+    the *plain text* ``instruction + w_1..w_{k-1}`` (minus the previous chunk's
+    last word when recovering), with the same audio window as the packed branch.
+    The packed builder must reproduce these branches' logits exactly (parity test).
     """
+    M = max(int(audio_history_chunks), 0)
+    frame_starts: List[int] = []
+    running_frames = 0
+    for ch in chunks:
+        frame_starts.append(running_frames)
+        running_frames += ch.audio_len
+
     out: List[SeparateChunkExample] = []
     history: List[int] = list(instruction_ids)
-    for ch in chunks:
-        branch_tokens = [vision_start_id] + [AUDIO_TOKEN_IDX] * ch.audio_len + [vision_end_id]
-        branch_is_audio = [False] + [True] * ch.audio_len + [False]
-        branch_tokens.extend(ch.target_ids)
-        branch_is_audio.extend([False] * len(ch.target_ids))
+    for kc, ch in enumerate(chunks):
+        win_start = frame_starts[max(0, kc - M)]
+        win_end = frame_starts[kc] + ch.audio_len
+        window_frames = list(range(win_start, win_end))
+        window_len = len(window_frames)
+
+        do_recover = (
+            recover_prev is not None
+            and kc >= 1
+            and recover_prev[kc]
+            and M >= 1
+            and len(chunks[kc - 1].last_word_ids) > 0
+        )
+        if do_recover:
+            dropped = list(chunks[kc - 1].last_word_ids)
+            prefix = list(history[: len(history) - len(dropped)])  # drop prev chunk's last word
+            branch_words = dropped + list(ch.target_ids)
+        else:
+            prefix = list(history)
+            branch_words = list(ch.target_ids)
+
+        branch_tokens = [vision_start_id] + [AUDIO_TOKEN_IDX] * window_len + [vision_end_id]
+        branch_is_audio = [False] + [True] * window_len + [False]
+        branch_frame_idx = [-1] + window_frames + [-1]
+        branch_tokens.extend(branch_words)
+        branch_is_audio.extend([False] * len(branch_words))
+        branch_frame_idx.extend([-1] * len(branch_words))
         branch_tokens.append(eot_id)
         branch_is_audio.append(False)
+        branch_frame_idx.append(-1)
 
-        prefix = list(history)
         input_ids = prefix + branch_tokens
         is_audio = [False] * len(prefix) + branch_is_audio
+        audio_frame_index = [-1] * len(prefix) + branch_frame_idx
 
         target_ids = [IGNORE_INDEX] * len(input_ids)
-        ve_idx = len(prefix) + 1 + ch.audio_len  # position of <ve>
-        for j, tok in enumerate(ch.target_ids):
+        ve_idx = len(prefix) + 1 + window_len  # position of <ve>
+        for j, tok in enumerate(branch_words):
             target_ids[ve_idx + j] = tok
-        last_word_pos = ve_idx + len(ch.target_ids)
+        last_word_pos = ve_idx + len(branch_words)
         if supervise_eot:
             target_ids[last_word_pos] = eot_id
 
         out.append(
             SeparateChunkExample(
+                audio_frame_index=torch.tensor(audio_frame_index, dtype=torch.long),
                 input_ids=torch.tensor(input_ids, dtype=torch.long),
                 target_ids=torch.tensor(target_ids, dtype=torch.long),
                 is_audio=torch.tensor(is_audio, dtype=torch.bool),
@@ -399,6 +486,7 @@ def stream_decode_chunk_completion(
     eot_id: int,
     max_new_tokens: int = 64,
     device: Optional[torch.device] = None,
+    audio_history_chunks: int = 0,
 ) -> List[List[int]]:
     """Greedy streaming decode of one utterance in the chunk-completion model.
 
@@ -448,10 +536,12 @@ def stream_decode_chunk_completion(
 
     n_frames = frames.shape[0]
     num_chunks = math.ceil(n_frames / chunk_size) if n_frames > 0 else 0
+    M = max(int(audio_history_chunks), 0)
 
     emitted_per_chunk: List[List[int]] = []
     for k in range(num_chunks):
-        cf = frames[k * chunk_size : (k + 1) * chunk_size]
+        # Audio window = frames of chunks [max(0, k-M) .. k].
+        cf = frames[max(0, k - M) * chunk_size : (k + 1) * chunk_size]
         c = cf.shape[0]
         if c == 0:
             break
@@ -515,6 +605,7 @@ def batched_stream_decode_chunk_completion(
     pad_id: int,
     max_new_tokens: int = 64,
     device: Optional[torch.device] = None,
+    audio_history_chunks: int = 0,
 ) -> List[List[int]]:
     """Batched greedy chunk-completion decode for B utterances at once.
 
@@ -554,6 +645,7 @@ def batched_stream_decode_chunk_completion(
     n_frames = [int(f.shape[0]) for f in frames_list]
     num_chunks = [math.ceil(n / chunk_size) if n > 0 else 0 for n in n_frames]
     max_chunks = max(num_chunks) if B else 0
+    M = max(int(audio_history_chunks), 0)
 
     emitted: List[List[int]] = [[] for _ in range(B)]
 
@@ -567,7 +659,8 @@ def batched_stream_decode_chunk_completion(
         seqs: List[List[int]] = []
         chunk_frames: List[Tensor] = []
         for b in active:
-            fr = frames_list[b][k * chunk_size : (k + 1) * chunk_size].to(device=device, dtype=dtype)
+            # Audio window = frames of chunks [max(0, k-M) .. k].
+            fr = frames_list[b][max(0, k - M) * chunk_size : (k + 1) * chunk_size].to(device=device, dtype=dtype)
             c = int(fr.shape[0])
             toks = (
                 list(instruction_ids_list[b])

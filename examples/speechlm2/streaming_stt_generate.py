@@ -32,6 +32,7 @@ The model's ``generate()`` method returns ``list[str]`` directly.
 
 from __future__ import annotations
 
+import gc
 import math
 import os
 from dataclasses import dataclass, field
@@ -187,23 +188,54 @@ def main(cfg: StreamingSTTEvalConfig):
         debug_log_writer = SequentialJsonlWriter(str(debug_log_path))
         logging.info(f"Audio frame debug log → {debug_log_path}")
 
+    def _generate_with_oom_backoff(audios, audio_lens, gen_kwargs, debug_logs=None, min_bs=1):
+        """Run model.generate, halving the batch on CUDA OOM and retrying.
+
+        On out-of-memory the batch is split in two and each half is retried
+        recursively (down to ``min_bs``), freeing cached memory in between. This
+        gives the heh decode path the same graceful degradation the in-process
+        (sslm) driver has, so a too-large batch on long clips degrades instead of
+        crashing. ``debug_logs`` is only forwarded when the batch is NOT split.
+        """
+        B = int(audios.shape[0])
+        try:
+            return model.generate(audios=audios, audio_lens=audio_lens, debug_logs=debug_logs, **gen_kwargs)
+        except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+            if "out of memory" not in str(e).lower() or B <= min_bs:
+                raise
+            # IMPORTANT: do the retry OUTSIDE this except block. While `e` is in
+            # scope its traceback pins the failed forward's activations; recursing
+            # here would keep every nested attempt's memory alive and OOM even at
+            # batch 1. Just record that we should split, then fall through.
+        # `e` (and its traceback) is now released -> free the failed allocation.
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        mid = B // 2
+        logging.warning(f"CUDA OOM on batch of {B}; retrying as {mid}+{B - mid} sub-batches.")
+        left = _generate_with_oom_backoff(audios[:mid], audio_lens[:mid], gen_kwargs, None, min_bs)
+        right = _generate_with_oom_backoff(audios[mid:], audio_lens[mid:], gen_kwargs, None, min_bs)
+        return left + right
+
     for batch_idx, batch in tqdm(enumerate(dloader), total=num_batches):
         ts = perf_counter()
         cfg.generation_config.max_new_tokens = cfg.max_new_tokens
         generation_config = GenerationConfig(**OmegaConf.to_container(cfg.generation_config))
         batch_debug_logs: Optional[list] = [] if cfg.debug_log_audio_frames else None
-        batch_hyps_raw = model.generate(
-            audios=batch["audios"].to(model.device, non_blocking=True),
-            audio_lens=batch["audio_lens"].to(model.device, non_blocking=True),
-            system_prompt=cfg.system_prompt,
-            max_new_tokens=cfg.max_new_tokens,
-            generation_config=generation_config,
-            use_offline_embs=cfg.use_offline_embs,
-            use_state_machine_inference=cfg.use_state_machine_inference,
-            dynamic_min_chunk_size=cfg.dynamic_min_chunk_size,
-            dynamic_max_chunk_size=cfg.dynamic_max_chunk_size,
-            lm_head_emit_threshold=cfg.lm_head_emit_threshold,
-            chunk_size_override=cfg.chunk_size,
+        batch_hyps_raw = _generate_with_oom_backoff(
+            batch["audios"].to(model.device, non_blocking=True),
+            batch["audio_lens"].to(model.device, non_blocking=True),
+            gen_kwargs=dict(
+                system_prompt=cfg.system_prompt,
+                max_new_tokens=cfg.max_new_tokens,
+                generation_config=generation_config,
+                use_offline_embs=cfg.use_offline_embs,
+                use_state_machine_inference=cfg.use_state_machine_inference,
+                dynamic_min_chunk_size=cfg.dynamic_min_chunk_size,
+                dynamic_max_chunk_size=cfg.dynamic_max_chunk_size,
+                lm_head_emit_threshold=cfg.lm_head_emit_threshold,
+                chunk_size_override=cfg.chunk_size,
+            ),
             debug_logs=batch_debug_logs,
         )
         batch_infer_duration = perf_counter() - ts

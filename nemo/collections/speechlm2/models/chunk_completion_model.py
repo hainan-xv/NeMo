@@ -39,7 +39,7 @@ from torch.distributed.tensor.parallel import loss_parallel
 from transformers import GenerationConfig
 
 from nemo.collections.speechlm2.data.chunk_completion_dataset import ChunkCompletionBatch, ChunkCompletionSTTDataset
-from nemo.collections.speechlm2.data.streaming_stt_dataset import IGNORE_INDEX
+from nemo.collections.speechlm2.data.streaming_stt_dataset import AUDIO_TOKEN_IDX, IGNORE_INDEX
 from nemo.collections.speechlm2.models.streaming_stt_model import StreamingSTTModel
 from nemo.collections.speechlm2.parts.chunk_completion import (
     batched_stream_decode_chunk_completion,
@@ -68,6 +68,10 @@ class ChunkCompletionSTTModel(StreamingSTTModel):
         # args, which then break super().__init__.
         super().__init__(cfg, forced_aligner=forced_aligner, data_cfg=data_cfg, dataset_cls=dataset_cls)
 
+        # Audio history window (M previous chunks in each branch). Read from the
+        # MODEL config so it survives from_pretrained (data_cfg is None then).
+        self._audio_history_chunks = max(int(getattr(self.core_cfg, "audio_history_chunks", 0) or 0), 0)
+
         hf_tok = self.tokenizer.tokenizer
         self._cc_vision_start_id = hf_tok.convert_tokens_to_ids(self.audio_open_token)
         self._cc_vision_end_id = hf_tok.convert_tokens_to_ids(self.audio_close_token)
@@ -88,14 +92,42 @@ class ChunkCompletionSTTModel(StreamingSTTModel):
 
         logging.info("=" * 72)
         logging.info(
-            "[chunk-completion] packed spine+branch objective active | audio span %r/%r | eot=%s | attn_impl=%s "
-            "-- models p(words_k | text_history_<k, audio_k).",
+            "[chunk-completion] packed spine+branch objective active | audio span %r/%r | eot=%s | "
+            "audio_history_chunks=%d | attn_impl=%s -- models p(words_k | text_history_<k, audio_{k-M..k}).",
             self.audio_open_token,
             self.audio_close_token,
             self._cc_eot_id,
+            self._audio_history_chunks,
             self.llm.config._attn_implementation,
         )
         logging.info("=" * 72)
+
+    def _build_input_embeds_indexed(
+        self, input_tokens: Tensor, audios: Tensor, audio_lens: Tensor, audio_frame_index: Tensor
+    ) -> dict:
+        """Like ``_build_input_embeds`` but fills each audio slot by an EXPLICIT
+        global encoder-frame index (gather), not a positional cumsum.
+
+        Needed when ``audio_history_chunks > 0``: a branch's window spans multiple
+        chunks and the same frame appears in multiple branches, so the 1:1 cumsum
+        mapping no longer holds. Out-of-range indices (last-chunk ceiling) gather a
+        zero-padded frame, matching ``interleave_embeddings``.
+        """
+        audio_mask = input_tokens == AUDIO_TOKEN_IDX  # (B, L)
+        text_tokens = input_tokens.where(~audio_mask, torch.zeros_like(input_tokens))
+        text_embeds = self.embed_tokens(text_tokens)  # (B, L, H)
+        audio_embs, _ = self.perception(input_signal=audios, input_signal_length=audio_lens)  # (B, T_enc, H)
+        B, L = input_tokens.shape
+        H = audio_embs.shape[2]
+        T_enc = audio_embs.shape[1]
+        max_idx = int(audio_frame_index.max().item()) if audio_frame_index.numel() else -1
+        if max_idx >= T_enc:
+            audio_embs = F.pad(audio_embs, (0, 0, 0, max_idx - T_enc + 1))
+        gather_idx = audio_frame_index.clamp(min=0).unsqueeze(-1).expand(B, L, H)
+        audio_at = torch.gather(audio_embs, dim=1, index=gather_idx)  # (B, L, H)
+        embeds = torch.where(audio_mask.unsqueeze(-1), audio_at, text_embeds)
+        attention_mask = input_tokens != self.text_pad_id
+        return {"input_embeds": embeds, "attention_mask": attention_mask}
 
     # ------------------------------------------------------------------
     # Training
@@ -112,7 +144,14 @@ class ChunkCompletionSTTModel(StreamingSTTModel):
         self._set_encoder_att_context(getattr(batch, "chunk_size", None))
 
         # Interleave encoder frames into the packed AUDIO_TOKEN_IDX positions.
-        inputs = self._build_input_embeds(batch.input_tokens, batch.audios, batch.audio_lens)
+        # With an audio history window (audio_frame_index set) frames are reused
+        # across branches -> gather by explicit index; else the cumsum fill.
+        if getattr(batch, "audio_frame_index", None) is not None:
+            inputs = self._build_input_embeds_indexed(
+                batch.input_tokens, batch.audios, batch.audio_lens, batch.audio_frame_index
+            )
+        else:
+            inputs = self._build_input_embeds(batch.input_tokens, batch.audios, batch.audio_lens)
         input_embeds = inputs["input_embeds"]
 
         mask = build_chunk_completion_mask(
@@ -221,5 +260,6 @@ class ChunkCompletionSTTModel(StreamingSTTModel):
             pad_id=self.text_pad_id,
             max_new_tokens=max_new_tokens,
             device=self.device,
+            audio_history_chunks=self._audio_history_chunks,
         )
         return [self.tokenizer.ids_to_text(ids) if ids else "" for ids in emitted]
