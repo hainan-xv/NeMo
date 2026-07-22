@@ -36,12 +36,14 @@ import argparse
 import gc
 import json
 import os
+import sys
 import time
 from typing import List, Tuple
 
 import numpy as np
 import soundfile
 import torch
+from tqdm import tqdm
 
 # Default Open-ASR-Leaderboard entries (name:split).
 DEFAULT_DATASETS = [
@@ -213,12 +215,22 @@ def evaluate_dataset(model, args, dataset: str, split: str, device: torch.device
     hyps: List[str] = []
     start = time.time()
     bs = max(1, int(args.batch_size))
-    for i in range(0, len(paths), bs):
+    total = len(paths)
+    # Progress bar goes to stdout, which the SLURM launcher redirects into this
+    # dataset's .log -> `tail -f <log>` shows a live bar. mininterval throttles
+    # how often it rewrites so the log stays small over a long decode.
+    pbar = tqdm(
+        total=total, desc=key, unit="utt", ncols=100,
+        mininterval=float(args.progress_interval), file=sys.stdout,
+    )
+    for i in range(0, total, bs):
         audios, audio_lens = load_audio_batch(paths[i : i + bs])
         audios = audios.to(device, non_blocking=True)
         audio_lens = audio_lens.to(device, non_blocking=True)
         with torch.inference_mode():
             hyps.extend(_generate_with_oom_backoff(model, audios, audio_lens, gen_kwargs, args.min_batch_size))
+        pbar.update(min(bs, total - i))
+    pbar.close()
     elapsed = time.time() - start
 
     wer = WER(normalize=True, verbose=args.verbose)
@@ -260,6 +272,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dtype", choices=["bf16", "fp32"], default="bf16")
     p.add_argument("--max_eval_samples", type=int, default=0, help="Cap samples per dataset (0 = all).")
     p.add_argument("--output_dir", type=str, default=None, help="If set, dump per-dataset generations JSONL.")
+    p.add_argument(
+        "--progress_interval",
+        type=float,
+        default=5.0,
+        help="Min seconds between progress-bar refreshes in the log (tail -f friendly).",
+    )
     p.add_argument("--verbose", action="store_true")
     return p.parse_args()
 
