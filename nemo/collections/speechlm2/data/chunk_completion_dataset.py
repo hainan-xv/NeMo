@@ -176,6 +176,14 @@ class ChunkCompletionSTTDataset(StreamingSTTDataset):
                 ),
             )
 
+        # --- Contiguous-text positions ("Option A") ---
+        self._contiguous_text_positions = bool(getattr(self.cfg, "contiguous_text_positions", False))
+        if self._contiguous_text_positions:
+            logging.info(
+                "ChunkCompletionSTTDataset: contiguous_text_positions=True (words placed "
+                "contiguous with history; audio prelude overlaid on history tail positions)."
+            )
+
     def _sample_delay_prompt(self, rng):
         """Sample one (num_delay_frames, prompt) uniformly, or None if disabled."""
         if not self._delay_prompts:
@@ -318,6 +326,7 @@ class ChunkCompletionSTTDataset(StreamingSTTDataset):
                     eot_id=self.eot_id,
                     audio_history_chunks=self._audio_history_chunks,
                     recover_prev=recover_prev,
+                    contiguous_text_positions=self._contiguous_text_positions,
                 )
             )
 

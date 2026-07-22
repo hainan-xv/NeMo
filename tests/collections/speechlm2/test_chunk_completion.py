@@ -645,3 +645,194 @@ def test_batched_decode_matches_per_utterance_windowed():
         max_new_tokens=max_new, audio_history_chunks=M,
     )
     assert got == ref, f"windowed batched decode diverged:\n batched={got}\n per-utt={ref}"
+
+
+# ---------------------------------------------------------------------------
+# Contiguous-text positions ("Option A"): words placed contiguous with the
+# history, audio prelude overlaid on the history's tail positions.
+# ---------------------------------------------------------------------------
+
+# A 6-token instruction leaves room so early-chunk preludes don't clamp.
+LONG_INSTR = [10, 11, 12, 13, 14, 15]
+
+
+def test_contiguous_positions_layout():
+    chunks = [ChunkSpec(audio_len=2, target_ids=[20, 21]), ChunkSpec(audio_len=3, target_ids=[30])]
+    ex = build_packed_chunk_example(LONG_INSTR, chunks, VS, VE, EOT, contiguous_text_positions=True)
+
+    # Spine is pure text and unchanged: INSTR(6) + [20,21] + [30] at positions 0..8.
+    assert ex.spine_len == 9
+    assert ex.position_ids[:9].tolist() == list(range(9))
+
+    # Branch 1: <vs> A A <ve> 20 21 <eot>, pref=6.
+    #   prelude (<vs>,A,A,<ve>) overlaid at [2,3,4,5]; words+eot contiguous at [6,7,8].
+    b1 = (ex.seg_ids == 1).nonzero(as_tuple=True)[0]
+    assert ex.input_ids[b1].tolist() == [VS, AUDIO_TOKEN_IDX, AUDIO_TOKEN_IDX, VE, 20, 21, EOT]
+    assert ex.position_ids[b1].tolist() == [2, 3, 4, 5, 6, 7, 8]
+    # word "20" sits one past the history's last position (5) AND equals its spine twin.
+    assert int(ex.position_ids[b1][4]) == 6
+    assert int(ex.position_ids[6]) == 6  # spine "20" is also at position 6
+
+    # Branch 2: <vs> A A A <ve> 30 <eot>, pref=8 -> prelude [3,4,5,6,7], words [8,9].
+    b2 = (ex.seg_ids == 2).nonzero(as_tuple=True)[0]
+    assert ex.position_ids[b2].tolist() == [3, 4, 5, 6, 7, 8, 9]
+    assert int(ex.position_ids[b2][5]) == 8  # word "30" == its spine twin position (8)
+
+
+def test_contiguous_positions_clamp_short_history_is_nonnegative():
+    # First chunk with a big audio window vs a 2-token instruction: the prelude
+    # would need positions < 0, so it clamps at 0 (benign) and never goes negative.
+    chunks = [ChunkSpec(audio_len=5, target_ids=[20])]
+    ex = build_packed_chunk_example([10, 11], chunks, VS, VE, EOT, contiguous_text_positions=True)
+    b1 = (ex.seg_ids == 1).nonzero(as_tuple=True)[0]
+    # pref=2, window_len=5 -> prelude=[0,0,0,0,0,0,1], words+eot=[2,3].
+    assert ex.position_ids[b1].tolist() == [0, 0, 0, 0, 0, 0, 1, 2, 3]
+    assert int(ex.position_ids[b1].min()) >= 0
+    # Words are still contiguous with the history (first word at pref=2).
+    assert int(ex.position_ids[b1][7]) == 2
+
+
+@torch.no_grad()
+def test_parity_contiguous_packed_vs_separate():
+    """Contiguous-position packed branch logits must equal the standalone example
+    run with the SAME (overlaid) position_ids. Instruction is long enough that no
+    prelude clamps, so position-causal (packed) == order-causal (standalone)."""
+    model = _tiny_qwen3()
+    H = model.config.hidden_size
+    instruction = [5, 6, 7, 8, 9, 1, 2, 3]  # len 8
+    chunks = [
+        ChunkSpec(audio_len=2, target_ids=[20, 21]),
+        ChunkSpec(audio_len=3, target_ids=[30]),
+        ChunkSpec(audio_len=1, target_ids=[]),  # silent chunk
+        ChunkSpec(audio_len=2, target_ids=[40, 41, 42]),
+    ]
+    torch.manual_seed(123)
+    audio_frames = [torch.randn(ch.audio_len, H) for ch in chunks]
+
+    packed = build_packed_chunk_example(instruction, chunks, VS, VE, EOT, contiguous_text_positions=True)
+    valid = torch.ones_like(packed.input_ids, dtype=torch.bool)
+    mask = build_chunk_completion_mask(
+        packed.seg_ids[None], packed.position_ids[None], packed.prefix_len[None], valid[None], torch.float32
+    )
+    packed_audio = torch.cat(audio_frames, dim=0)
+    packed_emb = _embed_with_audio(model, packed.input_ids, packed.is_audio, packed_audio)
+    packed_logits = model(
+        inputs_embeds=packed_emb[None], attention_mask=mask, position_ids=packed.position_ids[None]
+    ).logits[0]
+
+    separate = build_separate_chunk_examples(instruction, chunks, VS, VE, EOT, contiguous_text_positions=True)
+    for k, (sep, frames) in enumerate(zip(separate, audio_frames), start=1):
+        sep_emb = _embed_with_audio(model, sep.input_ids, sep.is_audio, frames)
+        # Must pass the overlaid positions (NOT the HF default 0..L-1).
+        sep_logits = model(inputs_embeds=sep_emb[None], position_ids=sep.position_ids[None]).logits[0]
+        idx = (packed.seg_ids == k).nonzero(as_tuple=True)[0]
+        torch.testing.assert_close(packed_logits[idx], sep_logits[sep.branch_start :], atol=1e-4, rtol=1e-4)
+
+
+@torch.no_grad()
+def test_parity_windowed_contiguous_packed_vs_separate():
+    """Contiguous positions + an audio history window together."""
+    model = _tiny_qwen3()
+    H = model.config.hidden_size
+    instruction = [5, 6, 7, 8, 9, 1, 2, 3]  # len 8 (no clamp for these windows)
+    chunks = [ChunkSpec(2, [20, 21]), ChunkSpec(3, [30]), ChunkSpec(2, [40, 41])]
+    M = 1
+    total_frames = sum(c.audio_len for c in chunks)
+    torch.manual_seed(2024)
+    global_frames = torch.randn(total_frames, H)
+
+    packed = build_packed_chunk_example(
+        instruction, chunks, VS, VE, EOT, audio_history_chunks=M, contiguous_text_positions=True
+    )
+    valid = torch.ones_like(packed.input_ids, dtype=torch.bool)
+    mask = build_chunk_completion_mask(
+        packed.seg_ids[None], packed.position_ids[None], packed.prefix_len[None], valid[None], torch.float32
+    )
+    packed_emb = _embed_by_frame_index(model, packed.input_ids, packed.audio_frame_index, global_frames)
+    packed_logits = model(
+        inputs_embeds=packed_emb[None], attention_mask=mask, position_ids=packed.position_ids[None]
+    ).logits[0]
+
+    separate = build_separate_chunk_examples(
+        instruction, chunks, VS, VE, EOT, audio_history_chunks=M, contiguous_text_positions=True
+    )
+    for k, sep in enumerate(separate, start=1):
+        sep_emb = _embed_by_frame_index(model, sep.input_ids, sep.audio_frame_index, global_frames)
+        sep_logits = model(inputs_embeds=sep_emb[None], position_ids=sep.position_ids[None]).logits[0]
+        idx = (packed.seg_ids == k).nonzero(as_tuple=True)[0]
+        torch.testing.assert_close(packed_logits[idx], sep_logits[sep.branch_start :], atol=1e-4, rtol=1e-4)
+
+
+@torch.no_grad()
+def test_stream_decode_contiguous_matches_forced_packed():
+    """Greedy contiguous-position streaming decode must equal the argmax of a
+    teacher-forced contiguous-position packed forward of the emitted tokens."""
+    model = _tiny_qwen3()
+    H = model.config.hidden_size
+    embed = model.get_input_embeddings()
+
+    instruction = [5, 6, 7, 8, 9, 1]  # len 6 -> pref >= c+2=4 always (no clamp)
+    chunk_size = 2
+    n_frames = 6  # 3 chunks
+    torch.manual_seed(321)
+    frames = torch.randn(n_frames, H)
+
+    max_new = 4
+    emitted = stream_decode_chunk_completion(
+        llm=model, embed_tokens=embed, instruction_ids=instruction, frames=frames,
+        chunk_size=chunk_size, vision_start_id=VS, vision_end_id=VE, eot_id=EOT,
+        max_new_tokens=max_new, contiguous_text_positions=True,
+    )
+    assert len(emitted) == 3
+
+    chunks = [ChunkSpec(audio_len=chunk_size, target_ids=emitted[k]) for k in range(3)]
+    packed = build_packed_chunk_example(instruction, chunks, VS, VE, EOT, contiguous_text_positions=True)
+    valid = torch.ones_like(packed.input_ids, dtype=torch.bool)
+    mask = build_chunk_completion_mask(
+        packed.seg_ids[None], packed.position_ids[None], packed.prefix_len[None], valid[None], torch.float32
+    )
+    packed_emb = _embed_with_audio(model, packed.input_ids, packed.is_audio, frames)
+    logits = model(
+        inputs_embeds=packed_emb[None], attention_mask=mask, position_ids=packed.position_ids[None]
+    ).logits[0]
+    pred = logits.argmax(dim=-1)
+
+    supervised = packed.target_ids != IGNORE_INDEX
+    for k, words in enumerate(emitted, start=1):
+        idx_k = ((packed.seg_ids == k) & supervised).nonzero(as_tuple=True)[0]
+        u = len(words)
+        assert pred[idx_k[:u]].tolist() == words, f"chunk {k}: stream words != packed argmax"
+        if u < max_new:
+            assert int(pred[idx_k[u]]) == EOT, f"chunk {k}: expected eot at terminating position"
+
+
+@torch.no_grad()
+def test_batched_decode_contiguous_matches_per_utterance():
+    """Batched == per-utterance decode also holds under contiguous positions
+    (both decoders assign identical positions + order-causal KV attention)."""
+    model = _tiny_qwen3()
+    H = model.config.hidden_size
+    embed = model.get_input_embeddings()
+    pad_id = 0
+    chunk_size = 2
+    max_new = 4
+
+    torch.manual_seed(999)
+    instrs = [[5, 6, 7, 8], [8, 9, 1, 2, 3], [10, 11, 12, 13]]
+    frames_list = [torch.randn(6, H), torch.randn(2, H), torch.randn(7, H)]
+
+    ref = []
+    for instr, frames in zip(instrs, frames_list):
+        per_chunk = stream_decode_chunk_completion(
+            llm=model, embed_tokens=embed, instruction_ids=instr, frames=frames,
+            chunk_size=chunk_size, vision_start_id=VS, vision_end_id=VE, eot_id=EOT,
+            max_new_tokens=max_new, contiguous_text_positions=True,
+        )
+        ref.append([t for chunk in per_chunk for t in chunk])
+
+    got = batched_stream_decode_chunk_completion(
+        llm=model, embed_tokens=embed, instruction_ids_list=instrs, frames_list=frames_list,
+        chunk_size=chunk_size, vision_start_id=VS, vision_end_id=VE, eot_id=EOT, pad_id=pad_id,
+        max_new_tokens=max_new, contiguous_text_positions=True,
+    )
+    assert got == ref, f"contiguous batched decode diverged:\n batched={got}\n per-utt={ref}"

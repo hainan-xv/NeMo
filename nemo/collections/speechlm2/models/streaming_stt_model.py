@@ -564,6 +564,16 @@ class StreamingSTTModelConfig:
     # config (not just data) so ChunkCompletionSTTModel.generate can rebuild the
     # window at inference after from_pretrained.
     audio_history_chunks: int = 0
+    # --- Contiguous-text positions ("Option A", ChunkCompletionSTTModel only) ---
+    # When True, each chunk-completion branch places its predicted words + eot at
+    # positions contiguous with the plain-text history (word j -> pref+j) and
+    # overlays the <vs>/audio/<ve> prelude on the history's tail positions, so the
+    # transcript reads as one uninterrupted stream instead of being split by a
+    # per-chunk positional gap where the audio sits. Physical tensor layout and the
+    # 4D mask are unchanged (transformers are order-agnostic; only position_ids +
+    # mask impose order). Kept in the MODEL config so generate() uses the matching
+    # convention after from_pretrained. False = original behavior.
+    contiguous_text_positions: bool = False
     # --- Two-stream last-layer fusion (fixed chunking only) ---
     # When True, the LLM processes the TEXT stream alone through layers[:-1]
     # (a contiguous text-only sequence with its own causal mask and positions).

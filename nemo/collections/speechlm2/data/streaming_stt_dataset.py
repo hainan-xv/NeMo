@@ -108,6 +108,12 @@ class StreamingSTTDataConfig:
     # history and must recover it (prepended to its target) from the now-visible
     # previous-chunk audio. Trains robustness to a missing history word. 0 = off.
     history_word_recovery_prob: float = 0.0
+    # Contiguous-text positions ("Option A"): place each branch's predicted words
+    # contiguous with the plain-text history and overlay the audio prelude on the
+    # history's tail positions, so the transcript reads as one uninterrupted stream
+    # (no per-chunk positional gap). Should match model.contiguous_text_positions.
+    # 0/False = original behavior. ChunkCompletionSTTDataset only.
+    contiguous_text_positions: bool = False
     # When True, ignore the scalar num_delay_frames and delay each word by a
     # WORD-LENGTH-dependent amount (see word_length_delay_frames): longer words
     # get less delay. Fixed/dynamic chunking only.

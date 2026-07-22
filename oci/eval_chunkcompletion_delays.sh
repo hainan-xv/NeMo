@@ -22,6 +22,9 @@
 #   RUN_AVERAGING   1 (default) -> average top-k checkpoints; 0 -> best single
 #   QUICK_TEST      1 -> 10 utts from ami only (fast smoke test per prompt)
 #   ONLY            comma-separated dataset filter (e.g. "librispeech,gigaspeech")
+#   CUSTOM_PROMPT   if set, run ONE eval with this exact prompt instead of the
+#                   0/2/4 sweep (to test an arbitrary/experimental prompt).
+#   CUSTOM_TAG      RUN_TAG label for the custom-prompt run (default: "custom").
 #   plus any other eval_leaderboard_oci.sh knob (HEH_*, BATCH_SIZE, MODEL_CLASS, ...).
 #
 # Examples:
@@ -29,6 +32,8 @@
 #   DELAYS="0 4" CHUNK_SIZE=7 ./oci/eval_chunkcompletion_delays.sh
 #   QUICK_TEST=1 ./oci/eval_chunkcompletion_delays.sh granary2_chunkcompletion_delayprompt 1
 #   DECODE_BACKEND=heh HEH_BATCH_SIZE=16 HEH_MAX_NEW_TOKENS=64 ./oci/eval_chunkcompletion_delays.sh
+#   CUSTOM_PROMPT="Transcribe the current chunk given the history." CUSTOM_TAG=myprompt \
+#     ./oci/eval_chunkcompletion_delays.sh   # single run with a custom prompt
 # ============================================================================
 set -euo pipefail
 
@@ -65,6 +70,25 @@ prompt_for_delay() {
 
 # RUN_TAG suffix so a chunk-size sweep on top of the delay sweep stays isolated.
 CHUNK_TAG="chunk${CHUNK_SIZE}"
+
+# --- Custom-prompt mode: run ONE eval with an arbitrary prompt, skip the sweep ---
+CUSTOM_PROMPT="${CUSTOM_PROMPT:-}"
+CUSTOM_TAG="${CUSTOM_TAG:-custom}"
+if [ -n "$CUSTOM_PROMPT" ]; then
+    tag="${CUSTOM_TAG}_${CHUNK_TAG}"
+    echo "==> Custom-prompt eval | exp=${EXP_NAME} | gpu=${GPU} | backend=${DECODE_BACKEND} | chunk=${CHUNK_SIZE} | RUN_TAG=${tag}"
+    echo "    prompt: ${CUSTOM_PROMPT}"
+    RUN_TAG="$tag" \
+    SYSTEM_PROMPT="$CUSTOM_PROMPT" \
+    MODEL_CLASS="$MODEL_CLASS" \
+    DECODE_BACKEND="$DECODE_BACKEND" \
+    RUN_AVERAGING="$RUN_AVERAGING" \
+    CHUNK_SIZE="$CHUNK_SIZE" \
+    bash "$EVAL" --gpu "$GPU" "$EXP_NAME"
+    echo ""
+    echo "==> Done. Results under \$LEADERBOARD_RUN/results/${EXP_NAME}_step*_${tag}/"
+    exit 0
+fi
 
 echo "==> Flexible-prompt eval | exp=${EXP_NAME} | gpu=${GPU} | backend=${DECODE_BACKEND} | chunk=${CHUNK_SIZE} | delays='${DELAYS}'"
 for d in $DELAYS; do

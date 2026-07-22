@@ -63,6 +63,46 @@ from nemo.collections.speechlm2.data.streaming_stt_dataset import AUDIO_TOKEN_ID
 SPINE_SEG_ID = 0
 
 
+def _branch_positions(
+    pref: int, window_len: int, n_words: int, contiguous_text_positions: bool
+) -> List[int]:
+    """RoPE position ids for one branch's tokens.
+
+    Physical branch layout is ``<vs> [window_len audio] <ve> [n_words words] <eot>``
+    (``n_bt = window_len + n_words + 3`` tokens; ``n_words = len(branch_words)``).
+
+    Two conventions:
+
+    * **Default** (``contiguous_text_positions=False``): positions are a plain
+      contiguous run ``pref, pref+1, ..., pref+n_bt-1`` — the audio consumes
+      ``window_len+2`` position slots *between* the history (ending at ``pref-1``)
+      and the predicted words, so the transcript has a per-chunk positional gap.
+
+    * **Contiguous text** (``contiguous_text_positions=True``, "Option A"): the
+      words + eot are placed *contiguously with the history* at ``pref, pref+1,
+      ...`` (word ``j`` -> ``pref+j``, eot -> ``pref+n_words``), so ``[history |
+      words]`` reads as one uninterrupted stream. The prelude (``<vs>`` + audio +
+      ``<ve>``) is overlaid *just before* ``pref`` (positions
+      ``pref-(window_len+2) .. pref-1``, clamped at 0), overlapping the tail of
+      the history's position range. This keeps the position-based causal rule of
+      :func:`build_chunk_completion_mask` intact (audio positions ``< pref`` so
+      the words still attend all their audio), and a word ends up at the *same*
+      position as its spine twin. When ``pref < window_len+2`` (history shorter
+      than the audio window, e.g. an early chunk with a large window) the earliest
+      prelude positions clamp to 0 and tie; this is benign (it only makes those
+      audio frames attend each other, never leaks history/words) but breaks
+      exact parity with an order-causal standalone, so parity tests use configs
+      with ``pref >= window_len+2``.
+    """
+    n_bt = window_len + n_words + 3  # <vs> + audio + <ve> + words + <eot>
+    if not contiguous_text_positions:
+        return [pref + off for off in range(n_bt)]
+    n_prelude = window_len + 2  # <vs> + audio + <ve>
+    prelude = [max(0, pref - n_prelude + i) for i in range(n_prelude)]
+    words = [pref + j for j in range(n_words + 1)]  # words + eot, contiguous with history
+    return prelude + words
+
+
 @dataclass
 class ChunkSpec:
     """One chunk of an utterance.
@@ -126,6 +166,7 @@ def build_packed_chunk_example(
     supervise_eot: bool = True,
     audio_history_chunks: int = 0,
     recover_prev: Optional[List[bool]] = None,
+    contiguous_text_positions: bool = False,
 ) -> PackedChunkExample:
     """Build the packed spine+branch layout for one utterance.
 
@@ -156,6 +197,14 @@ def build_packed_chunk_example(
             history word from the (now-visible) previous chunk's audio. The spine
             and all OTHER branches (incl. the one that normally emits that word)
             are unchanged.
+        contiguous_text_positions: when True (Option A), each branch's predicted
+            words + eot get positions ``pref, pref+1, ...`` (contiguous with the
+            history), and the branch's ``<vs>``/audio/``<ve>`` prelude is overlaid
+            just before ``pref`` — so the transcript reads as one uninterrupted
+            stream with the audio parked on the history's tail positions. False
+            (default) keeps the original contiguous-branch positions (audio
+            consumes position slots between history and words). See
+            :func:`_branch_positions`.
 
     Returns:
         PackedChunkExample.
@@ -236,7 +285,7 @@ def build_packed_chunk_example(
         if supervise_eot:
             next_targets[last_word_pos] = eot_id
 
-        branch_positions = [pref + off for off in range(n_bt)]
+        branch_positions = _branch_positions(pref, window_len, len(branch_words), contiguous_text_positions)
 
         input_ids.extend(branch_tokens)
         position_ids.extend(branch_positions)
@@ -380,13 +429,17 @@ class SeparateChunkExample:
     """One standalone per-chunk example (the reference formulation).
 
     ``[instruction w_1..w_{k-1}] <vs> audio_window <ve> w_k <eot>`` with plain
-    causal attention and contiguous positions ``0..len-1``.
+    causal attention. ``position_ids`` are ``0..len-1`` in the default convention;
+    under ``contiguous_text_positions`` they match the packed branch's overlaid
+    scheme (the prefix is ``0..pref-1`` and the branch follows
+    :func:`_branch_positions`), so the parity test must pass them to the model.
     """
 
     input_ids: Tensor  # (L,)
     target_ids: Tensor  # (L,)
     is_audio: Tensor  # (L,)
     audio_frame_index: Tensor  # (L,) global encoder-frame index at audio positions, -1 elsewhere
+    position_ids: Tensor  # (L,) RoPE positions (0..L-1 by default; overlaid under contiguous mode)
     # index range [branch_start, L) of this example's branch (audio + words + eot)
     branch_start: int
 
@@ -400,6 +453,7 @@ def build_separate_chunk_examples(
     supervise_eot: bool = True,
     audio_history_chunks: int = 0,
     recover_prev: Optional[List[bool]] = None,
+    contiguous_text_positions: bool = False,
 ) -> List[SeparateChunkExample]:
     """Build the naive per-chunk examples used as a correctness oracle.
 
@@ -407,6 +461,10 @@ def build_separate_chunk_examples(
     the *plain text* ``instruction + w_1..w_{k-1}`` (minus the previous chunk's
     last word when recovering), with the same audio window as the packed branch.
     The packed builder must reproduce these branches' logits exactly (parity test).
+
+    ``contiguous_text_positions`` must match the packed builder: it selects the
+    position-id convention (see :func:`_branch_positions`) and is written into
+    each example's ``position_ids`` for the parity forward.
     """
     M = max(int(audio_history_chunks), 0)
     frame_starts: List[int] = []
@@ -460,12 +518,20 @@ def build_separate_chunk_examples(
         if supervise_eot:
             target_ids[last_word_pos] = eot_id
 
+        # Positions: prefix is 0..pref-1; the branch follows the same convention
+        # as the packed builder so the parity comparison is apples-to-apples.
+        pref = len(prefix)
+        position_ids = list(range(pref)) + _branch_positions(
+            pref, window_len, len(branch_words), contiguous_text_positions
+        )
+
         out.append(
             SeparateChunkExample(
                 audio_frame_index=torch.tensor(audio_frame_index, dtype=torch.long),
                 input_ids=torch.tensor(input_ids, dtype=torch.long),
                 target_ids=torch.tensor(target_ids, dtype=torch.long),
                 is_audio=torch.tensor(is_audio, dtype=torch.bool),
+                position_ids=torch.tensor(position_ids, dtype=torch.long),
                 branch_start=len(prefix),
             )
         )
@@ -487,6 +553,7 @@ def stream_decode_chunk_completion(
     max_new_tokens: int = 64,
     device: Optional[torch.device] = None,
     audio_history_chunks: int = 0,
+    contiguous_text_positions: bool = False,
 ) -> List[List[int]]:
     """Greedy streaming decode of one utterance in the chunk-completion model.
 
@@ -549,10 +616,20 @@ def stream_decode_chunk_completion(
         prelude = torch.cat(
             [embed_ids([vision_start_id])[0], cf, embed_ids([vision_end_id])[0]], dim=0
         )[None]  # (1, c+2, H)
-        bpos = torch.arange(spine_len, spine_len + c + 2, device=device)[None]
+        # Positions: default = spine_len..spine_len+c+1 (audio consumes slots, words
+        # follow after). Contiguous (Option A) = prelude overlaid just before
+        # spine_len (clamped >=0) so the first word lands at spine_len, contiguous
+        # with the history.
+        if contiguous_text_positions:
+            bpos = torch.tensor(
+                [[max(0, spine_len - (c + 2) + i) for i in range(c + 2)]], device=device
+            )
+            cur = spine_len  # first decoded word position
+        else:
+            bpos = torch.arange(spine_len, spine_len + c + 2, device=device)[None]
+            cur = spine_len + c + 2
         out = llm(inputs_embeds=prelude, position_ids=bpos, past_key_values=spine, use_cache=True, return_dict=True)
         cache = out.past_key_values
-        cur = spine_len + c + 2
         logits = out.logits[:, -1]  # position of <ve>: predicts first word
 
         words: List[int] = []
@@ -606,6 +683,7 @@ def batched_stream_decode_chunk_completion(
     max_new_tokens: int = 64,
     device: Optional[torch.device] = None,
     audio_history_chunks: int = 0,
+    contiguous_text_positions: bool = False,
 ) -> List[List[int]]:
     """Batched greedy chunk-completion decode for B utterances at once.
 
@@ -694,7 +772,23 @@ def batched_stream_decode_chunk_completion(
         embeds = torch.where(audio_mask.unsqueeze(-1), audio_at, text_embeds)
 
         valid = input_tokens != pad_id  # (na, L) bool
-        position_ids = (valid.long().cumsum(dim=1) - 1).clamp(min=0)
+        if contiguous_text_positions:
+            # Per row: history (instr+emitted) at 0..pref-1, the <vs>/audio/<ve>
+            # prelude overlaid just before pref (clamped >=0), and the first decoded
+            # word at pref -> the transcript stays contiguous with the history.
+            position_ids = torch.zeros(na, L, dtype=torch.long, device=device)
+            cur_pos = torch.zeros(na, dtype=torch.long, device=device)
+            for i, (s, fr) in enumerate(zip(seqs, chunk_frames)):
+                seq_len = len(s)
+                start = L - seq_len
+                c = int(fr.shape[0])
+                pref = seq_len - (c + 2)  # history length (instr + emitted)
+                row_pos = list(range(pref)) + [max(0, pref - (c + 2) + j) for j in range(c + 2)]
+                position_ids[i, start:] = torch.tensor(row_pos, dtype=torch.long, device=device)
+                cur_pos[i] = pref
+        else:
+            position_ids = (valid.long().cumsum(dim=1) - 1).clamp(min=0)
+            cur_pos = position_ids[:, -1] + 1  # (na,)
 
         out = llm(
             inputs_embeds=embeds,
@@ -705,7 +799,6 @@ def batched_stream_decode_chunk_completion(
         )
         cache = out.past_key_values
         logits = out.logits[:, -1]  # <ve> position -> predicts first word
-        cur_pos = position_ids[:, -1] + 1  # (na,)
         attn_running = valid.long()
 
         finished = [False] * na
