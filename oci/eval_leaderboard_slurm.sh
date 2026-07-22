@@ -189,7 +189,11 @@ fi
 HFCACHE="${OUTPUT_PREFIX}/hf_cache"; mkdir -p "$HFCACHE"
 CODE_DIR="${CODE_DIR:-/lustre/fsw/portfolios/nemotron/users/hainanx/NeMo79/}"
 H_DIR=/lustre/fsw/portfolios/llmservice/users/heh
-OCI_TMP_DIR="${OCI_TMP_DIR:-${RESULTS_DIR}/tmp}"
+# TMPDIR must stay SHORT: Python multiprocessing (the heh DataLoader workers)
+# creates AF_UNIX sockets at ${TMPDIR}/pymp-*/listener-*, and Linux caps the
+# socket path at ~108 bytes. The deep, timestamped RESULTS_DIR blows past that
+# ("OSError: AF_UNIX path too long"), so default to a short node-local path.
+OCI_TMP_DIR="${OCI_TMP_DIR:-/tmp/sslm_eval_${SLURM_JOB_ID:-$$}}"
 
 OUTFILE=${RESULTS_DIR}/slurm-%j-%n.out
 ERRFILE=${RESULTS_DIR}/error-%j-%n.out
