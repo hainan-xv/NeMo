@@ -15,8 +15,13 @@
 
 # ============================================================================
 # Parallel Open-ASR-Leaderboard eval for a SpeechLM model, ON OCI: one node,
-# one dataset per GPU (8 datasets over 8 GPUs), so the full suite finishes in
-# ~one dataset's time instead of eight.
+# work BALANCED across 8 GPUs. Instead of one dataset per GPU (imbalanced, since
+# datasets differ hugely in size), we POOL every utterance across all datasets,
+# shuffle with a fixed seed, and give each GPU an even 1/8 slice. Each shard
+# writes a dataset-tagged generations JSONL; a final --aggregate reduce step
+# pools them by dataset and reports per-dataset WER (identical to non-sharded WER
+# since it's additive over utterances). Total time ~= sum(all)/8 instead of the
+# single largest dataset.
 #
 # Uses the TRACKED, offline driver scripts/speechlm_leaderboard_eval.py (synced
 # to /code), which reads a PRE-STAGED wav/manifest cache on lustre (no HF
@@ -44,6 +49,7 @@
 #   STEP=<n>          eval step=<n>.ckpt explicitly
 #   CKPT=<path>       eval this exact .ckpt (overrides EXP resolution)
 #   DATASETS          space-separated 'name:split' list (default: full 8-set suite)
+#   SHUFFLE_SEED      seed for the pooled global shuffle (default 1234)
 #   MAX_EVAL_SAMPLES  cap samples per dataset (fast smoke test)
 #   OUTPUT_PREFIX     results root (default nemotron users/hainanx)
 # ============================================================================
@@ -71,6 +77,9 @@ USE_LAST="${USE_LAST:-0}"
 STEP="${STEP:-}"
 CKPT="${CKPT:-}"
 DATASETS="${DATASETS:-librispeech:test.clean librispeech:test.other ami:test earnings22:test gigaspeech:test spgispeech:test tedlium:test voxpopuli:test}"
+SHUFFLE_SEED="${SHUFFLE_SEED:-1234}"
+# Comma-joined form for the driver's --datasets (which splits on commas).
+DATASETS_CSV="$(echo "$DATASETS" | tr -s ' ' ',')"
 
 # Pre-staged leaderboard cache on lustre (rsync of ~/leaderboard_run/cache).
 CACHE_DIR="${CACHE_DIR:-/lustre/fsw/portfolios/llmservice/users/hainanx/leaderboard_cache}"
@@ -114,10 +123,10 @@ MOUNTS="--container-mounts=${CODE_DIR}:/code,${H_DIR}:${H_DIR},${HFCACHE}:/hfcac
 NGPU=8
 
 read -r -d '' cmd <<EOF
-echo "*******SpeechLM leaderboard eval (1 node, one dataset per GPU)********" \
+echo "*******SpeechLM leaderboard eval (1 node, pooled shards balanced over ${NGPU} GPUs)********" \
 && echo "*** EXP=${EXP_NAME} | MODEL_CLASS=${MODEL_CLASS} ***" \
 && echo "*** CKPT=${CKPT} ***" \
-&& echo "*** CACHE_DIR=${CACHE_DIR} | CHUNK_SIZE=${CHUNK_SIZE:-<default>} | BATCH_SIZE=${BATCH_SIZE} ***" \
+&& echo "*** CACHE_DIR=${CACHE_DIR} | CHUNK_SIZE=${CHUNK_SIZE:-<default>} | BATCH_SIZE=${BATCH_SIZE} | SEED=${SHUFFLE_SEED} ***" \
 && nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader \
 && cd /code \
 && git rev-parse HEAD \
@@ -131,18 +140,21 @@ echo "*******SpeechLM leaderboard eval (1 node, one dataset per GPU)********" \
 && export HYDRA_FULL_ERROR=1 \
 && export TMPDIR=${OCI_TMP_DIR} && mkdir -p ${OCI_TMP_DIR} \
 && python -c "import nemo, nemo.collections.speechlm2; print('NeMo:', nemo.__file__)" \
-&& DATASETS_ARR=(${DATASETS}) \
-&& echo "Launching \${#DATASETS_ARR[@]} datasets across ${NGPU} GPUs..." \
+&& echo "Pooled datasets: ${DATASETS_CSV}" \
+&& echo "Fanning ${NGPU} balanced shards across ${NGPU} GPUs (seed=${SHUFFLE_SEED})..." \
+&& rm -f ${RESULTS_DIR}/shard*_of*.generations.jsonl \
 && pids=() \
-&& for i in "\${!DATASETS_ARR[@]}"; do \
-      ds="\${DATASETS_ARR[\$i]}"; gpu=\$(( i % ${NGPU} )); \
-      safe=\$(echo "\$ds" | tr ':/' '__'); \
-      echo "  [gpu \$gpu] \$ds -> ${RESULTS_DIR}/\${safe}.log"; \
+&& for gpu in \$(seq 0 \$(( ${NGPU} - 1 ))); do \
+      log="${RESULTS_DIR}/shard_\${gpu}.log"; \
+      echo "  [gpu \$gpu] shard \$gpu/${NGPU} -> \${log}"; \
       python /code/scripts/speechlm_leaderboard_eval.py \
         --ckpt_path "${CKPT}" \
         --model_class "${MODEL_CLASS}" \
-        --datasets "\$ds" \
-        --device "\$gpu" \
+        --datasets "${DATASETS_CSV}" \
+        --num_shards ${NGPU} \
+        --shard_index \$gpu \
+        --shuffle_seed ${SHUFFLE_SEED} \
+        --device \$gpu \
         --cache_dir "${CACHE_DIR}" \
         --batch_size ${BATCH_SIZE} \
         --max_new_tokens ${MAX_NEW_TOKENS} \
@@ -150,17 +162,15 @@ echo "*******SpeechLM leaderboard eval (1 node, one dataset per GPU)********" \
         --system_prompt "${SYSTEM_PROMPT}" \
         --output_dir "${RESULTS_DIR}" \
         ${CHUNK_SIZE:+--chunk_size ${CHUNK_SIZE}} \
-        > "${RESULTS_DIR}/\${safe}.log" 2>&1 & \
+        > "\${log}" 2>&1 & \
       pids+=(\$!); \
    done \
 && fail=0 && for p in "\${pids[@]}"; do wait "\$p" || fail=1; done \
 && echo "" \
 && echo "==================== Leaderboard WER ====================" \
-&& printf "  %-28s %8s %10s\n" "Dataset" "WER(%)" "Time(s)" \
-&& printf "  %-28s %8s %10s\n" "----------------------------" "--------" "----------" \
-&& grep -h -P "^RESULT\t" ${RESULTS_DIR}/*.log 2>/dev/null | awk -F"\t" '{printf "  %-28s %8s %10s\n", \$2, \$3, \$4; if(\$3+0==\$3){s+=\$3; n++}} END{if(n>0){printf "  %-28s %8s\n", "----------------------------", "--------"; printf "  %-28s %8.2f\n", "Average", s/n}}' \
+&& python /code/scripts/speechlm_leaderboard_eval.py --aggregate --output_dir "${RESULTS_DIR}" 2>&1 | tee "${RESULTS_DIR}/aggregate.log" \
 && echo "" \
-&& echo "Per-dataset logs + generations under: ${RESULTS_DIR}" \
+&& echo "Per-shard logs + generations under: ${RESULTS_DIR}" \
 && exit \$fail
 EOF
 

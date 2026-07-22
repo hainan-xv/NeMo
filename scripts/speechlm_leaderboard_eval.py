@@ -34,11 +34,14 @@ several datasets in one process (model loaded once).
 """
 import argparse
 import gc
+import glob
 import json
 import os
+import random
 import sys
 import time
-from typing import List, Tuple
+from collections import Counter, defaultdict
+from typing import Dict, List, Tuple
 
 import numpy as np
 import soundfile
@@ -124,8 +127,10 @@ def load_model(ckpt_path: str, model_class_path: str, device: torch.device, dtyp
     return model
 
 
-def read_cache_manifest(cache_dir: str, dataset: str, split: str, max_samples: int = 0) -> Tuple[List[str], List[str]]:
-    """Read a pre-staged split: returns (audio_filepaths, references)."""
+def read_cache_manifest(
+    cache_dir: str, dataset: str, split: str, max_samples: int = 0
+) -> Tuple[List[str], List[str], List[float]]:
+    """Read a pre-staged split: returns (audio_filepaths, references, durations)."""
     path = os.path.join(cache_dir, dataset, split, "_cache_manifest.jsonl")
     if not os.path.isfile(path):
         raise FileNotFoundError(
@@ -134,7 +139,7 @@ def read_cache_manifest(cache_dir: str, dataset: str, split: str, max_samples: i
             f"<cache_dir>/<dataset>/<split>/_cache_manifest.jsonl + 16kHz wavs)."
         )
     ds_dir = os.path.join(cache_dir, dataset, split)
-    paths, refs = [], []
+    paths, refs, durs = [], [], []
     with open(path) as f:
         for line in f:
             line = line.strip()
@@ -153,9 +158,10 @@ def read_cache_manifest(cache_dir: str, dataset: str, split: str, max_samples: i
                 continue
             paths.append(fp)
             refs.append(rec.get("reference", rec.get("text", "")))
+            durs.append(float(rec.get("duration", 0.0) or 0.0))
             if max_samples and len(paths) >= max_samples:
                 break
-    return paths, refs
+    return paths, refs, durs
 
 
 def load_audio_batch(paths: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -200,7 +206,7 @@ def evaluate_dataset(model, args, dataset: str, split: str, device: torch.device
     from nemo.collections.speechlm2.parts.metrics.wer import WER
 
     key = f"{dataset}/{split}"
-    paths, refs = read_cache_manifest(args.cache_dir, dataset, split, args.max_eval_samples)
+    paths, refs, _durs = read_cache_manifest(args.cache_dir, dataset, split, args.max_eval_samples)
     if not paths:
         _log(f"{key}: no samples found; skipping")
         return None
@@ -249,9 +255,161 @@ def evaluate_dataset(model, args, dataset: str, split: str, device: torch.device
     return {"key": key, "wer": wer_val, "time": elapsed, "n": len(paths)}
 
 
+def build_global_items(cache_dir: str, entries: List[Tuple[str, str]], max_samples: int) -> List[dict]:
+    """Pool every utterance across all datasets into one flat list.
+
+    Each item carries its dataset/split so per-dataset WER can be reduced later.
+    ``max_samples`` still caps PER dataset (so smoke tests stay small)."""
+    items: List[dict] = []
+    for dataset, split in entries:
+        paths, refs, durs = read_cache_manifest(cache_dir, dataset, split, max_samples)
+        key = f"{dataset}/{split}"
+        for p, r, d in zip(paths, refs, durs):
+            items.append({"key": key, "path": p, "ref": r, "dur": d})
+    return items
+
+
+def select_shard(items: List[dict], shard_index: int, num_shards: int, seed: int) -> List[dict]:
+    """Deterministically pick this GPU's slice: seeded global shuffle for load
+    balancing, round-robin assignment to shards, then sort the slice by duration
+    so each decode batch holds similar-length clips (minimal padding waste)."""
+    order = list(range(len(items)))
+    random.Random(seed).shuffle(order)
+    shard = [items[j] for pos, j in enumerate(order) if pos % num_shards == shard_index]
+    shard.sort(key=lambda it: it["dur"])
+    return shard
+
+
+def evaluate_shard(model, args, device: torch.device) -> int:
+    """Decode this GPU's pooled slice of utterances (a mix of all datasets) and
+    write a shard-unique, dataset-tagged generations JSONL for the reduce step.
+
+    Per-batch decode errors are non-fatal: the batch's hyps are left empty and we
+    keep going, so one bad clip can't corrupt every dataset's WER."""
+    from transformers import GenerationConfig
+
+    entries = _parse_entries(args.datasets)
+    items = build_global_items(args.cache_dir, entries, args.max_eval_samples)
+    if not items:
+        _log("shard: no samples found across any dataset; nothing to do")
+        return 0
+    shard = select_shard(items, args.shard_index, args.num_shards, args.shuffle_seed)
+    total = len(shard)
+    _log(
+        f"shard {args.shard_index}/{args.num_shards}: {total}/{len(items)} pooled utts "
+        f"across {len(entries)} datasets (seed={args.shuffle_seed})"
+    )
+    if total == 0:
+        return 0
+
+    gen_kwargs = dict(
+        system_prompt=args.system_prompt,
+        max_new_tokens=args.max_new_tokens,
+        generation_config=GenerationConfig(do_sample=False),
+        chunk_size_override=(args.chunk_size if args.chunk_size and args.chunk_size > 0 else None),
+    )
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    out_path = os.path.join(args.output_dir, f"shard{args.shard_index}_of{args.num_shards}.generations.jsonl")
+
+    per_ds_total = Counter(it["key"] for it in shard)
+    per_ds_done: Counter = Counter()
+
+    def _postfix() -> str:
+        # Compact per-dataset done/total, ordered like the leaderboard suite.
+        return " ".join(f"{k.split('/')[0]}:{per_ds_done[k]}/{per_ds_total[k]}" for k in sorted(per_ds_total))
+
+    bs = max(1, int(args.batch_size))
+    start = time.time()
+    pbar = tqdm(
+        total=total, desc=f"shard{args.shard_index}", unit="utt", ncols=140,
+        mininterval=float(args.progress_interval), file=sys.stdout,
+    )
+    pbar.set_postfix_str(_postfix())
+    with open(out_path, "w") as fout:
+        for i in range(0, total, bs):
+            batch = shard[i : i + bs]
+            paths = [it["path"] for it in batch]
+            audios, audio_lens = load_audio_batch(paths)
+            audios = audios.to(device, non_blocking=True)
+            audio_lens = audio_lens.to(device, non_blocking=True)
+            try:
+                with torch.inference_mode():
+                    hyps = _generate_with_oom_backoff(model, audios, audio_lens, gen_kwargs, args.min_batch_size)
+            except Exception as ex:  # noqa: BLE001 - non-fatal: keep other datasets intact
+                _log(f"  WARN: batch [{i}:{i + len(batch)}] failed ({type(ex).__name__}: {ex}); emitting empty hyps")
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                hyps = [""] * len(batch)
+            for it, h in zip(batch, hyps):
+                fout.write(json.dumps({"key": it["key"], "reference": it["ref"], "hypothesis": h}) + "\n")
+                per_ds_done[it["key"]] += 1
+            fout.flush()
+            pbar.update(len(batch))
+            pbar.set_postfix_str(_postfix())
+    pbar.close()
+    _log(f"shard {args.shard_index}: decoded {total} utts in {time.time() - start:.1f}s -> {out_path}")
+    return 0
+
+
+def aggregate_results(args) -> int:
+    """Reduce step: pool every shard's dataset-tagged generations and compute WER
+    per dataset (identical to non-sharded WER, since it's additive over utts)."""
+    from nemo.collections.speechlm2.parts.metrics.wer import WER
+
+    files = sorted(glob.glob(os.path.join(args.output_dir, "shard*_of*.generations.jsonl")))
+    if not files:
+        _log(f"aggregate: no shard generation files under {args.output_dir}")
+        return 1
+    groups: Dict[str, Dict[str, list]] = defaultdict(lambda: {"refs": [], "hyps": []})
+    for fn in files:
+        with open(fn) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                rec = json.loads(line)
+                g = groups[rec["key"]]
+                g["refs"].append(rec.get("reference", ""))
+                g["hyps"].append(rec.get("hypothesis", ""))
+    _log(f"aggregate: {len(files)} shard files -> {len(groups)} datasets")
+
+    results = []
+    for key in sorted(groups):
+        g = groups[key]
+        wer = WER(normalize=True, verbose=args.verbose)
+        wer.update(key, refs=g["refs"], hyps=g["hyps"])
+        wer_val = float(wer.compute()["wer"]) * 100.0
+        # time field is meaningless post-shard; keep the RESULT schema for the launcher grep.
+        _log(f"RESULT\t{key}\t{wer_val:.2f}\t0.0\t{len(g['refs'])}")
+        results.append({"key": key, "wer": wer_val, "n": len(g["refs"])})
+
+    if results:
+        _log("\n  {:<28} {:>8} {:>10}".format("Dataset", "WER(%)", "N"))
+        _log("  " + "-" * 48)
+        tot = 0.0
+        for r in results:
+            _log(f"  {r['key']:<28} {r['wer']:>8.2f} {r['n']:>10d}")
+            tot += r["wer"]
+        _log("  " + "-" * 48)
+        _log(f"  {'Average':<28} {tot / len(results):>8.2f}")
+    return 0
+
+
+def _parse_entries(datasets_arg: str) -> List[Tuple[str, str]]:
+    entries = []
+    for e in (x.strip() for x in datasets_arg.split(",")):
+        if not e:
+            continue
+        name, _, split = e.partition(":")
+        entries.append((name, split or "test"))
+    return entries
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--ckpt_path", required=True, help="Lightning .ckpt to evaluate.")
+    p.add_argument("--ckpt_path", help="Lightning .ckpt to evaluate (required unless --aggregate).")
     p.add_argument(
         "--model_class",
         default="nemo.collections.speechlm2.models.chunk_completion_model.ChunkCompletionSTTModel",
@@ -262,8 +420,24 @@ def parse_args() -> argparse.Namespace:
         default=",".join(DEFAULT_DATASETS),
         help="Comma-separated 'name:split' list (default = full leaderboard). Pass one for per-GPU eval.",
     )
-    p.add_argument("--cache_dir", required=True, help="Pre-staged cache root (<dataset>/<split>/_cache_manifest.jsonl).")
+    p.add_argument("--cache_dir", help="Pre-staged cache root (<dataset>/<split>/_cache_manifest.jsonl).")
     p.add_argument("--device", type=int, default=0, help="GPU index (cuda:N).")
+    # --- pooled-shard mode (balance work across GPUs regardless of dataset size) ---
+    p.add_argument(
+        "--num_shards",
+        type=int,
+        default=1,
+        help="If >1, pool ALL datasets' utts, shuffle, and evaluate only this GPU's 1/num_shards slice "
+        "(writes a dataset-tagged generations JSONL; run --aggregate afterwards for WER). Default 1 = "
+        "legacy per-dataset inline-WER mode.",
+    )
+    p.add_argument("--shard_index", type=int, default=0, help="This shard's index in [0, num_shards).")
+    p.add_argument("--shuffle_seed", type=int, default=1234, help="Seed for the global shuffle (stable across shards).")
+    p.add_argument(
+        "--aggregate",
+        action="store_true",
+        help="Reduce mode: read all shard generation JSONLs under --output_dir and print per-dataset WER.",
+    )
     p.add_argument("--batch_size", type=int, default=64)
     p.add_argument("--min_batch_size", type=int, default=1, help="Lower bound for the OOM batch-halving.")
     p.add_argument("--max_new_tokens", type=int, default=64)
@@ -284,6 +458,18 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+
+    # Reduce mode needs no GPU/model: just pool shard JSONLs and score.
+    if args.aggregate:
+        if not args.output_dir:
+            _log("ERROR: --aggregate requires --output_dir (where shard JSONLs live).")
+            return 1
+        return aggregate_results(args)
+
+    if not args.ckpt_path or not args.cache_dir:
+        _log("ERROR: --ckpt_path and --cache_dir are required for evaluation.")
+        return 1
+
     if not torch.cuda.is_available():
         _log("WARNING: CUDA not available; running on CPU (very slow).")
         device = torch.device("cpu")
@@ -291,15 +477,18 @@ def main() -> int:
         device = torch.device(f"cuda:{args.device}")
     dtype = torch.float32 if args.dtype == "fp32" else torch.bfloat16
 
-    entries = []
-    for e in (x.strip() for x in args.datasets.split(",")):
-        if not e:
-            continue
-        name, _, split = e.partition(":")
-        entries.append((name, split or "test"))
-
     model = load_model(args.ckpt_path, args.model_class, device, dtype)
 
+    # Pooled-shard mode: this process decodes only its balanced slice of all
+    # datasets and writes a tagged JSONL; WER comes from the later --aggregate.
+    if args.num_shards and args.num_shards > 1:
+        if not args.output_dir:
+            _log("ERROR: --num_shards > 1 requires --output_dir for shard generations.")
+            return 1
+        return evaluate_shard(model, args, device)
+
+    # Legacy per-dataset mode (one or more full datasets in this process).
+    entries = _parse_entries(args.datasets)
     results = []
     for dataset, split in entries:
         try:
