@@ -806,8 +806,8 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             if compute_wer:
                 tensorboard_logs.update({'training_batch_wer': wer})
 
-        # Log items
-        self.log_dict(tensorboard_logs)
+        if (sample_id + 1) % log_every_n_steps == 0:
+            self.log_dict(tensorboard_logs)
 
         # Preserve batch acoustic model T and language model U parameters if normalizing
         if self._optim_normalize_joint_txu:
