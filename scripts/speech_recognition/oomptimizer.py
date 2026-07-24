@@ -366,16 +366,7 @@ def oomptimizer(
     logging.setLevel(logging.CRITICAL)
     torch.cuda.set_per_process_memory_fraction(memory_fraction, device)
 
-    # trainer = pl.Trainer(barebones=True)
-    trainer = pl.Trainer(
-        **{
-            **resolve_trainer_cfg(cfg.trainer),
-            "max_steps": 1,
-            "max_epochs": 1,
-            "limit_val_batches": 0.0,
-            "val_check_interval": 0.0,
-        }
-    )
+    trainer = pl.Trainer(barebones=True)
     trainer.log_every_n_steps = 1000000
     model_clones = []
     for _ in range(2 if ddp else 1):
@@ -392,6 +383,16 @@ def oomptimizer(
             assert config_path is not None, "--module-name requires --config-path to be specified as well."
             assert module_name is not None, "--config-path requires --module-name to be specified as well."
             cfg = OmegaConf.load(config_path)
+            trainer = pl.Trainer(
+                **{
+                    **resolve_trainer_cfg(cfg.trainer),
+                    "max_steps": 1,
+                    "max_epochs": 1,
+                    "limit_val_batches": 0.0,
+                    "val_check_interval": 0.0,
+                }
+            )
+            trainer.log_every_n_steps = 1000000
             namespace, name = module_name.rsplit('.', maxsplit=1)
             model_cls = getattr(importlib.import_module(namespace), name)
             model = model_cls(cfg=cfg.model, trainer=trainer).to(device)
