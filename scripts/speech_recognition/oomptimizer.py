@@ -27,6 +27,7 @@ from omegaconf import OmegaConf
 from nemo.collections.asr.models.asr_model import ASRModel
 from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, MaskType, NeuralType
 from nemo.utils import logging
+from nemo.utils.trainer_utils import resolve_trainer_cfg
 
 
 class ProfilingBatchGenerator:
@@ -365,7 +366,16 @@ def oomptimizer(
     logging.setLevel(logging.CRITICAL)
     torch.cuda.set_per_process_memory_fraction(memory_fraction, device)
 
-    trainer = pl.Trainer(barebones=True)
+    # trainer = pl.Trainer(barebones=True)
+    trainer = pl.Trainer(
+        **{
+            **resolve_trainer_cfg(cfg.trainer),
+            "max_steps": 1,
+            "max_epochs": 1,
+            "limit_val_batches": 0.0,
+            "val_check_interval": 0.0,
+        }
+    )
     trainer.log_every_n_steps = 1000000
     model_clones = []
     for _ in range(2 if ddp else 1):
