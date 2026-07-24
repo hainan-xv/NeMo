@@ -115,6 +115,10 @@ class StreamingSTTEvalConfig:
     # candidate; set e.g. 2/4/7/10/14/28 to measure a specific latency. None keeps
     # the model default. Ignored for dynamic/offline configs.
     chunk_size: Optional[int] = None
+    # Chunk-completion only: cap the conditioning transcript history to the most
+    # recent N tokens (instruction always kept) to keep long-form decode linear.
+    # None/0 = unlimited. Ignored by non-chunk-completion models.
+    max_history_tokens: Optional[int] = None
     # When set, LM-head boundary decision uses a probability threshold:
     # emit when p(user_footer_first_id) ≥ threshold (instead of argmax). Useful
     # to recover boundaries where the LM is moderately confident but loses
@@ -222,20 +226,25 @@ def main(cfg: StreamingSTTEvalConfig):
         cfg.generation_config.max_new_tokens = cfg.max_new_tokens
         generation_config = GenerationConfig(**OmegaConf.to_container(cfg.generation_config))
         batch_debug_logs: Optional[list] = [] if cfg.debug_log_audio_frames else None
+        _gen_kwargs = dict(
+            system_prompt=cfg.system_prompt,
+            max_new_tokens=cfg.max_new_tokens,
+            generation_config=generation_config,
+            use_offline_embs=cfg.use_offline_embs,
+            use_state_machine_inference=cfg.use_state_machine_inference,
+            dynamic_min_chunk_size=cfg.dynamic_min_chunk_size,
+            dynamic_max_chunk_size=cfg.dynamic_max_chunk_size,
+            lm_head_emit_threshold=cfg.lm_head_emit_threshold,
+            chunk_size_override=cfg.chunk_size,
+        )
+        # Only forward the chunk-completion max-history cap when explicitly set, so
+        # other model classes never receive an unexpected kwarg.
+        if cfg.max_history_tokens is not None:
+            _gen_kwargs["max_history_tokens"] = int(cfg.max_history_tokens)
         batch_hyps_raw = _generate_with_oom_backoff(
             batch["audios"].to(model.device, non_blocking=True),
             batch["audio_lens"].to(model.device, non_blocking=True),
-            gen_kwargs=dict(
-                system_prompt=cfg.system_prompt,
-                max_new_tokens=cfg.max_new_tokens,
-                generation_config=generation_config,
-                use_offline_embs=cfg.use_offline_embs,
-                use_state_machine_inference=cfg.use_state_machine_inference,
-                dynamic_min_chunk_size=cfg.dynamic_min_chunk_size,
-                dynamic_max_chunk_size=cfg.dynamic_max_chunk_size,
-                lm_head_emit_threshold=cfg.lm_head_emit_threshold,
-                chunk_size_override=cfg.chunk_size,
-            ),
+            gen_kwargs=_gen_kwargs,
             debug_logs=batch_debug_logs,
         )
         batch_infer_duration = perf_counter() - ts
@@ -276,6 +285,9 @@ def main(cfg: StreamingSTTEvalConfig):
     logging.info(f"RTFx: {rtfx:.1f}")
 
     if cfg.output_manifest is not None:
+        # Ensure the output directory exists (the caller may point output_manifest
+        # at a fresh dir); otherwise the log.txt / generations writes below fail.
+        Path(cfg.output_manifest).parent.mkdir(parents=True, exist_ok=True)
         log_file = Path(cfg.output_manifest).parent / "log.txt"
         with open(log_file, "a") as f:
             f.write(f"======{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}======\n")

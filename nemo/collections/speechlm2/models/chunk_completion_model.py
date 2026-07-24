@@ -30,6 +30,7 @@ Only the training and generation paths differ from the parent — audio encoding
 validation/WER accumulation are reused as-is.
 """
 
+import math
 from typing import List, Optional, Union
 
 import torch
@@ -38,6 +39,7 @@ from torch import Tensor
 from torch.distributed.tensor.parallel import loss_parallel
 from transformers import GenerationConfig
 
+from nemo.collections.asr.inference.streaming.framing.request import Frame
 from nemo.collections.speechlm2.data.chunk_completion_dataset import ChunkCompletionBatch, ChunkCompletionSTTDataset
 from nemo.collections.speechlm2.data.streaming_stt_dataset import AUDIO_TOKEN_IDX, IGNORE_INDEX
 from nemo.collections.speechlm2.models.streaming_stt_model import StreamingSTTModel
@@ -74,6 +76,20 @@ class ChunkCompletionSTTModel(StreamingSTTModel):
         # Contiguous-text positions ("Option A"): must match how the data was
         # packed at train time; read from the MODEL config for from_pretrained.
         self._contiguous_text_positions = bool(getattr(self.core_cfg, "contiguous_text_positions", False))
+
+        # Long-form encode: clips longer than this (seconds) are encoded with the
+        # cache-aware STREAMING encoder in generate() (bounded memory) instead of a
+        # single offline perception() forward (chunked_limited attention is still
+        # O(T^2) -> OOM on multi-minute audio). Shorter clips keep the exact offline
+        # path so leaderboard-length WER/throughput is unchanged. 0 disables (always
+        # offline); a large value effectively disables streaming.
+        self._stream_encode_min_sec = float(getattr(self.core_cfg, "stream_encode_min_sec", 40.0) or 0.0)
+
+        # Inference max-history cap: retain at most this many of the most recently
+        # emitted transcript tokens as the conditioning history (instruction always
+        # kept); 0 = unlimited. Bounds the per-chunk prefill so long-form decode
+        # cost stays linear (the text spine otherwise grows with the word count).
+        self._max_history_tokens = int(getattr(self.core_cfg, "max_history_tokens", 0) or 0)
 
         hf_tok = self.tokenizer.tokenizer
         self._cc_vision_start_id = hf_tok.convert_tokens_to_ids(self.audio_open_token)
@@ -211,6 +227,59 @@ class ChunkCompletionSTTModel(StreamingSTTModel):
     # ------------------------------------------------------------------
 
     @torch.no_grad()
+    def _encode_frames_streaming(self, wav: Tensor, n_samples: int, N: int, chunk_samples: int) -> Tensor:
+        """Encode ONE clip's waveform into ``(T_enc, H)`` LLM-space frames via the
+        cache-aware STREAMING encoder path, keeping memory bounded to one window.
+
+        This mirrors the interleaving model's ``_generate_dynamic_streaming`` refill
+        loop (feature buffer -> ``perception(..., streaming=True)`` -> carried
+        encoder cache), but simply concatenates every step's frames instead of
+        feeding them to the LLM one at a time. Because the encoder is
+        ``chunked_limited`` with a fixed per-layer cache, this reproduces the same
+        limited-context frames the model was trained on — but without the offline
+        forward's O(T^2) attention that OOMs on multi-minute clips.
+
+        Requires ``setup_streaming_params()`` to have run (the caller does so via
+        ``_set_encoder_att_context(cs, recompute_streaming=True)``).
+        """
+        device = wav.device
+        enc_param = next(self.perception.encoder.parameters())
+        cache_lc, cache_lt, cache_lcl = self.perception.get_initial_cache_state(
+            batch_size=1, dtype=enc_param.dtype, device=device
+        )
+        buf = self.get_audio_feature_buffer(batch_size=1, chunk_size_override=N)
+        out: List[Tensor] = []
+        pos = 0
+        while pos < n_samples:
+            end = min(pos + chunk_samples, n_samples)
+            seg = wav[pos:end]
+            length = end - pos
+            if seg.shape[0] < chunk_samples:
+                seg = F.pad(seg, (0, chunk_samples - seg.shape[0]))
+            features, right_paddings = buf.update([Frame(samples=seg, stream_id=0, length=length)])
+            processed_signal = torch.stack(features).type_as(self.embed_tokens.weight)  # (1, D, T_mel)
+            processed_signal_length = torch.tensor(
+                [processed_signal.shape[-1] - int(right_paddings[0])], device=device
+            ).long()
+            emb, emb_len, new_cache = self.perception(
+                processed_signal=processed_signal,
+                processed_signal_length=processed_signal_length,
+                cache_last_channel=cache_lc,
+                cache_last_time=cache_lt,
+                cache_last_channel_len=cache_lcl,
+                streaming=True,
+            )
+            cache_lc = new_cache["cache_last_channel"]
+            cache_lt = new_cache["cache_last_time"]
+            cache_lcl = new_cache["cache_last_channel_len"]
+            n_enc = int(emb_len[0].item()) if emb_len is not None else emb.shape[1]
+            if n_enc > 0:
+                out.append(emb[0, :n_enc])
+            pos = end
+        if not out:
+            return torch.zeros(0, self.llm.config.hidden_size, device=device, dtype=self.embed_tokens.weight.dtype)
+        return torch.cat(out, dim=0)  # (T_enc, H)
+
     def generate(
         self,
         audios: Tensor,
@@ -232,26 +301,61 @@ class ChunkCompletionSTTModel(StreamingSTTModel):
         cs = self._resolve_inference_chunk_size(chunk_size_override)
         if cs <= 0:
             raise ValueError(f"chunk-completion generate requires a positive chunk size, got {cs}")
-        self._set_encoder_att_context(cs)
 
         B = audios.shape[0]
         if isinstance(system_prompt, str):
             system_prompt = [system_prompt] * B
 
-        # --- 1) Encode audio in sub-batches -> per-utterance frame tensors ---
-        # A single full-batch encode of long, length-sorted clips overflows 32-bit
-        # CUDA indexing in the subsampling conv; sub-batching keeps it bounded.
-        enc_bs = max(1, int(self.encode_batch_size))
-        frames_list: List[Tensor] = []
-        for i in range(0, B, enc_bs):
-            sl = audio_lens[i : i + enc_bs]
-            max_len = int(sl.max().item())
-            sig = audios[i : i + enc_bs, :max_len]
-            emb, emb_len = self.perception(input_signal=sig, input_signal_length=sl)  # (b, T_enc, H)
-            for j in range(emb.shape[0]):
-                frames_list.append(emb[j, : int(emb_len[j].item())].clone())
+        # --- 1) Encode audio -> per-utterance frame tensors ---
+        # Short clips: exact batched OFFLINE encode (unchanged; keeps leaderboard
+        # WER/throughput). Long clips: cache-aware STREAMING encode so encoder
+        # memory stays bounded (offline chunked_limited attention is O(T^2) and
+        # OOMs on multi-minute audio). ``stream_encode`` (True/False) forces either
+        # path; otherwise clips longer than ``_stream_encode_min_sec`` stream.
+        sr = self.core_cfg.sample_rate
+        force = generation_kwargs.pop("stream_encode", None)
+        thr = float(getattr(self, "_stream_encode_min_sec", 0.0) or 0.0)
+        if isinstance(force, bool):
+            stream_flags = [force] * B
+        else:
+            stream_flags = [thr > 0.0 and (int(audio_lens[b].item()) / sr) > thr for b in range(B)]
+
+        frames_list: List[Optional[Tensor]] = [None] * B
+
+        # Long clips: cache-aware streaming encode (bounded memory), per utterance.
+        stream_idx = [b for b in range(B) if stream_flags[b]]
+        if stream_idx:
+            self._set_encoder_att_context(cs, recompute_streaming=True)
+            enc = self.perception.encoder
+            if getattr(enc, "streaming_cfg", None) is None:
+                enc.setup_streaming_params()
+            N = max(int(cs), 1)
+            chunk_samples = math.ceil(N * self.core_cfg.frame_length_in_secs * sr)
+            for b in stream_idx:
+                n = int(audio_lens[b].item())
+                frames_list[b] = self._encode_frames_streaming(audios[b, :n], n, N, chunk_samples)
+
+        # Short clips: batched OFFLINE encode. Sub-batched because a single
+        # full-batch encode of long, length-sorted clips overflows 32-bit CUDA
+        # indexing in the subsampling conv; sub-batching keeps each conv tensor bounded.
+        offline_idx = [b for b in range(B) if not stream_flags[b]]
+        if offline_idx:
+            self._set_encoder_att_context(cs)
+            enc_bs = max(1, int(self.encode_batch_size))
+            for i in range(0, len(offline_idx), enc_bs):
+                grp = offline_idx[i : i + enc_bs]
+                grp_t = torch.tensor(grp, device=audio_lens.device)
+                sl = audio_lens[grp_t]
+                max_len = int(sl.max().item())
+                sig = audios[grp_t, :max_len]
+                emb, emb_len = self.perception(input_signal=sig, input_signal_length=sl)  # (b, T_enc, H)
+                for j, b in enumerate(grp):
+                    frames_list[b] = emb[j, : int(emb_len[j].item())].clone()
 
         # --- 2) Batched chunk-synchronous streaming decode ---
+        # Per-call override of the max-history cap, else the model-config default.
+        mh = generation_kwargs.pop("max_history_tokens", None)
+        max_history_tokens = int(mh) if mh is not None else self._max_history_tokens
         instruction_ids_list = [self.tokenizer.text_to_ids(system_prompt[b] + "\n") for b in range(B)]
         emitted = batched_stream_decode_chunk_completion(
             llm=self.llm,
@@ -267,5 +371,6 @@ class ChunkCompletionSTTModel(StreamingSTTModel):
             device=self.device,
             audio_history_chunks=self._audio_history_chunks,
             contiguous_text_positions=self._contiguous_text_positions,
+            max_history_tokens=max_history_tokens,
         )
         return [self.tokenizer.ids_to_text(ids) if ids else "" for ids in emitted]

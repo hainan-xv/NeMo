@@ -554,6 +554,7 @@ def stream_decode_chunk_completion(
     device: Optional[torch.device] = None,
     audio_history_chunks: int = 0,
     contiguous_text_positions: bool = False,
+    max_history_tokens: int = 0,
 ) -> List[List[int]]:
     """Greedy streaming decode of one utterance in the chunk-completion model.
 
@@ -604,7 +605,9 @@ def stream_decode_chunk_completion(
     n_frames = frames.shape[0]
     num_chunks = math.ceil(n_frames / chunk_size) if n_frames > 0 else 0
     M = max(int(audio_history_chunks), 0)
+    instr_len = len(instruction_ids)
 
+    emitted_flat: List[int] = []
     emitted_per_chunk: List[List[int]] = []
     for k in range(num_chunks):
         # Audio window = frames of chunks [max(0, k-M) .. k].
@@ -663,6 +666,21 @@ def stream_decode_chunk_completion(
             )
             spine = out.past_key_values
             spine_len += len(words)
+        emitted_flat.extend(words)
+
+        # Optional max-history cap: keep only the most recent ``max_history_tokens``
+        # emitted tokens as spine history (instruction always kept). Rebuild the
+        # spine (crop to instruction, re-prefill the kept tail at contiguous
+        # positions) so the retained history matches the batched decoder's capped
+        # prefill. Bounds cost to linear in duration.
+        if max_history_tokens and (spine_len - instr_len) > max_history_tokens:
+            kept = emitted_flat[-max_history_tokens:]
+            spine.crop(instr_len)
+            kemb = embed_ids(kept)
+            kpos = torch.arange(instr_len, instr_len + len(kept), device=device)[None]
+            out = llm(inputs_embeds=kemb, position_ids=kpos, past_key_values=spine, use_cache=True, return_dict=True)
+            spine = out.past_key_values
+            spine_len = instr_len + len(kept)
 
         emitted_per_chunk.append(words)
 
@@ -684,6 +702,7 @@ def batched_stream_decode_chunk_completion(
     device: Optional[torch.device] = None,
     audio_history_chunks: int = 0,
     contiguous_text_positions: bool = False,
+    max_history_tokens: int = 0,
 ) -> List[List[int]]:
     """Batched greedy chunk-completion decode for B utterances at once.
 
@@ -740,9 +759,16 @@ def batched_stream_decode_chunk_completion(
             # Audio window = frames of chunks [max(0, k-M) .. k].
             fr = frames_list[b][max(0, k - M) * chunk_size : (k + 1) * chunk_size].to(device=device, dtype=dtype)
             c = int(fr.shape[0])
+            # Optionally cap the CONDITIONING history to the most recent
+            # ``max_history_tokens`` emitted tokens (instruction always kept). This
+            # bounds the per-chunk prefill so cost is linear in duration instead of
+            # quadratic; all emitted tokens are still recorded for the output.
+            hist = emitted[b]
+            if max_history_tokens and len(hist) > max_history_tokens:
+                hist = hist[-max_history_tokens:]
             toks = (
                 list(instruction_ids_list[b])
-                + list(emitted[b])
+                + list(hist)
                 + [vision_start_id]
                 + [AUDIO_TOKEN_IDX] * c
                 + [vision_end_id]
