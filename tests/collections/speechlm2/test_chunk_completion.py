@@ -246,6 +246,95 @@ def test_delay_prompt_disabled_returns_none():
     assert ds._sample_delay_prompt(np.random.default_rng(0)) is None
 
 
+# ---------------------------------------------------------------------------
+# Exact-delay + text-representation prompting
+# ---------------------------------------------------------------------------
+
+
+def _promptctl_stub(vary=True, blank=""):
+    cls = _cc_dataset_class()
+    ds = object.__new__(cls)
+    ds.cfg = SimpleNamespace(blank_token=blank)
+    ds._vary_text_repr = vary
+    ds._text_repr_keep = set("'")
+    ds._prompt_template = cls._DEFAULT_PROMPT_TEMPLATE
+    ds._format_clauses = dict(cls._DEFAULT_FORMAT_CLAUSES)
+    ds._exact_delay = True
+    ds._exact_max_delay = 4
+    return ds
+
+
+def test_exact_delay_prompt_render():
+    ds = _promptctl_stub()
+    p = ds._build_exact_prompt(3, True, True)
+    assert "delay of 3 frames" in p
+    assert "normal capitalization and punctuation" in p
+    p2 = ds._build_exact_prompt(0, False, False)
+    assert "delay of 0 frames" in p2
+    assert "lowercase with no punctuation" in p2
+    # No dangling placeholders.
+    assert "{" not in p and "}" not in p
+
+
+def test_exact_delay_prompt_render_without_text_repr():
+    ds = _promptctl_stub(vary=False)
+    p = ds._build_exact_prompt(2, True, True)
+    assert "delay of 2 frames" in p
+    assert "{" not in p and "}" not in p  # {format_clause} resolves to empty
+
+
+def test_text_repr_transform_all_four_combos():
+    ds = _promptctl_stub()
+    content = " Hello, World's best!"
+    assert ds._apply_text_repr(content, True, True) == content  # cap+punct: unchanged
+    assert ds._apply_text_repr(content, False, True) == " hello, world's best!"  # lowercase, keep punct
+    assert ds._apply_text_repr(content, True, False) == " Hello World's best"  # strip punct, keep apostrophe+case
+    assert ds._apply_text_repr(content, False, False) == " hello world's best"  # lowercase + strip punct
+
+
+def test_text_repr_preserves_leading_space_and_blank():
+    ds = _promptctl_stub(blank="<blank>")
+    # blank / empty sentinels untouched.
+    assert ds._apply_text_repr("<blank>", False, False) == "<blank>"
+    assert ds._apply_text_repr("", False, False) == ""
+    # no leading space in -> none out.
+    assert ds._apply_text_repr("Cat.", True, False) == "Cat"
+    # punctuation-only content collapses to '' (treated as silent downstream).
+    assert ds._apply_text_repr(" ...", True, False) == ""
+
+
+def test_strip_punct_collapses_and_keeps_apostrophe():
+    ds = _promptctl_stub()
+    assert ds._strip_punct("well - known") == "well known"  # hyphen removed, spaces collapsed
+    assert ds._strip_punct("don't stop!") == "don't stop"  # apostrophe kept, bang removed
+
+
+def test_append_format_clause():
+    ds = _promptctl_stub()
+    base = "Do the thing."
+    out = ds._append_format_clause(base, False, False)
+    assert out == "Do the thing. Write the text in all lowercase with no punctuation."
+
+
+def test_sample_text_repr_disabled_makes_no_draw():
+    import numpy as np
+
+    ds = _promptctl_stub(vary=False)
+    rng = np.random.default_rng(0)
+    state_before = rng.bit_generator.state
+    assert ds._sample_text_repr(rng) == (True, True)
+    assert rng.bit_generator.state == state_before  # no RNG consumption when disabled
+
+
+def test_sample_text_repr_covers_all_combos():
+    import numpy as np
+
+    ds = _promptctl_stub()
+    rng = np.random.default_rng(0)
+    seen = {ds._sample_text_repr(rng) for _ in range(500)}
+    assert seen == {(True, True), (True, False), (False, True), (False, False)}
+
+
 def test_collate_shapes_and_padding():
     ex1 = build_packed_chunk_example(INSTR, [ChunkSpec(2, [20, 21])], VS, VE, EOT)
     ex2 = build_packed_chunk_example(INSTR, [ChunkSpec(1, [30]), ChunkSpec(2, [31])], VS, VE, EOT)

@@ -114,6 +114,34 @@ class StreamingSTTDataConfig:
     # (no per-chunk positional gap). Should match model.contiguous_text_positions.
     # 0/False = original behavior. ChunkCompletionSTTDataset only.
     contiguous_text_positions: bool = False
+    # --- Exact-delay prompting (ChunkCompletionSTTDataset; needs num_delay_frames=-1) ---
+    # When True, prompt-controlled delay uses an EXACT integer delay embedded in the
+    # prompt instead of the natural-language delay_prompts list. Each batch samples
+    # one delay uniformly from [0, exact_max_delay]; num_delay_frames is set to it and
+    # the number is rendered into prompt_template's {delay} field, so at inference you
+    # request an exact delay. delay_prompts is ignored. Default False = unchanged.
+    exact_delay: bool = False
+    # Inclusive upper bound of the exact-delay sampling range [0, exact_max_delay].
+    # Required (>= 1) when exact_delay=True.
+    exact_max_delay: int = 0
+    # --- Text-representation variation (ChunkCompletionSTTDataset) ---
+    # When True, each batch samples one of the 4 (capitalization on/off) x
+    # (punctuation on/off) combinations uniformly; the chunk TARGET text is
+    # transformed accordingly and the choice is stated in the prompt (via
+    # prompt_template's {format_clause}). The whole batch shares one setting.
+    # Default False = always original capitalization + punctuation.
+    vary_text_repr: bool = False
+    # Characters to KEEP when stripping punctuation (punct off): anything that is
+    # not alphanumeric, whitespace, or in this string is removed. Default keeps the
+    # apostrophe so contractions ("don't") survive.
+    text_repr_keep_chars: str = "'"
+    # Prompt template for exact_delay / vary_text_repr. Must contain '{delay}' when
+    # exact_delay=True and '{format_clause}' when vary_text_repr=True. None -> a
+    # built-in default (see ChunkCompletionSTTDataset._DEFAULT_PROMPT_TEMPLATE).
+    prompt_template: Optional[str] = None
+    # Optional override of the 4 format clauses, keyed by "cap_punct", "cap_nopunct",
+    # "nocap_punct", "nocap_nopunct". None -> built-in defaults.
+    format_clauses: Optional[dict] = None
     # When True, ignore the scalar num_delay_frames and delay each word by a
     # WORD-LENGTH-dependent amount (see word_length_delay_frames): longer words
     # get less delay. Fixed/dynamic chunking only.
