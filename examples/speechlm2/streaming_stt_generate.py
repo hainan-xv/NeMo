@@ -119,6 +119,11 @@ class StreamingSTTEvalConfig:
     # recent N tokens (instruction always kept) to keep long-form decode linear.
     # None/0 = unlimited. Ignored by non-chunk-completion models.
     max_history_tokens: Optional[int] = None
+    # Chunk-completion only: also report per-word emission latency (proxy) = the
+    # time from audio start to the end of the chunk of each word's last subword,
+    # averaged over words. Off by a constant from true latency. Ignored by other
+    # model classes.
+    report_word_latency: bool = False
     # When set, LM-head boundary decision uses a probability threshold:
     # emit when p(user_footer_first_id) ≥ threshold (instead of argmax). Useful
     # to recover boundaries where the LM is moderately confident but loses
@@ -178,6 +183,7 @@ def main(cfg: StreamingSTTEvalConfig):
 
     refs = []
     hyps = []
+    word_lat = []  # per-utterance list of per-word emission times (s); empty unless report_word_latency
     input_durations = []
     infer_durations = []
 
@@ -219,6 +225,10 @@ def main(cfg: StreamingSTTEvalConfig):
         logging.warning(f"CUDA OOM on batch of {B}; retrying as {mid}+{B - mid} sub-batches.")
         left = _generate_with_oom_backoff(audios[:mid], audio_lens[:mid], gen_kwargs, None, min_bs)
         right = _generate_with_oom_backoff(audios[mid:], audio_lens[mid:], gen_kwargs, None, min_bs)
+        # generate() may return (hyps, per_word_latencies) when report_word_latency
+        # is on; concatenate both halves in that case.
+        if isinstance(left, tuple):
+            return left[0] + right[0], left[1] + right[1]
         return left + right
 
     for batch_idx, batch in tqdm(enumerate(dloader), total=num_batches):
@@ -241,12 +251,21 @@ def main(cfg: StreamingSTTEvalConfig):
         # other model classes never receive an unexpected kwarg.
         if cfg.max_history_tokens is not None:
             _gen_kwargs["max_history_tokens"] = int(cfg.max_history_tokens)
-        batch_hyps_raw = _generate_with_oom_backoff(
+        if cfg.report_word_latency:
+            _gen_kwargs["return_word_latency"] = True
+        _result = _generate_with_oom_backoff(
             batch["audios"].to(model.device, non_blocking=True),
             batch["audio_lens"].to(model.device, non_blocking=True),
             gen_kwargs=_gen_kwargs,
             debug_logs=batch_debug_logs,
         )
+        # generate() returns (hyps, per-word-latencies) only when the model honored
+        # return_word_latency (chunk-completion). Fall back gracefully otherwise.
+        if cfg.report_word_latency and isinstance(_result, tuple):
+            batch_hyps_raw, batch_word_lat = _result
+        else:
+            batch_hyps_raw = _result
+            batch_word_lat = [[] for _ in range(len(batch["cuts"]))]
         batch_infer_duration = perf_counter() - ts
 
         # Write per-frame debug records keyed by cut id.
@@ -273,6 +292,7 @@ def main(cfg: StreamingSTTEvalConfig):
 
         refs.extend(batch_refs)
         hyps.extend(batch_hyps)
+        word_lat.extend(batch_word_lat)
         input_durations.append(batch_duration)
         infer_durations.append(batch_infer_duration)
 
@@ -283,6 +303,11 @@ def main(cfg: StreamingSTTEvalConfig):
     rtfx = sum(input_durations) / sum(infer_durations)
     logging.info(f"WER: {wer:.2%} [ins={nins:.2%} del={ndel:.2%} sub={nsub:.2%}]")
     logging.info(f"RTFx: {rtfx:.1f}")
+    # Word emission latency proxy (mean over all words of end-of-chunk-of-last-subword).
+    _all_lat = [t for utt in word_lat for t in utt]
+    mean_word_lat = (sum(_all_lat) / len(_all_lat)) if _all_lat else None
+    if mean_word_lat is not None:
+        logging.info(f"WordLatency: {mean_word_lat:.3f}s (proxy, w.r.t. audio start; {len(_all_lat)} words)")
 
     if cfg.output_manifest is not None:
         # Ensure the output directory exists (the caller may point output_manifest
@@ -294,9 +319,13 @@ def main(cfg: StreamingSTTEvalConfig):
             f.write(f"Input: {cfg.inputs}\n")
             f.write(f"WER: {wer:.2%} [ins={nins:.2%} del={ndel:.2%} sub={nsub:.2%}]\n")
             f.write(f"RTFx: {rtfx:.1f}\n")
+            if mean_word_lat is not None:
+                f.write(f"WordLatency: {mean_word_lat:.3f}s (proxy, w.r.t. audio start)\n")
             f.write(f"=============================================\n\n")
+        if not word_lat:
+            word_lat = [[] for _ in hyps]
         with SequentialJsonlWriter(cfg.output_manifest) as writer:
-            for cut, ref, hyp in zip(cuts, refs, hyps):
+            for cut, ref, hyp, wl in zip(cuts, refs, hyps, word_lat):
                 wer, _, nins, ndel, nsub = word_error_rate_detail(hypotheses=[hyp], references=[ref], use_cer=False)
                 record = {
                     "id": cut.id,
@@ -315,6 +344,11 @@ def main(cfg: StreamingSTTEvalConfig):
                 custom = getattr(cut, "custom", None) or {}
                 if "dataset_key" in custom:
                     record["dataset_key"] = custom["dataset_key"]
+                # Per-utterance word-emission latency (proxy) + word count, so the
+                # reduce step can compute a word-weighted per-dataset average.
+                if wl:
+                    record["word_latency"] = sum(wl) / len(wl)
+                    record["n_words"] = len(wl)
                 writer.write(record)
 
 

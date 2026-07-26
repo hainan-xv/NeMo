@@ -185,7 +185,9 @@ def cmd_aggregate(args) -> int:
     if not files:
         print(f"aggregate: no shard generation files under {args.out_dir}")
         return 1
-    groups = defaultdict(lambda: {"refs": [], "hyps": []})
+    # lat_sum/lat_words accumulate the word-weighted emission latency (proxy), when
+    # streaming_stt_generate wrote per-utterance word_latency + n_words.
+    groups = defaultdict(lambda: {"refs": [], "hyps": [], "lat_sum": 0.0, "lat_words": 0})
     n_rows = 0
     for fn in files:
         with open(fn) as f:
@@ -197,6 +199,9 @@ def cmd_aggregate(args) -> int:
                 key = rec.get("dataset_key") or "unknown"
                 groups[key]["refs"].append(rec.get("text", ""))
                 groups[key]["hyps"].append(rec.get("pred_text", ""))
+                if "word_latency" in rec and "n_words" in rec:
+                    groups[key]["lat_sum"] += float(rec["word_latency"]) * int(rec["n_words"])
+                    groups[key]["lat_words"] += int(rec["n_words"])
                 n_rows += 1
     print(f"aggregate: {len(files)} shard files, {n_rows} utts -> {len(groups)} datasets")
 
@@ -206,18 +211,30 @@ def cmd_aggregate(args) -> int:
         # text/pred_text are already whisper-normalized by streaming_stt_generate,
         # so a plain word_error_rate here matches heh's per-dataset WER exactly.
         wer_val = _word_error_rate(g["hyps"], g["refs"]) * 100.0
-        print(f"RESULT\t{key}\t{wer_val:.2f}\t0.0\t{len(g['refs'])}")
-        results.append({"key": key, "wer": wer_val, "n": len(g["refs"])})
+        lat = (g["lat_sum"] / g["lat_words"]) if g["lat_words"] else None
+        lat_str = f"{lat:.3f}" if lat is not None else "-"
+        print(f"RESULT\t{key}\t{wer_val:.2f}\t0.0\t{len(g['refs'])}\t{lat_str}")
+        results.append({"key": key, "wer": wer_val, "n": len(g["refs"]), "lat": lat})
 
     if results:
-        print("\n  {:<28} {:>8} {:>10}".format("Dataset", "WER(%)", "N"))
-        print("  " + "-" * 48)
+        has_lat = any(r["lat"] is not None for r in results)
+        print("\n  {:<28} {:>8} {:>10} {:>12}".format("Dataset", "WER(%)", "N", "WordLat(s)"))
+        print("  " + "-" * 62)
         tot = 0.0
+        lat_tot = 0.0
+        lat_n = 0
         for r in results:
-            print(f"  {r['key']:<28} {r['wer']:>8.2f} {r['n']:>10d}")
+            ls = f"{r['lat']:.3f}" if r["lat"] is not None else "-"
+            print(f"  {r['key']:<28} {r['wer']:>8.2f} {r['n']:>10d} {ls:>12}")
             tot += r["wer"]
-        print("  " + "-" * 48)
-        print(f"  {'Average':<28} {tot / len(results):>8.2f}")
+            if r["lat"] is not None:
+                lat_tot += r["lat"]
+                lat_n += 1
+        print("  " + "-" * 62)
+        avg_lat = f"{lat_tot / lat_n:.3f}" if lat_n else "-"
+        print(f"  {'Average':<28} {tot / len(results):>8.2f} {'':>10} {avg_lat:>12}")
+        if has_lat:
+            print("  (WordLat = mean emission time w.r.t. audio start; latency proxy, off by a constant.)")
     return 0
 
 

@@ -356,8 +356,13 @@ class ChunkCompletionSTTModel(StreamingSTTModel):
         # Per-call override of the max-history cap, else the model-config default.
         mh = generation_kwargs.pop("max_history_tokens", None)
         max_history_tokens = int(mh) if mh is not None else self._max_history_tokens
+        # Optionally return per-word emission latency (proxy): the time from audio
+        # start to when each word was emitted, i.e. the end of the chunk of the
+        # word's LAST subword. Off by a constant from true latency (the mean word
+        # onset time), which is fine for comparing models/latency settings.
+        return_word_latency = bool(generation_kwargs.pop("return_word_latency", False))
         instruction_ids_list = [self.tokenizer.text_to_ids(system_prompt[b] + "\n") for b in range(B)]
-        emitted = batched_stream_decode_chunk_completion(
+        out = batched_stream_decode_chunk_completion(
             llm=self.llm,
             embed_tokens=self.embed_tokens,
             instruction_ids_list=instruction_ids_list,
@@ -372,5 +377,31 @@ class ChunkCompletionSTTModel(StreamingSTTModel):
             audio_history_chunks=self._audio_history_chunks,
             contiguous_text_positions=self._contiguous_text_positions,
             max_history_tokens=max_history_tokens,
+            return_chunk_ids=return_word_latency,
         )
-        return [self.tokenizer.ids_to_text(ids) if ids else "" for ids in emitted]
+        if return_word_latency:
+            emitted, chunk_ids = out
+            hyps = [self.tokenizer.ids_to_text(ids) if ids else "" for ids in emitted]
+            frame_len = float(self.core_cfg.frame_length_in_secs)
+            latencies = [self._word_emission_times(emitted[b], chunk_ids[b], cs, frame_len) for b in range(B)]
+            return hyps, latencies
+        return [self.tokenizer.ids_to_text(ids) if ids else "" for ids in out]
+
+    def _word_emission_times(self, tokens: List[int], chunk_ids: List[int], chunk_size: int, frame_len: float):
+        """Per-word emission time (s from audio start): end of the chunk of the
+        word's LAST subword. Words are whitespace-delimited (matching WER). Token
+        ``i`` completes a word when the next token starts a new word (its
+        detokenized prefix gains a word); the final token completes the last word.
+        """
+        if not tokens:
+            return []
+        end_t = lambda k: (k + 1) * chunk_size * frame_len  # end time of chunk k
+        times: List[float] = []
+        wc_prev = 0
+        for i in range(len(tokens)):
+            wc_i = len(self.tokenizer.ids_to_text(tokens[: i + 1]).split())
+            if i > 0 and wc_i > wc_prev:  # token i started a new word -> token i-1 finished one
+                times.append(end_t(chunk_ids[i - 1]))
+            wc_prev = wc_i
+        times.append(end_t(chunk_ids[-1]))  # final word
+        return times

@@ -703,7 +703,8 @@ def batched_stream_decode_chunk_completion(
     audio_history_chunks: int = 0,
     contiguous_text_positions: bool = False,
     max_history_tokens: int = 0,
-) -> List[List[int]]:
+    return_chunk_ids: bool = False,
+):
     """Batched greedy chunk-completion decode for B utterances at once.
 
     Chunk-synchronous: for chunk index ``k`` every still-active stream is decoded
@@ -745,6 +746,9 @@ def batched_stream_decode_chunk_completion(
     M = max(int(audio_history_chunks), 0)
 
     emitted: List[List[int]] = [[] for _ in range(B)]
+    # Per emitted token, the audio chunk index during which it was decoded (for
+    # word-latency: a word's emission time = end of the chunk of its last subword).
+    chunk_ids: List[List[int]] = [[] for _ in range(B)]
 
     for k in range(max_chunks):
         active = [b for b in range(B) if k < num_chunks[b]]
@@ -862,5 +866,8 @@ def batched_stream_decode_chunk_completion(
 
         for i, b in enumerate(active):
             emitted[b].extend(words[i])
+            chunk_ids[b].extend([k] * len(words[i]))
 
+    if return_chunk_ids:
+        return emitted, chunk_ids
     return emitted

@@ -95,6 +95,14 @@ HEH_USE_STATE_MACHINE="${HEH_USE_STATE_MACHINE:-true}"
 HEH_USE_OFFLINE_EMBS="${HEH_USE_OFFLINE_EMBS:-false}"
 HEH_PAD_DURATION="${HEH_PAD_DURATION:-0.5}"
 FORCE_CONVERT="${FORCE_CONVERT:-0}"
+# Report per-word emission latency (proxy: end-of-chunk time of each word's last
+# subword, averaged). Chunk-completion only; default on for it, off otherwise.
+if [[ -z "${REPORT_LATENCY:-}" ]]; then
+    case "$MODEL_CLASS" in
+        *ChunkCompletionSTTModel) REPORT_LATENCY=true ;;
+        *) REPORT_LATENCY=false ;;
+    esac
+fi
 # Checkpoint averaging (DEFAULT ON): average the top-k (non '-last') checkpoints
 # — the ones exp_manager keeps by val_wer — into <CKPT_DIR>/<EXP>-averaged.ckpt,
 # stored in the model folder and REUSED on later runs. FORCE_AVERAGE=1 recomputes
@@ -310,6 +318,7 @@ ${AVG_CLAUSE} \
         use_offline_embs=${HEH_USE_OFFLINE_EMBS} \
         use_state_machine_inference=${HEH_USE_STATE_MACHINE} \
         pad_extra_duration=${HEH_PAD_DURATION} \
+        report_word_latency=${REPORT_LATENCY} \
         output_manifest="'\${gen}'" \
         verbose=false \
         device=cuda \
