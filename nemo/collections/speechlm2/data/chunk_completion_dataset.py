@@ -219,11 +219,6 @@ class ChunkCompletionSTTDataset(StreamingSTTDataset):
             raise ValueError(
                 f"history_word_recovery_prob must be in [0, 1], got {self._history_word_recovery_prob}"
             )
-        if self._history_word_recovery_prob > 0.0 and self._audio_history_chunks < 1:
-            raise ValueError(
-                "history_word_recovery_prob > 0 requires audio_history_chunks >= 1 "
-                "(the recovered word's audio must be in the branch window)."
-            )
         if self._audio_history_chunks > 0:
             logging.info(
                 "ChunkCompletionSTTDataset: audio_history_chunks=%d%s",
@@ -233,6 +228,17 @@ class ChunkCompletionSTTDataset(StreamingSTTDataset):
                     if self._history_word_recovery_prob > 0.0
                     else ""
                 ),
+            )
+        elif self._history_word_recovery_prob > 0.0:
+            # Recovery with NO audio window: the recovering branch drops the previous
+            # chunk's last word from history but does NOT see that chunk's audio, so
+            # the model must recover it from the current chunk's (left-context-
+            # carrying) encoder frames + the remaining text history.
+            logging.info(
+                "ChunkCompletionSTTDataset: history_word_recovery_prob=%.3f with "
+                "audio_history_chunks=0 (no prior-chunk audio window; recover the "
+                "dropped word from the current chunk's audio left-context + text history).",
+                self._history_word_recovery_prob,
             )
 
         # --- Contiguous-text positions ("Option A") ---

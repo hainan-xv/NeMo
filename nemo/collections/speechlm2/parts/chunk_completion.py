@@ -191,10 +191,12 @@ def build_packed_chunk_example(
             chunks ``[max(0, k-M) .. k]`` (fewer for early chunks; no padding). ``0``
             = original behavior (only the current chunk's audio).
         recover_prev: optional per-chunk bool list. When ``recover_prev[k]`` is
-            True (requires ``M>=1`` and a non-empty previous-chunk last word),
-            branch ``k`` DROPS the previous chunk's last word from its history and
-            prepends it to its target, so the model learns to recover a missing
-            history word from the (now-visible) previous chunk's audio. The spine
+            True (needs a non-empty previous-chunk last word), branch ``k`` DROPS
+            the previous chunk's last word from its history and prepends it to its
+            target, so the model learns to recover a missing history word. With
+            ``M>=1`` that word's audio is inside branch ``k``'s window; with
+            ``M==0`` it is not, so recovery must come from the current chunk's
+            (left-context-carrying) audio + the remaining text history. The spine
             and all OTHER branches (incl. the one that normally emits that word)
             are unchanged.
         contiguous_text_positions: when True (Option A), each branch's predicted
@@ -246,13 +248,14 @@ def build_packed_chunk_example(
         window_len = len(window_frames)
 
         # History-word recovery: drop the previous chunk's last word from THIS
-        # branch's history and recover it. Requires M>=1 (prev chunk in window)
-        # and a non-empty previous-chunk last word.
+        # branch's history and recover it. Needs a previous chunk with a non-empty
+        # last word. When M>=1 the dropped word's audio is in this branch's window;
+        # when M==0 it is NOT, so the model must recover it from the current chunk's
+        # (left-context-carrying) audio + the remaining text history.
         do_recover = (
             recover_prev is not None
             and kc >= 1
             and recover_prev[kc]
-            and M >= 1
             and len(chunks[kc - 1].last_word_ids) > 0
         )
         if do_recover:
@@ -485,7 +488,6 @@ def build_separate_chunk_examples(
             recover_prev is not None
             and kc >= 1
             and recover_prev[kc]
-            and M >= 1
             and len(chunks[kc - 1].last_word_ids) > 0
         )
         if do_recover:

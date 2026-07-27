@@ -662,6 +662,65 @@ def test_parity_windowed_recovery_packed_vs_separate():
         torch.testing.assert_close(packed_logits[idx], sep_logits[sep.branch_start :], atol=1e-4, rtol=1e-4)
 
 
+def test_recovery_no_window_layout():
+    """Recovery with NO audio window (audio_history_chunks=0): the recovering
+    branch drops the previous chunk's last word from history and prepends it to
+    its target, but its audio is ONLY its own chunk (no prior-chunk frames)."""
+    # chunk1 "one two" (last word "two"=[21]); chunk2 "three"=[30].
+    chunks = [ChunkSpec(2, [20, 21], last_word_ids=[21]), ChunkSpec(2, [30], last_word_ids=[30])]
+    ex = build_packed_chunk_example(
+        INSTR, chunks, VS, VE, EOT, audio_history_chunks=0, recover_prev=[False, True]
+    )
+    b2 = (ex.seg_ids == 2).nonzero(as_tuple=True)[0]
+    # prefix for chunk2 normally = INSTR(2)+[20,21] = 4; recovery drops "two"(1) -> 3.
+    assert (ex.prefix_len[b2] == 3).all()
+    # audio window is ONLY chunk2's 2 frames (no previous chunk pulled in).
+    assert int(ex.is_audio[b2].sum()) == 2
+    # target predicts [recovered "two"(21), "three"(30), eot].
+    supervised = ex.target_ids != IGNORE_INDEX
+    assert ex.target_ids[b2][supervised[b2]].tolist() == [21, 30, EOT]
+    # branch1 untouched.
+    b1 = (ex.seg_ids == 1).nonzero(as_tuple=True)[0]
+    assert (ex.prefix_len[b1] == 2).all()
+    assert ex.target_ids[b1][supervised[b1]].tolist() == [20, 21, EOT]
+
+
+@torch.no_grad()
+def test_parity_recovery_no_window_packed_vs_separate():
+    """Recovery with audio_history_chunks=0 must still match the standalone example
+    (which drops the same word and sees only its own chunk's audio)."""
+    model = _tiny_qwen3()
+    H = model.config.hidden_size
+    instruction = [5, 6]
+    chunks = [ChunkSpec(2, [20, 21], last_word_ids=[21]), ChunkSpec(3, [30, 31], last_word_ids=[31])]
+    recover = [False, True]
+    M = 0
+    total_frames = sum(c.audio_len for c in chunks)
+    torch.manual_seed(88)
+    global_frames = torch.randn(total_frames, H)
+
+    packed = build_packed_chunk_example(
+        instruction, chunks, VS, VE, EOT, audio_history_chunks=M, recover_prev=recover
+    )
+    valid = torch.ones_like(packed.input_ids, dtype=torch.bool)
+    mask = build_chunk_completion_mask(
+        packed.seg_ids[None], packed.position_ids[None], packed.prefix_len[None], valid[None], torch.float32
+    )
+    packed_emb = _embed_by_frame_index(model, packed.input_ids, packed.audio_frame_index, global_frames)
+    packed_logits = model(
+        inputs_embeds=packed_emb[None], attention_mask=mask, position_ids=packed.position_ids[None]
+    ).logits[0]
+
+    separate = build_separate_chunk_examples(
+        instruction, chunks, VS, VE, EOT, audio_history_chunks=M, recover_prev=recover
+    )
+    for k, sep in enumerate(separate, start=1):
+        sep_emb = _embed_by_frame_index(model, sep.input_ids, sep.audio_frame_index, global_frames)
+        sep_logits = model(inputs_embeds=sep_emb[None]).logits[0]
+        idx = (packed.seg_ids == k).nonzero(as_tuple=True)[0]
+        torch.testing.assert_close(packed_logits[idx], sep_logits[sep.branch_start :], atol=1e-4, rtol=1e-4)
+
+
 @torch.no_grad()
 def test_batched_decode_matches_per_utterance():
     """Batched chunk-synchronous decode must equal per-utterance stream decode.

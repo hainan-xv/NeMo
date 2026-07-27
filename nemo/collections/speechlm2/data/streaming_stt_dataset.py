@@ -103,10 +103,12 @@ class StreamingSTTDataConfig:
     # window (a word split across a boundary is then fully visible). 0 = current
     # chunk only. Should match model.audio_history_chunks.
     audio_history_chunks: int = 0
-    # History-word recovery regularization (requires audio_history_chunks >= 1).
-    # With this probability, a chunk DROPS the previous chunk's last word from its
-    # history and must recover it (prepended to its target) from the now-visible
-    # previous-chunk audio. Trains robustness to a missing history word. 0 = off.
+    # History-word recovery regularization. With this probability, a chunk DROPS
+    # the previous chunk's last word from its history and must recover it (prepended
+    # to its target). Trains robustness to a missing history word. With
+    # audio_history_chunks >= 1 the dropped word's audio is in the branch window;
+    # with audio_history_chunks == 0 it is NOT, so the model must recover it from the
+    # current chunk's (left-context-carrying) audio + text history. 0 = off.
     history_word_recovery_prob: float = 0.0
     # Contiguous-text positions ("Option A"): place each branch's predicted words
     # contiguous with the plain-text history and overlay the audio prelude on the
