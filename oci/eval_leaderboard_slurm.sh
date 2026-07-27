@@ -67,6 +67,13 @@
 #   SHUFFLE_SEED      seed for the pooled global shuffle (default 1234)
 #   MAX_EVAL_SAMPLES  cap samples per dataset (fast smoke test)
 #   OUTPUT_PREFIX     results root (default nemotron users/hainanx)
+#   EVAL_TAG          optional label spliced into RESULTS_DIR (e.g. d2_cap_punct);
+#                     set by oci/eval_leaderboard_promptctl.sh
+#
+# Concurrent jobs for the SAME exp (e.g. many promptctl delay/cap/punct evals)
+# share <EXP>-averaged.ckpt and hf_model_* . Those prep steps are guarded by
+# mkdir-based locks on lustre so only one writer runs; others wait and reuse.
+# Per-run outputs live under a unique RESULTS_DIR (timestamp + job id + EVAL_TAG).
 # ============================================================================
 
 read_optional_token() { [[ -r "$1" ]] && tr -d '\r\n' < "$1" || true; }
@@ -133,12 +140,12 @@ if [[ -n "$CKPT" || -n "$STEP" || "$USE_LAST" == "1" ]]; then
 fi
 
 # ---- Resolve the checkpoint on lustre (no rsync; it's already here) ----
-# NEED_AVG=1 means the averaged .ckpt must be (re)computed inside the container
-# below; AVG_INPUTS_QUOTED holds the single-quoted inputs for that step.
-NEED_AVG=0
+# When RUN_AVERAGING=1 the shared target is <EXP>-averaged.ckpt. Concurrent jobs
+# for the same exp all point at it; the in-container ensure step (mkdir lock)
+# serializes writers so only one averages and the rest reuse.
 AVG_INPUTS_QUOTED=""
+ENSURE_AVG=0
 if [[ "$RUN_AVERAGING" == "1" ]]; then
-    # Average exactly the top-k non-last snapshots exp_manager keeps by val_wer.
     AVG_CKPT="${CKPT_DIR}/${EXP_NAME}-averaged.ckpt"
     mapfile -t _AVG_IN < <(ls -t "${CKPT_DIR}"/*.ckpt 2>/dev/null | grep -v -- '-last\.ckpt$' | grep -v -- '-averaged\.ckpt$')
     if [[ ${#_AVG_IN[@]} -eq 0 ]]; then
@@ -147,11 +154,13 @@ if [[ "$RUN_AVERAGING" == "1" ]]; then
     fi
     for f in "${_AVG_IN[@]}"; do AVG_INPUTS_QUOTED+=" '${f}'"; done
     CKPT="$AVG_CKPT"
-    if [[ "$FORCE_AVERAGE" == "1" || ! -f "$AVG_CKPT" ]]; then
-        NEED_AVG=1
-        echo "==> Averaging ${#_AVG_IN[@]} checkpoint(s) -> ${AVG_CKPT} (computed in-container below)."
+    ENSURE_AVG=1
+    if [[ "$FORCE_AVERAGE" == "1" ]]; then
+        echo "==> Will (re)average ${#_AVG_IN[@]} checkpoint(s) -> ${AVG_CKPT} (locked; concurrent jobs wait/reuse)."
+    elif [[ -f "$AVG_CKPT" ]]; then
+        echo "==> Averaged checkpoint present: ${AVG_CKPT} (locked ensure will reuse unless another job is mid-write)."
     else
-        echo "==> Reusing cached averaged checkpoint: ${AVG_CKPT}"
+        echo "==> Averaged checkpoint missing: will create ${AVG_CKPT} under lock (${#_AVG_IN[@]} inputs)."
     fi
 else
     if [[ -z "$CKPT" ]]; then
@@ -166,25 +175,24 @@ else
     fi
 fi
 # Validate now unless the ckpt is produced by the in-container averaging step.
-if [[ "$NEED_AVG" != "1" && ( -z "$CKPT" || ! -f "$CKPT" ) ]]; then
+if [[ "$ENSURE_AVG" != "1" && ( -z "$CKPT" || ! -f "$CKPT" ) ]]; then
     echo "ERROR: could not resolve a checkpoint under ${CKPT_DIR} (set CKPT=, STEP=, USE_LAST=1, or RUN_AVERAGING=1)." >&2
     exit 1
 fi
 
-# When the averaged weights are (re)computed, any cached HF conversion of the
-# same-named averaged ckpt is stale -> force a rebuild.
-[[ "$NEED_AVG" == "1" ]] && FORCE_CONVERT=1
-
-# Timestamp the eval folder so every run is a distinct, self-contained dir.
+# Timestamp + job id (+ optional EVAL_TAG) so concurrent evals never share a results dir.
 RUN_TS="$(date +%Y%m%d_%H%M%S)"
-RESULTS_DIR="${OUTPUT_PREFIX}/results/${PROJECT}/${EXP_NAME}/leaderboard_eval$( [[ -n "$CHUNK_SIZE" ]] && echo "_chunk${CHUNK_SIZE}" )_${BACKEND}_${RUN_TS}"
+JOB_TAG="${SLURM_JOB_ID:-local$$}"
+CHUNK_TAG=""; [[ -n "$CHUNK_SIZE" ]] && CHUNK_TAG="_chunk${CHUNK_SIZE}"
+EVAL_TAG_SUFFIX=""; [[ -n "${EVAL_TAG:-}" ]] && EVAL_TAG_SUFFIX="_${EVAL_TAG}"
+RESULTS_DIR="${OUTPUT_PREFIX}/results/${PROJECT}/${EXP_NAME}/leaderboard_eval${CHUNK_TAG}${EVAL_TAG_SUFFIX}_${BACKEND}_${RUN_TS}_${JOB_TAG}"
 mkdir -p "$RESULTS_DIR"
 # Pooled shard manifests are cheap + depend on seed/datasets, so keep them in the
 # timestamped run dir (fresh each run).
 SHARD_DIR="${RESULTS_DIR}/shards"; mkdir -p "$SHARD_DIR"
 # The HF conversion depends only on the (averaged) checkpoint, not on the decode
 # config, so cache it per-ckpt OUTSIDE the timestamped dir and reuse across runs
-# (rebuilt when FORCE_CONVERT=1, incl. after the averaged weights are recomputed).
+# (rebuilt under lock when missing, FORCE_CONVERT=1, or ckpt newer than HF).
 CKPT_STEM="$(basename "${CKPT%.ckpt}")"
 HF_CKPT_DIR="${OUTPUT_PREFIX}/results/${PROJECT}/${EXP_NAME}/hf_model_${CKPT_STEM}"
 # The exp config (with a top-level model:) sits next to the checkpoints dir on
@@ -215,6 +223,8 @@ NGPU=8
 {
     echo "# SpeechLM leaderboard eval run config"
     echo "timestamp:            ${RUN_TS}"
+    echo "slurm_job_id:         ${JOB_TAG}"
+    echo "eval_tag:             ${EVAL_TAG:-}"
     echo "exp_name:             ${EXP_NAME}"
     echo "project:              ${PROJECT}"
     echo "backend:              ${BACKEND}"
@@ -222,7 +232,7 @@ NGPU=8
     echo "checkpoint:           ${CKPT}"
     echo "run_averaging:        ${RUN_AVERAGING}"
     echo "force_average:        ${FORCE_AVERAGE}"
-    echo "averaged_recomputed:  ${NEED_AVG}"
+    echo "ensure_avg:           ${ENSURE_AVG}"
     if [[ "$RUN_AVERAGING" == "1" ]]; then
         echo "averaged_num_inputs:  ${#_AVG_IN[@]}"
         echo "averaged_inputs:"
@@ -249,12 +259,137 @@ NGPU=8
 } > "${RESULTS_DIR}/run_config.yaml"
 echo "==> Wrote run config: ${RESULTS_DIR}/run_config.yaml"
 
-# In-container averaging step (empty unless the averaged ckpt must be computed).
-# Paths are single-quoted so Hydra/argparse handle best-ckpt names containing '='.
-AVG_CLAUSE=""
-if [[ "$NEED_AVG" == "1" ]]; then
-    AVG_CLAUSE="&& echo '==> Averaging ${#_AVG_IN[@]} checkpoints -> ${CKPT}' && python /code/scripts/average_sslm_ckpts.py --output '${CKPT}'${AVG_INPUTS_QUOTED} "
+# ---- Shared-prep helpers (mkdir locks; safe across concurrent jobs/nodes) ----
+# Written into SHARD_DIR and invoked inside the container. mkdir is atomic on
+# lustre; flock is not reliably cross-client. Writers stage to a temp path then
+# mv/rename into place so waiters never observe a partial file.
+ENSURE_AVG_SH="${SHARD_DIR}/ensure_averaged_ckpt.sh"
+ENSURE_HF_SH="${SHARD_DIR}/ensure_hf_model.sh"
+
+if [[ "$ENSURE_AVG" == "1" ]]; then
+    cat > "$ENSURE_AVG_SH" <<AVG_EOF
+#!/bin/bash
+set -euo pipefail
+OUT='${CKPT}'
+FORCE='${FORCE_AVERAGE}'
+LOCK="\${OUT}.preparing"
+TMP="\${OUT}.tmp.\$\$"
+STALE_SEC=7200  # steal lock if holder died mid-write (>2h)
+acquire() {
+  while ! mkdir "\$LOCK" 2>/dev/null; do
+    if [[ -d "\$LOCK" ]]; then
+      # portable mtime age (busybox/gnu)
+      lock_mtime=\$(stat -c %Y "\$LOCK" 2>/dev/null || stat -f %m "\$LOCK" 2>/dev/null || echo 0)
+      now=\$(date +%s)
+      if [[ "\$lock_mtime" -gt 0 && \$(( now - lock_mtime )) -gt \$STALE_SEC ]]; then
+        echo "==> stale avg lock (>\${STALE_SEC}s); removing \$LOCK"
+        rmdir "\$LOCK" 2>/dev/null || rm -rf "\$LOCK"
+        continue
+      fi
+    fi
+    echo "==> waiting for another job to finish averaging -> \$OUT"
+    for _ in \$(seq 1 60); do
+      if [[ "\$FORCE" != "1" && -f "\$OUT" ]]; then
+        echo "==> averaged ckpt ready (reusing): \$OUT"
+        exit 0
+      fi
+      [[ -d "\$LOCK" ]] || break
+      sleep 10
+    done
+  done
+}
+release() { rmdir "\$LOCK" 2>/dev/null || true; }
+acquire
+trap release EXIT
+if [[ "\$FORCE" == "1" || ! -f "\$OUT" ]]; then
+  echo "==> Averaging ${#_AVG_IN[@]} checkpoints -> \$OUT"
+  python /code/scripts/average_sslm_ckpts.py --output "\$TMP"${AVG_INPUTS_QUOTED}
+  mv -f "\$TMP" "\$OUT"
+  echo "==> wrote \$OUT"
+else
+  echo "==> Reusing cached averaged checkpoint: \$OUT"
 fi
+release
+trap - EXIT
+AVG_EOF
+    chmod +x "$ENSURE_AVG_SH"
+fi
+
+if [[ "$BACKEND" == "heh" ]]; then
+    cat > "$ENSURE_HF_SH" <<HF_EOF
+#!/bin/bash
+set -euo pipefail
+HF_DIR='${HF_CKPT_DIR}'
+CKPT='${CKPT}'
+FORCE='${FORCE_CONVERT}'
+MODEL_CLASS='${MODEL_CLASS}'
+EXP_CFG_LOCAL='${SHARD_DIR}/exp_config.local.yaml'
+LOCK="\${HF_DIR}.preparing"
+STALE_SEC=7200
+acquire() {
+  while ! mkdir "\$LOCK" 2>/dev/null; do
+    if [[ -d "\$LOCK" ]]; then
+      lock_mtime=\$(stat -c %Y "\$LOCK" 2>/dev/null || stat -f %m "\$LOCK" 2>/dev/null || echo 0)
+      now=\$(date +%s)
+      if [[ "\$lock_mtime" -gt 0 && \$(( now - lock_mtime )) -gt \$STALE_SEC ]]; then
+        echo "==> stale HF lock (>\${STALE_SEC}s); removing \$LOCK"
+        rmdir "\$LOCK" 2>/dev/null || rm -rf "\$LOCK"
+        continue
+      fi
+    fi
+    echo "==> waiting for another job to finish HF convert -> \$HF_DIR"
+    for _ in \$(seq 1 60); do
+      if [[ "\$FORCE" != "1" && -f "\${HF_DIR}/config.json" ]]; then
+        # Reuse only if HF is at least as new as the ckpt (covers the case where
+        # a sibling job just re-averaged and we must not keep a stale HF tree).
+        if [[ ! -f "\$CKPT" ]] || [[ ! "\$CKPT" -nt "\${HF_DIR}/config.json" ]]; then
+          echo "==> HF model ready (reusing): \$HF_DIR"
+          exit 0
+        fi
+      fi
+      [[ -d "\$LOCK" ]] || break
+      sleep 10
+    done
+  done
+}
+release() { rmdir "\$LOCK" 2>/dev/null || true; }
+acquire
+trap release EXIT
+NEED=0
+if [[ "\$FORCE" == "1" || ! -f "\${HF_DIR}/config.json" ]]; then
+  NEED=1
+elif [[ -f "\$CKPT" && "\$CKPT" -nt "\${HF_DIR}/config.json" ]]; then
+  echo "==> ckpt newer than HF cache; rebuilding"
+  NEED=1
+fi
+if [[ "\$NEED" == "1" ]]; then
+  echo "==> Converting ckpt -> HF format: \$HF_DIR"
+  python /code/scripts/patch_exp_config.py '${EXP_CFG}' "\$EXP_CFG_LOCAL" "\$CKPT"
+  TMP_HF="\${HF_DIR}.tmp.\$\$"
+  rm -rf "\$TMP_HF"
+  CUDA_VISIBLE_DEVICES=0 python /code/examples/speechlm2/to_hf.py \\
+    class_path="\$MODEL_CLASS" \\
+    ckpt_path="'\$CKPT'" \\
+    ckpt_config="'\$EXP_CFG_LOCAL'" \\
+    output_dir="'\$TMP_HF'" \\
+    weights_only=false
+  [[ -f "\${TMP_HF}/config.json" ]] || { echo "ERROR: to_hf.py did not produce \${TMP_HF}/config.json"; exit 1; }
+  rm -rf "\$HF_DIR"
+  mv -f "\$TMP_HF" "\$HF_DIR"
+  echo "==> wrote \$HF_DIR"
+else
+  echo "==> Reusing existing HF model: \$HF_DIR"
+fi
+release
+trap - EXIT
+HF_EOF
+    chmod +x "$ENSURE_HF_SH"
+fi
+
+AVG_CLAUSE=""
+[[ "$ENSURE_AVG" == "1" ]] && AVG_CLAUSE="&& bash '${ENSURE_AVG_SH}' "
+HF_CLAUSE=""
+[[ "$BACKEND" == "heh" ]] && HF_CLAUSE="&& bash '${ENSURE_HF_SH}' "
 
 if [[ "$BACKEND" == "heh" ]]; then
 # ===== heh backend: convert ckpt -> HF once, then decode each shard with =====
@@ -279,19 +414,8 @@ echo "*******SpeechLM leaderboard eval (heh engine, pooled shards over ${NGPU} G
 && export TMPDIR=${OCI_TMP_DIR} && mkdir -p ${OCI_TMP_DIR} \
 && python -c "import nemo, nemo.collections.speechlm2; print('NeMo:', nemo.__file__)" \
 ${AVG_CLAUSE} \
-&& echo "==> Patching exp config for to_hf ..." \
-&& python /code/scripts/patch_exp_config.py "${EXP_CFG}" "${SHARD_DIR}/exp_config.local.yaml" "${CKPT}" \
-&& if [ "${FORCE_CONVERT}" = "1" ] || [ ! -f "${HF_CKPT_DIR}/config.json" ]; then \
-      echo "==> Converting ckpt -> HF format: ${HF_CKPT_DIR}"; \
-      rm -rf "${HF_CKPT_DIR}"; \
-      CUDA_VISIBLE_DEVICES=0 python /code/examples/speechlm2/to_hf.py \
-        class_path="${MODEL_CLASS}" \
-        ckpt_path="'${CKPT}'" \
-        ckpt_config="'${SHARD_DIR}/exp_config.local.yaml'" \
-        output_dir="'${HF_CKPT_DIR}'" \
-        weights_only=false; \
-   else echo "==> Reusing existing HF model: ${HF_CKPT_DIR}"; fi \
-&& [ -f "${HF_CKPT_DIR}/config.json" ] || { echo "ERROR: to_hf.py did not produce ${HF_CKPT_DIR}/config.json"; exit 1; } \
+${HF_CLAUSE} \
+&& [ -f "${HF_CKPT_DIR}/config.json" ] || { echo "ERROR: HF model missing at ${HF_CKPT_DIR}/config.json"; exit 1; } \
 && echo "==> Building ${NGPU} pooled shard manifests (seed=${SHUFFLE_SEED}) ..." \
 && python /code/scripts/leaderboard_heh_shards.py build \
       --cache_dir "${CACHE_DIR}" \
