@@ -141,7 +141,35 @@ echo "    delay:         ${DELAY} frames (max trained ${MAX_DELAY})"
 echo "    chunk_size:    ${CHUNK_SIZE}"
 echo "    system_prompt: ${SYSTEM_PROMPT}"
 
+# Locate oci/eval_leaderboard_slurm.sh. Under sbatch, Slurm COPIES this script
+# into /cm/local/apps/slurm/var/spool/job<id>/, so BASH_SOURCE is useless —
+# use SLURM_SUBMIT_DIR (cwd at sbatch time) instead. Accepts submit-from-repo-
+# root (`sbatch oci/...`) or submit-from-oci/ (`sbatch ./...`).
+resolve_oci_dir() {
+    if [[ -n "${SLURM_SUBMIT_DIR:-}" ]]; then
+        if [[ -f "${SLURM_SUBMIT_DIR}/eval_leaderboard_slurm.sh" ]]; then
+            echo "${SLURM_SUBMIT_DIR}"
+            return
+        fi
+        if [[ -f "${SLURM_SUBMIT_DIR}/oci/eval_leaderboard_slurm.sh" ]]; then
+            echo "${SLURM_SUBMIT_DIR}/oci"
+            return
+        fi
+    fi
+    # Interactive / non-sbatch fallback (script not spool-copied).
+    local here
+    here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    if [[ -f "${here}/eval_leaderboard_slurm.sh" ]]; then
+        echo "${here}"
+        return
+    fi
+    echo "ERROR: cannot locate eval_leaderboard_slurm.sh (SLURM_SUBMIT_DIR=${SLURM_SUBMIT_DIR:-<unset>})" >&2
+    exit 1
+}
+OCI_DIR="$(resolve_oci_dir)"
+# Keep cwd at the submit dir so relative paths (slurm_out/) land where expected.
+cd "${SLURM_SUBMIT_DIR:-$OCI_DIR}"
+
 # Already inside the sbatch allocation: run the shared eval body as a normal
 # bash script (its #SBATCH headers are ignored). $1 = EXP_NAME.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-exec bash "${SCRIPT_DIR}/eval_leaderboard_slurm.sh" "${EXP_NAME}"
+exec bash "${OCI_DIR}/eval_leaderboard_slurm.sh" "${EXP_NAME}"
