@@ -1234,14 +1234,16 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         """Match the encoder's attention look-ahead to ``chunk_size``.
 
         The left context is taken from ``att_context_size[0]`` (fixed). The right context
-        (look-ahead) depends on the encoder:
+        (look-ahead) depends on the encoder's masking style:
 
-        - A causal cache-aware encoder (:class:`StreamingTransformerEncoder`) uses **no**
-          look-ahead (``right = 0``). Its rolling KV cache makes chunk-by-chunk streaming exact
-          only when ``right == 0`` (a frame never needs a future frame), and training therefore
-          also uses the ``right = 0`` window so it matches inference.
-        - The Conformer looks ahead to the chunk end (``right = chunk_size - 1``,
-          ``chunked_limited`` style).
+        - ``chunked_limited`` (the Conformer, and :class:`StreamingTransformerEncoder` when
+          configured with ``att_context_style="chunked_limited"``) looks ahead to the chunk end,
+          ``right = chunk_size - 1``. The look-ahead does not compound across layers, so
+          chunk-by-chunk streaming reproduces it exactly.
+        - A sliding-window :class:`StreamingTransformerEncoder` uses **no** look-ahead
+          (``right = 0``). Its per-query right context would compound across layers
+          (``n_layers * right`` frames ahead), which the rolling KV cache cannot reproduce, so
+          training also uses the ``right = 0`` window to match inference.
 
         No-op for dynamic (0) / offline (<0) chunking or when ``att_context_size`` is unset.
 
@@ -1261,9 +1263,12 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             return
         left = int(self.core_cfg.att_context_size[0])
         encoder = self.perception.encoder
-        # Causal cache-aware encoders stream exactly only with no look-ahead; the Conformer
-        # instead looks ahead to the chunk end (chunked_limited style).
-        right = 0 if isinstance(encoder, StreamingTransformerEncoder) else int(chunk_size) - 1
+        # Sliding-window cache-aware encoders stream exactly only with no look-ahead; chunk-aligned
+        # (chunked_limited) encoders look ahead to the chunk end without compounding across layers.
+        sliding_window_transformer = (
+            isinstance(encoder, StreamingTransformerEncoder) and encoder.att_context_style != "chunked_limited"
+        )
+        right = 0 if sliding_window_transformer else int(chunk_size) - 1
         new_ctx = [left, right]
         # Set att_context_size directly (rather than set_default_att_context_size)
         # to avoid per-batch "not among supported look-aheads" warnings and to

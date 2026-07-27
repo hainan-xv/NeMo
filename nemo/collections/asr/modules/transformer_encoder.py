@@ -144,8 +144,36 @@ def _make_sliding_window_mod(left, right):
     return sliding_window
 
 
+def _make_chunked_limited_mod(left, right):
+    """Chunk-aligned (``chunked_limited``) attention, matching ``ConformerEncoder``.
+
+    Frames are grouped into non-overlapping chunks of ``chunk_size = right + 1``. A query
+    attends to every frame of its own chunk (including in-chunk look-ahead) plus the
+    ``left // chunk_size`` preceding chunks — whole chunks only, never a partial one.
+    ``left < 0`` removes the left bound.
+
+    Unlike :func:`_make_sliding_window_mod`, the look-ahead does **not** compound across
+    layers: every layer stops at the same chunk boundary, so an N-layer stack still looks
+    ahead at most to the end of the current chunk. That is what makes it streamable — see
+    :class:`StreamingTransformerEncoder`.
+    """
+    chunk = right + 1
+    # ``left_chunks`` is a Python int (or None) known at trace time, so the branch below is
+    # resolved once when FlexAttention traces the mask, not per element.
+    left_chunks = (left // chunk) if left >= 0 else None
+
+    def chunked_limited(b, h, q_idx, kv_idx):
+        diff = (q_idx // chunk) - (kv_idx // chunk)
+        if left_chunks is None:
+            return diff >= 0
+        return (diff >= 0) & (diff <= left_chunks)
+
+    return chunked_limited
+
+
 _SUPPORTED_ATTENTION_MODES = ("full", "causal")
 _SUPPORTED_SELF_ATTENTION_MODELS = ("abs_pos", "rel_pos", "no_pos", "rope")
+_SUPPORTED_ATT_CONTEXT_STYLES = ("sliding_window", "chunked_limited")
 
 
 class FeedForward(nn.Module):
@@ -412,7 +440,7 @@ class TransformerBlock(nn.Module):
         x = x + self.drop(self.ffn(self.norm2(x)))
         return x
 
-    def forward_streaming(self, x_cur, cache_in, block_mask, pos_emb, left):
+    def forward_streaming(self, x_cur, cache_in, block_mask, pos_emb, cache_size):
         """Cache-aware streaming forward for one chunk.
 
         Args:
@@ -421,7 +449,7 @@ class TransformerBlock(nn.Module):
                 ``L``; validity is enforced by ``block_mask``).
             block_mask: FlexAttention ``BlockMask`` over ``(C, L + C)``.
             pos_emb: relative-position embedding for length ``L + C`` (``rel_pos`` only).
-            left: rolling-cache size in frames (``left >= 0``), or ``< 0`` to grow the cache
+            cache_size: rolling-cache size in frames (``>= 0``), or ``< 0`` to grow the cache
                 unbounded (full cache). Determines how many layer-input frames to retain.
 
         Returns:
@@ -435,14 +463,14 @@ class TransformerBlock(nn.Module):
         attn_out = self.attn.forward_streaming(self.norm1(kv_in), C, block_mask, pos_emb)
         x = x_cur + self.drop(attn_out)
         x = x + self.drop(self.ffn(self.norm2(x)))
-        # Update cache with this layer's *inputs* (kv_in), keeping the last ``left`` frames
-        # (rolling) or all of them (full cache when left < 0). ``left == 0`` keeps nothing.
-        if left < 0:
+        # Update cache with this layer's *inputs* (kv_in), keeping the last ``cache_size`` frames
+        # (rolling) or all of them (full cache when cache_size < 0). ``0`` keeps nothing.
+        if cache_size < 0:
             new_cache = kv_in
-        elif left == 0:
+        elif cache_size == 0:
             new_cache = kv_in[:, :0]
         else:
-            new_cache = kv_in[:, -left:]
+            new_cache = kv_in[:, -cache_size:]
         return x, new_cache
 
 
@@ -798,7 +826,9 @@ class _StreamingTransformerCfg:
     ``pre_encode_cache_size = 0``: ``FeatureStacking`` subsampling is non-overlapping, so no
     input-feature overlap is required between chunks (chunks must align to
     ``subsampling_factor``). ``last_channel_cache_size``: rolling attention-cache size in encoder
-    frames (= left context); ``< 0`` denotes an unbounded (full) cache that grows with the stream.
+    frames (``StreamingTransformerEncoder.cache_size`` — the left context, quantized down to whole
+    chunks under ``chunked_limited``); ``< 0`` denotes an unbounded (full) cache that grows with
+    the stream.
     """
 
     pre_encode_cache_size: int = 0
@@ -807,24 +837,34 @@ class _StreamingTransformerCfg:
 
 @experimental
 class StreamingTransformerEncoder(TransformerEncoder, StreamingEncoder):
-    """``TransformerEncoder`` with sliding-window attention and cache-aware streaming.
+    """``TransformerEncoder`` with bounded-context attention and cache-aware streaming.
 
     Adds two things on top of the base FlexAttention :class:`TransformerEncoder`:
 
-    1. **Sliding-window (local) attention** — a bounded ``[left, right]`` window (in encoder
-       frames) in the full-sequence (training) forward, so each frame attends to only ``left``
-       past and ``right`` future frames.
-    2. **Cache-aware streaming** — a rolling KV cache of the last ``left`` layer-input frames, so
-       chunked inference reproduces the full causal forward without re-encoding history. Implements
-       the real :class:`StreamingEncoder` interface consumed by ``StreamingSTTModel`` /
+    1. **Bounded-context attention** in the full-sequence (training) forward, in one of two
+       styles selected by ``att_context_style``:
+
+       - ``"sliding_window"`` (default): a per-query ``[left, right]`` window — frame ``t``
+         attends to ``[t - left, t + right]``.
+       - ``"chunked_limited"``: chunk-aligned attention matching ``ConformerEncoder`` — frames
+         are grouped into chunks of ``chunk_size = right + 1`` and a query attends to its whole
+         chunk plus the ``left // chunk_size`` preceding chunks.
+
+    2. **Cache-aware streaming** — a rolling KV cache of the last :attr:`cache_size` layer-input
+       frames, so chunked inference reproduces the full forward without re-encoding history.
+       Implements the real :class:`StreamingEncoder` interface consumed by ``StreamingSTTModel`` /
        ``AudioPerceptionModule`` (``cache_aware_stream_step`` / ``get_initial_cache_state`` /
        ``setup_streaming_params``), reusing the Conformer ``cache_last_channel`` cache plumbing.
 
-    Streaming is **exact** for a causal window (``right == 0``): a frame never needs a future
-    frame, so a rolling cache of ``left`` past frames suffices and chunk-by-chunk streaming matches
-    the full forward. With ``right > 0`` the current chunk still supplies in-chunk look-ahead, but
-    frames near a chunk boundary lose the look-ahead that crossed it in training — use
-    ``att_context_size=[chunk_size, 0]`` for exact causal streaming.
+    **Look-ahead and exactness.** For ``sliding_window``, streaming is exact only with ``right ==
+    0``: a sliding right context compounds across layers (an N-layer stack sees ``N * right``
+    frames ahead), which chunk-by-chunk streaming cannot reproduce. ``chunked_limited`` exists
+    precisely to lift that restriction — every layer stops at the same chunk boundary, so the
+    look-ahead stays bounded by the current chunk no matter how deep the stack, and streaming is
+    exact as long as the streaming chunk matches ``chunk_size = right + 1``. Use
+    ``att_context_style="chunked_limited"`` with ``att_context_size=[left, chunk_size - 1]`` to get
+    in-chunk look-ahead; use the default sliding window with ``[left, 0]`` for a strictly causal
+    encoder.
 
     The cache stores raw (position-agnostic) per-layer inputs; the positional scheme is applied per
     step in :meth:`MultiHeadAttention._apply_streaming_position`, keeping the cache format
@@ -832,29 +872,58 @@ class StreamingTransformerEncoder(TransformerEncoder, StreamingEncoder):
     supported for streaming).
 
     Args:
-        att_context_size: ``[left, right]`` window in encoder (post-subsampling) frames. ``left``
-            also sets the rolling-cache size; ``left < 0`` uses an unbounded (full) cache that grows
-            with the stream (bounded memory only for finite ``left``). ``right`` should be ``0`` for
-            exact causal streaming. Default ``(-1, -1)`` is full bidirectional attention (no
-            streaming benefit — set a finite causal window to stream).
+        att_context_size: ``[left, right]`` context in encoder (post-subsampling) frames. A negative
+            bound removes the limit on that side; ``left < 0`` means an unbounded (full) cache that
+            grows with the stream (bounded memory only for finite ``left``). Under
+            ``chunked_limited``, ``right + 1`` is the chunk size and the left context is quantized
+            down to a whole number of chunks. Default ``(-1, -1)`` is full bidirectional attention
+            (no streaming benefit — set a finite context to stream).
+        att_context_style: ``"sliding_window"`` (default) or ``"chunked_limited"``. Mirrors the
+            ``ConformerEncoder`` argument of the same name so configs read alike across encoders.
         *args, **kwargs: Forwarded to :class:`TransformerEncoder` (``attn_mode`` is managed
             internally and ignored).
     """
 
-    def __init__(self, *args, att_context_size=(-1, -1), **kwargs):
-        # This encoder's attention pattern is governed by ``att_context_size``; drop any
-        # caller-provided ``attn_mode`` so it never reaches (and fails) the base's
-        # supported-mode validation, then run the base with a valid placeholder mode.
+    def __init__(self, *args, att_context_size=(-1, -1), att_context_style="sliding_window", **kwargs):
+        # This encoder's attention pattern is governed by ``att_context_size`` /
+        # ``att_context_style``; drop any caller-provided ``attn_mode`` so it never reaches (and
+        # fails) the base's supported-mode validation, then run the base with a valid placeholder.
         kwargs.pop("attn_mode", None)
         super().__init__(*args, attn_mode="full", **kwargs)
+        if att_context_style not in _SUPPORTED_ATT_CONTEXT_STYLES:
+            raise ValueError(
+                f"att_context_style='{att_context_style}' is not supported. "
+                f"Supported styles: {_SUPPORTED_ATT_CONTEXT_STYLES}."
+            )
+        self.att_context_style = att_context_style
         self.streaming_cfg = None
         self.set_default_att_context_size(att_context_size)
         # Purely a label for introspection/logging: ``_build_mask_mod`` below fully
         # overrides the base's mask selection, so ``attn_mode`` is never consulted here.
-        self.attn_mode = "sliding_window"
+        self.attn_mode = att_context_style
+
+    @property
+    def cache_size(self) -> int:
+        """Rolling attention-cache size in encoder frames (``< 0`` -> unbounded/full cache).
+
+        For ``sliding_window`` this is ``left`` — the furthest back any query may look. For
+        ``chunked_limited`` the visible history is a whole number of chunks, so the cache only
+        needs ``(left // chunk_size) * chunk_size`` frames; sizing it exactly is what keeps the
+        streaming mask a plain "last N cache frames" test with no per-query term.
+        """
+        left, right = self.att_context_size
+        if left < 0:
+            return -1
+        if self.att_context_style == "chunked_limited":
+            if right < 0:
+                # Unlimited right degenerates to a left-only sliding window (Conformer parity).
+                return left
+            chunk = right + 1
+            return (left // chunk) * chunk
+        return left
 
     def set_default_att_context_size(self, att_context_size) -> None:
-        """Set the ``[left, right]`` attention window (in encoder frames) and refresh streaming cfg.
+        """Set the ``[left, right]`` attention context (in encoder frames) and refresh streaming cfg.
 
         A negative bound means unlimited context on that side. Named to mirror
         ``ConformerEncoder.set_default_att_context_size`` so streaming inference code that calls this
@@ -868,6 +937,10 @@ class StreamingTransformerEncoder(TransformerEncoder, StreamingEncoder):
     def _build_mask_mod(self, length):
         left, right = self.att_context_size
         pad_mod = _make_padding_mod(length)
+        if self.att_context_style == "chunked_limited" and right >= 0:
+            return and_masks(_make_chunked_limited_mod(left, right), pad_mod)
+        # Sliding window, and the ``chunked_limited`` + unlimited-right degenerate case which
+        # ConformerEncoder also collapses to a left-only bound.
         if left < 0 and right < 0:
             # Unbounded on both sides -> full (padding-only) attention.
             return pad_mod
@@ -877,26 +950,26 @@ class StreamingTransformerEncoder(TransformerEncoder, StreamingEncoder):
     # Cache-aware streaming interface (StreamingEncoder)
     # ------------------------------------------------------------------ #
     def setup_streaming_params(self, **kwargs) -> None:
-        """(Re)build ``streaming_cfg`` from the current ``att_context_size``.
+        """(Re)build ``streaming_cfg`` from the current ``att_context_size`` / ``att_context_style``.
 
-        The rolling attention cache holds ``left`` frames; ``FeatureStacking`` subsampling is
-        non-overlapping so no pre-encode overlap is needed (``pre_encode_cache_size = 0``).
+        The rolling attention cache holds :attr:`cache_size` frames; ``FeatureStacking`` subsampling
+        is non-overlapping so no pre-encode overlap is needed (``pre_encode_cache_size = 0``).
         """
         self.streaming_cfg = _StreamingTransformerCfg(
             pre_encode_cache_size=0,
-            last_channel_cache_size=self.att_context_size[0],
+            last_channel_cache_size=self.cache_size,
         )
 
     def get_initial_cache_state(self, batch_size=1, dtype=None, device=None, max_dim=0):
         """Empty KV cache. ``cache_last_channel`` is ``(n_layers, B, cache_size, d_model)`` of
-        per-layer inputs (padded to ``left`` for a rolling cache; length ``0`` — grows — for a full
-        cache or ``left == 0``). ``cache_last_time`` is an unused zero-width placeholder (no conv)."""
+        per-layer inputs (padded to :attr:`cache_size` for a rolling cache; length ``0`` — grows —
+        for a full cache or a zero-size one). ``cache_last_time`` is an unused zero-width
+        placeholder (no conv)."""
         if dtype is None:
             dtype = next(self.parameters()).dtype
         if device is None:
             device = next(self.parameters()).device
-        left = self.att_context_size[0]
-        cache_size = left if left > 0 else 0
+        cache_size = max(self.cache_size, 0)
         cache_last_channel = torch.zeros(
             self.n_layers, batch_size, cache_size, self.d_model, dtype=dtype, device=device
         )
@@ -952,8 +1025,15 @@ class StreamingTransformerEncoder(TransformerEncoder, StreamingEncoder):
             cache_last_channel, _, cache_last_channel_len = self.get_initial_cache_state(
                 batch_size=B, dtype=x.dtype, device=x.device
             )
-        left, right = self.att_context_size
-        L = cache_last_channel.shape[2]  # padded cache size (== left for rolling; grows for full)
+        right = self.att_context_size[1]
+        cache_size = self.cache_size
+        if self.att_context_style == "chunked_limited" and right >= 0 and C > right + 1:
+            raise ValueError(
+                f"chunked_limited streaming needs the streaming chunk to fit inside one attention "
+                f"chunk, but got {C} encoder frames per step with chunk_size=right+1={right + 1}. "
+                f"Feed {right + 1} frames per step (a shorter final chunk is fine)."
+            )
+        L = cache_last_channel.shape[2]  # padded cache size (== cache_size for rolling; grows for full)
         num_kv = L + C
 
         # 2. Positional prep (once). Extend positional buffers to cover the [cache | current]
@@ -976,10 +1056,10 @@ class StreamingTransformerEncoder(TransformerEncoder, StreamingEncoder):
         x = self.embed_norm(x)
 
         # 3. Streaming layers with the shared block mask; collect each layer's updated cache.
-        block_mask = self._build_streaming_block_mask(cache_last_channel_len, length, L, C, left, right, x.device)
+        block_mask = self._build_streaming_block_mask(cache_last_channel_len, length, L, C, x.device)
         new_caches = []
         for i, layer in enumerate(self.layers):
-            x, new_cache_l = layer.forward_streaming(x, cache_last_channel[i], block_mask, pos_emb, left)
+            x, new_cache_l = layer.forward_streaming(x, cache_last_channel[i], block_mask, pos_emb, cache_size)
             new_caches.append(new_cache_l)
         new_cache_last_channel = torch.stack(new_caches, dim=0)
 
@@ -989,8 +1069,8 @@ class StreamingTransformerEncoder(TransformerEncoder, StreamingEncoder):
         x = x.transpose(1, 2)  # (B, C, D) -> (B, D, C)
 
         new_cache_len = cache_last_channel_len + length
-        if left >= 0:
-            new_cache_len = torch.clamp(new_cache_len, max=left)
+        if cache_size >= 0:
+            new_cache_len = torch.clamp(new_cache_len, max=cache_size)
         return x, length, new_cache_last_channel, new_cache_len.to(torch.int64)
 
     def _streaming_pos_emb(self, num_kv, ref):
@@ -1001,18 +1081,27 @@ class StreamingTransformerEncoder(TransformerEncoder, StreamingEncoder):
         _, pos_emb = self.pos_enc(x=dummy)
         return pos_emb
 
-    def _build_streaming_block_mask(self, cache_valid_len, cur_len, L, C, left, right, device):
+    def _build_streaming_block_mask(self, cache_valid_len, cur_len, L, C, device):
         """FlexAttention block mask over ``(C, L + C)`` for the cache-aware step.
 
         The ``[cache | current]`` sequence is positionally contiguous: key index ``k`` sits at
         position ``k`` and current-query ``j`` at position ``L + j``. Valid keys are the last
         ``cache_valid_len`` cache frames (right-aligned in ``[0, L)``) plus the first ``cur_len``
-        current frames, intersected with the ``[left, right]`` window around each query.
+        current frames.
+
+        For ``sliding_window`` that set is further intersected with the ``[left, right]`` window
+        around each query. For ``chunked_limited`` no per-query term is needed: the whole streaming
+        chunk is one attention chunk, and the cache is sized to exactly the visible history
+        (:attr:`cache_size` == ``left_chunks * chunk_size``), so "everything valid" *is* the mask.
         """
+        left, right = self.att_context_size
+        chunked = self.att_context_style == "chunked_limited" and right >= 0
         num_kv = L + C
 
         def mask_mod(b, h, q_idx, kv_idx):
             ok = (kv_idx >= L - cache_valid_len[b]) & (kv_idx < L + cur_len[b])
+            if chunked:
+                return ok
             if right >= 0:
                 ok = ok & (kv_idx <= q_idx + L + right)
             if left >= 0:

@@ -21,6 +21,7 @@ from nemo.collections.asr.modules.transformer_encoder import (
     StreamingTransformerEncoder,
     TransformerEncoder,
     TransformerEncoderConfig,
+    _make_chunked_limited_mod,
     _make_sliding_window_mod,
 )
 from nemo.collections.asr.parts.mixins.streaming import StreamingEncoder
@@ -705,6 +706,53 @@ class TestSlidingWindowMod:
         assert not self._allowed(mod, 5, 3)  # two frames back masked
 
 
+class TestChunkedLimitedMod:
+    """Unit tests for the ``_make_chunked_limited_mod`` FlexAttention mask factory."""
+
+    @staticmethod
+    def _allowed(mod, q, kv):
+        return bool(mod(torch.tensor(0), torch.tensor(0), torch.tensor(q), torch.tensor(kv)))
+
+    @pytest.mark.unit
+    def test_own_chunk_plus_left_chunks(self):
+        """left=4, right=1 -> chunk_size 2, left_chunks 2: query in chunk 3 sees chunks 1..3."""
+        mod = _make_chunked_limited_mod(4, 1)
+        assert self._allowed(mod, 6, 7)  # own chunk, in-chunk look-ahead
+        assert self._allowed(mod, 7, 6)  # own chunk, backwards
+        assert self._allowed(mod, 6, 2)  # two chunks back (left_chunks = 4 // 2 = 2)
+        assert not self._allowed(mod, 6, 1)  # three chunks back -> masked
+        assert not self._allowed(mod, 6, 8)  # next chunk -> masked
+
+    @pytest.mark.unit
+    def test_left_context_quantized_to_whole_chunks(self):
+        """left is floored to whole chunks: left=5, chunk_size=4 -> 1 left chunk (4 frames)."""
+        mod = _make_chunked_limited_mod(5, 3)
+        assert self._allowed(mod, 8, 4)  # start of the single visible left chunk
+        assert not self._allowed(mod, 8, 3)  # 5 frames back, but a chunk earlier -> masked
+
+    @pytest.mark.unit
+    def test_unlimited_left(self):
+        """left<0 -> every earlier chunk is visible, still no cross-chunk look-ahead."""
+        mod = _make_chunked_limited_mod(-1, 3)
+        assert self._allowed(mod, 100, 0)
+        assert self._allowed(mod, 100, 103)  # own chunk (100..103)
+        assert not self._allowed(mod, 100, 104)
+
+    @pytest.mark.unit
+    def test_matches_conformer_reference_mask(self):
+        """Bit-for-bit agreement with ``ConformerEncoder._create_masks``'s chunked_limited branch."""
+        T, left, right = 24, 5, 2
+        chunk_size = right + 1
+        left_chunks_num = left // chunk_size
+        chunk_idx = torch.div(torch.arange(T), chunk_size, rounding_mode="trunc")
+        diff_chunks = chunk_idx.unsqueeze(1) - chunk_idx.unsqueeze(0)
+        reference = torch.logical_and(diff_chunks <= left_chunks_num, diff_chunks >= 0)
+
+        mod = _make_chunked_limited_mod(left, right)
+        ours = torch.tensor([[self._allowed(mod, q, kv) for kv in range(T)] for q in range(T)])
+        assert torch.equal(ours, reference)
+
+
 class TestStreamingTransformerEncoder:
     """Tests for the sliding-window streaming encoder and its cache-aware interface."""
 
@@ -933,6 +981,193 @@ class TestStreamingTransformerEncoder:
         # Valid cache length saturates at ``left`` for a rolling cache (whole utterance for full).
         expected = chunk * n_chunks if left < 0 else min(chunk * n_chunks, left)
         assert final_valid_len.tolist() == [expected] * batch
+
+    # ------------------------------------------------------------------ #
+    # chunked_limited (chunk-aligned look-ahead)
+    # ------------------------------------------------------------------ #
+
+    @pytest.mark.unit
+    def test_invalid_att_context_style_raises(self):
+        with pytest.raises(ValueError, match="att_context_style"):
+            StreamingTransformerEncoder(feat_in=80, d_model=64, n_heads=4, n_layers=2, att_context_style="bogus")
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "left, right, expected",
+        [
+            (70, 13, 70),  # chunk 14 divides 70 exactly -> full left context
+            (70, 27, 56),  # chunk 28 -> 2 whole chunks, left quantized down from 70
+            (70, 3, 68),  # chunk 4 -> 17 whole chunks
+            (2, 13, 0),  # left smaller than one chunk -> chunk attends to itself only
+            (-1, 13, -1),  # unbounded left -> full (growing) cache
+        ],
+    )
+    def test_chunked_limited_cache_size_quantizes_to_chunks(self, left, right, expected):
+        """The rolling cache holds whole chunks only, so it matches what the mask can actually see."""
+        enc = StreamingTransformerEncoder(
+            feat_in=80,
+            d_model=64,
+            n_heads=4,
+            n_layers=2,
+            att_context_style="chunked_limited",
+            att_context_size=[left, right],
+        )
+        assert enc.cache_size == expected
+        assert enc.streaming_cfg.last_channel_cache_size == expected
+        clc, _, _ = enc.get_initial_cache_state(batch_size=2)
+        assert clc.shape[2] == max(expected, 0)
+
+    @pytest.mark.unit
+    def test_chunked_limited_lookahead_does_not_compound_across_layers(self):
+        """The property that makes chunk-aligned look-ahead streamable.
+
+        A sliding ``right`` window lets each layer peek one window further ahead, so an N-layer
+        stack sees ``N * right`` frames of future — unreproducible chunk-by-chunk. Chunk-aligned
+        attention stops every layer at the same boundary, so the look-ahead stays inside the
+        current chunk no matter how deep the stack.
+        """
+        n_layers, chunk, sub, feat_in = 4, 8, 4, 32
+        right = chunk - 1
+
+        def first_affected_frame(style):
+            torch.manual_seed(0)
+            enc = StreamingTransformerEncoder(
+                feat_in=feat_in,
+                d_model=64,
+                n_heads=4,
+                n_layers=n_layers,
+                drop_rate=0.0,
+                dropout_pre_encoder=0.0,
+                dropout_emb=0.0,
+                self_attention_model="rope",
+                subsampling_factor=sub,
+                att_context_style=style,
+                att_context_size=[24, right],
+            ).eval()
+            T = 16 * chunk * sub
+            x = torch.randn(1, feat_in, T)
+            lengths = torch.tensor([T], dtype=torch.int64)
+            perturb_from = 8 * chunk  # encoder frame index — the start of chunk 8
+            x2 = x.clone()
+            x2[:, :, perturb_from * sub :] = torch.randn_like(x2[:, :, perturb_from * sub :])
+            with torch.no_grad():
+                a, _ = enc(audio_signal=x, length=lengths)
+                b, _ = enc(audio_signal=x2, length=lengths)
+            diff = (a - b).abs().mean(dim=1)[0]
+            return perturb_from - int((diff > 1e-6).nonzero()[0])
+
+        # Chunk-aligned: only the frames of the perturbed frame's own chunk can see it, and the
+        # perturbation starts on a chunk boundary — so nothing before it moves at all.
+        assert first_affected_frame("chunked_limited") == 0
+        # Sliding window with the same ``right``: the reach compounds well past one chunk.
+        assert first_affected_frame("sliding_window") > chunk
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("sam", ["rope", "rel_pos", "no_pos"])
+    @pytest.mark.parametrize("left, chunk, n_chunks", [(24, 8, 5), (6, 4, 6), (3, 8, 4)])
+    def test_chunked_limited_streaming_matches_full_forward(self, sam, left, chunk, n_chunks):
+        """The payoff: with chunk-aligned look-ahead, chunk-by-chunk streaming is still exact.
+
+        Contrast with :meth:`test_streaming_matches_full_forward`, which requires ``right == 0``.
+        Here ``right = chunk - 1`` gives a full chunk of look-ahead and streaming still reproduces
+        the full forward, because the current chunk is entirely present in the KV span.
+        """
+        torch.manual_seed(0)
+        d_model, sub, feat_in = 64, 4, 32
+        enc = StreamingTransformerEncoder(
+            feat_in=feat_in,
+            d_model=d_model,
+            n_heads=4,
+            n_layers=3,
+            drop_rate=0.0,
+            dropout_pre_encoder=0.0,
+            dropout_emb=0.0,
+            self_attention_model=sam,
+            subsampling_factor=sub,
+            att_context_style="chunked_limited",
+            att_context_size=[left, chunk - 1],
+        )
+        enc.eval()
+
+        x = torch.randn(1, feat_in, chunk * sub * n_chunks)
+        lengths = torch.tensor([x.shape[2]], dtype=torch.int64)
+
+        with torch.no_grad():
+            full_out, _ = enc(audio_signal=x, length=lengths)
+            stream_out, final_valid_len = self._stream_sequence(enc, x, chunk * sub, n_chunks, 1, False)
+
+        assert stream_out.shape == full_out.shape
+        assert torch.allclose(full_out, stream_out, atol=1e-5)
+        assert final_valid_len.tolist() == [min(chunk * n_chunks, enc.cache_size)]
+
+    @pytest.mark.unit
+    def test_chunked_limited_streaming_ragged_batch_matches_full_forward(self):
+        """Batched streaming stays exact over every stream's valid frames when lengths differ."""
+        torch.manual_seed(0)
+        sub, feat_in, chunk, n_chunks = 4, 32, 8, 5
+        enc = StreamingTransformerEncoder(
+            feat_in=feat_in,
+            d_model=64,
+            n_heads=4,
+            n_layers=3,
+            drop_rate=0.0,
+            dropout_pre_encoder=0.0,
+            dropout_emb=0.0,
+            self_attention_model="rope",
+            subsampling_factor=sub,
+            att_context_style="chunked_limited",
+            att_context_size=[16, chunk - 1],
+        )
+        enc.eval()
+
+        valid_enc = [chunk * n_chunks, 3 * chunk + 5]  # stream 1 ends mid-chunk
+        x = torch.randn(2, feat_in, chunk * sub * n_chunks)
+        x[1, :, valid_enc[1] * sub :] = 0.0  # zero-pad the tail, as streaming inference does
+        lengths = torch.tensor([v * sub for v in valid_enc], dtype=torch.int64)
+
+        with torch.no_grad():
+            full_out, _ = enc(audio_signal=x, length=lengths)
+            clc, clt, clcl = enc.get_initial_cache_state(batch_size=2)
+            outs = []
+            for c in range(n_chunks):
+                step = chunk * sub
+                chunk_lens = torch.tensor([max(0, min(step, int(l) - c * step)) for l in lengths], dtype=torch.int64)
+                out, _, clc, clt, clcl = enc.cache_aware_stream_step(
+                    processed_signal=x[:, :, c * step : (c + 1) * step],
+                    processed_signal_length=chunk_lens,
+                    cache_last_channel=clc,
+                    cache_last_time=clt,
+                    cache_last_channel_len=clcl,
+                )
+                outs.append(out)
+            stream_out = torch.cat(outs, dim=2)
+
+        # Frames past a stream's end are discarded by the caller, so only valid frames must match.
+        for b, v in enumerate(valid_enc):
+            assert torch.allclose(full_out[b, :, :v], stream_out[b, :, :v], atol=1e-5)
+
+    @pytest.mark.unit
+    def test_chunked_limited_rejects_oversized_streaming_chunk(self):
+        """A streaming step wider than one attention chunk would silently break exactness."""
+        enc = StreamingTransformerEncoder(
+            feat_in=64,
+            d_model=64,
+            n_heads=4,
+            n_layers=1,
+            att_context_style="chunked_limited",
+            att_context_size=[8, 3],  # chunk_size = 4
+        )
+        enc.eval()
+        clc, clt, clcl = enc.get_initial_cache_state(batch_size=1)
+        with torch.no_grad(), pytest.raises(ValueError, match="chunked_limited streaming"):
+            enc.cache_aware_stream_step(
+                processed_signal=torch.randn(1, 5, 64),  # 5 > chunk_size 4
+                processed_signal_length=torch.tensor([5]),
+                cache_last_channel=clc,
+                cache_last_time=clt,
+                cache_last_channel_len=clcl,
+                bypass_pre_encode=True,
+            )
 
     @pytest.mark.unit
     def test_streaming_abs_pos_not_implemented(self):
