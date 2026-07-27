@@ -259,6 +259,19 @@ NGPU=8
 } > "${RESULTS_DIR}/run_config.yaml"
 echo "==> Wrote run config: ${RESULTS_DIR}/run_config.yaml"
 
+# System prompt may contain spaces / apostrophes (e.g. "chunk's"). Embedding it
+# as system_prompt='...' breaks Hydra on the apostrophe; bash -c "..." also
+# fights with nested quotes. Write the raw prompt + a Hydra override line to
+# files and have the container command read them.
+printf '%s' "$SYSTEM_PROMPT" > "${SHARD_DIR}/system_prompt.txt"
+python3 -c "
+from pathlib import Path
+p = Path(r'${SHARD_DIR}/system_prompt.txt').read_text()
+e = p.replace('\\\\', '\\\\\\\\').replace('\"', '\\\\\"')
+Path(r'${SHARD_DIR}/system_prompt.hydra_override').write_text('system_prompt=\"' + e + '\"')
+"
+echo "==> Wrote system prompt override: ${SHARD_DIR}/system_prompt.hydra_override"
+
 # ---- Shared-prep helpers (mkdir locks; safe across concurrent jobs/nodes) ----
 # Written into SHARD_DIR and invoked inside the container. mkdir is atomic on
 # lustre; flock is not reliably cross-client. Writers stage to a temp path then
@@ -426,6 +439,7 @@ ${HF_CLAUSE} \
       --max_eval_samples ${MAX_EVAL_SAMPLES} \
 && rm -f ${SHARD_DIR}/shard*_of*.generations.jsonl \
 && echo "Fanning ${NGPU} shards across ${NGPU} GPUs with the heh engine..." \
+&& SP_HYDRA=\$(cat '${SHARD_DIR}/system_prompt.hydra_override') \
 && pids=() \
 && for gpu in \$(seq 0 \$(( ${NGPU} - 1 ))); do \
       log="${RESULTS_DIR}/shard_\${gpu}.log"; \
@@ -438,7 +452,7 @@ ${HF_CLAUSE} \
         inputs="'\${man}'" \
         batch_size=${BATCH_SIZE} \
         max_new_tokens=${HEH_MAX_NEW_TOKENS} \
-        system_prompt="'${SYSTEM_PROMPT}'" \
+        "\$SP_HYDRA" \
         use_offline_embs=${HEH_USE_OFFLINE_EMBS} \
         use_state_machine_inference=${HEH_USE_STATE_MACHINE} \
         pad_extra_duration=${HEH_PAD_DURATION} \
@@ -483,6 +497,7 @@ ${AVG_CLAUSE} \
 && echo "Pooled datasets: ${DATASETS_CSV}" \
 && echo "Fanning ${NGPU} balanced shards across ${NGPU} GPUs (seed=${SHUFFLE_SEED})..." \
 && rm -f ${RESULTS_DIR}/shard*_of*.generations.jsonl \
+&& SP_TEXT=\$(cat '${SHARD_DIR}/system_prompt.txt') \
 && pids=() \
 && for gpu in \$(seq 0 \$(( ${NGPU} - 1 ))); do \
       log="${RESULTS_DIR}/shard_\${gpu}.log"; \
@@ -499,7 +514,7 @@ ${AVG_CLAUSE} \
         --batch_size ${BATCH_SIZE} \
         --max_new_tokens ${MAX_NEW_TOKENS} \
         --max_eval_samples ${MAX_EVAL_SAMPLES} \
-        --system_prompt "${SYSTEM_PROMPT}" \
+        --system_prompt "\$SP_TEXT" \
         --output_dir "${RESULTS_DIR}" \
         ${CHUNK_SIZE:+--chunk_size ${CHUNK_SIZE}} \
         > "\${log}" 2>&1 & \
@@ -515,6 +530,13 @@ ${AVG_CLAUSE} \
 EOF
 fi
 
-srun -o "$OUTFILE" -e "$ERRFILE" --container-image="$CONTAINER" $MOUNTS bash -c "${cmd}"
+# Run via a script file (not bash -c "...") so nested quotes in the prompt /
+# hydra override cannot break the outer shell quoting.
+CMD_FILE="${RESULTS_DIR}/container_cmd.sh"
+printf '%s\n' "$cmd" > "$CMD_FILE"
+chmod +x "$CMD_FILE"
+echo "==> Container command: ${CMD_FILE}"
+
+srun -o "$OUTFILE" -e "$ERRFILE" --container-image="$CONTAINER" $MOUNTS bash "$CMD_FILE"
 
 set +x
