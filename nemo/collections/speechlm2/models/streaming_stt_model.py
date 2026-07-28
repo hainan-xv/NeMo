@@ -352,25 +352,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         self.save_hyperparameters()
         self.cfg = DictConfig(cfg)
         self.core_cfg: StreamingSTTModelConfig = to_dataclass(StreamingSTTModelConfig, cfg)
-
-        # Normalize chunk_size: a list (e.g. [2, 6, 13]) enables multi chunk-size
-        # training (one drawn per batch) and configurable inference (longest by
-        # default). A scalar keeps the original single fixed/dynamic/offline mode.
-        cs = self.core_cfg.chunk_size
-        if isinstance(cs, (list, tuple, ListConfig)):
-            self._chunk_size_candidates = [int(x) for x in cs]
-            if not self._chunk_size_candidates or any(x <= 0 for x in self._chunk_size_candidates):
-                raise ValueError(f"chunk_size list must be non-empty and all positive (fixed chunking), got {cs}")
-            # Representative scalar for cache/template build and mode dispatch.
-            self._chunk_size_repr = _repr_chunk_size(self._chunk_size_candidates)
-            if self.core_cfg.att_context_size is None:
-                logging.warning(
-                    "chunk_size is a list but att_context_size is not set — the encoder's "
-                    "attention look-ahead will NOT be matched to the per-batch chunk size."
-                )
-        else:
-            self._chunk_size_candidates = None
-            self._chunk_size_repr = int(cs)
+        self._normalize_chunk_size()
 
         # --- LLM ---
         self.tokenizer = AutoTokenizer(self.core_cfg.pretrained_llm, use_fast=True)
@@ -379,65 +361,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             pretrained_weights=self.core_cfg.load_llm_weights,
         )
 
-        # Ensure <blank> token is in the vocabulary.
-        # Unescape Python escape sequences (e.g. "\\n" → "\n") because Hydra/OmegaConf
-        # loads YAML strings literally without interpreting backslash escapes.
-        # An empty blank_token ("") disables the blank mechanism entirely
-        # (fixed chunking only — see StreamingSTTDataset for the guard).
-        self.blank_token = self.core_cfg.blank_token.encode().decode('unicode_escape')
-
-        if self.blank_token == "":
-            logging.info("blank_token is empty: blank mechanism disabled")
-        elif not token_in_vocab(self.blank_token, self.tokenizer):
-            self.tokenizer.add_special_tokens({"additional_special_tokens": [self.blank_token]})
-            self.llm.resize_token_embeddings(len(self.tokenizer.tokenizer))
-            logging.info(f"Added blank token `{self.blank_token}` to tokenizer: {self.blank_token_id}")
-        else:
-            logging.info(f"Blank token `{str(self.blank_token)}` already in tokenizer: {self.blank_token_id}")
-
-        # End-of-audio token registration: the compact per-chunk audio->text
-        # scaffold anchor. Default <|im_start|> is already in Qwen3's vocab →
-        # uses pretrained embedding, no resize.
-        if self.core_cfg.compact_template:
-            eoa = self.core_cfg.end_of_audio_token
-            if not token_in_vocab(eoa, self.tokenizer):
-                self.tokenizer.add_special_tokens({"additional_special_tokens": [eoa]})
-                self.llm.resize_token_embeddings(len(self.tokenizer.tokenizer))
-                eoa_id = self.tokenizer.tokenizer.convert_tokens_to_ids(eoa)
-                logging.info(f"Added end_of_audio_token `{eoa}` to tokenizer: {eoa_id}")
-            else:
-                eoa_id = self.tokenizer.tokenizer.convert_tokens_to_ids(eoa)
-                logging.info(f"Using existing vocab token `{eoa}` as end_of_audio_token: {eoa_id}")
-
-        # Write token registration: the start-of-text emit gate, needed only when
-        # prepend_write_token is enabled (both compact and non-compact). Added as
-        # a new special token and learned from scratch — no warm start, mirroring
-        # blank_token (they are the two symmetric sides of the same binary gate).
-        if self.core_cfg.prepend_write_token:
-            wt = self.core_cfg.write_token
-            if not token_in_vocab(wt, self.tokenizer):
-                self.tokenizer.add_special_tokens({"additional_special_tokens": [wt]})
-                self.llm.resize_token_embeddings(len(self.tokenizer.tokenizer))
-                wt_id = self.tokenizer.tokenizer.convert_tokens_to_ids(wt)
-                logging.info(f"Added write_token `{wt}` to tokenizer: {wt_id}")
-            else:
-                wt_id = self.tokenizer.tokenizer.convert_tokens_to_ids(wt)
-                logging.info(f"Using existing vocab token `{wt}` as write_token: {wt_id}")
-
-        # Validate prepend_write_token preconditions
-        if self.core_cfg.prepend_write_token:
-            if self.blank_token == "":
-                raise ValueError(
-                    "prepend_write_token=True requires a non-empty blank_token "
-                    "(the binary content-gate needs both write_token and blank_token)."
-                )
-            if self.core_cfg.compact_template and self.core_cfg.write_token == self.core_cfg.end_of_audio_token:
-                raise ValueError(
-                    "prepend_write_token=True with compact_template=True requires "
-                    "write_token != end_of_audio_token (the emit gate and the "
-                    f"end-of-audio scaffold must be distinct tokens); both are "
-                    f"{self.core_cfg.write_token!r}."
-                )
+        self._register_special_tokens()
 
         # Separate embedding layer to avoid FSDP/TP conflicts (same pattern as SALM)
         self.embed_tokens = self.llm.model.embed_tokens
@@ -476,11 +400,121 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             # Install LoRA after freezing the LLM body to avoid freezing the LoRA weights
             maybe_install_lora(self)
             # huggingface PEFT library freezes the whole LLM, so we need to unfreeze the lm_head if needed
-            if self.core_cfg.freeze_llm_head:
-                freeze_module(self.llm.lm_head)
-            else:
-                unfreeze_module(self.llm.lm_head)
+            if (lm_head := self._lm_head_module) is not None:
+                if self.core_cfg.freeze_llm_head:
+                    freeze_module(lm_head)
+                else:
+                    unfreeze_module(lm_head)
 
+        self._setup_forced_aligner(forced_aligner, data_cfg, val_data_cfg, dataset_cls)
+
+        logging.info("\n" + str(ModelSummary(self, max_depth=2)))
+
+    # ------------------------------------------------------------------
+    # __init__ building blocks
+    # ------------------------------------------------------------------
+    # Kept as separate methods (rather than inlined in ``__init__``) so that
+    # subclasses which build the LLM lazily — e.g.
+    # :class:`~nemo.collections.speechlm2.models.streaming_stt_model_automodel.StreamingSTTModelAutomodel`,
+    # which defers LLM construction to ``configure_model()`` — can reuse them
+    # in a different order.
+
+    def _normalize_chunk_size(self) -> None:
+        """Resolve ``core_cfg.chunk_size`` into ``_chunk_size_candidates`` / ``_chunk_size_repr``.
+
+        A list (e.g. ``[2, 6, 13]``) enables multi chunk-size training (one drawn
+        per batch) and configurable inference (longest by default). A scalar keeps
+        the original single fixed/dynamic/offline mode.
+        """
+        cs = self.core_cfg.chunk_size
+        if isinstance(cs, (list, tuple, ListConfig)):
+            self._chunk_size_candidates = [int(x) for x in cs]
+            if not self._chunk_size_candidates or any(x <= 0 for x in self._chunk_size_candidates):
+                raise ValueError(f"chunk_size list must be non-empty and all positive (fixed chunking), got {cs}")
+            # Representative scalar for cache/template build and mode dispatch.
+            self._chunk_size_repr = _repr_chunk_size(self._chunk_size_candidates)
+            if self.core_cfg.att_context_size is None:
+                logging.warning(
+                    "chunk_size is a list but att_context_size is not set — the encoder's "
+                    "attention look-ahead will NOT be matched to the per-batch chunk size."
+                )
+        else:
+            self._chunk_size_candidates = None
+            self._chunk_size_repr = int(cs)
+
+    def _resize_llm_embeddings(self) -> None:
+        """Grow the LLM's embedding table to cover newly added special tokens."""
+        self.llm.resize_token_embeddings(len(self.tokenizer.tokenizer))
+
+    def _register_special_tokens(self) -> None:
+        """Register ``blank`` / ``end_of_audio`` / ``write`` tokens on the tokenizer.
+
+        Each newly added token grows the LLM embedding table via
+        :meth:`_resize_llm_embeddings` (overridden by the Automodel subclass,
+        where the LLM does not exist yet at this point).
+        """
+        # Ensure <blank> token is in the vocabulary.
+        # Unescape Python escape sequences (e.g. "\\n" → "\n") because Hydra/OmegaConf
+        # loads YAML strings literally without interpreting backslash escapes.
+        # An empty blank_token ("") disables the blank mechanism entirely
+        # (fixed chunking only — see StreamingSTTDataset for the guard).
+        self.blank_token = self.core_cfg.blank_token.encode().decode('unicode_escape')
+
+        if self.blank_token == "":
+            logging.info("blank_token is empty: blank mechanism disabled")
+        elif not token_in_vocab(self.blank_token, self.tokenizer):
+            self.tokenizer.add_special_tokens({"additional_special_tokens": [self.blank_token]})
+            self._resize_llm_embeddings()
+            logging.info(f"Added blank token `{self.blank_token}` to tokenizer: {self.blank_token_id}")
+        else:
+            logging.info(f"Blank token `{str(self.blank_token)}` already in tokenizer: {self.blank_token_id}")
+
+        # End-of-audio token registration: the compact per-chunk audio->text
+        # scaffold anchor. Default <|im_start|> is already in Qwen3's vocab →
+        # uses pretrained embedding, no resize.
+        if self.core_cfg.compact_template:
+            eoa = self.core_cfg.end_of_audio_token
+            if not token_in_vocab(eoa, self.tokenizer):
+                self.tokenizer.add_special_tokens({"additional_special_tokens": [eoa]})
+                self._resize_llm_embeddings()
+                eoa_id = self.tokenizer.tokenizer.convert_tokens_to_ids(eoa)
+                logging.info(f"Added end_of_audio_token `{eoa}` to tokenizer: {eoa_id}")
+            else:
+                eoa_id = self.tokenizer.tokenizer.convert_tokens_to_ids(eoa)
+                logging.info(f"Using existing vocab token `{eoa}` as end_of_audio_token: {eoa_id}")
+
+        # Write token registration: the start-of-text emit gate, needed only when
+        # prepend_write_token is enabled (both compact and non-compact). Added as
+        # a new special token and learned from scratch — no warm start, mirroring
+        # blank_token (they are the two symmetric sides of the same binary gate).
+        if self.core_cfg.prepend_write_token:
+            wt = self.core_cfg.write_token
+            if not token_in_vocab(wt, self.tokenizer):
+                self.tokenizer.add_special_tokens({"additional_special_tokens": [wt]})
+                self._resize_llm_embeddings()
+                wt_id = self.tokenizer.tokenizer.convert_tokens_to_ids(wt)
+                logging.info(f"Added write_token `{wt}` to tokenizer: {wt_id}")
+            else:
+                wt_id = self.tokenizer.tokenizer.convert_tokens_to_ids(wt)
+                logging.info(f"Using existing vocab token `{wt}` as write_token: {wt_id}")
+
+        # Validate prepend_write_token preconditions
+        if self.core_cfg.prepend_write_token:
+            if self.blank_token == "":
+                raise ValueError(
+                    "prepend_write_token=True requires a non-empty blank_token "
+                    "(the binary content-gate needs both write_token and blank_token)."
+                )
+            if self.core_cfg.compact_template and self.core_cfg.write_token == self.core_cfg.end_of_audio_token:
+                raise ValueError(
+                    "prepend_write_token=True with compact_template=True requires "
+                    "write_token != end_of_audio_token (the emit gate and the "
+                    f"end-of-audio scaffold must be distinct tokens); both are "
+                    f"{self.core_cfg.write_token!r}."
+                )
+
+    def _setup_forced_aligner(self, forced_aligner, data_cfg, val_data_cfg, dataset_cls) -> None:
+        """Attach the optional online forced aligner and its dataset(s)."""
         if forced_aligner is not None:
             assert data_cfg is not None, "Dataset config is required for online forced alignment"
             assert dataset_cls is not None, "Dataset class is required for online forced alignment"
@@ -497,8 +531,6 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             self.forced_aligner = None
             self.dataset = None
             self.val_dataset = None
-
-        logging.info("\n" + str(ModelSummary(self, max_depth=2)))
 
     def _build_chunk_classifier(self) -> None:
         """Construct the aux backbone + linear head.
@@ -563,10 +595,12 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             unfreeze_module(self.llm.model)
 
         # lm_head is inside self.llm, so re-apply after the LLM-wide freeze
-        if self.core_cfg.freeze_llm_head:
-            freeze_module(self.llm.lm_head)
-        else:
-            unfreeze_module(self.llm.lm_head)
+        lm_head = self._lm_head_module
+        if lm_head is not None:
+            if self.core_cfg.freeze_llm_head:
+                freeze_module(lm_head)
+            else:
+                unfreeze_module(lm_head)
 
         # embed_tokens is a separate top-level module (moved out of llm)
         if self.core_cfg.freeze_embed_tokens:
@@ -637,6 +671,48 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
     @property
     def has_blank(self) -> bool:
         return self.blank_token != ""
+
+    # ------------------------------------------------------------------
+    # LLM-backend indirection hooks
+    # ------------------------------------------------------------------
+    # Every training / inference code path below goes through these four hooks
+    # instead of touching ``self.llm`` / ``self.embed_tokens`` directly, so a
+    # subclass can swap the LLM backend without duplicating those paths. See
+    # :class:`~nemo.collections.speechlm2.models.streaming_stt_model_automodel.StreamingSTTModelAutomodel`
+    # for the NeMo Automodel implementations (sharded DTensor embeddings, LLM
+    # outputs that aren't HuggingFace ``ModelOutput`` objects, and an
+    # ``embed_tokens`` that stays inside the LLM).
+
+    def _embed_tokens(self, input_ids: Tensor) -> Tensor:
+        """Embed token IDs with the text embedding table."""
+        return self.embed_tokens(input_ids)
+
+    @property
+    def _lm_head_module(self) -> Optional[nn.Module]:
+        """The LLM's output projection, or ``None`` when the backbone has no ``lm_head``."""
+        return getattr(self.llm, "lm_head", None)
+
+    @property
+    def _embed_ref_tensor(self) -> Tensor:
+        """A tensor carrying the embedding table's dtype/device, for ``Tensor.type_as``."""
+        return self.embed_tokens.weight
+
+    def _llm_forward(self, **kwargs):
+        """Run the LLM forward pass.
+
+        Returns an object supporting both attribute (``out.logits``) and
+        mapping (``out["logits"]``) access, i.e. a HuggingFace ``ModelOutput``.
+        """
+        return self.llm(**kwargs)
+
+    def _move_embedding_ctx(self):
+        """Context manager that makes ``embed_tokens`` reachable from inside the LLM.
+
+        Needed by HuggingFace generation utilities that look the embedding table
+        up on the LLM; here ``embed_tokens`` was moved to the top level in
+        ``__init__``, so it is temporarily put back.
+        """
+        return move_embedding(self)
 
     # ------------------------------------------------------------------
     # Cached auto-detection: content-score mode and annotation availability
@@ -721,7 +797,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         # --- text embeddings ---
         # Zero-out audio positions so embed_tokens gets valid indices.
         text_tokens = input_tokens.where(~audio_mask, torch.zeros_like(input_tokens))
-        text_embeds = self.embed_tokens(text_tokens)  # (B, L, H)
+        text_embeds = self._embed_tokens(text_tokens)  # (B, L, H)
 
         # --- audio embeddings ---
         audio_embs, _audio_emb_lens = self.perception(
@@ -756,7 +832,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         ``hidden_states`` (B, L, H) — the LLM's last-layer hidden state, used
         as input to the aux chunk-boundary classifier.
         """
-        out = self.llm(
+        out = self._llm_forward(
             inputs_embeds=input_embeds,
             attention_mask=attention_mask,
             past_key_values=cache,
@@ -1568,7 +1644,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 for b in range(B):
                     state.seq_lens[b] += 1
 
-            token_emb = self.embed_tokens(tokens_to_feed.unsqueeze(1))  # (B, 1, H)
+            token_emb = self._embed_tokens(tokens_to_feed.unsqueeze(1))  # (B, 1, H)
 
             state.attention_mask = torch.cat(
                 [
@@ -1577,7 +1653,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 ],
                 dim=1,
             )
-            out = self.llm(
+            out = self._llm_forward(
                 inputs_embeds=token_emb,
                 past_key_values=cache,
                 attention_mask=state.attention_mask,
@@ -1672,11 +1748,11 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
 
         if not needs_padding:
             # Fast path: all same length, no padding needed
-            sys_embs = self.embed_tokens(
+            sys_embs = self._embed_tokens(
                 torch.tensor(all_sys_ids[0], device=device, dtype=torch.long).unsqueeze(0)
             ).expand(batch_size, -1, -1)
             attention_mask = torch.ones(batch_size, sys_lens[0], dtype=torch.long, device=device)
-            out = self.llm(
+            out = self._llm_forward(
                 inputs_embeds=sys_embs,
                 attention_mask=attention_mask,
                 use_cache=True,
@@ -1691,7 +1767,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             sys_embs = torch.zeros(batch_size, max_sys_len, H, device=device, dtype=dtype)
             attention_mask = torch.zeros(batch_size, max_sys_len, dtype=torch.long, device=device)
             for b in range(batch_size):
-                embs = self.embed_tokens(
+                embs = self._embed_tokens(
                     torch.tensor(all_sys_ids[b], device=device, dtype=torch.long).unsqueeze(0)
                 ).squeeze(
                     0
@@ -1699,7 +1775,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 offset = max_sys_len - sys_lens[b]
                 sys_embs[b, offset:] = embs
                 attention_mask[b, offset:] = 1
-            out = self.llm(
+            out = self._llm_forward(
                 inputs_embeds=sys_embs,
                 attention_mask=attention_mask,
                 use_cache=True,
@@ -1763,7 +1839,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         B = state.batch_size
 
         if _audio_embs is not None:
-            audio_chunk_embs = _audio_embs.type_as(self.embed_tokens.weight)
+            audio_chunk_embs = _audio_embs.type_as(self._embed_ref_tensor)
         else:
             # 0. Update audio feature buffer — B frames, one per stream
             if audio_chunk_lens is None:
@@ -1778,7 +1854,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             ]
             features, right_paddings = state.audio_feature_buffer.update(frames)
             # Stack B feature buffers → (B, D, fbl)
-            processed_signal = torch.stack(features).type_as(self.embed_tokens.weight)
+            processed_signal = torch.stack(features).type_as(self._embed_ref_tensor)
             processed_signal_length = torch.tensor(
                 [processed_signal.shape[-1] - int(rp) for rp in right_paddings],
                 device=device,
@@ -1817,7 +1893,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         audio_mask = turn_ids_t == AUDIO_TOKEN_IDX  # (B, L)
 
         text_tokens = turn_ids_t.where(~audio_mask, torch.zeros_like(turn_ids_t))
-        input_embeds = self.embed_tokens(text_tokens)  # (B, L, H)
+        input_embeds = self._embed_tokens(text_tokens)  # (B, L, H)
 
         # Replace audio placeholder positions with actual audio embeddings
         input_embeds[audio_mask] = audio_chunk_embs.reshape(-1, audio_chunk_embs.shape[-1])
@@ -1828,7 +1904,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             [state.attention_mask, torch.ones(B, input_len, dtype=state.attention_mask.dtype, device=device)],
             dim=1,
         )
-        out = self.llm(
+        out = self._llm_forward(
             inputs_embeds=input_embeds,
             past_key_values=state.cache,
             attention_mask=state.attention_mask,
@@ -1853,14 +1929,14 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         any_needs_footer = any(not fc for fc in footer_consumed)
         if any_needs_footer and self._asst_footer_ids:
             flen = len(self._asst_footer_ids)
-            asst_footer_embs = self.embed_tokens(
+            asst_footer_embs = self._embed_tokens(
                 torch.tensor(self._asst_footer_ids, device=device).unsqueeze(0).expand(B, -1)
             )
             state.attention_mask = torch.cat(
                 [state.attention_mask, torch.ones(B, flen, dtype=state.attention_mask.dtype, device=device)],
                 dim=1,
             )
-            out = self.llm(
+            out = self._llm_forward(
                 inputs_embeds=asst_footer_embs,
                 past_key_values=state.cache,
                 attention_mask=state.attention_mask,
@@ -1957,16 +2033,16 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 add_generation_prompt=False,
                 enable_thinking=False,
             )
-            embs = self.embed_tokens(torch.tensor(sys_ids, device=device, dtype=torch.long).unsqueeze(0)).squeeze(
+            embs = self._embed_tokens(torch.tensor(sys_ids, device=device, dtype=torch.long).unsqueeze(0)).squeeze(
                 0
             )  # (L_sys_b, H)
             all_sys_embs.append(embs)
 
         # 2. Embed turn template components (shared across batch)
-        user_header_embs = self.embed_tokens(
+        user_header_embs = self._embed_tokens(
             torch.tensor(self._user_header_ids, device=device, dtype=torch.long).unsqueeze(0)
         )  # (1, L_uh, H)
-        uf_ah_embs = self.embed_tokens(
+        uf_ah_embs = self._embed_tokens(
             torch.tensor(self._user_footer_and_asst_header_ids, device=device, dtype=torch.long).unsqueeze(0)
         )  # (1, L_uf, H)
 
@@ -1976,7 +2052,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             input_signal=audios,
             input_signal_length=audio_lens_t,
         )  # (B, T_enc_max, H), (B,)
-        batch_audio_embs = batch_audio_embs.type_as(self.embed_tokens.weight)
+        batch_audio_embs = batch_audio_embs.type_as(self._embed_ref_tensor)
         all_audio_embs = [batch_audio_embs[b, : int(batch_emb_lens[b].item())] for b in range(B)]
 
         # 4. Build per-sample input sequences:
@@ -2002,7 +2078,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             attention_mask[b, offset:] = 1
 
         # 6. LLM prefill (single forward pass)
-        out = self.llm(
+        out = self._llm_forward(
             inputs_embeds=input_embeds,
             attention_mask=attention_mask,
             use_cache=True,
@@ -2186,7 +2262,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         # Use the blank token embedding when blank is enabled (a real token the
         # model knows). Otherwise fall back to the text pad id.
         pad_token_id = self.blank_token_id if self.has_blank else self.text_pad_id
-        pad_emb = self.embed_tokens(torch.tensor([pad_token_id], device=device)).squeeze(0)  # (H,)
+        pad_emb = self._embed_tokens(torch.tensor([pad_token_id], device=device)).squeeze(0)  # (H,)
 
         for _step in range(max_steps):
             # --- Refill audio embedding buffers for LISTENING streams ---
@@ -2216,7 +2292,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
 
                 # Feature buffer selectively updates only the submitted stream_ids
                 features, right_paddings = state.audio_feature_buffer.update(frames)
-                processed_signal = torch.stack(features).type_as(self.embed_tokens.weight)  # (S, D, T)
+                processed_signal = torch.stack(features).type_as(self._embed_ref_tensor)  # (S, D, T)
                 processed_signal_length = torch.tensor(
                     [processed_signal.shape[-1] - int(rp) for rp in right_paddings],
                     device=device,
@@ -2269,22 +2345,22 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                         embs_list.append(pad_emb)
                 elif stream_state[b] == FOOTER:
                     tid = uf_ah_ids[template_pos[b]]
-                    embs_list.append(self.embed_tokens(torch.tensor([tid], device=device)).squeeze(0))  # (H,)
+                    embs_list.append(self._embed_tokens(torch.tensor([tid], device=device)).squeeze(0))  # (H,)
                 elif stream_state[b] == GENERATING:
                     embs_list.append(
-                        self.embed_tokens(torch.tensor([last_gen_token[b]], device=device)).squeeze(0)  # (H,)
+                        self._embed_tokens(torch.tensor([last_gen_token[b]], device=device)).squeeze(0)  # (H,)
                     )
                 elif stream_state[b] == BLANK_FEED:
                     # Only reached when has_blank is True (guarded at transition sites).
                     embs_list.append(
-                        self.embed_tokens(torch.tensor([self.blank_token_id], device=device)).squeeze(0)  # (H,)
+                        self._embed_tokens(torch.tensor([self.blank_token_id], device=device)).squeeze(0)  # (H,)
                     )
                 elif stream_state[b] == ASST_FOOTER:
                     tid = af_ids[template_pos[b]]
-                    embs_list.append(self.embed_tokens(torch.tensor([tid], device=device)).squeeze(0))  # (H,)
+                    embs_list.append(self._embed_tokens(torch.tensor([tid], device=device)).squeeze(0))  # (H,)
                 elif stream_state[b] == HEADER:
                     tid = uh_ids[template_pos[b]]
-                    embs_list.append(self.embed_tokens(torch.tensor([tid], device=device)).squeeze(0))  # (H,)
+                    embs_list.append(self._embed_tokens(torch.tensor([tid], device=device)).squeeze(0))  # (H,)
                 else:  # DONE
                     embs_list.append(pad_emb)
 
@@ -2305,7 +2381,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                     dim=1,
                 )
                 llm_kwargs["attention_mask"] = state.attention_mask
-            out = self.llm(**llm_kwargs)
+            out = self._llm_forward(**llm_kwargs)
             state.cache = out.past_key_values
             for b in range(B):
                 state.seq_lens[b] += 1
@@ -2982,7 +3058,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         chunk_size = self._resolve_inference_chunk_size(chunk_size_override)
         self._set_encoder_att_context(chunk_size, recompute_streaming=True)
 
-        with move_embedding(self):
+        with self._move_embedding_ctx():
             B = audios.shape[0]
             n_samples_list = [int(audio_lens[b].item()) for b in range(B)]
 
