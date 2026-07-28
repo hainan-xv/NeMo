@@ -604,6 +604,98 @@ def test_parity_windowed_packed_vs_separate():
 
 
 # ---------------------------------------------------------------------------
+# Fixed-frame audio window (audio_window_frames > 0)
+# ---------------------------------------------------------------------------
+
+
+def test_fixed_frame_window_structure():
+    # 4 chunks of 3 frames each; a fixed 7-frame window ending at each boundary.
+    # Global frames: chunk0=[0,1,2], chunk1=[3,4,5], chunk2=[6,7,8], chunk3=[9,10,11].
+    chunks = [ChunkSpec(3, [20]), ChunkSpec(3, [21]), ChunkSpec(3, [22]), ChunkSpec(3, [23])]
+    ex = build_packed_chunk_example(INSTR, chunks, VS, VE, EOT, audio_window_frames=7)
+
+    def win(seg):
+        b = (ex.seg_ids == seg).nonzero(as_tuple=True)[0]
+        return ex.audio_frame_index[b][ex.is_audio[b]].tolist()
+
+    assert win(1) == [0, 1, 2]  # only 3 frames available (clamped at start)
+    assert win(2) == [0, 1, 2, 3, 4, 5]  # 6 available (< 7)
+    assert win(3) == [2, 3, 4, 5, 6, 7, 8]  # exactly 7, ending at frame 9
+    assert win(4) == [5, 6, 7, 8, 9, 10, 11]  # exactly 7, ending at frame 12
+
+
+def test_fixed_frame_window_keeps_large_chunk():
+    # A chunk LARGER than the window keeps ALL its frames (the frame count is a floor).
+    chunks = [ChunkSpec(10, [20, 21])]
+    ex = build_packed_chunk_example(INSTR, chunks, VS, VE, EOT, audio_window_frames=7)
+    b1 = (ex.seg_ids == 1).nonzero(as_tuple=True)[0]
+    assert ex.audio_frame_index[b1][ex.is_audio[b1]].tolist() == list(range(10))
+
+
+@torch.no_grad()
+def test_parity_fixed_frame_window_packed_vs_separate():
+    """Packed branch logits must match the standalone example when the audio
+    window is sized by a fixed frame count (audio_window_frames)."""
+    model = _tiny_qwen3()
+    H = model.config.hidden_size
+    instruction = [5, 6, 7]
+    chunks = [ChunkSpec(3, [20, 21]), ChunkSpec(3, [30]), ChunkSpec(3, [40, 41]), ChunkSpec(3, [50])]
+    W = 7
+    total_frames = sum(c.audio_len for c in chunks)
+    torch.manual_seed(2025)
+    global_frames = torch.randn(total_frames, H)
+
+    packed = build_packed_chunk_example(instruction, chunks, VS, VE, EOT, audio_window_frames=W)
+    valid = torch.ones_like(packed.input_ids, dtype=torch.bool)
+    mask = build_chunk_completion_mask(
+        packed.seg_ids[None], packed.position_ids[None], packed.prefix_len[None], valid[None], torch.float32
+    )
+    packed_emb = _embed_by_frame_index(model, packed.input_ids, packed.audio_frame_index, global_frames)
+    packed_logits = model(
+        inputs_embeds=packed_emb[None], attention_mask=mask, position_ids=packed.position_ids[None]
+    ).logits[0]
+
+    separate = build_separate_chunk_examples(instruction, chunks, VS, VE, EOT, audio_window_frames=W)
+    for k, sep in enumerate(separate, start=1):
+        sep_emb = _embed_by_frame_index(model, sep.input_ids, sep.audio_frame_index, global_frames)
+        sep_logits = model(inputs_embeds=sep_emb[None]).logits[0]
+        idx = (packed.seg_ids == k).nonzero(as_tuple=True)[0]
+        torch.testing.assert_close(packed_logits[idx], sep_logits[sep.branch_start :], atol=1e-4, rtol=1e-4)
+
+
+@torch.no_grad()
+def test_batched_decode_matches_per_utterance_fixed_frame():
+    """Batched == per-utterance decode with a fixed-frame audio window."""
+    model = _tiny_qwen3()
+    H = model.config.hidden_size
+    embed = model.get_input_embeddings()
+    pad_id = 0
+    chunk_size = 3
+    max_new = 4
+    W = 7
+
+    torch.manual_seed(444)
+    instrs = [[5, 6, 7], [8, 9], [10, 11, 12, 13]]
+    frames_list = [torch.randn(9, H), torch.randn(3, H), torch.randn(12, H)]
+
+    ref = []
+    for instr, frames in zip(instrs, frames_list):
+        per_chunk = stream_decode_chunk_completion(
+            llm=model, embed_tokens=embed, instruction_ids=instr, frames=frames,
+            chunk_size=chunk_size, vision_start_id=VS, vision_end_id=VE, eot_id=EOT,
+            max_new_tokens=max_new, audio_window_frames=W,
+        )
+        ref.append([t for chunk in per_chunk for t in chunk])
+
+    got = batched_stream_decode_chunk_completion(
+        llm=model, embed_tokens=embed, instruction_ids_list=instrs, frames_list=frames_list,
+        chunk_size=chunk_size, vision_start_id=VS, vision_end_id=VE, eot_id=EOT, pad_id=pad_id,
+        max_new_tokens=max_new, audio_window_frames=W,
+    )
+    assert got == ref, f"fixed-frame batched decode diverged:\n batched={got}\n per-utt={ref}"
+
+
+# ---------------------------------------------------------------------------
 # History-word recovery
 # ---------------------------------------------------------------------------
 

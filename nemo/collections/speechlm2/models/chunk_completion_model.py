@@ -73,6 +73,8 @@ class ChunkCompletionSTTModel(StreamingSTTModel):
         # Audio history window (M previous chunks in each branch). Read from the
         # MODEL config so it survives from_pretrained (data_cfg is None then).
         self._audio_history_chunks = max(int(getattr(self.core_cfg, "audio_history_chunks", 0) or 0), 0)
+        # Fixed-frame audio window (takes precedence over audio_history_chunks).
+        self._audio_window_frames = max(int(getattr(self.core_cfg, "audio_window_frames", 0) or 0), 0)
         # Contiguous-text positions ("Option A"): must match how the data was
         # packed at train time; read from the MODEL config for from_pretrained.
         self._contiguous_text_positions = bool(getattr(self.core_cfg, "contiguous_text_positions", False))
@@ -112,12 +114,13 @@ class ChunkCompletionSTTModel(StreamingSTTModel):
         logging.info("=" * 72)
         logging.info(
             "[chunk-completion] packed spine+branch objective active | audio span %r/%r | eot=%s | "
-            "audio_history_chunks=%d | contiguous_text_positions=%s | attn_impl=%s -- "
-            "models p(words_k | text_history_<k, audio_{k-M..k}).",
+            "audio_history_chunks=%d | audio_window_frames=%d | contiguous_text_positions=%s | "
+            "attn_impl=%s -- models p(words_k | text_history_<k, audio_{k-M..k}).",
             self.audio_open_token,
             self.audio_close_token,
             self._cc_eot_id,
             self._audio_history_chunks,
+            self._audio_window_frames,
             self._contiguous_text_positions,
             self.llm.config._attn_implementation,
         )
@@ -378,6 +381,7 @@ class ChunkCompletionSTTModel(StreamingSTTModel):
             contiguous_text_positions=self._contiguous_text_positions,
             max_history_tokens=max_history_tokens,
             return_chunk_ids=return_word_latency,
+            audio_window_frames=self._audio_window_frames,
         )
         if return_word_latency:
             emitted, chunk_ids = out

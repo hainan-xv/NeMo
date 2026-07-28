@@ -214,6 +214,20 @@ class ChunkCompletionSTTDataset(StreamingSTTDataset):
 
         # --- Audio history window + history-word recovery ---
         self._audio_history_chunks = max(int(getattr(self.cfg, "audio_history_chunks", 0) or 0), 0)
+        self._audio_window_frames = max(int(getattr(self.cfg, "audio_window_frames", 0) or 0), 0)
+        if self._audio_window_frames > 0 and self._audio_history_chunks > 0:
+            raise ValueError(
+                "audio_window_frames and audio_history_chunks are mutually exclusive "
+                "(pick a frame-based OR a chunk-based audio window)."
+            )
+        if self._audio_window_frames > 0:
+            logging.info(
+                "ChunkCompletionSTTDataset: audio_window_frames=%d (fixed acoustic context; "
+                "each branch sees the last %d encoder frames ending at the chunk boundary, "
+                "regardless of chunk size).",
+                self._audio_window_frames,
+                self._audio_window_frames,
+            )
         self._history_word_recovery_prob = float(getattr(self.cfg, "history_word_recovery_prob", 0.0) or 0.0)
         if not (0.0 <= self._history_word_recovery_prob <= 1.0):
             raise ValueError(
@@ -471,6 +485,7 @@ class ChunkCompletionSTTDataset(StreamingSTTDataset):
                     audio_history_chunks=self._audio_history_chunks,
                     recover_prev=recover_prev,
                     contiguous_text_positions=self._contiguous_text_positions,
+                    audio_window_frames=self._audio_window_frames,
                 )
             )
 
@@ -485,9 +500,14 @@ class ChunkCompletionSTTDataset(StreamingSTTDataset):
             prefix_len=packed.prefix_len,
             target_tokens=packed.target_ids,
             is_audio=packed.is_audio,
-            # Only carry the explicit frame index when the window spans >1 chunk;
-            # for M=0 the model keeps the (byte-identical) cumsum interleave path.
-            audio_frame_index=(packed.audio_frame_index if self._audio_history_chunks > 0 else None),
+            # Carry the explicit frame index whenever a window (chunk- or frame-based)
+            # reuses frames across branches; otherwise the model keeps the
+            # (byte-identical) cumsum interleave path.
+            audio_frame_index=(
+                packed.audio_frame_index
+                if (self._audio_history_chunks > 0 or self._audio_window_frames > 0)
+                else None
+            ),
             valid=packed.valid,
             text=text,
             cuts=cuts,

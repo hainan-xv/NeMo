@@ -103,6 +103,26 @@ def _branch_positions(
     return prelude + words
 
 
+def _audio_window_start(cur_chunk_start: int, win_end: int, m_window_start: int, audio_window_frames: int) -> int:
+    """Global start frame of a branch's audio window (window is ``[start, win_end)``).
+
+    Two ways to size the window (see :func:`build_packed_chunk_example`):
+
+    * ``audio_window_frames > 0`` (FRAME-based): the last ``audio_window_frames``
+      encoder frames ending at the chunk boundary ``win_end`` — a fixed acoustic
+      context independent of the chunk size. The start is never past the current
+      chunk's own start (``cur_chunk_start``), so a chunk LARGER than the window
+      still shows all of its own frames (the frame count is a floor, not a cap),
+      and it is clamped at 0 for the first chunk(s). Takes precedence over
+      ``audio_history_chunks``.
+    * otherwise (CHUNK-based): ``m_window_start`` = the start of chunk
+      ``max(0, k - audio_history_chunks)``.
+    """
+    if audio_window_frames > 0:
+        return max(0, min(cur_chunk_start, win_end - audio_window_frames))
+    return m_window_start
+
+
 @dataclass
 class ChunkSpec:
     """One chunk of an utterance.
@@ -167,6 +187,7 @@ def build_packed_chunk_example(
     audio_history_chunks: int = 0,
     recover_prev: Optional[List[bool]] = None,
     contiguous_text_positions: bool = False,
+    audio_window_frames: int = 0,
 ) -> PackedChunkExample:
     """Build the packed spine+branch layout for one utterance.
 
@@ -190,6 +211,13 @@ def build_packed_chunk_example(
             included in each branch's window. Branch ``k`` then wraps the frames of
             chunks ``[max(0, k-M) .. k]`` (fewer for early chunks; no padding). ``0``
             = original behavior (only the current chunk's audio).
+        audio_window_frames: if ``> 0``, size each branch's audio window by a FIXED
+            number of encoder frames (the last ``audio_window_frames`` frames ending
+            at the chunk boundary) instead of by whole chunks — a constant acoustic
+            context regardless of chunk size. Never smaller than the current chunk
+            (so chunks larger than the window keep all their frames). Takes
+            precedence over ``audio_history_chunks``; ``0`` = disabled. See
+            :func:`_audio_window_start`.
         recover_prev: optional per-chunk bool list. When ``recover_prev[k]`` is
             True (needs a non-empty previous-chunk last word), branch ``k`` DROPS
             the previous chunk's last word from its history and prepends it to its
@@ -241,9 +269,12 @@ def build_packed_chunk_example(
         k = kc + 1  # 1-based branch/segment id
         pref = prefix_lens[kc]
 
-        # Audio window = frames of chunks [max(0, kc-M) .. kc] (global indices).
-        win_start = frame_starts[max(0, kc - M)]
+        # Audio window (global frame indices): chunk-based (audio_history_chunks) or
+        # fixed frame count (audio_window_frames), ending at the chunk boundary.
         win_end = frame_starts[kc] + ch.audio_len
+        win_start = _audio_window_start(
+            frame_starts[kc], win_end, frame_starts[max(0, kc - M)], audio_window_frames
+        )
         window_frames = list(range(win_start, win_end))
         window_len = len(window_frames)
 
@@ -457,6 +488,7 @@ def build_separate_chunk_examples(
     audio_history_chunks: int = 0,
     recover_prev: Optional[List[bool]] = None,
     contiguous_text_positions: bool = False,
+    audio_window_frames: int = 0,
 ) -> List[SeparateChunkExample]:
     """Build the naive per-chunk examples used as a correctness oracle.
 
@@ -465,9 +497,10 @@ def build_separate_chunk_examples(
     last word when recovering), with the same audio window as the packed branch.
     The packed builder must reproduce these branches' logits exactly (parity test).
 
-    ``contiguous_text_positions`` must match the packed builder: it selects the
-    position-id convention (see :func:`_branch_positions`) and is written into
-    each example's ``position_ids`` for the parity forward.
+    ``contiguous_text_positions`` and ``audio_window_frames`` must match the packed
+    builder: the former selects the position-id convention (see
+    :func:`_branch_positions`, written into each example's ``position_ids``), the
+    latter the audio-window sizing (see :func:`_audio_window_start`).
     """
     M = max(int(audio_history_chunks), 0)
     frame_starts: List[int] = []
@@ -479,8 +512,10 @@ def build_separate_chunk_examples(
     out: List[SeparateChunkExample] = []
     history: List[int] = list(instruction_ids)
     for kc, ch in enumerate(chunks):
-        win_start = frame_starts[max(0, kc - M)]
         win_end = frame_starts[kc] + ch.audio_len
+        win_start = _audio_window_start(
+            frame_starts[kc], win_end, frame_starts[max(0, kc - M)], audio_window_frames
+        )
         window_frames = list(range(win_start, win_end))
         window_len = len(window_frames)
 
@@ -557,6 +592,7 @@ def stream_decode_chunk_completion(
     audio_history_chunks: int = 0,
     contiguous_text_positions: bool = False,
     max_history_tokens: int = 0,
+    audio_window_frames: int = 0,
 ) -> List[List[int]]:
     """Greedy streaming decode of one utterance in the chunk-completion model.
 
@@ -611,9 +647,13 @@ def stream_decode_chunk_completion(
 
     emitted_flat: List[int] = []
     emitted_per_chunk: List[List[int]] = []
+    W = max(int(audio_window_frames), 0)
     for k in range(num_chunks):
-        # Audio window = frames of chunks [max(0, k-M) .. k].
-        cf = frames[max(0, k - M) * chunk_size : (k + 1) * chunk_size]
+        # Audio window: chunk-based (audio_history_chunks) or fixed frame count
+        # (audio_window_frames), ending at this chunk's boundary.
+        win_end = (k + 1) * chunk_size
+        win_start = _audio_window_start(k * chunk_size, win_end, max(0, k - M) * chunk_size, W)
+        cf = frames[win_start:win_end]
         c = cf.shape[0]
         if c == 0:
             break
@@ -706,6 +746,7 @@ def batched_stream_decode_chunk_completion(
     contiguous_text_positions: bool = False,
     max_history_tokens: int = 0,
     return_chunk_ids: bool = False,
+    audio_window_frames: int = 0,
 ):
     """Batched greedy chunk-completion decode for B utterances at once.
 
@@ -746,6 +787,7 @@ def batched_stream_decode_chunk_completion(
     num_chunks = [math.ceil(n / chunk_size) if n > 0 else 0 for n in n_frames]
     max_chunks = max(num_chunks) if B else 0
     M = max(int(audio_history_chunks), 0)
+    W = max(int(audio_window_frames), 0)
 
     emitted: List[List[int]] = [[] for _ in range(B)]
     # Per emitted token, the audio chunk index during which it was decoded (for
@@ -762,8 +804,11 @@ def batched_stream_decode_chunk_completion(
         seqs: List[List[int]] = []
         chunk_frames: List[Tensor] = []
         for b in active:
-            # Audio window = frames of chunks [max(0, k-M) .. k].
-            fr = frames_list[b][max(0, k - M) * chunk_size : (k + 1) * chunk_size].to(device=device, dtype=dtype)
+            # Audio window: chunk-based (audio_history_chunks) or fixed frame count
+            # (audio_window_frames), ending at this chunk's boundary.
+            win_end = (k + 1) * chunk_size
+            win_start = _audio_window_start(k * chunk_size, win_end, max(0, k - M) * chunk_size, W)
+            fr = frames_list[b][win_start:win_end].to(device=device, dtype=dtype)
             c = int(fr.shape[0])
             # Optionally cap the CONDITIONING history to the most recent
             # ``max_history_tokens`` emitted tokens (instruction always kept). This

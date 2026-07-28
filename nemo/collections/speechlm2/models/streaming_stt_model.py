@@ -564,6 +564,13 @@ class StreamingSTTModelConfig:
     # config (not just data) so ChunkCompletionSTTModel.generate can rebuild the
     # window at inference after from_pretrained.
     audio_history_chunks: int = 0
+    # --- Fixed-frame audio window (ChunkCompletionSTTModel only) ---
+    # If > 0, each branch conditions on a FIXED number of encoder frames (the last
+    # ``audio_window_frames`` frames ending at the chunk boundary) regardless of
+    # chunk size — a constant acoustic context. Never smaller than the current
+    # chunk. Takes precedence over audio_history_chunks. Kept in the MODEL config so
+    # generate() rebuilds the same window after from_pretrained. 0 = disabled.
+    audio_window_frames: int = 0
     # --- Contiguous-text positions ("Option A", ChunkCompletionSTTModel only) ---
     # When True, each chunk-completion branch places its predicted words + eot at
     # positions contiguous with the plain-text history (word j -> pref+j) and
