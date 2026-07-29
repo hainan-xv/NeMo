@@ -579,6 +579,20 @@ class StreamingSTTModelConfig:
     # generate() uses the matching decoder after from_pretrained. False = original
     # per-branch-audio layout.
     shared_audio_track: bool = False
+    # --- Self-correction (delete-last-word) (ChunkCompletionSTTModel only) ---
+    # When True, training injects the model's OWN forced-decoding errors: each step
+    # a no-grad teacher-forced pass finds chunks whose last word the model mispredicts,
+    # then the NEXT branch is rebuilt with that wrong word as its (committed) history
+    # tail and target ``<del> w_prev w_k`` -- learning to delete a bad word and re-emit
+    # it. delete_token is reused from the in-vocab tokenizer (no embedding resize).
+    self_correction: bool = False
+    # In-vocab special token used as the "delete last word" marker.
+    delete_token: str = "<|object_ref_start|>"
+    # Probability of actually injecting a correction at a DETECTED error (rest train
+    # normally). 1.0 = correct every detected error.
+    self_correction_prob: float = 1.0
+    # Log error stats + a sample correction every N steps (0 disables the sample).
+    self_correction_log_every: int = 200
     # --- Contiguous-text positions ("Option A", ChunkCompletionSTTModel only) ---
     # When True, each chunk-completion branch places its predicted words + eot at
     # positions contiguous with the plain-text history (word j -> pref+j) and

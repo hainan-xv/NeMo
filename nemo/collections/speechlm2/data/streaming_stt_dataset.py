@@ -114,6 +114,14 @@ class StreamingSTTDataConfig:
     # the packed length is independent of the window size. Should match
     # model.shared_audio_track. False = original per-branch-audio layout.
     shared_audio_track: bool = False
+    # --- Self-correction (delete-last-word) ---
+    # When True (ChunkCompletionSTTDataset), each chunk also carries its last word's
+    # tokens and the batch carries per-example chunk metadata, so the MODEL can inject
+    # its own forced-decoding errors and build correction targets in the training step
+    # (see ChunkCompletionSTTModel). Should match model.self_correction. False = off.
+    self_correction: bool = False
+    # Optional clause appended to the system prompt describing the delete ability.
+    self_correction_prompt_suffix: Optional[str] = None
     # History-word recovery regularization. With this probability, a chunk DROPS
     # the previous chunk's last word from its history and must recover it (prepended
     # to its target). Trains robustness to a missing history word. With

@@ -188,6 +188,8 @@ def build_packed_chunk_example(
     recover_prev: Optional[List[bool]] = None,
     contiguous_text_positions: bool = False,
     audio_window_frames: int = 0,
+    corrupt_prev: Optional[List[Optional[List[int]]]] = None,
+    delete_id: Optional[int] = None,
 ) -> PackedChunkExample:
     """Build the packed spine+branch layout for one utterance.
 
@@ -227,6 +229,16 @@ def build_packed_chunk_example(
             (left-context-carrying) audio + the remaining text history. The spine
             and all OTHER branches (incl. the one that normally emits that word)
             are unchanged.
+        corrupt_prev: optional per-chunk list for self-correction. When
+            ``corrupt_prev[k]`` is a non-empty token list ``W'`` (and ``delete_id``
+            is given and the previous chunk has a non-empty last word), branch ``k``
+            is built as if the previous chunk's last word had been mis-committed as
+            ``W'``: the correct previous word is excluded from the attended history,
+            ``W'`` is shown as this branch's history tail, and the target becomes
+            ``[delete_id] + w_prev + w_k`` (delete the wrong word, re-emit the truth,
+            then this chunk's words). The spine and all other branches are unchanged.
+            Mutually exclusive with ``recover_prev``; non-contiguous layout only.
+        delete_id: the special "delete last word" token id used by ``corrupt_prev``.
         contiguous_text_positions: when True (Option A), each branch's predicted
             words + eot get positions ``pref, pref+1, ...`` (contiguous with the
             history), and the branch's ``<vs>``/audio/``<ve>`` prelude is overlaid
@@ -278,28 +290,51 @@ def build_packed_chunk_example(
         window_frames = list(range(win_start, win_end))
         window_len = len(window_frames)
 
-        # History-word recovery: drop the previous chunk's last word from THIS
-        # branch's history and recover it. Needs a previous chunk with a non-empty
-        # last word. When M>=1 the dropped word's audio is in this branch's window;
-        # when M==0 it is NOT, so the model must recover it from the current chunk's
-        # (left-context-carrying) audio + the remaining text history.
+        # Per-branch history edit (mutually exclusive, both need a previous chunk
+        # with a non-empty last word, both only in the non-contiguous layout):
+        #  * recovery: DROP the prev chunk's correct last word and re-emit it.
+        #  * self-correction: the prev chunk's last word was mis-committed as W'
+        #    (corrupt_prev[kc]); show W' as this branch's history tail and target
+        #    ``<del> w_prev w_k`` -- delete the wrong word and re-emit the truth.
         do_recover = (
             recover_prev is not None
             and kc >= 1
             and recover_prev[kc]
             and len(chunks[kc - 1].last_word_ids) > 0
         )
-        if do_recover:
+        do_corrupt = (
+            corrupt_prev is not None
+            and kc >= 1
+            and delete_id is not None
+            and corrupt_prev[kc] is not None
+            and len(corrupt_prev[kc]) > 0
+            and len(chunks[kc - 1].last_word_ids) > 0
+        )
+        if do_recover and do_corrupt:
+            raise ValueError("a chunk cannot both recover and self-correct its previous word")
+        if (do_recover or do_corrupt) and contiguous_text_positions:
+            raise ValueError("recovery / self-correction are not supported with contiguous_text_positions")
+
+        context: List[int] = []  # unsupervised branch-leading tokens (the mis-committed word W')
+        if do_corrupt:
+            wprime = list(corrupt_prev[kc])
+            wprev = list(chunks[kc - 1].last_word_ids)
+            pref = pref - len(wprev)  # exclude the correct prev word from the attended history
+            context = wprime  # the wrong word, shown as the (committed) history tail
+            branch_words = [delete_id] + wprev + list(ch.target_ids)
+        elif do_recover:
             dropped = list(chunks[kc - 1].last_word_ids)
             pref = pref - len(dropped)  # exclude the dropped word's spine tokens
             branch_words = dropped + list(ch.target_ids)
         else:
             branch_words = list(ch.target_ids)
 
-        # branch tokens: <vs> [window audio] <ve> [branch_words] <eot>
-        branch_tokens: List[int] = [vision_start_id] + [AUDIO_TOKEN_IDX] * window_len + [vision_end_id]
-        branch_is_audio: List[bool] = [False] + [True] * window_len + [False]
-        branch_frame_idx: List[int] = [-1] + window_frames + [-1]
+        # branch tokens: [W' context] <vs> [window audio] <ve> [branch_words] <eot>
+        branch_tokens: List[int] = (
+            list(context) + [vision_start_id] + [AUDIO_TOKEN_IDX] * window_len + [vision_end_id]
+        )
+        branch_is_audio: List[bool] = [False] * len(context) + [False] + [True] * window_len + [False]
+        branch_frame_idx: List[int] = [-1] * len(context) + [-1] + window_frames + [-1]
         branch_tokens.extend(branch_words)
         branch_is_audio.extend([False] * len(branch_words))
         branch_frame_idx.extend([-1] * len(branch_words))
@@ -308,18 +343,24 @@ def build_packed_chunk_example(
         branch_frame_idx.append(-1)
 
         # Next-token targets: <ve> predicts branch_words[0]; word i predicts word
-        # i+1; the last word predicts eot. <vs>/audio/eot are not supervised.
+        # i+1; the last word predicts eot. context/<vs>/audio/eot are not supervised.
         n_bt = len(branch_tokens)
         next_targets: List[int] = [IGNORE_INDEX] * n_bt
-        ve_idx = 1 + window_len  # index of <ve> within the branch
-        first_word_pos = ve_idx  # <ve> position predicts the first (recovered/normal) word
+        ve_idx = len(context) + 1 + window_len  # index of <ve> within the branch
+        first_word_pos = ve_idx  # <ve> predicts the first (delete/recovered/normal) target
         for j, tok in enumerate(branch_words):
             next_targets[first_word_pos + j] = tok
         last_word_pos = first_word_pos + len(branch_words)  # predicts eot
         if supervise_eot:
             next_targets[last_word_pos] = eot_id
 
-        branch_positions = _branch_positions(pref, window_len, len(branch_words), contiguous_text_positions)
+        if context:
+            # W' occupies the history-tail positions pref..pref+|W'|-1; the rest follows.
+            branch_positions = [pref + i for i in range(len(context))] + _branch_positions(
+                pref + len(context), window_len, len(branch_words), contiguous_text_positions
+            )
+        else:
+            branch_positions = _branch_positions(pref, window_len, len(branch_words), contiguous_text_positions)
 
         input_ids.extend(branch_tokens)
         position_ids.extend(branch_positions)
@@ -489,6 +530,8 @@ def build_separate_chunk_examples(
     recover_prev: Optional[List[bool]] = None,
     contiguous_text_positions: bool = False,
     audio_window_frames: int = 0,
+    corrupt_prev: Optional[List[Optional[List[int]]]] = None,
+    delete_id: Optional[int] = None,
 ) -> List[SeparateChunkExample]:
     """Build the naive per-chunk examples used as a correctness oracle.
 
@@ -525,7 +568,22 @@ def build_separate_chunk_examples(
             and recover_prev[kc]
             and len(chunks[kc - 1].last_word_ids) > 0
         )
-        if do_recover:
+        do_corrupt = (
+            corrupt_prev is not None
+            and kc >= 1
+            and delete_id is not None
+            and corrupt_prev[kc] is not None
+            and len(corrupt_prev[kc]) > 0
+            and len(chunks[kc - 1].last_word_ids) > 0
+        )
+        context: List[int] = []
+        if do_corrupt:
+            wprime = list(corrupt_prev[kc])
+            wprev = list(chunks[kc - 1].last_word_ids)
+            prefix = list(history[: len(history) - len(wprev)])  # drop the correct prev word
+            context = wprime  # show the mis-committed word as the history tail
+            branch_words = [delete_id] + wprev + list(ch.target_ids)
+        elif do_recover:
             dropped = list(chunks[kc - 1].last_word_ids)
             prefix = list(history[: len(history) - len(dropped)])  # drop prev chunk's last word
             branch_words = dropped + list(ch.target_ids)
@@ -533,9 +591,9 @@ def build_separate_chunk_examples(
             prefix = list(history)
             branch_words = list(ch.target_ids)
 
-        branch_tokens = [vision_start_id] + [AUDIO_TOKEN_IDX] * window_len + [vision_end_id]
-        branch_is_audio = [False] + [True] * window_len + [False]
-        branch_frame_idx = [-1] + window_frames + [-1]
+        branch_tokens = list(context) + [vision_start_id] + [AUDIO_TOKEN_IDX] * window_len + [vision_end_id]
+        branch_is_audio = [False] * len(context) + [False] + [True] * window_len + [False]
+        branch_frame_idx = [-1] * len(context) + [-1] + window_frames + [-1]
         branch_tokens.extend(branch_words)
         branch_is_audio.extend([False] * len(branch_words))
         branch_frame_idx.extend([-1] * len(branch_words))
@@ -548,19 +606,26 @@ def build_separate_chunk_examples(
         audio_frame_index = [-1] * len(prefix) + branch_frame_idx
 
         target_ids = [IGNORE_INDEX] * len(input_ids)
-        ve_idx = len(prefix) + 1 + window_len  # position of <ve>
+        ve_idx = len(prefix) + len(context) + 1 + window_len  # position of <ve>
         for j, tok in enumerate(branch_words):
             target_ids[ve_idx + j] = tok
         last_word_pos = ve_idx + len(branch_words)
         if supervise_eot:
             target_ids[last_word_pos] = eot_id
 
-        # Positions: prefix is 0..pref-1; the branch follows the same convention
-        # as the packed builder so the parity comparison is apples-to-apples.
+        # Positions: prefix is 0..pref-1; W' context (if any) takes the history-tail
+        # positions; the branch follows the same convention as the packed builder.
         pref = len(prefix)
-        position_ids = list(range(pref)) + _branch_positions(
-            pref, window_len, len(branch_words), contiguous_text_positions
-        )
+        if context:
+            position_ids = (
+                list(range(pref))
+                + [pref + i for i in range(len(context))]
+                + _branch_positions(pref + len(context), window_len, len(branch_words), contiguous_text_positions)
+            )
+        else:
+            position_ids = list(range(pref)) + _branch_positions(
+                pref, window_len, len(branch_words), contiguous_text_positions
+            )
 
         out.append(
             SeparateChunkExample(
@@ -747,6 +812,8 @@ def batched_stream_decode_chunk_completion(
     max_history_tokens: int = 0,
     return_chunk_ids: bool = False,
     audio_window_frames: int = 0,
+    delete_id: Optional[int] = None,
+    is_word_start: Optional[Callable[[int], bool]] = None,
 ):
     """Batched greedy chunk-completion decode for B utterances at once.
 
@@ -793,6 +860,22 @@ def batched_stream_decode_chunk_completion(
     # Per emitted token, the audio chunk index during which it was decoded (for
     # word-latency: a word's emission time = end of the chunk of its last subword).
     chunk_ids: List[List[int]] = [[] for _ in range(B)]
+    # Self-correction: token index in emitted[b] where each committed word begins,
+    # so a leading <del> can pop the last committed word. Only tracked when the
+    # delete token is active.
+    word_starts: List[List[int]] = [[] for _ in range(B)]
+
+    def _append_token(b: int, tok: int, k: int) -> None:
+        if not emitted[b] or (is_word_start is not None and is_word_start(tok)):
+            word_starts[b].append(len(emitted[b]))
+        emitted[b].append(tok)
+        chunk_ids[b].append(k)
+
+    def _pop_last_word(b: int) -> None:
+        if word_starts[b]:
+            start = word_starts[b].pop()
+            del emitted[b][start:]
+            del chunk_ids[b][start:]
 
     for k in range(max_chunks):
         active = [b for b in range(B) if k < num_chunks[b]]
@@ -880,6 +963,7 @@ def batched_stream_decode_chunk_completion(
 
         finished = [False] * na
         words: List[List[int]] = [[] for _ in range(na)]
+        do_delete = [False] * na  # a leading <del> deletes the last committed word
         for _ in range(max_new_tokens):
             nxt = logits.argmax(dim=-1)  # (na,)
             for i in range(na):
@@ -888,6 +972,8 @@ def batched_stream_decode_chunk_completion(
                 tid = int(nxt[i].item())
                 if tid == eot_id:
                     finished[i] = True
+                elif delete_id is not None and tid == delete_id and len(words[i]) == 0 and not do_delete[i]:
+                    do_delete[i] = True  # leading delete: pop last word at commit, don't emit <del>
                 else:
                     words[i].append(tid)
             if all(finished):
@@ -912,8 +998,14 @@ def batched_stream_decode_chunk_completion(
             logits = out.logits[:, -1]
 
         for i, b in enumerate(active):
-            emitted[b].extend(words[i])
-            chunk_ids[b].extend([k] * len(words[i]))
+            if delete_id is None:
+                emitted[b].extend(words[i])
+                chunk_ids[b].extend([k] * len(words[i]))
+            else:
+                if do_delete[i]:
+                    _pop_last_word(b)  # remove the mis-committed previous word
+                for tok in words[i]:
+                    _append_token(b, tok, k)
 
     if return_chunk_ids:
         return emitted, chunk_ids

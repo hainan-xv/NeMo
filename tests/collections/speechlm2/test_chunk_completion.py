@@ -813,6 +813,131 @@ def test_parity_recovery_no_window_packed_vs_separate():
         torch.testing.assert_close(packed_logits[idx], sep_logits[sep.branch_start :], atol=1e-4, rtol=1e-4)
 
 
+# ---------------------------------------------------------------------------
+# Self-correction (delete-last-word)
+# ---------------------------------------------------------------------------
+
+DEL = 93  # toy "delete last word" token id
+
+
+def test_self_correction_layout():
+    # chunk1 "one two" (last word "two"=[21]); chunk2 "three"=[30]. The model
+    # mis-committed "two" as W'=[99]; branch2 must delete it and re-emit 21.
+    chunks = [ChunkSpec(2, [20, 21], last_word_ids=[21]), ChunkSpec(2, [30], last_word_ids=[30])]
+    ex = build_packed_chunk_example(INSTR, chunks, VS, VE, EOT, corrupt_prev=[None, [99]], delete_id=DEL)
+
+    b2 = (ex.seg_ids == 2).nonzero(as_tuple=True)[0]
+    # [99] <vs> A A <ve> <DEL> 21 30 <eot>
+    assert ex.input_ids[b2].tolist() == [99, VS, AUDIO_TOKEN_IDX, AUDIO_TOKEN_IDX, VE, DEL, 21, 30, EOT]
+    assert ex.is_audio[b2].tolist() == [False, False, True, True, False, False, False, False, False]
+    # prefix excludes the correct "21" (spine pos 3): branch2 attends spine 0,1,2 only.
+    assert (ex.prefix_len[b2] == 3).all()
+    # W' at the history-tail position (3), then the rest contiguous.
+    assert ex.position_ids[b2].tolist() == [3, 4, 5, 6, 7, 8, 9, 10, 11]
+    # target: delete the wrong word, re-emit "two"(21), then "three"(30), then eot.
+    supervised = ex.target_ids != IGNORE_INDEX
+    assert ex.target_ids[b2][supervised[b2]].tolist() == [DEL, 21, 30, EOT]
+
+    # branch 1 (no corruption) is untouched.
+    b1 = (ex.seg_ids == 1).nonzero(as_tuple=True)[0]
+    assert ex.input_ids[b1].tolist() == [VS, AUDIO_TOKEN_IDX, AUDIO_TOKEN_IDX, VE, 20, 21, EOT]
+    assert (ex.prefix_len[b1] == 2).all()
+
+
+class _ScriptedLLM:
+    """A stand-in LLM whose argmax follows a fixed per-call token script, so we can
+    drive the decoder deterministically (used to test <del> word-popping)."""
+
+    def __init__(self, script, vocab_size):
+        self.script = list(script)
+        self.i = 0
+        self.V = vocab_size
+
+    def __call__(self, inputs_embeds, attention_mask=None, position_ids=None,
+                 past_key_values=None, use_cache=False, return_dict=True):
+        na, L, _ = inputs_embeds.shape
+        logits = torch.zeros(na, L, self.V)
+        tok = self.script[self.i]
+        self.i += 1
+        logits[:, -1, tok] = 100.0  # force argmax at the last position
+
+        class _Out:
+            pass
+
+        o = _Out()
+        o.logits = logits
+        o.past_key_values = past_key_values if past_key_values is not None else object()
+        return o
+
+
+@torch.no_grad()
+def test_delete_aware_decode_pops_last_word():
+    """A leading <del> in a chunk pops the previous chunk's last committed word."""
+    A = 20
+    V, H = 128, 8
+    # scripted argmax per llm call: chunk0 -> [A (prefill), eot]; chunk1 -> [<del>, A, eot]
+    llm = _ScriptedLLM([A, EOT, DEL, A, EOT], V)
+    embed = lambda ids: torch.zeros(*ids.shape, H)  # noqa: E731
+    frames = torch.zeros(4, H)  # 2 chunks of size 2
+    emitted = batched_stream_decode_chunk_completion(
+        llm=llm, embed_tokens=embed, instruction_ids_list=[[5, 6]], frames_list=[frames],
+        chunk_size=2, vision_start_id=VS, vision_end_id=VE, eot_id=EOT, pad_id=0,
+        max_new_tokens=4, delete_id=DEL, is_word_start=lambda t: True,
+    )
+    # chunk0 commits [A]; chunk1's leading <del> pops it, then re-emits A -> [A].
+    assert emitted == [[A]]
+
+
+@torch.no_grad()
+def test_delete_id_none_is_unchanged():
+    """Without delete_id the decode is byte-identical to the original behavior."""
+    A, Bt = 20, 21
+    V, H = 128, 8
+    llm = _ScriptedLLM([A, EOT, Bt, EOT], V)
+    embed = lambda ids: torch.zeros(*ids.shape, H)  # noqa: E731
+    frames = torch.zeros(4, H)
+    emitted = batched_stream_decode_chunk_completion(
+        llm=llm, embed_tokens=embed, instruction_ids_list=[[5, 6]], frames_list=[frames],
+        chunk_size=2, vision_start_id=VS, vision_end_id=VE, eot_id=EOT, pad_id=0,
+        max_new_tokens=4,
+    )
+    assert emitted == [[A, Bt]]
+
+
+@torch.no_grad()
+def test_parity_self_correction_packed_vs_separate():
+    """A self-correcting branch's packed logits must equal the standalone example
+    with the same wrong word W' shown as history tail and target <DEL> w_prev w_k."""
+    model = _tiny_qwen3()
+    H = model.config.hidden_size
+    instruction = [5, 6, 7]
+    chunks = [
+        ChunkSpec(2, [20, 21], last_word_ids=[21]),
+        ChunkSpec(3, [30, 31], last_word_ids=[31]),
+        ChunkSpec(2, [40], last_word_ids=[40]),
+    ]
+    corrupt = [None, [99], None]  # chunk2 corrupts the prev last word "21" -> 99
+    torch.manual_seed(5)
+    audio_frames = [torch.randn(c.audio_len, H) for c in chunks]
+
+    packed = build_packed_chunk_example(instruction, chunks, VS, VE, EOT, corrupt_prev=corrupt, delete_id=DEL)
+    valid = torch.ones_like(packed.input_ids, dtype=torch.bool)
+    mask = build_chunk_completion_mask(
+        packed.seg_ids[None], packed.position_ids[None], packed.prefix_len[None], valid[None], torch.float32
+    )
+    packed_emb = _embed_with_audio(model, packed.input_ids, packed.is_audio, torch.cat(audio_frames, dim=0))
+    packed_logits = model(
+        inputs_embeds=packed_emb[None], attention_mask=mask, position_ids=packed.position_ids[None]
+    ).logits[0]
+
+    separate = build_separate_chunk_examples(instruction, chunks, VS, VE, EOT, corrupt_prev=corrupt, delete_id=DEL)
+    for k, (sep, frames) in enumerate(zip(separate, audio_frames), start=1):
+        sep_emb = _embed_with_audio(model, sep.input_ids, sep.is_audio, frames)
+        sep_logits = model(inputs_embeds=sep_emb[None], position_ids=sep.position_ids[None]).logits[0]
+        idx = (packed.seg_ids == k).nonzero(as_tuple=True)[0]
+        torch.testing.assert_close(packed_logits[idx], sep_logits[sep.branch_start :], atol=1e-4, rtol=1e-4)
+
+
 @torch.no_grad()
 def test_batched_decode_matches_per_utterance():
     """Batched chunk-synchronous decode must equal per-utterance stream decode.

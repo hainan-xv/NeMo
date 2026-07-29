@@ -46,6 +46,8 @@ from nemo.collections.speechlm2.models.streaming_stt_model import StreamingSTTMo
 from nemo.collections.speechlm2.parts.chunk_completion import (
     batched_stream_decode_chunk_completion,
     build_chunk_completion_mask,
+    build_packed_chunk_example,
+    collate_packed_chunk_examples,
 )
 from nemo.collections.speechlm2.parts.shared_audio_chunk import (
     batched_shared_audio_decode,
@@ -81,6 +83,35 @@ class ChunkCompletionSTTModel(StreamingSTTModel):
         self._audio_window_frames = max(int(getattr(self.core_cfg, "audio_window_frames", 0) or 0), 0)
         # Shared-audio packed layout (encoder frames laid once, windowed via the mask).
         self._shared_audio_track = bool(getattr(self.core_cfg, "shared_audio_track", False))
+
+        # --- Self-correction (delete-last-word) ---
+        self._self_correction = bool(getattr(self.core_cfg, "self_correction", False))
+        self._self_correction_prob = float(getattr(self.core_cfg, "self_correction_prob", 1.0) or 0.0)
+        self._self_correction_log_every = int(getattr(self.core_cfg, "self_correction_log_every", 200) or 0)
+        self._delete_id = None
+        if self._self_correction:
+            delete_token = str(getattr(self.core_cfg, "delete_token", "<|object_ref_start|>"))
+            self._delete_id = hf_tok.convert_tokens_to_ids(delete_token)
+            unk2 = getattr(hf_tok, "unk_token_id", None)
+            if self._delete_id is None or (unk2 is not None and self._delete_id == unk2):
+                raise ValueError(
+                    f"self_correction delete_token {delete_token!r} is not a valid in-vocab token "
+                    f"(id={self._delete_id}). Pick an unused tokenizer special token."
+                )
+            self._sc_rng = torch.Generator(device="cpu")
+            self._sc_rng.manual_seed(1234)
+
+            def _is_word_start(tid: int) -> bool:
+                # Byte-level BPE: a word-initial subword decodes with a leading space.
+                tok = hf_tok.convert_ids_to_tokens(int(tid))
+                return isinstance(tok, str) and (tok.startswith("\u0120") or tok.startswith("\u2581"))
+
+            self._is_word_start = _is_word_start
+            logging.info(
+                "[chunk-completion] self-correction ON | delete_token=%r (id=%s) | inject_prob=%.2f "
+                "-- learns to emit <del> to fix a mis-committed previous word.",
+                delete_token, self._delete_id, self._self_correction_prob,
+            )
         # Contiguous-text positions ("Option A"): must match how the data was
         # packed at train time; read from the MODEL config for from_pretrained.
         self._contiguous_text_positions = bool(getattr(self.core_cfg, "contiguous_text_positions", False))
@@ -164,7 +195,24 @@ class ChunkCompletionSTTModel(StreamingSTTModel):
     # Training
     # ------------------------------------------------------------------
 
+    def _chunk_logits(self, input_tokens, position_ids, seg_ids, prefix_len, valid, audios, audio_lens, audio_frame_index):
+        """Forward the (regular per-branch-audio) packed batch -> (B, T, V) logits."""
+        if audio_frame_index is not None:
+            inputs = self._build_input_embeds_indexed(input_tokens, audios, audio_lens, audio_frame_index)
+        else:
+            inputs = self._build_input_embeds(input_tokens, audios, audio_lens)
+        input_embeds = inputs["input_embeds"]
+        mask = build_chunk_completion_mask(seg_ids, position_ids, prefix_len, valid, input_embeds.dtype)
+        out = self.llm(
+            inputs_embeds=input_embeds, attention_mask=mask, position_ids=position_ids,
+            use_cache=False, return_dict=True,
+        )
+        return out["logits"]
+
     def training_step(self, batch: ChunkCompletionBatch, batch_idx: int):
+        if self._self_correction and getattr(batch, "chunk_meta", None) is not None:
+            return self._self_correction_training_step(batch, batch_idx)
+
         # Keep frozen modules in eval mode (disables dropout / BN updates).
         for m in (self.perception.preprocessor, self.perception.encoder, self.llm):
             if is_frozen(m):
@@ -234,6 +282,115 @@ class ChunkCompletionSTTModel(StreamingSTTModel):
                 }
             )
         self.log_dict(train_metrics, on_step=True)
+        return {"loss": loss}
+
+    def _self_correction_training_step(self, batch: ChunkCompletionBatch, batch_idx: int):
+        """DAgger-style self-correction step.
+
+        (1) A no-grad teacher-forced pass on the ground-truth-history batch gives the
+            model's argmax per branch. (2) Where a chunk's LAST word is mispredicted,
+            the NEXT branch is rebuilt with that wrong word ``W'`` as its committed
+            history tail and target ``<del> w_prev w_k``. (3) A grad forward on the
+            rebuilt batch takes the CE loss. Error stats are logged and a sample
+            correction is printed every ``self_correction_log_every`` steps.
+        """
+        for m in (self.perception.preprocessor, self.perception.encoder, self.llm):
+            if is_frozen(m):
+                m.eval()
+        self._set_encoder_att_context(getattr(batch, "chunk_size", None))
+
+        # 1) Forced (teacher-forced) argmax on the correct-history batch.
+        with torch.no_grad():
+            logits = self._chunk_logits(
+                batch.input_tokens, batch.position_ids, batch.seg_ids, batch.prefix_len,
+                batch.valid, batch.audios, batch.audio_lens, batch.audio_frame_index,
+            )
+            argmax = logits.argmax(dim=-1)  # (B, T)
+
+        # 2) Detect last-word errors; build per-example corrupt_prev; rebuild.
+        B = batch.input_tokens.shape[0]
+        n_eligible = n_error = n_corrupt = 0
+        sample = None
+        corrupt_examples = []
+        for b in range(B):
+            instruction_ids, chunks = batch.chunk_meta[b]
+            corrupt_prev = [None] * len(chunks)
+            seg_b, tgt_b, am_b = batch.seg_ids[b], batch.target_tokens[b], argmax[b]
+            for kc in range(len(chunks) - 1):  # an error in chunk kc corrupts chunk kc+1
+                lw = len(chunks[kc].last_word_ids)
+                nword = len(chunks[kc].target_ids)
+                if lw == 0 or nword == 0:
+                    continue
+                n_eligible += 1
+                sup = ((seg_b == kc + 1) & (tgt_b != IGNORE_INDEX)).nonzero(as_tuple=True)[0]
+                if sup.numel() < nword:
+                    continue
+                pred_last = am_b[sup[:nword]][nword - lw:].tolist()
+                if pred_last != list(chunks[kc].last_word_ids):
+                    n_error += 1
+                    if float(torch.rand((), generator=self._sc_rng).item()) < self._self_correction_prob:
+                        corrupt_prev[kc + 1] = pred_last
+                        n_corrupt += 1
+                        if sample is None:
+                            sample = (list(chunks[kc].last_word_ids), pred_last, list(chunks[kc + 1].target_ids))
+            corrupt_examples.append(
+                build_packed_chunk_example(
+                    instruction_ids=instruction_ids,
+                    chunks=chunks,
+                    vision_start_id=self._cc_vision_start_id,
+                    vision_end_id=self._cc_vision_end_id,
+                    eot_id=self._cc_eot_id,
+                    corrupt_prev=corrupt_prev,
+                    delete_id=self._delete_id,
+                    audio_history_chunks=self._audio_history_chunks,
+                    audio_window_frames=self._audio_window_frames,
+                )
+            )
+
+        packed = collate_packed_chunk_examples(corrupt_examples, pad_id=self.tokenizer.pad_id)
+        dev = self.device
+        windowed = self._audio_history_chunks > 0 or self._audio_window_frames > 0
+        target_tokens = packed.target_ids.to(dev)
+
+        # 3) Grad forward on the corrupted batch.
+        logits = self._chunk_logits(
+            packed.input_ids.to(dev), packed.position_ids.to(dev), packed.seg_ids.to(dev),
+            packed.prefix_len.to(dev), packed.valid.to(dev), batch.audios, batch.audio_lens,
+            packed.audio_frame_index.to(dev) if windowed else None,
+        )
+        num_targets = (target_tokens != IGNORE_INDEX).long().sum()
+        if num_targets == 0:
+            return {"loss": torch.tensor(0.0, device=logits.device, requires_grad=True)}
+        with loss_parallel():
+            loss = F.cross_entropy(
+                logits.flatten(0, 1), target_tokens.flatten(0, 1),
+                reduction="mean", ignore_index=IGNORE_INDEX,
+            )
+
+        # 4) Stats + periodic sample printout.
+        err_rate = (n_error / n_eligible) if n_eligible else 0.0
+        self.log_dict(
+            {
+                "loss": loss,
+                "learning_rate": torch.as_tensor(
+                    self.trainer.optimizers[0].param_groups[0]["lr"] if self._trainer is not None else 0
+                ),
+                "sc/eligible_chunks": float(n_eligible),
+                "sc/errors": float(n_error),
+                "sc/error_rate": float(err_rate),
+                "sc/injected": float(n_corrupt),
+            },
+            on_step=True,
+        )
+        if self._self_correction_log_every and (batch_idx % self._self_correction_log_every == 0) and sample is not None:
+            w_prev, wprime, w_cur = sample
+            logging.info(
+                "[self-correction] step %d | eligible=%d errors=%d (%.1f%%) injected=%d | "
+                "example: model committed %r for true %r -> target: <del> %r then chunk %r",
+                batch_idx, n_eligible, n_error, 100.0 * err_rate, n_corrupt,
+                self.tokenizer.ids_to_text(wprime), self.tokenizer.ids_to_text(w_prev),
+                self.tokenizer.ids_to_text(w_prev), self.tokenizer.ids_to_text(w_cur) if w_cur else "",
+            )
         return {"loss": loss}
 
     # ``backward`` (loss_parallel wrapper) is inherited from StreamingSTTModel.
@@ -416,6 +573,8 @@ class ChunkCompletionSTTModel(StreamingSTTModel):
             max_history_tokens=max_history_tokens,
             return_chunk_ids=return_word_latency,
             audio_window_frames=self._audio_window_frames,
+            delete_id=self._delete_id if self._self_correction else None,
+            is_word_start=self._is_word_start if self._self_correction else None,
         )
         if return_word_latency:
             emitted, chunk_ids = out

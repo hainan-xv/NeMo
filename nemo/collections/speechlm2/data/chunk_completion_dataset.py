@@ -80,6 +80,9 @@ class ChunkCompletionBatch:
     text: Optional[List[str]] = None
     cuts: Optional[object] = None
     chunk_size: Optional[int] = None
+    # Self-correction only: per-example (instruction_ids, chunks) so the model can
+    # rebuild corrupted branches from its own forced-decoding errors. None otherwise.
+    chunk_meta: Optional[List] = None
 
 
 class ChunkCompletionSTTDataset(StreamingSTTDataset):
@@ -269,6 +272,19 @@ class ChunkCompletionSTTDataset(StreamingSTTDataset):
             logging.info(
                 "ChunkCompletionSTTDataset: contiguous_text_positions=True (words placed "
                 "contiguous with history; audio prelude overlaid on history tail positions)."
+            )
+
+        # --- Self-correction (delete-last-word) ---
+        self._self_correction = bool(getattr(self.cfg, "self_correction", False))
+        self._self_correction_prompt_suffix = getattr(self.cfg, "self_correction_prompt_suffix", None)
+        if self._self_correction:
+            if self._contiguous_text_positions:
+                raise ValueError("self_correction is not compatible with contiguous_text_positions.")
+            if bool(getattr(self.cfg, "shared_audio_track", False)):
+                raise ValueError("self_correction is not compatible with shared_audio_track (yet).")
+            logging.info(
+                "ChunkCompletionSTTDataset: self_correction=True (each batch carries chunk metadata + "
+                "last-word tokens; the model injects its own forced-decoding errors as delete targets)."
             )
 
         # --- Shared-audio packed layout ---
@@ -485,16 +501,24 @@ class ChunkCompletionSTTDataset(StreamingSTTDataset):
         )
 
         recover_on = self._history_word_recovery_prob > 0.0
+        # Self-correction needs each chunk's last-word tokens (to know the correct
+        # word to re-emit) and passes the chunk metadata through for the model.
+        compute_last_word = recover_on or self._self_correction
         transform_text = self._vary_text_repr and (not cap or not punct)
         examples = []
+        chunk_meta = [] if self._self_correction else None
         for messages, sysp in zip(batch_messages, system_prompts):
             if transform_text:
                 messages = self._apply_text_repr_to_messages(messages, cap, punct)
-            chunks = self._messages_to_chunks(messages, compute_last_word=recover_on)
+            chunks = self._messages_to_chunks(messages, compute_last_word=compute_last_word)
             recover_prev = self._sample_recover_flags(chunks, self._get_chunk_rng()) if recover_on else None
             # Instruction/history separator: a newline keeps the first history word
             # from BPE-merging into the instruction text.
+            if self._self_correction and self._self_correction_prompt_suffix:
+                sysp = sysp.rstrip() + " " + str(self._self_correction_prompt_suffix)
             instruction_ids = self.tokenizer.text_to_ids(sysp + "\n")
+            if chunk_meta is not None:
+                chunk_meta.append((instruction_ids, chunks))
             if self._shared_audio_track:
                 examples.append(
                     build_shared_audio_chunk_example(
@@ -564,4 +588,5 @@ class ChunkCompletionSTTDataset(StreamingSTTDataset):
             text=text,
             cuts=cuts,
             chunk_size=chunk_size,
+            chunk_meta=chunk_meta,
         )
