@@ -38,6 +38,7 @@ from nemo.collections.speechlm2.data.streaming_stt_dataset import (
     _replace_audio_chunks,
     _tokenize_compact_with_assistant_mask,
     _tokenize_with_assistant_mask,
+    apply_chat_template_ids,
     build_compact_turn_markers,
     compute_word_spans,
     decode_with_blank,
@@ -1718,6 +1719,55 @@ def real_tokenizer(request):
     if hf_tok is None:
         pytest.skip(f"Tokenizer {model_id} not available")
     return label, hf_tok
+
+
+class TestApplyChatTemplateIds:
+    """``apply_chat_template(tokenize=True)`` returns ``list[int]`` on transformers 4.x
+    but a ``BatchEncoding`` on 5.x. ``apply_chat_template_ids`` must flatten both to
+    the same ``list[int]`` — otherwise callers iterate the mapping's *keys* and blow up
+    later with "too many dimensions 'str'"."""
+
+    MESSAGES = [{"role": "system", "content": "hi"}]
+
+    class _FakeTok:
+        """Returns whichever shape a given transformers version would."""
+
+        IDS = [1, 2, 3]
+
+        def __init__(self, shape):
+            self.shape = shape
+            self.seen_kwargs = None
+
+        def apply_chat_template(self, messages, **kwargs):
+            self.seen_kwargs = kwargs
+            if self.shape == "list":  # transformers 4.x
+                return list(self.IDS)
+            if self.shape == "dict":  # transformers 5.x
+                return {"input_ids": list(self.IDS), "attention_mask": [1, 1, 1]}
+            if self.shape == "batched_dict":  # hypothetical future batching
+                return {"input_ids": [list(self.IDS)], "attention_mask": [[1, 1, 1]]}
+            if self.shape == "tensor_dict":
+                import torch
+
+                return {"input_ids": torch.tensor(self.IDS)}
+            raise AssertionError(self.shape)
+
+    @pytest.mark.parametrize("shape", ["list", "dict", "batched_dict", "tensor_dict"])
+    def test_all_return_shapes_flatten_to_ids(self, shape):
+        tok = self._FakeTok(shape)
+        assert apply_chat_template_ids(tok, self.MESSAGES) == [1, 2, 3]
+
+    def test_forwards_kwargs_and_forces_tokenize(self):
+        tok = self._FakeTok("dict")
+        apply_chat_template_ids(tok, self.MESSAGES, add_generation_prompt=False, enable_thinking=False)
+        assert tok.seen_kwargs == {"tokenize": True, "add_generation_prompt": False, "enable_thinking": False}
+
+    def test_matches_the_raw_call_on_this_transformers_version(self, real_tokenizer):
+        """Whatever the installed version returns, the helper yields the same IDs."""
+        _, hf_tok = real_tokenizer
+        raw = hf_tok.apply_chat_template(self.MESSAGES, tokenize=True, add_generation_prompt=False)
+        expected = list(raw["input_ids"]) if hasattr(raw, "keys") else list(raw)
+        assert apply_chat_template_ids(hf_tok, self.MESSAGES, add_generation_prompt=False) == expected
 
 
 class TestTokenizeWithAssistantMaskRealTokenizers:

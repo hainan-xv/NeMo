@@ -39,6 +39,7 @@ from nemo.collections.speechlm2.data.streaming_stt_dataset import (
     IGNORE_INDEX,
     StreamingSTTBatch,
     StreamingSTTDataset,
+    apply_chat_template_ids,
     build_compact_turn_markers,
     decode_with_blank,
     parse_chat_template_ids,
@@ -1729,9 +1730,9 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         # Tokenize each prompt
         all_sys_ids = []
         for prompt in prompts:
-            ids = hf_tok.apply_chat_template(
+            ids = apply_chat_template_ids(
+                hf_tok,
                 [{"role": "system", "content": prompt}],
-                tokenize=True,
                 add_generation_prompt=False,
                 enable_thinking=False,
             )
@@ -2027,9 +2028,9 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         prompts = [system_prompt] * B if isinstance(system_prompt, str) else system_prompt
         all_sys_embs = []
         for prompt in prompts:
-            sys_ids = hf_tok.apply_chat_template(
+            sys_ids = apply_chat_template_ids(
+                hf_tok,
                 [{"role": "system", "content": prompt}],
-                tokenize=True,
                 add_generation_prompt=False,
                 enable_thinking=False,
             )

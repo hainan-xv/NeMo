@@ -541,6 +541,34 @@ def get_llm_messages_for_batch(
     return batch_messages
 
 
+def apply_chat_template_ids(hf_tok, messages: List[dict], **kwargs) -> list[int]:
+    """``apply_chat_template(..., tokenize=True)`` normalized to a flat list of token IDs.
+
+    transformers 4.x returns a plain ``list[int]`` from a tokenizing call, while
+    transformers 5.x always returns a ``BatchEncoding`` (``return_dict`` became
+    the default). Callers here only ever want the IDs, so unwrap the mapping —
+    and a batched ``[[ids]]`` layout too, in case a future version wraps single
+    conversations.
+
+    Args:
+        hf_tok: A HuggingFace tokenizer (``tokenizer.tokenizer``).
+        messages: ``[{"role": ..., "content": ...}, ...]``.
+        kwargs: Forwarded to ``apply_chat_template`` (e.g. ``add_generation_prompt``,
+            ``enable_thinking``). Do not pass ``tokenize`` or ``return_dict``.
+
+    Returns:
+        The conversation's token IDs as a flat ``list[int]``.
+    """
+    out = hf_tok.apply_chat_template(messages, tokenize=True, **kwargs)
+    if hasattr(out, "keys"):  # BatchEncoding / dict — transformers >= 5
+        out = out["input_ids"]
+    if hasattr(out, "tolist"):  # torch tensor (only when return_tensors was requested)
+        out = out.tolist()
+    if len(out) > 0 and isinstance(out[0], (list, tuple)):  # batched [[ids]]
+        out = out[0]
+    return list(out)
+
+
 def parse_chat_template_ids(hf_tok, last_turn: bool = False) -> tuple[list[int], list[int], list[int]]:
     """Discover turn-structure token IDs from a HuggingFace chat template.
 
@@ -679,13 +707,13 @@ def _tokenize_compact_with_assistant_mask(
     # --- System section: keep Qwen3-style wrapping ---
     system_msgs = [m for m in messages if m["role"] == "system"]
     if system_msgs:
-        system_ids = hf_tok.apply_chat_template(
+        system_ids = apply_chat_template_ids(
+            hf_tok,
             system_msgs,
-            tokenize=True,
             add_generation_prompt=False,
             enable_thinking=False,
         )
-        input_ids.extend(list(system_ids))
+        input_ids.extend(system_ids)
         assistant_mask.extend([0] * len(system_ids))
 
     # --- Per-turn compact encoding ---
@@ -777,14 +805,7 @@ def _tokenize_with_assistant_mask(
     assistant_mask = [0] * len(input_ids)
 
     msgs_sentinel = [{**m, "content": _SENTINEL_CHAR} if m["role"] == "assistant" else m for m in messages]
-    ids_sentinel_result = hf_tok.apply_chat_template(
-        msgs_sentinel,
-        tokenize=True,
-        enable_thinking=False,
-    )
-    ids_sentinel = list(
-        ids_sentinel_result["input_ids"] if hasattr(ids_sentinel_result, "keys") else ids_sentinel_result
-    )
+    ids_sentinel = apply_chat_template_ids(hf_tok, msgs_sentinel, enable_thinking=False)
 
     eos_id = getattr(hf_tok, 'eos_token_id', None)
     i, j = 0, 0  # pointers into input_ids and ids_sentinel
