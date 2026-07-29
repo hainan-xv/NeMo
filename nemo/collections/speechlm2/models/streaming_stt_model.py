@@ -571,6 +571,14 @@ class StreamingSTTModelConfig:
     # chunk. Takes precedence over audio_history_chunks. Kept in the MODEL config so
     # generate() rebuilds the same window after from_pretrained. 0 = disabled.
     audio_window_frames: int = 0
+    # --- Shared-audio packed layout (ChunkCompletionSTTModel only) ---
+    # When True, the encoder frames are laid down ONCE as a shared audio track and
+    # each branch attends its window through the mask, instead of copying the window
+    # into every branch. Makes the packed sequence length independent of the audio
+    # window size (fixes the fixed-frame-window OOM). Kept in the MODEL config so
+    # generate() uses the matching decoder after from_pretrained. False = original
+    # per-branch-audio layout.
+    shared_audio_track: bool = False
     # --- Contiguous-text positions ("Option A", ChunkCompletionSTTModel only) ---
     # When True, each chunk-completion branch places its predicted words + eot at
     # positions contiguous with the plain-text history (word j -> pref+j) and

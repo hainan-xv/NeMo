@@ -109,6 +109,11 @@ class StreamingSTTDataConfig:
     # fewer than the current chunk. Takes precedence over audio_history_chunks;
     # mutually exclusive with it. Should match model.audio_window_frames. 0 = off.
     audio_window_frames: int = 0
+    # Shared-audio packed layout (ChunkCompletionSTTDataset): lay the encoder frames
+    # down ONCE and window each branch via the mask (no per-branch audio copies), so
+    # the packed length is independent of the window size. Should match
+    # model.shared_audio_track. False = original per-branch-audio layout.
+    shared_audio_track: bool = False
     # History-word recovery regularization. With this probability, a chunk DROPS
     # the previous chunk's last word from its history and must recover it (prepended
     # to its target). Trains robustness to a missing history word. With

@@ -47,6 +47,10 @@ from nemo.collections.speechlm2.parts.chunk_completion import (
     batched_stream_decode_chunk_completion,
     build_chunk_completion_mask,
 )
+from nemo.collections.speechlm2.parts.shared_audio_chunk import (
+    batched_shared_audio_decode,
+    build_shared_audio_chunk_mask,
+)
 from nemo.collections.speechlm2.parts.optim_setup import is_frozen
 from nemo.utils import logging
 
@@ -75,6 +79,8 @@ class ChunkCompletionSTTModel(StreamingSTTModel):
         self._audio_history_chunks = max(int(getattr(self.core_cfg, "audio_history_chunks", 0) or 0), 0)
         # Fixed-frame audio window (takes precedence over audio_history_chunks).
         self._audio_window_frames = max(int(getattr(self.core_cfg, "audio_window_frames", 0) or 0), 0)
+        # Shared-audio packed layout (encoder frames laid once, windowed via the mask).
+        self._shared_audio_track = bool(getattr(self.core_cfg, "shared_audio_track", False))
         # Contiguous-text positions ("Option A"): must match how the data was
         # packed at train time; read from the MODEL config for from_pretrained.
         self._contiguous_text_positions = bool(getattr(self.core_cfg, "contiguous_text_positions", False))
@@ -114,13 +120,14 @@ class ChunkCompletionSTTModel(StreamingSTTModel):
         logging.info("=" * 72)
         logging.info(
             "[chunk-completion] packed spine+branch objective active | audio span %r/%r | eot=%s | "
-            "audio_history_chunks=%d | audio_window_frames=%d | contiguous_text_positions=%s | "
-            "attn_impl=%s -- models p(words_k | text_history_<k, audio_{k-M..k}).",
+            "audio_history_chunks=%d | audio_window_frames=%d | shared_audio_track=%s | "
+            "contiguous_text_positions=%s | attn_impl=%s -- models p(words_k | text_history_<k, audio_{k-M..k}).",
             self.audio_open_token,
             self.audio_close_token,
             self._cc_eot_id,
             self._audio_history_chunks,
             self._audio_window_frames,
+            self._shared_audio_track,
             self._contiguous_text_positions,
             self.llm.config._attn_implementation,
         )
@@ -178,9 +185,15 @@ class ChunkCompletionSTTModel(StreamingSTTModel):
             inputs = self._build_input_embeds(batch.input_tokens, batch.audios, batch.audio_lens)
         input_embeds = inputs["input_embeds"]
 
-        mask = build_chunk_completion_mask(
-            batch.seg_ids, batch.position_ids, batch.prefix_len, batch.valid, input_embeds.dtype
-        )
+        if self._shared_audio_track:
+            mask = build_shared_audio_chunk_mask(
+                batch.seg_ids, batch.position_ids, batch.prefix_len,
+                batch.win_start, batch.win_end, batch.audio_frame_index, batch.valid, input_embeds.dtype,
+            )
+        else:
+            mask = build_chunk_completion_mask(
+                batch.seg_ids, batch.position_ids, batch.prefix_len, batch.valid, input_embeds.dtype
+            )
 
         out = self.llm(
             inputs_embeds=input_embeds,
@@ -365,6 +378,27 @@ class ChunkCompletionSTTModel(StreamingSTTModel):
         # onset time), which is fine for comparing models/latency settings.
         return_word_latency = bool(generation_kwargs.pop("return_word_latency", False))
         instruction_ids_list = [self.tokenizer.text_to_ids(system_prompt[b] + "\n") for b in range(B)]
+
+        if self._shared_audio_track:
+            if return_word_latency:
+                raise NotImplementedError("return_word_latency is not supported with shared_audio_track yet.")
+            emitted = batched_shared_audio_decode(
+                llm=self.llm,
+                embed_tokens=self.embed_tokens,
+                instruction_ids_list=instruction_ids_list,
+                frames_list=frames_list,
+                chunk_size=cs,
+                vision_end_id=self._cc_vision_end_id,
+                eot_id=self._cc_eot_id,
+                pad_id=self.text_pad_id,
+                max_new_tokens=max_new_tokens,
+                device=self.device,
+                audio_window_frames=self._audio_window_frames,
+                audio_history_chunks=self._audio_history_chunks,
+                max_history_tokens=max_history_tokens,
+            )
+            return [self.tokenizer.ids_to_text(ids) if ids else "" for ids in emitted]
+
         out = batched_stream_decode_chunk_completion(
             llm=self.llm,
             embed_tokens=self.embed_tokens,

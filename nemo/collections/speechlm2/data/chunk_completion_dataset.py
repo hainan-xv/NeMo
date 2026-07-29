@@ -36,6 +36,10 @@ from nemo.collections.speechlm2.parts.chunk_completion import (
     build_packed_chunk_example,
     collate_packed_chunk_examples,
 )
+from nemo.collections.speechlm2.parts.shared_audio_chunk import (
+    build_shared_audio_chunk_example,
+    collate_shared_audio_examples,
+)
 from nemo.utils import logging
 
 
@@ -68,6 +72,10 @@ class ChunkCompletionBatch:
     # Set only when audio_history_chunks > 0 (windowed audio reuses frames across
     # branches, so the model gathers by this index instead of the cumsum fill).
     audio_frame_index: Optional[torch.Tensor] = None
+    # Shared-audio layout only (audio laid once, windowed via the mask): per-branch
+    # audio-window frame bounds [win_start, win_end). None in the per-branch-audio layout.
+    win_start: Optional[torch.Tensor] = None
+    win_end: Optional[torch.Tensor] = None
     valid: Optional[torch.Tensor] = None
     text: Optional[List[str]] = None
     cuts: Optional[object] = None
@@ -261,6 +269,18 @@ class ChunkCompletionSTTDataset(StreamingSTTDataset):
             logging.info(
                 "ChunkCompletionSTTDataset: contiguous_text_positions=True (words placed "
                 "contiguous with history; audio prelude overlaid on history tail positions)."
+            )
+
+        # --- Shared-audio packed layout ---
+        self._shared_audio_track = bool(getattr(self.cfg, "shared_audio_track", False))
+        if self._shared_audio_track:
+            if self._contiguous_text_positions:
+                raise ValueError("shared_audio_track is not compatible with contiguous_text_positions.")
+            if self._history_word_recovery_prob > 0.0:
+                raise ValueError("shared_audio_track does not support history_word_recovery_prob (yet).")
+            logging.info(
+                "ChunkCompletionSTTDataset: shared_audio_track=True (encoder frames laid ONCE; "
+                "each branch windowed via the mask -> packed length independent of the audio window)."
             )
 
     def _sample_delay_prompt(self, rng):
@@ -475,18 +495,50 @@ class ChunkCompletionSTTDataset(StreamingSTTDataset):
             # Instruction/history separator: a newline keeps the first history word
             # from BPE-merging into the instruction text.
             instruction_ids = self.tokenizer.text_to_ids(sysp + "\n")
-            examples.append(
-                build_packed_chunk_example(
-                    instruction_ids=instruction_ids,
-                    chunks=chunks,
-                    vision_start_id=self.vision_start_id,
-                    vision_end_id=self.vision_end_id,
-                    eot_id=self.eot_id,
-                    audio_history_chunks=self._audio_history_chunks,
-                    recover_prev=recover_prev,
-                    contiguous_text_positions=self._contiguous_text_positions,
-                    audio_window_frames=self._audio_window_frames,
+            if self._shared_audio_track:
+                examples.append(
+                    build_shared_audio_chunk_example(
+                        instruction_ids=instruction_ids,
+                        chunks=chunks,
+                        vision_end_id=self.vision_end_id,
+                        eot_id=self.eot_id,
+                        audio_window_frames=self._audio_window_frames,
+                        audio_history_chunks=self._audio_history_chunks,
+                    )
                 )
+            else:
+                examples.append(
+                    build_packed_chunk_example(
+                        instruction_ids=instruction_ids,
+                        chunks=chunks,
+                        vision_start_id=self.vision_start_id,
+                        vision_end_id=self.vision_end_id,
+                        eot_id=self.eot_id,
+                        audio_history_chunks=self._audio_history_chunks,
+                        recover_prev=recover_prev,
+                        contiguous_text_positions=self._contiguous_text_positions,
+                        audio_window_frames=self._audio_window_frames,
+                    )
+                )
+
+        if self._shared_audio_track:
+            packed = collate_shared_audio_examples(examples, pad_id=self.tokenizer.pad_id)
+            return ChunkCompletionBatch(
+                audios=audios,
+                audio_lens=audio_lens,
+                input_tokens=packed.input_ids,
+                position_ids=packed.position_ids,
+                seg_ids=packed.seg_ids,
+                prefix_len=packed.prefix_len,
+                target_tokens=packed.target_ids,
+                is_audio=packed.is_audio,
+                audio_frame_index=packed.audio_frame_index,  # always set (audio laid once)
+                win_start=packed.win_start,
+                win_end=packed.win_end,
+                valid=packed.valid,
+                text=text,
+                cuts=cuts,
+                chunk_size=chunk_size,
             )
 
         packed = collate_packed_chunk_examples(examples, pad_id=self.tokenizer.pad_id)
