@@ -90,6 +90,7 @@ class ChunkCompletionSTTModel(StreamingSTTModel):
         self._self_correction_log_every = int(getattr(self.core_cfg, "self_correction_log_every", 200) or 0)
         self._delete_id = None
         if self._self_correction:
+            hf_tok = self.tokenizer.tokenizer
             delete_token = str(getattr(self.core_cfg, "delete_token", "<|object_ref_start|>"))
             self._delete_id = hf_tok.convert_tokens_to_ids(delete_token)
             unk2 = getattr(hf_tok, "unk_token_id", None)
