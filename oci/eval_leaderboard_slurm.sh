@@ -102,6 +102,10 @@ HEH_USE_STATE_MACHINE="${HEH_USE_STATE_MACHINE:-true}"
 HEH_USE_OFFLINE_EMBS="${HEH_USE_OFFLINE_EMBS:-false}"
 HEH_PAD_DURATION="${HEH_PAD_DURATION:-0.5}"
 FORCE_CONVERT="${FORCE_CONVERT:-0}"
+# Self-correction: also dump the RAW emission stream with <del> markers (e.g.
+# "the cat <del> cat sat") as a raw_text field in each generations record, so you
+# can see exactly where the model corrected. heh backend only. Default off.
+SAVE_RAW="${SAVE_RAW:-false}"
 # Report per-word emission latency (proxy: end-of-chunk time of each word's last
 # subword, averaged). Chunk-completion only; default on for it, off otherwise.
 if [[ -z "${REPORT_LATENCY:-}" ]]; then
@@ -249,6 +253,7 @@ NGPU=8
         echo "heh_use_state_machine: ${HEH_USE_STATE_MACHINE}"
         echo "heh_use_offline_embs: ${HEH_USE_OFFLINE_EMBS}"
         echo "heh_pad_duration:     ${HEH_PAD_DURATION}"
+        echo "save_raw:             ${SAVE_RAW}"
     fi
     echo "num_gpus:             ${NGPU}"
     echo "shuffle_seed:         ${SHUFFLE_SEED}"
@@ -457,6 +462,7 @@ ${HF_CLAUSE} \
         use_state_machine_inference=${HEH_USE_STATE_MACHINE} \
         pad_extra_duration=${HEH_PAD_DURATION} \
         report_word_latency=${REPORT_LATENCY} \
+        save_raw=${SAVE_RAW} \
         output_manifest="'\${gen}'" \
         verbose=false \
         device=cuda \

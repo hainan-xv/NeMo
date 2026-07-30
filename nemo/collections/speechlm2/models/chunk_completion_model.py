@@ -535,11 +535,15 @@ class ChunkCompletionSTTModel(StreamingSTTModel):
         # word's LAST subword. Off by a constant from true latency (the mean word
         # onset time), which is fine for comparing models/latency settings.
         return_word_latency = bool(generation_kwargs.pop("return_word_latency", False))
+        # Return the RAW emission stream with <del> markers kept in place (so callers
+        # can dump "A B <del> C" and see where self-correction fired). Only meaningful
+        # with self-correction; harmless (== hyp) otherwise.
+        return_raw = bool(generation_kwargs.pop("return_raw", False))
         instruction_ids_list = [self.tokenizer.text_to_ids(system_prompt[b] + "\n") for b in range(B)]
 
         if self._shared_audio_track:
-            if return_word_latency:
-                raise NotImplementedError("return_word_latency is not supported with shared_audio_track yet.")
+            if return_word_latency or return_raw:
+                raise NotImplementedError("return_word_latency / return_raw not supported with shared_audio_track yet.")
             emitted = batched_shared_audio_decode(
                 llm=self.llm,
                 embed_tokens=self.embed_tokens,
@@ -576,14 +580,43 @@ class ChunkCompletionSTTModel(StreamingSTTModel):
             audio_window_frames=self._audio_window_frames,
             delete_id=self._delete_id if self._self_correction else None,
             is_word_start=self._is_word_start if self._self_correction else None,
+            return_raw=return_raw,
         )
+        # The decoder returns emitted, then (chunk_ids if requested), then (raw if
+        # requested), in that fixed order. Unpack accordingly.
+        extras = list(out[1:]) if isinstance(out, tuple) else []
+        emitted = out[0] if isinstance(out, tuple) else out
+        hyps = [self.tokenizer.ids_to_text(ids) if ids else "" for ids in emitted]
+
+        result = [hyps]
+        ei = 0
         if return_word_latency:
-            emitted, chunk_ids = out
-            hyps = [self.tokenizer.ids_to_text(ids) if ids else "" for ids in emitted]
+            chunk_ids = extras[ei]
+            ei += 1
             frame_len = float(self.core_cfg.frame_length_in_secs)
-            latencies = [self._word_emission_times(emitted[b], chunk_ids[b], cs, frame_len) for b in range(B)]
-            return hyps, latencies
-        return [self.tokenizer.ids_to_text(ids) if ids else "" for ids in out]
+            result.append([self._word_emission_times(emitted[b], chunk_ids[b], cs, frame_len) for b in range(B)])
+        if return_raw:
+            raw = extras[ei]
+            ei += 1
+            result.append([self._raw_to_text(r) for r in raw])
+        return tuple(result) if len(result) > 1 else hyps
+
+    def _raw_to_text(self, tokens: List[int]) -> str:
+        """Render the raw emission stream with the delete token shown as ``<del>``,
+        so a correction reads e.g. ``the cat <del> cat sat``."""
+        if not tokens:
+            return ""
+        parts: List[str] = []
+        seg: List[int] = []
+        for t in tokens:
+            if self._delete_id is not None and t == self._delete_id:
+                parts.append(self.tokenizer.ids_to_text(seg) if seg else "")
+                parts.append("<del>")
+                seg = []
+            else:
+                seg.append(t)
+        parts.append(self.tokenizer.ids_to_text(seg) if seg else "")
+        return " ".join(p for p in parts if p != "").strip()
 
     def _word_emission_times(self, tokens: List[int], chunk_ids: List[int], chunk_size: int, frame_len: float):
         """Per-word emission time (s from audio start): end of the chunk of the

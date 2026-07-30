@@ -125,10 +125,13 @@ SYSTEM_PROMPT="You are doing streaming speech recognition. Given the transcript 
 
 MODEL_CLASS="${MODEL_CLASS:-nemo.collections.speechlm2.models.chunk_completion_model.ChunkCompletionSTTModel}"
 CHUNK_SIZE="${CHUNK_SIZE:-14}"
+# Dump the raw <del>-annotated emission stream (raw_text) so you can see where the
+# model self-corrected. On by default for this model; set SAVE_RAW=false to skip.
+SAVE_RAW="${SAVE_RAW:-true}"
 # Distinguishes concurrent selfcorrect evals in RESULTS_DIR (shared avg/HF are locked).
 EVAL_TAG="d${DELAY}_${REPR_TAG}_sc"
 
-export SYSTEM_PROMPT MODEL_CLASS CHUNK_SIZE EXP_NAME EVAL_TAG
+export SYSTEM_PROMPT MODEL_CLASS CHUNK_SIZE EXP_NAME EVAL_TAG SAVE_RAW
 
 echo "==> self-correction leaderboard eval"
 echo "    exp_name:      ${EXP_NAME}"
@@ -137,6 +140,7 @@ echo "    cap/punct:     ${REPR_TAG}"
 echo "    delay:         ${DELAY} frames (max trained ${MAX_DELAY})"
 echo "    chunk_size:    ${CHUNK_SIZE}"
 echo "    self-correct:  delete-last-word handled by ChunkCompletionSTTModel.generate (config-driven)"
+echo "    save_raw:      ${SAVE_RAW} (raw_text field with <del> markers in generations.jsonl)"
 echo "    system_prompt: ${SYSTEM_PROMPT}"
 
 # Locate oci/eval_leaderboard_slurm.sh. Under sbatch, Slurm COPIES this script

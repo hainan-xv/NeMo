@@ -124,6 +124,11 @@ class StreamingSTTEvalConfig:
     # averaged over words. Off by a constant from true latency. Ignored by other
     # model classes.
     report_word_latency: bool = False
+    # Self-correction only: also capture the RAW emission stream with <del> markers
+    # kept in place (e.g. "the cat <del> cat sat") and write it as ``raw_text`` in the
+    # output manifest, so you can see exactly where the model self-corrected. Ignored
+    # by models without a delete token.
+    save_raw: bool = False
     # When set, LM-head boundary decision uses a probability threshold:
     # emit when p(user_footer_first_id) ≥ threshold (instead of argmax). Useful
     # to recover boundaries where the LM is moderately confident but loses
@@ -183,6 +188,7 @@ def main(cfg: StreamingSTTEvalConfig):
 
     refs = []
     hyps = []
+    raws = []  # per-utterance raw emission with <del> markers; empty unless save_raw
     word_lat = []  # per-utterance list of per-word emission times (s); empty unless report_word_latency
     input_durations = []
     infer_durations = []
@@ -225,10 +231,10 @@ def main(cfg: StreamingSTTEvalConfig):
         logging.warning(f"CUDA OOM on batch of {B}; retrying as {mid}+{B - mid} sub-batches.")
         left = _generate_with_oom_backoff(audios[:mid], audio_lens[:mid], gen_kwargs, None, min_bs)
         right = _generate_with_oom_backoff(audios[mid:], audio_lens[mid:], gen_kwargs, None, min_bs)
-        # generate() may return (hyps, per_word_latencies) when report_word_latency
-        # is on; concatenate both halves in that case.
+        # generate() may return a tuple (hyps, [latencies], [raws]) when
+        # report_word_latency / save_raw are on; concatenate every element.
         if isinstance(left, tuple):
-            return left[0] + right[0], left[1] + right[1]
+            return tuple(l + r for l, r in zip(left, right))
         return left + right
 
     for batch_idx, batch in tqdm(enumerate(dloader), total=num_batches):
@@ -253,19 +259,26 @@ def main(cfg: StreamingSTTEvalConfig):
             _gen_kwargs["max_history_tokens"] = int(cfg.max_history_tokens)
         if cfg.report_word_latency:
             _gen_kwargs["return_word_latency"] = True
+        if cfg.save_raw:
+            _gen_kwargs["return_raw"] = True
         _result = _generate_with_oom_backoff(
             batch["audios"].to(model.device, non_blocking=True),
             batch["audio_lens"].to(model.device, non_blocking=True),
             gen_kwargs=_gen_kwargs,
             debug_logs=batch_debug_logs,
         )
-        # generate() returns (hyps, per-word-latencies) only when the model honored
-        # return_word_latency (chunk-completion). Fall back gracefully otherwise.
-        if cfg.report_word_latency and isinstance(_result, tuple):
-            batch_hyps_raw, batch_word_lat = _result
+        # generate() returns a tuple (hyps, [latencies], [raws]) in that fixed order
+        # only when the model honored the corresponding flag. Unpack defensively.
+        n_cuts = len(batch["cuts"])
+        if isinstance(_result, tuple):
+            batch_hyps_raw = _result[0]
+            _extra = list(_result[1:])
+            batch_word_lat = _extra.pop(0) if cfg.report_word_latency and _extra else [[] for _ in range(n_cuts)]
+            batch_raw = _extra.pop(0) if cfg.save_raw and _extra else None
         else:
             batch_hyps_raw = _result
-            batch_word_lat = [[] for _ in range(len(batch["cuts"]))]
+            batch_word_lat = [[] for _ in range(n_cuts)]
+            batch_raw = None
         batch_infer_duration = perf_counter() - ts
 
         # Write per-frame debug records keyed by cut id.
@@ -292,9 +305,14 @@ def main(cfg: StreamingSTTEvalConfig):
 
         refs.extend(batch_refs)
         hyps.extend(batch_hyps)
+        raws.extend(batch_raw if batch_raw is not None else ["" for _ in batch_hyps])
         word_lat.extend(batch_word_lat)
         input_durations.append(batch_duration)
         infer_durations.append(batch_infer_duration)
+
+        if cfg.verbose and batch_raw is not None:
+            for ref, raw in zip(batch_refs, batch_raw):
+                logging.info(f"\n[REF]\t`{ref}`\n[RAW]\t`{raw}`\n")
 
     if debug_log_writer is not None:
         debug_log_writer.close()
@@ -324,8 +342,10 @@ def main(cfg: StreamingSTTEvalConfig):
             f.write(f"=============================================\n\n")
         if not word_lat:
             word_lat = [[] for _ in hyps]
+        if not raws:
+            raws = ["" for _ in hyps]
         with SequentialJsonlWriter(cfg.output_manifest) as writer:
-            for cut, ref, hyp, wl in zip(cuts, refs, hyps, word_lat):
+            for cut, ref, hyp, wl, raw in zip(cuts, refs, hyps, word_lat, raws):
                 wer, _, nins, ndel, nsub = word_error_rate_detail(hypotheses=[hyp], references=[ref], use_cer=False)
                 record = {
                     "id": cut.id,
@@ -337,6 +357,9 @@ def main(cfg: StreamingSTTEvalConfig):
                     "del": ndel,
                     "sub": nsub,
                 }
+                # Raw emission with <del> markers kept in place (self-correction).
+                if cfg.save_raw:
+                    record["raw_text"] = raw
                 # Carry through any per-utterance tag from the input manifest
                 # (e.g. dataset_key, used by pooled multi-dataset eval to reduce
                 # per-dataset WER). cut.custom survives resample/pad/sort and is

@@ -814,6 +814,7 @@ def batched_stream_decode_chunk_completion(
     audio_window_frames: int = 0,
     delete_id: Optional[int] = None,
     is_word_start: Optional[Callable[[int], bool]] = None,
+    return_raw: bool = False,
 ):
     """Batched greedy chunk-completion decode for B utterances at once.
 
@@ -864,6 +865,9 @@ def batched_stream_decode_chunk_completion(
     # so a leading <del> can pop the last committed word. Only tracked when the
     # delete token is active.
     word_starts: List[List[int]] = [[] for _ in range(B)]
+    # Raw literal emission stream per utterance INCLUDING <del> tokens (not popped),
+    # so callers can render "A B <del> C" and see exactly where corrections happened.
+    raw: List[List[int]] = [[] for _ in range(B)]
 
     def _append_token(b: int, tok: int, k: int) -> None:
         if not emitted[b] or (is_word_start is not None and is_word_start(tok)):
@@ -963,6 +967,7 @@ def batched_stream_decode_chunk_completion(
 
         finished = [False] * na
         words: List[List[int]] = [[] for _ in range(na)]
+        raw_words: List[List[int]] = [[] for _ in range(na)]  # literal stream incl. <del>
         do_delete = [False] * na  # a leading <del> deletes the last committed word
         for _ in range(max_new_tokens):
             nxt = logits.argmax(dim=-1)  # (na,)
@@ -972,7 +977,10 @@ def batched_stream_decode_chunk_completion(
                 tid = int(nxt[i].item())
                 if tid == eot_id:
                     finished[i] = True
-                elif delete_id is not None and tid == delete_id and len(words[i]) == 0 and not do_delete[i]:
+                    continue
+                if return_raw:
+                    raw_words[i].append(tid)  # keep <del> in the raw stream
+                if delete_id is not None and tid == delete_id and len(words[i]) == 0 and not do_delete[i]:
                     do_delete[i] = True  # leading delete: pop last word at commit, don't emit <del>
                 else:
                     words[i].append(tid)
@@ -1006,7 +1014,12 @@ def batched_stream_decode_chunk_completion(
                     _pop_last_word(b)  # remove the mis-committed previous word
                 for tok in words[i]:
                     _append_token(b, tok, k)
+            if return_raw:
+                raw[b].extend(raw_words[i])
 
+    out_tuple = [emitted]
     if return_chunk_ids:
-        return emitted, chunk_ids
-    return emitted
+        out_tuple.append(chunk_ids)
+    if return_raw:
+        out_tuple.append(raw)
+    return tuple(out_tuple) if len(out_tuple) > 1 else emitted

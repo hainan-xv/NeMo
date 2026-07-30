@@ -889,6 +889,24 @@ def test_delete_aware_decode_pops_last_word():
 
 
 @torch.no_grad()
+def test_delete_aware_decode_returns_raw_stream():
+    """return_raw yields the literal emission stream WITH <del> kept, while the
+    corrected `emitted` has the popped word removed."""
+    A = 20
+    V, H = 128, 8
+    llm = _ScriptedLLM([A, EOT, DEL, A, EOT], V)
+    embed = lambda ids: torch.zeros(*ids.shape, H)  # noqa: E731
+    frames = torch.zeros(4, H)  # 2 chunks of size 2
+    emitted, raw = batched_stream_decode_chunk_completion(
+        llm=llm, embed_tokens=embed, instruction_ids_list=[[5, 6]], frames_list=[frames],
+        chunk_size=2, vision_start_id=VS, vision_end_id=VE, eot_id=EOT, pad_id=0,
+        max_new_tokens=4, delete_id=DEL, is_word_start=lambda t: True, return_raw=True,
+    )
+    assert emitted == [[A]]  # corrected: <del> popped the first A, re-emitted A
+    assert raw == [[A, DEL, A]]  # raw: chunk0 "A", chunk1 "<del> A"
+
+
+@torch.no_grad()
 def test_delete_id_none_is_unchanged():
     """Without delete_id the decode is byte-identical to the original behavior."""
     A, Bt = 20, 21
