@@ -142,9 +142,17 @@ if [[ -z "$INIT_CKPT" ]]; then
         echo "WARNING: no checkpoint under ${_INIT_DIR}; training from base pretrained (set INIT_CKPT= or INIT_EXP=)."
     fi
 fi
+# The ckpt filename contains '=' (step=..-val_wer=..), which breaks Hydra override
+# parsing, and it lives outside the container's mounted dirs. Expose it via a
+# clean-named symlink under the (mounted) results dir, mount its source dir, and
+# point resume_from_checkpoint at the symlink.
 INIT_CKPT_ARG=""
+INIT_MOUNT=""
 if [[ -n "$INIT_CKPT" && "$INIT_CKPT" != "none" ]]; then
-    INIT_CKPT_ARG="++exp_manager.resume_from_checkpoint=$INIT_CKPT"
+    mkdir -p "$RESULTS_DIR"
+    ln -sfn "$INIT_CKPT" "${RESULTS_DIR}/init_from.ckpt"
+    INIT_MOUNT="$(dirname "$INIT_CKPT")"
+    INIT_CKPT_ARG="++exp_manager.resume_from_checkpoint=/results/init_from.ckpt"
 fi
 PRETRAINED_MODEL_DIR=${LUSTRE_ACCOUNT_PREFIX}/${OLDUSERID}/pretrained_models
 CHECKPOINT_DIR=${LUSTRE_ACCOUNT_PREFIX}/${OLDUSERID}/checkpoints/
@@ -170,7 +178,7 @@ DONGJI_DIR=/lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/u
 # The recipe's validation manifest lives under dongjig's steve_val dir.
 DONGJI_ROOT=/lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/users/dongjig
 
-MOUNTS="--container-mounts=${DATA_DIR}:${DATA_DIR},${H_DIR}:${H_DIR},$HAINAN_DIR:$HAINAN_DIR,$CODE_DIR:/code,$RESULTS_DIR:/results,$DATA_DIR:/data,$PRETRAINED_MODEL_DIR:/pretrained,$CHECKPOINT_DIR:/checkpoints,${QUESTIONS_DIR}:/questions/,${HFCACHE}:/hfcache/,$DONGJI_ROOT:$DONGJI_ROOT"
+MOUNTS="--container-mounts=${DATA_DIR}:${DATA_DIR},${H_DIR}:${H_DIR},$HAINAN_DIR:$HAINAN_DIR,$CODE_DIR:/code,$RESULTS_DIR:/results,$DATA_DIR:/data,$PRETRAINED_MODEL_DIR:/pretrained,$CHECKPOINT_DIR:/checkpoints,${QUESTIONS_DIR}:/questions/,${HFCACHE}:/hfcache/,$DONGJI_ROOT:$DONGJI_ROOT${INIT_MOUNT:+,${INIT_MOUNT}:${INIT_MOUNT}}"
 
 # SLURM_JOB_NUM_NODES=1
 # GPUS_PER_NODE=1
