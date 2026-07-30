@@ -122,6 +122,18 @@ class StreamingSTTDataConfig:
     self_correction: bool = False
     # Optional clause appended to the system prompt describing the delete ability.
     self_correction_prompt_suffix: Optional[str] = None
+    # --- Self-correction via a PREFIX heuristic (data-side; no forced decoding) ---
+    # When True, with probability self_correction_prefix_prob per eligible chunk, the
+    # previous chunk's last word is replaced in the history by a random CHARACTER
+    # prefix of it (a truncation), and the branch target becomes "<del> w_prev w_k"
+    # (delete the truncated word, re-emit the full one). Baked into the packed batch,
+    # so training uses the normal step (no model forced-decode). Needs delete_token.
+    # Independent of / mutually exclusive with self_correction (the forced version).
+    self_correction_prefix: bool = False
+    self_correction_prefix_prob: float = 0.2
+    # In-vocab special token used as the "delete last word" marker (dataset-side, to
+    # build the correction targets). Should match model.delete_token.
+    delete_token: str = "<|object_ref_start|>"
     # History-word recovery regularization. With this probability, a chunk DROPS
     # the previous chunk's last word from its history and must recover it (prepended
     # to its target). Trains robustness to a missing history word. With

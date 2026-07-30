@@ -287,6 +287,33 @@ class ChunkCompletionSTTDataset(StreamingSTTDataset):
                 "last-word tokens; the model injects its own forced-decoding errors as delete targets)."
             )
 
+        # --- Self-correction via prefix heuristic (data-side) ---
+        self._self_correction_prefix = bool(getattr(self.cfg, "self_correction_prefix", False))
+        self._sc_prefix_prob = float(getattr(self.cfg, "self_correction_prefix_prob", 0.2) or 0.0)
+        self._sc_delete_id = None
+        if self._self_correction_prefix:
+            if self._self_correction:
+                raise ValueError("self_correction (forced) and self_correction_prefix are mutually exclusive.")
+            if self._contiguous_text_positions:
+                raise ValueError("self_correction_prefix is not compatible with contiguous_text_positions.")
+            if bool(getattr(self.cfg, "shared_audio_track", False)):
+                raise ValueError("self_correction_prefix is not compatible with shared_audio_track (yet).")
+            if not (0.0 <= self._sc_prefix_prob <= 1.0):
+                raise ValueError(f"self_correction_prefix_prob must be in [0, 1], got {self._sc_prefix_prob}")
+            delete_token = str(getattr(self.cfg, "delete_token", "<|object_ref_start|>"))
+            hf_tok = self.tokenizer.tokenizer
+            self._sc_delete_id = hf_tok.convert_tokens_to_ids(delete_token)
+            unk = getattr(hf_tok, "unk_token_id", None)
+            if self._sc_delete_id is None or (unk is not None and self._sc_delete_id == unk):
+                raise ValueError(
+                    f"delete_token {delete_token!r} is not a valid in-vocab token (id={self._sc_delete_id})."
+                )
+            logging.info(
+                "ChunkCompletionSTTDataset: self_correction_prefix ON (prob=%.2f, delete_token=%r id=%s) -- "
+                "the previous chunk's last word is truncated to a random char prefix; target = <del> w_prev w_k.",
+                self._sc_prefix_prob, delete_token, self._sc_delete_id,
+            )
+
         # --- Shared-audio packed layout ---
         self._shared_audio_track = bool(getattr(self.cfg, "shared_audio_track", False))
         if self._shared_audio_track:
@@ -386,6 +413,41 @@ class ChunkCompletionSTTDataset(StreamingSTTDataset):
         if 0 < n_prefix < len(target_ids):
             return list(target_ids[n_prefix:])
         return list(target_ids)
+
+    def _prefix_word_ids(self, last_word_ids: List[int], rng) -> Optional[List[int]]:
+        """A random CHARACTER prefix of a word (given as token ids), returned as token
+        ids, for the prefix self-correction heuristic. Keeps a uniformly random number
+        of the word's characters in ``[1, len-1]`` (a strict truncation), preserving
+        the word's leading space so it still tokenizes as a word. Returns None when the
+        word is too short or the prefix retokenizes back to the same word.
+        """
+        if not last_word_ids:
+            return None
+        w_full = self.tokenizer.ids_to_text(list(last_word_ids))
+        lead = " " if w_full[:1] == " " else ""
+        core = w_full[len(lead):]
+        if len(core) < 2:
+            return None
+        k = int(rng.integers(1, len(core)))  # keep 1..len(core)-1 chars
+        prefix = self.tokenizer.text_to_ids(lead + core[:k])
+        if not prefix or list(prefix) == list(last_word_ids):
+            return None
+        return list(prefix)
+
+    def _sample_prefix_corrupt(self, chunks: List[ChunkSpec], rng) -> Optional[List[Optional[List[int]]]]:
+        """Per-chunk corrupt_prev for the prefix heuristic: with prob prefix_prob, set
+        chunk k's entry to a random char prefix of chunk k-1's last word (skip when the
+        previous chunk produced no words). None entries = no corruption."""
+        corrupt = [None] * len(chunks)
+        for kc in range(1, len(chunks)):
+            prev_lw = chunks[kc - 1].last_word_ids
+            if not prev_lw:  # skip if the previous chunk had no output
+                continue
+            if rng.random() < self._sc_prefix_prob:
+                wprime = self._prefix_word_ids(prev_lw, rng)
+                if wprime:
+                    corrupt[kc] = wprime
+        return corrupt
 
     def _messages_to_chunks(self, messages: List[dict], compute_last_word: bool = False) -> List[ChunkSpec]:
         """Parse alternating user(audio)/assistant(words) turns into ChunkSpecs.
@@ -501,9 +563,10 @@ class ChunkCompletionSTTDataset(StreamingSTTDataset):
         )
 
         recover_on = self._history_word_recovery_prob > 0.0
-        # Self-correction needs each chunk's last-word tokens (to know the correct
-        # word to re-emit) and passes the chunk metadata through for the model.
-        compute_last_word = recover_on or self._self_correction
+        # Self-correction needs each chunk's last-word tokens (to know the correct word
+        # to re-emit). The forced version also passes chunk metadata for the model;
+        # the prefix version bakes the corruption in here (no chunk_meta).
+        compute_last_word = recover_on or self._self_correction or self._self_correction_prefix
         transform_text = self._vary_text_repr and (not cap or not punct)
         examples = []
         chunk_meta = [] if self._self_correction else None
@@ -512,6 +575,9 @@ class ChunkCompletionSTTDataset(StreamingSTTDataset):
                 messages = self._apply_text_repr_to_messages(messages, cap, punct)
             chunks = self._messages_to_chunks(messages, compute_last_word=compute_last_word)
             recover_prev = self._sample_recover_flags(chunks, self._get_chunk_rng()) if recover_on else None
+            # Prefix self-correction: truncate the previous chunk's last word in-place
+            # (baked correction target), sampled per chunk.
+            corrupt_prev = self._sample_prefix_corrupt(chunks, rng) if self._self_correction_prefix else None
             # Instruction/history separator: a newline keeps the first history word
             # from BPE-merging into the instruction text.
             if self._self_correction and self._self_correction_prompt_suffix:
@@ -542,6 +608,8 @@ class ChunkCompletionSTTDataset(StreamingSTTDataset):
                         recover_prev=recover_prev,
                         contiguous_text_positions=self._contiguous_text_positions,
                         audio_window_frames=self._audio_window_frames,
+                        corrupt_prev=corrupt_prev,
+                        delete_id=self._sc_delete_id if self._self_correction_prefix else None,
                     )
                 )
 

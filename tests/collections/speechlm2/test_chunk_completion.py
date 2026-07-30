@@ -246,6 +246,52 @@ def test_delay_prompt_disabled_returns_none():
     assert ds._sample_delay_prompt(np.random.default_rng(0)) is None
 
 
+class _CharTok:
+    """Char-code tokenizer with round-tripping ids_to_text (for prefix tests)."""
+
+    def text_to_ids(self, s):
+        return [ord(c) for c in s]
+
+    def ids_to_text(self, ids):
+        return "".join(chr(int(i)) for i in ids)
+
+
+def test_prefix_word_ids_is_a_strict_char_prefix():
+    import numpy as np
+
+    ds = object.__new__(_cc_dataset_class())
+    ds.tokenizer = _CharTok()
+    rng = np.random.default_rng(0)
+    full = [ord(c) for c in " two"]  # leading space + "two"
+    for _ in range(20):
+        got = ds._prefix_word_ids(full, rng)
+        assert got is not None
+        assert got == full[: len(got)]  # genuine char/token prefix (keeps the leading space)
+        assert got != full  # strictly shorter (a truncation)
+    # single-char core or empty -> no proper prefix
+    assert ds._prefix_word_ids([ord(" "), ord("a")], rng) is None
+    assert ds._prefix_word_ids([], rng) is None
+
+
+def test_sample_prefix_corrupt_eligibility():
+    import numpy as np
+
+    ds = object.__new__(_cc_dataset_class())
+    ds.tokenizer = _CharTok()
+    ds._sc_prefix_prob = 1.0  # always corrupt eligible chunks
+    one = [ord(c) for c in " one"]
+    two = [ord(c) for c in " two"]
+    chunks = [
+        ChunkSpec(2, one, last_word_ids=one),
+        ChunkSpec(2, [], last_word_ids=[]),  # silent chunk (no output)
+        ChunkSpec(2, two, last_word_ids=two),
+    ]
+    corrupt = ds._sample_prefix_corrupt(chunks, np.random.default_rng(0))
+    assert corrupt[0] is None  # no previous chunk
+    assert corrupt[1] is not None and corrupt[1] == one[: len(corrupt[1])]  # prefix of chunk0's " one"
+    assert corrupt[2] is None  # previous chunk (1) was silent -> skip
+
+
 # ---------------------------------------------------------------------------
 # Exact-delay + text-representation prompting
 # ---------------------------------------------------------------------------

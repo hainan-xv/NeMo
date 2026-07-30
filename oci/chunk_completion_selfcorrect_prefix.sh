@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH -A nemotron_speechprod_asr
-#SBATCH -J nemotron_speechprod_asr:streaming-stt-chunkcompletion-selfcorrect
+#SBATCH -J nemotron_speechprod_asr:streaming-stt-chunkcompletion-selfcorrect-prefix
 #SBATCH -p batch_block1,batch_block3,batch_block4
 #SBATCH -N 8
 #SBATCH --gpus-per-node=8
@@ -20,23 +20,22 @@
 # trained with the chunk-completion objective via a different entrypoint + recipe:
 #   entrypoint: examples/speechlm2/chunk_completion_train.py
 #               (ChunkCompletionSTTModel + ChunkCompletionSTTDataset)
-#   recipe:     /code/examples/speechlm2/conf/streaming_stt_granary2_lora_chunkcompletion_selfcorrect.yaml
+#   recipe:     /code/examples/speechlm2/conf/streaming_stt_granary2_lora_chunkcompletion_selfcorrect_prefix.yaml
 #
-# SELF-CORRECTION variant, built on _promptctl and INITIALIZED from its checkpoint
-# (set INIT_CKPT below). Adds a "delete last word" token: each step a no-grad
-# teacher-forced pass finds chunks whose last word the model mispredicts, then the
-# next branch is rebuilt with that wrong word as its committed history tail and
-# target "<del> w_prev w_k" (delete + re-emit). Errors are the model's OWN
-# forced-decoding mistakes; stats + a sample correction are logged periodically
-# (grep the logs for "[self-correction]"). Also keeps the prompt-controlled exact
-# delay (0..4) + text-representation knobs from _promptctl.
+# SELF-CORRECTION (PREFIX-HEURISTIC) variant, built on _promptctl and INITIALIZED
+# from its checkpoint (set INIT_CKPT below). Adds a "delete last word" token; the
+# training errors are injected DATA-SIDE (no forced decoding): with prob 0.2 per
+# eligible chunk, the previous chunk's last word is truncated to a random character
+# prefix in the history and the branch target becomes "<del> w_prev w_k" (delete the
+# truncated word, re-emit the full one). Uses the normal training step. Also keeps
+# the prompt-controlled exact delay (0..4) + text-representation knobs from _promptctl.
 #
 # Runs MY code (git-synced repo mounted at /code), not the container's NeMo.
 #
 # Usage (optional random seed as $1; defaults to 42):
 #   cd /lustre/fsw/portfolios/llmservice/users/hainanx/NeMo79
-#   sbatch oci/chunk_completion_selfcorrect.sh          # seed 42
-#   sbatch oci/chunk_completion_selfcorrect.sh 123      # seed 123
+#   sbatch oci/chunk_completion_selfcorrect_prefix.sh          # seed 42
+#   sbatch oci/chunk_completion_selfcorrect_prefix.sh 123      # seed 123
 #
 # Weights are AUTO-INITIALIZED from the best checkpoint of INIT_EXP
 # (default granary2_chunkcompletion_promptctl) -- no need to set anything. Override:
@@ -108,9 +107,9 @@ DEBUG_VALIDATE_TOKENS="${DEBUG_VALIDATE_TOKENS:-false}"
 
 # Config: OUR chunk-completion recipe, shipped in the synced repo at /code.
 CONFIG_PATH=/code/examples/speechlm2/conf/
-CONFIG_NAME=streaming_stt_granary2_lora_chunkcompletion_selfcorrect
+CONFIG_NAME=streaming_stt_granary2_lora_chunkcompletion_selfcorrect_prefix
 
-EXP_NAME=granary2_chunkcompletion_selfcorrect
+EXP_NAME=granary2_chunkcompletion_selfcorrect_prefix
 
 # Initialize weights from a good checkpoint of INIT_EXP (default: the _promptctl
 # model this is built on). If INIT_CKPT is empty it is AUTO-RESOLVED below to that
@@ -179,7 +178,7 @@ MOUNTS="--container-mounts=${DATA_DIR}:${DATA_DIR},${H_DIR}:${H_DIR},$HAINAN_DIR
 read -r -d '' cmd <<EOF
 echo "*******STARTING********" \
 && echo "---------------" \
-&& echo "*** RECIPE: ${CONFIG_NAME} (chunk-completion, SELF-CORRECTION delete-last-word, init=${INIT_CKPT:-none}, granary2, no-blank) ***" \
+&& echo "*** RECIPE: ${CONFIG_NAME} (chunk-completion, SELF-CORRECTION prefix-heuristic delete-last-word, init=${INIT_CKPT:-none}, granary2, no-blank) ***" \
 && echo "*** OBJECTIVE: p(words_k | text_history_<k, audio_k); packed spine+branch, exact delay + cap/punct via prompt ***" \
 && echo "*** MONITOR: val_wer (min) -- streaming spine-KV decode ***" \
 && echo "*** SEED: ${LHOTSE_RND_SEED} ***" \
