@@ -149,6 +149,22 @@ def _build_k_aligned_audio_mask(audio_mask: Tensor, K: int) -> Tensor:
     return (within_run > 0) & (within_run % K == 0)
 
 
+def _duration_for_frames(n_frames: int, window_stride_in_secs: float) -> float:
+    """Smallest duration in seconds that recovers exactly ``n_frames`` mel frames.
+
+    ``BatchedCacheFeatureBufferer`` reconstructs frame counts as ``int(secs / window_stride)``,
+    which truncates — and ``n * window_stride`` can land a fraction of a ULP low (e.g.
+    ``232 * 0.01 / 0.01 == 231.99999999999997``, so 232 frames would be read back as 231). Step up
+    by ULPs until the round-trip is exact. The adjustment is on the order of 1e-16 s, some twelve
+    orders of magnitude below one audio sample (6.25e-5 s at 16 kHz), so every sample count derived
+    from this duration is unchanged.
+    """
+    secs = n_frames * window_stride_in_secs
+    while int(secs / window_stride_in_secs) < n_frames:
+        secs = math.nextafter(secs, math.inf)
+    return secs
+
+
 def _repr_chunk_size(chunk_size) -> int:
     """Representative scalar chunk size for a config value that may be a list.
 
@@ -1594,6 +1610,36 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
 
         return generated, cache, footer_consumed, num_feed_steps
 
+    def _mel_frames_per_encoder_frame(self) -> int:
+        """Mel frames per encoder frame (``frame_length_in_secs / window_stride``), as an int.
+
+        Encoder frames must land on whole mel frames or the whole fixed-chunk scheme is
+        ill-defined, so a non-integral ratio is a config error rather than something to round away.
+        """
+        window_stride_in_secs = self.perception.cfg.preprocessor.window_stride
+        ratio = self.core_cfg.frame_length_in_secs / window_stride_in_secs
+        n = round(ratio)
+        if n < 1 or not math.isclose(ratio, n, rel_tol=1e-9):
+            raise ValueError(
+                f"frame_length_in_secs ({self.core_cfg.frame_length_in_secs}) must be a whole "
+                f"multiple of the preprocessor window_stride ({window_stride_in_secs}), but their "
+                f"ratio is {ratio}."
+            )
+        return n
+
+    def _samples_per_encoder_frame(self) -> int:
+        """Audio samples per encoder frame, computed exactly.
+
+        ``ceil(n * frame_length_in_secs * sample_rate)`` overshoots by one sample whenever the
+        float product lands just above the integer (e.g. chunk_size 35 -> 44800.00000000001 ->
+        44801). That single extra sample exceeds the audio buffer sized by
+        :meth:`get_audio_feature_buffer` and trips ``AudioBufferer``'s "Frame size exceeds buffer
+        size" RuntimeError.
+        """
+        return self._mel_frames_per_encoder_frame() * round(
+            self.perception.cfg.preprocessor.window_stride * self.core_cfg.sample_rate
+        )
+
     def get_audio_feature_buffer(
         self,
         batch_size: int,
@@ -1613,10 +1659,14 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         pre_encode_cache_size = self.perception.encoder.streaming_cfg.pre_encode_cache_size
         if isinstance(pre_encode_cache_size, list):
             pre_encode_cache_size = pre_encode_cache_size[1]
-        pre_encode_cache_size_in_secs = pre_encode_cache_size * window_stride_in_secs
         cs = chunk_size_override if chunk_size_override is not None else max(self._chunk_size_repr, 1)
-        chunk_size_in_secs = cs * self.core_cfg.frame_length_in_secs
-        buffer_size_in_secs = pre_encode_cache_size_in_secs + chunk_size_in_secs
+        # Size the buffer from an integer mel-frame count rather than by adding float durations.
+        # ``BatchedCacheFeatureBufferer`` recovers the count as ``int(secs / window_stride)``, so
+        # accumulating seconds lets rounding error truncate a whole frame — e.g. chunk_size 6 with
+        # an 8-frame pre-encode cache gives 8*0.01 + 6*0.08 == 0.5599999999999999 -> 55 frames
+        # instead of 56, which misaligns every frame of every chunk.
+        buffer_size_in_frames = pre_encode_cache_size + cs * self._mel_frames_per_encoder_frame()
+        buffer_size_in_secs = _duration_for_frames(buffer_size_in_frames, window_stride_in_secs)
 
         audio_feature_buffer = BatchedCacheFeatureBufferer(
             num_slots=batch_size,
@@ -2088,7 +2138,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             N = max(chunk_size, 1)
         else:
             N = inference_chunk_size
-        chunk_samples = math.ceil(N * self.core_cfg.frame_length_in_secs * self.core_cfg.sample_rate)
+        chunk_samples = N * self._samples_per_encoder_frame()
 
         # K-frame grouping for dynamic-chunking read/write decisions.
         # Defaults to the training-time `dynamic_chunk_step` from the model
@@ -2817,7 +2867,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         if B == 0 or max(n_samples_list) == 0:
             return StreamingSTTGenerateResult(texts=[""] * B)
         device = audios.device
-        chunk_samples = math.ceil(chunk_size * self.core_cfg.frame_length_in_secs * self.core_cfg.sample_rate)
+        chunk_samples = chunk_size * self._samples_per_encoder_frame()
         # Turn template embedding the audio-slot count for this call's chunk size.
         turn_template_ids = self._build_turn_template_ids(chunk_size)
         state = self.get_init_streaming_state(system_prompt, device=device, batch_size=B)

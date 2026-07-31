@@ -24,7 +24,11 @@ import pytest
 from transformers import AutoTokenizer
 
 from nemo.collections.speechlm2.data.streaming_stt_dataset import AUDIO_TOKEN_IDX
-from nemo.collections.speechlm2.models.streaming_stt_model import StreamingSTTModel, _repr_chunk_size
+from nemo.collections.speechlm2.models.streaming_stt_model import (
+    StreamingSTTModel,
+    _duration_for_frames,
+    _repr_chunk_size,
+)
 
 PRETRAINED_LLM = "Qwen/Qwen3-1.7B"
 BLANK_TOKEN = "<blank>"
@@ -347,3 +351,76 @@ class TestWriteTokenRefactor:
         mock.core_cfg.write_token = self.WRITE_TOKEN
         StreamingSTTModel._ensure_inference_cache(mock)
         assert mock._user_footer_first_id == hf_tok.convert_tokens_to_ids(self.END_OF_AUDIO_TOKEN)
+
+
+class TestStreamingBufferFrameArithmetic:
+    """Frame/sample counts for the streaming audio buffer must be exact integer arithmetic.
+
+    ``BatchedCacheFeatureBufferer`` takes durations in float seconds and recovers integer frame and
+    sample counts from them by truncation, so any duration accumulated in seconds can silently lose
+    a frame. Two concrete regressions this guards:
+      * ``pre_encode*0.01 + chunk*0.08`` -> ``int(secs/0.01)`` undercounts (chunk 29/58/59 at
+        pre_encode 0; chunk 6/9 at pre_encode 8), misaligning every frame of every chunk.
+      * ``ceil(chunk*0.08*16000)`` overshoots by one sample (chunk 35/41/47/57), which exceeds the
+        audio buffer and raises AudioBufferer's "Frame size exceeds buffer size".
+    """
+
+    WS, SR, FRAME_LEN = 0.01, 16000, 0.08
+
+    def _mock(self, frame_length_in_secs=None, window_stride=None):
+        mock = SimpleNamespace(
+            core_cfg=SimpleNamespace(frame_length_in_secs=frame_length_in_secs or self.FRAME_LEN, sample_rate=self.SR),
+            perception=SimpleNamespace(
+                cfg=SimpleNamespace(preprocessor=SimpleNamespace(window_stride=window_stride or self.WS))
+            ),
+        )
+        # _samples_per_encoder_frame calls this on self; bind it for the namespace stand-in.
+        mock._mel_frames_per_encoder_frame = lambda: StreamingSTTModel._mel_frames_per_encoder_frame(mock)
+        return mock
+
+    def test_duration_for_frames_round_trips(self):
+        """The duration must read back as exactly the frame count it was built from."""
+        for n in range(1, 2001):
+            secs = _duration_for_frames(n, self.WS)
+            assert int(secs / self.WS) == n, f"{n} frames -> {secs!r} -> {int(secs / self.WS)}"
+
+    def test_duration_for_frames_fixes_naive_multiplication(self):
+        """Frame counts where the naive product truncates low — the reason the helper exists."""
+        for n in (29, 58, 59, 116, 232):
+            assert int((n * self.WS) / self.WS) < n  # naive is wrong ...
+            assert int(_duration_for_frames(n, self.WS) / self.WS) == n  # ... helper is not
+
+    def test_duration_for_frames_does_not_move_sample_count(self):
+        """The ULP nudge is far below one sample, so derived sample counts are untouched."""
+        for n in range(1, 501):
+            secs = _duration_for_frames(n, self.WS)
+            assert int(secs * self.SR) == n * round(self.WS * self.SR)
+
+    def test_mel_frames_per_encoder_frame(self):
+        assert StreamingSTTModel._mel_frames_per_encoder_frame(self._mock()) == 8
+        assert StreamingSTTModel._mel_frames_per_encoder_frame(self._mock(frame_length_in_secs=0.04)) == 4
+
+    def test_non_integral_frame_ratio_raises(self):
+        """Encoder frames that do not land on whole mel frames are a config error, not a rounding job."""
+        with pytest.raises(ValueError, match="whole multiple"):
+            StreamingSTTModel._mel_frames_per_encoder_frame(self._mock(frame_length_in_secs=0.085))
+
+    def test_samples_per_encoder_frame_is_exact(self):
+        mock = self._mock()
+        assert StreamingSTTModel._samples_per_encoder_frame(mock) == 1280
+        # ceil() overshot by one sample at these chunk sizes; exact arithmetic must not.
+        for cs in (35, 41, 47, 57):
+            assert cs * StreamingSTTModel._samples_per_encoder_frame(mock) == cs * 1280
+
+    @pytest.mark.parametrize("pre_encode", [0, 8, 16])
+    @pytest.mark.parametrize("chunk_size", [1, 6, 9, 14, 28, 29, 35, 41, 47, 57, 58, 59, 64])
+    def test_buffer_frames_and_samples_agree(self, pre_encode, chunk_size):
+        """The buffer must hold exactly the intended frames, and a chunk must fit inside it."""
+        mock = self._mock()
+        want_frames = pre_encode + chunk_size * StreamingSTTModel._mel_frames_per_encoder_frame(mock)
+        secs = _duration_for_frames(want_frames, self.WS)
+        assert int(secs / self.WS) == want_frames
+        capacity_samples = int(secs * self.SR)
+        assert capacity_samples == want_frames * round(self.WS * self.SR)
+        chunk_samples = chunk_size * StreamingSTTModel._samples_per_encoder_frame(mock)
+        assert chunk_samples <= capacity_samples
