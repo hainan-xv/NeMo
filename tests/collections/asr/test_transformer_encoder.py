@@ -12,10 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
+
 import numpy as np
 import pytest
 import torch
 
+from nemo.collections.asr.models.configs import CacheAwareStreamingConfig
 from nemo.collections.asr.modules.transformer_encoder import (
     FeatureStacking,
     StreamingTransformerEncoder,
@@ -1013,9 +1016,14 @@ class TestStreamingTransformerEncoder:
             att_context_size=[left, right],
         )
         assert enc.cache_size == expected
-        assert enc.streaming_cfg.last_channel_cache_size == expected
         clc, _, _ = enc.get_initial_cache_state(batch_size=2)
         assert clc.shape[2] == max(expected, 0)
+        # ``streaming_cfg`` reports a concrete size, substituting ``max_context`` for an unbounded
+        # left context (Conformer parity); ``cache_size < 0`` stays the encoder's "grow" marker.
+        if expected >= 0:
+            assert enc.streaming_cfg.last_channel_cache_size == expected
+        else:
+            assert enc.streaming_cfg.last_channel_cache_size == 10000
 
     @pytest.mark.unit
     def test_chunked_limited_lookahead_does_not_compound_across_layers(self):
@@ -1168,6 +1176,294 @@ class TestStreamingTransformerEncoder:
                 cache_last_channel_len=clcl,
                 bypass_pre_encode=True,
             )
+
+    # ------------------------------------------------------------------ #
+    # multi chunk-size training (att_context_size as a list of pairs)
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _multi_ctx_encoder(att_context_size, att_context_probs=None, n_layers=2, **kw):
+        return StreamingTransformerEncoder(
+            feat_in=128,
+            feat_out=-1,
+            d_model=256,
+            n_heads=8,
+            n_layers=n_layers,
+            drop_rate=0.0,
+            dropout_pre_encoder=0.0,
+            dropout_emb=0.0,
+            qk_norm=True,
+            subsampling="feature_stacking",
+            subsampling_factor=8,
+            self_attention_model="rope",
+            att_context_style="chunked_limited",
+            att_context_size=att_context_size,
+            att_context_probs=att_context_probs,
+            **kw,
+        )
+
+    @pytest.mark.unit
+    def test_multi_att_context_size_parsed(self):
+        """A list of [left, right] pairs configures multi chunk-size training."""
+        enc = self._multi_ctx_encoder([[70, 1], [70, 6], [70, 13]])
+        assert enc.att_context_size_all == [[70, 1], [70, 6], [70, 13]]
+        assert enc.att_context_probs == pytest.approx([1 / 3, 1 / 3, 1 / 3])
+        # Eval/streaming default is the first entry, as in ConformerEncoder.
+        assert enc.att_context_size == [70, 1]
+
+    @pytest.mark.unit
+    def test_single_pair_still_accepted(self):
+        """Backward compatible: a bare pair becomes a one-entry list and disables sampling."""
+        enc = self._multi_ctx_encoder([70, 13])
+        assert enc.att_context_size_all == [[70, 13]]
+        assert enc.att_context_size == [70, 13]
+        enc.train()
+        assert {tuple(enc._sample_att_context_size()) for _ in range(20)} == {(70, 13)}
+
+    @pytest.mark.unit
+    def test_sampling_only_in_training(self):
+        """Training samples per batch; eval is deterministic so val loss and streaming are stable."""
+        enc = self._multi_ctx_encoder([[70, 1], [70, 6], [70, 13]])
+        enc.train()
+        seen = {tuple(enc._sample_att_context_size()) for _ in range(200)}
+        assert seen == {(70, 1), (70, 6), (70, 13)}, f"not all contexts sampled: {seen}"
+        enc.eval()
+        assert {tuple(enc._sample_att_context_size()) for _ in range(50)} == {(70, 1)}
+
+    @pytest.mark.unit
+    def test_att_context_probs_respected(self):
+        """A degenerate distribution must pin the corresponding context."""
+        enc = self._multi_ctx_encoder([[70, 1], [70, 13]], att_context_probs=[0.0, 1.0])
+        enc.train()
+        assert {tuple(enc._sample_att_context_size()) for _ in range(100)} == {(70, 13)}
+
+    @pytest.mark.unit
+    def test_invalid_att_context_probs_raise(self):
+        with pytest.raises(ValueError, match="att_context_probs has"):
+            self._multi_ctx_encoder([[70, 1], [70, 13]], att_context_probs=[1.0])
+        with pytest.raises(ValueError, match="must sum to 1"):
+            self._multi_ctx_encoder([[70, 1], [70, 13]], att_context_probs=[0.3, 0.3])
+
+    @pytest.mark.unit
+    def test_malformed_att_context_size_raises(self):
+        with pytest.raises(ValueError, match=r"\[left, right\] pairs"):
+            self._multi_ctx_encoder([[70, 1, 2], [70, 13]])
+        with pytest.raises(ValueError, match="must not be empty"):
+            self._multi_ctx_encoder([])
+
+    @pytest.mark.unit
+    def test_set_default_att_context_size_pins_eval_context_only(self):
+        """How inference selects a chunk size — and what pinning does NOT do.
+
+        Pinning fixes the eval/streaming context. Training keeps sampling over the configured set
+        (matching ConformerEncoder), so pinning never silently narrows a training run.
+        """
+        enc = self._multi_ctx_encoder([[70, 1], [70, 6], [70, 13]])
+        enc.set_default_att_context_size([70, 13])
+        assert enc.att_context_size == [70, 13]
+        assert enc.streaming_cfg.chunk_size == 8 * 14  # input frames for a 14-frame chunk
+        enc.eval()
+        assert {tuple(enc._sample_att_context_size()) for _ in range(20)} == {(70, 13)}
+        enc.train()
+        assert enc.att_context_size_all == [[70, 1], [70, 6], [70, 13]]
+        assert len({tuple(enc._sample_att_context_size()) for _ in range(200)}) == 3
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("context", [[70, 1], [70, 6], [70, 13]])
+    def test_every_configured_context_streams_exactly(self, context):
+        """The guarantee that makes multi chunk-size training usable: each context a batch may be
+        trained at must also stream exactly, so one checkpoint serves every chunk size."""
+        torch.manual_seed(0)
+        sub, n_chunks = 8, 5
+        enc = self._multi_ctx_encoder([[70, 1], [70, 6], [70, 13]], n_layers=3)
+        enc.eval()
+        enc.set_default_att_context_size(context)
+        chunk = context[1] + 1
+        x = torch.randn(1, 128, chunk * sub * n_chunks)
+        lengths = torch.tensor([x.shape[2]], dtype=torch.int64)
+        with torch.no_grad():
+            full_out, _ = enc(audio_signal=x, length=lengths)
+            stream_out, _ = self._stream_sequence(enc, x, chunk * sub, n_chunks, 1, False)
+        assert stream_out.shape == full_out.shape
+        assert torch.allclose(full_out, stream_out, atol=1e-5)
+
+    # ------------------------------------------------------------------ #
+    # streaming_cfg / pre-encode cache (shared cache-aware tooling contract)
+    # ------------------------------------------------------------------ #
+
+    @pytest.mark.unit
+    def test_streaming_cfg_exposes_full_cache_aware_config(self):
+        """``speech_to_text_cache_aware_streaming_infer.py`` and ``CacheAwareStreamingAudioBuffer``
+        read fields off ``streaming_cfg`` directly; a missing one is an AttributeError mid-stream."""
+        enc = StreamingTransformerEncoder(
+            feat_in=80, d_model=64, n_heads=4, n_layers=2, subsampling_factor=8, att_context_size=[70, 0]
+        )
+        for field in dataclasses.fields(CacheAwareStreamingConfig):
+            assert hasattr(enc.streaming_cfg, field.name), f"streaming_cfg is missing {field.name}"
+        # Units follow the Conformer: chunk/shift in input frames, valid_out_len in encoder frames.
+        assert enc.streaming_cfg.chunk_size == 8 * enc.streaming_cfg.valid_out_len
+        assert enc.streaming_cfg.shift_size == enc.streaming_cfg.chunk_size
+        assert enc.streaming_cfg.cache_drop_size == 0
+        assert enc.streaming_cfg.last_channel_num == 2
+        assert enc.streaming_cfg.last_time_num == 0
+
+    @pytest.mark.unit
+    def test_setup_streaming_params_honors_chunk_and_left_chunks(self):
+        """The overrides the infer script passes for offline/full-context models must take effect."""
+        enc = StreamingTransformerEncoder(
+            feat_in=80, d_model=64, n_heads=4, n_layers=2, subsampling_factor=8, att_context_size=[70, 0]
+        )
+        # Causal sliding window implies a 1-frame step; the script can widen it for throughput.
+        assert enc.streaming_cfg.chunk_size == 8
+        enc.setup_streaming_params(chunk_size=14, shift_size=14)
+        assert enc.streaming_cfg.chunk_size == 8 * 14
+        assert enc.streaming_cfg.valid_out_len == 14
+        # left_chunks retunes the window itself, so mask and cache cannot disagree.
+        enc.setup_streaming_params(chunk_size=14, shift_size=14, left_chunks=3)
+        assert enc.att_context_size[0] == 42
+        assert enc.streaming_cfg.last_channel_cache_size == 42 == enc.cache_size
+
+    @pytest.mark.unit
+    def test_setup_streaming_params_rejects_unsupported_overrides(self):
+        enc = StreamingTransformerEncoder(
+            feat_in=80, d_model=64, n_heads=4, n_layers=2, subsampling_factor=8, att_context_size=[70, 0]
+        )
+        with pytest.raises(ValueError, match="shift_size"):
+            enc.setup_streaming_params(chunk_size=14, shift_size=7)  # overlapping chunks
+        enc2 = StreamingTransformerEncoder(
+            feat_in=80,
+            d_model=64,
+            n_heads=4,
+            n_layers=2,
+            subsampling_factor=8,
+            att_context_style="chunked_limited",
+            att_context_size=[70, 13],
+        )
+        with pytest.raises(ValueError, match="exceeds the chunked_limited attention chunk"):
+            enc2.setup_streaming_params(chunk_size=20)  # wider than the 14-frame attention chunk
+
+    @pytest.mark.unit
+    def test_pre_encode_cache_size_must_align_to_subsampling(self):
+        with pytest.raises(ValueError, match="pre_encode_cache_size"):
+            StreamingTransformerEncoder(
+                feat_in=80, d_model=64, n_heads=4, n_layers=2, subsampling_factor=8, pre_encode_cache_size=5
+            )
+
+    @pytest.mark.unit
+    def test_pre_encode_cache_size_derives_drop_extra_and_step0_list(self):
+        """``pre_encode_cache_size`` is emitted as ``[0, P]`` so the streaming buffer prepends
+        nothing on the first step, matching ``calc_drop_extra_pre_encoded`` returning 0 there."""
+        enc = StreamingTransformerEncoder(
+            feat_in=80,
+            d_model=64,
+            n_heads=4,
+            n_layers=2,
+            subsampling_factor=8,
+            pre_encode_cache_size=16,
+            att_context_size=[70, 0],
+        )
+        assert enc.streaming_cfg.pre_encode_cache_size == [0, 16]
+        assert enc.streaming_cfg.drop_extra_pre_encoded == 2  # 16 input frames / 8 = 2 encoder frames
+        # Default (no look-back) stays a plain scalar 0, unchanged from before.
+        plain = StreamingTransformerEncoder(feat_in=80, d_model=64, n_heads=4, n_layers=2, subsampling_factor=8)
+        assert plain.streaming_cfg.pre_encode_cache_size == 0
+        assert plain.streaming_cfg.drop_extra_pre_encoded == 0
+
+    @pytest.mark.unit
+    def test_no_cache_means_no_implicit_drop(self):
+        """A caller with no cache is passing a whole utterance, not a chunk with look-back.
+
+        ``conformer_stream_step(processed_signal=<whole audio>)`` — which the cache-aware infer
+        script uses for ``compare_vs_offline`` — reaches the encoder with ``cache_last_channel=None``
+        and ``drop_extra_pre_encoded=None``. Defaulting to the configured drop there would silently
+        truncate the offline reference it is meant to compare against.
+        """
+        sub, feat_in, frames = 8, 32, 6
+        enc = StreamingTransformerEncoder(
+            feat_in=feat_in,
+            d_model=64,
+            n_heads=4,
+            n_layers=2,
+            self_attention_model="rope",
+            subsampling_factor=sub,
+            att_context_size=[16, 0],
+            pre_encode_cache_size=sub,  # -> drop_extra_pre_encoded == 1
+        )
+        enc.eval()
+        assert enc.streaming_cfg.drop_extra_pre_encoded == 1
+        x = torch.randn(1, feat_in, frames * sub)
+        with torch.no_grad():
+            out, out_len, *_ = enc.cache_aware_stream_step(
+                processed_signal=x,
+                processed_signal_length=torch.tensor([x.shape[2]], dtype=torch.int64),
+                cache_last_channel=None,  # no cache -> whole-utterance call
+            )
+        assert out.shape[2] == frames, "whole-utterance call must not lose leading frames"
+        assert out_len.tolist() == [frames]
+        # An explicit value is still honoured regardless of the cache state.
+        with torch.no_grad():
+            out2, _, *_ = enc.cache_aware_stream_step(
+                processed_signal=x,
+                processed_signal_length=torch.tensor([x.shape[2]], dtype=torch.int64),
+                cache_last_channel=None,
+                drop_extra_pre_encoded=1,
+            )
+        assert out2.shape[2] == frames - 1
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("pre_encode_cache_size", [8, 16])
+    def test_drop_extra_pre_encoded_makes_lookback_chunks_exact(self, pre_encode_cache_size):
+        """Feeding ``[look-back | chunk]`` and dropping the extra pre-encoded frames must return the
+        same frames — and the same count — as feeding the bare chunk.
+
+        This mirrors ``CacheAwareStreamingAudioBuffer``: step 0 gets no look-back and drops nothing;
+        later steps prepend the real preceding input frames and drop ``drop_extra_pre_encoded``.
+        """
+        torch.manual_seed(0)
+        sub, feat_in, chunk, n_chunks = 8, 32, 4, 5
+        enc = StreamingTransformerEncoder(
+            feat_in=feat_in,
+            d_model=64,
+            n_heads=4,
+            n_layers=3,
+            drop_rate=0.0,
+            dropout_pre_encoder=0.0,
+            dropout_emb=0.0,
+            self_attention_model="rope",
+            subsampling_factor=sub,
+            att_context_size=[16, 0],
+            pre_encode_cache_size=pre_encode_cache_size,
+        )
+        enc.eval()
+        step = chunk * sub
+        x = torch.randn(1, feat_in, step * n_chunks)
+        lengths = torch.tensor([x.shape[2]], dtype=torch.int64)
+        drop = enc.streaming_cfg.drop_extra_pre_encoded
+
+        with torch.no_grad():
+            full_out, _ = enc(audio_signal=x, length=lengths)
+            clc, clt, clcl = enc.get_initial_cache_state(batch_size=1)
+            outs = []
+            for c in range(n_chunks):
+                start = c * step
+                # Step 0 has no history: no look-back, nothing to drop (calc_drop_extra_pre_encoded).
+                back = 0 if c == 0 else pre_encode_cache_size
+                piece = x[:, :, start - back : start + step]
+                out, out_len, clc, clt, clcl = enc.cache_aware_stream_step(
+                    processed_signal=piece,
+                    processed_signal_length=torch.tensor([piece.shape[2]], dtype=torch.int64),
+                    cache_last_channel=clc,
+                    cache_last_time=clt,
+                    cache_last_channel_len=clcl,
+                    drop_extra_pre_encoded=0 if c == 0 else drop,
+                )
+                assert out.shape[2] == chunk, f"chunk {c}: got {out.shape[2]} frames, expected {chunk}"
+                assert out_len.tolist() == [chunk]
+                outs.append(out)
+            stream_out = torch.cat(outs, dim=2)
+
+        assert stream_out.shape == full_out.shape
+        assert torch.allclose(full_out, stream_out, atol=1e-5)
 
     @pytest.mark.unit
     def test_streaming_abs_pos_not_implemented(self):
