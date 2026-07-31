@@ -1003,6 +1003,47 @@ def test_parity_self_correction_packed_vs_separate():
 
 
 @torch.no_grad()
+def test_parity_self_correction_windowed_packed_vs_separate():
+    """Self-correction + a 1-chunk audio history window (M=1, i.e. 2 chunks per
+    branch): the corrected branch now also sees the previous chunk's audio (where the
+    mis-committed word was spoken). Packed logits must still match the standalone."""
+    model = _tiny_qwen3()
+    H = model.config.hidden_size
+    instruction = [5, 6, 7]
+    chunks = [
+        ChunkSpec(2, [20, 21], last_word_ids=[21]),
+        ChunkSpec(3, [30, 31], last_word_ids=[31]),
+        ChunkSpec(2, [40], last_word_ids=[40]),
+    ]
+    corrupt = [None, [99], None]  # chunk2 corrupts the prev last word "21" -> 99
+    M = 1
+    total_frames = sum(c.audio_len for c in chunks)
+    torch.manual_seed(11)
+    global_frames = torch.randn(total_frames, H)
+
+    packed = build_packed_chunk_example(
+        instruction, chunks, VS, VE, EOT, audio_history_chunks=M, corrupt_prev=corrupt, delete_id=DEL
+    )
+    valid = torch.ones_like(packed.input_ids, dtype=torch.bool)
+    mask = build_chunk_completion_mask(
+        packed.seg_ids[None], packed.position_ids[None], packed.prefix_len[None], valid[None], torch.float32
+    )
+    packed_emb = _embed_by_frame_index(model, packed.input_ids, packed.audio_frame_index, global_frames)
+    packed_logits = model(
+        inputs_embeds=packed_emb[None], attention_mask=mask, position_ids=packed.position_ids[None]
+    ).logits[0]
+
+    separate = build_separate_chunk_examples(
+        instruction, chunks, VS, VE, EOT, audio_history_chunks=M, corrupt_prev=corrupt, delete_id=DEL
+    )
+    for k, sep in enumerate(separate, start=1):
+        sep_emb = _embed_by_frame_index(model, sep.input_ids, sep.audio_frame_index, global_frames)
+        sep_logits = model(inputs_embeds=sep_emb[None], position_ids=sep.position_ids[None]).logits[0]
+        idx = (packed.seg_ids == k).nonzero(as_tuple=True)[0]
+        torch.testing.assert_close(packed_logits[idx], sep_logits[sep.branch_start :], atol=1e-4, rtol=1e-4)
+
+
+@torch.no_grad()
 def test_batched_decode_matches_per_utterance():
     """Batched chunk-synchronous decode must equal per-utterance stream decode.
 
