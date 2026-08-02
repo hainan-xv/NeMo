@@ -168,6 +168,21 @@ class ChunkCompletionSTTDataset(StreamingSTTDataset):
         self._vary_text_repr = bool(getattr(self.cfg, "vary_text_repr", False))
         self._text_repr_keep = set(getattr(self.cfg, "text_repr_keep_chars", "'") or "")
         self._prompt_template = str(getattr(self.cfg, "prompt_template", None) or self._DEFAULT_PROMPT_TEMPLATE)
+        # --- Chunk-size prompting ---
+        # When set, the per-batch chunk size (frames) is rendered into the prompt via
+        # this template's {chunk_size} placeholder and appended to the system prompt,
+        # so the model is TOLD its chunk size (and can be asked for a specific one at
+        # inference). Off by default (backward compatible: chunk size stays implicit).
+        self._chunk_size_prompt_template = getattr(self.cfg, "chunk_size_prompt_template", None)
+        if self._chunk_size_prompt_template is not None:
+            self._chunk_size_prompt_template = str(self._chunk_size_prompt_template)
+            if "{chunk_size}" not in self._chunk_size_prompt_template:
+                raise ValueError("chunk_size_prompt_template must contain '{chunk_size}'.")
+            logging.info(
+                "ChunkCompletionSTTDataset: chunk-size prompting ON (template=%r; the per-batch "
+                "chunk size in frames is rendered into the prompt).",
+                self._chunk_size_prompt_template,
+            )
         self._format_clauses = dict(self._DEFAULT_FORMAT_CLAUSES)
         _fc = getattr(self.cfg, "format_clauses", None)
         if _fc:
@@ -274,17 +289,30 @@ class ChunkCompletionSTTDataset(StreamingSTTDataset):
                 "contiguous with history; audio prelude overlaid on history tail positions)."
             )
 
-        # --- Self-correction (delete-last-word) ---
+        # --- Self-correction (delete-last-word), forced/DAgger variant ---
         self._self_correction = bool(getattr(self.cfg, "self_correction", False))
         self._self_correction_prompt_suffix = getattr(self.cfg, "self_correction_prompt_suffix", None)
+        # Per-batch prompt-controlled toggle: with prob p a batch trains WITH the
+        # correction objective (emit chunk_meta so the model runs its forced-decode
+        # DAgger step + the ON clause is stated in the prompt); with prob 1-p it
+        # trains as a plain chunk-completion batch (chunk_meta=None -> normal step +
+        # the OFF clause is stated). p=1.0 (default) reproduces the always-on model.
+        self._self_correction_batch_prob = float(getattr(self.cfg, "self_correction_batch_prob", 1.0) or 0.0)
+        self._no_self_correction_prompt_suffix = getattr(self.cfg, "no_self_correction_prompt_suffix", None)
         if self._self_correction:
             if self._contiguous_text_positions:
                 raise ValueError("self_correction is not compatible with contiguous_text_positions.")
             if bool(getattr(self.cfg, "shared_audio_track", False)):
                 raise ValueError("self_correction is not compatible with shared_audio_track (yet).")
+            if not (0.0 <= self._self_correction_batch_prob <= 1.0):
+                raise ValueError(
+                    f"self_correction_batch_prob must be in [0, 1], got {self._self_correction_batch_prob}"
+                )
             logging.info(
-                "ChunkCompletionSTTDataset: self_correction=True (each batch carries chunk metadata + "
-                "last-word tokens; the model injects its own forced-decoding errors as delete targets)."
+                "ChunkCompletionSTTDataset: self_correction=True (forced/DAgger) | batch_prob=%.2f "
+                "(fraction of batches trained WITH the correction objective; the rest are plain "
+                "chunk-completion batches with the 'do not correct' clause).",
+                self._self_correction_batch_prob,
             )
 
         # --- Self-correction via prefix heuristic (data-side) ---
@@ -351,6 +379,21 @@ class ChunkCompletionSTTDataset(StreamingSTTDataset):
         """Append the (cap, punct) format clause to an existing prompt string."""
         clause = self._format_clause(cap, punct)
         return (prompt.rstrip() + " " + clause).strip() if clause else prompt
+
+    def _append_chunk_clause(self, prompt: str, chunk_size: int) -> str:
+        """Append the chunk-size clause (rendered with the batch chunk size in frames)."""
+        if not self._chunk_size_prompt_template:
+            return prompt
+        clause = self._chunk_size_prompt_template.format(chunk_size=int(chunk_size)).strip()
+        return (prompt.rstrip() + " " + clause).strip() if clause else prompt
+
+    def _append_correction_clause(self, prompt: str, sc_on: bool) -> str:
+        """Append the self-correction ON/OFF clause so the prompt states whether the
+        model is allowed to delete + rewrite a previously committed word."""
+        suffix = self._self_correction_prompt_suffix if sc_on else self._no_self_correction_prompt_suffix
+        if not suffix:
+            return prompt
+        return (prompt.rstrip() + " " + str(suffix)).strip()
 
     def _strip_punct(self, s: str) -> str:
         """Remove punctuation (keep alphanumerics, whitespace, and text_repr_keep_chars),
@@ -521,6 +564,10 @@ class ChunkCompletionSTTDataset(StreamingSTTDataset):
         # in / appended to the prompt and whose transform is applied to the targets.
         rng = self._get_chunk_rng()
         cap, punct = self._sample_text_repr(rng)
+        # Per-batch self-correction decision (forced variant only). When on, this
+        # batch trains WITH the delete objective and states so in the prompt; when
+        # off it is a plain chunk-completion batch with the "do not correct" clause.
+        sc_on = bool(self._self_correction and rng.random() < self._self_correction_batch_prob)
         if self._multi_delay:
             if self._exact_delay:
                 num_delay_frames = int(rng.integers(0, self._exact_max_delay + 1))
@@ -535,6 +582,13 @@ class ChunkCompletionSTTDataset(StreamingSTTDataset):
             system_prompts = [cut.custom.get(self.cfg.prompt_field, self.cfg.system_prompt) for cut in cuts]
             if self._vary_text_repr:
                 system_prompts = [self._append_format_clause(p, cap, punct) for p in system_prompts]
+
+        # State the per-batch chunk size and the self-correction ON/OFF choice in the
+        # prompt (no-ops when their templates/suffixes are unset -> backward compatible).
+        if self._chunk_size_prompt_template:
+            system_prompts = [self._append_chunk_clause(p, chunk_size) for p in system_prompts]
+        if self._self_correction:
+            system_prompts = [self._append_correction_clause(p, sc_on) for p in system_prompts]
 
         batch_messages = get_llm_messages_for_batch(
             system_role=self.cfg.system_role,
@@ -565,11 +619,13 @@ class ChunkCompletionSTTDataset(StreamingSTTDataset):
         recover_on = self._history_word_recovery_prob > 0.0
         # Self-correction needs each chunk's last-word tokens (to know the correct word
         # to re-emit). The forced version also passes chunk metadata for the model;
-        # the prefix version bakes the corruption in here (no chunk_meta).
-        compute_last_word = recover_on or self._self_correction or self._self_correction_prefix
+        # the prefix version bakes the corruption in here (no chunk_meta). For the
+        # forced variant this is per-batch: only the correction-ON batches carry
+        # chunk_meta (and thus route to the model's forced-decode step).
+        compute_last_word = recover_on or sc_on or self._self_correction_prefix
         transform_text = self._vary_text_repr and (not cap or not punct)
         examples = []
-        chunk_meta = [] if self._self_correction else None
+        chunk_meta = [] if sc_on else None
         for messages, sysp in zip(batch_messages, system_prompts):
             if transform_text:
                 messages = self._apply_text_repr_to_messages(messages, cap, punct)
@@ -579,9 +635,8 @@ class ChunkCompletionSTTDataset(StreamingSTTDataset):
             # (baked correction target), sampled per chunk.
             corrupt_prev = self._sample_prefix_corrupt(chunks, rng) if self._self_correction_prefix else None
             # Instruction/history separator: a newline keeps the first history word
-            # from BPE-merging into the instruction text.
-            if self._self_correction and self._self_correction_prompt_suffix:
-                sysp = sysp.rstrip() + " " + str(self._self_correction_prompt_suffix)
+            # from BPE-merging into the instruction text. The self-correction ON/OFF
+            # clause is already baked into ``sysp`` (system_prompts) above.
             instruction_ids = self.tokenizer.text_to_ids(sysp + "\n")
             if chunk_meta is not None:
                 chunk_meta.append((instruction_ids, chunks))
