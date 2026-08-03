@@ -76,7 +76,9 @@ class ASRBPEMixin(ABC):
             os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
         self.tokenizer_cfg = OmegaConf.to_container(tokenizer_cfg, resolve=True)  # type: dict
-        self.tokenizer_dir = self.tokenizer_cfg.pop('dir')  # Remove tokenizer directory
+        # `dir` is optional for a `huggingface` tokenizer, which is loaded from a HF
+        # hub id / local dir given via `hf_kwargs.pretrained_model_name` instead.
+        self.tokenizer_dir = self.tokenizer_cfg.pop('dir', None)  # Remove tokenizer directory
         self.tokenizer_type = self.tokenizer_cfg.pop('type').lower()  # Remove tokenizer_type
 
         self.hf_tokenizer_kwargs = self.tokenizer_cfg.pop("hf_kwargs", {})  # Remove HF tokenizer kwargs
@@ -86,17 +88,21 @@ class ASRBPEMixin(ABC):
 
         # Preserve config
         if hasattr(self, 'cfg') and 'tokenizer' in self.cfg:
-            self.cfg.tokenizer.dir = self.tokenizer_dir
-            self.cfg.tokenizer.type = self.tokenizer_type
+            # open_dict so this also works when `dir` was removed from the config
+            # (e.g. `~model.tokenizer.dir` for a huggingface tokenizer).
+            with open_dict(self.cfg.tokenizer):
+                self.cfg.tokenizer.dir = self.tokenizer_dir
+                self.cfg.tokenizer.type = self.tokenizer_type
 
             if 'hf_kwargs' in tokenizer_cfg:
                 with open_dict(self.cfg.tokenizer):
                     self.cfg.tokenizer.hf_kwargs = tokenizer_cfg.get('hf_kwargs')
 
-        if self.tokenizer_type not in ['bpe', 'wpe']:
+        if self.tokenizer_type not in ['bpe', 'wpe', 'huggingface']:
             raise ValueError(
-                "`tokenizer.type` must be either `bpe` for SentencePiece tokenizer or "
-                "`wpe` for BERT based tokenizer"
+                "`tokenizer.type` must be `bpe` for a SentencePiece tokenizer, "
+                "`wpe` for a BERT WordPiece tokenizer, or `huggingface` for a "
+                "HuggingFace AutoTokenizer (e.g. reusing an LLM tokenizer such as Qwen)."
             )
 
         if self.tokenizer_type == 'bpe':
@@ -153,6 +159,73 @@ class ASRBPEMixin(ABC):
             self.tokenizer.tokenizer.vocab_size = len(vocabulary)
             self.tokenizer.tokenizer.get_vocab = get_vocab
             self.tokenizer.tokenizer.all_special_tokens = self.tokenizer.special_token_to_id
+
+        elif self.tokenizer_type == 'huggingface':
+            # HuggingFace AutoTokenizer -- e.g. reuse an LLM tokenizer such as Qwen.
+            # Requires `tokenizer.hf_kwargs.pretrained_model_name` (a HF hub id or a
+            # local HF tokenizer directory); `tokenizer.dir` may also serve as that
+            # local directory. The tokenizer files are NOT registered as .nemo
+            # artifacts, so on restore the tokenizer is re-created from
+            # `pretrained_model_name` (kept in cfg.tokenizer.hf_kwargs) -- that value
+            # must remain resolvable in the restore environment.
+            pretrained_model_name = self.hf_tokenizer_kwargs.get('pretrained_model_name', None)
+            if not pretrained_model_name:
+                pretrained_model_name = self.tokenizer_dir
+            if not pretrained_model_name:
+                raise ValueError(
+                    "For `tokenizer.type=huggingface`, set "
+                    "`tokenizer.hf_kwargs.pretrained_model_name` to a HuggingFace hub id "
+                    "or a local HF tokenizer directory (or set `tokenizer.dir`)."
+                )
+
+            # No SentencePiece/vocab artifacts for a hub-loaded HF tokenizer.
+            self.model_path = None
+            self.vocab_path = None
+            self.spe_vocab_path = None
+
+            self.tokenizer = tokenizers.AutoTokenizer(
+                pretrained_model_name=pretrained_model_name,
+                vocab_file=self.hf_tokenizer_kwargs.get('vocab_file', None),
+                merges_file=self.hf_tokenizer_kwargs.get('merges_file', None),
+                mask_token=self.hf_tokenizer_kwargs.get('mask_token', None),
+                bos_token=self.hf_tokenizer_kwargs.get('bos_token', None),
+                eos_token=self.hf_tokenizer_kwargs.get('eos_token', None),
+                pad_token=self.hf_tokenizer_kwargs.get('pad_token', None),
+                sep_token=self.hf_tokenizer_kwargs.get('sep_token', None),
+                cls_token=self.hf_tokenizer_kwargs.get('cls_token', None),
+                unk_token=self.hf_tokenizer_kwargs.get('unk_token', None),
+                use_fast=self.hf_tokenizer_kwargs.get('use_fast', True),
+                trust_remote_code=self.hf_tokenizer_kwargs.get('trust_remote_code', False),
+            )
+
+            # ASR BPE models read `self.tokenizer.tokenizer.get_vocab()` and use
+            # `list(vocab)` as the id-ordered label set (model class index i == token
+            # id i). A HuggingFace `get_vocab()` returns a {token: id} dict that is not
+            # guaranteed to iterate in id order, so attach an id-ordered vocab.
+            #
+            # We build it over the HuggingFace *base* vocab size (added special tokens
+            # EXCLUDED) so that `joint.num_classes == len(vocab)` matches the RNN-T
+            # blank id, which `RNNTBPEDecoding` computes as `tokenizer.tokenizer.vocab_size`
+            # (also the base size). ASR transcription targets never contain the LLM's
+            # added chat/control tokens (e.g. <|im_start|>), so excluding them is safe
+            # and keeps the blank id from landing on a real token.
+            hf_vocab_size = self.tokenizer.tokenizer.vocab_size  # HF base vocab (excl. added)
+            id_to_piece = self.tokenizer.tokenizer.convert_ids_to_tokens(list(range(hf_vocab_size)))
+            vocabulary = {}
+            for i, piece in enumerate(id_to_piece):
+                if piece is None:
+                    piece = f"<unused_{i}>"
+                if piece in vocabulary:
+                    # Guarantee uniqueness so the label count matches the vocab size.
+                    piece = f"{piece}\u2063<dup{i}>"
+                vocabulary[piece] = i
+
+            def get_vocab(_vocab=vocabulary):
+                return _vocab
+
+            # Shadow the HF method with an id-ordered vocab getter (consumed by model
+            # init and `_derive_tokenizer_properties`).
+            self.tokenizer.tokenizer.get_vocab = get_vocab
 
         else:
             # This is a WPE Tokenizer

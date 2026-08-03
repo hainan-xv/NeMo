@@ -23,7 +23,7 @@ git add -u
 git add .gitignore sync_to_oci.sh sync_to_ord.sh
 # The oci/ dir is gitignored (local scratch scripts); force-add just the
 # project-owned launchers (baseline + experiment variants).
-git add -f oci/streaming_stt_finetune*.sh oci/baseline_granary2.sh oci/two_stream_*granary2.sh oci/test_vllm_eval_oci.sh oci/chat_fullctx_ce.sh
+git add -f oci/streaming_stt_finetune*.sh oci/baseline_granary2.sh oci/two_stream_*granary2.sh oci/test_vllm_eval_oci.sh oci/chat_fullctx_ce.sh oci/chat_fullctx_ce_qwen.sh
 
 if ! git diff --cached --quiet; then
   message="${1:-Sync OCI code $(date +%Y%m%d_%H%M%S)}"
