@@ -51,10 +51,14 @@
 #   DATASETS          space/comma 'name:split' list (default: full 8-set suite)
 #   SHUFFLE_SEED      seed for the pooled global shuffle (default 1234)
 #   MAX_EVAL_SAMPLES  cap samples per dataset (fast smoke test; 0 = all)
-#   CKPT=<path>       eval this exact .nemo/.ckpt (overrides EXP resolution)
-#   STEP=<n>          eval step=<n>.ckpt explicitly
-#   USE_LAST=1        eval the rolling -last.ckpt
-#   PREFER_CKPT=1     use the best .ckpt even if a .nemo exists
+#   RUN_AVERAGING     1 (DEFAULT) -> average the top-k non-last checkpoints into
+#                     <CKPT_DIR>/<EXP>-averaged.ckpt (built once under an mkdir
+#                     lock; concurrent jobs wait/reuse). 0 -> single checkpoint.
+#   FORCE_AVERAGE=1   recompute the averaged ckpt even if it is cached
+#   CKPT=<path>       eval this exact .nemo/.ckpt (overrides EXP; disables averaging)
+#   STEP=<n>          eval step=<n>.ckpt explicitly (disables averaging)
+#   USE_LAST=1        eval the rolling -last.ckpt (disables averaging)
+#   PREFER_CKPT=1     with RUN_AVERAGING=0, use the best .ckpt even if a .nemo exists
 #   CKPT_DIR=<path>   override the checkpoints dir (skip the layout autodetect)
 #   CHUNK_SIZE        override CHAT joint chunk_size (full-context models)
 #   MAX_SYMBOLS       override greedy max symbols per (chunk) step
@@ -89,6 +93,16 @@ CHUNK_SIZE="${CHUNK_SIZE:-}"
 MAX_SYMBOLS="${MAX_SYMBOLS:-}"
 ATT_CONTEXT_SIZE="${ATT_CONTEXT_SIZE:-}"
 
+# Checkpoint averaging (DEFAULT ON): average the top-k (non '-last', non
+# '-averaged') checkpoints exp_manager keeps by val_wer into a shared
+# <CKPT_DIR>/<EXP>-averaged.ckpt that is REUSED across runs. Concurrent eval jobs
+# for the same exp all point at that one target; a mkdir-based lock (below)
+# serializes writers so exactly ONE job averages and the rest wait/reuse.
+# FORCE_AVERAGE=1 recomputes it. Any specific selection (CKPT=/STEP=/USE_LAST=1)
+# disables averaging.
+RUN_AVERAGING="${RUN_AVERAGING:-1}"
+FORCE_AVERAGE="${FORCE_AVERAGE:-0}"
+
 # Pre-staged leaderboard cache on lustre (same layout as the SpeechLM eval).
 CACHE_DIR="${CACHE_DIR:-/lustre/fsw/portfolios/llmservice/users/hainanx/leaderboard_cache}"
 if [[ ! -d "$CACHE_DIR" ]]; then
@@ -117,27 +131,57 @@ if [[ -z "${CKPT_DIR:-}" || ! -d "$CKPT_DIR" ]]; then
     exit 1
 fi
 
-# ---- Resolve the model file (.nemo preferred; else best/last/step .ckpt) ----
-if [[ -z "${CKPT:-}" ]]; then
-    if [[ -n "${STEP:-}" ]]; then
-        CKPT="${CKPT_DIR}/step=${STEP}.ckpt"
-    elif [[ "${USE_LAST:-0}" == "1" ]]; then
-        CKPT="$(ls -t "${CKPT_DIR}"/*-last.ckpt 2>/dev/null | head -1)"
+# A specific-checkpoint request (CKPT=/STEP=/USE_LAST=1) disables averaging.
+if [[ -n "${CKPT:-}" || -n "${STEP:-}" || "${USE_LAST:-0}" == "1" ]]; then
+    RUN_AVERAGING=0
+fi
+
+# ---- Resolve the model file (averaged .ckpt by default; else .nemo/best/last/step) ----
+AVG_INPUTS_QUOTED=""
+ENSURE_AVG=0
+if [[ "$RUN_AVERAGING" == "1" ]]; then
+    # Inputs = the top-k snapshots exp_manager kept by val_wer (exclude the rolling
+    # '-last' and any prior '-averaged'). The shared target is <EXP>-averaged.ckpt.
+    mapfile -t _AVG_IN < <(ls -t "${CKPT_DIR}"/*.ckpt 2>/dev/null | grep -v -- '-last\.ckpt$' | grep -v -- '-averaged\.ckpt$')
+    if [[ ${#_AVG_IN[@]} -eq 0 ]]; then
+        echo "ERROR: RUN_AVERAGING=1 but no non-last checkpoints under ${CKPT_DIR}." >&2
+        echo "       Use CKPT=<file> / STEP=<n> / USE_LAST=1, or set RUN_AVERAGING=0." >&2
+        exit 1
+    fi
+    for f in "${_AVG_IN[@]}"; do AVG_INPUTS_QUOTED+=" '${f}'"; done
+    CKPT="${CKPT_DIR}/${EXP_NAME}-averaged.ckpt"
+    ENSURE_AVG=1
+    if [[ "$FORCE_AVERAGE" == "1" ]]; then
+        echo "==> Will (re)average ${#_AVG_IN[@]} checkpoint(s) -> ${CKPT} (locked; concurrent jobs wait/reuse)."
+    elif [[ -f "$CKPT" ]]; then
+        echo "==> Averaged checkpoint present: ${CKPT} (locked ensure reuses unless another job is mid-write)."
     else
-        if [[ "${PREFER_CKPT:-0}" != "1" ]]; then
+        echo "==> Averaged checkpoint missing: will create ${CKPT} under lock (${#_AVG_IN[@]} inputs)."
+    fi
+else
+    if [[ -z "${CKPT:-}" ]]; then
+        if [[ -n "${STEP:-}" ]]; then
+            CKPT="${CKPT_DIR}/step=${STEP}.ckpt"
+        elif [[ "${USE_LAST:-0}" == "1" ]]; then
+            CKPT="$(ls -t "${CKPT_DIR}"/*-last.ckpt 2>/dev/null | head -1)"
+        elif [[ "${PREFER_CKPT:-0}" == "1" ]]; then
+            CKPT="$(ls -t "${CKPT_DIR}"/*.ckpt 2>/dev/null | grep -v -- '-last\.ckpt$' | grep -v -- '-averaged\.ckpt$' | head -1)"
+            [[ -z "${CKPT:-}" ]] && CKPT="$(ls -t "${CKPT_DIR}"/*-last.ckpt 2>/dev/null | head -1)"
+        else
             CKPT="$(ls -t "${CKPT_DIR}"/*.nemo 2>/dev/null | head -1)"
-        fi
-        if [[ -z "${CKPT:-}" ]]; then
-            CKPT="$(ls -t "${CKPT_DIR}"/*.ckpt 2>/dev/null | grep -v -- '-last\.ckpt$' | head -1)"
+            [[ -z "${CKPT:-}" ]] && CKPT="$(ls -t "${CKPT_DIR}"/*.ckpt 2>/dev/null | grep -v -- '-last\.ckpt$' | grep -v -- '-averaged\.ckpt$' | head -1)"
             [[ -z "${CKPT:-}" ]] && CKPT="$(ls -t "${CKPT_DIR}"/*-last.ckpt 2>/dev/null | head -1)"
         fi
     fi
 fi
-if [[ -z "${CKPT:-}" || ! -f "$CKPT" ]]; then
-    echo "ERROR: could not resolve a model file under ${CKPT_DIR} (set CKPT=, STEP=, USE_LAST=1, or PREFER_CKPT=1)." >&2
+
+# Validate now unless the ckpt is produced by the in-container averaging step.
+if [[ "$ENSURE_AVG" != "1" && ( -z "${CKPT:-}" || ! -f "$CKPT" ) ]]; then
+    echo "ERROR: could not resolve a model file under ${CKPT_DIR} (set CKPT=, STEP=, USE_LAST=1, PREFER_CKPT=1, or RUN_AVERAGING=0)." >&2
     exit 1
 fi
 echo "==> Model: ${CKPT}"
+[[ "$ENSURE_AVG" == "1" ]] && echo "    (averaged checkpoint; built under an mkdir-lock inside the container)"
 
 RUN_TS="$(date +%Y%m%d_%H%M%S)"
 JOB_TAG="${SLURM_JOB_ID:-local$$}"
@@ -165,6 +209,13 @@ MOUNTS="--container-mounts=${CODE_DIR}:/code,${H_DIR}:${H_DIR},${HFCACHE}:/hfcac
     echo "exp_name:          ${EXP_NAME}"
     echo "project:           ${PROJECT}"
     echo "checkpoint:        ${CKPT}"
+    echo "run_averaging:     ${RUN_AVERAGING}"
+    echo "force_average:     ${FORCE_AVERAGE}"
+    if [[ "$ENSURE_AVG" == "1" ]]; then
+        echo "averaged_num_inputs: ${#_AVG_IN[@]}"
+        echo "averaged_inputs:"
+        for f in "${_AVG_IN[@]}"; do echo "  - ${f}"; done
+    fi
     echo "batch_size:        ${BATCH_SIZE}"
     echo "use_normalizer:    ${USE_NORMALIZER}"
     echo "num_gpus:          ${NGPU}"
@@ -178,6 +229,63 @@ MOUNTS="--container-mounts=${CODE_DIR}:/code,${H_DIR}:${H_DIR},${HFCACHE}:/hfcac
     echo "results_dir:       ${RESULTS_DIR}"
 } > "${RESULTS_DIR}/run_config.yaml"
 echo "==> Wrote run config: ${RESULTS_DIR}/run_config.yaml"
+
+# ---- Shared averaging step (mkdir lock; safe across concurrent jobs/nodes) ----
+# mkdir is atomic on lustre (flock is not reliably cross-client). The writer
+# averages into a temp file then renames into place, so waiters never observe a
+# partial checkpoint. Reuses the model-agnostic Lightning-ckpt averager
+# scripts/average_sslm_ckpts.py (averages state_dict float tensors, keeps
+# hyper_parameters from the first ckpt -> loadable via load_from_checkpoint).
+ENSURE_AVG_SH="${SHARD_DIR}/ensure_averaged_ckpt.sh"
+if [[ "$ENSURE_AVG" == "1" ]]; then
+    cat > "$ENSURE_AVG_SH" <<AVG_EOF
+#!/bin/bash
+set -euo pipefail
+OUT='${CKPT}'
+FORCE='${FORCE_AVERAGE}'
+LOCK="\${OUT}.preparing"
+TMP="\${OUT}.tmp.\$\$"
+STALE_SEC=7200  # steal the lock if a holder died mid-write (>2h)
+acquire() {
+  while ! mkdir "\$LOCK" 2>/dev/null; do
+    if [[ -d "\$LOCK" ]]; then
+      lock_mtime=\$(stat -c %Y "\$LOCK" 2>/dev/null || stat -f %m "\$LOCK" 2>/dev/null || echo 0)
+      now=\$(date +%s)
+      if [[ "\$lock_mtime" -gt 0 && \$(( now - lock_mtime )) -gt \$STALE_SEC ]]; then
+        echo "==> stale avg lock (>\${STALE_SEC}s); removing \$LOCK"
+        rmdir "\$LOCK" 2>/dev/null || rm -rf "\$LOCK"
+        continue
+      fi
+    fi
+    echo "==> waiting for another job to finish averaging -> \$OUT"
+    for _ in \$(seq 1 60); do
+      if [[ "\$FORCE" != "1" && -f "\$OUT" ]]; then
+        echo "==> averaged ckpt ready (reusing): \$OUT"; exit 0
+      fi
+      [[ -d "\$LOCK" ]] || break
+      sleep 10
+    done
+  done
+}
+release() { rmdir "\$LOCK" 2>/dev/null || true; }
+acquire
+trap release EXIT
+if [[ "\$FORCE" == "1" || ! -f "\$OUT" ]]; then
+  echo "==> Averaging ${#_AVG_IN[@]} checkpoints -> \$OUT"
+  python /code/scripts/average_sslm_ckpts.py --output "\$TMP"${AVG_INPUTS_QUOTED}
+  mv -f "\$TMP" "\$OUT"
+  echo "==> wrote \$OUT"
+else
+  echo "==> Reusing cached averaged checkpoint: \$OUT"
+fi
+release
+trap - EXIT
+AVG_EOF
+    chmod +x "$ENSURE_AVG_SH"
+fi
+
+AVG_CLAUSE=""
+[[ "$ENSURE_AVG" == "1" ]] && AVG_CLAUSE="&& bash '${ENSURE_AVG_SH}' "
 
 read -r -d '' cmd <<EOF
 echo "*******CHAT/RNNT leaderboard eval (pooled shards over ${NGPU} GPUs)********" \
@@ -196,6 +304,8 @@ echo "*******CHAT/RNNT leaderboard eval (pooled shards over ${NGPU} GPUs)*******
 && export HYDRA_FULL_ERROR=1 \
 && export TMPDIR=${OCI_TMP_DIR} && mkdir -p ${OCI_TMP_DIR} \
 && python -c "import nemo, nemo.collections.asr; print('NeMo:', nemo.__file__)" \
+${AVG_CLAUSE} \
+&& [ -f "${CKPT}" ] \
 && echo "==> Building ${NGPU} pooled shard manifests (seed=${SHUFFLE_SEED}) ..." \
 && python /code/scripts/leaderboard_heh_shards.py build \
       --cache_dir "${CACHE_DIR}" \
