@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Self-contained Open-ASR-Leaderboard evaluator for a SpeechLM (StreamingSTT /
-ChunkCompletion) model, reading a PRE-STAGED wav/manifest cache on disk.
+Script) model, reading a PRE-STAGED wav/manifest cache on disk.
 
 This is the SpeechLM counterpart of scripts/asr_leaderboard_eval.py, and unlike
 the local ``run_eval_sslm.py`` driver it does NOT download from HuggingFace: it
@@ -23,7 +23,7 @@ makes it usable on OCI compute nodes that have no internet: pre-stage the cache
 on lustre once, then evaluate there.
 
 It loads ONE Lightning ``.ckpt`` into a configurable model class (default the
-chunk-completion model), transcribes each dataset via ``model.generate`` (batched,
+SCRIPT model), transcribes each dataset via ``model.generate`` (batched,
 with CUDA-OOM batch-halving), and reports WER per dataset using the same
 whisper-normalized metric as training's ``val_wer``.
 
@@ -412,7 +412,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ckpt_path", help="Lightning .ckpt to evaluate (required unless --aggregate).")
     p.add_argument(
         "--model_class",
-        default="nemo.collections.speechlm2.models.chunk_completion_model.ChunkCompletionSTTModel",
+        default="nemo.collections.speechlm2.models.script_model.ScriptSTTModel",
         help="Dotted path of the model class to load.",
     )
     p.add_argument(

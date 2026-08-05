@@ -22,9 +22,10 @@ fi
 # be swept into a GitHub commit.
 git add -u
 git add .gitignore sync_to_ord.sh
-# The oci/ dir is gitignored (local scratch scripts); force-add just the
-# project-owned launchers (baseline + experiment variants).
-git add -f oci/streaming_stt_finetune*.sh
+# Model launch + eval scripts now live under the gitignored /launch/ dir (local-
+# only scratch); copy most of them to the cluster manually if needed. The project-
+# owned baseline launcher is force-added so it syncs through git.
+git add -f launch/script_baseline.sh
 
 if ! git diff --cached --quiet; then
   message="${1:-Sync ORD code $(date +%Y%m%d_%H%M%S)}"

@@ -90,7 +90,7 @@ class StreamingSTTDataConfig:
     chunk_size_std: float = 0.0
     chunk_size_seed: int = 42
     num_delay_frames: int = 0
-    # Multi-delay-prompt training (ChunkCompletionSTTDataset): a list of
+    # Multi-delay-prompt training (ScriptSTTDataset): a list of
     # {delay: int, prompt: str} entries. When set, each batch samples ONE entry
     # uniformly; num_delay_frames is set to that entry's delay and the
     # instruction/system prompt to its prompt for the whole batch. This teaches
@@ -98,27 +98,27 @@ class StreamingSTTDataConfig:
     # "emit ASAP", 4 = "wait until confident"). None disables (use scalar
     # num_delay_frames + system_prompt as before).
     delay_prompts: Optional[List] = None
-    # --- Chunk-completion audio history window (ChunkCompletionSTTDataset) ---
+    # --- SCRIPT audio history window (ScriptSTTDataset) ---
     # Number M of PREVIOUS chunks whose audio is included in each chunk's branch
     # window (a word split across a boundary is then fully visible). 0 = current
     # chunk only. Should match model.audio_history_chunks.
     audio_history_chunks: int = 0
-    # Fixed-frame audio window (ChunkCompletionSTTDataset): if > 0, each branch
+    # Fixed-frame audio window (ScriptSTTDataset): if > 0, each branch
     # conditions on the last ``audio_window_frames`` encoder frames ending at the
     # chunk boundary (a constant acoustic context regardless of chunk size), never
     # fewer than the current chunk. Takes precedence over audio_history_chunks;
     # mutually exclusive with it. Should match model.audio_window_frames. 0 = off.
     audio_window_frames: int = 0
-    # Shared-audio packed layout (ChunkCompletionSTTDataset): lay the encoder frames
+    # Shared-audio packed layout (ScriptSTTDataset): lay the encoder frames
     # down ONCE and window each branch via the mask (no per-branch audio copies), so
     # the packed length is independent of the window size. Should match
     # model.shared_audio_track. False = original per-branch-audio layout.
     shared_audio_track: bool = False
     # --- Self-correction (delete-last-word) ---
-    # When True (ChunkCompletionSTTDataset), each chunk also carries its last word's
+    # When True (ScriptSTTDataset), each chunk also carries its last word's
     # tokens and the batch carries per-example chunk metadata, so the MODEL can inject
     # its own forced-decoding errors and build correction targets in the training step
-    # (see ChunkCompletionSTTModel). Should match model.self_correction. False = off.
+    # (see ScriptSTTModel). Should match model.self_correction. False = off.
     self_correction: bool = False
     # Optional clause appended to the system prompt describing the delete ability.
     self_correction_prompt_suffix: Optional[str] = None
@@ -145,9 +145,9 @@ class StreamingSTTDataConfig:
     # contiguous with the plain-text history and overlay the audio prelude on the
     # history's tail positions, so the transcript reads as one uninterrupted stream
     # (no per-chunk positional gap). Should match model.contiguous_text_positions.
-    # 0/False = original behavior. ChunkCompletionSTTDataset only.
+    # 0/False = original behavior. ScriptSTTDataset only.
     contiguous_text_positions: bool = False
-    # --- Exact-delay prompting (ChunkCompletionSTTDataset; needs num_delay_frames=-1) ---
+    # --- Exact-delay prompting (ScriptSTTDataset; needs num_delay_frames=-1) ---
     # When True, prompt-controlled delay uses an EXACT integer delay embedded in the
     # prompt instead of the natural-language delay_prompts list. Each batch samples
     # one delay uniformly from [0, exact_max_delay]; num_delay_frames is set to it and
@@ -157,7 +157,7 @@ class StreamingSTTDataConfig:
     # Inclusive upper bound of the exact-delay sampling range [0, exact_max_delay].
     # Required (>= 1) when exact_delay=True.
     exact_max_delay: int = 0
-    # --- Text-representation variation (ChunkCompletionSTTDataset) ---
+    # --- Text-representation variation (ScriptSTTDataset) ---
     # When True, each batch samples one of the 4 (capitalization on/off) x
     # (punctuation on/off) combinations uniformly; the chunk TARGET text is
     # transformed accordingly and the choice is stated in the prompt (via
@@ -170,7 +170,7 @@ class StreamingSTTDataConfig:
     text_repr_keep_chars: str = "'"
     # Prompt template for exact_delay / vary_text_repr. Must contain '{delay}' when
     # exact_delay=True and '{format_clause}' when vary_text_repr=True. None -> a
-    # built-in default (see ChunkCompletionSTTDataset._DEFAULT_PROMPT_TEMPLATE).
+    # built-in default (see ScriptSTTDataset._DEFAULT_PROMPT_TEMPLATE).
     prompt_template: Optional[str] = None
     # Optional override of the 4 format clauses, keyed by "cap_punct", "cap_nopunct",
     # "nocap_punct", "nocap_nopunct". None -> built-in defaults.

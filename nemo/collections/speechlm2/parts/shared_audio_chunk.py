@@ -11,10 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Shared-audio packed layout for the chunk-completion SpeechLM.
+"""Shared-audio packed layout for the SCRIPT SpeechLM.
 
 This is a **memory-efficient** variant of
-:mod:`nemo.collections.speechlm2.parts.chunk_completion`. In the original packed
+:mod:`nemo.collections.speechlm2.parts.script`. In the original packed
 layout each chunk's branch *copies* its audio window as fresh ``AUDIO_TOKEN_IDX``
 positions, so with a fixed frame window ``W`` and a small chunk size the packed
 sequence length blows up (audio tokens = ``W * num_chunks``, frames re-duplicated
@@ -52,7 +52,7 @@ import torch
 from torch import Tensor
 
 from nemo.collections.speechlm2.data.streaming_stt_dataset import AUDIO_TOKEN_IDX, IGNORE_INDEX
-from nemo.collections.speechlm2.parts.chunk_completion import ChunkSpec, _audio_window_start
+from nemo.collections.speechlm2.parts.script import ChunkSpec, _audio_window_start
 
 SPINE_SEG_ID = 0
 AUDIO_SEG_ID = -2  # padding uses -1; spine 0; branches 1..N; audio track -2

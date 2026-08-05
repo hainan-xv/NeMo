@@ -557,21 +557,21 @@ class StreamingSTTModelConfig:
     # the two are equivalent for text queries and differ only for audio queries.
     # Only valid for chunk_size > 0.
     restrict_audio_cross_chunk: bool = False
-    # --- Chunk-completion audio history window (ChunkCompletionSTTModel only) ---
+    # --- SCRIPT audio history window (ScriptSTTModel only) ---
     # Number M of PREVIOUS chunks whose audio is also included in each chunk's
     # branch window, so a word split across a chunk boundary is fully visible.
     # 0 = only the current chunk's audio (original behavior). Kept in the MODEL
-    # config (not just data) so ChunkCompletionSTTModel.generate can rebuild the
+    # config (not just data) so ScriptSTTModel.generate can rebuild the
     # window at inference after from_pretrained.
     audio_history_chunks: int = 0
-    # --- Fixed-frame audio window (ChunkCompletionSTTModel only) ---
+    # --- Fixed-frame audio window (ScriptSTTModel only) ---
     # If > 0, each branch conditions on a FIXED number of encoder frames (the last
     # ``audio_window_frames`` frames ending at the chunk boundary) regardless of
     # chunk size — a constant acoustic context. Never smaller than the current
     # chunk. Takes precedence over audio_history_chunks. Kept in the MODEL config so
     # generate() rebuilds the same window after from_pretrained. 0 = disabled.
     audio_window_frames: int = 0
-    # --- Shared-audio packed layout (ChunkCompletionSTTModel only) ---
+    # --- Shared-audio packed layout (ScriptSTTModel only) ---
     # When True, the encoder frames are laid down ONCE as a shared audio track and
     # each branch attends its window through the mask, instead of copying the window
     # into every branch. Makes the packed sequence length independent of the audio
@@ -579,7 +579,7 @@ class StreamingSTTModelConfig:
     # generate() uses the matching decoder after from_pretrained. False = original
     # per-branch-audio layout.
     shared_audio_track: bool = False
-    # --- Self-correction (delete-last-word) (ChunkCompletionSTTModel only) ---
+    # --- Self-correction (delete-last-word) (ScriptSTTModel only) ---
     # When True, training injects the model's OWN forced-decoding errors: each step
     # a no-grad teacher-forced pass finds chunks whose last word the model mispredicts,
     # then the NEXT branch is rebuilt with that wrong word as its (committed) history
@@ -593,8 +593,8 @@ class StreamingSTTModelConfig:
     self_correction_prob: float = 1.0
     # Log error stats + a sample correction every N steps (0 disables the sample).
     self_correction_log_every: int = 200
-    # --- Contiguous-text positions ("Option A", ChunkCompletionSTTModel only) ---
-    # When True, each chunk-completion branch places its predicted words + eot at
+    # --- Contiguous-text positions ("Option A", ScriptSTTModel only) ---
+    # When True, each SCRIPT branch places its predicted words + eot at
     # positions contiguous with the plain-text history (word j -> pref+j) and
     # overlays the <vs>/audio/<ve> prelude on the history's tail positions, so the
     # transcript reads as one uninterrupted stream instead of being split by a

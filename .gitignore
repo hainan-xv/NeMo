@@ -202,6 +202,8 @@ eval_results/
 # Local OCI scratch scripts are ignored; the tracked launcher is force-added
 # by sync_to_oci.sh / sync_to_ord.sh (git add -f oci/streaming_stt_finetune.sh).
 /oci/
+# Personal model launch + eval scripts (moved out of oci/); local-only, untracked.
+/launch/
 /nemo/collections/asr/models/NeMo.code-workspace
 
 # Unpublished paper draft — do NOT commit before submission (leak risk).

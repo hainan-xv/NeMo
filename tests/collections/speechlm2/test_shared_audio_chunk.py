@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for the shared-audio chunk-completion layout.
+"""Tests for the shared-audio SCRIPT layout.
 
 The centrepiece is the parity test: a branch's logits in the single packed
 sequence (audio laid down ONCE, windowed via the mask) equal the standalone
@@ -23,7 +23,7 @@ import pytest
 import torch
 
 from nemo.collections.speechlm2.data.streaming_stt_dataset import AUDIO_TOKEN_IDX, IGNORE_INDEX
-from nemo.collections.speechlm2.parts.chunk_completion import ChunkSpec
+from nemo.collections.speechlm2.parts.script import ChunkSpec
 from nemo.collections.speechlm2.parts.shared_audio_chunk import (
     AUDIO_SEG_ID,
     batched_shared_audio_decode,

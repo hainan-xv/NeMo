@@ -24,9 +24,11 @@ git add .gitignore sync_to_oci.sh sync_to_ord.sh
 # New tracked-dir scripts must be added explicitly (git add -u only stages
 # already-tracked files).
 git add scripts/asr_leaderboard_shard_decode.py
-# The oci/ dir is gitignored (local scratch scripts); force-add just the
-# project-owned launchers (baseline + experiment variants).
-git add -f oci/streaming_stt_finetune*.sh oci/baseline_granary2.sh oci/two_stream_*granary2.sh oci/test_vllm_eval_oci.sh oci/chat_fullctx_ce.sh oci/chat_fullctx_ce_qwen.sh oci/eval_leaderboard_chat_slurm.sh
+# Model launch + eval scripts now live under the gitignored /launch/ dir (local-
+# only scratch). Most stay untracked -- copy them to the cluster manually if needed
+# (e.g. rsync launch/ to $OCI_REPO/launch/). The project-owned baseline launcher is
+# force-added so it DOES sync to the grid through git.
+git add -f launch/script_baseline.sh
 
 if ! git diff --cached --quiet; then
   message="${1:-Sync OCI code $(date +%Y%m%d_%H%M%S)}"

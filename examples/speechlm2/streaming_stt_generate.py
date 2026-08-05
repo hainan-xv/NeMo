@@ -88,8 +88,8 @@ class StreamingSTTGenerationConfig:
 class StreamingSTTEvalConfig:
     pretrained_name: str = ""
     # Dotted path of the model class to load with ``from_pretrained``. Use
-    # nemo.collections.speechlm2.models.chunk_completion_model.ChunkCompletionSTTModel
-    # for chunk-completion checkpoints (its spine/branch streaming decode); the
+    # nemo.collections.speechlm2.models.script_model.ScriptSTTModel
+    # for SCRIPT checkpoints (its spine/branch streaming decode); the
     # default is the interleaved StreamingSTTModel.
     model_class: str = "nemo.collections.speechlm2.models.StreamingSTTModel"
     inputs: str = ""
@@ -115,11 +115,11 @@ class StreamingSTTEvalConfig:
     # candidate; set e.g. 2/4/7/10/14/28 to measure a specific latency. None keeps
     # the model default. Ignored for dynamic/offline configs.
     chunk_size: Optional[int] = None
-    # Chunk-completion only: cap the conditioning transcript history to the most
+    # SCRIPT only: cap the conditioning transcript history to the most
     # recent N tokens (instruction always kept) to keep long-form decode linear.
-    # None/0 = unlimited. Ignored by non-chunk-completion models.
+    # None/0 = unlimited. Ignored by non-SCRIPT models.
     max_history_tokens: Optional[int] = None
-    # Chunk-completion only: also report per-word emission latency (proxy) = the
+    # SCRIPT only: also report per-word emission latency (proxy) = the
     # time from audio start to the end of the chunk of each word's last subword,
     # averaged over words. Off by a constant from true latency. Ignored by other
     # model classes.
@@ -253,7 +253,7 @@ def main(cfg: StreamingSTTEvalConfig):
             lm_head_emit_threshold=cfg.lm_head_emit_threshold,
             chunk_size_override=cfg.chunk_size,
         )
-        # Only forward the chunk-completion max-history cap when explicitly set, so
+        # Only forward the SCRIPT max-history cap when explicitly set, so
         # other model classes never receive an unexpected kwarg.
         if cfg.max_history_tokens is not None:
             _gen_kwargs["max_history_tokens"] = int(cfg.max_history_tokens)
