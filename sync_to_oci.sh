@@ -27,8 +27,9 @@ git add scripts/asr_leaderboard_shard_decode.py
 # Model launch + eval scripts now live under the gitignored /launch/ dir (local-
 # only scratch). Most stay untracked -- copy them to the cluster manually if needed
 # (e.g. rsync launch/ to $OCI_REPO/launch/). The project-owned baseline launcher is
-# force-added so it DOES sync to the grid through git.
+# force-added so they DO sync to the grid through git.
 git add -f launch/script_baseline.sh
+git add -f launch/script_promptctl.sh
 
 if ! git diff --cached --quiet; then
   message="${1:-Sync OCI code $(date +%Y%m%d_%H%M%S)}"

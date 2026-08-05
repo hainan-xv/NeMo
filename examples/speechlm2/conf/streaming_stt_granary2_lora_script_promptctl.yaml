@@ -1,26 +1,33 @@
 # ============================================================================
 # SCRIPT streaming SpeechLM — Granary 2.0, LoRA, no-blank, val_wer.
-# PROMPT-CONTROLLED variant: exact delay + text-representation, built on the
-# multi-delay-prompt model (streaming_stt_granary2_lora_script_delayprompt).
+# PROMPT-CONTROL variant: the flexible counterpart to the fixed baseline
+# (streaming_stt_granary2_lora_script). ONE model whose streaming operating point
+# is dialed entirely through the prompt -- three knobs, each drawn per batch by
+# ScriptSTTDataset and stated in the prompt, so at inference you pick the setting
+# by wording the prompt:
 #
-# Two prompt-controlled knobs, both batch-shared (one setting per batch so the
-# system prompt can be reused and no per-sample prompt bookkeeping is needed):
+#  1) CHUNK SIZE (data.dataset.chunk_size_prompt_template): the per-batch chunk
+#     size (one of model.chunk_size, in frames) is rendered into the prompt
+#     ("Process the audio in chunks of {chunk_size} frames."). At inference you
+#     request a chunk size by writing that number in the prompt.
 #
-#  1) EXACT DELAY (data.dataset.exact_delay=true, needs num_delay_frames=-1):
-#     each batch samples an integer delay ~ Uniform[0, exact_max_delay] frames,
-#     sets num_delay_frames to it, and renders the number directly into the
-#     prompt ("... with a fixed delay of N frames."). At inference you request an
-#     exact latency by writing that number in the prompt. Replaces the vague
-#     natural-language delay_prompts list.
+#  2) EXACT DELAY / LATENCY (data.dataset.exact_delay=true, num_delay_frames=-1):
+#     each batch samples an integer delay ~ Uniform[0, exact_max_delay] frames and
+#     renders it into the prompt ("... with a fixed delay of N frames."). At
+#     inference you request an exact latency by writing that number.
 #
-#  2) TEXT REPRESENTATION (data.dataset.vary_text_repr=true): each batch samples
+#  3) TEXT REPRESENTATION (data.dataset.vary_text_repr=true): each batch samples
 #     one of the 4 (capitalization on/off) x (punctuation on/off) combos, states
 #     it in the prompt, and transforms the chunk TARGET text accordingly. At
-#     inference you pick punctuation/capitalization via the prompt.
+#     inference you pick capitalization/punctuation via the prompt.
+#
+# Objective is the plain SCRIPT p(words_k | text_history_<k, audio_k). Self-
+# correction is NOT part of this recipe; a later variant adds a self-correction
+# suffix (the <del> delete-last-word objective + prompt clause) on top of this
+# prompt-control base.
 #
 # Everything else (packed spine+branch objective, multi chunk-size, att_context,
-# LoRA, data, optimizer, trainer, val_wer) is inherited from the delay-prompt
-# recipe. Backward compatible: both knobs default off elsewhere.
+# LoRA, data, optimizer, trainer, val_wer) matches the base SCRIPT recipe.
 # ============================================================================
 
 model:
@@ -32,7 +39,7 @@ model:
   sample_rate: 16000
   blank_token: ""            # no-blank: silent chunks emit <|im_end|>
   frame_length_in_secs: 0.08
-  chunk_size: [2, 4, 7, 10, 14, 28]   # multi chunk-size: one drawn per batch
+  chunk_size: [2, 7, 14, 28]   # multi chunk-size: one drawn per batch (and stated in the prompt); matches the baseline's set
   att_context_size: [70, 1]  # left 70; right (lookahead) is set per batch to chunk-1
   audio_pad_to: 0
 
@@ -90,20 +97,31 @@ data:
     compact_template: ${model.compact_template}
     system_role: system
 
-    # --- Exact-delay prompting ---
-    exact_delay: true
-    exact_max_delay: 4    # sample delay ~ Uniform[0, 4] frames per batch (matches the delay-prompt range at finer granularity)
+    # --- (1) Chunk-size prompting ---
+    # The per-batch chunk size (frames) is rendered here and appended to the prompt.
+    chunk_size_prompt_template: "Process the audio in chunks of {chunk_size} frames."
 
-    # --- Text-representation variation ---
+    # --- (2) Exact-delay prompting ---
+    exact_delay: true
+    exact_max_delay: 4    # sample delay ~ Uniform[0, 4] frames per batch
+
+    # --- (3) Text-representation variation ---
     vary_text_repr: true
     text_repr_keep_chars: "'"   # keep apostrophes when stripping punctuation
 
-    # Validation prompt (model.val_system_prompt reads data.dataset.system_prompt).
-    # Must equal the training render for (delay=2, capitalization+punctuation) so
-    # val is in-distribution; the val references are original cap+punct transcripts.
-    system_prompt: "You are doing streaming speech recognition. Given the transcript so far and the next audio chunk, output the words spoken in that chunk. Emit each chunk's words with a fixed delay of 2 frames. Write the text with normal capitalization and punctuation."
+    # NOTE: self-correction is intentionally NOT set here (no self_correction /
+    # self_correction_prefix / history_word_recovery keys). A later variant layers
+    # the self-correction suffix on top of this prompt-control base.
 
-  # Decode-only val_wer runs generate() on raw audio; pin a single fixed size.
+    # Validation prompt (model.val_system_prompt reads data.dataset.system_prompt).
+    # Must equal the training render for (delay=2, cap+punct, chunk=14) so val is
+    # in-distribution; the val references are plain cap+punct transcripts. Clause
+    # order matches the append order in the dataset: base template (delay + format
+    # clause rendered inline) -> chunk clause.
+    system_prompt: "You are doing streaming speech recognition. Given the transcript so far and the next audio chunk, output the words spoken in that chunk. Emit each chunk's words with a fixed delay of 2 frames. Write the text with normal capitalization and punctuation. Process the audio in chunks of 14 frames."
+
+  # Decode-only val_wer runs generate() on raw audio; pin a single fixed size
+  # (must match the chunk count stated in system_prompt above).
   val_dataset_overrides:
     chunk_size: 14
 
@@ -146,7 +164,7 @@ trainer:
   logger: false
   enable_checkpointing: false
   use_distributed_sampler: false
-  max_steps: 200000
+  max_steps: 300000
   limit_train_batches: 2000
   val_check_interval: ${trainer.limit_train_batches}
   log_every_n_steps: 10
