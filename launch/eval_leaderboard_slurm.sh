@@ -236,6 +236,11 @@ WANDB_EVAL_PROJECT="${WANDB_EVAL_PROJECT:-${PROJECT}_leaderboard_eval}"
 # Default run name encodes the decode config: <exp><_eval_tag><_chunkN>_<backend>
 # (the model wrappers usually pass a cleaner WANDB_RUN_NAME explicitly).
 WANDB_RUN_NAME="${WANDB_RUN_NAME:-${EXP_NAME}${EVAL_TAG_SUFFIX}${CHUNK_TAG}_${BACKEND}}"
+# Always stamp the run with its start time (the same RUN_TS used for RESULTS_DIR)
+# so repeated evals of the SAME config are distinct + time-ordered in wandb, and
+# the run name maps 1:1 to its results dir. Applied whether the name came from a
+# wrapper (WANDB_RUN_NAME=) or the default above.
+WANDB_RUN_NAME="${WANDB_RUN_NAME}_${RUN_TS}"
 DO_WANDB=0
 case "$REPORT_WANDB" in
     auto)          [[ -n "${WANDB_TOKEN:-}" ]] && DO_WANDB=1 ;;

@@ -97,7 +97,7 @@ echo "    project:       ${PROJECT}"
 echo "    eval_tag:      ${EVAL_TAG}"
 echo "    chunk_size:    ${CHUNK_SIZE}"
 (( QUICK_RUN )) && echo "    quick_run:     first ${QUICK_N} utts/dataset (MAX_EVAL_SAMPLES=${MAX_EVAL_SAMPLES})"
-echo "    wandb_run:     ${WANDB_RUN_NAME}"
+echo "    wandb_run:     ${WANDB_RUN_NAME} (+_<launch-time> appended by backend)"
 echo "    system_prompt: ${SYSTEM_PROMPT}"
 
 # Locate eval_leaderboard_slurm.sh. Under sbatch, Slurm COPIES this script into a

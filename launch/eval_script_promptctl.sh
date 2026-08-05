@@ -167,7 +167,7 @@ echo "    cap/punct:     ${REPR_TAG}"
 echo "    delay:         ${DELAY} frames (max trained ${MAX_DELAY})"
 echo "    chunk_size:    ${CHUNK_SIZE}"
 (( QUICK_RUN )) && echo "    quick_run:     first ${QUICK_N} utts/dataset (MAX_EVAL_SAMPLES=${MAX_EVAL_SAMPLES})"
-echo "    wandb_run:     ${WANDB_RUN_NAME}"
+echo "    wandb_run:     ${WANDB_RUN_NAME} (+_<launch-time> appended by backend)"
 echo "    system_prompt: ${SYSTEM_PROMPT}"
 
 # Locate eval_leaderboard_slurm.sh (see note in eval_script_baseline.sh).
