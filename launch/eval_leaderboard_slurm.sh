@@ -201,8 +201,10 @@ SHARD_DIR="${RESULTS_DIR}/shards"; mkdir -p "$SHARD_DIR"
 CKPT_STEM="$(basename "${CKPT%.ckpt}")"
 HF_CKPT_DIR="${OUTPUT_PREFIX}/results/${PROJECT}/${EXP_NAME}/hf_model_${CKPT_STEM}"
 # The exp config (with a top-level model:) sits next to the checkpoints dir on
-# lustre; to_hf.py needs it to instantiate the model class.
-EXP_CFG="${CKPT_DIR%/checkpoints}/exp_config.yaml"
+# lustre; to_hf.py needs it to instantiate the model class. Env-overridable so an
+# EXTERNAL checkpoint (e.g. a colleague's model via CKPT=, not under our
+# results/<PROJECT>/<EXP> layout) can point EXP_CFG at its own exp_config.yaml.
+EXP_CFG="${EXP_CFG:-${CKPT_DIR%/checkpoints}/exp_config.yaml}"
 if [[ "$BACKEND" == "heh" && ! -f "$EXP_CFG" ]]; then
     echo "ERROR: heh backend needs the exp config at ${EXP_CFG} (set BACKEND=sslm to skip conversion)." >&2
     exit 1
