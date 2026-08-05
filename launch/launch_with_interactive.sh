@@ -9,9 +9,9 @@
 # `#SBATCH -p ...` directive (ours: batch_block1,batch_block3,batch_block4), so the
 # target file is never modified -- only the partition it lands on changes.
 #
-# Examples:
-#   ./launch_with_interactive.sh launch/script_baseline.sh
-#   ./launch_with_interactive.sh launch/eval_script_promptctl.sh cap punct 2 14
+# Examples (run from the launch/ dir):
+#   ./launch_with_interactive.sh script_baseline.sh
+#   ./launch_with_interactive.sh eval_script_promptctl.sh cap punct 2 14
 #
 # Optional env:
 #   INTERACTIVE_PARTITION=<name>   target partition (default: interactive)

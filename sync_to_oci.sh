@@ -20,7 +20,7 @@ fi
 # Stage existing tracked changes and the project-owned launch/sync scripts only.
 # Avoid `git add -A`, which could accidentally include local credentials.
 git add -u
-git add .gitignore sync_to_oci.sh sync_to_ord.sh launch_with_interactive.sh
+git add .gitignore sync_to_oci.sh sync_to_ord.sh
 # New tracked-dir scripts must be added explicitly (git add -u only stages
 # already-tracked files).
 git add scripts/asr_leaderboard_shard_decode.py
@@ -36,6 +36,7 @@ git add -f launch/script_promptctl.sh
 git add -f launch/eval_script_baseline.sh
 git add -f launch/eval_script_promptctl.sh
 git add -f launch/eval_leaderboard_slurm.sh
+git add -f launch/launch_with_interactive.sh
 
 if ! git diff --cached --quiet; then
   message="${1:-Sync OCI code $(date +%Y%m%d_%H%M%S)}"
