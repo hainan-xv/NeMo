@@ -38,6 +38,14 @@ def average_checkpoints(input_paths, output_path):
     acc = None          # float32 running sum of float tensors (CPU)
     dtypes = {}         # original dtype per averaged key
     hyper_parameters = None
+    # Lightning/NeMo top-level metadata carried over from the FIRST input so the
+    # averaged file stays a valid Lightning checkpoint. In particular
+    # `EncDecRNNTBPEModel.load_from_checkpoint` runs Lightning's checkpoint
+    # migration, which hard-requires `pytorch-lightning_version` (its absence
+    # raises `KeyError: 'pytorch-lightning_version'`). These are all plain
+    # str/int values, so they remain safe under torch.load(weights_only=True).
+    meta = {}
+    _META_KEYS = ("pytorch-lightning_version", "epoch", "global_step")
     n = len(input_paths)
 
     for i, path in enumerate(input_paths):
@@ -46,6 +54,7 @@ def average_checkpoints(input_paths, output_path):
         sd = ckpt["state_dict"]
         if acc is None:
             hyper_parameters = ckpt.get("hyper_parameters")
+            meta = {k: ckpt[k] for k in _META_KEYS if k in ckpt}
             acc = {}
             for k, v in sd.items():
                 if torch.is_tensor(v) and v.is_floating_point():
@@ -64,6 +73,9 @@ def average_checkpoints(input_paths, output_path):
         acc[k] = (acc[k] / n).to(dtypes[k])
 
     out = {"state_dict": acc}
+    # Preserve Lightning metadata (esp. pytorch-lightning_version) so Lightning's
+    # load_from_checkpoint / checkpoint migration accepts the averaged file.
+    out.update(meta)
     if hyper_parameters is not None:
         # Store hyper_parameters as plain containers so the checkpoint loads under
         # torch.load(weights_only=True) (PyTorch 2.6+ default) — e.g. the vLLM
