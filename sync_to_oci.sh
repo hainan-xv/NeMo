@@ -37,6 +37,7 @@ git add -f launch/eval_script_baseline.sh
 git add -f launch/eval_script_promptctl.sh
 git add -f launch/eval_leaderboard_slurm.sh
 git add -f launch/eval_interleave.sh
+git add -f launch/eval_longform.sh
 git add -f launch/launch_with_interactive.sh
 
 if ! git diff --cached --quiet; then

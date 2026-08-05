@@ -148,6 +148,145 @@ def cmd_build(args) -> int:
     return 0
 
 
+# ------------------------------------------------------------------------------
+# Long-form variant of `build`.
+#
+# The Open-ASR-Leaderboard sets are short utterances staged in a fixed cache
+# layout; long-form sets instead ship as a few NeMo manifests each holding a
+# handful of VERY long recordings (minutes to ~1h). Differences from `build`:
+#   * source = arbitrary manifests discovered under --longform_dir (each *.json /
+#     *.jsonl is one dataset; its audio_filepath is resolved RELATIVE to the
+#     manifest's own dir), not the <cache>/<ds>/<split> layout.
+#   * balancing = greedy longest-processing-time by DURATION (not round-robin by
+#     count): with wildly uneven, few clips, count-balancing would leave one GPU
+#     with a 1h clip while others idle. LPT keeps wall time ~= total_dur / N.
+# Output shard files use the SAME shard{k}_of{n}.json schema + dataset_key, so the
+# decode fan-out and `aggregate` are shared with the short-form path unchanged.
+# ------------------------------------------------------------------------------
+def _longform_key(manifest_path: str) -> str:
+    """dataset_key = the manifest's parent-directory name, so a dataset shipped as
+    several manifests (e.g. apptek's 14 per-locale files under
+    apptek_callcenter_dialogues/) pools into ONE key -> one WER. Gives the clean
+    3-way long-form comparison: tedlium_longform / earnings22_longform /
+    apptek_callcenter_dialogues. Falls back to the filename stem if the manifest
+    sits at the root (no dataset subdir)."""
+    parent = os.path.basename(os.path.dirname(os.path.abspath(manifest_path)))
+    return parent or os.path.splitext(os.path.basename(manifest_path))[0]
+
+
+def _is_nemo_manifest(path: str) -> bool:
+    """True iff the first non-empty line is a JSON object with 'audio_filepath'.
+    Filters out sidecar files like HF 'metadata.jsonl' (schema file_name/text)."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                rec = json.loads(line)
+                return isinstance(rec, dict) and "audio_filepath" in rec
+    except Exception:
+        return False
+    return False
+
+
+def discover_longform_manifests(longform_dir: str) -> List[str]:
+    out = []
+    for root, _dirs, files in os.walk(longform_dir):
+        for fn in files:
+            if fn.endswith((".json", ".jsonl")):
+                p = os.path.join(root, fn)
+                if _is_nemo_manifest(p):
+                    out.append(p)
+    return sorted(out)
+
+
+def read_longform_manifest(manifest_path: str, max_samples: int = 0):
+    """Read one long-form manifest -> list of {path, ref, dur}. audio_filepath is
+    resolved relative to the manifest's directory when not absolute (and falls back
+    to <manifest_dir>/<basename> if the recorded path doesn't exist)."""
+    base = os.path.dirname(os.path.abspath(manifest_path))
+    out = []
+    with open(manifest_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            fp = rec.get("audio_filepath")
+            if not fp:
+                continue
+            if not os.path.isabs(fp):
+                fp = os.path.join(base, fp)
+            if not os.path.exists(fp):
+                alt = os.path.join(base, os.path.basename(rec["audio_filepath"]))
+                if os.path.exists(alt):
+                    fp = alt
+            if not os.path.exists(fp):
+                print(f"  WARN missing audio (skipped): {rec['audio_filepath']}")
+                continue
+            out.append(
+                {
+                    "path": fp,
+                    "ref": rec.get("text", rec.get("reference", "")),
+                    "dur": float(rec.get("duration", 0.0) or 0.0),
+                }
+            )
+            if max_samples and len(out) >= max_samples:
+                break
+    return out
+
+
+def cmd_build_longform(args) -> int:
+    manifests = discover_longform_manifests(args.longform_dir)
+    if not manifests:
+        raise SystemExit(f"build_longform: no *.json/*.jsonl manifests under {args.longform_dir}")
+
+    items: List[dict] = []
+    for mp in manifests:
+        key = _longform_key(mp)
+        recs = read_longform_manifest(mp, args.max_eval_samples)
+        for r in recs:
+            r["key"] = key
+            items.append(r)
+    if not items:
+        raise SystemExit("build_longform: no usable utterances found")
+
+    n = int(args.num_shards)
+    # Greedy longest-processing-time: assign the longest clip to the currently
+    # least-loaded shard so total duration is spread as evenly as possible.
+    shards: List[List[dict]] = [[] for _ in range(n)]
+    loads = [0.0] * n
+    for it in sorted(items, key=lambda x: _ensure_duration(x), reverse=True):
+        k = min(range(n), key=lambda i: loads[i])
+        shards[k].append(it)
+        loads[k] += max(_ensure_duration(it), 0.0)
+
+    os.makedirs(args.out_dir, exist_ok=True)
+    total_by_ds = Counter(it["key"] for it in items)
+    print(f"build_longform: {len(items)} utts across {len(manifests)} manifests -> {n} shards")
+    for k in range(n):
+        shard = shards[k]
+        shard.sort(key=_ensure_duration)  # ascending within shard
+        out_path = os.path.join(args.out_dir, f"shard{k}_of{n}.json")
+        with open(out_path, "w") as f:
+            for it in shard:
+                f.write(
+                    json.dumps(
+                        {
+                            "audio_filepath": it["path"],
+                            "duration": _ensure_duration(it),
+                            "text": it["ref"],
+                            "dataset_key": it["key"],
+                        }
+                    )
+                    + "\n"
+                )
+        print(f"  shard{k}_of{n}.json: {len(shard)} utts, {loads[k] / 60.0:.1f} min audio")
+    print("  per-dataset totals: " + ", ".join(f"{k}={total_by_ds[k]}" for k in sorted(total_by_ds)))
+    return 0
+
+
 def _word_edit_distance(hyp_words: List[str], ref_words: List[str]) -> int:
     """Levenshtein distance between two word sequences (unit costs)."""
     n, m = len(hyp_words), len(ref_words)
@@ -250,6 +389,13 @@ def main() -> int:
     b.add_argument("--shuffle_seed", type=int, default=1234)
     b.add_argument("--max_eval_samples", type=int, default=0, help="Cap samples per dataset (0 = all).")
     b.set_defaults(func=cmd_build)
+
+    bl = sub.add_parser("build_longform", help="Build duration-balanced shards from long-form manifests.")
+    bl.add_argument("--longform_dir", required=True, help="Root holding long-form NeMo manifests (*.json).")
+    bl.add_argument("--out_dir", required=True)
+    bl.add_argument("--num_shards", type=int, required=True)
+    bl.add_argument("--max_eval_samples", type=int, default=0, help="Cap utts per manifest (0 = all).")
+    bl.set_defaults(func=cmd_build_longform)
 
     a = sub.add_parser("aggregate", help="Reduce shard generations to per-dataset WER.")
     a.add_argument("--out_dir", required=True)

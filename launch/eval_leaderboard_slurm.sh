@@ -91,6 +91,18 @@ CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/llmservice/users/heh/containers/n
 PROJECT="${PROJECT:-Speechlm79}"
 EXP_NAME="${1:-${EXP_NAME:-granary2_script}}"
 BACKEND="${BACKEND:-heh}"
+# Long-form mode: when LONGFORM_DIR is set the shard source switches from the
+# short-form leaderboard cache to the long-form manifests discovered under it
+# (build_longform: resolve relative audio paths, duration-balance the few huge
+# recordings across the GPUs). Everything downstream (convert, decode fan-out,
+# aggregate, wandb) is identical. Only the heh backend is supported here (the
+# sslm in-process driver is hard-wired to the leaderboard cache layout). Set by
+# launch/eval_longform.sh. Must live under a mounted lustre root (/lustre/fsw|fs12).
+LONGFORM_DIR="${LONGFORM_DIR:-}"
+if [[ -n "$LONGFORM_DIR" && "$BACKEND" != "heh" ]]; then
+    echo "ERROR: long-form eval (LONGFORM_DIR set) requires BACKEND=heh." >&2
+    exit 1
+fi
 MODEL_CLASS="${MODEL_CLASS:-nemo.collections.speechlm2.models.script_model.ScriptSTTModel}"
 SYSTEM_PROMPT="${SYSTEM_PROMPT:-Transcribe the audio into text.}"
 # Local-mirror overrides for the HF conversion (heh backend) when an EXTERNAL
@@ -137,8 +149,14 @@ SHUFFLE_SEED="${SHUFFLE_SEED:-1234}"
 DATASETS_CSV="$(echo "$DATASETS" | tr -s ' ' ',')"
 
 # Pre-staged leaderboard cache on lustre (rsync of ~/leaderboard_run/cache).
+# Not needed in long-form mode (the shards come from LONGFORM_DIR instead).
 CACHE_DIR="${CACHE_DIR:-/lustre/fsw/portfolios/llmservice/users/hainanx/leaderboard_cache}"
-if [[ ! -d "$CACHE_DIR" ]]; then
+if [[ -n "$LONGFORM_DIR" ]]; then
+    if [[ ! -d "$LONGFORM_DIR" ]]; then
+        echo "ERROR: LONGFORM_DIR not found: $LONGFORM_DIR (stage the long-form manifests there, or set LONGFORM_DIR=)." >&2
+        exit 1
+    fi
+elif [[ ! -d "$CACHE_DIR" ]]; then
     echo "ERROR: CACHE_DIR not found: $CACHE_DIR (stage the leaderboard cache there, or set CACHE_DIR=)." >&2
     exit 1
 fi
@@ -233,6 +251,16 @@ MOUNTS="--container-mounts=${CODE_DIR}:/code,${H_DIR}:${H_DIR},${HFCACHE}:/hfcac
 
 NGPU=8
 
+# Shard builder invocation (heh backend). Long-form pulls from LONGFORM_DIR with
+# duration balancing; short-form pulls from the leaderboard cache with a seeded
+# global shuffle. Both emit the same shard{k}_of{n}.json (with dataset_key), so
+# the decode fan-out + aggregate below are identical.
+if [[ -n "$LONGFORM_DIR" ]]; then
+    BUILD_INVOCATION="python /code/scripts/leaderboard_heh_shards.py build_longform --longform_dir '${LONGFORM_DIR}' --out_dir '${SHARD_DIR}' --num_shards ${NGPU} --max_eval_samples ${MAX_EVAL_SAMPLES}"
+else
+    BUILD_INVOCATION="python /code/scripts/leaderboard_heh_shards.py build --cache_dir '${CACHE_DIR}' --datasets '${DATASETS_CSV}' --out_dir '${SHARD_DIR}' --num_shards ${NGPU} --shuffle_seed ${SHUFFLE_SEED} --max_eval_samples ${MAX_EVAL_SAMPLES}"
+fi
+
 # ---- Weights & Biases reporting of the final per-dataset WER (default: auto) ----
 # After aggregation, scripts/eval_wandb_report.py logs ONE run per eval to a
 # SEPARATE project (WANDB_EVAL_PROJECT, default <PROJECT>_leaderboard_eval), named
@@ -308,8 +336,12 @@ fi
     echo "num_gpus:             ${NGPU}"
     echo "shuffle_seed:         ${SHUFFLE_SEED}"
     echo "max_eval_samples:     ${MAX_EVAL_SAMPLES}"
-    echo "datasets:             ${DATASETS_CSV}"
-    echo "cache_dir:            ${CACHE_DIR}"
+    if [[ -n "$LONGFORM_DIR" ]]; then
+        echo "longform_dir:         ${LONGFORM_DIR}"
+    else
+        echo "datasets:             ${DATASETS_CSV}"
+        echo "cache_dir:            ${CACHE_DIR}"
+    fi
     echo "results_dir:          ${RESULTS_DIR}"
     echo "report_wandb:         ${DO_WANDB}"
     echo "wandb_eval_project:   ${WANDB_EVAL_PROJECT}"
@@ -472,6 +504,7 @@ echo "*******SpeechLM leaderboard eval (heh engine, pooled shards over ${NGPU} G
 && echo "*** CKPT=${CKPT} ***" \
 && echo "*** CACHE_DIR=${CACHE_DIR} | CHUNK_SIZE=${CHUNK_SIZE:-<default>} | BATCH_SIZE=${BATCH_SIZE} | SEED=${SHUFFLE_SEED} ***" \
 && echo "*** heh: max_tok=${HEH_MAX_NEW_TOKENS} state_machine=${HEH_USE_STATE_MACHINE} offline=${HEH_USE_OFFLINE_EMBS} pad=${HEH_PAD_DURATION}s ***" \
+&& echo "*** system_prompt (auto-set for ${MODEL_CLASS##*.}): [\$(cat '${SHARD_DIR}/system_prompt.txt')] ***" \
 && nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader \
 && cd /code \
 && git rev-parse HEAD \
@@ -488,14 +521,8 @@ echo "*******SpeechLM leaderboard eval (heh engine, pooled shards over ${NGPU} G
 ${AVG_CLAUSE} \
 ${HF_CLAUSE} \
 && [ -f "${HF_CKPT_DIR}/config.json" ] || { echo "ERROR: HF model missing at ${HF_CKPT_DIR}/config.json"; exit 1; } \
-&& echo "==> Building ${NGPU} pooled shard manifests (seed=${SHUFFLE_SEED}) ..." \
-&& python /code/scripts/leaderboard_heh_shards.py build \
-      --cache_dir "${CACHE_DIR}" \
-      --datasets "${DATASETS_CSV}" \
-      --out_dir "${SHARD_DIR}" \
-      --num_shards ${NGPU} \
-      --shuffle_seed ${SHUFFLE_SEED} \
-      --max_eval_samples ${MAX_EVAL_SAMPLES} \
+&& echo "==> Building ${NGPU} shard manifests ..." \
+&& ${BUILD_INVOCATION} \
 && rm -f ${SHARD_DIR}/shard*_of*.generations.jsonl \
 && echo "Fanning ${NGPU} shards across ${NGPU} GPUs with the heh engine..." \
 && SP_HYDRA=\$(cat '${SHARD_DIR}/system_prompt.hydra_override') \
@@ -541,6 +568,7 @@ echo "*******SpeechLM leaderboard eval (sslm in-process, pooled shards over ${NG
 && echo "*** EXP=${EXP_NAME} | MODEL_CLASS=${MODEL_CLASS} ***" \
 && echo "*** CKPT=${CKPT} ***" \
 && echo "*** CACHE_DIR=${CACHE_DIR} | CHUNK_SIZE=${CHUNK_SIZE:-<default>} | BATCH_SIZE=${BATCH_SIZE} | SEED=${SHUFFLE_SEED} ***" \
+&& echo "*** system_prompt (auto-set for ${MODEL_CLASS##*.}): [\$(cat '${SHARD_DIR}/system_prompt.txt')] ***" \
 && nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader \
 && cd /code \
 && git rev-parse HEAD \
