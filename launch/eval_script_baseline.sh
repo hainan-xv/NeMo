@@ -62,14 +62,18 @@ SYSTEM_PROMPT="You are doing streaming speech recognition. You are given the tex
 
 # Distinguishes this run's RESULTS_DIR (the backend also appends _chunk<CHUNK_SIZE>).
 EVAL_TAG="baseline"
+# wandb run name encodes the decode config (delay is baked; targets are caps+punct),
+# so the only knob to surface is the chunk size. Logged to WANDB_EVAL_PROJECT.
+WANDB_RUN_NAME="${WANDB_RUN_NAME:-${EXP_NAME}_chunk${CHUNK_SIZE}}"
 
-export SYSTEM_PROMPT MODEL_CLASS CHUNK_SIZE EXP_NAME PROJECT EVAL_TAG
+export SYSTEM_PROMPT MODEL_CLASS CHUNK_SIZE EXP_NAME PROJECT EVAL_TAG WANDB_RUN_NAME
 
 echo "==> baseline SCRIPT leaderboard eval"
 echo "    exp_name:      ${EXP_NAME}"
 echo "    project:       ${PROJECT}"
 echo "    eval_tag:      ${EVAL_TAG}"
 echo "    chunk_size:    ${CHUNK_SIZE}"
+echo "    wandb_run:     ${WANDB_RUN_NAME}"
 echo "    system_prompt: ${SYSTEM_PROMPT}"
 
 # Locate eval_leaderboard_slurm.sh. Under sbatch, Slurm COPIES this script into a

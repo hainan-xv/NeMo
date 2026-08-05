@@ -78,6 +78,7 @@
 
 read_optional_token() { [[ -r "$1" ]] && tr -d '\r\n' < "$1" || true; }
 HF_TOKEN="$(read_optional_token "$HOME/.hf_token")"
+WANDB_TOKEN="$(read_optional_token "$HOME/.wandb_token")"
 
 mkdir -p slurm_out
 SLURM_ACCOUNT='llmservice'
@@ -223,6 +224,39 @@ MOUNTS="--container-mounts=${CODE_DIR}:/code,${H_DIR}:${H_DIR},${HFCACHE}:/hfcac
 
 NGPU=8
 
+# ---- Weights & Biases reporting of the final per-dataset WER (default: auto) ----
+# After aggregation, scripts/eval_wandb_report.py logs ONE run per eval to a
+# SEPARATE project (WANDB_EVAL_PROJECT, default <PROJECT>_leaderboard_eval), named
+# by the decode config (WANDB_RUN_NAME) so runs are self-describing/comparable.
+#   REPORT_WANDB: auto (report iff ~/.wandb_token exists) | 1 (force) | 0 (off)
+# Reporting is best-effort and NEVER fails the eval (the reporter no-ops on any
+# wandb/network/key error). Set WANDB_MODE=offline to log locally without a key.
+REPORT_WANDB="${REPORT_WANDB:-auto}"
+WANDB_EVAL_PROJECT="${WANDB_EVAL_PROJECT:-${PROJECT}_leaderboard_eval}"
+# Default run name encodes the decode config: <exp><_eval_tag><_chunkN>_<backend>
+# (the model wrappers usually pass a cleaner WANDB_RUN_NAME explicitly).
+WANDB_RUN_NAME="${WANDB_RUN_NAME:-${EXP_NAME}${EVAL_TAG_SUFFIX}${CHUNK_TAG}_${BACKEND}}"
+DO_WANDB=0
+case "$REPORT_WANDB" in
+    auto)          [[ -n "${WANDB_TOKEN:-}" ]] && DO_WANDB=1 ;;
+    1|true|yes|on)  DO_WANDB=1 ;;
+    0|false|no|off) DO_WANDB=0 ;;
+    *) echo "WARNING: unknown REPORT_WANDB='${REPORT_WANDB}' (expected auto|1|0); treating as off." >&2 ;;
+esac
+WANDB_MODE_EXPORT=""
+[[ -n "${WANDB_MODE:-}" ]] && WANDB_MODE_EXPORT="export WANDB_MODE='${WANDB_MODE}'; "
+WANDB_CLAUSE=""
+if [[ "$DO_WANDB" == "1" ]]; then
+    if [[ -z "${WANDB_TOKEN:-}" && "${WANDB_MODE:-}" != "offline" ]]; then
+        echo "==> NOTE: wandb reporting requested but no ~/.wandb_token found; the reporter will skip (set WANDB_MODE=offline to log locally)."
+    fi
+    echo "==> wandb reporting ON -> project='${WANDB_EVAL_PROJECT}' run='${WANDB_RUN_NAME}'"
+    # Best-effort: '|| true' + the reporter's own guards keep a wandb hiccup from
+    # failing an otherwise-successful eval. The token is embedded like HF_TOKEN
+    # below (same container_cmd.sh) -- keep RESULTS_DIR private.
+    WANDB_CLAUSE="&& { ${WANDB_MODE_EXPORT}export WANDB_API_KEY='${WANDB_TOKEN}'; python /code/scripts/eval_wandb_report.py --project '${WANDB_EVAL_PROJECT}' --run_name '${WANDB_RUN_NAME}' --results_dir '${RESULTS_DIR}' --group '${EXP_NAME}' --job_type '${BACKEND}' 2>&1 | tee '${RESULTS_DIR}/wandb_report.log' || true; }"
+fi
+
 # ---- Record this run's configuration under the (timestamped) eval folder ----
 {
     echo "# SpeechLM leaderboard eval run config"
@@ -261,6 +295,9 @@ NGPU=8
     echo "datasets:             ${DATASETS_CSV}"
     echo "cache_dir:            ${CACHE_DIR}"
     echo "results_dir:          ${RESULTS_DIR}"
+    echo "report_wandb:         ${DO_WANDB}"
+    echo "wandb_eval_project:   ${WANDB_EVAL_PROJECT}"
+    echo "wandb_run_name:       ${WANDB_RUN_NAME}"
 } > "${RESULTS_DIR}/run_config.yaml"
 echo "==> Wrote run config: ${RESULTS_DIR}/run_config.yaml"
 
@@ -474,6 +511,7 @@ ${HF_CLAUSE} \
 && echo "" \
 && echo "==================== Leaderboard WER (heh) ====================" \
 && python /code/scripts/leaderboard_heh_shards.py aggregate --out_dir "${SHARD_DIR}" 2>&1 | tee "${RESULTS_DIR}/aggregate.log" \
+${WANDB_CLAUSE} \
 && echo "" \
 && echo "Per-shard logs: ${RESULTS_DIR} | manifests+generations: ${SHARD_DIR}" \
 && exit \$fail
@@ -530,6 +568,7 @@ ${AVG_CLAUSE} \
 && echo "" \
 && echo "==================== Leaderboard WER ====================" \
 && python /code/scripts/speechlm_leaderboard_eval.py --aggregate --output_dir "${RESULTS_DIR}" 2>&1 | tee "${RESULTS_DIR}/aggregate.log" \
+${WANDB_CLAUSE} \
 && echo "" \
 && echo "Per-shard logs + generations under: ${RESULTS_DIR}" \
 && exit \$fail

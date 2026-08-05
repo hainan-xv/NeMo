@@ -128,8 +128,10 @@ PROJECT="${PROJECT:-SpeechlmRefactored}"
 MODEL_CLASS="${MODEL_CLASS:-nemo.collections.speechlm2.models.script_model.ScriptSTTModel}"
 # Distinguishes concurrent promptctl evals in RESULTS_DIR (backend adds _chunk<n>).
 EVAL_TAG="d${DELAY}_${REPR_TAG}"
+# wandb run name encodes the full decode config. Logged to WANDB_EVAL_PROJECT.
+WANDB_RUN_NAME="${WANDB_RUN_NAME:-${EXP_NAME}_d${DELAY}_${REPR_TAG}_chunk${CHUNK_SIZE}}"
 
-export SYSTEM_PROMPT MODEL_CLASS CHUNK_SIZE EXP_NAME PROJECT EVAL_TAG
+export SYSTEM_PROMPT MODEL_CLASS CHUNK_SIZE EXP_NAME PROJECT EVAL_TAG WANDB_RUN_NAME
 
 echo "==> prompt-controlled SCRIPT leaderboard eval"
 echo "    exp_name:      ${EXP_NAME}"
@@ -138,6 +140,7 @@ echo "    eval_tag:      ${EVAL_TAG}"
 echo "    cap/punct:     ${REPR_TAG}"
 echo "    delay:         ${DELAY} frames (max trained ${MAX_DELAY})"
 echo "    chunk_size:    ${CHUNK_SIZE}"
+echo "    wandb_run:     ${WANDB_RUN_NAME}"
 echo "    system_prompt: ${SYSTEM_PROMPT}"
 
 # Locate eval_leaderboard_slurm.sh (see note in eval_script_baseline.sh).

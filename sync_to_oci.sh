@@ -24,6 +24,7 @@ git add .gitignore sync_to_oci.sh sync_to_ord.sh
 # New tracked-dir scripts must be added explicitly (git add -u only stages
 # already-tracked files).
 git add scripts/asr_leaderboard_shard_decode.py
+git add scripts/eval_wandb_report.py
 # Model launch + eval scripts now live under the gitignored /launch/ dir (local-
 # only scratch). Most stay untracked -- copy them to the cluster manually if needed
 # (e.g. rsync launch/ to $OCI_REPO/launch/). The project-owned baseline launcher is
