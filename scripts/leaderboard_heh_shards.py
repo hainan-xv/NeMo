@@ -242,15 +242,27 @@ def cmd_build_longform(args) -> int:
     if not manifests:
         raise SystemExit(f"build_longform: no *.json/*.jsonl manifests under {args.longform_dir}")
 
-    items: List[dict] = []
+    # Collect ALL utts (tagged with their dataset key), then optionally cap to the
+    # globally SHORTEST `max_eval_samples` across every dataset (a pooled cap, NOT
+    # per-dataset/per-manifest). This is the quick_run path: e.g. cap=8 selects the
+    # 8 shortest recordings anywhere, which the greedy balancer below then spreads
+    # one-per-shard (one per GPU) -> a fast end-to-end smoke test. cap=0 keeps all.
+    all_items: List[dict] = []
     for mp in manifests:
         key = _longform_key(mp)
-        recs = read_longform_manifest(mp, args.max_eval_samples)
-        for r in recs:
+        for r in read_longform_manifest(mp, 0):
             r["key"] = key
-            items.append(r)
-    if not items:
+            all_items.append(r)
+    if not all_items:
         raise SystemExit("build_longform: no usable utterances found")
+
+    cap = int(args.max_eval_samples)
+    if cap and len(all_items) > cap:
+        items = sorted(all_items, key=_ensure_duration)[:cap]  # globally shortest N
+        print(f"build_longform: quick cap -> {cap} globally shortest utts "
+              f"(of {len(all_items)}); max selected clip {_ensure_duration(max(items, key=_ensure_duration)) / 60.0:.1f} min")
+    else:
+        items = all_items
 
     n = int(args.num_shards)
     # Greedy longest-processing-time: assign the longest clip to the currently
@@ -394,7 +406,8 @@ def main() -> int:
     bl.add_argument("--longform_dir", required=True, help="Root holding long-form NeMo manifests (*.json).")
     bl.add_argument("--out_dir", required=True)
     bl.add_argument("--num_shards", type=int, required=True)
-    bl.add_argument("--max_eval_samples", type=int, default=0, help="Cap utts per manifest (0 = all).")
+    bl.add_argument("--max_eval_samples", type=int, default=0,
+                    help="Cap to the globally shortest N utts across ALL datasets (quick_run; 0 = all).")
     bl.set_defaults(func=cmd_build_longform)
 
     a = sub.add_parser("aggregate", help="Reduce shard generations to per-dataset WER.")

@@ -54,8 +54,10 @@
 #   chunk  : encoder frames/chunk (optional, default 14) -- also via CHUNK_SIZE=
 #
 # Flags (may appear anywhere):
-#   --quick_run[=N]   decode only the first N (default 10) utts of EACH dataset
-#                     for a fast debug run; tags RESULTS_DIR + wandb run _quick.
+#   --quick_run[=N]   fast smoke test: decode the N (default 8) GLOBALLY SHORTEST
+#                     utterances across all datasets -- with N=8 that's one per GPU.
+#                     Tags RESULTS_DIR + wandb run _quick. (Not per-dataset; it's a
+#                     pipeline check, so it won't touch the hour-long clips.)
 #
 # Key env:
 #   LONGFORM_DIR   root holding the long-form manifests on lustre
@@ -78,7 +80,7 @@ mkdir -p slurm_out
 
 # --- Flags (--quick_run), stripped before reading positionals ---------------
 QUICK_RUN=0
-QUICK_N=10
+QUICK_N=8   # 8 = one per GPU: decode the 8 globally shortest utts, one per shard
 POSITIONAL=()
 for _arg in "$@"; do
     case "$_arg" in
@@ -185,7 +187,7 @@ echo "    exp_cfg:       ${EXP_CFG}"
 echo "    longform_dir:  ${LONGFORM_DIR}"
 [[ -n "$PRETRAINED_LLM_OVERRIDE" ]] && echo "    llm_mirror:    ${PRETRAINED_LLM_OVERRIDE}"
 [[ -n "$PRETRAINED_ASR_OVERRIDE" ]] && echo "    asr_mirror:    ${PRETRAINED_ASR_OVERRIDE}"
-(( QUICK_RUN )) && echo "    quick_run:     first ${QUICK_N} utts/dataset (MAX_EVAL_SAMPLES=${MAX_EVAL_SAMPLES})"
+(( QUICK_RUN )) && echo "    quick_run:     ${QUICK_N} globally shortest utts, one per GPU (MAX_EVAL_SAMPLES=${MAX_EVAL_SAMPLES})"
 echo "    wandb_run:     ${WANDB_RUN_NAME} (+_<launch-time> appended by backend)"
 echo "    system_prompt: ${SYSTEM_PROMPT}"
 
