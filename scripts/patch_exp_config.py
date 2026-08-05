@@ -17,6 +17,12 @@ for the heh leaderboard eval.
 Usage:  python patch_exp_config.py <src_cfg> <dst_cfg> <ckpt_path>
 
 Edits (mirrors scripts/speechlm_leaderboard_eval.load_model):
+  * pretrained_llm / pretrained_asr: if the config value is NOT a valid local
+    path (e.g. a bare Hub id ``Qwen/Qwen3-1.7B`` from an external/colleague model),
+    and an override is supplied via env (OVERRIDE_PRETRAINED_LLM /
+    OVERRIDE_PRETRAINED_ASR) that DOES exist locally, swap it in so the offline
+    (HF_HUB_OFFLINE=1) conversion can load it from the mounted lustre mirror. A
+    value that already exists locally is left untouched.
   * load_llm_weights=False (LLM weights come from the checkpoint).
   * pretrained_llm / pretrained_asr: kept as-is when the path EXISTS locally
     (OCI lustre paths are mounted -> stay offline); only mapped to a Hub id
@@ -28,6 +34,10 @@ import os
 import sys
 
 from omegaconf import OmegaConf
+
+
+def _is_local(path) -> bool:
+    return isinstance(path, str) and path.startswith("/") and os.path.exists(path)
 
 
 def _hubify(path: str) -> str:
@@ -53,6 +63,25 @@ def main() -> int:
     src, dst, ckpt_path = sys.argv[1], sys.argv[2], sys.argv[3]
     cfg = OmegaConf.load(src)
     m = cfg.model
+
+    # Local-mirror overrides for external checkpoints whose config references a
+    # bare Hub id (unreachable under HF_HUB_OFFLINE=1). Only applied when the
+    # existing value is NOT already a valid local path AND the override exists.
+    overrides = {
+        "pretrained_llm": os.environ.get("OVERRIDE_PRETRAINED_LLM", "").strip(),
+        "pretrained_asr": os.environ.get("OVERRIDE_PRETRAINED_ASR", "").strip(),
+    }
+    for key, ov in overrides.items():
+        if not ov or key not in m:
+            continue
+        cur = m[key]
+        if _is_local(cur):
+            continue  # config already points at a valid local mirror; keep it
+        if not _is_local(ov):
+            print(f"  {key}: override '{ov}' not found locally; leaving '{cur}' as-is")
+            continue
+        print(f"  {key}: {cur} -> {ov} (local-mirror override)")
+        m[key] = ov
 
     for key in ("pretrained_llm", "pretrained_asr"):
         if key in m and m[key]:

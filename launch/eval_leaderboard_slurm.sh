@@ -93,6 +93,13 @@ EXP_NAME="${1:-${EXP_NAME:-granary2_script}}"
 BACKEND="${BACKEND:-heh}"
 MODEL_CLASS="${MODEL_CLASS:-nemo.collections.speechlm2.models.script_model.ScriptSTTModel}"
 SYSTEM_PROMPT="${SYSTEM_PROMPT:-Transcribe the audio into text.}"
+# Local-mirror overrides for the HF conversion (heh backend) when an EXTERNAL
+# checkpoint's exp_config references a bare Hub id (e.g. Qwen/Qwen3-1.7B) that the
+# offline container can't fetch. patch_exp_config.py only swaps these in when the
+# config value isn't already a valid local path. Empty = no override (our models
+# already use mounted local paths). Set by launch/eval_interleave.sh.
+PRETRAINED_LLM_OVERRIDE="${PRETRAINED_LLM_OVERRIDE:-}"
+PRETRAINED_ASR_OVERRIDE="${PRETRAINED_ASR_OVERRIDE:-}"
 CHUNK_SIZE="${CHUNK_SIZE:-}"
 BATCH_SIZE="${BATCH_SIZE:-32}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-64}"
@@ -274,6 +281,8 @@ fi
     echo "project:              ${PROJECT}"
     echo "backend:              ${BACKEND}"
     echo "model_class:          ${MODEL_CLASS}"
+    [[ -n "$PRETRAINED_LLM_OVERRIDE" ]] && echo "pretrained_llm_override: ${PRETRAINED_LLM_OVERRIDE}"
+    [[ -n "$PRETRAINED_ASR_OVERRIDE" ]] && echo "pretrained_asr_override: ${PRETRAINED_ASR_OVERRIDE}"
     echo "checkpoint:           ${CKPT}"
     echo "run_averaging:        ${RUN_AVERAGING}"
     echo "force_average:        ${FORCE_AVERAGE}"
@@ -426,7 +435,8 @@ elif [[ -f "\$CKPT" && "\$CKPT" -nt "\${HF_DIR}/config.json" ]]; then
 fi
 if [[ "\$NEED" == "1" ]]; then
   echo "==> Converting ckpt -> HF format: \$HF_DIR"
-  python /code/scripts/patch_exp_config.py '${EXP_CFG}' "\$EXP_CFG_LOCAL" "\$CKPT"
+  OVERRIDE_PRETRAINED_LLM='${PRETRAINED_LLM_OVERRIDE}' OVERRIDE_PRETRAINED_ASR='${PRETRAINED_ASR_OVERRIDE}' \
+    python /code/scripts/patch_exp_config.py '${EXP_CFG}' "\$EXP_CFG_LOCAL" "\$CKPT"
   TMP_HF="\${HF_DIR}.tmp.\$\$"
   rm -rf "\$TMP_HF"
   CUDA_VISIBLE_DEVICES=0 python /code/examples/speechlm2/to_hf.py \\

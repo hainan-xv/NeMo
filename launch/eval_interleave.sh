@@ -48,11 +48,20 @@
 #   --quick_run[=N]   decode only the first N (default 10) utts of EACH dataset for
 #                     a fast debug run; tags RESULTS_DIR + wandb run with _quick.
 #
+# The colleague's exp_config references the LLM/ASR by bare Hub id
+# (e.g. Qwen/Qwen3-1.7B), which the offline (HF_HUB_OFFLINE=1) container can't
+# fetch during HF conversion. We therefore hand the backend the SAME local,
+# mounted mirrors our own SCRIPT configs use (heh's pretrained_models dir);
+# patch_exp_config.py only swaps them in when the config value isn't already a
+# valid local path. Override with PRETRAINED_LLM_OVERRIDE / PRETRAINED_ASR_OVERRIDE
+# if this baseline used a different LLM/encoder.
+#
 # Optional env (forwarded to eval_leaderboard_slurm.sh):
 #   CKPT=<path>       eval an arbitrary interleaved checkpoint (overrides variant)
 #   EXP_CFG=<path>    its exp_config.yaml (default: <ckpt>/../../exp_config.yaml)
 #   EXP_NAME=<name>   wandb group + results subdir (default: interleave_<variant>)
 #   PROJECT=SpeechlmRefactored (default; shares the SCRIPT eval wandb project)
+#   PRETRAINED_LLM_OVERRIDE / PRETRAINED_ASR_OVERRIDE   local LLM/ASR mirrors
 #   BACKEND=heh|sslm  BATCH_SIZE=...  CHUNK_SIZE=...  DATASETS="..."  SHUFFLE_SEED=1234
 # ============================================================================
 set -euo pipefail
@@ -107,11 +116,18 @@ PROJECT="${PROJECT:-SpeechlmRefactored}"
 MODEL_CLASS="${MODEL_CLASS:-nemo.collections.speechlm2.models.streaming_stt_model.StreamingSTTModel}"
 # Interleaved model's default ASR prompt (its training/inference framing).
 SYSTEM_PROMPT="${SYSTEM_PROMPT:-Transcribe the audio into text.}"
+# Local, mounted mirrors of the LLM + ASR (identical to our SCRIPT configs, since
+# this is the same granary2 / Qwen3-1.7B / nemotron-streaming family). The backend
+# only applies these if the checkpoint's exp_config value isn't a valid local path
+# (i.e. it's a bare Hub id -> unreachable offline). Under H_DIR mount.
+PRETRAINED_LLM_OVERRIDE="${PRETRAINED_LLM_OVERRIDE:-/lustre/fsw/portfolios/llmservice/users/heh/pretrained_models/huggingface/Qwen/Qwen3-1.7B}"
+PRETRAINED_ASR_OVERRIDE="${PRETRAINED_ASR_OVERRIDE:-/lustre/fsw/portfolios/llmservice/users/heh/pretrained_models/huggingface/nvidia/nemotron-speech-streaming-en-0.6b/nemotron-speech-streaming-en-0.6b.nemo}"
 # quick-run marker only; the backend also appends _chunk<n> + the launch timestamp.
 EVAL_TAG=""
 (( QUICK_RUN )) && EVAL_TAG="quick"
 
 export SYSTEM_PROMPT MODEL_CLASS EXP_NAME PROJECT EVAL_TAG CKPT EXP_CFG
+export PRETRAINED_LLM_OVERRIDE PRETRAINED_ASR_OVERRIDE
 
 echo "==> interleaved-baseline leaderboard eval"
 echo "    variant:       ${VARIANT}"
@@ -120,6 +136,8 @@ echo "    project:       ${PROJECT}"
 echo "    model_class:   ${MODEL_CLASS}"
 echo "    ckpt:          ${CKPT}"
 echo "    exp_cfg:       ${EXP_CFG}"
+echo "    llm_mirror:    ${PRETRAINED_LLM_OVERRIDE}"
+echo "    asr_mirror:    ${PRETRAINED_ASR_OVERRIDE}"
 (( QUICK_RUN )) && echo "    quick_run:     first ${QUICK_N} utts/dataset (MAX_EVAL_SAMPLES=${MAX_EVAL_SAMPLES})"
 echo "    system_prompt: ${SYSTEM_PROMPT}"
 echo "    wandb_run:     ${EXP_NAME}${QUICK_SUFFIX} (+_chunk/_<launch-time> appended by backend)"
