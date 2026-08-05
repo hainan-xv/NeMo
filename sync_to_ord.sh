@@ -24,9 +24,14 @@ git add -u
 git add .gitignore sync_to_ord.sh
 # Model launch + eval scripts now live under the gitignored /launch/ dir (local-
 # only scratch); copy most of them to the cluster manually if needed. The project-
-# owned launchers are force-added so they sync through git.
+# owned launchers are force-added so they sync through git. This covers the two
+# SCRIPT training launchers, the two SCRIPT inference launchers, and the shared
+# pooled-shard eval backend they exec (eval_leaderboard_slurm.sh).
 git add -f launch/script_baseline.sh
 git add -f launch/script_promptctl.sh
+git add -f launch/eval_script_baseline.sh
+git add -f launch/eval_script_promptctl.sh
+git add -f launch/eval_leaderboard_slurm.sh
 
 if ! git diff --cached --quiet; then
   message="${1:-Sync ORD code $(date +%Y%m%d_%H%M%S)}"
