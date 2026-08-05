@@ -35,6 +35,11 @@
 #   sbatch launch/eval_script_baseline.sh
 #   CHUNK_SIZE=7  sbatch launch/eval_script_baseline.sh
 #   for c in 2 7 14 28; do CHUNK_SIZE=$c sbatch launch/eval_script_baseline.sh; done
+#   sbatch launch/eval_script_baseline.sh --quick_run        # smoke test, 10 utts/ds
+#
+# Flags:
+#   --quick_run[=N]   decode only the first N (default 10) utts of EACH dataset for
+#                     a fast smoke test; tags RESULTS_DIR + wandb run with _quick.
 #
 # Optional env (forwarded to eval_leaderboard_slurm.sh):
 #   CHUNK_SIZE=14 (default)     BACKEND=heh|sslm     BATCH_SIZE=...
@@ -45,6 +50,24 @@
 set -euo pipefail
 
 mkdir -p slurm_out
+
+# --- Flags (--quick_run) --------------------------------------------------
+# --quick_run caps decoding to the first N (default 10) utts/dataset via the
+# backend's MAX_EVAL_SAMPLES (first-N per dataset on both backends).
+QUICK_RUN=0
+QUICK_N=10
+for _arg in "$@"; do
+    case "$_arg" in
+        --quick_run|--quick-run) QUICK_RUN=1 ;;
+        --quick_run=*|--quick-run=*) QUICK_RUN=1; QUICK_N="${_arg#*=}" ;;
+        *) echo "WARNING: ignoring unrecognized argument '${_arg}' (baseline eval takes no positional args)." >&2 ;;
+    esac
+done
+QUICK_SUFFIX=""
+if (( QUICK_RUN )); then
+    export MAX_EVAL_SAMPLES="${MAX_EVAL_SAMPLES:-$QUICK_N}"
+    QUICK_SUFFIX="_quick"
+fi
 
 # --- Model + run identity ---
 EXP_NAME="${EXP_NAME:-granary2_script_baseline}"
@@ -61,10 +84,10 @@ CHUNK_SIZE="${CHUNK_SIZE:-14}"
 SYSTEM_PROMPT="You are doing streaming speech recognition. You are given the text history so far, followed by the audio representation of the next chunk; output the words spoken in that chunk. The text history is:"
 
 # Distinguishes this run's RESULTS_DIR (the backend also appends _chunk<CHUNK_SIZE>).
-EVAL_TAG="baseline"
+EVAL_TAG="baseline${QUICK_SUFFIX}"
 # wandb run name encodes the decode config (delay is baked; targets are caps+punct),
 # so the only knob to surface is the chunk size. Logged to WANDB_EVAL_PROJECT.
-WANDB_RUN_NAME="${WANDB_RUN_NAME:-${EXP_NAME}_chunk${CHUNK_SIZE}}"
+WANDB_RUN_NAME="${WANDB_RUN_NAME:-${EXP_NAME}_chunk${CHUNK_SIZE}${QUICK_SUFFIX}}"
 
 export SYSTEM_PROMPT MODEL_CLASS CHUNK_SIZE EXP_NAME PROJECT EVAL_TAG WANDB_RUN_NAME
 
@@ -73,6 +96,7 @@ echo "    exp_name:      ${EXP_NAME}"
 echo "    project:       ${PROJECT}"
 echo "    eval_tag:      ${EVAL_TAG}"
 echo "    chunk_size:    ${CHUNK_SIZE}"
+(( QUICK_RUN )) && echo "    quick_run:     first ${QUICK_N} utts/dataset (MAX_EVAL_SAMPLES=${MAX_EVAL_SAMPLES})"
 echo "    wandb_run:     ${WANDB_RUN_NAME}"
 echo "    system_prompt: ${SYSTEM_PROMPT}"
 

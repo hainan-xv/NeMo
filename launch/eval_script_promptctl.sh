@@ -44,6 +44,11 @@
 #   sbatch launch/eval_script_promptctl.sh cap   punct   0  7   # low-latency, chunk 7
 #   sbatch launch/eval_script_promptctl.sh nocap nopunct 4  28  # high-accuracy, chunk 28
 #   for d in 0 2 4; do sbatch launch/eval_script_promptctl.sh cap punct $d 14; done  # delay sweep
+#   sbatch launch/eval_script_promptctl.sh --quick_run cap punct 2 14   # smoke test
+#
+# Flags (may appear anywhere among the positional args):
+#   --quick_run[=N]   decode only the first N (default 10) utts of EACH dataset for
+#                     a fast smoke test; tags RESULTS_DIR + wandb run with _quick.
 #
 # Each run gets its own RESULTS_DIR via EVAL_TAG=d<delay>_<cap>_<punct> + the
 # backend's _chunk<chunk> tag + slurm job id; concurrent runs for the same exp
@@ -57,6 +62,27 @@
 set -euo pipefail
 
 mkdir -p slurm_out
+
+# --- Flags (--quick_run) --------------------------------------------------
+# Strip --quick_run[=N] out of the argument list FIRST so the positional
+# cap/punct/delay/chunk parsing below is unaffected by flag position. --quick_run
+# caps decoding to the first N (default 10) utts/dataset via MAX_EVAL_SAMPLES.
+QUICK_RUN=0
+QUICK_N=10
+POSITIONAL=()
+for _arg in "$@"; do
+    case "$_arg" in
+        --quick_run|--quick-run) QUICK_RUN=1 ;;
+        --quick_run=*|--quick-run=*) QUICK_RUN=1; QUICK_N="${_arg#*=}" ;;
+        *) POSITIONAL+=("$_arg") ;;
+    esac
+done
+set -- "${POSITIONAL[@]+"${POSITIONAL[@]}"}"
+QUICK_SUFFIX=""
+if (( QUICK_RUN )); then
+    export MAX_EVAL_SAMPLES="${MAX_EVAL_SAMPLES:-$QUICK_N}"
+    QUICK_SUFFIX="_quick"
+fi
 
 # --- Operating point (positional, all optional with defaults) ---
 CAP_ARG="${1:-cap}"
@@ -127,9 +153,9 @@ EXP_NAME="${EXP_NAME:-granary2_script_promptctl}"
 PROJECT="${PROJECT:-SpeechlmRefactored}"
 MODEL_CLASS="${MODEL_CLASS:-nemo.collections.speechlm2.models.script_model.ScriptSTTModel}"
 # Distinguishes concurrent promptctl evals in RESULTS_DIR (backend adds _chunk<n>).
-EVAL_TAG="d${DELAY}_${REPR_TAG}"
+EVAL_TAG="d${DELAY}_${REPR_TAG}${QUICK_SUFFIX}"
 # wandb run name encodes the full decode config. Logged to WANDB_EVAL_PROJECT.
-WANDB_RUN_NAME="${WANDB_RUN_NAME:-${EXP_NAME}_d${DELAY}_${REPR_TAG}_chunk${CHUNK_SIZE}}"
+WANDB_RUN_NAME="${WANDB_RUN_NAME:-${EXP_NAME}_d${DELAY}_${REPR_TAG}_chunk${CHUNK_SIZE}${QUICK_SUFFIX}}"
 
 export SYSTEM_PROMPT MODEL_CLASS CHUNK_SIZE EXP_NAME PROJECT EVAL_TAG WANDB_RUN_NAME
 
@@ -140,6 +166,7 @@ echo "    eval_tag:      ${EVAL_TAG}"
 echo "    cap/punct:     ${REPR_TAG}"
 echo "    delay:         ${DELAY} frames (max trained ${MAX_DELAY})"
 echo "    chunk_size:    ${CHUNK_SIZE}"
+(( QUICK_RUN )) && echo "    quick_run:     first ${QUICK_N} utts/dataset (MAX_EVAL_SAMPLES=${MAX_EVAL_SAMPLES})"
 echo "    wandb_run:     ${WANDB_RUN_NAME}"
 echo "    system_prompt: ${SYSTEM_PROMPT}"
 

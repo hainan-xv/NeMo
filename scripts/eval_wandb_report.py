@@ -19,9 +19,14 @@ Backend-agnostic: both pooled-shard aggregators
 tab-separated ``RESULT<TAB>key<TAB>wer<TAB>time<TAB>n[<TAB>lat]`` lines, which the
 launcher (``launch/eval_leaderboard_slurm.sh``) tees to ``aggregate.log``. This
 script parses those + the ``run_config.yaml`` the launcher writes, and logs ONE
-wandb run -- named by the decode config -- with per-dataset WER + the macro
-average as metrics and the full run config as wandb config, into a SEPARATE
-project from training.
+wandb run -- named by the decode config -- into a SEPARATE project from training.
+
+Per-dataset WER is logged as a training-like STEPPED series: one step per dataset
+in a fixed (alphabetical) order, then the macro average as the final step. So the
+default ``wer`` line chart shows a single line per run over the datasets (+ avg at
+the end), and several runs overlay for a dataset-by-dataset comparison. The same
+numbers are also written to the run SUMMARY (``wer/avg`` + per-dataset ``wer/<key>``)
+so the project Runs table can sort/compare across runs, plus a ``per_dataset`` table.
 
 It must NEVER fail the eval: a missing wandb install / API key / network error is
 caught and turned into a warning with exit code 0.
@@ -116,6 +121,14 @@ def main() -> int:
         _log("[wandb-report] no RESULT rows parsed; skipping wandb (nothing to report).")
         return 0
 
+    # Fix a deterministic dataset order (alphabetical by key) so the stepped WER
+    # series below lines up ACROSS runs: step 0 is always the same dataset in every
+    # run (e.g. ami/test), step 1 the next, etc. -> overlaying two runs' `wer` line
+    # charts compares them dataset-by-dataset. (The aggregators already emit rows in
+    # sorted-key order, but we re-sort here to be robust.)
+    rows = sorted(rows, key=lambda r: r["key"])
+    dataset_order = [r["key"] for r in rows]
+
     # Macro average == the 'Average' both aggregators print (mean over datasets).
     avg = sum(r["wer"] for r in rows) / len(rows)
     lat_vals = [r["lat"] for r in rows if r["lat"] is not None]
@@ -130,6 +143,8 @@ def main() -> int:
         cfg.setdefault("text_repr", m.group(2))
     cfg["macro_wer"] = avg
     cfg["num_datasets"] = len(rows)
+    # step index -> dataset legend (so a reader can map x=step back to a dataset).
+    cfg["dataset_order"] = dataset_order
 
     try:
         import wandb
@@ -161,31 +176,51 @@ def main() -> int:
         return 0
 
     try:
-        metrics = {}
-        for r in rows:
-            metrics[f"wer/{r['key']}"] = r["wer"]
-            if r["n"] is not None:
-                metrics[f"n/{r['key']}"] = r["n"]
+        # Training-like stepped series: emit ONE step per dataset (in the fixed
+        # dataset_order), then the macro average as the final step. Plotted as
+        # `wer` vs step, each run is a single line over the 8 datasets (+ avg at the
+        # end), so several runs overlay directly for a dataset-by-dataset compare.
+        # We log an explicit, monotonically-increasing `step=` so mixing with the
+        # summary/table writes below is safe.
+        for i, r in enumerate(rows):
+            step_metrics = {"wer": r["wer"]}
             if r["lat"] is not None:
-                metrics[f"latency/{r['key']}"] = r["lat"]
-        metrics["wer/avg"] = avg
+                step_metrics["latency"] = r["lat"]
+            if r["n"] is not None:
+                step_metrics["n"] = r["n"]
+            wandb.log(step_metrics, step=i)
+        avg_step = len(rows)  # last time-step == the average
+        avg_metrics = {"wer": avg}
         if avg_lat is not None:
-            metrics["latency/avg"] = avg_lat
-        wandb.log(metrics)
+            avg_metrics["latency"] = avg_lat
+        wandb.log(avg_metrics, step=avg_step)
 
-        # Overview columns.
+        # Runs-table columns (summary, step-independent): sortable macro avg + a
+        # per-dataset `wer/<key>` so the project Runs table can compare across runs.
         run.summary["wer/avg"] = avg
         if avg_lat is not None:
             run.summary["latency/avg"] = avg_lat
-
-        # Sortable per-dataset table.
-        table = wandb.Table(columns=["dataset", "wer", "n", "latency"])
         for r in rows:
-            table.add_data(r["key"], r["wer"], r["n"], r["lat"])
-        wandb.log({"per_dataset": table})
+            run.summary[f"wer/{r['key']}"] = r["wer"]
+            if r["lat"] is not None:
+                run.summary[f"latency/{r['key']}"] = r["lat"]
 
         _log(f"[wandb-report] logged {len(rows)} datasets (avg WER={avg:.2f}%) to "
              f"project='{args.project}' run='{args.run_name}'.")
+        _log("[wandb-report] step->dataset: " +
+             ", ".join(f"{i}={k}" for i, k in enumerate(dataset_order)) +
+             f", {avg_step}=Average")
+
+        # Sortable per-dataset table (also encodes step<->dataset mapping via idx).
+        # Isolated: a wandb Table writes an artifact, which can fail on read-only
+        # cache dirs; that must not drop the scalar series/summary logged above.
+        try:
+            table = wandb.Table(columns=["step", "dataset", "wer", "n", "latency"])
+            for i, r in enumerate(rows):
+                table.add_data(i, r["key"], r["wer"], r["n"], r["lat"])
+            wandb.log({"per_dataset": table}, step=avg_step)
+        except Exception as e:  # noqa: BLE001
+            _log(f"[wandb-report] per_dataset table skipped ({e}); scalars already logged.")
     except Exception as e:  # noqa: BLE001
         _log(f"[wandb-report] logging error ({e}); continuing (eval unaffected).")
     finally:
