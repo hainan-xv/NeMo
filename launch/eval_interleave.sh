@@ -27,8 +27,10 @@
 #
 # The interleaved model is a plain ASR model: MODEL_CLASS=StreamingSTTModel and
 # the classic prompt "Transcribe the audio into text." (its training/inference
-# default). Its 3-frame delay + chunking are baked into the weights, so the only
-# inference knob is CHUNK_SIZE (env; default = model's own, i.e. unset here).
+# default). Its 3-frame delay is baked into the weights; the one inference knob is
+# CHUNK_SIZE (encoder frames/chunk). This is a MULTI chunk-size ("mcs") model, so
+# with no override the backend uses the model's default (the LONGEST it saw, 28).
+# We therefore default CHUNK_SIZE=14 and let you change it (env or 2nd arg).
 #
 # By default it logs into the SAME wandb eval project as the SCRIPT evals
 # (PROJECT=SpeechlmRefactored -> <PROJECT>_leaderboard_eval), grouped by EXP_NAME
@@ -36,13 +38,16 @@
 # runs directly.
 #
 # Usage (from the NeMo79 repo root on OCI):
-#   sbatch launch/eval_interleave.sh                       # noblank_v2 (r1), full suite
-#   sbatch launch/eval_interleave.sh readwrite             # the read-write variant (r2)
-#   sbatch launch/eval_interleave.sh --quick_run           # noblank, 10 utts/ds smoke test
-#   sbatch launch/eval_interleave.sh readwrite --quick_run # readwrite smoke test
+#   sbatch launch/eval_interleave.sh                       # noblank_v2 (r1), chunk 14
+#   sbatch launch/eval_interleave.sh readwrite             # read-write variant (r2), chunk 14
+#   sbatch launch/eval_interleave.sh noblank 7             # chunk size 7
+#   CHUNK_SIZE=28 sbatch launch/eval_interleave.sh         # chunk size 28 (env form)
+#   sbatch launch/eval_interleave.sh --quick_run           # noblank, chunk 14, 10 utts/ds
+#   for c in 7 14 28; do sbatch launch/eval_interleave.sh noblank $c; done  # chunk sweep
 #
 # Positional:
 #   variant : noblank (default) | readwrite   -- which colleague checkpoint to eval
+#   chunk   : encoder frames/chunk (default 14) -- also settable via CHUNK_SIZE=
 #
 # Flags (may appear anywhere among the args):
 #   --quick_run[=N]   decode only the first N (default 10) utts of EACH dataset for
@@ -106,6 +111,18 @@ case "$VARIANT" in
         ;;
 esac
 
+# --- Chunk size: 2nd positional wins, else CHUNK_SIZE env, else 14 ---
+CHUNK_ARG="${2:-}"
+if [[ -n "$CHUNK_ARG" ]]; then
+    if ! [[ "$CHUNK_ARG" =~ ^[0-9]+$ ]] || (( CHUNK_ARG < 1 )); then
+        echo "ERROR: chunk must be a positive integer (got '$CHUNK_ARG')" >&2
+        exit 1
+    fi
+    CHUNK_SIZE=$((10#$CHUNK_ARG))
+else
+    CHUNK_SIZE="${CHUNK_SIZE:-14}"
+fi
+
 # --- Model + run identity ---
 CKPT="${CKPT:-$CKPT_DEFAULT}"
 # The exp_config.yaml sits next to the checkpoints/ dir: <...>/<run>/<run>/exp_config.yaml.
@@ -126,7 +143,7 @@ PRETRAINED_ASR_OVERRIDE="${PRETRAINED_ASR_OVERRIDE:-/lustre/fsw/portfolios/llmse
 EVAL_TAG=""
 (( QUICK_RUN )) && EVAL_TAG="quick"
 
-export SYSTEM_PROMPT MODEL_CLASS EXP_NAME PROJECT EVAL_TAG CKPT EXP_CFG
+export SYSTEM_PROMPT MODEL_CLASS EXP_NAME PROJECT EVAL_TAG CKPT EXP_CFG CHUNK_SIZE
 export PRETRAINED_LLM_OVERRIDE PRETRAINED_ASR_OVERRIDE
 
 echo "==> interleaved-baseline leaderboard eval"
@@ -134,6 +151,7 @@ echo "    variant:       ${VARIANT}"
 echo "    exp_name:      ${EXP_NAME}"
 echo "    project:       ${PROJECT}"
 echo "    model_class:   ${MODEL_CLASS}"
+echo "    chunk_size:    ${CHUNK_SIZE}"
 echo "    ckpt:          ${CKPT}"
 echo "    exp_cfg:       ${EXP_CFG}"
 echo "    llm_mirror:    ${PRETRAINED_LLM_OVERRIDE}"
