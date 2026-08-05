@@ -367,6 +367,12 @@ def main(cfg: StreamingSTTEvalConfig):
                 custom = getattr(cut, "custom", None) or {}
                 if "dataset_key" in custom:
                     record["dataset_key"] = custom["dataset_key"]
+                # Windowed long-form eval tags each row with its parent utterance
+                # id + window order, so the reduce step can concatenate a whole
+                # recording's per-window hyps back together (offset/duration cuts).
+                for _k in ("utt_id", "window_index"):
+                    if _k in custom:
+                        record[_k] = custom[_k]
                 # Per-utterance word-emission latency (proxy) + word count, so the
                 # reduce step can compute a word-weighted per-dataset average.
                 if wl:

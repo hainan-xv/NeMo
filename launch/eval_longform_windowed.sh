@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH -A nemotron_speechprod_asr
-#SBATCH -J nemotron_speechprod_asr:sslm-longform-eval
+#SBATCH -J nemotron_speechprod_asr:sslm-longform-win
 #SBATCH -p batch_block1,batch_block3,batch_block4
 #SBATCH -N 1
 #SBATCH --gpus-per-node=8
@@ -14,73 +14,64 @@
 #SBATCH --output=slurm_out/%x=%j --error=slurm_out/%x=%j
 
 # ============================================================================
-# LONG-FORM eval of a SINGLE checkpoint (SCRIPT *or* interleaving), so we can
-# compare long-form robustness across the two designs on the SAME footing.
+# WINDOWED long-form eval of a SINGLE checkpoint (SCRIPT *or* interleaving).
 #
-# Long-form sets are a handful of VERY long recordings (minutes to ~1h) shipped
-# as NeMo manifests under LONGFORM_DIR (default 3 sets: tedlium_longform,
-# earnings22_longform, apptek_callcenter_dialogues). Their audio_filepath is
-# RELATIVE to each manifest's own dir; the shard builder
-# (leaderboard_heh_shards.py build_longform) resolves them to absolute paths,
-# tags each utt with its dataset (parent-dir name, so apptek's 14 per-locale
-# manifests pool into ONE key), and DURATION-balances the few huge clips across
-# the 8 GPUs (greedy longest-processing-time) so wall time ~= total_dur / 8.
+# A SIMPLER long-form method than eval_longform.sh's whole-recording streaming:
+# chop each recording into fixed ~WINDOW_SEC-second windows (snapped to a whole
+# number of chunks, since one chunk = chunk_size * 0.08s; e.g. 60s -> 54 x 14
+# frames = 60.48s), decode each window INDEPENDENTLY (a fresh decode with no
+# cross-window state / no growing context), then concatenate a recording's
+# per-window hypotheses in order to form its full transcript and score WER
+# against the full reference. This bounds per-decode context (fast, no ~1h
+# streaming state) at the cost of losing context across window boundaries.
 #
-# It then execs the SAME pooled-shard backend as every other eval
-# (launch/eval_leaderboard_slurm.sh, heh engine): convert the ckpt to HF once,
-# decode each shard with streaming_stt_generate.py (state-machine, batch_size=1
-# since one clip can be ~1h), aggregate per-dataset WER, and log to wandb.
+# Windows are referenced as offset/duration into the original audio (NO audio is
+# rewritten), tagged with utt_id + window_index; the window aggregator stitches
+# them back. Same backend as the other evals (launch/eval_leaderboard_slurm.sh,
+# heh engine + convert-once + wandb); only the shard build + reduce differ, keyed
+# by LONGFORM_WINDOW_SEC.
 #
-# Unlike eval_script_baseline.sh (which resolves a ckpt from our results tree),
-# this takes the ckpt PATH directly (works for both our SCRIPT runs and a
-# colleague's external interleaving runs) and derives EXP_CFG as the exp_config
-# sibling of the checkpoint's checkpoints/ dir.
+# Takes the ckpt PATH directly (works for our SCRIPT runs AND a colleague's
+# external interleaving runs) and derives EXP_CFG as the exp_config sibling of the
+# checkpoint's checkpoints/ dir. The prompt is auto-set per model type.
 #
-# !!! SCALE WARNING: the full 3-set suite is ~420h of audio (~53h/GPU) -- days
-# of streaming decode. Start with --quick_run, and/or point LONGFORM_DIR at a
-# single dataset subdir (e.g. .../longform/tedlium_longform), and/or cap with
-# MAX_EVAL_SAMPLES=. Bump #SBATCH -t for real runs.
+# !!! SCALE: windowing does NOT reduce total audio (~420h for the full 3-set
+# suite), it only bounds per-decode length; a full run is still huge. Start with
+# --quick_run, scope via LONGFORM_DIR=.../<one_dataset>, and/or MAX_EVAL_SAMPLES=.
 #
 # Usage (from the NeMo79 repo root on OCI):
-#   sbatch launch/eval_longform.sh script    <ckpt.ckpt>            # SCRIPT model
-#   sbatch launch/eval_longform.sh interleave <ckpt.ckpt>           # interleaving model
-#   sbatch launch/eval_longform.sh script    <ckpt.ckpt> 7          # chunk size 7
-#   sbatch launch/eval_longform.sh script    <ckpt.ckpt> --quick_run
-#   sbatch launch/eval_longform.sh script    <ckpt.ckpt> --stratified   # small set
-#   MAX_RANGE_MIN=40 sbatch launch/eval_longform.sh script <ckpt.ckpt> --stratified
-#   LONGFORM_DIR=/lustre/.../tedlium_longform sbatch launch/eval_longform.sh script <ckpt.ckpt> --quick_run
+#   sbatch launch/eval_longform_windowed.sh script     <ckpt.ckpt>            # 60s windows
+#   sbatch launch/eval_longform_windowed.sh interleave <ckpt.ckpt>
+#   WINDOW_SEC=30 sbatch launch/eval_longform_windowed.sh script <ckpt.ckpt>  # 30s windows
+#   sbatch launch/eval_longform_windowed.sh script <ckpt.ckpt> 14 --quick_run
 #
 # Positional (order matters):
 #   type   : script | interleave   -- selects MODEL_CLASS + default prompt
 #   ckpt   : full path to the .ckpt to evaluate (REQUIRED)
-#   chunk  : encoder frames/chunk (optional, default 14) -- also via CHUNK_SIZE=
+#   chunk  : encoder frames/chunk (optional, default 14) -- windows snap to a multiple
 #
 # Flags (may appear anywhere):
-#   --quick_run[=N]   fast smoke test: decode the N (default 8) GLOBALLY SHORTEST
-#                     utterances across all datasets -- with N=8 that's one per GPU.
-#                     Tags RESULTS_DIR + wandb run _quick. (Not per-dataset; it's a
-#                     pipeline check, so it won't touch the hour-long clips.)
-#   --stratified[=K]  the SMALL representative set: the shortest K (default 8) utts
-#                     in each minute bucket (2-5,5-10,10-20,20-40,40-60), with the
-#                     i-th shortest of every bucket on GPU i -- so all 8 GPUs get the
-#                     same short..long duration mix. Buckets stop at MAX_RANGE_MIN
-#                     (default 60) so the multi-hour tail is excluded. Tags runs
-#                     _strat<max>m; takes precedence over --quick_run.
+#   --quick_run[=N]   fast smoke test: window only the N (default 8) globally
+#                     SHORTEST recordings; tags RESULTS_DIR + wandb run _quick.
+#   --stratified[=K]  the SMALL representative set: shortest K (default 8) utts per
+#                     minute bucket (2-5,...,40-60, capped at MAX_RANGE_MIN=60),
+#                     which are THEN windowed. Tags runs _strat<max>m; takes
+#                     precedence over --quick_run.
 #
 # Key env:
-#   LONGFORM_DIR   root holding the long-form manifests on lustre
-#                  (default /lustre/fsw/portfolios/nemotron/users/hainanx/longform).
-#                  Point at a single dataset subdir to eval just that set.
-#   SYSTEM_PROMPT  decode prompt. Defaults per type (see below); OVERRIDE this for
-#                  a prompt-controlled SCRIPT model so it matches how it was trained.
-#   EXP_NAME       wandb group + results subdir (default longform_<type>). Set a
-#                  distinct name per checkpoint to keep runs from grouping together.
+#   WINDOW_SEC     target window length in seconds (default 60; snapped to a whole
+#                  number of chunk_size-frame chunks by the builder).
+#   LONGFORM_DIR   long-form manifests root on lustre (default
+#                  /lustre/fsw/portfolios/nemotron/users/hainanx/longform); point at
+#                  a single dataset subdir to scope down.
+#   SYSTEM_PROMPT  decode prompt (defaults per type; OVERRIDE for a prompt-controlled
+#                  SCRIPT model to match its training prompt).
+#   EXP_NAME       wandb group + results subdir (default longform_win_<type>).
 #   PROJECT        SpeechlmRefactored (default) -> wandb project <PROJECT>_longform_eval.
 #   EXP_CFG        exp_config.yaml (default: sibling of the ckpt's checkpoints/ dir).
-#   PRETRAINED_LLM_OVERRIDE / PRETRAINED_ASR_OVERRIDE   local LLM/ASR mirrors used
-#                  during HF conversion when the exp_config references a bare Hub id
-#                  (default: heh's Qwen3-1.7B + nemotron-streaming, for interleave).
-#   CHUNK_SIZE / BATCH_SIZE(=1) / MAX_EVAL_SAMPLES / REPORT_WANDB=auto|1|0
+#   PRETRAINED_LLM_OVERRIDE / PRETRAINED_ASR_OVERRIDE   local LLM/ASR mirrors for
+#                  HF conversion of an external (bare-Hub-id) exp_config.
+#   CHUNK_SIZE / BATCH_SIZE(=8) / MAX_EVAL_SAMPLES / REPORT_WANDB=auto|1|0
 # ============================================================================
 set -euo pipefail
 
@@ -88,9 +79,9 @@ mkdir -p slurm_out
 
 # --- Flags (--quick_run / --stratified), stripped before reading positionals -
 QUICK_RUN=0
-QUICK_N=8   # 8 = one per GPU: decode the 8 globally shortest utts, one per shard
+QUICK_N=8   # window only the 8 globally shortest recordings for a fast smoke test
 STRATIFIED=0
-STRAT_K=8   # per minute-bucket count (8 => one per GPU per bucket)
+STRAT_K=8   # per minute-bucket count for the small range-stratified set
 POSITIONAL=()
 for _arg in "$@"; do
     case "$_arg" in
@@ -103,9 +94,8 @@ for _arg in "$@"; do
 done
 set -- "${POSITIONAL[@]+"${POSITIONAL[@]}"}"
 
-# --stratified builds the small range-stratified set (shortest STRAT_K per minute
-# bucket up to MAX_RANGE_MIN, one bucket per GPU); it defines its own selection so
-# it takes precedence over --quick_run.
+# --stratified selects the small range-stratified set (shortest STRAT_K per minute
+# bucket up to MAX_RANGE_MIN); windows are then duration-balanced across GPUs.
 RUN_SUFFIX=""
 if (( STRATIFIED )); then
     export LONGFORM_STRATIFIED=1
@@ -124,7 +114,7 @@ CKPT_ARG="${2:-}"
 CHUNK_ARG="${3:-}"
 
 if [[ -z "$TYPE" || -z "$CKPT_ARG" ]]; then
-    echo "usage: sbatch launch/eval_longform.sh <script|interleave> <ckpt.ckpt> [chunk] [--quick_run]" >&2
+    echo "usage: sbatch launch/eval_longform_windowed.sh <script|interleave> <ckpt.ckpt> [chunk] [--quick_run]" >&2
     exit 1
 fi
 if [[ ! -f "$CKPT_ARG" ]]; then
@@ -143,6 +133,9 @@ else
     CHUNK_SIZE="${CHUNK_SIZE:-14}"
 fi
 
+# Window length (seconds); the builder snaps it to a whole number of chunks.
+WINDOW_SEC="${WINDOW_SEC:-60}"
+
 # --- Per-type model class + default prompt + pretrained mirrors -------------
 case "$TYPE" in
     script)
@@ -151,16 +144,12 @@ case "$TYPE" in
         # launch/script_baseline.sh). OVERRIDE via SYSTEM_PROMPT= for a
         # prompt-controlled model, matching how THAT model was trained.
         SYSTEM_PROMPT="${SYSTEM_PROMPT:-You are doing streaming speech recognition. You are given the text history so far, followed by the audio representation of the next chunk; output the words spoken in that chunk. The text history is:}"
-        # Our SCRIPT configs already point at local pretrained paths -> no override.
         PRETRAINED_LLM_OVERRIDE="${PRETRAINED_LLM_OVERRIDE:-}"
         PRETRAINED_ASR_OVERRIDE="${PRETRAINED_ASR_OVERRIDE:-}"
         ;;
     interleave|interleaving)
         MODEL_CLASS="${MODEL_CLASS:-nemo.collections.speechlm2.models.streaming_stt_model.StreamingSTTModel}"
         SYSTEM_PROMPT="${SYSTEM_PROMPT:-Transcribe the audio into text.}"
-        # External interleaving exp_configs reference the LLM/ASR by bare Hub id,
-        # unreachable in the offline container; hand the backend local mirrors
-        # (patch_exp_config.py only swaps them in if the config path isn't local).
         PRETRAINED_LLM_OVERRIDE="${PRETRAINED_LLM_OVERRIDE:-/lustre/fsw/portfolios/llmservice/users/heh/pretrained_models/huggingface/Qwen/Qwen3-1.7B}"
         PRETRAINED_ASR_OVERRIDE="${PRETRAINED_ASR_OVERRIDE:-/lustre/fsw/portfolios/llmservice/users/heh/pretrained_models/huggingface/nvidia/nemotron-speech-streaming-en-0.6b/nemotron-speech-streaming-en-0.6b.nemo}"
         ;;
@@ -172,36 +161,33 @@ esac
 
 # --- Model + run identity ---------------------------------------------------
 CKPT="$CKPT_ARG"
-# The exp_config.yaml sits next to the checkpoints/ dir: <run>/checkpoints/x.ckpt
-# -> <run>/exp_config.yaml.
 EXP_CFG="${EXP_CFG:-$(dirname "$(dirname "$CKPT")")/exp_config.yaml}"
-EXP_NAME="${EXP_NAME:-longform_${TYPE}}"
+EXP_NAME="${EXP_NAME:-longform_win_${TYPE}}"
 PROJECT="${PROJECT:-SpeechlmRefactored}"
-# Long-form gets its OWN wandb project so it never mixes with the short-form
-# leaderboard runs; group by EXP_NAME so the 3 stepped per-dataset WER lines
-# (apptek/earnings22/tedlium + avg) of different models overlay for comparison.
+# Shares the long-form wandb project with eval_longform.sh; the win<sec> tag in the
+# run name keeps windowed runs distinct from the whole-recording streaming ones.
 WANDB_EVAL_PROJECT="${WANDB_EVAL_PROJECT:-${PROJECT}_longform_eval}"
 
-# Long-form recordings are enormous -> one utt per GPU at a time.
-BATCH_SIZE="${BATCH_SIZE:-1}"
+# Windows are short (~WINDOW_SEC), so batch several per GPU (heh OOM backoff guards).
+BATCH_SIZE="${BATCH_SIZE:-8}"
 BACKEND="heh"
+export LONGFORM_WINDOW_SEC="${WINDOW_SEC}"
 
-# Where the long-form manifests live on lustre (must sit under a mounted root:
-# /lustre/fsw or /lustre/fs12). Override to a single dataset subdir to scope down.
 LONGFORM_DIR="${LONGFORM_DIR:-/lustre/fsw/portfolios/nemotron/users/hainanx/longform}"
 
 # RESULTS_DIR + wandb run name (backend appends _chunk<N> + launch timestamp).
-EVAL_TAG="longform${RUN_SUFFIX}"
-WANDB_RUN_NAME="${WANDB_RUN_NAME:-${EXP_NAME}_chunk${CHUNK_SIZE}${RUN_SUFFIX}}"
+EVAL_TAG="lfwin${WINDOW_SEC}s${RUN_SUFFIX}"
+WANDB_RUN_NAME="${WANDB_RUN_NAME:-${EXP_NAME}_win${WINDOW_SEC}s_chunk${CHUNK_SIZE}${RUN_SUFFIX}}"
 
 export TYPE MODEL_CLASS SYSTEM_PROMPT CKPT EXP_CFG EXP_NAME PROJECT
 export WANDB_EVAL_PROJECT WANDB_RUN_NAME EVAL_TAG CHUNK_SIZE BATCH_SIZE BACKEND LONGFORM_DIR
 export PRETRAINED_LLM_OVERRIDE PRETRAINED_ASR_OVERRIDE
 
-echo "==> long-form eval (${TYPE})"
+echo "==> windowed long-form eval (${TYPE})"
 echo "    exp_name:      ${EXP_NAME}"
 echo "    project:       ${PROJECT}  (wandb: ${WANDB_EVAL_PROJECT})"
 echo "    model_class:   ${MODEL_CLASS}"
+echo "    window_sec:    ${WINDOW_SEC} (snapped to a multiple of ${CHUNK_SIZE}-frame chunks by the builder)"
 echo "    chunk_size:    ${CHUNK_SIZE}   batch_size: ${BATCH_SIZE}"
 echo "    ckpt:          ${CKPT}"
 echo "    exp_cfg:       ${EXP_CFG}"
@@ -209,15 +195,13 @@ echo "    longform_dir:  ${LONGFORM_DIR}"
 [[ -n "$PRETRAINED_LLM_OVERRIDE" ]] && echo "    llm_mirror:    ${PRETRAINED_LLM_OVERRIDE}"
 [[ -n "$PRETRAINED_ASR_OVERRIDE" ]] && echo "    asr_mirror:    ${PRETRAINED_ASR_OVERRIDE}"
 if (( STRATIFIED )); then
-    echo "    stratified:    shortest ${STRAT_K}/bucket, buckets up to ${LONGFORM_MAX_RANGE_MIN%.*} min (one bucket per GPU)"
+    echo "    stratified:    shortest ${STRAT_K}/bucket, buckets up to ${LONGFORM_MAX_RANGE_MIN%.*} min (then windowed)"
 elif (( QUICK_RUN )); then
-    echo "    quick_run:     ${QUICK_N} globally shortest utts, one per GPU (MAX_EVAL_SAMPLES=${MAX_EVAL_SAMPLES})"
+    echo "    quick_run:     window the ${QUICK_N} globally shortest recordings (MAX_EVAL_SAMPLES=${MAX_EVAL_SAMPLES})"
 fi
 echo "    wandb_run:     ${WANDB_RUN_NAME} (+_<launch-time> appended by backend)"
 echo "    system_prompt: ${SYSTEM_PROMPT}"
 
-# Locate eval_leaderboard_slurm.sh (see note in eval_script_baseline.sh): under
-# sbatch, Slurm copies this file to a spool dir, so prefer SLURM_SUBMIT_DIR.
 resolve_launch_dir() {
     if [[ -n "${SLURM_SUBMIT_DIR:-}" ]]; then
         if [[ -f "${SLURM_SUBMIT_DIR}/eval_leaderboard_slurm.sh" ]]; then
@@ -238,6 +222,4 @@ resolve_launch_dir() {
 LAUNCH_DIR="$(resolve_launch_dir)"
 cd "${SLURM_SUBMIT_DIR:-$LAUNCH_DIR}"
 
-# Already inside the sbatch allocation: run the shared pooled-shard body as a
-# normal bash script (its own #SBATCH headers are ignored). $1 = EXP_NAME.
 exec bash "${LAUNCH_DIR}/eval_leaderboard_slurm.sh" "${EXP_NAME}"

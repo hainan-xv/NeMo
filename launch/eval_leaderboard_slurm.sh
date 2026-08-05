@@ -99,6 +99,18 @@ BACKEND="${BACKEND:-heh}"
 # sslm in-process driver is hard-wired to the leaderboard cache layout). Set by
 # launch/eval_longform.sh. Must live under a mounted lustre root (/lustre/fsw|fs12).
 LONGFORM_DIR="${LONGFORM_DIR:-}"
+# Windowed long-form: when >0, split each recording into ~this-many-second windows
+# (snapped to a whole number of chunks), decode each window independently, and the
+# window aggregator stitches a recording's per-window hyps back together before
+# scoring. 0 = whole-recording streaming decode. Only meaningful with LONGFORM_DIR.
+LONGFORM_WINDOW_SEC="${LONGFORM_WINDOW_SEC:-0}"
+# Range-stratified "small" long-form set: shortest LONGFORM_PER_RANGE utts per
+# minute bucket (2-5,5-10,10-20,20-40,... up to LONGFORM_MAX_RANGE_MIN), one utt
+# per bucket on each GPU. A small, representative set spanning short..long clips
+# without the multi-hour tail. Set by launch/eval_longform*.sh --stratified.
+LONGFORM_STRATIFIED="${LONGFORM_STRATIFIED:-0}"
+LONGFORM_PER_RANGE="${LONGFORM_PER_RANGE:-8}"
+LONGFORM_MAX_RANGE_MIN="${LONGFORM_MAX_RANGE_MIN:-60}"
 if [[ -n "$LONGFORM_DIR" && "$BACKEND" != "heh" ]]; then
     echo "ERROR: long-form eval (LONGFORM_DIR set) requires BACKEND=heh." >&2
     exit 1
@@ -255,8 +267,20 @@ NGPU=8
 # duration balancing; short-form pulls from the leaderboard cache with a seeded
 # global shuffle. Both emit the same shard{k}_of{n}.json (with dataset_key), so
 # the decode fan-out + aggregate below are identical.
+# Aggregator invocation mirrors the builder: windowed long-form stitches windows
+# back per recording (needs the utt_map sidecar); everything else uses the plain
+# per-row per-dataset reduce.
+AGG_INVOCATION="python /code/scripts/leaderboard_heh_shards.py aggregate --out_dir '${SHARD_DIR}'"
 if [[ -n "$LONGFORM_DIR" ]]; then
     BUILD_INVOCATION="python /code/scripts/leaderboard_heh_shards.py build_longform --longform_dir '${LONGFORM_DIR}' --out_dir '${SHARD_DIR}' --num_shards ${NGPU} --max_eval_samples ${MAX_EVAL_SAMPLES}"
+    if [[ "${LONGFORM_STRATIFIED}" == "1" ]]; then
+        BUILD_INVOCATION="${BUILD_INVOCATION} --range_stratified --per_range ${LONGFORM_PER_RANGE} --max_range_min ${LONGFORM_MAX_RANGE_MIN}"
+    fi
+    if [[ "${LONGFORM_WINDOW_SEC}" != "0" ]]; then
+        # chunk_size may be blank (model default); windowing needs a concrete value.
+        BUILD_INVOCATION="${BUILD_INVOCATION} --window_sec ${LONGFORM_WINDOW_SEC} --chunk_size ${CHUNK_SIZE:-14}"
+        AGG_INVOCATION="python /code/scripts/leaderboard_heh_shards.py aggregate_longform_windows --out_dir '${SHARD_DIR}' --utt_map '${SHARD_DIR}/longform_utt_map.json'"
+    fi
 else
     BUILD_INVOCATION="python /code/scripts/leaderboard_heh_shards.py build --cache_dir '${CACHE_DIR}' --datasets '${DATASETS_CSV}' --out_dir '${SHARD_DIR}' --num_shards ${NGPU} --shuffle_seed ${SHUFFLE_SEED} --max_eval_samples ${MAX_EVAL_SAMPLES}"
 fi
@@ -338,6 +362,12 @@ fi
     echo "max_eval_samples:     ${MAX_EVAL_SAMPLES}"
     if [[ -n "$LONGFORM_DIR" ]]; then
         echo "longform_dir:         ${LONGFORM_DIR}"
+        echo "longform_window_sec:  ${LONGFORM_WINDOW_SEC}"
+        echo "longform_stratified:  ${LONGFORM_STRATIFIED}"
+        if [[ "${LONGFORM_STRATIFIED}" == "1" ]]; then
+            echo "longform_per_range:   ${LONGFORM_PER_RANGE}"
+            echo "longform_max_range_min: ${LONGFORM_MAX_RANGE_MIN}"
+        fi
     else
         echo "datasets:             ${DATASETS_CSV}"
         echo "cache_dir:            ${CACHE_DIR}"
@@ -554,7 +584,7 @@ ${HF_CLAUSE} \
 && fail=0 && for p in "\${pids[@]}"; do wait "\$p" || fail=1; done \
 && echo "" \
 && echo "==================== Leaderboard WER (heh) ====================" \
-&& python /code/scripts/leaderboard_heh_shards.py aggregate --out_dir "${SHARD_DIR}" 2>&1 | tee "${RESULTS_DIR}/aggregate.log" \
+&& ${AGG_INVOCATION} 2>&1 | tee "${RESULTS_DIR}/aggregate.log" \
 ${WANDB_CLAUSE} \
 && echo "" \
 && echo "Per-shard logs: ${RESULTS_DIR} | manifests+generations: ${SHARD_DIR}" \
