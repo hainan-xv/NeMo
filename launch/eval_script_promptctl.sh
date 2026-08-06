@@ -36,15 +36,16 @@
 #   sbatch launch/eval_script_promptctl.sh [cap] [punct] [delay] [chunk]
 #     cap    : cap | nocap       (default cap)      aliases: true/1/yes, false/0/no
 #     punct  : punct | nopunct   (default punct)    aliases: true/1/yes, false/0/no
-#     delay  : integer frames 0..4 (default 2)      (exact_max_delay=4 in the recipe)
+#     delay  : integer frames 0..4 (default 3)      (exact_max_delay=4 in the recipe;
+#                                                   3 matches baseline baked delay + training val)
 #     chunk  : encoder frames/chunk (default 14)    (one the model saw: {2,7,14,28})
 #
 # Examples:
-#   sbatch launch/eval_script_promptctl.sh                      # cap punct, delay 2, chunk 14
+#   sbatch launch/eval_script_promptctl.sh                      # cap punct, delay 3, chunk 14
 #   sbatch launch/eval_script_promptctl.sh cap   punct   0  7   # low-latency, chunk 7
 #   sbatch launch/eval_script_promptctl.sh nocap nopunct 4  28  # high-accuracy, chunk 28
-#   for d in 0 2 4; do sbatch launch/eval_script_promptctl.sh cap punct $d 14; done  # delay sweep
-#   sbatch launch/eval_script_promptctl.sh --quick_run cap punct 2 14   # smoke test
+#   for d in 0 2 3 4; do sbatch launch/eval_script_promptctl.sh cap punct $d 14; done  # delay sweep
+#   sbatch launch/eval_script_promptctl.sh --quick_run cap punct 3 14   # smoke test
 #
 # Flags (may appear anywhere among the positional args):
 #   --quick_run[=N]   decode only the first N (default 10) utts of EACH dataset for
@@ -87,7 +88,7 @@ fi
 # --- Operating point (positional, all optional with defaults) ---
 CAP_ARG="${1:-cap}"
 PUNCT_ARG="${2:-punct}"
-DELAY_ARG="${3:-2}"
+DELAY_ARG="${3:-3}"
 CHUNK_ARG="${4:-14}"
 
 MAX_DELAY=4   # recipe exact_max_delay=4 (delay ~ Uniform[0,4] at training)

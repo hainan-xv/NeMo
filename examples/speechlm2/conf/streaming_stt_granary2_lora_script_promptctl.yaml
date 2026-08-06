@@ -114,11 +114,13 @@ data:
     # the self-correction suffix on top of this prompt-control base.
 
     # Validation prompt (model.val_system_prompt reads data.dataset.system_prompt).
-    # Must equal the training render for (delay=2, cap+punct, chunk=14) so val is
-    # in-distribution; the val references are plain cap+punct transcripts. Clause
-    # order matches the append order in the dataset: base template (delay + format
-    # clause rendered inline) -> chunk clause.
-    system_prompt: "You are doing streaming speech recognition. Given the transcript so far and the next audio chunk, output the words spoken in that chunk. Emit each chunk's words with a fixed delay of 2 frames. Write the text with normal capitalization and punctuation. Process the audio in chunks of 14 frames."
+    # Must equal the training render for (delay=3, cap+punct, chunk=14) so val is
+    # in-distribution and matches the baseline's baked delay=3 operating point; the
+    # val references are plain cap+punct transcripts. Clause order matches the
+    # append order in the dataset: base template (delay + format clause rendered
+    # inline) -> chunk clause. Override data.dataset.system_prompt to eval another
+    # delay at val time.
+    system_prompt: "You are doing streaming speech recognition. Given the transcript so far and the next audio chunk, output the words spoken in that chunk. Emit each chunk's words with a fixed delay of 3 frames. Write the text with normal capitalization and punctuation. Process the audio in chunks of 14 frames."
 
   # Decode-only val_wer runs generate() on raw audio; pin a single fixed size
   # (must match the chunk count stated in system_prompt above).
