@@ -29,10 +29,12 @@ from nemo.collections.speechlm2.data.streaming_stt_dataset import AUDIO_TOKEN_ID
 from nemo.collections.speechlm2.parts.script import (
     ChunkSpec,
     batched_stream_decode_script,
+    batched_stream_decode_script_last_layer,
     build_script_mask,
     build_packed_chunk_example,
     build_separate_chunk_examples,
     collate_packed_chunk_examples,
+    run_script_layers_split,
     stream_decode_script,
 )
 
@@ -1274,6 +1276,189 @@ def test_stream_decode_contiguous_matches_forced_packed():
         assert pred[idx_k[:u]].tolist() == words, f"chunk {k}: stream words != packed argmax"
         if u < max_new:
             assert int(pred[idx_k[u]]) == EOT, f"chunk {k}: expected eot at terminating position"
+
+
+# ---------------------------------------------------------------------------
+# Last-layer restricted history (script_last_layer_history_tokens)
+# ---------------------------------------------------------------------------
+
+
+def _core(model):
+    """(layers, norm, rotary_emb, lm_head) for a tiny Qwen3ForCausalLM."""
+    return model.model.layers, model.model.norm, model.model.rotary_emb, model.lm_head
+
+
+def test_history_window_large_is_noop():
+    """A history_window >= the longest history reproduces the unrestricted mask."""
+    chunks = [ChunkSpec(2, [20, 21]), ChunkSpec(3, [30]), ChunkSpec(2, [40, 41])]
+    ex = build_packed_chunk_example(INSTR, chunks, VS, VE, EOT)
+    valid = torch.ones_like(ex.input_ids, dtype=torch.bool)
+    full = build_script_mask(ex.seg_ids[None], ex.position_ids[None], ex.prefix_len[None], valid[None], torch.float32)
+    wide = build_script_mask(
+        ex.seg_ids[None], ex.position_ids[None], ex.prefix_len[None], valid[None], torch.float32, history_window=1000
+    )
+    assert torch.equal(full, wide)
+
+
+def test_history_window_blocks_old_history_for_branch_only():
+    """With a small window a branch query loses OLD history tokens but keeps the
+    last N + its own audio/tokens; spine queries stay fully causal."""
+    chunks = [ChunkSpec(2, [20, 21]), ChunkSpec(3, [30])]
+    ex = build_packed_chunk_example(INSTR, chunks, VS, VE, EOT)
+    valid = torch.ones_like(ex.input_ids, dtype=torch.bool)
+    N = 1
+    mask = build_script_mask(
+        ex.seg_ids[None], ex.position_ids[None], ex.prefix_len[None], valid[None], torch.float32, history_window=N
+    )[0, 0]
+
+    # Branch 2's word "30": prefix_len = 4 (INSTR + "20 21"); last N=1 history token
+    # is spine pos 3 ("21"). So spine 3 allowed; spine 0,1,2 blocked.
+    b2 = (ex.seg_ids == 2).nonzero(as_tuple=True)[0].tolist()
+    q30 = b2[5]
+    assert _allowed(mask[q30, 3])  # last history token kept
+    for j in range(3):
+        assert _blocked(mask[q30, j])  # older history dropped
+    # Own audio + <ve> still attended.
+    assert _allowed(mask[q30, b2[1]]) and _allowed(mask[q30, b2[4]])
+
+    # Spine query stays fully causal (window only restricts BRANCH queries).
+    full = build_script_mask(
+        ex.seg_ids[None], ex.position_ids[None], ex.prefix_len[None], valid[None], torch.float32
+    )[0, 0]
+    P = ex.spine_len
+    assert torch.equal(mask[:P, :P], full[:P, :P])
+
+
+@torch.no_grad()
+def test_run_script_layers_split_noop_equals_model():
+    """Manual per-layer driver with mask_top == mask_lower == the standard forward.
+
+    Validates the manual layer-stack driver reproduces HF's own forward exactly,
+    for every choice of how many top layers are split off.
+    """
+    model = _tiny_qwen3()
+    H = model.config.hidden_size
+    instruction = [5, 6, 7]
+    chunks = [ChunkSpec(2, [20, 21]), ChunkSpec(3, [30]), ChunkSpec(2, [40, 41, 42])]
+    torch.manual_seed(123)
+    audio_frames = [torch.randn(ch.audio_len, H) for ch in chunks]
+
+    packed = build_packed_chunk_example(instruction, chunks, VS, VE, EOT)
+    valid = torch.ones_like(packed.input_ids, dtype=torch.bool)
+    mask = build_script_mask(
+        packed.seg_ids[None], packed.position_ids[None], packed.prefix_len[None], valid[None], torch.float32
+    )
+    emb = _embed_with_audio(model, packed.input_ids, packed.is_audio, torch.cat(audio_frames, dim=0))[None]
+    ref = model(inputs_embeds=emb, attention_mask=mask, position_ids=packed.position_ids[None]).logits
+
+    layers, norm, rotary_emb, lm_head = _core(model)
+    for k in range(1, model.config.num_hidden_layers):
+        got = run_script_layers_split(
+            layers=layers, norm=norm, rotary_emb=rotary_emb, lm_head=lm_head,
+            inputs_embeds=emb, position_ids=packed.position_ids[None],
+            mask_lower=mask, mask_top=mask, num_top_layers=k,
+        )
+        torch.testing.assert_close(got, ref, atol=1e-4, rtol=1e-4)
+
+
+@torch.no_grad()
+def test_last_layer_restricted_decode_matches_forced_packed():
+    """Greedy last-layer-restricted decode == argmax of a teacher-forced restricted
+    packed forward of the emitted tokens (train/inference parity under restriction).
+    """
+    model = _tiny_qwen3()
+    H = model.config.hidden_size
+    embed = model.get_input_embeddings()
+    layers, norm, rotary_emb, lm_head = _core(model)
+
+    instruction = [5, 6, 7]
+    chunk_size = 2
+    n_frames = 8  # 4 chunks
+    N = 2  # keep last 2 history tokens at the top layer
+    K = 1  # restrict only the final layer
+    torch.manual_seed(321)
+    frames = torch.randn(n_frames, H)
+
+    max_new = 4
+    emitted = batched_stream_decode_script_last_layer(
+        layers=layers, norm=norm, rotary_emb=rotary_emb, lm_head=lm_head,
+        embed_tokens=embed, instruction_ids_list=[instruction], frames_list=[frames],
+        chunk_size=chunk_size, vision_start_id=VS, vision_end_id=VE, eot_id=EOT, pad_id=0,
+        num_top_layers=K, history_tokens=N, max_new_tokens=max_new,
+    )
+    got = emitted[0]
+
+    # Rebuild the packed example with the emitted words per chunk and teacher-force a
+    # restricted packed forward; its argmax at supervised positions must match.
+    num_chunks = -(-n_frames // chunk_size)
+    per_chunk = [[] for _ in range(num_chunks)]
+    # Re-run the per-chunk split of the flat emission via a second decode that also
+    # returns chunk ids, so we can group tokens by chunk.
+    emitted2, chunk_ids = batched_stream_decode_script_last_layer(
+        layers=layers, norm=norm, rotary_emb=rotary_emb, lm_head=lm_head,
+        embed_tokens=embed, instruction_ids_list=[instruction], frames_list=[frames],
+        chunk_size=chunk_size, vision_start_id=VS, vision_end_id=VE, eot_id=EOT, pad_id=0,
+        num_top_layers=K, history_tokens=N, max_new_tokens=max_new, return_chunk_ids=True,
+    )
+    assert emitted2 == emitted
+    for tok, cid in zip(emitted2[0], chunk_ids[0]):
+        per_chunk[cid].append(tok)
+
+    chunks = [ChunkSpec(audio_len=chunk_size, target_ids=per_chunk[c]) for c in range(num_chunks)]
+    packed = build_packed_chunk_example(instruction, chunks, VS, VE, EOT)
+    valid = torch.ones_like(packed.input_ids, dtype=torch.bool)
+    mask_full = build_script_mask(
+        packed.seg_ids[None], packed.position_ids[None], packed.prefix_len[None], valid[None], torch.float32
+    )
+    mask_restricted = build_script_mask(
+        packed.seg_ids[None], packed.position_ids[None], packed.prefix_len[None], valid[None], torch.float32,
+        history_window=N,
+    )
+    emb = _embed_with_audio(model, packed.input_ids, packed.is_audio, frames)[None]
+    logits = run_script_layers_split(
+        layers=layers, norm=norm, rotary_emb=rotary_emb, lm_head=lm_head,
+        inputs_embeds=emb, position_ids=packed.position_ids[None],
+        mask_lower=mask_full, mask_top=mask_restricted, num_top_layers=K,
+    )[0]
+    pred = logits.argmax(dim=-1)
+
+    supervised = packed.target_ids != IGNORE_INDEX
+    for c in range(num_chunks):
+        idx_k = ((packed.seg_ids == c + 1) & supervised).nonzero(as_tuple=True)[0]
+        u = len(per_chunk[c])
+        assert pred[idx_k[:u]].tolist() == per_chunk[c], f"chunk {c}: decode words != restricted packed argmax"
+        if u < max_new:
+            assert int(pred[idx_k[u]]) == EOT, f"chunk {c}: expected eot at terminating position"
+
+
+@torch.no_grad()
+def test_last_layer_decode_large_window_matches_baseline():
+    """With history_tokens >= any history the restriction is a no-op, so the
+    two-cache manual decode must reproduce the standard batched decode token-for-token."""
+    model = _tiny_qwen3()
+    H = model.config.hidden_size
+    embed = model.get_input_embeddings()
+    layers, norm, rotary_emb, lm_head = _core(model)
+    chunk_size = 2
+    max_new = 4
+
+    torch.manual_seed(999)
+    instrs = [[5, 6, 7], [8, 9], [10, 11, 12, 13]]
+    frames_list = [torch.randn(6, H), torch.randn(2, H), torch.randn(7, H)]
+
+    baseline = batched_stream_decode_script(
+        llm=model, embed_tokens=embed, instruction_ids_list=instrs, frames_list=frames_list,
+        chunk_size=chunk_size, vision_start_id=VS, vision_end_id=VE, eot_id=EOT, pad_id=0,
+        max_new_tokens=max_new,
+    )
+    for K in (1, 2):
+        got = batched_stream_decode_script_last_layer(
+            layers=layers, norm=norm, rotary_emb=rotary_emb, lm_head=lm_head,
+            embed_tokens=embed, instruction_ids_list=instrs, frames_list=frames_list,
+            chunk_size=chunk_size, vision_start_id=VS, vision_end_id=VE, eot_id=EOT, pad_id=0,
+            num_top_layers=K, history_tokens=10_000, max_new_tokens=max_new,
+        )
+        assert got == baseline, f"no-op restricted decode (K={K}) diverged:\n got={got}\n base={baseline}"
 
 
 @torch.no_grad()

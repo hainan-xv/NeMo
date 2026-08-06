@@ -388,6 +388,7 @@ def build_script_mask(
     prefix_len: Tensor,
     valid: Tensor,
     dtype: torch.dtype,
+    history_window: int = 0,
 ) -> Tensor:
     """Build the 4D additive attention mask for a packed SCRIPT batch.
 
@@ -412,6 +413,14 @@ def build_script_mask(
         prefix_len: (B, T) per-branch-token history-prefix length (0 for spine).
         valid: (B, T) bool, False at padding.
         dtype: floating dtype for the additive mask.
+        history_window: if ``> 0``, a BRANCH query only attends to the most recent
+            ``history_window`` tokens of its text history (spine positions in
+            ``[prefix_len - history_window, prefix_len)``) instead of the whole
+            prefix; its own audio + earlier branch tokens are unaffected, and SPINE
+            queries stay fully causal. Used to build the restricted mask for the top
+            LLM layer(s) (see :func:`run_script_layers_split`). ``0`` (default) =
+            unlimited history — bit-identical to the original mask. A value
+            ``>=`` the longest history is also a no-op.
 
     Returns:
         (B, 1, T, T) additive mask: 0 where allowed, ``finfo(dtype).min`` where blocked.
@@ -430,6 +439,9 @@ def build_script_mask(
 
     spine_to_spine = q_is_spine & k_is_spine & causal
     branch_to_prefix = (~q_is_spine) & k_is_spine & (k_pos < q_prefix)
+    if history_window and int(history_window) > 0:
+        # Keep only the last ``history_window`` history tokens for branch queries.
+        branch_to_prefix = branch_to_prefix & (k_pos >= (q_prefix - int(history_window)))
     branch_to_own = same_branch & causal
 
     allowed = (spine_to_spine | branch_to_prefix | branch_to_own) & k_valid  # (B, T, T)
@@ -437,6 +449,94 @@ def build_script_mask(
     additive = torch.zeros_like(allowed, dtype=dtype)
     additive = additive.masked_fill(~allowed, torch.finfo(dtype).min)
     return additive.unsqueeze(1)  # (B, 1, T, T)
+
+
+# ---------------------------------------------------------------------------
+# Last-layer restricted history: manual layer-stack driving
+#
+# The feature runs the LOWER LLM layers with the normal SCRIPT mask
+# (:func:`build_script_mask`) and the TOP ``num_top_layers`` layers with a
+# RESTRICTED mask in which a branch (chunk) query attends to only the most recent
+# ``history_window`` history tokens (plus its own audio + already-emitted tokens).
+# Because HF applies one attention mask to every layer, we drive the decoder layer
+# stack manually here (mirrors two_stream_llm_forward in streaming_stt_model.py).
+# ---------------------------------------------------------------------------
+
+
+def _call_decoder_layer(layer, hidden, attn_mask, position_ids, position_embeddings):
+    """Run one HF decoder layer (no cache), tolerating tuple/tensor returns."""
+    out = layer(
+        hidden,
+        attention_mask=attn_mask,
+        position_ids=position_ids,
+        position_embeddings=position_embeddings,
+        use_cache=False,
+    )
+    return out[0] if isinstance(out, tuple) else out
+
+
+def _call_decoder_layer_cached(layer, hidden, attn_mask, position_ids, position_embeddings, cache, cache_position):
+    """Run one HF decoder layer WITH a KV cache (incremental decode)."""
+    out = layer(
+        hidden,
+        attention_mask=attn_mask,
+        position_ids=position_ids,
+        position_embeddings=position_embeddings,
+        past_key_values=cache,
+        use_cache=True,
+        cache_position=cache_position,
+    )
+    return out[0] if isinstance(out, tuple) else out
+
+
+def _top_layer_split(num_layers: int, num_top_layers: int) -> int:
+    """Number of TOP layers to run with the restricted mask.
+
+    Clamped to ``[1, num_layers - 1]`` (>= 1 restricted top layer, >= 1
+    unrestricted lower layer) when the feature is on; 0 for a 1-layer stack.
+    """
+    if num_layers <= 1:
+        return 0
+    return max(1, min(int(num_top_layers), num_layers - 1))
+
+
+def run_script_layers_split(
+    *,
+    layers,
+    norm,
+    rotary_emb,
+    lm_head,
+    inputs_embeds: Tensor,
+    position_ids: Tensor,
+    mask_lower: Tensor,
+    mask_top: Tensor,
+    num_top_layers: int,
+) -> Tensor:
+    """Full-sequence packed SCRIPT forward with a per-layer attention mask.
+
+    The lower ``layers[:-num_top_layers]`` run with ``mask_lower`` (the normal
+    SCRIPT mask); the top ``layers[-num_top_layers:]`` run with ``mask_top`` (the
+    restricted-history mask), followed by ``norm`` + ``lm_head``. Position ids /
+    RoPE embeddings are shared by every layer (only the mask changes), so this is
+    identical to a standard forward when ``mask_top == mask_lower``.
+
+    Args mirror the modules returned by ``ScriptSTTModel._resolve_llm_core()``.
+
+    Returns:
+        (B, T, V) logits.
+    """
+    n = len(layers)
+    k = _top_layer_split(n, num_top_layers)
+    pos_emb = rotary_emb(inputs_embeds, position_ids)
+    h = inputs_embeds
+    lower = layers if k == 0 else layers[: n - k]
+    top = [] if k == 0 else layers[n - k:]
+    for layer in lower:
+        h = _call_decoder_layer(layer, h, mask_lower, position_ids, pos_emb)
+    for layer in top:
+        h = _call_decoder_layer(layer, h, mask_top, position_ids, pos_emb)
+    h = norm(h)
+    return lm_head(h)
 
 
 @dataclass
@@ -1023,3 +1123,214 @@ def batched_stream_decode_script(
     if return_raw:
         out_tuple.append(raw)
     return tuple(out_tuple) if len(out_tuple) > 1 else emitted
+
+
+@torch.no_grad()
+def batched_stream_decode_script_last_layer(
+    *,
+    layers,
+    norm,
+    rotary_emb,
+    lm_head,
+    embed_tokens: Callable[[Tensor], Tensor],
+    instruction_ids_list: List[List[int]],
+    frames_list: List[Tensor],
+    chunk_size: int,
+    vision_start_id: int,
+    vision_end_id: int,
+    eot_id: int,
+    pad_id: int,
+    num_top_layers: int,
+    history_tokens: int,
+    max_new_tokens: int = 64,
+    device: Optional[torch.device] = None,
+    audio_history_chunks: int = 0,
+    audio_window_frames: int = 0,
+    max_history_tokens: int = 0,
+    return_chunk_ids: bool = False,
+):
+    """Batched greedy SCRIPT decode with a RESTRICTED-history top layer(s).
+
+    Same chunk-synchronous conditioning as :func:`batched_stream_decode_script`
+    (per chunk: ``[instruction] [emitted words] <vs> [audio_k] <ve> -> words``), but
+    the top ``num_top_layers`` LLM layers only let a chunk (branch) query attend to
+    the most recent ``history_tokens`` tokens of its text history (its own audio +
+    already-emitted chunk tokens stay fully attended); the lower layers are
+    unchanged. This mirrors the last-layer restricted training mask
+    (:func:`build_script_mask` with ``history_window``) so greedy decoding matches a
+    teacher-forced restricted packed forward (see the parity test).
+
+    The layer stack is driven manually with TWO KV caches — one for the lower
+    layers, one for the top layers — so each group can use its own attention mask
+    (HF applies a single mask to all layers). ``layers / norm / rotary_emb /
+    lm_head`` are as returned by ``ScriptSTTModel._resolve_llm_core()``.
+
+    Only the default (non-contiguous) position convention is supported; delete /
+    self-correction / shared-audio / contiguous-positions are intentionally not
+    combined with this feature (the model guards against it).
+
+    Returns:
+        ``B`` lists of emitted token ids (flattened across chunks; ``eot`` excluded);
+        with ``return_chunk_ids`` also the per-token chunk index (for word latency).
+    """
+    from transformers.cache_utils import DynamicCache
+
+    B = len(frames_list)
+    if B == 0:
+        return [] if not return_chunk_ids else ([], [])
+    if device is None:
+        device = frames_list[0].device
+    H = frames_list[0].shape[-1]
+    dtype = embed_tokens(torch.zeros(1, 1, dtype=torch.long, device=device)).dtype
+
+    n_frames = [int(f.shape[0]) for f in frames_list]
+    num_chunks = [math.ceil(n / chunk_size) if n > 0 else 0 for n in n_frames]
+    max_chunks = max(num_chunks) if B else 0
+    M = max(int(audio_history_chunks), 0)
+    W = max(int(audio_window_frames), 0)
+    N = max(int(history_tokens), 0)
+    n_layers = len(layers)
+    k_top = _top_layer_split(n_layers, num_top_layers)
+
+    emitted: List[List[int]] = [[] for _ in range(B)]
+    chunk_ids: List[List[int]] = [[] for _ in range(B)]
+
+    def _neg_inf_mask(allowed: Tensor) -> Tensor:
+        """(.., q, kv) bool-allowed -> (.., 1, q, kv) additive mask for one group."""
+        additive = torch.zeros_like(allowed, dtype=dtype)
+        additive = additive.masked_fill(~allowed, torch.finfo(dtype).min)
+        return additive.unsqueeze(1)
+
+    for k in range(max_chunks):
+        active = [b for b in range(B) if k < num_chunks[b]]
+        if not active:
+            break
+        na = len(active)
+
+        # --- build per-stream prefill: instr + emitted + <vs> audio_k <ve> ---
+        seqs: List[List[int]] = []
+        chunk_frames: List[Tensor] = []
+        for b in active:
+            win_end = (k + 1) * chunk_size
+            win_start = _audio_window_start(k * chunk_size, win_end, max(0, k - M) * chunk_size, W)
+            fr = frames_list[b][win_start:win_end].to(device=device, dtype=dtype)
+            c = int(fr.shape[0])
+            hist = emitted[b]
+            if max_history_tokens and len(hist) > max_history_tokens:
+                hist = hist[-max_history_tokens:]
+            toks = (
+                list(instruction_ids_list[b])
+                + list(hist)
+                + [vision_start_id]
+                + [AUDIO_TOKEN_IDX] * c
+                + [vision_end_id]
+            )
+            seqs.append(toks)
+            chunk_frames.append(fr)
+
+        L = max(len(s) for s in seqs)
+        max_c = max(int(fr.shape[0]) for fr in chunk_frames)
+
+        # Left-pad so every row's last position is the <ve> (shared query column).
+        input_tokens = torch.full((na, L), pad_id, dtype=torch.long, device=device)
+        for i, s in enumerate(seqs):
+            input_tokens[i, L - len(s) :] = torch.tensor(s, dtype=torch.long, device=device)
+
+        audio_embs = torch.zeros(na, max_c, H, dtype=dtype, device=device)
+        for i, fr in enumerate(chunk_frames):
+            audio_embs[i, : fr.shape[0]] = fr
+
+        # Interleave audio into the AUDIO_TOKEN_IDX slots (per-row cumsum gather).
+        audio_mask = input_tokens == AUDIO_TOKEN_IDX
+        text_tokens = input_tokens.where(~audio_mask, torch.zeros_like(input_tokens))
+        text_embeds = embed_tokens(text_tokens)
+        frame_idx = audio_mask.long().cumsum(dim=1) - 1
+        gather_idx = frame_idx.clamp(min=0).unsqueeze(-1).expand(na, L, H)
+        audio_at = torch.gather(audio_embs, dim=1, index=gather_idx)
+        embeds = torch.where(audio_mask.unsqueeze(-1), audio_at, text_embeds)
+
+        valid = input_tokens != pad_id  # (na, L) bool
+        position_ids = (valid.long().cumsum(dim=1) - 1).clamp(min=0)
+        cur_pos = position_ids[:, -1] + 1  # (na,)
+
+        # <vs> column per row (start of the branch: <vs> audio <ve> = c+2 trailing
+        # tokens). A branch query attends only history columns >= vs_col - N.
+        c_per_row = torch.tensor([int(fr.shape[0]) for fr in chunk_frames], device=device)
+        vs_col = (L - (c_per_row + 2)).clamp(min=0)  # (na,)
+
+        # --- prefill masks (na, 1, L, L) ---
+        col = torch.arange(L, device=device)
+        causal = col[None, :] <= col[:, None]  # (L, L)
+        allowed_lower = causal[None] & valid[:, None, :]  # (na, L, L)
+        q_is_hist = col[None, :] < vs_col[:, None]  # (na, L): query is a history token
+        key_in_win = col[None, None, :] >= (vs_col[:, None, None] - N)  # (na, 1, L)
+        allowed_top = allowed_lower & (q_is_hist[:, :, None] | key_in_win)
+        mask_lower = _neg_inf_mask(allowed_lower)
+        mask_top = _neg_inf_mask(allowed_top)
+
+        lower_cache = DynamicCache()
+        top_cache = DynamicCache()
+        cache_position = torch.arange(L, device=device)
+        pos_emb = rotary_emb(embeds, position_ids)
+        h = embeds
+        for layer in layers[: n_layers - k_top]:
+            h = _call_decoder_layer_cached(layer, h, mask_lower, position_ids, pos_emb, lower_cache, cache_position)
+        h_top = h
+        for layer in layers[n_layers - k_top:]:
+            h_top = _call_decoder_layer_cached(
+                layer, h_top, mask_top, position_ids, pos_emb, top_cache, cache_position
+            )
+        logits = lm_head(norm(h_top))[:, -1]  # <ve> predicts first word
+
+        attn_running = valid.long()  # (na, L) key validity accumulated across steps
+        finished = [False] * na
+        words: List[List[int]] = [[] for _ in range(na)]
+        for _ in range(max_new_tokens):
+            nxt = logits.argmax(dim=-1)  # (na,)
+            for i in range(na):
+                if finished[i]:
+                    continue
+                tid = int(nxt[i].item())
+                if tid == eot_id:
+                    finished[i] = True
+                    continue
+                words[i].append(tid)
+            if all(finished):
+                break
+            feed = nxt.clone()
+            for i in range(na):
+                if finished[i]:
+                    feed[i] = eot_id
+            temb = embed_tokens(feed.unsqueeze(1))  # (na, 1, H)
+            kv = attn_running.shape[1]
+            attn_running = torch.cat([attn_running, torch.ones(na, 1, dtype=attn_running.dtype, device=device)], dim=1)
+            new_kv = kv + 1
+            col_kv = torch.arange(new_kv, device=device)
+            valid_kv = attn_running.bool()  # (na, new_kv)
+            # New (branch) token: lower layers attend all valid kv; top layers keep
+            # only history keys >= vs_col - N (own/audio columns are all >= vs_col).
+            step_lower = valid_kv[:, None, None, :]  # (na, 1, 1, new_kv)
+            step_top = (valid_kv & (col_kv[None, :] >= (vs_col[:, None] - N)))[:, None, None, :]
+            m_lower = torch.zeros_like(step_lower, dtype=dtype).masked_fill(~step_lower, torch.finfo(dtype).min)
+            m_top = torch.zeros_like(step_top, dtype=dtype).masked_fill(~step_top, torch.finfo(dtype).min)
+            step_pos = cur_pos.unsqueeze(1)
+            step_cache_pos = torch.arange(kv, new_kv, device=device)
+            step_pos_emb = rotary_emb(temb, step_pos)
+            h = temb
+            for layer in layers[: n_layers - k_top]:
+                h = _call_decoder_layer_cached(layer, h, m_lower, step_pos, step_pos_emb, lower_cache, step_cache_pos)
+            h_top = h
+            for layer in layers[n_layers - k_top:]:
+                h_top = _call_decoder_layer_cached(
+                    layer, h_top, m_top, step_pos, step_pos_emb, top_cache, step_cache_pos
+                )
+            logits = lm_head(norm(h_top))[:, -1]
+            cur_pos = cur_pos + 1
+
+        for i, b in enumerate(active):
+            emitted[b].extend(words[i])
+            chunk_ids[b].extend([k] * len(words[i]))
+
+    if return_chunk_ids:
+        return emitted, chunk_ids
+    return emitted

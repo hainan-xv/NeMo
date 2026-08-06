@@ -45,9 +45,11 @@ from nemo.collections.speechlm2.data.streaming_stt_dataset import AUDIO_TOKEN_ID
 from nemo.collections.speechlm2.models.streaming_stt_model import StreamingSTTModel
 from nemo.collections.speechlm2.parts.script import (
     batched_stream_decode_script,
+    batched_stream_decode_script_last_layer,
     build_script_mask,
     build_packed_chunk_example,
     collate_packed_chunk_examples,
+    run_script_layers_split,
 )
 from nemo.collections.speechlm2.parts.shared_audio_chunk import (
     batched_shared_audio_decode,
@@ -116,6 +118,49 @@ class ScriptSTTModel(StreamingSTTModel):
         # Contiguous-text positions ("Option A"): must match how the data was
         # packed at train time; read from the MODEL config for from_pretrained.
         self._contiguous_text_positions = bool(getattr(self.core_cfg, "contiguous_text_positions", False))
+
+        # --- Last-layer restricted history ---
+        # When > 0, the TOP ``script_last_layer_restrict_num_layers`` LLM layer(s)
+        # restrict a chunk (branch) query to only the most recent
+        # ``script_last_layer_history_tokens`` history tokens (its audio + own
+        # already-emitted tokens stay fully attended); lower layers are unchanged.
+        # Both training and decode drive the layer stack manually to apply a
+        # per-layer mask. Read from the MODEL config so from_pretrained rebuilds it.
+        self._last_layer_history_tokens = max(int(getattr(self.core_cfg, "script_last_layer_history_tokens", 0) or 0), 0)
+        self._last_layer_restrict_num_layers = max(
+            int(getattr(self.core_cfg, "script_last_layer_restrict_num_layers", 1) or 1), 1
+        )
+        self._last_layer_restrict = self._last_layer_history_tokens > 0
+        if self._last_layer_restrict:
+            n_llm_layers = int(self.llm.config.num_hidden_layers)
+            if not (1 <= self._last_layer_restrict_num_layers < n_llm_layers):
+                raise ValueError(
+                    f"script_last_layer_restrict_num_layers must be in [1, {n_llm_layers - 1}] "
+                    f"(need >= 1 unrestricted lower layer), got {self._last_layer_restrict_num_layers}"
+                )
+            # These features change the packed layout / decode path in ways not yet
+            # composed with the manual per-layer mask driver; guard rather than
+            # silently produce a train/inference mismatch.
+            for name, on in (
+                ("shared_audio_track", self._shared_audio_track),
+                ("self_correction", self._self_correction),
+                ("contiguous_text_positions", self._contiguous_text_positions),
+            ):
+                if on:
+                    raise ValueError(
+                        f"script_last_layer_history_tokens is not supported together with {name} yet."
+                    )
+            logging.info("=" * 72)
+            logging.info(
+                "[SCRIPT] last-layer restricted history ON | history_tokens=%d | top_layers=%d/%d "
+                "-- the top layer(s) attend only the last %d history tokens + this chunk's audio "
+                "(lower layers unchanged).",
+                self._last_layer_history_tokens,
+                self._last_layer_restrict_num_layers,
+                int(self.llm.config.num_hidden_layers),
+                self._last_layer_history_tokens,
+            )
+            logging.info("=" * 72)
 
         # Long-form encode: clips longer than this (seconds) are encoded with the
         # cache-aware STREAMING encoder in generate() (bounded memory) instead of a
@@ -244,14 +289,29 @@ class ScriptSTTModel(StreamingSTTModel):
                 batch.seg_ids, batch.position_ids, batch.prefix_len, batch.valid, input_embeds.dtype
             )
 
-        out = self.llm(
-            inputs_embeds=input_embeds,
-            attention_mask=mask,
-            position_ids=batch.position_ids,
-            use_cache=False,
-            return_dict=True,
-        )
-        logits = out["logits"]  # (B, T, V)
+        if self._last_layer_restrict:
+            # Top layer(s) use a restricted (last-N-history) mask; lower layers use
+            # the normal mask. Drive the layer stack manually (one mask per layer).
+            mask_restricted = build_script_mask(
+                batch.seg_ids, batch.position_ids, batch.prefix_len, batch.valid, input_embeds.dtype,
+                history_window=self._last_layer_history_tokens,
+            )
+            layers, norm, rotary_emb, lm_head = self._resolve_llm_core()
+            logits = run_script_layers_split(
+                layers=layers, norm=norm, rotary_emb=rotary_emb, lm_head=lm_head,
+                inputs_embeds=input_embeds, position_ids=batch.position_ids,
+                mask_lower=mask, mask_top=mask_restricted,
+                num_top_layers=self._last_layer_restrict_num_layers,
+            )  # (B, T, V)
+        else:
+            out = self.llm(
+                inputs_embeds=input_embeds,
+                attention_mask=mask,
+                position_ids=batch.position_ids,
+                use_cache=False,
+                return_dict=True,
+            )
+            logits = out["logits"]  # (B, T, V)
 
         target_ids = batch.target_tokens
         num_targets = (target_ids != IGNORE_INDEX).long().sum()
@@ -540,6 +600,38 @@ class ScriptSTTModel(StreamingSTTModel):
         # with self-correction; harmless (== hyp) otherwise.
         return_raw = bool(generation_kwargs.pop("return_raw", False))
         instruction_ids_list = [self.tokenizer.text_to_ids(system_prompt[b] + "\n") for b in range(B)]
+
+        if self._last_layer_restrict:
+            if return_raw:
+                raise NotImplementedError("return_raw is not supported with the last-layer restricted decode.")
+            layers, norm, rotary_emb, lm_head = self._resolve_llm_core()
+            out = batched_stream_decode_script_last_layer(
+                layers=layers, norm=norm, rotary_emb=rotary_emb, lm_head=lm_head,
+                embed_tokens=self.embed_tokens,
+                instruction_ids_list=instruction_ids_list,
+                frames_list=frames_list,
+                chunk_size=cs,
+                vision_start_id=self._cc_vision_start_id,
+                vision_end_id=self._cc_vision_end_id,
+                eot_id=self._cc_eot_id,
+                pad_id=self.text_pad_id,
+                num_top_layers=self._last_layer_restrict_num_layers,
+                history_tokens=self._last_layer_history_tokens,
+                max_new_tokens=max_new_tokens,
+                device=self.device,
+                audio_history_chunks=self._audio_history_chunks,
+                audio_window_frames=self._audio_window_frames,
+                max_history_tokens=max_history_tokens,
+                return_chunk_ids=return_word_latency,
+            )
+            emitted = out[0] if isinstance(out, tuple) else out
+            hyps = [self.tokenizer.ids_to_text(ids) if ids else "" for ids in emitted]
+            if return_word_latency:
+                chunk_ids = out[1]
+                frame_len = float(self.core_cfg.frame_length_in_secs)
+                lat = [self._word_emission_times(emitted[b], chunk_ids[b], cs, frame_len) for b in range(B)]
+                return hyps, lat
+            return hyps
 
         if self._shared_audio_track:
             if return_word_latency or return_raw:

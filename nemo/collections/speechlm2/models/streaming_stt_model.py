@@ -603,6 +603,23 @@ class StreamingSTTModelConfig:
     # mask impose order). Kept in the MODEL config so generate() uses the matching
     # convention after from_pretrained. False = original behavior.
     contiguous_text_positions: bool = False
+    # --- Last-layer restricted history (ScriptSTTModel only) ---
+    # When > 0, the TOP ``script_last_layer_restrict_num_layers`` LLM layer(s) use a
+    # RESTRICTED attention mask in which a branch (chunk) query attends to only the
+    # most recent ``script_last_layer_history_tokens`` tokens of its text history
+    # (instead of the full history). Its own audio window and its own already-emitted
+    # chunk tokens stay fully attended, and all lower layers are unchanged. This makes
+    # the final output distribution p(words_k | last-N history tokens, audio_k) while
+    # the lower layers still build fully-contextualized history representations.
+    # <= 0 disables the feature entirely (bit-identical to the original SCRIPT model);
+    # a value >= the history length is also a no-op (the window then covers all
+    # history). Kept in the MODEL config so generate() rebuilds the same restricted
+    # decode after from_pretrained.
+    script_last_layer_history_tokens: int = 0
+    # Number of TOP LLM layers that use the restricted mask above (default 1 = only
+    # the final layer). Must be in [1, num_hidden_layers-1] when the feature is on
+    # (>= 1 unrestricted lower layer is required so history is still contextualized).
+    script_last_layer_restrict_num_layers: int = 1
     # --- Two-stream last-layer fusion (fixed chunking only) ---
     # When True, the LLM processes the TEXT stream alone through layers[:-1]
     # (a contiguous text-only sequence with its own causal mask and positions).
