@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
-# Submit a SLURM batch script to the "interactive" partition instead of its own
-# default, with everything else left unchanged.
+# Submit a SLURM batch script to the "interactive" partition on a single node,
+# with EXP_NAME suffixed so interactive smoke runs don't collide with full jobs.
 #
 #   ./launch_with_interactive.sh <scriptname.sh> [script args...]
 #
-# This is exactly `sbatch <scriptname.sh> [args...]` with an added
-# `--partition=interactive`. A command-line --partition OVERRIDES the script's own
-# `#SBATCH -p ...` directive (ours: batch_block1,batch_block3,batch_block4), so the
-# target file is never modified -- only the partition it lands on changes.
+# This is `sbatch <scriptname.sh> [args...]` with:
+#   --partition=interactive   (overrides the script's #SBATCH -p ...)
+#   --nodes=1                 (overrides the script's #SBATCH -N ...)
+# plus a rewritten copy of the script where every EXP_NAME=... assignment gets
+# an `_interactive` suffix (same idea as make_tmp.sh's `_tmp` suffix). The
+# original file is never modified.
 #
 # Examples (run from the launch/ dir):
 #   ./launch_with_interactive.sh script_baseline.sh
@@ -24,12 +26,24 @@ if [[ $# -lt 1 ]]; then
 fi
 
 PARTITION="${INTERACTIVE_PARTITION:-interactive}"
+SCRIPT="$1"
+shift
 
-if [[ ! -f "$1" ]]; then
-    echo "WARNING: '$1' is not a file in the current directory; passing to sbatch as-is." >&2
+if [[ ! -f "$SCRIPT" ]]; then
+    echo "WARNING: '$SCRIPT' is not a file in the current directory; passing to sbatch as-is (no EXP_NAME rewrite)." >&2
+    echo "==> sbatch --partition=${PARTITION} --nodes=1 ${SBATCH_EXTRA:-} ${SCRIPT} $*"
+    exec sbatch --partition="${PARTITION}" --nodes=1 ${SBATCH_EXTRA:-} "$SCRIPT" "$@"
 fi
 
+# Ephemeral rewrite: append _interactive to every EXP_NAME=... line so results
+# land under a distinct folder / wandb name. Slurm reads the batch script at
+# submit time, so the temp file can be removed as soon as sbatch returns.
+TMP="$(mktemp --tmpdir "${SCRIPT##*/}.XXXXXX.sh")"
+trap 'rm -f "$TMP"' EXIT
+sed -E -e 's/^([[:space:]]*EXP_NAME=.*)$/\1_interactive/' "$SCRIPT" > "$TMP"
+chmod +x "$TMP"
+
 # ${SBATCH_EXTRA:-} is intentionally unquoted so multiple flags word-split; "$@"
-# keeps the script path + its args exactly as given.
-echo "==> sbatch --partition=${PARTITION} ${SBATCH_EXTRA:-} $*"
-exec sbatch --partition="${PARTITION}" ${SBATCH_EXTRA:-} "$@"
+# keeps the script args exactly as given.
+echo "==> sbatch --partition=${PARTITION} --nodes=1 ${SBATCH_EXTRA:-} ${SCRIPT} (EXP_NAME+=_interactive) $*"
+sbatch --partition="${PARTITION}" --nodes=1 ${SBATCH_EXTRA:-} "$TMP" "$@"
