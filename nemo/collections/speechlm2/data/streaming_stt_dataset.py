@@ -16,6 +16,7 @@ import logging
 import math
 import random
 import re
+import warnings
 from dataclasses import dataclass
 from typing import Iterable, List, Optional, Union
 
@@ -539,6 +540,31 @@ def get_llm_messages_for_batch(
             )
         )
     return batch_messages
+
+
+def resolve_pad_id(tokenizer: AutoTokenizer) -> int:
+    """Padding token ID for a tokenizer that may not define one.
+
+    Falls back to ``<unk>`` and finally to id 0. Some LLM tokenizers ship without
+    a pad token (e.g. NVIDIA-Nemotron-3-Nano, where ``pad_id`` is ``None`` and
+    ``unk_id`` is 0) — passing that ``None`` into ``pad_sequence`` raises
+    ``TypeError: argument 'padding_value' must be float, not NoneType``.
+
+    The dataset and :attr:`StreamingSTTModel.text_pad_id` MUST agree on this
+    value: the model derives its attention mask as ``input_tokens != pad_id``, so
+    a mismatch would either unmask padding or mask real tokens. Both call here.
+    """
+    pad_id = tokenizer.pad_id
+    if pad_id is None:
+        pad_id = getattr(tokenizer, "unk_id", None)
+    if pad_id is None:
+        warnings.warn(
+            "The text tokenizer has no <pad> or <unk> token; using id 0 for padding "
+            "(this may lead to silent bugs).",
+            stacklevel=2,
+        )
+        pad_id = 0
+    return int(pad_id)
 
 
 def apply_chat_template_ids(hf_tok, messages: List[dict], **kwargs) -> list[int]:
@@ -1143,13 +1169,14 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
             all_input_ids.append(torch.tensor(input_ids, dtype=torch.long))
             all_target_ids.append(torch.tensor(target_ids, dtype=torch.long))
 
+        pad_id = resolve_pad_id(self.tokenizer)
         if chunk_size >= 0:  # fixed chunking or dynamic chunking: right-pad
-            input_tokens = right_collate_vectors(all_input_ids, padding_value=self.tokenizer.pad_id)
+            input_tokens = right_collate_vectors(all_input_ids, padding_value=pad_id)
             target_tokens = right_collate_vectors(all_target_ids, padding_value=IGNORE_INDEX)
             input_token_lens = torch.tensor([len(ids) for ids in all_input_ids], dtype=torch.long)
             target_token_lens = torch.tensor([len(ids) for ids in all_target_ids], dtype=torch.long)
         else:  # offline mode: left-pad
-            input_tokens = left_collate_vectors(all_input_ids, padding_value=self.tokenizer.pad_id)
+            input_tokens = left_collate_vectors(all_input_ids, padding_value=pad_id)
             target_tokens = left_collate_vectors(all_target_ids, padding_value=IGNORE_INDEX)
             # length is the same size as input_tokens.shape[1] since they're left-padded
             input_token_lens = torch.tensor(

@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import math
-import warnings
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -43,6 +42,7 @@ from nemo.collections.speechlm2.data.streaming_stt_dataset import (
     build_compact_turn_markers,
     decode_with_blank,
     parse_chat_template_ids,
+    resolve_pad_id,
 )
 from nemo.collections.speechlm2.parts.alignments import ForcedAligner
 from nemo.collections.speechlm2.parts.hf_hub import HFHubMixin
@@ -645,16 +645,9 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
 
     @property
     def text_pad_id(self) -> int:
-        pad_id = self.tokenizer.pad_id
-        if pad_id is None:
-            pad_id = self.tokenizer.unk_id
-        if pad_id is None:
-            warnings.warn(
-                "The text tokenizer has no <pad> or <unk> token; using id 0 for "
-                "padding (this may lead to silent bugs)."
-            )
-            pad_id = 0
-        return pad_id
+        # Shared with the dataset's collation so the padding value the batch was
+        # built with always matches the one the attention mask is derived from.
+        return resolve_pad_id(self.tokenizer)
 
     @property
     def text_eos_id(self) -> int:

@@ -29,8 +29,10 @@ The primary reference is the docstring example in get_llm_messages_for_sample:
 """
 
 import math
+from types import SimpleNamespace
 
 import pytest
+import torch
 
 from nemo.collections.speechlm2.data.streaming_stt_dataset import (
     AUDIO_TOKEN_IDX,
@@ -44,6 +46,8 @@ from nemo.collections.speechlm2.data.streaming_stt_dataset import (
     decode_with_blank,
     get_llm_messages_for_batch,
     get_llm_messages_for_sample,
+    resolve_pad_id,
+    right_collate_vectors,
 )
 from nemo.collections.speechlm2.parts.alignments import WordAlignment
 
@@ -1719,6 +1723,41 @@ def real_tokenizer(request):
     if hf_tok is None:
         pytest.skip(f"Tokenizer {model_id} not available")
     return label, hf_tok
+
+
+class TestResolvePadId:
+    """Some LLM tokenizers ship without a pad token (e.g. NVIDIA-Nemotron-3-Nano:
+    ``pad_id`` None, ``unk_id`` 0). Feeding that None to ``pad_sequence`` raises,
+    and the dataset's padding value must match the model's ``text_pad_id``,
+    which is how the attention mask is derived."""
+
+    @staticmethod
+    def _tok(pad_id, unk_id):
+        return SimpleNamespace(pad_id=pad_id, unk_id=unk_id)
+
+    def test_uses_pad_id_when_present(self):
+        assert resolve_pad_id(self._tok(pad_id=7, unk_id=0)) == 7
+
+    def test_falls_back_to_unk(self):
+        assert resolve_pad_id(self._tok(pad_id=None, unk_id=0)) == 0
+
+    def test_falls_back_to_zero_with_warning(self):
+        with pytest.warns(UserWarning, match="no <pad> or <unk> token"):
+            assert resolve_pad_id(self._tok(pad_id=None, unk_id=None)) == 0
+
+    def test_tolerates_tokenizer_without_unk_attribute(self):
+        with pytest.warns(UserWarning):
+            assert resolve_pad_id(SimpleNamespace(pad_id=None)) == 0
+
+    def test_collation_pads_with_the_resolved_id(self):
+        """A padless tokenizer must not crash collation, and the pad value used
+        must be the resolved one (not None)."""
+        pad = resolve_pad_id(self._tok(pad_id=None, unk_id=0))
+        collated = right_collate_vectors(
+            [torch.tensor([5, 6, 7]), torch.tensor([8])],
+            padding_value=pad,
+        )
+        assert collated[1].tolist() == [8, pad, pad]
 
 
 class TestApplyChatTemplateIds:
