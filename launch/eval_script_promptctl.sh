@@ -45,6 +45,7 @@
 #   sbatch launch/eval_script_promptctl.sh cap   punct   0  7   # low-latency, chunk 7
 #   sbatch launch/eval_script_promptctl.sh nocap nopunct 4  28  # high-accuracy, chunk 28
 #   for d in 0 2 3 4; do sbatch launch/eval_script_promptctl.sh cap punct $d 14; done  # delay sweep
+#   CHUNK_SIZE=7 sbatch launch/eval_script_promptctl.sh         # env form of the same knob
 #   sbatch launch/eval_script_promptctl.sh --quick_run cap punct 3 14   # smoke test
 #
 # Flags (may appear anywhere among the positional args):
@@ -55,6 +56,8 @@
 # backend's _chunk<chunk> tag + slurm job id; concurrent runs for the same exp
 # share the averaged ckpt / HF convert (mkdir-locked in the backend).
 #
+# Optional env:
+#   CAP / PUNCT / DELAY / CHUNK_SIZE  defaults for the four positional args above.
 # Optional env (forwarded to eval_leaderboard_slurm.sh):
 #   BACKEND=heh|sslm   BATCH_SIZE=...   PROJECT=SpeechlmRefactored (default)
 #   RUN_AVERAGING=1 (default) / USE_LAST=1 / STEP=n / CKPT=path
@@ -86,10 +89,12 @@ if (( QUICK_RUN )); then
 fi
 
 # --- Operating point (positional, all optional with defaults) ---
-CAP_ARG="${1:-cap}"
-PUNCT_ARG="${2:-punct}"
-DELAY_ARG="${3:-3}"
-CHUNK_ARG="${4:-14}"
+# Env vars act as the defaults so `CHUNK_SIZE=7 sbatch ...` works like it does for
+# eval_script_baseline.sh; an explicit positional arg still wins.
+CAP_ARG="${1:-${CAP:-cap}}"
+PUNCT_ARG="${2:-${PUNCT:-punct}}"
+DELAY_ARG="${3:-${DELAY:-3}}"
+CHUNK_ARG="${4:-${CHUNK_SIZE:-14}}"
 
 MAX_DELAY=4   # recipe exact_max_delay=4 (delay ~ Uniform[0,4] at training)
 
