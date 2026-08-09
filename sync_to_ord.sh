@@ -31,8 +31,12 @@ git add scripts/eval_wandb_report.py
 # SCRIPT training launchers, the two SCRIPT inference launchers, and the shared
 # pooled-shard eval backend they exec (eval_leaderboard_slurm.sh).
 git add -f launch/script_baseline.sh
+git add -f launch/script_lastlayer.sh
+git add -f launch/script_lastlayer_promptctl.sh
 git add -f launch/script_promptctl.sh
 git add -f launch/eval_script_baseline.sh
+git add -f launch/eval_script_lastlayer.sh
+git add -f launch/eval_script_lastlayer_promptctl.sh
 git add -f launch/eval_script_promptctl.sh
 git add -f launch/eval_leaderboard_slurm.sh
 git add -f launch/eval_interleave.sh

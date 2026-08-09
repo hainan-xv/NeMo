@@ -36,8 +36,11 @@ git add examples/speechlm2/conf/streaming_stt_granary2_lora_script_lastlayer.yam
 # shard eval backend they exec (eval_leaderboard_slurm.sh).
 git add -f launch/script_baseline.sh
 git add -f launch/script_lastlayer.sh
+git add -f launch/script_lastlayer_promptctl.sh
 git add -f launch/script_promptctl.sh
 git add -f launch/eval_script_baseline.sh
+git add -f launch/eval_script_lastlayer.sh
+git add -f launch/eval_script_lastlayer_promptctl.sh
 git add -f launch/eval_script_promptctl.sh
 git add -f launch/eval_leaderboard_slurm.sh
 git add -f launch/eval_interleave.sh
