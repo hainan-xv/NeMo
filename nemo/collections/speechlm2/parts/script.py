@@ -190,6 +190,7 @@ def build_packed_chunk_example(
     audio_window_frames: int = 0,
     corrupt_prev: Optional[List[Optional[List[int]]]] = None,
     delete_id: Optional[int] = None,
+    correction_scope: str = "word",
 ) -> PackedChunkExample:
     """Build the packed spine+branch layout for one utterance.
 
@@ -238,6 +239,13 @@ def build_packed_chunk_example(
             ``[delete_id] + w_prev + w_k`` (delete the wrong word, re-emit the truth,
             then this chunk's words). The spine and all other branches are unchanged.
             Mutually exclusive with ``recover_prev``; non-contiguous layout only.
+        correction_scope: what a correction (``corrupt_prev``) deletes and re-emits.
+            ``"word"`` (default) rolls back only the previous chunk's LAST word
+            (target ``<del> w_prev_word w_k``). ``"chunk"`` rolls back the ENTIRE
+            previous chunk's words (target ``<del> w_prev_chunk w_k``) -- a single
+            ``<del>`` deletes the whole last chunk. In both cases ``corrupt_prev[k]``
+            is the mis-committed unit ``W'`` (a word or a whole chunk, respectively)
+            and it must correspond to this scope.
         delete_id: the special "delete last word" token id used by ``corrupt_prev``.
         contiguous_text_positions: when True (Option A), each branch's predicted
             words + eot get positions ``pref, pref+1, ...`` (contiguous with the
@@ -253,6 +261,8 @@ def build_packed_chunk_example(
     """
     m = len(instruction_ids)
     M = max(int(audio_history_chunks), 0)
+    if correction_scope not in ("word", "chunk"):
+        raise ValueError(f"correction_scope must be 'word' or 'chunk', got {correction_scope!r}")
 
     # --- spine: instruction followed by all chunk words, in order ---
     spine_ids: List[int] = list(instruction_ids)
@@ -293,9 +303,16 @@ def build_packed_chunk_example(
         # Per-branch history edit (mutually exclusive, both need a previous chunk
         # with a non-empty last word, both only in the non-contiguous layout):
         #  * recovery: DROP the prev chunk's correct last word and re-emit it.
-        #  * self-correction: the prev chunk's last word was mis-committed as W'
+        #  * self-correction: the prev chunk's last unit was mis-committed as W'
         #    (corrupt_prev[kc]); show W' as this branch's history tail and target
-        #    ``<del> w_prev w_k`` -- delete the wrong word and re-emit the truth.
+        #    ``<del> w_prev w_k`` -- delete the wrong unit and re-emit the truth.
+        #    The corrected unit is the previous chunk's last WORD (correction_scope
+        #    == "word") or its ENTIRE words (correction_scope == "chunk").
+        prev_correction_unit = (
+            (chunks[kc - 1].target_ids if correction_scope == "chunk" else chunks[kc - 1].last_word_ids)
+            if kc >= 1
+            else []
+        )
         do_recover = (
             recover_prev is not None
             and kc >= 1
@@ -308,18 +325,18 @@ def build_packed_chunk_example(
             and delete_id is not None
             and corrupt_prev[kc] is not None
             and len(corrupt_prev[kc]) > 0
-            and len(chunks[kc - 1].last_word_ids) > 0
+            and len(prev_correction_unit) > 0
         )
         if do_recover and do_corrupt:
             raise ValueError("a chunk cannot both recover and self-correct its previous word")
         if (do_recover or do_corrupt) and contiguous_text_positions:
             raise ValueError("recovery / self-correction are not supported with contiguous_text_positions")
 
-        context: List[int] = []  # unsupervised branch-leading tokens (the mis-committed word W')
+        context: List[int] = []  # unsupervised branch-leading tokens (the mis-committed unit W')
         if do_corrupt:
             wprime = list(corrupt_prev[kc])
-            wprev = list(chunks[kc - 1].last_word_ids)
-            pref = pref - len(wprev)  # exclude the correct prev word from the attended history
+            wprev = list(prev_correction_unit)
+            pref = pref - len(wprev)  # exclude the correct prev unit from the attended history
             context = wprime  # the wrong word, shown as the (committed) history tail
             branch_words = [delete_id] + wprev + list(ch.target_ids)
         elif do_recover:
@@ -632,6 +649,7 @@ def build_separate_chunk_examples(
     audio_window_frames: int = 0,
     corrupt_prev: Optional[List[Optional[List[int]]]] = None,
     delete_id: Optional[int] = None,
+    correction_scope: str = "word",
 ) -> List[SeparateChunkExample]:
     """Build the naive per-chunk examples used as a correctness oracle.
 
@@ -646,6 +664,8 @@ def build_separate_chunk_examples(
     latter the audio-window sizing (see :func:`_audio_window_start`).
     """
     M = max(int(audio_history_chunks), 0)
+    if correction_scope not in ("word", "chunk"):
+        raise ValueError(f"correction_scope must be 'word' or 'chunk', got {correction_scope!r}")
     frame_starts: List[int] = []
     running_frames = 0
     for ch in chunks:
@@ -668,19 +688,24 @@ def build_separate_chunk_examples(
             and recover_prev[kc]
             and len(chunks[kc - 1].last_word_ids) > 0
         )
+        prev_correction_unit = (
+            (chunks[kc - 1].target_ids if correction_scope == "chunk" else chunks[kc - 1].last_word_ids)
+            if kc >= 1
+            else []
+        )
         do_corrupt = (
             corrupt_prev is not None
             and kc >= 1
             and delete_id is not None
             and corrupt_prev[kc] is not None
             and len(corrupt_prev[kc]) > 0
-            and len(chunks[kc - 1].last_word_ids) > 0
+            and len(prev_correction_unit) > 0
         )
         context: List[int] = []
         if do_corrupt:
             wprime = list(corrupt_prev[kc])
-            wprev = list(chunks[kc - 1].last_word_ids)
-            prefix = list(history[: len(history) - len(wprev)])  # drop the correct prev word
+            wprev = list(prev_correction_unit)
+            prefix = list(history[: len(history) - len(wprev)])  # drop the correct prev unit
             context = wprime  # show the mis-committed word as the history tail
             branch_words = [delete_id] + wprev + list(ch.target_ids)
         elif do_recover:
@@ -914,6 +939,7 @@ def batched_stream_decode_script(
     audio_window_frames: int = 0,
     delete_id: Optional[int] = None,
     is_word_start: Optional[Callable[[int], bool]] = None,
+    correction_scope: str = "word",
     return_raw: bool = False,
 ):
     """Batched greedy SCRIPT decode for B utterances at once.
@@ -946,6 +972,8 @@ def batched_stream_decode_script(
     B = len(frames_list)
     if B == 0:
         return []
+    if correction_scope not in ("word", "chunk"):
+        raise ValueError(f"correction_scope must be 'word' or 'chunk', got {correction_scope!r}")
     if device is None:
         device = frames_list[0].device
     H = frames_list[0].shape[-1]
@@ -980,6 +1008,22 @@ def batched_stream_decode_script(
             start = word_starts[b].pop()
             del emitted[b][start:]
             del chunk_ids[b][start:]
+
+    def _pop_last_chunk(b: int) -> None:
+        """Remove ALL committed tokens emitted during the most recent chunk (the
+        contiguous trailing run of a single chunk id). Used by the whole-chunk
+        self-correction scope, where one leading <del> deletes the last chunk."""
+        if not chunk_ids[b]:
+            return
+        last = chunk_ids[b][-1]
+        start = len(chunk_ids[b])
+        while start > 0 and chunk_ids[b][start - 1] == last:
+            start -= 1
+        del emitted[b][start:]
+        del chunk_ids[b][start:]
+        # Keep word_starts consistent (drop any word that began in the popped run).
+        while word_starts[b] and word_starts[b][-1] >= start:
+            word_starts[b].pop()
 
     for k in range(max_chunks):
         active = [b for b in range(B) if k < num_chunks[b]]
@@ -1111,7 +1155,12 @@ def batched_stream_decode_script(
                 chunk_ids[b].extend([k] * len(words[i]))
             else:
                 if do_delete[i]:
-                    _pop_last_word(b)  # remove the mis-committed previous word
+                    # remove the mis-committed previous unit: just its last word
+                    # (word scope) or the entire previous chunk (chunk scope).
+                    if correction_scope == "chunk":
+                        _pop_last_chunk(b)
+                    else:
+                        _pop_last_word(b)
                 for tok in words[i]:
                     _append_token(b, tok, k)
             if return_raw:

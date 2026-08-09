@@ -892,6 +892,87 @@ def test_self_correction_layout():
     assert (ex.prefix_len[b1] == 2).all()
 
 
+def test_self_correction_chunk_scope_layout():
+    # Whole-chunk scope: chunk1 "one two"=[20,21]; chunk2 "three"=[30]. The model
+    # mis-committed the WHOLE chunk1 as W'=[98,99]; branch2 must delete the whole
+    # previous chunk and re-emit both true tokens [20,21], then chunk2's [30].
+    chunks = [ChunkSpec(2, [20, 21], last_word_ids=[21]), ChunkSpec(2, [30], last_word_ids=[30])]
+    ex = build_packed_chunk_example(
+        INSTR, chunks, VS, VE, EOT, corrupt_prev=[None, [98, 99]], delete_id=DEL, correction_scope="chunk"
+    )
+
+    b2 = (ex.seg_ids == 2).nonzero(as_tuple=True)[0]
+    # [98 99] <vs> A A <ve> <DEL> 20 21 30 <eot>
+    assert ex.input_ids[b2].tolist() == [98, 99, VS, AUDIO_TOKEN_IDX, AUDIO_TOKEN_IDX, VE, DEL, 20, 21, 30, EOT]
+    # prefix excludes the WHOLE correct chunk1 (spine positions 2,3): branch2
+    # attends only the instruction (spine positions 0,1).
+    assert (ex.prefix_len[b2] == 2).all()
+    # W' (2 tokens) sits on the history-tail positions (2,3), then the rest contiguous.
+    assert ex.position_ids[b2].tolist() == [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    # target: delete, re-emit the whole true chunk1 [20,21], then chunk2 [30], then eot.
+    supervised = ex.target_ids != IGNORE_INDEX
+    assert ex.target_ids[b2][supervised[b2]].tolist() == [DEL, 20, 21, 30, EOT]
+
+
+@torch.no_grad()
+def test_delete_aware_decode_pops_last_chunk():
+    """With correction_scope='chunk', a leading <del> pops ALL tokens committed in
+    the previous chunk (not just its last word)."""
+    A, Bt = 20, 21
+    V, H = 128, 8
+    # chunk0 prefill emits A then B then eot (a 2-token chunk); chunk1 emits
+    # <del> (pop the whole previous chunk) then C, eot.
+    C = 22
+    llm = _ScriptedLLM([A, Bt, EOT, DEL, C, EOT], V)
+    embed = lambda ids: torch.zeros(*ids.shape, H)  # noqa: E731
+    frames = torch.zeros(4, H)  # 2 chunks of size 2
+    emitted = batched_stream_decode_script(
+        llm=llm, embed_tokens=embed, instruction_ids_list=[[5, 6]], frames_list=[frames],
+        chunk_size=2, vision_start_id=VS, vision_end_id=VE, eot_id=EOT, pad_id=0,
+        max_new_tokens=4, delete_id=DEL, is_word_start=lambda t: True, correction_scope="chunk",
+    )
+    # chunk0 commits [A, B]; chunk1's leading <del> pops the WHOLE chunk -> [], then C.
+    assert emitted == [[C]]
+
+
+@torch.no_grad()
+def test_parity_self_correction_chunk_scope_packed_vs_separate():
+    """Whole-chunk self-correction: packed branch logits must equal the standalone
+    example with the whole wrong chunk W' as history tail and target <DEL> w_prev_chunk w_k."""
+    model = _tiny_qwen3()
+    H = model.config.hidden_size
+    instruction = [5, 6, 7]
+    chunks = [
+        ChunkSpec(2, [20, 21], last_word_ids=[21]),
+        ChunkSpec(3, [30, 31], last_word_ids=[31]),
+        ChunkSpec(2, [40], last_word_ids=[40]),
+    ]
+    corrupt = [None, [98, 99], None]  # chunk2 corrects the whole mis-committed chunk1 -> [98,99]
+    torch.manual_seed(7)
+    audio_frames = [torch.randn(c.audio_len, H) for c in chunks]
+
+    packed = build_packed_chunk_example(
+        instruction, chunks, VS, VE, EOT, corrupt_prev=corrupt, delete_id=DEL, correction_scope="chunk"
+    )
+    valid = torch.ones_like(packed.input_ids, dtype=torch.bool)
+    mask = build_script_mask(
+        packed.seg_ids[None], packed.position_ids[None], packed.prefix_len[None], valid[None], torch.float32
+    )
+    packed_emb = _embed_with_audio(model, packed.input_ids, packed.is_audio, torch.cat(audio_frames, dim=0))
+    packed_logits = model(
+        inputs_embeds=packed_emb[None], attention_mask=mask, position_ids=packed.position_ids[None]
+    ).logits[0]
+
+    separate = build_separate_chunk_examples(
+        instruction, chunks, VS, VE, EOT, corrupt_prev=corrupt, delete_id=DEL, correction_scope="chunk"
+    )
+    for k, (sep, frames) in enumerate(zip(separate, audio_frames), start=1):
+        sep_emb = _embed_with_audio(model, sep.input_ids, sep.is_audio, frames)
+        sep_logits = model(inputs_embeds=sep_emb[None], position_ids=sep.position_ids[None]).logits[0]
+        idx = (packed.seg_ids == k).nonzero(as_tuple=True)[0]
+        torch.testing.assert_close(packed_logits[idx], sep_logits[sep.branch_start :], atol=1e-4, rtol=1e-4)
+
+
 class _ScriptedLLM:
     """A stand-in LLM whose argmax follows a fixed per-call token script, so we can
     drive the decoder deterministically (used to test <del> word-popping)."""

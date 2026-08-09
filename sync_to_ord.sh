@@ -25,6 +25,7 @@ git add .gitignore sync_to_ord.sh
 # New files in tracked dirs must be added explicitly (git add -u only stages
 # already-tracked files).
 git add scripts/eval_wandb_report.py
+git add examples/speechlm2/conf/streaming_stt_granary2_lora_script_selfcorrect_chunk.yaml
 # Model launch + eval scripts now live under the gitignored /launch/ dir (local-
 # only scratch); copy most of them to the cluster manually if needed. The project-
 # owned launchers are force-added so they sync through git. This covers the two

@@ -28,6 +28,7 @@ git add scripts/eval_wandb_report.py
 # New SCRIPT last-layer-restricted-history recipe (a new file under the tracked
 # examples/ dir; git add -u only stages already-tracked files).
 git add examples/speechlm2/conf/streaming_stt_granary2_lora_script_lastlayer.yaml
+git add examples/speechlm2/conf/streaming_stt_granary2_lora_script_selfcorrect_chunk.yaml
 # Model launch + eval scripts now live under the gitignored /launch/ dir (local-
 # only scratch). Most stay untracked -- copy them to the cluster manually if needed
 # (e.g. rsync launch/ to $OCI_REPO/launch/). The project-owned baseline launcher is

@@ -299,6 +299,14 @@ class ScriptSTTDataset(StreamingSTTDataset):
         # the OFF clause is stated). p=1.0 (default) reproduces the always-on model.
         self._self_correction_batch_prob = float(getattr(self.cfg, "self_correction_batch_prob", 1.0) or 0.0)
         self._no_self_correction_prompt_suffix = getattr(self.cfg, "no_self_correction_prompt_suffix", None)
+        # Correction scope: "word" (delete only the previous chunk's last word) or
+        # "chunk" (delete the entire previous chunk). Forced/DAgger variant only;
+        # the model reads the same knob from its own config for the rebuild + decode.
+        self._self_correction_scope = str(getattr(self.cfg, "self_correction_scope", "word") or "word").lower()
+        if self._self_correction_scope not in ("word", "chunk"):
+            raise ValueError(
+                f"self_correction_scope must be 'word' or 'chunk', got {self._self_correction_scope!r}"
+            )
         if self._self_correction:
             if self._contiguous_text_positions:
                 raise ValueError("self_correction is not compatible with contiguous_text_positions.")
@@ -320,9 +328,10 @@ class ScriptSTTDataset(StreamingSTTDataset):
                     f"self_correction_batch_prob must be in [0, 1], got {self._self_correction_batch_prob}"
                 )
             logging.info(
-                "ScriptSTTDataset: self_correction=True (forced/DAgger) | batch_prob=%.2f "
+                "ScriptSTTDataset: self_correction=True (forced/DAgger) | scope=%s | batch_prob=%.2f "
                 "(fraction of batches trained WITH the correction objective; the rest are plain "
                 "SCRIPT batches with the 'do not correct' clause).",
+                self._self_correction_scope,
                 self._self_correction_batch_prob,
             )
 
@@ -333,6 +342,14 @@ class ScriptSTTDataset(StreamingSTTDataset):
         if self._self_correction_prefix:
             if self._self_correction:
                 raise ValueError("self_correction (forced) and self_correction_prefix are mutually exclusive.")
+            if self._self_correction_scope != "word":
+                # The prefix heuristic bakes a random char-prefix of the previous
+                # chunk's last WORD; whole-chunk scope is only wired for the forced
+                # (DAgger) variant. Guard rather than silently ignore the scope.
+                raise NotImplementedError(
+                    "self_correction_scope='chunk' is only supported with the forced self_correction "
+                    "variant, not self_correction_prefix."
+                )
             if self._contiguous_text_positions:
                 raise ValueError("self_correction_prefix is not compatible with contiguous_text_positions.")
             if bool(getattr(self.cfg, "shared_audio_track", False)):

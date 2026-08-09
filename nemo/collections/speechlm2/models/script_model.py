@@ -90,6 +90,14 @@ class ScriptSTTModel(StreamingSTTModel):
         self._self_correction = bool(getattr(self.core_cfg, "self_correction", False))
         self._self_correction_prob = float(getattr(self.core_cfg, "self_correction_prob", 1.0) or 0.0)
         self._self_correction_log_every = int(getattr(self.core_cfg, "self_correction_log_every", 200) or 0)
+        # Correction scope: "word" deletes only the previous chunk's last word;
+        # "chunk" deletes the entire previous chunk (one <del> -> whole last chunk).
+        # Read from the MODEL config so from_pretrained rebuilds it for decode.
+        self._self_correction_scope = str(getattr(self.core_cfg, "self_correction_scope", "word") or "word").lower()
+        if self._self_correction_scope not in ("word", "chunk"):
+            raise ValueError(
+                f"self_correction_scope must be 'word' or 'chunk', got {self._self_correction_scope!r}"
+            )
         self._delete_id = None
         if self._self_correction:
             hf_tok = self.tokenizer.tokenizer
@@ -111,9 +119,10 @@ class ScriptSTTModel(StreamingSTTModel):
 
             self._is_word_start = _is_word_start
             logging.info(
-                "[SCRIPT] self-correction ON | delete_token=%r (id=%s) | inject_prob=%.2f "
-                "-- learns to emit <del> to fix a mis-committed previous word.",
-                delete_token, self._delete_id, self._self_correction_prob,
+                "[SCRIPT] self-correction ON | delete_token=%r (id=%s) | inject_prob=%.2f | scope=%s "
+                "-- learns to emit <del> to fix a mis-committed previous %s.",
+                delete_token, self._delete_id, self._self_correction_prob, self._self_correction_scope,
+                "chunk" if self._self_correction_scope == "chunk" else "word",
             )
         # Contiguous-text positions ("Option A"): must match how the data was
         # packed at train time; read from the MODEL config for from_pretrained.
@@ -377,23 +386,28 @@ class ScriptSTTModel(StreamingSTTModel):
             instruction_ids, chunks = batch.chunk_meta[b]
             corrupt_prev = [None] * len(chunks)
             seg_b, tgt_b, am_b = batch.seg_ids[b], batch.target_tokens[b], argmax[b]
+            chunk_scope = self._self_correction_scope == "chunk"
             for kc in range(len(chunks) - 1):  # an error in chunk kc corrupts chunk kc+1
-                lw = len(chunks[kc].last_word_ids)
+                # The corrected unit is chunk kc's last word (word scope) or all of
+                # its words (chunk scope). Both need chunk kc to have emitted words.
+                truth = list(chunks[kc].target_ids) if chunk_scope else list(chunks[kc].last_word_ids)
                 nword = len(chunks[kc].target_ids)
-                if lw == 0 or nword == 0:
+                if len(truth) == 0 or nword == 0:
                     continue
                 n_eligible += 1
                 sup = ((seg_b == kc + 1) & (tgt_b != IGNORE_INDEX)).nonzero(as_tuple=True)[0]
                 if sup.numel() < nword:
                     continue
-                pred_last = am_b[sup[:nword]][nword - lw:].tolist()
-                if pred_last != list(chunks[kc].last_word_ids):
+                # Predicted unit: the whole chunk (chunk scope) or just its last word.
+                pred_words = am_b[sup[:nword]]
+                pred_unit = pred_words.tolist() if chunk_scope else pred_words[nword - len(truth):].tolist()
+                if pred_unit != truth:
                     n_error += 1
                     if float(torch.rand((), generator=self._sc_rng).item()) < self._self_correction_prob:
-                        corrupt_prev[kc + 1] = pred_last
+                        corrupt_prev[kc + 1] = pred_unit
                         n_corrupt += 1
                         if sample is None:
-                            sample = (list(chunks[kc].last_word_ids), pred_last, list(chunks[kc + 1].target_ids))
+                            sample = (truth, pred_unit, list(chunks[kc + 1].target_ids))
             corrupt_examples.append(
                 build_packed_chunk_example(
                     instruction_ids=instruction_ids,
@@ -403,6 +417,7 @@ class ScriptSTTModel(StreamingSTTModel):
                     eot_id=self._cc_eot_id,
                     corrupt_prev=corrupt_prev,
                     delete_id=self._delete_id,
+                    correction_scope=self._self_correction_scope,
                     audio_history_chunks=self._audio_history_chunks,
                     audio_window_frames=self._audio_window_frames,
                 )
@@ -672,6 +687,7 @@ class ScriptSTTModel(StreamingSTTModel):
             audio_window_frames=self._audio_window_frames,
             delete_id=self._delete_id if self._self_correction else None,
             is_word_start=self._is_word_start if self._self_correction else None,
+            correction_scope=self._self_correction_scope,
             return_raw=return_raw,
         )
         # The decoder returns emitted, then (chunk_ids if requested), then (raw if
