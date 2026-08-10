@@ -33,9 +33,14 @@
 #   depth  R = model.redecode_depth           (recipe: R=2 -> lock lag 2 chunks)
 # See nemo/collections/speechlm2/docs/script_windowed_redecoding.md
 #
-# INITIALIZED from the _promptctl checkpoint (set INIT_CKPT below); the j=0
-# branch matches a windowed SCRIPT objective, so it warm-starts well. Keeps the
-# prompt-controlled exact delay (0..4) + text-representation knobs from _promptctl.
+# Keeps the BASELINE fixed-delay=3 operating point and chunk-size set (narrowed to
+# [2,7,10,14]) so results stay comparable to older baseline numbers. Uses the newer
+# prompt design (defined in the recipe): the prompt states the per-batch chunk size
+# and the target text format (cap x punct, varied via vary_text_repr) and ends with
+# the "The text history is:" connector. INITIALIZED from the BASELINE SCRIPT
+# checkpoint (set INIT_CKPT below), i.e. redecode = baseline + windowed
+# re-decoding; the j=0 branch is close to the baseline objective, so it warm-starts
+# well.
 #
 # Runs MY code (git-synced repo mounted at /code), not the container's NeMo.
 #
@@ -45,7 +50,7 @@
 #   sbatch launch/script_redecode.sh 123      # seed 123
 #
 # Weights are AUTO-INITIALIZED from the best checkpoint of INIT_EXP
-# (default granary2_script_promptctl) -- no need to set anything. Override:
+# (default granary2_script_baseline) -- no need to set anything. Override:
 #   INIT_CKPT=/path/to.ckpt   (pin a checkpoint)
 #   INIT_EXP=<other_exp>      (init from a different run)
 #   INIT_CKPT=none            (train from the base pretrained LLM+ASR)
@@ -88,15 +93,14 @@ CONTAINER="gitlab-master.nvidia.com/hainanx/nemo_containers:speechlm_heh"
 CONTAINER="/lustre/fsw/portfolios/llmservice/users/heh/containers/nemo-26.02-streaming-speechlm.sqsh"
 
 
-PROJECT_NAME=Speechlm79
+PROJECT_NAME=SpeechlmRefactored
 
 # Training parameters (match the granary2 no-blank launcher overrides).
-MAX_STEPS=200000
+MAX_STEPS=300000
 VAL_CHECK_INTERVAL=2000
-# DELAY=-1 activates prompt-controlled delay. With the recipe's exact_delay=true,
-# each batch samples an integer delay ~ Uniform[0, exact_max_delay] and renders
-# the exact number into the prompt. Set a fixed delay >=0 to disable.
-DELAY=-1
+# Fixed delay of 3 frames -- matches the older BASELINE results this is compared
+# against (the redecode recipe uses no prompt-controlled / exact delay).
+DELAY=3
 LR=0.0001
 WARMUP_STEPS=10000
 COMPACT_TEMPLATE=true
@@ -118,12 +122,28 @@ CONFIG_NAME=streaming_stt_granary2_lora_script_redecode
 
 EXP_NAME=granary2_script_redecode
 
-# Initialize weights from a good checkpoint of INIT_EXP (default: the _promptctl
-# model this is built on). If INIT_CKPT is empty it is AUTO-RESOLVED below to that
-# exp's best (lowest val_wer) checkpoint, so you normally don't set anything. Set
-# INIT_CKPT=/path/to.ckpt to pin one, INIT_EXP=<other_exp> to init from a different
-# run, or INIT_CKPT=none to train from the base pretrained LLM+ASR.
-INIT_EXP="${INIT_EXP:-granary2_script_promptctl}"
+# Baseline operating point (CLI overrides on top of the recipe), matched to
+# launch/script_baseline.sh so redecode is directly comparable to older results.
+# One chunk size is drawn per batch from this set (encoder frames).
+# 28 is dropped: with the M=2 re-decode window (3 chunks of audio per branch) a
+# 14-frame chunk already gives the model up to ~42 frames of context, so the
+# 28-frame regime is effectively covered by the window. 10 is added for a finer
+# mid-range operating point.
+CHUNK_SIZES="[2,7,10,14]"
+
+# The prompt design lives entirely in the recipe (train_system_prompt + chunk-size
+# clause + vary_text_repr format clause + "The text history is:" connector, with a
+# byte-identical fully-rendered validation system_prompt). We deliberately do NOT
+# override data.dataset.system_prompt here -- doing so would clobber the recipe's
+# carefully-rendered validation prompt.
+
+# Initialize weights from a good checkpoint of INIT_EXP (default: the BASELINE
+# SCRIPT model, so redecode = baseline + windowed re-decoding). If INIT_CKPT is
+# empty it is AUTO-RESOLVED below to that exp's best (lowest val_wer) checkpoint,
+# so you normally don't set anything. Set INIT_CKPT=/path/to.ckpt to pin one,
+# INIT_EXP=<other_exp> to init from a different run, or INIT_CKPT=none to train
+# from the base pretrained LLM+ASR.
+INIT_EXP="${INIT_EXP:-granary2_script_baseline}"
 INIT_CKPT="${INIT_CKPT:-}"
 
 # Directories for manifests, data, etc.
@@ -193,7 +213,7 @@ MOUNTS="--container-mounts=${DATA_DIR}:${DATA_DIR},${H_DIR}:${H_DIR},$HAINAN_DIR
 read -r -d '' cmd <<EOF
 echo "*******STARTING********" \
 && echo "---------------" \
-&& echo "*** RECIPE: ${CONFIG_NAME} (SCRIPT, WINDOWED RE-DECODING, init=${INIT_CKPT:-none}, granary2, no-blank) ***" \
+&& echo "*** RECIPE: ${CONFIG_NAME} (SCRIPT, WINDOWED RE-DECODING, init=${INIT_CKPT:-none}, granary2, no-blank | delay=${DELAY} | vary_text_repr + chunk-size prompt | chunk-size ${CHUNK_SIZES}) ***" \
 && echo "*** OBJECTIVE: p(words_k | text_history_<k, audio_{k-M..k+j}); re-decode each chunk at lookahead 0..R on clean history ***" \
 && echo "*** MONITOR: val_wer (min) -- windowed re-decoding streaming decode (previews + R-chunk lock lag) ***" \
 && echo "*** SEED: ${LHOTSE_RND_SEED} ***" \
@@ -227,6 +247,7 @@ echo "*******STARTING********" \
     model.optimizer.lr=$LR \
     model.lr_scheduler.warmup_steps=$WARMUP_STEPS \
     data.dataset.num_delay_frames=$DELAY \
+    model.chunk_size="${CHUNK_SIZES}" \
     data.train_ds.seed=$LHOTSE_RND_SEED \
     ++trainer.limit_train_batches=$VAL_CHECK_INTERVAL \
     ++trainer.val_check_interval=$VAL_CHECK_INTERVAL \

@@ -2,24 +2,26 @@
 # SCRIPT streaming SpeechLM — Granary 2.0, LoRA, no-blank, val_wer.
 # WINDOWED RE-DECODING self-correction variant.
 #
-# Replaces the <del> backspace token with windowed re-decoding: each chunk is
+# Same data / model / optimizer / trainer and fixed delay=3 operating point as
+# the BASELINE recipe streaming_stt_granary2_lora_script.yaml, so it stays
+# comparable to the older baseline results. Two changes: (a) the windowed
+# re-decoding objective, and (b) the newer prompt design -- the prompt states the
+# per-batch chunk size and the target text format (cap x punct, varied via
+# vary_text_repr), and ends with the "The text history is:" connector. Delay is
+# still FIXED at 3 frames (NO exact / prompt-controlled delay).
+#
+# Windowed re-decoding replaces the <del> backspace token: each chunk is
 # transcribed several times, each time with one more chunk of LOOKAHEAD audio,
 # always conditioning on clean (believed-correct) history. Early emissions are
 # low-latency provisional previews; later re-decodes (more lookahead) refine and
-# finally LOCK each chunk. No delete token, no synthetic-error manufacturing --
-# correction falls out of re-decoding with more acoustic context.
+# finally LOCK each chunk. No delete token, no synthetic-error manufacturing.
 #
 #   window size N = audio_history_chunks + 1  (chunks of audio per branch)
 #   depth       R = redecode_depth            (max lookahead / lock lag, 1..M)
 #
 # Training adds, per chunk c, one branch per lookahead level j=0..R (j=0 is the
 # base branch; higher j slides the audio window j chunks into the future).
-# Inference emits each chunk immediately (j=0 preview) and locks it R chunks
-# later at maximal lookahead. See
-# nemo/collections/speechlm2/docs/script_windowed_redecoding.md
-#
-# INITIALIZE from a trained SCRIPT checkpoint (set INIT_CKPT in the launcher);
-# j=0 matches the base audio_history_chunks=M objective, so it warm-starts well.
+# See nemo/collections/speechlm2/docs/script_windowed_redecoding.md
 # ============================================================================
 
 model:
@@ -31,7 +33,7 @@ model:
   sample_rate: 16000
   blank_token: ""            # no-blank: silent chunks emit <|im_end|>
   frame_length_in_secs: 0.08
-  chunk_size: [2, 4, 7, 10, 14, 28]   # multi chunk-size: one drawn per batch
+  chunk_size: [2, 4, 7, 10, 14, 28]   # multi chunk-size: one drawn per batch (launcher narrows to [2,7,10,14])
   att_context_size: [70, 1]  # left 70; right (lookahead) is set per batch to chunk-1
   audio_pad_to: 0
 
@@ -40,6 +42,8 @@ model:
   audio_history_chunks: 2    # window N = 3 chunks (M=2); each branch sees up to 2 prior chunks
   redecode_depth: 2          # R=2: re-decode up to 2 chunks back; final transcript lags 2 chunks
 
+  # Compact template flag is irrelevant to the SCRIPT layout (it builds
+  # its own spine+branch structure), but kept for config compatibility.
   compact_template: true
 
   freeze_speech_encoder: false
@@ -62,6 +66,9 @@ model:
     modality_adapter:
       _target_: nemo.collections.speechlm2.modules.perception.IdentityConnector
     encoder:
+      # Per-rank-independent decode (see the no-blank recipe): the cache-aware
+      # encoder otherwise all-reduces max audio length every forward, desyncing
+      # the data-dependent streaming validation decode across ranks.
       sync_max_audio_length: false
 
   optimizer:
@@ -83,28 +90,44 @@ data:
     sample_rate: ${model.sample_rate}
     frame_length_in_secs: ${model.frame_length_in_secs}
     chunk_size: ${model.chunk_size}
-    num_delay_frames: -1  # -1 activates prompt-controlled delay (exact mode below)
+    num_delay_frames: 3
     audio_tag: "<audio>"
     blank_token: ${model.blank_token}
     compact_template: ${model.compact_template}
     system_role: system
 
-    # --- Exact-delay prompting ---
-    exact_delay: true
-    exact_max_delay: 4
-
-    # --- Text-representation variation ---
+    # --- Prompt design (fixed delay=3, so NO exact/prompt-controlled delay) ---
+    # The training prompt is assembled per batch as:
+    #   train_system_prompt  ->  + sampled format clause (cap/punct)
+    #                        ->  + chunk-size clause ("... The text history is:")
+    # so it states the actual per-batch chunk size, the target text format, and
+    # ends with the history connector that reads straight into the packed spine.
+    #
+    # (1) Chunk-size prompting: the per-batch chunk size (frames) is rendered here
+    #     and appended. The connector "The text history is:" is folded onto the END
+    #     of this clause so it stays last, right before the history words.
+    chunk_size_prompt_template: "Process the audio in chunks of {chunk_size} frames. The text history is:"
+    # (2) Text-representation variation: per batch sample one of 4 cap x punct
+    #     formats, state it in the prompt, and transform the targets to match.
     vary_text_repr: true
-    text_repr_keep_chars: "'"
+    text_repr_keep_chars: "'"   # keep apostrophes when stripping punctuation
+    # (3) Training prompt base (format + chunk clauses are appended to this).
+    train_system_prompt: "You are doing streaming speech recognition. Given the transcript so far and the representation of the next audio chunk, output the words spoken in that chunk."
+
+    # Validation prompt (model.val_system_prompt reads data.dataset.system_prompt),
+    # read VERBATIM -- so it is the FULLY-RENDERED training prompt for
+    # (cap+punct, chunk=14, connector), byte-identical to the append order above:
+    #   base -> "Write the text with normal capitalization and punctuation."
+    #        -> "Process the audio in chunks of 14 frames. The text history is:"
+    # Must match val_dataset_overrides.chunk_size below. Override to eval another
+    # chunk size / format.
+    system_prompt: "You are doing streaming speech recognition. Given the transcript so far and the representation of the next audio chunk, output the words spoken in that chunk. Write the text with normal capitalization and punctuation. Process the audio in chunks of 14 frames. The text history is:"
 
     # --- Windowed re-decoding (must match model.*) ---
     redecode: true
     audio_history_chunks: ${model.audio_history_chunks}
     redecode_depth: ${model.redecode_depth}
     redecode_train_prob: 1.0   # include every lookahead branch; lower this to cut training cost
-
-    # Validation prompt (model.val_system_prompt reads data.dataset.system_prompt).
-    system_prompt: "You are doing streaming speech recognition. Given the transcript so far and the next audio chunk, output the words spoken in that chunk. Emit each chunk's words with a fixed delay of 2 frames. Write the text with normal capitalization and punctuation."
 
   # Decode-only val_wer runs generate() on raw audio; pin a single fixed size.
   val_dataset_overrides:

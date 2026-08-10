@@ -169,6 +169,24 @@ class ScriptSTTDataset(StreamingSTTDataset):
         self._vary_text_repr = bool(getattr(self.cfg, "vary_text_repr", False))
         self._text_repr_keep = set(getattr(self.cfg, "text_repr_keep_chars", "'") or "")
         self._prompt_template = str(getattr(self.cfg, "prompt_template", None) or self._DEFAULT_PROMPT_TEMPLATE)
+        # --- Separate TRAINING base prompt ---
+        # When set, TRAINING builds its per-batch prompt from this base (then appends
+        # the sampled format clause and the rendered chunk-size clause), while the
+        # fully-rendered ``system_prompt`` below is reserved for VALIDATION (read
+        # verbatim by model.val_system_prompt). This mirrors the exact-delay path
+        # (where system_prompt is val-only and training uses a template): it lets a
+        # FIXED-delay recipe use chunk-size / text-representation prompting whose
+        # train and val renders are byte-identical, WITHOUT double-appending the
+        # chunk/format clauses onto a system_prompt that already contains them.
+        # Unset (default) => training uses system_prompt as the base (unchanged).
+        self._train_system_prompt = getattr(self.cfg, "train_system_prompt", None)
+        if self._train_system_prompt is not None:
+            self._train_system_prompt = str(self._train_system_prompt)
+            logging.info(
+                "ScriptSTTDataset: train_system_prompt set; TRAINING uses it as the "
+                "prompt base (format/chunk clauses appended), VALIDATION reads "
+                "data.dataset.system_prompt verbatim."
+            )
         # --- Chunk-size prompting ---
         # When set, the per-batch chunk size (frames) is rendered into the prompt via
         # this template's {chunk_size} placeholder and appended to the system prompt,
@@ -645,7 +663,13 @@ class ScriptSTTDataset(StreamingSTTDataset):
                 system_prompts = [forced_prompt] * len(cuts)
         else:
             num_delay_frames = self.cfg.num_delay_frames
-            system_prompts = [cut.custom.get(self.cfg.prompt_field, self.cfg.system_prompt) for cut in cuts]
+            # Training base = train_system_prompt when set (system_prompt is then the
+            # val-only fully-rendered prompt); else system_prompt. Per-cut overrides
+            # via prompt_field still win.
+            base_default = (
+                self._train_system_prompt if self._train_system_prompt is not None else self.cfg.system_prompt
+            )
+            system_prompts = [cut.custom.get(self.cfg.prompt_field, base_default) for cut in cuts]
             if self._vary_text_repr:
                 system_prompts = [self._append_format_clause(p, cap, punct) for p in system_prompts]
 
