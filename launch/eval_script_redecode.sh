@@ -34,9 +34,12 @@
 #   + chunk clause  ("Process the audio in chunks of {chunk} frames. The text history is:")
 # The chunk clause number MUST equal the decode CHUNK_SIZE (both set here).
 #
-# Windowed re-decoding is auto-enabled from the checkpoint's cfg (model.redecode);
-# generate() emits the LOCKED transcript (the one WER is scored on) and the eval
-# needs no special flags.
+# Windowed re-decoding is auto-enabled from the checkpoint's cfg (model.redecode).
+# By DEFAULT the eval runs the model NON-CORRECTIVELY: each chunk is decoded once
+# (j=0, on the M-chunk audio window ending at that chunk) and appended -- past
+# chunks are never revisited. Pass --self_correct to instead re-decode each chunk
+# with growing lookahead (up to the trained depth R) and score the self-corrected
+# LOCKED stream (which lags R chunks). Run both to measure the self-correction gain.
 #
 # Usage (from the NeMo79 repo root on OCI):
 #   sbatch launch/eval_script_redecode.sh [cap] [punct] [chunk]
@@ -50,7 +53,10 @@
 #   sbatch launch/eval_script_redecode.sh nocap nopunct 10   # lowercase/no-punct, chunk 10
 #   for c in 2 7 10 14; do sbatch launch/eval_script_redecode.sh cap punct $c; done  # chunk sweep
 #   CHUNK_SIZE=7 sbatch launch/eval_script_redecode.sh       # env form of the same knob
+#   sbatch launch/eval_script_redecode.sh --self_correct     # corrected (locked) stream
 #   sbatch launch/eval_script_redecode.sh --quick_run cap punct 14   # smoke test
+#   # measure the self-correction gain (same chunk, corrective vs not):
+#   sbatch launch/eval_script_redecode.sh 14; sbatch launch/eval_script_redecode.sh --self_correct 14
 #
 # Flags (may appear anywhere among the positional args):
 #   --quick_run[=N]   decode only the first N (default 10) utts of EACH dataset for
@@ -61,6 +67,10 @@
 #                     interactive smoke-training run while the full node=8 run is
 #                     still queued. DEFAULT (no flag) locates the non-interactive
 #                     (full-queue) EXP_NAME.
+#   --self_correct    turn ON self-correction: re-decode each chunk with lookahead
+#                     and score the LOCKED/corrected stream. DEFAULT (no flag) is
+#                     the non-corrective j=0 stream (decode each chunk once, append).
+#                     Env form: SELF_CORRECT=1. Tags the run <nocorr|selfcorrect>.
 #
 # NOTE: --interactive (WHICH checkpoint to decode) is INDEPENDENT of
 # launch/launch_with_interactive.sh (WHERE the decode job runs). The latter submits
@@ -76,6 +86,7 @@
 # Optional env:
 #   CAP / PUNCT / CHUNK_SIZE          defaults for the three positional args above.
 #   INTERACTIVE=1                     env form of the --interactive flag.
+#   SELF_CORRECT=1                    env form of the --self_correct flag.
 # Optional env (forwarded to eval_leaderboard_slurm.sh):
 #   BACKEND=heh|sslm   BATCH_SIZE=...   PROJECT=SpeechlmRefactored (default)
 #   RUN_AVERAGING=1 (default) / USE_LAST=1 / STEP=n / CKPT=path
@@ -93,12 +104,14 @@ mkdir -p slurm_out
 QUICK_RUN=0
 QUICK_N=10
 INTERACTIVE="${INTERACTIVE:-0}"
+SELF_CORRECT="${SELF_CORRECT:-0}"
 POSITIONAL=()
 for _arg in "$@"; do
     case "$_arg" in
         --quick_run|--quick-run) QUICK_RUN=1 ;;
         --quick_run=*|--quick-run=*) QUICK_RUN=1; QUICK_N="${_arg#*=}" ;;
         --interactive) INTERACTIVE=1 ;;
+        --self_correct|--self-correct) SELF_CORRECT=1 ;;
         *) POSITIONAL+=("$_arg") ;;
     esac
 done
@@ -108,6 +121,16 @@ if (( QUICK_RUN )); then
     export MAX_EVAL_SAMPLES="${MAX_EVAL_SAMPLES:-$QUICK_N}"
     QUICK_SUFFIX="_quick"
 fi
+
+# Normalize SELF_CORRECT (env may be 1/true) to 0/1 and derive a run tag. Default
+# OFF = the non-corrective j=0 stream (decode each chunk once, append); ON =
+# re-decode past chunks with lookahead and emit the locked/corrected stream.
+if [[ "$SELF_CORRECT" == 1 || "$SELF_CORRECT" == true ]]; then
+    SELF_CORRECT=1; CORR_TAG="selfcorrect"
+else
+    SELF_CORRECT=0; CORR_TAG="nocorr"
+fi
+export SELF_CORRECT
 
 # --- Operating point (positional, all optional with defaults) ---
 # Env vars act as the defaults so `CHUNK_SIZE=7 sbatch ...` works like it does for
@@ -177,17 +200,19 @@ fi
 PROJECT="${PROJECT:-SpeechlmRefactored}"
 MODEL_CLASS="${MODEL_CLASS:-nemo.collections.speechlm2.models.script_model.ScriptSTTModel}"
 # Distinguishes concurrent redecode evals in RESULTS_DIR (backend adds _chunk<n>).
-EVAL_TAG="${REPR_TAG}${QUICK_SUFFIX}"
+# Includes the correction mode so corrective vs non-corrective runs don't collide.
+EVAL_TAG="${CORR_TAG}_${REPR_TAG}${QUICK_SUFFIX}"
 # wandb run name encodes the decode config (delay baked). Logged to WANDB_EVAL_PROJECT.
-WANDB_RUN_NAME="${WANDB_RUN_NAME:-${EXP_NAME}_${REPR_TAG}_chunk${CHUNK_SIZE}${QUICK_SUFFIX}}"
+WANDB_RUN_NAME="${WANDB_RUN_NAME:-${EXP_NAME}_${CORR_TAG}_${REPR_TAG}_chunk${CHUNK_SIZE}${QUICK_SUFFIX}}"
 
-export SYSTEM_PROMPT MODEL_CLASS CHUNK_SIZE EXP_NAME PROJECT EVAL_TAG WANDB_RUN_NAME
+export SYSTEM_PROMPT MODEL_CLASS CHUNK_SIZE EXP_NAME PROJECT EVAL_TAG WANDB_RUN_NAME SELF_CORRECT
 
 echo "==> windowed re-decoding SCRIPT leaderboard eval"
 echo "    exp_name:      ${EXP_NAME}$( (( INTERACTIVE )) && echo '  (interactive-trained checkpoint)')"
 echo "    project:       ${PROJECT}"
 echo "    eval_tag:      ${EVAL_TAG}"
 echo "    cap/punct:     ${REPR_TAG}"
+echo "    self_correct:  $( (( SELF_CORRECT )) && echo 'ON  (locked/corrected stream; re-decode past chunks with lookahead)' || echo 'OFF (non-corrective j=0 stream; decode each chunk once, append)')"
 echo "    delay:         3 frames (FIXED / baked -- not a knob)"
 echo "    chunk_size:    ${CHUNK_SIZE}"
 (( QUICK_RUN )) && echo "    quick_run:     first ${QUICK_N} utts/dataset (MAX_EVAL_SAMPLES=${MAX_EVAL_SAMPLES})"

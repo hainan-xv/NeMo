@@ -1539,8 +1539,13 @@ def batched_stream_decode_redecode(
         device = frames_list[0].device
     M = max(int(audio_history_chunks), 0)
     R = int(redecode_depth)
-    if M < 1 or not (1 <= R <= M):
-        raise ValueError(f"redecode needs audio_history_chunks>=1 and 1<=redecode_depth<=M (M={M}, R={R}).")
+    # R=0 is the NON-CORRECTIVE operating point: the loop runs only j=0, so each
+    # chunk is decoded exactly once (on clean history + the M-chunk audio window
+    # ending at the current chunk, i.e. the trained base branch) and appended --
+    # no lookahead, no re-decoding of past chunks. R>=1 turns on self-correction
+    # (re-decode each chunk with up to R chunks of lookahead; locked stream).
+    if M < 1 or not (0 <= R <= M):
+        raise ValueError(f"redecode needs audio_history_chunks>=1 and 0<=redecode_depth<=M (M={M}, R={R}).")
     cs = int(chunk_size)
     if cs <= 0:
         raise ValueError(f"redecode decode requires a positive chunk size, got {cs}")

@@ -138,6 +138,18 @@ FORCE_CONVERT="${FORCE_CONVERT:-0}"
 # "the cat <del> cat sat") as a raw_text field in each generations record, so you
 # can see exactly where the model corrected. heh backend only. Default off.
 SAVE_RAW="${SAVE_RAW:-false}"
+# Self-correction (SCRIPT windowed-re-decoding / redecode models only): decode the
+# self-corrected LOCKED stream (re-decode each chunk with lookahead) instead of the
+# default non-corrective j=0 stream (decode each chunk once, append). Default off.
+# Accepts 1/true. Forwarded to both backends (heh: self_correct=true; sslm:
+# --self_correct); ignored by non-redecode models.
+SELF_CORRECT="${SELF_CORRECT:-0}"
+SELF_CORRECT_HEH=""
+SELF_CORRECT_SSLM=""
+if [[ "$SELF_CORRECT" == 1 || "$SELF_CORRECT" == true ]]; then
+    SELF_CORRECT_HEH="self_correct=true"
+    SELF_CORRECT_SSLM="--self_correct"
+fi
 # Report per-word emission latency (proxy: end-of-chunk time of each word's last
 # subword, averaged). SCRIPT only; default on for it, off otherwise.
 if [[ -z "${REPORT_LATENCY:-}" ]]; then
@@ -348,6 +360,7 @@ fi
     echo "force_convert:        ${FORCE_CONVERT}"
     echo "system_prompt:        \"${SYSTEM_PROMPT}\""
     echo "chunk_size:           ${CHUNK_SIZE:-<model default>}"
+    echo "self_correct:         $( [[ "$SELF_CORRECT" == 1 || "$SELF_CORRECT" == true ]] && echo 'true (locked/corrected stream)' || echo 'false (non-corrective j=0 stream)')"
     echo "batch_size:           ${BATCH_SIZE}"
     echo "max_new_tokens:       ${MAX_NEW_TOKENS}"
     if [[ "$BACKEND" == "heh" ]]; then
@@ -574,6 +587,7 @@ ${HF_CLAUSE} \
         pad_extra_duration=${HEH_PAD_DURATION} \
         report_word_latency=${REPORT_LATENCY} \
         save_raw=${SAVE_RAW} \
+        ${SELF_CORRECT_HEH} \
         output_manifest="'\${gen}'" \
         verbose=false \
         device=cuda \
@@ -636,6 +650,7 @@ ${AVG_CLAUSE} \
         --system_prompt "\$SP_TEXT" \
         --output_dir "${RESULTS_DIR}" \
         ${CHUNK_SIZE:+--chunk_size ${CHUNK_SIZE}} \
+        ${SELF_CORRECT_SSLM} \
         > "\${log}" 2>&1 & \
       pids+=(\$!); \
    done \

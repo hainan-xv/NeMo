@@ -217,6 +217,9 @@ def evaluate_dataset(model, args, dataset: str, split: str, device: torch.device
         generation_config=GenerationConfig(do_sample=False),
         chunk_size_override=(args.chunk_size if args.chunk_size and args.chunk_size > 0 else None),
     )
+    # Only forward when set, so non-redecode models never see an unexpected kwarg.
+    if args.self_correct:
+        gen_kwargs["self_correct"] = True
 
     hyps: List[str] = []
     start = time.time()
@@ -308,6 +311,9 @@ def evaluate_shard(model, args, device: torch.device) -> int:
         generation_config=GenerationConfig(do_sample=False),
         chunk_size_override=(args.chunk_size if args.chunk_size and args.chunk_size > 0 else None),
     )
+    # Only forward when set, so non-redecode models never see an unexpected kwarg.
+    if args.self_correct:
+        gen_kwargs["self_correct"] = True
 
     os.makedirs(args.output_dir, exist_ok=True)
     out_path = os.path.join(args.output_dir, f"shard{args.shard_index}_of{args.num_shards}.generations.jsonl")
@@ -442,6 +448,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--min_batch_size", type=int, default=1, help="Lower bound for the OOM batch-halving.")
     p.add_argument("--max_new_tokens", type=int, default=64)
     p.add_argument("--chunk_size", type=int, default=None, help="Decode chunk size override (encoder frames).")
+    p.add_argument(
+        "--self_correct",
+        action="store_true",
+        help="SCRIPT redecode models only: emit the self-corrected LOCKED stream "
+        "(re-decode each chunk with lookahead). Default (off) is the non-corrective "
+        "j=0 stream (decode each chunk once, append). Ignored by other models.",
+    )
     p.add_argument("--system_prompt", type=str, default="Transcribe the audio into text.")
     p.add_argument("--dtype", choices=["bf16", "fp32"], default="bf16")
     p.add_argument("--max_eval_samples", type=int, default=0, help="Cap samples per dataset (0 = all).")

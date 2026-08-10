@@ -1715,6 +1715,50 @@ def test_redecode_batched_matches_per_utterance():
 
 
 @torch.no_grad()
+def test_redecode_noncorrective_depth0():
+    """redecode_depth=0 is the NON-CORRECTIVE run: each chunk is decoded exactly
+    once at j=0 (on its own running j=0 history + the M-chunk window ending at that
+    chunk) and appended -- no lookahead, no re-decoding of past chunks. It must
+    match a manual j=0-only replay, and every token's lock step is its own chunk.
+
+    Note this is DISTINCT from the provisional (j=0) stream of a corrective (R>=1)
+    run, whose previews condition on already partially-corrected history.
+    """
+    model = _tiny_qwen3()
+    H = model.config.hidden_size
+    embed = model.get_input_embeddings()
+    instruction = [5, 6, 7]
+    chunk_size = 2
+    M = 2
+    n_chunks = 5
+    torch.manual_seed(313)
+    frames = torch.randn(n_chunks * chunk_size, H)
+    max_new = 4
+
+    emitted, lock_steps = batched_stream_decode_redecode(
+        llm=model, embed_tokens=embed, instruction_ids_list=[instruction], frames_list=[frames],
+        chunk_size=chunk_size, vision_start_id=VS, vision_end_id=VE, eot_id=EOT, pad_id=0,
+        audio_history_chunks=M, redecode_depth=0, max_new_tokens=max_new, return_chunk_ids=True,
+    )
+    emitted, lock_steps = emitted[0], lock_steps[0]
+
+    # Manual j=0-only replay: history is the running (un-corrected) j=0 outputs.
+    committed = []
+    for c in range(n_chunks):
+        win_start = max(0, c - M) * chunk_size
+        win_end = (c + 1) * chunk_size
+        fr = frames[win_start:win_end]
+        hist = [t for w in committed for t in w]
+        committed.append(_decode_one(model, embed, instruction, hist, fr, chunk_size, max_new))
+
+    expected = [t for w in committed for t in w]
+    assert emitted == expected, f"non-corrective (R=0) decode diverged:\n got={emitted}\n exp={expected}"
+    # min(c + R, last) with R=0 -> every token locks at its own chunk index.
+    exp_locks = [c for c, w in enumerate(committed) for _ in w]
+    assert lock_steps == exp_locks
+
+
+@torch.no_grad()
 def test_redecode_decode_matches_forced_packed():
     """Greedy redecode decode must equal the argmax of a teacher-forced packed
     forward built from the decoded per-chunk tokens (decode <-> training layout).

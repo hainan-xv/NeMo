@@ -129,6 +129,11 @@ class StreamingSTTEvalConfig:
     # output manifest, so you can see exactly where the model self-corrected. Ignored
     # by models without a delete token.
     save_raw: bool = False
+    # SCRIPT windowed-re-decoding (redecode) models only: emit the self-corrected
+    # LOCKED stream (re-decode each chunk with lookahead, lags R chunks). Default
+    # (off) emits the non-corrective j=0 stream (decode each chunk once, append).
+    # Ignored by other model classes.
+    self_correct: bool = False
     # When set, LM-head boundary decision uses a probability threshold:
     # emit when p(user_footer_first_id) ≥ threshold (instead of argmax). Useful
     # to recover boundaries where the LM is moderately confident but loses
@@ -261,6 +266,9 @@ def main(cfg: StreamingSTTEvalConfig):
             _gen_kwargs["return_word_latency"] = True
         if cfg.save_raw:
             _gen_kwargs["return_raw"] = True
+        # Forward only when set, so non-redecode models never see an unexpected kwarg.
+        if cfg.self_correct:
+            _gen_kwargs["self_correct"] = True
         _result = _generate_with_oom_backoff(
             batch["audios"].to(model.device, non_blocking=True),
             batch["audio_lens"].to(model.device, non_blocking=True),

@@ -651,6 +651,10 @@ class ScriptSTTModel(StreamingSTTModel):
         # can dump "A B <del> C" and see where self-correction fired). Only meaningful
         # with self-correction; harmless (== hyp) otherwise.
         return_raw = bool(generation_kwargs.pop("return_raw", False))
+        # Popped here (before any decode-path branch) so it never leaks into the
+        # non-redecode decoders as an unexpected kwarg. Only used by the redecode
+        # path below; harmlessly ignored otherwise.
+        self_correct = bool(generation_kwargs.pop("self_correct", False))
         instruction_ids_list = [self.tokenizer.text_to_ids(system_prompt[b] + "\n") for b in range(B)]
 
         if self._redecode:
@@ -659,6 +663,13 @@ class ScriptSTTModel(StreamingSTTModel):
             # Optionally also return the j=0 (zero-lookahead) preview transcript, i.e.
             # the low-latency streaming operating point alongside the locked output.
             return_provisional = bool(generation_kwargs.pop("return_provisional", False))
+            # Self-correction switch. DEFAULT OFF: run a plain non-corrective stream
+            # (effective redecode_depth=0) -- each new chunk is decoded once and
+            # appended, past chunks are never revisited. self_correct=True re-decodes
+            # each chunk with growing lookahead (up to the trained depth R) and emits
+            # the LOCKED/corrected stream (which lags R chunks). The model is trained
+            # either way; this only chooses which stream generate() emits.
+            eff_depth = self._redecode_depth if self_correct else 0
             out = batched_stream_decode_redecode(
                 llm=self.llm,
                 embed_tokens=self.embed_tokens,
@@ -670,7 +681,7 @@ class ScriptSTTModel(StreamingSTTModel):
                 eot_id=self._cc_eot_id,
                 pad_id=self.text_pad_id,
                 audio_history_chunks=self._audio_history_chunks,
-                redecode_depth=self._redecode_depth,
+                redecode_depth=eff_depth,
                 max_new_tokens=max_new_tokens,
                 device=self.device,
                 return_chunk_ids=return_word_latency,
