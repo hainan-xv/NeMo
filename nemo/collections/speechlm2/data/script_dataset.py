@@ -34,6 +34,7 @@ from nemo.collections.speechlm2.parts.alignments import WordAlignment
 from nemo.collections.speechlm2.parts.script import (
     ChunkSpec,
     build_packed_chunk_example,
+    build_packed_redecode_example,
     collate_packed_chunk_examples,
 )
 from nemo.collections.speechlm2.parts.shared_audio_chunk import (
@@ -370,6 +371,43 @@ class ScriptSTTDataset(StreamingSTTDataset):
                 self._sc_prefix_prob, delete_token, self._sc_delete_id,
             )
 
+        # --- Windowed re-decoding self-correction ---
+        # Each chunk c gets one branch per lookahead level j (0..R): predict chunk c
+        # from clean history y_0..y_{c-1} and the (M+1)-chunk audio window ending at
+        # the arrival chunk c+j (j chunks of lookahead). j=0 is the base branch.
+        self._redecode = bool(getattr(self.cfg, "redecode", False))
+        self._redecode_depth = int(getattr(self.cfg, "redecode_depth", 0) or 0)
+        self._redecode_train_prob = float(getattr(self.cfg, "redecode_train_prob", 1.0) or 0.0)
+        if self._redecode:
+            if self._audio_history_chunks < 1:
+                raise ValueError("redecode requires audio_history_chunks >= 1 (the window is M+1 chunks).")
+            if self._redecode_depth <= 0:
+                self._redecode_depth = self._audio_history_chunks  # default R = M
+            if not (1 <= self._redecode_depth <= self._audio_history_chunks):
+                raise ValueError(
+                    f"redecode_depth must be in [1, audio_history_chunks={self._audio_history_chunks}], "
+                    f"got {self._redecode_depth}"
+                )
+            if not (0.0 <= self._redecode_train_prob <= 1.0):
+                raise ValueError(f"redecode_train_prob must be in [0, 1], got {self._redecode_train_prob}")
+            for name, on in (
+                ("audio_window_frames", self._audio_window_frames > 0),
+                ("shared_audio_track", bool(getattr(self.cfg, "shared_audio_track", False))),
+                ("contiguous_text_positions", self._contiguous_text_positions),
+                ("self_correction", self._self_correction),
+                ("self_correction_prefix", self._self_correction_prefix),
+                ("history_word_recovery_prob>0", self._history_word_recovery_prob > 0.0),
+            ):
+                if on:
+                    raise ValueError(f"redecode is not compatible with {name}.")
+            logging.info(
+                "ScriptSTTDataset: redecode ON (windowed re-decoding) | window=%d chunks (M=%d) | "
+                "depth R=%d | train_prob=%.2f -- each chunk is trained at lookahead levels 0..R "
+                "(j=0 is the base branch; higher j adds one more chunk of lookahead).",
+                self._audio_history_chunks + 1, self._audio_history_chunks,
+                self._redecode_depth, self._redecode_train_prob,
+            )
+
         # --- Shared-audio packed layout ---
         self._shared_audio_track = bool(getattr(self.cfg, "shared_audio_track", False))
         if self._shared_audio_track:
@@ -668,7 +706,26 @@ class ScriptSTTDataset(StreamingSTTDataset):
             instruction_ids = self.tokenizer.text_to_ids(sysp + "\n")
             if chunk_meta is not None:
                 chunk_meta.append((instruction_ids, chunks))
-            if self._shared_audio_track:
+            if self._redecode:
+                if self._redecode_train_prob >= 1.0:
+                    include_mode = None
+                else:
+                    _r = self._get_chunk_rng()
+                    _p = self._redecode_train_prob
+                    include_mode = lambda c, j, _r=_r, _p=_p: _r.random() < _p
+                examples.append(
+                    build_packed_redecode_example(
+                        instruction_ids=instruction_ids,
+                        chunks=chunks,
+                        vision_start_id=self.vision_start_id,
+                        vision_end_id=self.vision_end_id,
+                        eot_id=self.eot_id,
+                        audio_history_chunks=self._audio_history_chunks,
+                        redecode_depth=self._redecode_depth,
+                        include_mode=include_mode,
+                    )
+                )
+            elif self._shared_audio_track:
                 examples.append(
                     build_shared_audio_chunk_example(
                         instruction_ids=instruction_ids,

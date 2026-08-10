@@ -28,11 +28,14 @@ import torch
 from nemo.collections.speechlm2.data.streaming_stt_dataset import AUDIO_TOKEN_IDX, IGNORE_INDEX
 from nemo.collections.speechlm2.parts.script import (
     ChunkSpec,
+    batched_stream_decode_redecode,
     batched_stream_decode_script,
     batched_stream_decode_script_last_layer,
     build_script_mask,
     build_packed_chunk_example,
+    build_packed_redecode_example,
     build_separate_chunk_examples,
+    build_separate_redecode_examples,
     collate_packed_chunk_examples,
     run_script_layers_split,
     stream_decode_script,
@@ -1572,3 +1575,238 @@ def test_batched_decode_contiguous_matches_per_utterance():
         max_new_tokens=max_new, contiguous_text_positions=True,
     )
     assert got == ref, f"contiguous batched decode diverged:\n batched={got}\n per-utt={ref}"
+
+
+# ---------------------------------------------------------------------------
+# Windowed re-decoding (redecode)
+# ---------------------------------------------------------------------------
+
+
+def test_redecode_layout_structure():
+    # 3 chunks of 2 frames each; window M=1 (N=2 chunks), depth R=1.
+    chunks = [ChunkSpec(2, [20, 21]), ChunkSpec(2, [30]), ChunkSpec(2, [40])]
+    ex = build_packed_redecode_example(INSTR, chunks, VS, VE, EOT, audio_history_chunks=1, redecode_depth=1)
+
+    # Spine = INSTR(2) + [20,21] + [30] + [40] = 6 tokens.
+    assert ex.spine_len == 6
+    assert ex.input_ids[:6].tolist() == [10, 11, 20, 21, 30, 40]
+    assert ex.seg_ids[:6].tolist() == [0] * 6
+
+    # Levels: c0 -> j=0,1 ; c1 -> j=0,1 ; c2 -> j=0  => 5 branches in (c,j) order.
+    assert int(ex.seg_ids.max()) == 5
+
+    # seg 1 = (c=0, j=0): base branch, window = chunk0 frames [0,1], prefix_len=2 (instruction).
+    b = (ex.seg_ids == 1).nonzero(as_tuple=True)[0]
+    assert ex.input_ids[b].tolist() == [VS, AUDIO_TOKEN_IDX, AUDIO_TOKEN_IDX, VE, 20, 21, EOT]
+    assert (ex.prefix_len[b] == 2).all()
+    assert ex.audio_frame_index[b][ex.is_audio[b]].tolist() == [0, 1]
+    assert ex.target_ids[b].tolist() == [IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX, 20, 21, EOT, IGNORE_INDEX]
+
+    # seg 2 = (c=0, j=1): +1 chunk lookahead -> window = chunks 0..1 frames [0,1,2,3];
+    # history unchanged (prefix_len=2); still predicts chunk 0's words [20,21].
+    b = (ex.seg_ids == 2).nonzero(as_tuple=True)[0]
+    assert ex.input_ids[b].tolist() == [VS] + [AUDIO_TOKEN_IDX] * 4 + [VE, 20, 21, EOT]
+    assert (ex.prefix_len[b] == 2).all()
+    assert ex.audio_frame_index[b][ex.is_audio[b]].tolist() == [0, 1, 2, 3]
+    # 9 branch tokens: <vs> + 4 audio + <ve> + 2 words + <eot>, positions pref..pref+8.
+    assert ex.position_ids[b].tolist() == list(range(2, 2 + 9))
+    sup = ex.target_ids[b] != IGNORE_INDEX
+    assert ex.target_ids[b][sup].tolist() == [20, 21, EOT]
+
+    # seg 4 = (c=1, j=1): history = instr + chunk0 words (prefix_len=4); window = chunks 1..2
+    # frames [2,3,4,5]; predicts chunk 1's word [30].
+    b = (ex.seg_ids == 4).nonzero(as_tuple=True)[0]
+    assert (ex.prefix_len[b] == 4).all()
+    assert ex.audio_frame_index[b][ex.is_audio[b]].tolist() == [2, 3, 4, 5]
+    sup = ex.target_ids[b] != IGNORE_INDEX
+    assert ex.target_ids[b][sup].tolist() == [30, EOT]
+
+    # seg 5 = (c=2, j=0): last chunk, no lookahead available; prefix_len=5, window chunks 1..2.
+    b = (ex.seg_ids == 5).nonzero(as_tuple=True)[0]
+    assert (ex.prefix_len[b] == 5).all()
+    assert ex.audio_frame_index[b][ex.is_audio[b]].tolist() == [2, 3, 4, 5]
+
+
+def test_redecode_include_mode_subsamples_lookahead_branches():
+    chunks = [ChunkSpec(2, [20, 21]), ChunkSpec(2, [30]), ChunkSpec(2, [40])]
+    # Drop every j>=1 branch -> only the 3 base (j=0) branches remain, and the result
+    # must be byte-identical to the base windowed builder (audio_history_chunks=1).
+    ex = build_packed_redecode_example(
+        INSTR, chunks, VS, VE, EOT, audio_history_chunks=1, redecode_depth=1,
+        include_mode=lambda c, j: False,
+    )
+    base = build_packed_chunk_example(INSTR, chunks, VS, VE, EOT, audio_history_chunks=1)
+    assert int(ex.seg_ids.max()) == 3
+    assert ex.input_ids.tolist() == base.input_ids.tolist()
+    assert ex.seg_ids.tolist() == base.seg_ids.tolist()
+    assert ex.position_ids.tolist() == base.position_ids.tolist()
+    assert ex.prefix_len.tolist() == base.prefix_len.tolist()
+    assert ex.target_ids.tolist() == base.target_ids.tolist()
+    assert ex.audio_frame_index.tolist() == base.audio_frame_index.tolist()
+
+
+@torch.no_grad()
+def test_parity_redecode_packed_vs_separate():
+    """Every (c, j) branch's packed logits must equal its standalone example."""
+    model = _tiny_qwen3()
+    H = model.config.hidden_size
+    instruction = [5, 6, 7]
+    chunks = [ChunkSpec(2, [20, 21]), ChunkSpec(3, [30]), ChunkSpec(2, [40, 41]), ChunkSpec(2, [50])]
+    M, R = 2, 2
+    total_frames = sum(c.audio_len for c in chunks)
+    torch.manual_seed(2026)
+    global_frames = torch.randn(total_frames, H)
+
+    packed = build_packed_redecode_example(
+        instruction, chunks, VS, VE, EOT, audio_history_chunks=M, redecode_depth=R
+    )
+    valid = torch.ones_like(packed.input_ids, dtype=torch.bool)
+    mask = build_script_mask(
+        packed.seg_ids[None], packed.position_ids[None], packed.prefix_len[None], valid[None], torch.float32
+    )
+    packed_emb = _embed_by_frame_index(model, packed.input_ids, packed.audio_frame_index, global_frames)
+    packed_logits = model(
+        inputs_embeds=packed_emb[None], attention_mask=mask, position_ids=packed.position_ids[None]
+    ).logits[0]
+
+    separate = build_separate_redecode_examples(
+        instruction, chunks, VS, VE, EOT, audio_history_chunks=M, redecode_depth=R
+    )
+    # examples[i] lines up with packed branch segment i+1.
+    for k, sep in enumerate(separate, start=1):
+        sep_emb = _embed_by_frame_index(model, sep.input_ids, sep.audio_frame_index, global_frames)
+        sep_logits = model(inputs_embeds=sep_emb[None]).logits[0]
+        idx = (packed.seg_ids == k).nonzero(as_tuple=True)[0]
+        assert idx.numel() == sep.input_ids.numel() - sep.branch_start
+        torch.testing.assert_close(packed_logits[idx], sep_logits[sep.branch_start :], atol=1e-4, rtol=1e-4)
+
+
+@torch.no_grad()
+def test_redecode_batched_matches_per_utterance():
+    """Batched redecode decode == decoding each utterance alone (padding-safe)."""
+    model = _tiny_qwen3()
+    H = model.config.hidden_size
+    embed = model.get_input_embeddings()
+    pad_id = 0
+    chunk_size = 2
+    max_new = 4
+    M, R = 2, 2
+
+    torch.manual_seed(909)
+    instrs = [[5, 6, 7], [8, 9], [10, 11, 12]]
+    # 5, 3, 6 chunks respectively (so the lock lag / trailing-chunk handling is exercised).
+    frames_list = [torch.randn(10, H), torch.randn(6, H), torch.randn(12, H)]
+
+    ref = []
+    for instr, frames in zip(instrs, frames_list):
+        one = batched_stream_decode_redecode(
+            llm=model, embed_tokens=embed, instruction_ids_list=[instr], frames_list=[frames],
+            chunk_size=chunk_size, vision_start_id=VS, vision_end_id=VE, eot_id=EOT, pad_id=pad_id,
+            audio_history_chunks=M, redecode_depth=R, max_new_tokens=max_new,
+        )
+        ref.append(one[0])
+
+    got = batched_stream_decode_redecode(
+        llm=model, embed_tokens=embed, instruction_ids_list=instrs, frames_list=frames_list,
+        chunk_size=chunk_size, vision_start_id=VS, vision_end_id=VE, eot_id=EOT, pad_id=pad_id,
+        audio_history_chunks=M, redecode_depth=R, max_new_tokens=max_new,
+    )
+    assert got == ref, f"batched redecode decode diverged:\n batched={got}\n per-utt={ref}"
+
+
+@torch.no_grad()
+def test_redecode_decode_matches_forced_packed():
+    """Greedy redecode decode must equal the argmax of a teacher-forced packed
+    forward built from the decoded per-chunk tokens (decode <-> training layout).
+
+    For each chunk c, the LOCKED value is decoded at lookahead j = min(R, last-c)
+    from clean history; rebuilding the packed redecode example with the decoded
+    tokens as targets and taking the argmax at that (c, j) branch must reproduce it.
+    """
+    model = _tiny_qwen3()
+    H = model.config.hidden_size
+    embed = model.get_input_embeddings()
+    instruction = [5, 6, 7]
+    chunk_size = 2
+    M, R = 2, 1
+    n_chunks = 4
+    torch.manual_seed(4242)
+    frames = torch.randn(n_chunks * chunk_size, H)
+    max_new = 4
+
+    # Decode a single stream; committed[c] is recovered by re-running the reference
+    # loop here so we can segment per chunk (the public API returns a flat stream).
+    emitted = batched_stream_decode_redecode(
+        llm=model, embed_tokens=embed, instruction_ids_list=[instruction], frames_list=[frames],
+        chunk_size=chunk_size, vision_start_id=VS, vision_end_id=VE, eot_id=EOT, pad_id=0,
+        audio_history_chunks=M, redecode_depth=R, max_new_tokens=max_new,
+    )[0]
+
+    # Recover per-chunk committed tokens with a tiny single-stream replay.
+    committed = [None] * n_chunks
+    for t in range(n_chunks):
+        for j in range(min(R, t), -1, -1):
+            c = t - j
+            win_start = max(0, t - M) * chunk_size
+            win_end = (t + 1) * chunk_size
+            fr = frames[win_start:win_end]
+            hist = [tok for cc in range(c) for tok in (committed[cc] or [])]
+            words = _decode_one(model, embed, instruction, hist, fr, chunk_size, max_new)
+            committed[c] = words
+    assert [tok for c in range(n_chunks) for tok in (committed[c] or [])] == emitted
+
+    # Now teacher-force the packed example built from the decoded chunks and check
+    # the locked branch's argmax reproduces each chunk's committed tokens.
+    chunks = [ChunkSpec(chunk_size, list(committed[c] or [])) for c in range(n_chunks)]
+    packed = build_packed_redecode_example(
+        instruction, chunks, VS, VE, EOT, audio_history_chunks=M, redecode_depth=R
+    )
+    valid = torch.ones_like(packed.input_ids, dtype=torch.bool)
+    mask = build_script_mask(
+        packed.seg_ids[None], packed.position_ids[None], packed.prefix_len[None], valid[None], torch.float32
+    )
+    packed_emb = _embed_by_frame_index(model, packed.input_ids, packed.audio_frame_index, frames)
+    logits = model(inputs_embeds=packed_emb[None], attention_mask=mask, position_ids=packed.position_ids[None]).logits[0]
+
+    # Map each (c, j) to its segment id in (c, j) order to find the locked branch.
+    seg = 0
+    seg_of = {}
+    for c in range(n_chunks):
+        for j in range(0, min(R, n_chunks - 1 - c) + 1):
+            seg += 1
+            seg_of[(c, j)] = seg
+    for c in range(n_chunks):
+        j_lock = min(R, n_chunks - 1 - c)
+        idx = (packed.seg_ids == seg_of[(c, j_lock)]).nonzero(as_tuple=True)[0]
+        sup = (packed.target_ids[idx] != IGNORE_INDEX)
+        n_words = len(committed[c] or [])
+        if n_words == 0:
+            continue
+        # supervised positions predict [w_0..w_{n-1}, eot]; first n argmax == the words.
+        pred = logits[idx][sup].argmax(dim=-1).tolist()
+        assert pred[:n_words] == list(committed[c])
+
+
+def _decode_one(model, embed, instruction, hist, fr, chunk_size, max_new):
+    """Single-chunk greedy decode reference (no padding/batching)."""
+    device = fr.device
+    ids = list(instruction) + list(hist) + [VS] + [AUDIO_TOKEN_IDX] * int(fr.shape[0]) + [VE]
+    ids_t = torch.tensor(ids, dtype=torch.long, device=device)
+    is_audio = ids_t == AUDIO_TOKEN_IDX
+    emb = _embed_with_audio(model, ids_t, is_audio, fr)
+    out = model(inputs_embeds=emb[None], use_cache=True, return_dict=True)
+    logits = out.logits[:, -1]
+    cache = out.past_key_values
+    cur = torch.tensor([[len(ids)]], device=device)
+    words = []
+    for _ in range(max_new):
+        nxt = int(logits.argmax(dim=-1).item())
+        if nxt == EOT:
+            break
+        words.append(nxt)
+        temb = model.get_input_embeddings()(torch.tensor([[nxt]], device=device))
+        out = model(inputs_embeds=temb, position_ids=cur, past_key_values=cache, use_cache=True, return_dict=True)
+        cache = out.past_key_values
+        cur = cur + 1
+        logits = out.logits[:, -1]
+    return words

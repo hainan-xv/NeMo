@@ -44,6 +44,7 @@ from nemo.collections.speechlm2.data.script_dataset import ScriptBatch, ScriptST
 from nemo.collections.speechlm2.data.streaming_stt_dataset import AUDIO_TOKEN_IDX, IGNORE_INDEX
 from nemo.collections.speechlm2.models.streaming_stt_model import StreamingSTTModel
 from nemo.collections.speechlm2.parts.script import (
+    batched_stream_decode_redecode,
     batched_stream_decode_script,
     batched_stream_decode_script_last_layer,
     build_script_mask,
@@ -168,6 +169,42 @@ class ScriptSTTModel(StreamingSTTModel):
                 self._last_layer_restrict_num_layers,
                 int(self.llm.config.num_hidden_layers),
                 self._last_layer_history_tokens,
+            )
+            logging.info("=" * 72)
+
+        # --- Windowed re-decoding self-correction (redecode) ---
+        # Each chunk is re-decoded at lookahead levels 0..R over an (M+1)-chunk audio
+        # window, conditioning on clean history; inference emits low-latency previews
+        # and locks each chunk R chunks later. Read from the MODEL config so
+        # from_pretrained rebuilds the decode path.
+        self._redecode = bool(getattr(self.core_cfg, "redecode", False))
+        self._redecode_depth = int(getattr(self.core_cfg, "redecode_depth", 0) or 0)
+        if self._redecode:
+            if self._audio_history_chunks < 1:
+                raise ValueError("redecode requires audio_history_chunks >= 1 (window is M+1 chunks).")
+            if self._redecode_depth <= 0:
+                self._redecode_depth = self._audio_history_chunks  # default R = M
+            if not (1 <= self._redecode_depth <= self._audio_history_chunks):
+                raise ValueError(
+                    f"redecode_depth must be in [1, audio_history_chunks={self._audio_history_chunks}], "
+                    f"got {self._redecode_depth}"
+                )
+            for name, on in (
+                ("audio_window_frames", self._audio_window_frames > 0),
+                ("shared_audio_track", self._shared_audio_track),
+                ("contiguous_text_positions", self._contiguous_text_positions),
+                ("self_correction", self._self_correction),
+                ("script_last_layer_history_tokens", self._last_layer_restrict),
+            ):
+                if on:
+                    raise ValueError(f"redecode is not compatible with {name}.")
+            logging.info("=" * 72)
+            logging.info(
+                "[SCRIPT] windowed re-decoding ON | window=%d chunks (M=%d) | depth R=%d "
+                "-- each chunk is re-decoded with growing lookahead on clean history; "
+                "inference emits previews and locks each chunk %d chunk(s) later.",
+                self._audio_history_chunks + 1, self._audio_history_chunks, self._redecode_depth,
+                self._redecode_depth,
             )
             logging.info("=" * 72)
 
@@ -615,6 +652,47 @@ class ScriptSTTModel(StreamingSTTModel):
         # with self-correction; harmless (== hyp) otherwise.
         return_raw = bool(generation_kwargs.pop("return_raw", False))
         instruction_ids_list = [self.tokenizer.text_to_ids(system_prompt[b] + "\n") for b in range(B)]
+
+        if self._redecode:
+            if return_raw:
+                raise NotImplementedError("return_raw is not supported with redecode (no <del> token).")
+            # Optionally also return the j=0 (zero-lookahead) preview transcript, i.e.
+            # the low-latency streaming operating point alongside the locked output.
+            return_provisional = bool(generation_kwargs.pop("return_provisional", False))
+            out = batched_stream_decode_redecode(
+                llm=self.llm,
+                embed_tokens=self.embed_tokens,
+                instruction_ids_list=instruction_ids_list,
+                frames_list=frames_list,
+                chunk_size=cs,
+                vision_start_id=self._cc_vision_start_id,
+                vision_end_id=self._cc_vision_end_id,
+                eot_id=self._cc_eot_id,
+                pad_id=self.text_pad_id,
+                audio_history_chunks=self._audio_history_chunks,
+                redecode_depth=self._redecode_depth,
+                max_new_tokens=max_new_tokens,
+                device=self.device,
+                return_chunk_ids=return_word_latency,
+                return_provisional=return_provisional,
+            )
+            extras = list(out[1:]) if isinstance(out, tuple) else []
+            emitted = out[0] if isinstance(out, tuple) else out
+            hyps = [self.tokenizer.ids_to_text(ids) if ids else "" for ids in emitted]
+            result = [hyps]
+            ei = 0
+            if return_word_latency:
+                lock_steps = extras[ei]
+                ei += 1
+                frame_len = float(self.core_cfg.frame_length_in_secs)
+                result.append(
+                    [self._word_emission_times(emitted[b], lock_steps[b], cs, frame_len) for b in range(B)]
+                )
+            if return_provisional:
+                prov = extras[ei]
+                ei += 1
+                result.append([self.tokenizer.ids_to_text(ids) if ids else "" for ids in prov])
+            return tuple(result) if len(result) > 1 else hyps
 
         if self._last_layer_restrict:
             if return_raw:
