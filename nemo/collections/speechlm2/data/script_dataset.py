@@ -131,6 +131,24 @@ class ScriptSTTDataset(StreamingSTTDataset):
                 if not hasattr(self.cfg, _k):
                     setattr(self.cfg, _k, _v)
 
+        # SCRIPT-specific config fields that get_batch_data reads directly as
+        # self.cfg.<name> (not via getattr). On the branch SCRIPT was developed
+        # against these were declared on the base StreamingSTTDataConfig dataclass;
+        # the clean automodel base does not have them, and the recipe usually omits
+        # them, so the re-attach loop above cannot restore them. Seed the original
+        # defaults here when absent so the direct reads below don't AttributeError.
+        _script_cfg_defaults = {
+            "use_word_length_delay": False,
+            "word_length_delay_stochastic": False,
+            "word_delay_max": 3,
+            "word_delay_midpoint": 4.5,
+            "word_delay_slope": 1.0,
+            "word_delay_seed": 1234,
+        }
+        for _k, _v in _script_cfg_defaults.items():
+            if not hasattr(self.cfg, _k):
+                setattr(self.cfg, _k, _v)
+
         # Per-rank/worker RNG streams. The base class on this branch does not create
         # these, so SCRIPT owns them here (used by _get_chunk_rng / _get_delay_rng).
         if not hasattr(self, "_chunk_rngs"):
