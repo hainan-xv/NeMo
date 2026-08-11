@@ -28,11 +28,13 @@ import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
 
-from nemo.collections.speechlm2.data.streaming_stt_dataset import (
-    StreamingSTTDataset,
-    get_llm_messages_for_batch,
-)
+from nemo.collections.speechlm2.data.streaming_stt_dataset import StreamingSTTDataset
 from nemo.collections.speechlm2.parts.alignments import WordAlignment
+
+# SCRIPT ships its own message builder: the clean automodel base's
+# get_llm_messages_for_batch is vanilla (no variable chunk schedule, no
+# word-length delay). See parts/script_messages.py.
+from nemo.collections.speechlm2.parts.script_messages import get_llm_messages_for_batch
 from nemo.collections.speechlm2.parts.script import (
     ChunkSpec,
     build_packed_chunk_example,

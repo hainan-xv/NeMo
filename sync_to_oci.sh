@@ -35,6 +35,7 @@ git add nemo/collections/speechlm2/models/script_model.py
 git add nemo/collections/speechlm2/data/script_dataset.py
 git add nemo/collections/speechlm2/parts/script.py
 git add nemo/collections/speechlm2/parts/shared_audio_chunk.py
+git add nemo/collections/speechlm2/parts/script_messages.py
 git add examples/speechlm2/script_train.py
 git add examples/speechlm2/conf/streaming_stt_granary2_lora_script*.yaml
 git add tests/collections/speechlm2/test_script.py

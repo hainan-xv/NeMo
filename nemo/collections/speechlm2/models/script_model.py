@@ -90,6 +90,18 @@ class ScriptSTTModel(StreamingSTTModel):
             if not hasattr(self.core_cfg, _k):
                 setattr(self.core_cfg, _k, _v)
 
+        # Base-config fields that this class reads directly as self.core_cfg.<name>
+        # (not via getattr) but that the clean automodel StreamingSTTModelConfig does
+        # not declare (they existed on the base SCRIPT was developed against). Seed
+        # the original defaults when absent from both the recipe and the base so the
+        # direct reads below don't AttributeError.
+        _script_core_cfg_defaults = {
+            "log_detailed_train_metrics": False,
+        }
+        for _k, _v in _script_core_cfg_defaults.items():
+            if not hasattr(self.core_cfg, _k):
+                setattr(self.core_cfg, _k, _v)
+
         # Audio history window (M previous chunks in each branch). Read from the
         # MODEL config so it survives from_pretrained (data_cfg is None then).
         self._audio_history_chunks = max(int(getattr(self.core_cfg, "audio_history_chunks", 0) or 0), 0)
