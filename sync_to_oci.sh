@@ -27,6 +27,20 @@ echo "==> Local branch: ${current_branch:-<detached HEAD>}  ->  remote branch: $
 git add -u
 git add .gitignore sync_to_oci.sh launch/script_baseline.sh
 
+# The SCRIPT model itself: brand-new files added on top of the clean automodel
+# base. They are untracked, so `git add -u` above does NOT stage them -- without
+# these explicit adds the grid's /code cannot import ScriptSTTModel. Keep this
+# list in sync with the SCRIPT source surface.
+git add nemo/collections/speechlm2/models/script_model.py
+git add nemo/collections/speechlm2/data/script_dataset.py
+git add nemo/collections/speechlm2/parts/script.py
+git add nemo/collections/speechlm2/parts/shared_audio_chunk.py
+git add examples/speechlm2/script_train.py
+git add examples/speechlm2/conf/streaming_stt_granary2_lora_script*.yaml
+git add tests/collections/speechlm2/test_script.py
+# SCRIPT design/usage docs (new dir on this branch).
+git add nemo/collections/speechlm2/docs/
+
 if ! git diff --cached --quiet; then
   message="${1:-Sync OCI code $(date +%Y%m%d_%H%M%S)}"
   echo "==> Committing: $message"
