@@ -92,8 +92,15 @@ mkdir -p "$HFCACHE" "$CACHE_DIR"
 OUTFILE=${OUTPUT_PREFIX}/results/stage_leaderboard_cache-%j-%n.out
 ERRFILE=${OUTPUT_PREFIX}/results/stage_leaderboard_cache-%j-%n.err
 mkdir -p "${OUTPUT_PREFIX}/results"
-# Broad lustre mount covers both the checkout and the cache at their real paths.
-MOUNTS="--container-mounts=${CODE_DIR}:/code,/lustre/fsw:/lustre/fsw,${HFCACHE}:/hfcache/"
+# Mount each needed lustre leaf DIRECTLY (source==target) instead of relying on a
+# broad /lustre/fsw bind. /lustre/fsw is an autofs tree: its sub-paths are mounted
+# lazily in the HOST namespace, but the container gets a private mount namespace,
+# so those sub-mounts do NOT appear inside the container under a broad bind (this
+# is why an earlier run's cmd file at /lustre/.../results was "No such file").
+# A direct bind of the exact dir forces autofs to resolve it at mount time -- the
+# same reason /code and /hfcache already work. CACHE_DIR is bound at its real path
+# so writes land on lustre and eval later reads the same location.
+MOUNTS="--container-mounts=${CODE_DIR}:/code,${CACHE_DIR}:${CACHE_DIR},${HFCACHE}:/hfcache/"
 
 HF_ENDPOINT_EXPORT=""
 [[ -n "${HF_ENDPOINT:-}" ]] && HF_ENDPOINT_EXPORT="export HF_ENDPOINT='${HF_ENDPOINT}'; "
@@ -123,8 +130,12 @@ echo "*******Staging Open ASR Leaderboard cache********" \
 EOF
 
 # Run via a script file so any quoting in dataset names cannot break the shell.
-CMD_FILE="${OUTPUT_PREFIX}/results/stage_cache_cmd_${SLURM_JOB_ID:-local$$}.sh"
-printf '%s\n' "$cmd" > "$CMD_FILE"
-chmod +x "$CMD_FILE"
+# Write it INSIDE the checkout (bind-mounted directly at /code) so the container
+# can always open it -- a path under the broad /lustre/fsw tree may be invisible
+# in the container (autofs; see MOUNTS note above).
+mkdir -p "${CODE_DIR}/slurm_out"
+CMD_BASENAME="stage_cache_cmd_${SLURM_JOB_ID:-local$$}.sh"
+printf '%s\n' "$cmd" > "${CODE_DIR}/slurm_out/${CMD_BASENAME}"
+chmod +x "${CODE_DIR}/slurm_out/${CMD_BASENAME}"
 
-srun -o "$OUTFILE" -e "$ERRFILE" --container-image="$CONTAINER" $MOUNTS bash "$CMD_FILE"
+srun -o "$OUTFILE" -e "$ERRFILE" --container-image="$CONTAINER" $MOUNTS bash "/code/slurm_out/${CMD_BASENAME}"

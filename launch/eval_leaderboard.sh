@@ -186,9 +186,17 @@ OCI_TMP_DIR="${OCI_TMP_DIR:-/tmp/sslm_eval_${SLURM_JOB_ID:-$$}}"
 
 OUTFILE=${RESULTS_DIR}/slurm-%j-%n.out
 ERRFILE=${RESULTS_DIR}/error-%j-%n.out
-# Broad lustre mounts cover the ckpt (nemotron) and the staged cache wherever it
-# lives; /code is our synced checkout.
-MOUNTS="--container-mounts=${CODE_DIR}:/code,${H_DIR}:${H_DIR},${HFCACHE}:/hfcache/,/lustre/fsw:/lustre/fsw"
+# Bind each needed lustre leaf DIRECTLY (source==target). /lustre/fsw is an autofs
+# tree whose lazily-mounted sub-paths do NOT propagate into the container's private
+# mount namespace under a broad bind, so a broad /lustre/fsw:/lustre/fsw alone can
+# leave RESULTS_DIR/CKPT_DIR/CACHE_DIR invisible inside the container ("No such file
+# or directory"). Direct binds force autofs to resolve at mount time (same reason
+# /code and /hfcache work). OUTPUT_PREFIX covers the ckpt dir, results/shards, and
+# the container_cmd.sh; CACHE_DIR is the staged leaderboard cache. The broad bind
+# is listed FIRST as a catch-all for arbitrary CKPT= paths elsewhere on lustre --
+# it must precede the direct binds, otherwise mounting an ancestor path last would
+# shadow (hide) the specific child mounts we rely on.
+MOUNTS="--container-mounts=/lustre/fsw:/lustre/fsw,${CODE_DIR}:/code,${OUTPUT_PREFIX}:${OUTPUT_PREFIX},${CACHE_DIR}:${CACHE_DIR},${H_DIR}:${H_DIR},${HFCACHE}:/hfcache/"
 
 NGPU=8
 
