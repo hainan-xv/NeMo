@@ -33,6 +33,10 @@ git add launch/eval_leaderboard.sh launch/eval_script_baseline.sh launch/stage_l
 git add scripts/speechlm_leaderboard_eval.py
 git add scripts/average_sslm_ckpts.py
 git add scripts/eval_wandb_report.py
+# Reference/sanity eval of a STANDARD NeMo ASR model (Parakeet TDT v2) through the
+# SAME cache + scorer, to validate the pipeline against the public board's numbers.
+git add launch/eval_parakeet_leaderboard.sh
+git add scripts/parakeet_leaderboard_eval.py
 # Vendored Open-ASR-Leaderboard scoring (normalizer fork + kaldialign WER) so the
 # eval matches the public board's numbers.
 git add scripts/leaderboard_normalizer/
