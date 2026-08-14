@@ -33,17 +33,28 @@
 # {2, 7, 14, 28}; default 14). Sweep it by resubmitting with CHUNK_SIZE=.
 #
 # Usage (from the clean repo root on OCI):
-#   sbatch launch/eval_script_baseline.sh
-#   CHUNK_SIZE=7  sbatch launch/eval_script_baseline.sh
+#   sbatch launch/eval_script_baseline.sh                       # default model, averaged ckpt
+#   sbatch launch/eval_script_baseline.sh granary2_script_myrun # $1 = model/exp name
+#   RUN_AVERAGING=0 sbatch launch/eval_script_baseline.sh <exp> # eval the single best ckpt
+#   FORCE_AVERAGE=1 sbatch launch/eval_script_baseline.sh <exp> # recompute the averaged ckpt
+#   USE_LAST=1      sbatch launch/eval_script_baseline.sh <exp> # eval the rolling -last.ckpt
+#   CHUNK_SIZE=7    sbatch launch/eval_script_baseline.sh <exp>
 #   for c in 2 7 14 28; do CHUNK_SIZE=$c sbatch launch/eval_script_baseline.sh; done
 #   MAX_EVAL_SAMPLES=10 sbatch launch/eval_script_baseline.sh   # smoke test, 10 utts/ds
+#
+# NOTE: $1 only swaps WHICH checkpoint folder is evaluated; the baseline SYSTEM_PROMPT
+# / MODEL_CLASS / CHUNK_SIZE below stay fixed. Only point $1 at models trained with
+# the SAME training instruction (SCRIPT baseline variants) -- a different prompt is
+# out-of-distribution. To eval a differently-prompted model, set SYSTEM_PROMPT= too.
 # ============================================================================
 set -euo pipefail
 
 mkdir -p slurm_out
 
 # --- Model + run identity (MUST match launch/script_baseline.sh) ---
-EXP_NAME="${EXP_NAME:-granary2_script_baseline}"
+# $1 selects the experiment/model name (the results/<PROJECT>/<EXP_NAME>/ folder
+# whose checkpoints we eval); falls back to $EXP_NAME then the baseline default.
+EXP_NAME="${1:-${EXP_NAME:-granary2_script_baseline}}"
 PROJECT="${PROJECT:-SpeechlmScriptClean}"
 MODEL_CLASS="${MODEL_CLASS:-nemo.collections.speechlm2.models.script_model.ScriptSTTModel}"
 CHUNK_SIZE="${CHUNK_SIZE:-14}"
