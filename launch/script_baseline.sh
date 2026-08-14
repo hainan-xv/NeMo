@@ -109,17 +109,6 @@ EXP_NAME=granary2_script_baseline
 # Baseline operating point (CLI overrides on top of the base recipe).
 # One chunk size is drawn per batch from this set (encoder frames).
 CHUNK_SIZES="[2,7,14,28]"
-
-# --- Batch size (2x) ---
-# train_ds uses Lhotse bucketing (use_bucketing=true), so the scalar batch_size
-# is IGNORED -- the per-bucket bucket_batch_size list is what sets the batch. To
-# DOUBLE the batch we double every entry of the recipe's list (override here in
-# the launcher, not in the yaml, per request):
-#   base: [38,29,25,22,20,18,17,15,14,13,12,11,10,8,7,6,5,4]
-#   2x:   [76,58,50,44,40,36,34,30,28,26,24,22,20,16,14,12,10,8]
-# If it OOMs it will do so on the long-duration (largest-audio) buckets first;
-# halve those tail entries or lower BUCKET_BATCH_SIZE as needed.
-BUCKET_BATCH_SIZE="${BUCKET_BATCH_SIZE:-[76,58,50,44,40,36,34,30,28,26,24,22,20,16,14,12,10,8]}"
 # Natural instruction that connects directly into the packed history spine
 # ([instruction | history words ...]); ending with "The text history is:" reads
 # straight into the transcript. No apostrophes (kept single-quote-safe below).
@@ -202,7 +191,6 @@ echo "*******STARTING********" \
     model.chunk_size="${CHUNK_SIZES}" \
     data.dataset.system_prompt="'${SYSTEM_PROMPT}'" \
     data.train_ds.seed=$LHOTSE_RND_SEED \
-    ++data.train_ds.bucket_batch_size="${BUCKET_BATCH_SIZE}" \
     ++trainer.limit_train_batches=$VAL_CHECK_INTERVAL \
     ++trainer.val_check_interval=$VAL_CHECK_INTERVAL \
     trainer.max_steps=$MAX_STEPS \
