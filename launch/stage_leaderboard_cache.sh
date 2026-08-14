@@ -43,12 +43,29 @@
 #   MAX_SAMPLES    cap utts per split (0 = all; e.g. 10 for a smoke test)
 #   REFRESH=1      re-stage even splits already cached
 #   HF_ENDPOINT    optional HF mirror endpoint
+#   HF_TOKEN       gated-dataset token; if exported it is used directly (sbatch
+#                  forwards the submitting env), else read from HF_TOKEN_FILE
+#   HF_TOKEN_FILE  path to a one-line token file (default ~/.hf_token). Put it on
+#                  lustre if the compute node does not mount your home dir.
 # ============================================================================
 
 read_optional_token() { [[ -r "$1" ]] && tr -d '\r\n' < "$1" || true; }
-HF_TOKEN="$(read_optional_token "$HOME/.hf_token")"
+# Token resolution order (the batch body runs on a COMPUTE node, where $HOME may
+# not be mounted the same as the login node, so an on-disk file can be invisible):
+#   1) an HF_TOKEN already exported into the environment (sbatch forwards the
+#      submitting env by default, so `export HF_TOKEN=...; sbatch ...` works);
+#   2) an explicit ${HF_TOKEN_FILE} (put it on lustre to guarantee it's mounted);
+#   3) the standard ~/.hf_token used by the other launch scripts.
+if [[ -z "${HF_TOKEN:-}" ]]; then
+    HF_TOKEN="$(read_optional_token "${HF_TOKEN_FILE:-$HOME/.hf_token}")"
+fi
 if [[ -z "${HF_TOKEN}" ]]; then
-    echo "ERROR: no HF token at ~/.hf_token -- staging needs it to download the gated dataset." >&2
+    echo "ERROR: no HF token available -- staging needs it to download the gated dataset." >&2
+    echo "Fix with ONE of (from the OCI login node):" >&2
+    echo "  A) export HF_TOKEN=hf_xxx && sbatch launch/stage_leaderboard_cache.sh" >&2
+    echo "  B) printf %s hf_xxx > ~/.hf_token && chmod 600 ~/.hf_token   # if home is mounted on compute" >&2
+    echo "  C) put the token on lustre and point at it:" >&2
+    echo "     HF_TOKEN_FILE=/lustre/.../.hf_token sbatch launch/stage_leaderboard_cache.sh" >&2
     exit 1
 fi
 
