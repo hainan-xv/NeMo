@@ -31,6 +31,7 @@ validation/WER accumulation are reused as-is.
 """
 
 import math
+from collections import defaultdict
 from typing import List, Optional, Union
 
 import torch
@@ -44,6 +45,7 @@ from nemo.collections.asr.inference.streaming.framing.request import Frame
 from nemo.collections.speechlm2.data.script_dataset import ScriptBatch, ScriptSTTDataset
 from nemo.collections.speechlm2.data.streaming_stt_dataset import AUDIO_TOKEN_IDX, IGNORE_INDEX
 from nemo.collections.speechlm2.models.streaming_stt_model import StreamingSTTModel
+from nemo.collections.speechlm2.parts.metrics.wer import WER
 from nemo.collections.speechlm2.parts.script import (
     batched_stream_decode_redecode,
     batched_stream_decode_script,
@@ -97,10 +99,31 @@ class ScriptSTTModel(StreamingSTTModel):
         # direct reads below don't AttributeError.
         _script_core_cfg_defaults = {
             "log_detailed_train_metrics": False,
+            # Decode-only val_wer knobs (present on the base SCRIPT was developed
+            # against; absent from the clean automodel base). None => derive the cap
+            # / decode chunk size from the (repr) chunk size at validation time.
+            # See the "Validation" section below.
+            "val_max_new_tokens_per_chunk": None,
+            "val_chunk_size": None,
         }
         for _k, _v in _script_core_cfg_defaults.items():
             if not hasattr(self.core_cfg, _k):
                 setattr(self.core_cfg, _k, _v)
+
+        # Decode-only validation prompts. The clean automodel base reports only a
+        # teacher-forced val_acc and never sets these; SCRIPT restores true
+        # autoregressive val_wer (see the "Validation" section) which needs the
+        # per-sample system prompt. Mirror the base SCRIPT behaviour: default prompt
+        # from the data config, per-utterance override read from
+        # cut.custom[<prompt_field>]. data_cfg is None under from_pretrained.
+        self.val_system_prompt = (
+            data_cfg.get("system_prompt", "Transcribe the audio into text.")
+            if data_cfg is not None
+            else "Transcribe the audio into text."
+        )
+        self.val_prompt_field = (
+            data_cfg.get("prompt_field", "system_prompt") if data_cfg is not None else "system_prompt"
+        )
 
         # Audio history window (M previous chunks in each branch). Read from the
         # MODEL config so it survives from_pretrained (data_cfg is None then).
@@ -278,6 +301,125 @@ class ScriptSTTModel(StreamingSTTModel):
             self.llm.config._attn_implementation,
         )
         logging.info("=" * 72)
+
+    # ------------------------------------------------------------------
+    # Validation / test: true autoregressive WER (decode-only)
+    #
+    # The clean automodel StreamingSTTModel reports a teacher-forced val_acc and
+    # never logs val_wer, so a ``ModelCheckpoint(monitor='val_wer')`` recipe
+    # crashes at the first validation epoch ("could not find the monitored key").
+    # The base SCRIPT was developed against ran a real chunk-synchronous greedy
+    # decode and logged corpus val_wer; that path is restored here (ported from
+    # that base) so checkpoint selection tracks actual streaming transcription
+    # quality instead of next-token teacher-forced accuracy.
+    # ------------------------------------------------------------------
+
+    @property
+    def val_max_new_tokens_per_chunk(self) -> int:
+        """Resolve the autoregressive per-chunk generation cap for validation."""
+        configured = getattr(self.core_cfg, "val_max_new_tokens_per_chunk", None)
+        if configured is not None:
+            if configured <= 0:
+                raise ValueError("val_max_new_tokens_per_chunk must be positive")
+            return int(configured)
+        if self._chunk_size_repr > 0:
+            return self._chunk_size_repr
+        return 64
+
+    def _validation_system_prompts(self, batch) -> Union[str, List[str]]:
+        if getattr(batch, "cuts", None) is None:
+            return self.val_system_prompt
+        return [
+            (cut.custom or {}).get(self.val_prompt_field, self.val_system_prompt)
+            for cut in batch.cuts
+        ]
+
+    def on_validation_epoch_start(self) -> None:
+        self._partial_wer_refs: dict = defaultdict(list)
+        self._partial_wer_hyps: dict = defaultdict(list)
+
+    def on_validation_epoch_end(self) -> None:
+        # Gather decoded strings, then compute true corpus WER on every rank.
+        # Averaging rank-local WERs would be incorrect when ranks see different
+        # numbers of reference words.
+        local_wer_data = {
+            name: {"refs": self._partial_wer_refs[name], "hyps": self._partial_wer_hyps[name]}
+            for name in self._partial_wer_refs
+        }
+        if torch.distributed.is_initialized():
+            gathered_wer_data = [None] * torch.distributed.get_world_size()
+            torch.distributed.all_gather_object(gathered_wer_data, local_wer_data)
+        else:
+            gathered_wer_data = [local_wer_data]
+
+        wer = WER(normalize=True, verbose=False)
+        has_wer_data = False
+        for rank_data in gathered_wer_data:
+            for name, values in rank_data.items():
+                has_wer_data = has_wer_data or bool(values["refs"])
+                wer.update(name, refs=values["refs"], hyps=values["hyps"])
+        if has_wer_data:
+            for metric_name, metric_value in wer.compute().items():
+                log_name = "val_wer" if metric_name == "wer" else f"val_{metric_name}"
+                self.log(log_name, metric_value.to(self.device), on_epoch=True, sync_dist=False)
+
+        self._partial_wer_refs.clear()
+        self._partial_wer_hyps.clear()
+
+    def validation_step(self, batch, batch_idx: int):
+        # Support multiple validation dataloaders ({name: batch} dict).
+        if isinstance(batch, dict):
+            for name, dataset_batch in batch.items():
+                if dataset_batch is not None:
+                    self._eval_step(dataset_batch, name, batch_idx)
+        else:
+            self._eval_step(batch, "val", batch_idx)
+
+    def _eval_step(self, batch, name: str, batch_idx: int = 0) -> None:
+        # Validation is decode-only: unlike the teacher-forced loss, autoregressive
+        # WER needs neither word alignments nor constructed target turns -- just the
+        # raw audio and the reference text.
+        refs = list(batch.text)
+        # Multi chunk-size: decode validation at a fixed, well-supported chunk
+        # (default 14) instead of the longest candidate, whose look-ahead may be an
+        # unsupported/slow streaming config that stalls the decode.
+        # generate(chunk_size_override=...) pins the size for this decode.
+        val_chunk = None
+        if getattr(self, "_chunk_size_candidates", None):
+            val_chunk = getattr(self.core_cfg, "val_chunk_size", None)
+            if val_chunk is None:
+                val_chunk = 14 if 14 in self._chunk_size_candidates else max(self._chunk_size_candidates)
+            val_chunk = int(val_chunk)
+        hyps = self.generate(
+            audios=batch.audios,
+            audio_lens=batch.audio_lens,
+            system_prompt=self._validation_system_prompts(batch),
+            max_new_tokens=self.val_max_new_tokens_per_chunk,
+            generation_config=GenerationConfig(do_sample=False),
+            chunk_size_override=val_chunk,
+        )
+        self._partial_wer_refs[name].extend(refs)
+        self._partial_wer_hyps[name].extend(hyps)
+
+        if batch_idx % self.core_cfg.log_every_n_steps == 0 and refs and hyps:
+            logging.info(
+                "[%s] autoregressive batch %d (max %d tokens/chunk)\n  ref: `%s`\n  hyp: `%s`",
+                name,
+                batch_idx,
+                self.val_max_new_tokens_per_chunk,
+                refs[0],
+                hyps[0],
+            )
+
+    # Test delegates to the validation (decode-only WER) logic.
+    def on_test_epoch_start(self) -> None:
+        return self.on_validation_epoch_start()
+
+    def on_test_epoch_end(self) -> None:
+        return self.on_validation_epoch_end()
+
+    def test_step(self, *args, **kwargs):
+        return self.validation_step(*args, **kwargs)
 
     def _resolve_llm_core(self):
         """Return ``(layers, norm, rotary_emb, lm_head)`` for the LLM.
