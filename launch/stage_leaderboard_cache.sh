@@ -7,7 +7,9 @@
 #SBATCH --gres=gpu:1
 #SBATCH -t 04:00:00
 #SBATCH --time-min 01:00:00
-#SBATCH --mem=0
+# Modest RAM: staging is CPU/network-bound, and requesting 1 GPU caps RAM (the
+# scheduler rejects --mem=0 here as it would strand the node's other 7 GPUs).
+#SBATCH --mem=64G
 #SBATCH --mail-type=FAIL
 #SBATCH --ntasks-per-node=1
 #SBATCH --output=slurm_out/%x=%j --error=slurm_out/%x=%j
