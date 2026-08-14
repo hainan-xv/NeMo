@@ -100,15 +100,26 @@ OCI_TMP_DIR="${OCI_TMP_DIR:-/tmp/parakeet_eval_${SLURM_JOB_ID:-$$}}"
 
 OUTFILE=${RESULTS_DIR}/slurm-%j-%n.out
 ERRFILE=${RESULTS_DIR}/error-%j-%n.out
-# Bind each needed lustre leaf DIRECTLY (source==target). /lustre/fsw is an autofs
-# tree whose lazily-mounted sub-paths do NOT propagate into the container's private
-# mount namespace under a broad bind, so a broad /lustre/fsw:/lustre/fsw alone can
-# leave RESULTS_DIR/NEMO_MODEL/CACHE_DIR invisible in the container ("No such file").
-# Direct binds force autofs to resolve at mount time (same reason /code and /hfcache
-# work). OUTPUT_PREFIX covers the .nemo + results/shards + container_cmd.sh;
-# CACHE_DIR is the staged cache. The broad bind is FIRST as a catch-all -- it must
-# precede the direct binds or mounting an ancestor last would shadow the children.
+# The .nemo may live on a DIFFERENT lustre filesystem than fsw (e.g. /lustre/fs12).
+# Bind its directory directly so it's visible regardless of which lustre it's on.
+MODEL_DIR="$(dirname "$NEMO_MODEL")"
+# Bind each needed lustre leaf DIRECTLY (source==target). /lustre/fsw (and fs12,
+# etc.) is an autofs tree whose lazily-mounted sub-paths do NOT propagate into the
+# container's private mount namespace under a broad bind, so a broad
+# /lustre/fsw:/lustre/fsw alone can leave RESULTS_DIR/CACHE_DIR (and a model on
+# another lustre) invisible in the container ("No such file"). Direct binds force
+# autofs to resolve at mount time (same reason /code and /hfcache work).
+# OUTPUT_PREFIX covers results/shards + container_cmd.sh; CACHE_DIR is the staged
+# cache; MODEL_DIR is wherever the .nemo lives. The broad bind is FIRST as a
+# catch-all -- it must precede the direct binds or mounting an ancestor last would
+# shadow the children.
 MOUNTS="--container-mounts=/lustre/fsw:/lustre/fsw,${CODE_DIR}:/code,${OUTPUT_PREFIX}:${OUTPUT_PREFIX},${CACHE_DIR}:${CACHE_DIR},${H_DIR}:${H_DIR},${HFCACHE}:/hfcache/"
+# Add the model dir only if it isn't already covered by a direct bind above
+# (enroot errors on a duplicate source==target mount).
+case ":${OUTPUT_PREFIX}:${CACHE_DIR}:${H_DIR}:${CODE_DIR}:" in
+    *":${MODEL_DIR}:"*) : ;;                              # already directly bound
+    *) MOUNTS="${MOUNTS},${MODEL_DIR}:${MODEL_DIR}" ;;
+esac
 
 NGPU=8
 
