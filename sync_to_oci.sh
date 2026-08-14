@@ -26,6 +26,20 @@ echo "==> Local branch: ${current_branch:-<detached HEAD>}  ->  remote branch: $
 # (git add -u only stages already-tracked paths).
 git add -u
 git add .gitignore sync_to_oci.sh launch/script_baseline.sh
+# Leaderboard eval: the pooled-shard SLURM launchers + the self-contained decode
+# driver and its helpers (checkpoint averaging, wandb reporting). New/untracked, so
+# they need an explicit add (git add -u only stages already-tracked paths).
+git add launch/eval_leaderboard.sh launch/eval_script_baseline.sh launch/stage_leaderboard_cache.sh
+git add scripts/speechlm_leaderboard_eval.py
+git add scripts/average_sslm_ckpts.py
+git add scripts/eval_wandb_report.py
+# Vendored Open-ASR-Leaderboard scoring (normalizer fork + kaldialign WER) so the
+# eval matches the public board's numbers.
+git add scripts/leaderboard_normalizer/
+git add scripts/leaderboard_wer.py
+# One-shot cache staging (downloads the leaderboard test sets into the on-disk
+# layout the eval reads).
+git add scripts/stage_leaderboard_cache.py
 
 # The SCRIPT model itself: brand-new files added on top of the clean automodel
 # base. They are untracked, so `git add -u` above does NOT stage them -- without
