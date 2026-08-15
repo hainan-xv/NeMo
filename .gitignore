@@ -193,5 +193,9 @@ bot_server.*
 audio_logs/
 eval_results/
 
+# local leaderboard eval outputs (parakeet desktop sanity runs)
+parakeet_nemo_local_*/
+parakeet_local_out*/
+
 # agents
 .claude/settings.local.json

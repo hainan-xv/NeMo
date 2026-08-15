@@ -37,6 +37,17 @@ git add scripts/eval_wandb_report.py
 # SAME cache + scorer, to validate the pipeline against the public board's numbers.
 git add launch/eval_parakeet_leaderboard.sh
 git add scripts/parakeet_leaderboard_eval.py
+# Single-process/single-GPU desktop sanity variant (no sharding/pooling) to
+# cross-check the grid numbers against the public board.
+git add scripts/parakeet_eval_local.py
+# NeMo-native reference eval: decode with NeMo's own speech_to_text_eval.py
+# (single GPU, no sharding), then rescore predictions with the leaderboard scorer.
+git add launch/eval_parakeet_nemo.sh
+git add scripts/rescore_nemo_eval.py
+# Desktop twin of eval_parakeet_nemo.sh (uv run, no container).
+git add scripts/run_parakeet_nemo_local.sh
+# Shared one-call log quieting used by the two local parakeet eval scripts.
+git add scripts/quiet_logs.py
 # Vendored Open-ASR-Leaderboard scoring (normalizer fork + kaldialign WER) so the
 # eval matches the public board's numbers.
 git add scripts/leaderboard_normalizer/

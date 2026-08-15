@@ -36,7 +36,7 @@
 #   MAX_EVAL_SAMPLES=10 sbatch launch/eval_parakeet_leaderboard.sh    # smoke test (10 utts/ds)
 #
 # Key env:
-#   NEMO_MODEL        .nemo model to eval (default parakeet.nemo; $1 overrides)
+#   NEMO_MODEL        .nemo model to eval (default parakeet-tdt-0.6b-v2.nemo; $1 overrides)
 #   CACHE_DIR         pre-staged leaderboard cache root on lustre
 #   BATCH_SIZE        transcribe() batch size (default 32; OOM auto-halves)
 #   DATASETS          space/comma 'name:split' list (default = current public suite)
@@ -56,8 +56,12 @@ mkdir -p slurm_out
 
 # --- Model identity ---
 PROJECT="${PROJECT:-SpeechlmScriptClean}"
-# $1 (or NEMO_MODEL) selects the .nemo; default is the downloaded Parakeet TDT v2.
-NEMO_MODEL="${1:-${NEMO_MODEL:-/lustre/fsw/portfolios/nemotron/users/hainanx/parakeet.nemo}}"
+# $1 (or NEMO_MODEL) selects the .nemo; default is the validated Parakeet TDT 0.6B
+# v2 (SAME path as launch/eval_parakeet_nemo.sh, so the balanced 8-GPU run and the
+# single-GPU NeMo-native reference eval the identical model). Note it lives on fs12,
+# a DIFFERENT lustre than the fsw broad bind -- the MODEL_DIR direct-bind below
+# covers that (autofs sub-paths don't propagate under the broad bind).
+NEMO_MODEL="${1:-${NEMO_MODEL:-/lustre/fs12/portfolios/llmservice/projects/llmservice_nemo_speechlm/users/hainanx/pretrained_models/parakeet-tdt-0.6b-v2.nemo}}"
 # EXP_NAME is just a results-folder label here (no checkpoint dir to resolve).
 EXP_NAME="${EXP_NAME:-$(basename "${NEMO_MODEL%.nemo}")}"
 

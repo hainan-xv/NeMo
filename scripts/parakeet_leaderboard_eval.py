@@ -91,12 +91,15 @@ def _transcribe_with_oom_backoff(model, paths: List[str], batch_size: int, min_b
     bs = max(min_bs, int(batch_size))
     try:
         with torch.inference_mode():
-            out = model.transcribe(paths, batch_size=bs, verbose=False)
-        return _hyps_to_text(out)
-    except TypeError:
-        # Older signatures may not accept verbose=; retry without it.
-        with torch.inference_mode():
-            out = model.transcribe(paths, batch_size=bs)
+            try:
+                out = model.transcribe(paths, batch_size=bs, verbose=False)
+            except TypeError as te:
+                # ONLY the "old signature lacks verbose=" case; any other internal
+                # TypeError (e.g. a NeMo version mismatch in the decoder) must
+                # surface, not be disguised as a verbose retry.
+                if "verbose" not in str(te):
+                    raise
+                out = model.transcribe(paths, batch_size=bs)
         return _hyps_to_text(out)
     except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
         if "out of memory" not in str(e).lower() or bs <= min_bs:
