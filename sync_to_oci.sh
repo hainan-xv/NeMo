@@ -37,6 +37,10 @@ git add scripts/eval_wandb_report.py
 # SAME cache + scorer, to validate the pipeline against the public board's numbers.
 git add launch/eval_parakeet_leaderboard.sh
 git add scripts/parakeet_leaderboard_eval.py
+# BACKEND=nemo twin of parakeet_leaderboard_eval.py: same pooled shards + generations
+# schema, but decodes each GPU's shard with NeMo's stock speech_to_text_eval.py so the
+# two decode backends can be compared over identical shards on the same GPUs.
+git add scripts/parakeet_nemo_shard_eval.py
 # Single-process/single-GPU desktop sanity variant (no sharding/pooling) to
 # cross-check the grid numbers against the public board.
 git add scripts/parakeet_eval_local.py

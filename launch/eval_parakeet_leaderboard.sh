@@ -29,14 +29,23 @@
 #   <CACHE_DIR>/<dataset>/<split>/_cache_manifest.jsonl + 16 kHz mono wavs
 # (stage it once with launch/stage_leaderboard_cache.sh).
 #
+# Two DECODE BACKENDS share this launcher (same shards, same scorer, same aggregate
+# -- only the decode differs, so per-dataset WER differences isolate the harness):
+#   BACKEND=transcribe (default) our own model.transcribe() loop (parakeet_leaderboard_eval.py)
+#   BACKEND=nemo                 NeMo's stock examples/asr/speech_to_text_eval.py
+#                                (parakeet_nemo_shard_eval.py: presort + amp + its batching)
+# Results dirs are backend-tagged, so you can run both and diff the aggregate logs.
+#
 # Usage (from the clean repo root on OCI):
 #   cd /lustre/fsw/portfolios/nemotron/users/hainanx/NeMo_script_clean
-#   sbatch launch/eval_parakeet_leaderboard.sh                       # default .nemo
+#   sbatch launch/eval_parakeet_leaderboard.sh                       # default .nemo, transcribe backend
 #   sbatch launch/eval_parakeet_leaderboard.sh /path/to/model.nemo   # $1 = .nemo path
-#   MAX_EVAL_SAMPLES=10 sbatch launch/eval_parakeet_leaderboard.sh    # smoke test (10 utts/ds)
+#   BACKEND=nemo sbatch launch/eval_parakeet_leaderboard.sh          # NeMo-native decode across 8 GPUs
+#   MAX_EVAL_SAMPLES=10 sbatch launch/eval_parakeet_leaderboard.sh   # smoke test (10 utts/ds)
 #
 # Key env:
 #   NEMO_MODEL        .nemo model to eval (default parakeet-tdt-0.6b-v2.nemo; $1 overrides)
+#   BACKEND           decode backend: transcribe (default) | nemo (speech_to_text_eval.py)
 #   CACHE_DIR         pre-staged leaderboard cache root on lustre
 #   BATCH_SIZE        transcribe() batch size (default 32; OOM auto-halves)
 #   DATASETS          space/comma 'name:split' list (default = current public suite)
@@ -68,6 +77,12 @@ EXP_NAME="${EXP_NAME:-$(basename "${NEMO_MODEL%.nemo}")}"
 BATCH_SIZE="${BATCH_SIZE:-32}"
 MAX_EVAL_SAMPLES="${MAX_EVAL_SAMPLES:-0}"
 SHUFFLE_SEED="${SHUFFLE_SEED:-1234}"
+# Decode backend: our transcribe() loop (default) or NeMo's stock speech_to_text_eval.py.
+BACKEND="${BACKEND:-transcribe}"
+case "$BACKEND" in
+    transcribe|nemo) : ;;
+    *) echo "ERROR: BACKEND must be 'transcribe' or 'nemo' (got '$BACKEND')." >&2; exit 1 ;;
+esac
 # Current PUBLIC leaderboard suite (must match the staged cache + eval_leaderboard.sh).
 DATASETS="${DATASETS:-librispeech:test.clean librispeech:test.other ami_cleaned:test earnings22:test gigaspeech_cleaned:test spgispeech:test voxpopuli_cleaned_aa:test}"
 DATASETS_CSV="$(echo "$DATASETS" | tr -s ' ' ',')"
@@ -93,7 +108,7 @@ fi
 RUN_TS="$(date +%Y%m%d_%H%M%S)"
 JOB_TAG="${SLURM_JOB_ID:-local$$}"
 EVAL_TAG_SUFFIX=""; [[ -n "${EVAL_TAG:-}" ]] && EVAL_TAG_SUFFIX="_${EVAL_TAG}"
-RESULTS_DIR="${OUTPUT_PREFIX}/results/${PROJECT}/${EXP_NAME}/parakeet_leaderboard_eval${EVAL_TAG_SUFFIX}_${RUN_TS}_${JOB_TAG}"
+RESULTS_DIR="${OUTPUT_PREFIX}/results/${PROJECT}/${EXP_NAME}/parakeet_leaderboard_eval_${BACKEND}${EVAL_TAG_SUFFIX}_${RUN_TS}_${JOB_TAG}"
 mkdir -p "$RESULTS_DIR"
 SHARD_DIR="${RESULTS_DIR}/shards"; mkdir -p "$SHARD_DIR"
 
@@ -155,6 +170,7 @@ fi
     echo "exp_name:             ${EXP_NAME}"
     echo "project:              ${PROJECT}"
     echo "backend:              parakeet"
+    echo "decode_backend:       ${BACKEND}"
     echo "scoring:              open_asr_leaderboard (vendored normalizer + kaldialign merge_compounds)"
     echo "nemo_model:           ${NEMO_MODEL}"
     echo "batch_size:           ${BATCH_SIZE}"
@@ -172,13 +188,27 @@ echo "==> Wrote run config: ${RESULTS_DIR}/run_config.yaml"
 
 echo "==> Parakeet leaderboard eval"
 echo "    nemo_model:   ${NEMO_MODEL}"
+echo "    backend:      ${BACKEND}"
 echo "    exp_name:     ${EXP_NAME}"
 echo "    datasets:     ${DATASETS_CSV}"
 echo "    cache_dir:    ${CACHE_DIR}"
 echo "    batch_size:   ${BATCH_SIZE}  seed:${SHUFFLE_SEED}  max_eval_samples:${MAX_EVAL_SAMPLES}"
 
+# Pick the per-GPU shard driver for the chosen backend. Both consume the SAME shard
+# args and write the SAME shard*_of*.generations.jsonl, so the aggregate/scorer below
+# is backend-agnostic. The transcribe driver takes --device 0 (it sets the torch
+# device itself); the nemo driver instead relies purely on CUDA_VISIBLE_DEVICES and
+# passes cuda=0 to speech_to_text_eval, so it takes no --device flag.
+if [[ "$BACKEND" == "nemo" ]]; then
+    DRIVER_SCRIPT="/code/scripts/parakeet_nemo_shard_eval.py"
+    DEVICE_FLAG=""
+else
+    DRIVER_SCRIPT="/code/scripts/parakeet_leaderboard_eval.py"
+    DEVICE_FLAG="--device 0"
+fi
+
 read -r -d '' cmd <<EOF
-echo "*******Parakeet leaderboard eval (pooled shards over ${NGPU} GPUs)********" \
+echo "*******Parakeet leaderboard eval (${BACKEND} backend, pooled shards over ${NGPU} GPUs)********" \
 && echo "*** MODEL=${NEMO_MODEL} ***" \
 && nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader \
 && cd /code \
@@ -194,19 +224,19 @@ echo "*******Parakeet leaderboard eval (pooled shards over ${NGPU} GPUs)********
 && python -c "import nemo, nemo.collections.asr; print('NeMo:', nemo.__file__)" \
 && { python -c "import kaldialign; kaldialign.batch_error_rate" 2>/dev/null || { echo '==> installing/upgrading kaldialign (leaderboard-faithful WER: batch_error_rate + merge_compounds)'; pip install -U --no-input --quiet kaldialign; }; } \
 && echo "Pooled datasets: ${DATASETS_CSV}" \
-&& echo "Fanning ${NGPU} balanced shards across ${NGPU} GPUs (seed=${SHUFFLE_SEED})..." \
+&& echo "Fanning ${NGPU} balanced shards across ${NGPU} GPUs (backend=${BACKEND}, seed=${SHUFFLE_SEED})..." \
 && rm -f ${SHARD_DIR}/shard*_of*.generations.jsonl \
 && pids=() \
 && for gpu in \$(seq 0 \$(( ${NGPU} - 1 ))); do \
       log="${RESULTS_DIR}/shard_\${gpu}.log"; \
       echo "  [gpu \$gpu] shard \$gpu/${NGPU} -> \${log}"; \
-      CUDA_VISIBLE_DEVICES=\$gpu python /code/scripts/parakeet_leaderboard_eval.py \
+      CUDA_VISIBLE_DEVICES=\$gpu python ${DRIVER_SCRIPT} \
         --nemo_model "${NEMO_MODEL}" \
         --datasets "${DATASETS_CSV}" \
         --num_shards ${NGPU} \
         --shard_index \$gpu \
         --shuffle_seed ${SHUFFLE_SEED} \
-        --device 0 \
+        ${DEVICE_FLAG} \
         --cache_dir "${CACHE_DIR}" \
         --batch_size ${BATCH_SIZE} \
         --max_eval_samples ${MAX_EVAL_SAMPLES} \
