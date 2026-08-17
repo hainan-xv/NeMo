@@ -1201,17 +1201,19 @@ def batched_stream_decode_script(
     correction_scope: str = "word",
     return_raw: bool = False,
     warn_chunk_word_start: bool = False,
-    first_token_mask: Optional[Tensor] = None,
+    insert_word_start_id: Optional[int] = None,
 ):
     """Batched greedy SCRIPT decode for B utterances at once.
 
     SCRIPT emits WHOLE words per chunk and the spine already holds the previous
-    chunk's finished words, so a chunk's FIRST decoded token must be word-initial
-    (leading-space BPE); otherwise it merges onto the prior word (e.g. "border
-    ruffian" -> "bordereruffian"). ``warn_chunk_word_start`` logs every violation
-    (needs ``is_word_start``); ``first_token_mask`` (a ``(vocab,)`` bool of tokens
-    allowed as a chunk's first token: word-starts + eot) hard-enforces the
-    invariant by masking the first step's logits.
+    chunk's finished words, so a chunk's FIRST decoded token should begin a new
+    word; otherwise it merges onto the prior word (e.g. "border ruffian" ->
+    "bordereruffian"). This is NOT enforced by restricting the model's choice
+    (which can starve a chunk into emitting nothing); instead the model emits
+    freely and, if a chunk's first token is not a word-start,
+    ``insert_word_start_id`` (a leading-space token) is INSERTED in front of it so
+    a word boundary is guaranteed. ``warn_chunk_word_start`` logs each such case
+    (needs ``is_word_start``). Both are no-ops unless ``is_word_start`` is given.
 
     Chunk-synchronous: for chunk index ``k`` every still-active stream is decoded
     together. For each stream the model sees, per chunk, the *plain-text history*
@@ -1376,11 +1378,6 @@ def batched_stream_decode_script(
         )
         cache = out.past_key_values
         logits = out.logits[:, -1]  # <ve> position -> predicts first word
-        # Enforce the chunk-start invariant: the FIRST decoded token of a chunk must
-        # be word-initial (or eot). Only the prefill logits feed the first argmax;
-        # later steps recompute logits fresh, so masking here alone is sufficient.
-        if first_token_mask is not None:
-            logits = logits.masked_fill(~first_token_mask.to(logits.device).unsqueeze(0), float("-inf"))
         attn_running = valid.long()
 
         finished = [False] * na
@@ -1424,12 +1421,20 @@ def batched_stream_decode_script(
             logits = out.logits[:, -1]
 
         for i, b in enumerate(active):
-            if warn_chunk_word_start and is_word_start is not None and words[i] and not is_word_start(words[i][0]):
-                logging.warning(
-                    "[SCRIPT chunk-start] stream=%d chunk=%d: first emitted token id=%d is NOT a word-start "
-                    "(merges onto the previous word).",
-                    b, k, int(words[i][0]),
-                )
+            # Chunk-start fix-up: if this chunk emitted tokens but its FIRST token is
+            # not a word-start, it would merge onto the previous chunk's last word.
+            # Insert a leading-space (word-start) token in front so a word boundary is
+            # guaranteed -- WITHOUT restricting what the model was allowed to emit.
+            if is_word_start is not None and words[i] and emitted[b] and not is_word_start(words[i][0]):
+                if warn_chunk_word_start:
+                    logging.warning(
+                        "[SCRIPT chunk-start] stream=%d chunk=%d: first emitted token id=%d is NOT a word-start"
+                        "%s.",
+                        b, k, int(words[i][0]),
+                        "; inserting a word-start token" if insert_word_start_id is not None else "",
+                    )
+                if insert_word_start_id is not None:
+                    words[i] = [insert_word_start_id] + words[i]
             if delete_id is None:
                 emitted[b].extend(words[i])
                 chunk_ids[b].extend([k] * len(words[i]))

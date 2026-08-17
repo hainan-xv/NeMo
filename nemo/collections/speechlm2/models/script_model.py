@@ -143,7 +143,7 @@ class ScriptSTTModel(StreamingSTTModel):
             return isinstance(tok, str) and (tok.startswith("\u0120") or tok.startswith("\u2581"))
 
         self._is_word_start = _is_word_start
-        self._word_start_first_mask = None  # lazily-built (vocab,) bool, cached on CPU
+        self._word_start_insert_id = None  # lazily resolved leading-space token id
 
         # --- Self-correction (delete-last-word) ---
         self._self_correction = bool(getattr(self.core_cfg, "self_correction", False))
@@ -757,21 +757,26 @@ class ScriptSTTModel(StreamingSTTModel):
             return torch.zeros(0, self.llm.config.hidden_size, device=device, dtype=self.embed_tokens.weight.dtype)
         return torch.cat(out, dim=0)  # (T_enc, H)
 
-    def _get_word_start_first_mask(self, device) -> Tensor:
-        """``(vocab,)`` bool mask of tokens allowed as a chunk's FIRST decoded token:
-        word-initial subwords (leading-space BPE) plus ``eot`` (so an empty chunk can
-        still stop). Built once over the vocab and cached on CPU."""
-        if self._word_start_first_mask is None:
+    def _get_word_start_insert_id(self) -> Optional[int]:
+        """Token id of a lone leading-space (word-start) subword, INSERTED in front
+        of a chunk's first token when that token is not itself a word-start, so the
+        chunk cannot merge onto the previous word. Resolved once and cached; returns
+        ``None`` (insertion disabled) if the tokenizer has no such token."""
+        if self._word_start_insert_id is None:
             hf_tok = self.tokenizer.tokenizer
-            vocab = int(self.llm.config.vocab_size)
-            toks = hf_tok.convert_ids_to_tokens(list(range(vocab)))
-            mask = torch.zeros(vocab, dtype=torch.bool)
-            for i, t in enumerate(toks):
-                if isinstance(t, str) and (t.startswith("\u0120") or t.startswith("\u2581")):
-                    mask[i] = True
-            mask[self._cc_eot_id] = True
-            self._word_start_first_mask = mask
-        return self._word_start_first_mask.to(device)
+            cand = None
+            for marker in ("\u0120", "\u2581"):  # GPT-2/Qwen "Ġ", SentencePiece "▁"
+                tid = hf_tok.convert_tokens_to_ids(marker)
+                unk = getattr(hf_tok, "unk_token_id", None)
+                if tid is not None and tid >= 0 and (unk is None or tid != unk) and self._is_word_start(tid):
+                    cand = int(tid)
+                    break
+            if cand is None:
+                logging.warning("[SCRIPT] no lone word-start (space) token found; chunk word-start insertion disabled.")
+                self._word_start_insert_id = -1  # sentinel: resolved-but-absent
+            else:
+                self._word_start_insert_id = cand
+        return self._word_start_insert_id if self._word_start_insert_id != -1 else None
 
     def _state_machine_encode_batched(self, audios: Tensor, audio_lens: Tensor, cs: int) -> List[Tensor]:
         """Batched cache-aware STREAMING encode: advance every still-active stream
@@ -876,7 +881,7 @@ class ScriptSTTModel(StreamingSTTModel):
         max_history_tokens: int,
         return_chunk_ids: bool = False,
         warn_chunk_word_start: bool = False,
-        first_token_mask: Optional[Tensor] = None,
+        insert_word_start_id: Optional[int] = None,
     ):
         """Batched SCRIPT state-machine decode: batched cache-aware streaming encode
         (:meth:`_state_machine_encode_batched`) followed by the batched spine/branch
@@ -901,9 +906,9 @@ class ScriptSTTModel(StreamingSTTModel):
             max_history_tokens=max_history_tokens,
             audio_window_frames=self._audio_window_frames,
             return_chunk_ids=return_chunk_ids,
-            is_word_start=self._is_word_start if warn_chunk_word_start else None,
+            is_word_start=self._is_word_start if (warn_chunk_word_start or insert_word_start_id is not None) else None,
             warn_chunk_word_start=warn_chunk_word_start,
-            first_token_mask=first_token_mask,
+            insert_word_start_id=insert_word_start_id,
         )
 
     def generate(
@@ -940,13 +945,13 @@ class ScriptSTTModel(StreamingSTTModel):
         if isinstance(system_prompt, str):
             system_prompt = [system_prompt] * B
 
-        # Chunk-start invariant controls (each SCRIPT chunk should emit whole words,
-        # so a chunk's first token must be word-initial). ``debug_chunk_word_start``
-        # logs violations; ``force_chunk_word_start`` masks each chunk's first-token
-        # logits to word-starts + eot.
+        # Chunk-start invariant controls (each SCRIPT chunk should begin a new word).
+        # ``debug_chunk_word_start`` logs when a chunk's first token is not a word-start.
+        # ``force_chunk_word_start`` fixes it by INSERTING a leading-space token in front
+        # (never restricts what the model may emit, so it cannot starve a chunk empty).
         warn_chunk_word_start = bool(generation_kwargs.pop("debug_chunk_word_start", False))
         force_chunk_word_start = bool(generation_kwargs.pop("force_chunk_word_start", False))
-        first_token_mask = self._get_word_start_first_mask(self.device) if force_chunk_word_start else None
+        insert_word_start_id = self._get_word_start_insert_id() if force_chunk_word_start else None
 
         if use_state_machine_inference:
             if self._redecode or self._last_layer_restrict or self._shared_audio_track:
@@ -971,7 +976,7 @@ class ScriptSTTModel(StreamingSTTModel):
                 max_history_tokens,
                 return_chunk_ids=return_word_latency,
                 warn_chunk_word_start=warn_chunk_word_start,
-                first_token_mask=first_token_mask,
+                insert_word_start_id=insert_word_start_id,
             )
             emitted = out[0] if isinstance(out, tuple) else out
             hyps = [self.tokenizer.ids_to_text(ids) if ids else "" for ids in emitted]
@@ -1165,11 +1170,15 @@ class ScriptSTTModel(StreamingSTTModel):
             return_chunk_ids=return_word_latency,
             audio_window_frames=self._audio_window_frames,
             delete_id=self._delete_id if self._self_correction else None,
-            is_word_start=self._is_word_start if (self._self_correction or warn_chunk_word_start) else None,
+            is_word_start=(
+                self._is_word_start
+                if (self._self_correction or warn_chunk_word_start or insert_word_start_id is not None)
+                else None
+            ),
             correction_scope=self._self_correction_scope,
             return_raw=return_raw,
             warn_chunk_word_start=warn_chunk_word_start,
-            first_token_mask=first_token_mask,
+            insert_word_start_id=insert_word_start_id,
         )
         # The decoder returns emitted, then (chunk_ids if requested), then (raw if
         # requested), in that fixed order. Unpack accordingly.
