@@ -1854,3 +1854,187 @@ def _decode_one(model, embed, instruction, hist, fr, chunk_size, max_new):
         cur = cur + 1
         logits = out.logits[:, -1]
     return words
+
+
+# ---------------------------------------------------------------------------
+# Shared-audio layout (encoder frames laid ONCE as a self-contained causal track;
+# each branch attends its window through the mask -> packed length independent of
+# the audio window size). Mirrors the coverage every other layout has: a
+# structural test, packed-vs-separate parity (base / fixed-frame / chunk windows),
+# and a batched==per-utterance decode equivalence.
+# ---------------------------------------------------------------------------
+
+from nemo.collections.speechlm2.parts.shared_audio_chunk import (  # noqa: E402
+    AUDIO_SEG_ID,
+    SPINE_SEG_ID,
+    batched_shared_audio_decode,
+    build_separate_shared_audio_examples,
+    build_shared_audio_chunk_example,
+    build_shared_audio_chunk_mask,
+)
+
+
+def _shared_audio_mask(ex, dtype=torch.float32):
+    """4D shared-audio mask for a single (unbatched) example."""
+    valid = torch.ones_like(ex.input_ids, dtype=torch.bool)
+    return build_shared_audio_chunk_mask(
+        ex.seg_ids[None],
+        ex.position_ids[None],
+        ex.prefix_len[None],
+        ex.win_start[None],
+        ex.win_end[None],
+        ex.audio_frame_index[None],
+        valid[None],
+        dtype,
+    )
+
+
+def test_shared_audio_layout_structure():
+    # chunk0: 2 frames [20,21]; chunk1: 3 frames [30]; chunk2: 2 frames [] (silent).
+    chunks = [ChunkSpec(2, [20, 21]), ChunkSpec(3, [30]), ChunkSpec(2, [])]
+    ex = build_shared_audio_chunk_example(INSTR, chunks, VE, EOT, audio_history_chunks=1)
+
+    P = len(INSTR) + 2 + 1 + 0  # instruction + all chunk words
+    F = 2 + 3 + 2  # total frames laid ONCE
+    # Spine (pure text) first, then the single shared audio track.
+    assert ex.spine_len == P
+    assert ex.audio_len == F
+    assert ex.seg_ids[:P].tolist() == [SPINE_SEG_ID] * P
+    assert ex.seg_ids[P : P + F].tolist() == [AUDIO_SEG_ID] * F
+    # Audio track carries the frame index 0..F-1 (doubles as the embed gather idx),
+    # laid contiguously exactly once (no per-branch copies).
+    assert ex.audio_frame_index[P : P + F].tolist() == list(range(F))
+    assert bool(ex.is_audio[P : P + F].all())
+    assert int(ex.is_audio[:P].sum()) == 0
+
+    # Branch windows (frame bounds [ws, we)) with audio_history_chunks=1:
+    #   chunk0 -> [0,2); chunk1 -> chunks 0..1 -> [0,5); chunk2 -> chunks 1..2 -> [2,7).
+    def win(seg):
+        b = (ex.seg_ids == seg).nonzero(as_tuple=True)[0]
+        return int(ex.win_start[b][0]), int(ex.win_end[b][0])
+
+    assert win(1) == (0, 2)
+    assert win(2) == (0, 5)
+    assert win(3) == (2, 7)
+    # A branch is anchor <ve> + words + eot (no per-branch <vs>/audio copy).
+    b2 = (ex.seg_ids == 2).nonzero(as_tuple=True)[0]
+    assert ex.input_ids[b2].tolist() == [VE, 30, EOT]
+    # Silent chunk 2: anchor + eot only, and the anchor predicts eot directly.
+    b3 = (ex.seg_ids == 3).nonzero(as_tuple=True)[0]
+    assert ex.input_ids[b3].tolist() == [VE, EOT]
+    assert ex.target_ids[b3].tolist() == [EOT, IGNORE_INDEX]
+
+
+@torch.no_grad()
+def _run_shared_audio_parity(chunks, instruction, *, audio_window_frames=0, audio_history_chunks=0, seed=0):
+    """Every branch's logits in the packed shared-audio sequence must equal the
+    standalone ``[history][audio 0..we][<ve> w_k <eot>]`` example run under the
+    same shared-audio mask (the parity claim for the shared-audio optimization)."""
+    model = _tiny_qwen3()
+    H = model.config.hidden_size
+    total_frames = sum(c.audio_len for c in chunks)
+    torch.manual_seed(seed)
+    global_frames = torch.randn(total_frames, H)
+
+    packed = build_shared_audio_chunk_example(
+        instruction,
+        chunks,
+        VE,
+        EOT,
+        audio_window_frames=audio_window_frames,
+        audio_history_chunks=audio_history_chunks,
+    )
+    packed_emb = _embed_by_frame_index(model, packed.input_ids, packed.audio_frame_index, global_frames)
+    packed_logits = model(
+        inputs_embeds=packed_emb[None],
+        attention_mask=_shared_audio_mask(packed),
+        position_ids=packed.position_ids[None],
+    ).logits[0]
+
+    separate = build_separate_shared_audio_examples(
+        instruction,
+        chunks,
+        VE,
+        EOT,
+        audio_window_frames=audio_window_frames,
+        audio_history_chunks=audio_history_chunks,
+    )
+    for k, sep in enumerate(separate, start=1):
+        sep_emb = _embed_by_frame_index(model, sep.input_ids, sep.audio_frame_index, global_frames)
+        sep_logits = model(
+            inputs_embeds=sep_emb[None],
+            attention_mask=_shared_audio_mask(sep),
+            position_ids=sep.position_ids[None],
+        ).logits[0]
+        idx = (packed.seg_ids == k).nonzero(as_tuple=True)[0]
+        assert packed_logits[idx].shape == sep_logits[sep.branch_start :].shape
+        torch.testing.assert_close(
+            packed_logits[idx], sep_logits[sep.branch_start :], atol=1e-4, rtol=1e-4
+        )
+
+
+def test_parity_shared_audio_packed_vs_separate():
+    # Base window (each branch sees only its own chunk's frames).
+    chunks = [ChunkSpec(2, [20, 21]), ChunkSpec(3, [30]), ChunkSpec(1, []), ChunkSpec(2, [40, 41, 42])]
+    _run_shared_audio_parity(chunks, [5, 6, 7], seed=123)
+
+
+def test_parity_shared_audio_fixed_frame_window():
+    # Fixed-frame window: each branch sees the last W=5 frames ending at its boundary.
+    chunks = [ChunkSpec(3, [20]), ChunkSpec(3, [21, 22]), ChunkSpec(3, [23]), ChunkSpec(3, [24, 25])]
+    _run_shared_audio_parity(chunks, [5, 6, 7], audio_window_frames=5, seed=2024)
+
+
+def test_parity_shared_audio_chunk_window():
+    # Chunk-based window: each branch sees the previous M=1 chunk plus its own.
+    chunks = [ChunkSpec(2, [20, 21]), ChunkSpec(3, [30]), ChunkSpec(2, [40, 41])]
+    _run_shared_audio_parity(chunks, [5, 6, 7], audio_history_chunks=1, seed=77)
+
+
+@torch.no_grad()
+def test_batched_shared_audio_decode_matches_per_utterance():
+    """Batched chunk-synchronous shared-audio decode must equal decoding each
+    utterance on its own (exercises left-padding, per-row positions/window bounds,
+    and finished-stream masking across a ragged batch)."""
+    model = _tiny_qwen3()
+    embed = model.get_input_embeddings()
+    H = model.config.hidden_size
+    chunk_size = 2
+    max_new = 4
+    W = 3  # fixed-frame window
+
+    torch.manual_seed(999)
+    instrs = [[5, 6, 7], [8, 9], [10, 11, 12, 13]]
+    # Different total frame counts -> different #chunks (3, 1, 4).
+    frames_list = [torch.randn(6, H), torch.randn(2, H), torch.randn(7, H)]
+
+    ref = [
+        batched_shared_audio_decode(
+            llm=model,
+            embed_tokens=embed,
+            instruction_ids_list=[instr],
+            frames_list=[fr],
+            chunk_size=chunk_size,
+            vision_end_id=VE,
+            eot_id=EOT,
+            pad_id=0,
+            max_new_tokens=max_new,
+            audio_window_frames=W,
+        )[0]
+        for instr, fr in zip(instrs, frames_list)
+    ]
+
+    got = batched_shared_audio_decode(
+        llm=model,
+        embed_tokens=embed,
+        instruction_ids_list=instrs,
+        frames_list=frames_list,
+        chunk_size=chunk_size,
+        vision_end_id=VE,
+        eot_id=EOT,
+        pad_id=0,
+        max_new_tokens=max_new,
+        audio_window_frames=W,
+    )
+
+    assert got == ref, f"batched shared-audio decode diverged from per-utterance:\n batched={got}\n per-utt={ref}"

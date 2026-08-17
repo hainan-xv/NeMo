@@ -29,8 +29,12 @@ git add .gitignore sync_to_oci.sh launch/script_baseline.sh
 # Leaderboard eval: the pooled-shard SLURM launchers + the self-contained decode
 # driver and its helpers (checkpoint averaging, wandb reporting). New/untracked, so
 # they need an explicit add (git add -u only stages already-tracked paths).
-git add launch/eval_leaderboard.sh launch/eval_script_baseline.sh launch/stage_leaderboard_cache.sh
+git add launch/eval_leaderboard.sh launch/eval_script_baseline.sh launch/eval_promptctl.sh launch/stage_leaderboard_cache.sh
 git add scripts/speechlm_leaderboard_eval.py
+# Prompt-controlled SCRIPT eval: builds the decode prompt from (chunk_size, delay,
+# cap, punct) knobs so it matches the model's training render, then reuses the
+# speechlm_leaderboard_eval driver unchanged.
+git add scripts/speechlm_promptctl_eval.py
 git add scripts/average_sslm_ckpts.py
 git add scripts/eval_wandb_report.py
 # Reference/sanity eval of a STANDARD NeMo ASR model (Parakeet TDT v2) through the
