@@ -27,14 +27,15 @@
 # SAME allocation (8-GPU pooled shards -> per-dataset + macro WER).
 #
 # Default operating point (all overridable):
-#   CHUNK_SIZE=12  frames/chunk (decode chunk AND the "...chunks of N frames." clause)
+#   CHUNK_SIZE=14  frames/chunk (decode chunk AND the "...chunks of N frames." clause;
+#                  a TRAINED size in [2,7,14,28], matching the baseline eval + val_wer)
 #   DELAY=3        emission delay in frames ("...delay of N frames.")
 #   CAP=1 PUNCT=1  capitalization + punctuation ON -> picks the format clause
 #
 # Usage (from the clean repo root on OCI):
-#   sbatch launch/eval_promptctl.sh                         # 12 fpc, cap+punct, delay 3
+#   sbatch launch/eval_promptctl.sh                         # 14 fpc, cap+punct, delay 3
 #   sbatch launch/eval_promptctl.sh granary2_script_myrun   # $1 = model/exp name
-#   CHUNK_SIZE=14 DELAY=0 sbatch launch/eval_promptctl.sh    # different operating point
+#   CHUNK_SIZE=28 DELAY=0 sbatch launch/eval_promptctl.sh    # different operating point
 #   CAP=0 PUNCT=0 sbatch launch/eval_promptctl.sh            # lowercase, no punctuation
 #   for c in 2 7 14 28; do CHUNK_SIZE=$c sbatch launch/eval_promptctl.sh; done  # sweep chunk
 #   MAX_EVAL_SAMPLES=10 sbatch launch/eval_promptctl.sh      # smoke test, 10 utts/ds
@@ -66,7 +67,7 @@ PROJECT="${PROJECT:-SpeechlmScriptClean}"
 MODEL_CLASS="${MODEL_CLASS:-nemo.collections.speechlm2.models.script_model.ScriptSTTModel}"
 
 # --- Prompt-control operating point (the headline knobs) ---
-CHUNK_SIZE="${CHUNK_SIZE:-12}"
+CHUNK_SIZE="${CHUNK_SIZE:-14}"
 DELAY="${DELAY:-3}"
 CAP="${CAP:-1}"
 PUNCT="${PUNCT:-1}"
