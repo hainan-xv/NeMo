@@ -28,6 +28,7 @@ import torch
 from nemo.collections.speechlm2.data.streaming_stt_dataset import AUDIO_TOKEN_IDX, IGNORE_INDEX
 from nemo.collections.speechlm2.parts.script import (
     ChunkSpec,
+    _audio_window_start,
     batched_stream_decode_redecode,
     batched_stream_decode_script,
     batched_stream_decode_script_last_layer,
@@ -579,6 +580,109 @@ def test_stream_decode_matches_forced_packed():
         assert pred[idx_k[:u]].tolist() == words, f"chunk {k}: stream words != packed argmax"
         if u < max_new:  # terminated on eot -> that decision must reproduce
             assert int(pred[idx_k[u]]) == EOT, f"chunk {k}: expected eot at terminating position"
+
+
+@torch.no_grad()
+def test_stream_decode_next_chunk_frames_matches_frames_arg():
+    """The streaming state-machine path (``next_chunk_frames`` callable) must
+    produce byte-identical emissions to the default ``frames``-arg path.
+
+    The callable here reconstructs each chunk's window from a GROWING buffer that
+    is filled in arbitrary-sized pieces (mimicking an incremental encoder that
+    returns a variable number of frames per step, then re-chunks by chunk_size) --
+    exactly what ``ScriptSTTModel._state_machine_decode_one`` does with real
+    encoder frames.
+    """
+    model = _tiny_qwen3()
+    H = model.config.hidden_size
+    embed = model.get_input_embeddings()
+
+    instruction = [5, 6, 7]
+    chunk_size = 2
+    n_frames = 7  # 4 chunks; last is partial (1 frame)
+    torch.manual_seed(321)
+    frames = torch.randn(n_frames, H)
+
+    common = dict(
+        llm=model,
+        embed_tokens=embed,
+        instruction_ids=instruction,
+        chunk_size=chunk_size,
+        vision_start_id=VS,
+        vision_end_id=VE,
+        eot_id=EOT,
+        max_new_tokens=4,
+    )
+    baseline = stream_decode_script(frames=frames, **common)
+
+    # Growing buffer filled in arbitrary "encoder step" sizes summing to n_frames.
+    buf: list = []
+    fed = [0]
+    steps = iter([1, 3, 1, 2])
+
+    def _feed_one_step() -> bool:
+        if fed[0] >= n_frames:
+            return False
+        try:
+            step = next(steps)
+        except StopIteration:
+            step = chunk_size
+        end = min(fed[0] + step, n_frames)
+        for r in range(fed[0], end):
+            buf.append(frames[r])
+        fed[0] = end
+        return True
+
+    def next_chunk_frames(k: int):
+        win_end = (k + 1) * chunk_size
+        while len(buf) < win_end and fed[0] < n_frames:
+            _feed_one_step()
+        if k * chunk_size >= len(buf):
+            return None
+        return torch.stack(buf[k * chunk_size : win_end], dim=0)
+
+    got = stream_decode_script(frames=None, next_chunk_frames=next_chunk_frames, device=frames.device, **common)
+    assert got == baseline
+
+
+@torch.no_grad()
+def test_stream_decode_next_chunk_frames_windowed_matches_frames_arg():
+    """Callable path parity with an audio-history window (audio_history_chunks>0),
+    where a branch's window spans multiple chunks back. The callable serves the
+    same window via ``_audio_window_start`` over a fully pre-filled buffer."""
+    model = _tiny_qwen3()
+    H = model.config.hidden_size
+    embed = model.get_input_embeddings()
+
+    instruction = [5, 6]
+    chunk_size = 2
+    n_frames = 8  # 4 chunks
+    M = 1  # one chunk of audio history
+    torch.manual_seed(99)
+    frames = torch.randn(n_frames, H)
+
+    common = dict(
+        llm=model,
+        embed_tokens=embed,
+        instruction_ids=instruction,
+        chunk_size=chunk_size,
+        vision_start_id=VS,
+        vision_end_id=VE,
+        eot_id=EOT,
+        max_new_tokens=4,
+        audio_history_chunks=M,
+    )
+    baseline = stream_decode_script(frames=frames, **common)
+
+    def next_chunk_frames(k: int):
+        if k * chunk_size >= n_frames:
+            return None
+        win_end = (k + 1) * chunk_size
+        win_start = _audio_window_start(k * chunk_size, win_end, max(0, k - M) * chunk_size, 0)
+        return frames[win_start:win_end]
+
+    got = stream_decode_script(frames=None, next_chunk_frames=next_chunk_frames, device=frames.device, **common)
+    assert got == baseline
 
 
 def _embed_by_frame_index(model, input_ids: torch.Tensor, audio_frame_index: torch.Tensor, global_frames: torch.Tensor):

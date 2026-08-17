@@ -65,7 +65,10 @@ CHUNK_SIZE="${CHUNK_SIZE:-14}"
 SYSTEM_PROMPT="You are doing streaming speech recognition. You are given the text history so far, followed by the audio representation of the next chunk; output the words spoken in that chunk. The text history is:"
 
 EVAL_TAG="${EVAL_TAG:-baseline}"
-export SYSTEM_PROMPT MODEL_CLASS CHUNK_SIZE EXP_NAME PROJECT EVAL_TAG
+# USE_STATE_MACHINE (backend knob) is forwarded. The SCRIPT streaming state
+# machine is ON by default (see eval_leaderboard.sh); set USE_STATE_MACHINE=0 to
+# fall back to the offline-encode decode.
+export SYSTEM_PROMPT MODEL_CLASS CHUNK_SIZE EXP_NAME PROJECT EVAL_TAG USE_STATE_MACHINE
 
 echo "==> baseline SCRIPT leaderboard eval"
 echo "    exp_name:      ${EXP_NAME}"

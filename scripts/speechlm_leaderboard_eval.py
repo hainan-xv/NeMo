@@ -228,6 +228,8 @@ def evaluate_dataset(model, args, dataset: str, split: str, device: torch.device
     # Only forward when set, so non-redecode models never see an unexpected kwarg.
     if args.self_correct:
         gen_kwargs["self_correct"] = True
+    if args.use_state_machine:
+        gen_kwargs["use_state_machine_inference"] = True
 
     hyps: List[str] = []
     start = time.time()
@@ -322,6 +324,8 @@ def evaluate_shard(model, args, device: torch.device) -> int:
     # Only forward when set, so non-redecode models never see an unexpected kwarg.
     if args.self_correct:
         gen_kwargs["self_correct"] = True
+    if args.use_state_machine:
+        gen_kwargs["use_state_machine_inference"] = True
 
     os.makedirs(args.output_dir, exist_ok=True)
     out_path = os.path.join(args.output_dir, f"shard{args.shard_index}_of{args.num_shards}.generations.jsonl")
@@ -464,6 +468,13 @@ def parse_args() -> argparse.Namespace:
         help="SCRIPT redecode models only: emit the self-corrected LOCKED stream "
         "(re-decode each chunk with lookahead). Default (off) is the non-corrective "
         "j=0 stream (decode each chunk once, append). Ignored by other models.",
+    )
+    p.add_argument(
+        "--use_state_machine",
+        action="store_true",
+        help="SCRIPT models only: decode via the streaming state machine "
+        "(incremental cache-aware encode + spine/branch decode) instead of the "
+        "up-front offline encode. Plain SCRIPT only (not redecode/last_layer/shared_audio).",
     )
     p.add_argument("--system_prompt", type=str, default="Transcribe the audio into text.")
     p.add_argument("--dtype", choices=["bf16", "fp32"], default="bf16")

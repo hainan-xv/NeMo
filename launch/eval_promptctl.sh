@@ -37,6 +37,7 @@
 #   sbatch launch/eval_promptctl.sh granary2_script_myrun   # $1 = model/exp name
 #   CHUNK_SIZE=28 DELAY=0 sbatch launch/eval_promptctl.sh    # different operating point
 #   CAP=0 PUNCT=0 sbatch launch/eval_promptctl.sh            # lowercase, no punctuation
+#   USE_STATE_MACHINE=0 sbatch launch/eval_promptctl.sh      # DISABLE state machine (offline encode); on by default
 #   for c in 2 7 14 28; do CHUNK_SIZE=$c sbatch launch/eval_promptctl.sh; done  # sweep chunk
 #   MAX_EVAL_SAMPLES=10 sbatch launch/eval_promptctl.sh      # smoke test, 10 utts/ds
 #
@@ -123,7 +124,10 @@ fi
 # the results dir / wandb run with this operating point.
 SYSTEM_PROMPT="$BUILT_PROMPT"
 EVAL_TAG="${EVAL_TAG:-promptctl_c${CHUNK_SIZE}_d${DELAY}_cap${CAP}_punct${PUNCT}}"
-export SYSTEM_PROMPT MODEL_CLASS CHUNK_SIZE EXP_NAME PROJECT EVAL_TAG
+# USE_STATE_MACHINE (backend knob) is forwarded. The SCRIPT streaming state
+# machine is ON by default (see eval_leaderboard.sh); set USE_STATE_MACHINE=0 to
+# fall back to the offline-encode decode.
+export SYSTEM_PROMPT MODEL_CLASS CHUNK_SIZE EXP_NAME PROJECT EVAL_TAG USE_STATE_MACHINE
 
 echo "==> prompt-controlled SCRIPT leaderboard eval"
 echo "    exp_name:      ${EXP_NAME}"

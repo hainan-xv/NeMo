@@ -58,6 +58,11 @@
 #   SHUFFLE_SEED      seed for the pooled global shuffle (default 1234)
 #   MAX_EVAL_SAMPLES  cap samples per dataset (fast smoke test)
 #   SELF_CORRECT=1    SCRIPT redecode models: emit the self-corrected LOCKED stream
+#                     (also forces USE_STATE_MACHINE off -- incompatible)
+#   USE_STATE_MACHINE SCRIPT streaming state-machine decode (incremental cache-aware
+#                     encode + spine/branch). DEFAULT 1 (on) for plain SCRIPT eval,
+#                     auto 0 when SELF_CORRECT=1. Set 0 for the offline-encode path.
+#                     Tags the run/results dir + wandb name with '_sm'.
 #   OUTPUT_PREFIX     results root (default nemotron users/hainanx)
 #   EVAL_TAG          optional label spliced into RESULTS_DIR + wandb run name
 #   REPORT_WANDB      auto (report iff ~/.wandb_token exists) | 1 (force) | 0 (off)
@@ -98,6 +103,23 @@ SELF_CORRECT="${SELF_CORRECT:-0}"
 SELF_CORRECT_FLAG=""
 if [[ "$SELF_CORRECT" == 1 || "$SELF_CORRECT" == true ]]; then
     SELF_CORRECT_FLAG="--self_correct"
+fi
+
+# State-machine decode (SCRIPT models only): ingest audio incrementally through
+# the cache-aware streaming encoder and decode chunk-by-chunk (spine/branch),
+# instead of the up-front offline encode. Plain SCRIPT only. Tags the run '_sm'.
+# DEFAULT ON for plain SCRIPT eval; automatically OFF when SELF_CORRECT=1 (the
+# redecode/self-correction path is incompatible with the state machine). Force
+# either way with USE_STATE_MACHINE=1/0.
+if [[ "$SELF_CORRECT" == 1 || "$SELF_CORRECT" == true ]]; then
+    USE_STATE_MACHINE="${USE_STATE_MACHINE:-0}"
+else
+    USE_STATE_MACHINE="${USE_STATE_MACHINE:-1}"
+fi
+USE_STATE_MACHINE_FLAG=""
+if [[ "$USE_STATE_MACHINE" == 1 || "$USE_STATE_MACHINE" == true ]]; then
+    USE_STATE_MACHINE_FLAG="--use_state_machine"
+    EVAL_TAG="${EVAL_TAG:+${EVAL_TAG}_}sm"
 fi
 
 # Checkpoint averaging (DEFAULT ON): average the top-k (non '-last') checkpoints --
@@ -241,6 +263,7 @@ fi
     echo "system_prompt:        \"${SYSTEM_PROMPT}\""
     echo "chunk_size:           ${CHUNK_SIZE:-<model default>}"
     echo "self_correct:         $( [[ "$SELF_CORRECT" == 1 || "$SELF_CORRECT" == true ]] && echo 'true (locked/corrected stream)' || echo 'false (non-corrective j=0 stream)')"
+    echo "use_state_machine:    $( [[ -n "$USE_STATE_MACHINE_FLAG" ]] && echo 'true (streaming encode + spine/branch decode)' || echo 'false (offline encode)')"
     echo "batch_size:           ${BATCH_SIZE}"
     echo "max_new_tokens:       ${MAX_NEW_TOKENS}"
     echo "num_gpus:             ${NGPU}"
@@ -313,6 +336,7 @@ ${AVG_CLAUSE} \
         --output_dir "${SHARD_DIR}" \
         ${CHUNK_SIZE:+--chunk_size ${CHUNK_SIZE}} \
         ${SELF_CORRECT_FLAG} \
+        ${USE_STATE_MACHINE_FLAG} \
         > "\${log}" 2>&1 & \
       pids+=(\$!); \
    done \

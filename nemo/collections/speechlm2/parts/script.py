@@ -999,7 +999,7 @@ def stream_decode_script(
     llm,
     embed_tokens: Callable[[Tensor], Tensor],
     instruction_ids: List[int],
-    frames: Tensor,
+    frames: Optional[Tensor],
     chunk_size: int,
     vision_start_id: int,
     vision_end_id: int,
@@ -1010,6 +1010,7 @@ def stream_decode_script(
     contiguous_text_positions: bool = False,
     max_history_tokens: int = 0,
     audio_window_frames: int = 0,
+    next_chunk_frames: Optional[Callable[[int], Optional[Tensor]]] = None,
 ) -> List[List[int]]:
     """Greedy streaming decode of one utterance in the SCRIPT model.
 
@@ -1032,9 +1033,15 @@ def stream_decode_script(
         embed_tokens: maps a ``(1, n)`` long tensor of ids to ``(1, n, H)`` embeddings.
         instruction_ids: instruction/system-prompt token ids (the spine root).
         frames: ``(T_enc, H)`` audio encoder frame embeddings for this utterance.
+            May be ``None`` when ``next_chunk_frames`` is supplied.
         chunk_size: number of encoder frames per chunk.
         vision_start_id / vision_end_id / eot_id: delimiter + end-of-turn ids.
         max_new_tokens: max words decoded per chunk.
+        next_chunk_frames: optional callable ``k -> (c, H)`` returning chunk
+            ``k``'s already-windowed frames, or ``None`` when the audio is
+            exhausted. When given, encode and decode interleave (true streaming
+            state machine) and ``frames`` is ignored; when ``None`` (default),
+            a window-aware slicer over ``frames`` is used (unchanged behavior).
 
     Returns:
         A list (per chunk) of emitted token-id lists (``eot`` excluded).
@@ -1042,6 +1049,8 @@ def stream_decode_script(
     from transformers.cache_utils import DynamicCache
 
     if device is None:
+        if frames is None:
+            raise ValueError("stream_decode_script requires `device` when `frames` is None.")
         device = frames.device
 
     def embed_ids(ids: List[int]) -> Tensor:
@@ -1050,27 +1059,48 @@ def stream_decode_script(
     spine = DynamicCache()
     instr_emb = embed_ids(list(instruction_ids))
     dtype = instr_emb.dtype
-    frames = frames.to(device=device, dtype=dtype)
 
     pos = torch.arange(len(instruction_ids), device=device)[None]
     out = llm(inputs_embeds=instr_emb, position_ids=pos, past_key_values=spine, use_cache=True, return_dict=True)
     spine = out.past_key_values
     spine_len = len(instruction_ids)
 
-    n_frames = frames.shape[0]
-    num_chunks = math.ceil(n_frames / chunk_size) if n_frames > 0 else 0
     M = max(int(audio_history_chunks), 0)
+    W = max(int(audio_window_frames), 0)
     instr_len = len(instruction_ids)
+
+    # Frame source: by default slice the pre-encoded ``frames`` tensor with the
+    # (history/window)-aware bounds. A streaming caller instead supplies
+    # ``next_chunk_frames(k)`` returning chunk k's already-windowed frames (or
+    # ``None`` when audio is exhausted), so encode and decode interleave.
+    num_chunks: Optional[int]
+    if next_chunk_frames is None:
+        if frames is None:
+            raise ValueError("stream_decode_script requires either `frames` or `next_chunk_frames`.")
+        frames = frames.to(device=device, dtype=dtype)
+        n_frames = frames.shape[0]
+        num_chunks = math.ceil(n_frames / chunk_size) if n_frames > 0 else 0
+
+        def _default_next_chunk_frames(k: int) -> Optional[Tensor]:
+            # Audio window: chunk-based (audio_history_chunks) or fixed frame count
+            # (audio_window_frames), ending at this chunk's boundary.
+            win_end = (k + 1) * chunk_size
+            win_start = _audio_window_start(k * chunk_size, win_end, max(0, k - M) * chunk_size, W)
+            return frames[win_start:win_end]
+
+        frame_source = _default_next_chunk_frames
+    else:
+        num_chunks = None  # unknown up front; loop until the source is exhausted
+        frame_source = next_chunk_frames
 
     emitted_flat: List[int] = []
     emitted_per_chunk: List[List[int]] = []
-    W = max(int(audio_window_frames), 0)
-    for k in range(num_chunks):
-        # Audio window: chunk-based (audio_history_chunks) or fixed frame count
-        # (audio_window_frames), ending at this chunk's boundary.
-        win_end = (k + 1) * chunk_size
-        win_start = _audio_window_start(k * chunk_size, win_end, max(0, k - M) * chunk_size, W)
-        cf = frames[win_start:win_end]
+    k = 0
+    while num_chunks is None or k < num_chunks:
+        cf = frame_source(k)
+        if cf is None:
+            break
+        cf = cf.to(device=device, dtype=dtype)
         c = cf.shape[0]
         if c == 0:
             break
@@ -1142,6 +1172,7 @@ def stream_decode_script(
             spine_len = instr_len + len(kept)
 
         emitted_per_chunk.append(words)
+        k += 1
 
     return emitted_per_chunk
 
