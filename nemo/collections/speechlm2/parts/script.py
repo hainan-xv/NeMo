@@ -58,6 +58,7 @@ import torch
 from torch import Tensor
 
 from nemo.collections.speechlm2.data.streaming_stt_dataset import AUDIO_TOKEN_IDX, IGNORE_INDEX
+from nemo.utils import logging
 
 # Segment id 0 is reserved for the spine; branches are 1..N.
 SPINE_SEG_ID = 0
@@ -1199,8 +1200,18 @@ def batched_stream_decode_script(
     is_word_start: Optional[Callable[[int], bool]] = None,
     correction_scope: str = "word",
     return_raw: bool = False,
+    warn_chunk_word_start: bool = False,
+    first_token_mask: Optional[Tensor] = None,
 ):
     """Batched greedy SCRIPT decode for B utterances at once.
+
+    SCRIPT emits WHOLE words per chunk and the spine already holds the previous
+    chunk's finished words, so a chunk's FIRST decoded token must be word-initial
+    (leading-space BPE); otherwise it merges onto the prior word (e.g. "border
+    ruffian" -> "bordereruffian"). ``warn_chunk_word_start`` logs every violation
+    (needs ``is_word_start``); ``first_token_mask`` (a ``(vocab,)`` bool of tokens
+    allowed as a chunk's first token: word-starts + eot) hard-enforces the
+    invariant by masking the first step's logits.
 
     Chunk-synchronous: for chunk index ``k`` every still-active stream is decoded
     together. For each stream the model sees, per chunk, the *plain-text history*
@@ -1365,6 +1376,11 @@ def batched_stream_decode_script(
         )
         cache = out.past_key_values
         logits = out.logits[:, -1]  # <ve> position -> predicts first word
+        # Enforce the chunk-start invariant: the FIRST decoded token of a chunk must
+        # be word-initial (or eot). Only the prefill logits feed the first argmax;
+        # later steps recompute logits fresh, so masking here alone is sufficient.
+        if first_token_mask is not None:
+            logits = logits.masked_fill(~first_token_mask.to(logits.device).unsqueeze(0), float("-inf"))
         attn_running = valid.long()
 
         finished = [False] * na
@@ -1408,6 +1424,12 @@ def batched_stream_decode_script(
             logits = out.logits[:, -1]
 
         for i, b in enumerate(active):
+            if warn_chunk_word_start and is_word_start is not None and words[i] and not is_word_start(words[i][0]):
+                logging.warning(
+                    "[SCRIPT chunk-start] stream=%d chunk=%d: first emitted token id=%d is NOT a word-start "
+                    "(merges onto the previous word).",
+                    b, k, int(words[i][0]),
+                )
             if delete_id is None:
                 emitted[b].extend(words[i])
                 chunk_ids[b].extend([k] * len(words[i]))

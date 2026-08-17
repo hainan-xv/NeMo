@@ -589,9 +589,9 @@ def test_stream_decode_next_chunk_frames_matches_frames_arg():
 
     The callable here reconstructs each chunk's window from a GROWING buffer that
     is filled in arbitrary-sized pieces (mimicking an incremental encoder that
-    returns a variable number of frames per step, then re-chunks by chunk_size) --
-    exactly what ``ScriptSTTModel._state_machine_decode_one`` does with real
-    encoder frames.
+    returns a variable number of frames per step, then re-chunks by chunk_size),
+    guaranteeing the frames->chunk mapping is identical whether audio is encoded
+    offline up front or incrementally by the streaming state machine.
     """
     model = _tiny_qwen3()
     H = model.config.hidden_size

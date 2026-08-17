@@ -63,6 +63,9 @@
 #                     encode + spine/branch). DEFAULT 1 (on) for plain SCRIPT eval,
 #                     auto 0 when SELF_CORRECT=1. Set 0 for the offline-encode path.
 #                     Tags the run/results dir + wandb name with '_sm'.
+#   FORCE_WORD_START  SCRIPT: mask each chunk's FIRST decoded token to a word-start
+#                     so a chunk cannot merge onto the previous word. DEFAULT 1 (on);
+#                     set 0 to disable (--no_force_word_start).
 #   OUTPUT_PREFIX     results root (default nemotron users/hainanx)
 #   EVAL_TAG          optional label spliced into RESULTS_DIR + wandb run name
 #   REPORT_WANDB      auto (report iff ~/.wandb_token exists) | 1 (force) | 0 (off)
@@ -120,6 +123,16 @@ USE_STATE_MACHINE_FLAG=""
 if [[ "$USE_STATE_MACHINE" == 1 || "$USE_STATE_MACHINE" == true ]]; then
     USE_STATE_MACHINE_FLAG="--use_state_machine"
     EVAL_TAG="${EVAL_TAG:+${EVAL_TAG}_}sm"
+fi
+
+# Chunk word-start enforcement (SCRIPT models only, DEFAULT ON): mask each chunk's
+# FIRST decoded token to a word-start (or eot) so a chunk cannot merge onto the
+# previous word (e.g. 'border ruffian' -> 'bordereruffian'). Disable with
+# FORCE_WORD_START=0 (passes --no_force_word_start; the python default is on).
+FORCE_WORD_START="${FORCE_WORD_START:-1}"
+FORCE_WORD_START_FLAG=""
+if [[ "$FORCE_WORD_START" == 0 || "$FORCE_WORD_START" == false ]]; then
+    FORCE_WORD_START_FLAG="--no_force_word_start"
 fi
 
 # Checkpoint averaging (DEFAULT ON): average the top-k (non '-last') checkpoints --
@@ -264,6 +277,7 @@ fi
     echo "chunk_size:           ${CHUNK_SIZE:-<model default>}"
     echo "self_correct:         $( [[ "$SELF_CORRECT" == 1 || "$SELF_CORRECT" == true ]] && echo 'true (locked/corrected stream)' || echo 'false (non-corrective j=0 stream)')"
     echo "use_state_machine:    $( [[ -n "$USE_STATE_MACHINE_FLAG" ]] && echo 'true (streaming encode + spine/branch decode)' || echo 'false (offline encode)')"
+    echo "force_word_start:     $( [[ -z "$FORCE_WORD_START_FLAG" ]] && echo 'true (chunk must start a new word)' || echo 'false')"
     echo "batch_size:           ${BATCH_SIZE}"
     echo "max_new_tokens:       ${MAX_NEW_TOKENS}"
     echo "num_gpus:             ${NGPU}"
@@ -337,6 +351,7 @@ ${AVG_CLAUSE} \
         ${CHUNK_SIZE:+--chunk_size ${CHUNK_SIZE}} \
         ${SELF_CORRECT_FLAG} \
         ${USE_STATE_MACHINE_FLAG} \
+        ${FORCE_WORD_START_FLAG} \
         > "\${log}" 2>&1 & \
       pids+=(\$!); \
    done \

@@ -124,10 +124,10 @@ fi
 # the results dir / wandb run with this operating point.
 SYSTEM_PROMPT="$BUILT_PROMPT"
 EVAL_TAG="${EVAL_TAG:-promptctl_c${CHUNK_SIZE}_d${DELAY}_cap${CAP}_punct${PUNCT}}"
-# USE_STATE_MACHINE (backend knob) is forwarded. The SCRIPT streaming state
-# machine is ON by default (see eval_leaderboard.sh); set USE_STATE_MACHINE=0 to
-# fall back to the offline-encode decode.
-export SYSTEM_PROMPT MODEL_CLASS CHUNK_SIZE EXP_NAME PROJECT EVAL_TAG USE_STATE_MACHINE
+# USE_STATE_MACHINE and FORCE_WORD_START (backend knobs) are forwarded. The SCRIPT
+# streaming state machine and chunk word-start enforcement are BOTH ON by default
+# (see eval_leaderboard.sh); set USE_STATE_MACHINE=0 / FORCE_WORD_START=0 to disable.
+export SYSTEM_PROMPT MODEL_CLASS CHUNK_SIZE EXP_NAME PROJECT EVAL_TAG USE_STATE_MACHINE FORCE_WORD_START
 
 echo "==> prompt-controlled SCRIPT leaderboard eval"
 echo "    exp_name:      ${EXP_NAME}"

@@ -230,6 +230,9 @@ def evaluate_dataset(model, args, dataset: str, split: str, device: torch.device
         gen_kwargs["self_correct"] = True
     if args.use_state_machine:
         gen_kwargs["use_state_machine_inference"] = True
+    # SCRIPT-only kwarg; guard so non-SCRIPT model classes never see it.
+    if args.force_word_start and "script" in args.model_class.lower():
+        gen_kwargs["force_chunk_word_start"] = True
 
     hyps: List[str] = []
     start = time.time()
@@ -326,6 +329,9 @@ def evaluate_shard(model, args, device: torch.device) -> int:
         gen_kwargs["self_correct"] = True
     if args.use_state_machine:
         gen_kwargs["use_state_machine_inference"] = True
+    # SCRIPT-only kwarg; guard so non-SCRIPT model classes never see it.
+    if args.force_word_start and "script" in args.model_class.lower():
+        gen_kwargs["force_chunk_word_start"] = True
 
     os.makedirs(args.output_dir, exist_ok=True)
     out_path = os.path.join(args.output_dir, f"shard{args.shard_index}_of{args.num_shards}.generations.jsonl")
@@ -475,6 +481,21 @@ def parse_args() -> argparse.Namespace:
         help="SCRIPT models only: decode via the streaming state machine "
         "(incremental cache-aware encode + spine/branch decode) instead of the "
         "up-front offline encode. Plain SCRIPT only (not redecode/last_layer/shared_audio).",
+    )
+    p.add_argument(
+        "--force_word_start",
+        dest="force_word_start",
+        action="store_true",
+        default=True,
+        help="SCRIPT models only (ON by default): mask each chunk's FIRST decoded token "
+        "to a word-start (leading-space BPE) or eot, so a chunk cannot merge onto the "
+        "previous word (e.g. 'border ruffian' -> 'bordereruffian').",
+    )
+    p.add_argument(
+        "--no_force_word_start",
+        dest="force_word_start",
+        action="store_false",
+        help="Disable the chunk word-start enforcement (see --force_word_start).",
     )
     p.add_argument("--system_prompt", type=str, default="Transcribe the audio into text.")
     p.add_argument("--dtype", choices=["bf16", "fp32"], default="bf16")

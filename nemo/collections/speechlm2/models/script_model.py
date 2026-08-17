@@ -47,7 +47,6 @@ from nemo.collections.speechlm2.data.streaming_stt_dataset import AUDIO_TOKEN_ID
 from nemo.collections.speechlm2.models.streaming_stt_model import StreamingSTTModel
 from nemo.collections.speechlm2.parts.metrics.wer import WER
 from nemo.collections.speechlm2.parts.script import (
-    _audio_window_start,
     batched_stream_decode_redecode,
     batched_stream_decode_script,
     batched_stream_decode_script_last_layer,
@@ -55,7 +54,6 @@ from nemo.collections.speechlm2.parts.script import (
     build_packed_chunk_example,
     collate_packed_chunk_examples,
     run_script_layers_split,
-    stream_decode_script,
 )
 from nemo.collections.speechlm2.parts.shared_audio_chunk import (
     batched_shared_audio_decode,
@@ -135,6 +133,18 @@ class ScriptSTTModel(StreamingSTTModel):
         # Shared-audio packed layout (encoder frames laid once, windowed via the mask).
         self._shared_audio_track = bool(getattr(self.core_cfg, "shared_audio_track", False))
 
+        # Byte-level BPE word-start test (leading-space marker), always available.
+        # SCRIPT emits WHOLE words per chunk, so a chunk's first decoded token must be
+        # word-initial; used for decode-time diagnostics / optional enforcement.
+        _hf_tok = self.tokenizer.tokenizer
+
+        def _is_word_start(tid: int) -> bool:
+            tok = _hf_tok.convert_ids_to_tokens(int(tid))
+            return isinstance(tok, str) and (tok.startswith("\u0120") or tok.startswith("\u2581"))
+
+        self._is_word_start = _is_word_start
+        self._word_start_first_mask = None  # lazily-built (vocab,) bool, cached on CPU
+
         # --- Self-correction (delete-last-word) ---
         self._self_correction = bool(getattr(self.core_cfg, "self_correction", False))
         self._self_correction_prob = float(getattr(self.core_cfg, "self_correction_prob", 1.0) or 0.0)
@@ -160,13 +170,6 @@ class ScriptSTTModel(StreamingSTTModel):
                 )
             self._sc_rng = torch.Generator(device="cpu")
             self._sc_rng.manual_seed(1234)
-
-            def _is_word_start(tid: int) -> bool:
-                # Byte-level BPE: a word-initial subword decodes with a leading space.
-                tok = hf_tok.convert_ids_to_tokens(int(tid))
-                return isinstance(tok, str) and (tok.startswith("\u0120") or tok.startswith("\u2581"))
-
-            self._is_word_start = _is_word_start
             logging.info(
                 "[SCRIPT] self-correction ON | delete_token=%r (id=%s) | inject_prob=%.2f | scope=%s "
                 "-- learns to emit <del> to fix a mis-committed previous %s.",
@@ -754,104 +757,114 @@ class ScriptSTTModel(StreamingSTTModel):
             return torch.zeros(0, self.llm.config.hidden_size, device=device, dtype=self.embed_tokens.weight.dtype)
         return torch.cat(out, dim=0)  # (T_enc, H)
 
-    def _state_machine_decode_one(
-        self,
-        wav: Tensor,
-        n_samples: int,
-        instruction_ids: List[int],
-        cs: int,
-        max_new_tokens: int,
-        max_history_tokens: int,
-    ) -> List[List[int]]:
-        """Single-utterance SCRIPT state machine: interleave cache-aware streaming
-        encode with the spine/branch decode.
+    def _get_word_start_first_mask(self, device) -> Tensor:
+        """``(vocab,)`` bool mask of tokens allowed as a chunk's FIRST decoded token:
+        word-initial subwords (leading-space BPE) plus ``eot`` (so an empty chunk can
+        still stop). Built once over the vocab and cached on CPU."""
+        if self._word_start_first_mask is None:
+            hf_tok = self.tokenizer.tokenizer
+            vocab = int(self.llm.config.vocab_size)
+            toks = hf_tok.convert_ids_to_tokens(list(range(vocab)))
+            mask = torch.zeros(vocab, dtype=torch.bool)
+            for i, t in enumerate(toks):
+                if isinstance(t, str) and (t.startswith("\u0120") or t.startswith("\u2581")):
+                    mask[i] = True
+            mask[self._cc_eot_id] = True
+            self._word_start_first_mask = mask
+        return self._word_start_first_mask.to(device)
 
-        A per-chunk ``next_chunk_frames(k)`` closure lazily advances the streaming
-        encoder (feature buffer + carried cache, mirroring
-        :meth:`_encode_frames_streaming`) only as far as chunk ``k``'s window
-        needs, then serves that window from a growing encoded-frame buffer. This
-        keeps the frames -> chunk mapping identical to slicing the offline-encoded
-        frames (parity with :func:`stream_decode_script`), while encode and decode
-        run interleaved rather than fully up front.
+    def _state_machine_encode_batched(self, audios: Tensor, audio_lens: Tensor, cs: int) -> List[Tensor]:
+        """Batched cache-aware STREAMING encode: advance every still-active stream
+        one ``chunk_samples`` step per iteration through a single shared feature
+        buffer + per-stream encoder cache, in ONE ``perception(streaming=True)``
+        call per step (mirrors ``StreamingSTTModel._generate_dynamic_streaming``'s
+        refill loop). Returns per-utterance ``(T_enc_b, H)`` frame tensors.
+
+        Because the encoder is ``chunked_limited`` with per-stream caches, batching
+        is numerically identical to encoding each utterance alone
+        (:meth:`_encode_frames_streaming`) -- it only parallelizes the work.
         """
         device = self.device
         sr = self.core_cfg.sample_rate
         N = max(int(cs), 1)
-        M = int(self._audio_history_chunks)
-        W = int(self._audio_window_frames)
         chunk_samples = math.ceil(N * self.core_cfg.frame_length_in_secs * sr)
+        B = audios.shape[0]
+        n_samples = [int(audio_lens[b].item()) for b in range(B)]
+
+        # Streaming inference needs the cache-aware config recomputed for cs.
+        self._set_encoder_att_context(cs, recompute_streaming=True)
+        enc = self.perception.encoder
+        if getattr(enc, "streaming_cfg", None) is None:
+            enc.setup_streaming_params()
 
         enc_param = next(self.perception.encoder.parameters())
-        cache = self.perception.get_initial_cache_state(batch_size=1, dtype=enc_param.dtype, device=device)
-        cache_lc, cache_lt, cache_lcl = cache
-        buf = self.get_audio_feature_buffer(batch_size=1, chunk_size_override=N)
+        cache_lc, cache_lt, cache_lcl = self.perception.get_initial_cache_state(
+            batch_size=B, dtype=enc_param.dtype, device=device
+        )
+        buf = self.get_audio_feature_buffer(batch_size=B, chunk_size_override=N)
 
-        enc_buf: List[Tensor] = []  # growing (H,) encoder frames
-        pos = [0]  # next audio sample offset (list -> mutable in closure)
+        frames_by_stream: List[List[Tensor]] = [[] for _ in range(B)]  # per-stream list of (n_enc, H) chunks
+        audio_pos = [0] * B
 
-        def _stream_step() -> bool:
-            """Feed one ``chunk_samples`` audio step; append its encoder frames.
-            Returns False when the audio is already exhausted."""
-            nonlocal cache_lc, cache_lt, cache_lcl
-            if pos[0] >= n_samples:
-                return False
-            end = min(pos[0] + chunk_samples, n_samples)
-            seg = wav[pos[0] : end]
-            length = end - pos[0]
-            if seg.shape[0] < chunk_samples:
-                seg = F.pad(seg, (0, chunk_samples - seg.shape[0]))
-            features, right_paddings = buf.update([Frame(samples=seg, stream_id=0, length=length)])
-            processed_signal = torch.stack(features).type_as(self.embed_tokens.weight)  # (1, D, T_mel)
+        while True:
+            active = [b for b in range(B) if audio_pos[b] < n_samples[b]]
+            if not active:
+                break
+            idx_t = torch.tensor(active, device=device)
+
+            frames = []
+            for b in active:
+                start = audio_pos[b]
+                end = min(start + chunk_samples, n_samples[b])
+                seg = audios[b, start:end]
+                length = end - start
+                if seg.shape[0] < chunk_samples:
+                    seg = F.pad(seg, (0, chunk_samples - seg.shape[0]))
+                frames.append(Frame(samples=seg, stream_id=b, length=length))
+                audio_pos[b] = end
+
+            features, right_paddings = buf.update(frames)
+            processed_signal = torch.stack(features).type_as(self.embed_tokens.weight)  # (S, D, T_mel)
             processed_signal_length = torch.tensor(
-                [processed_signal.shape[-1] - int(right_paddings[0])], device=device
+                [processed_signal.shape[-1] - int(rp) for rp in right_paddings], device=device
             ).long()
+
+            # Slice the per-stream encoder cache to the active subset, then scatter back.
+            if cache_lc is not None:
+                sub_lc = cache_lc.index_select(1, idx_t)
+                sub_lt = cache_lt.index_select(1, idx_t)
+                sub_lcl = cache_lcl[idx_t]
+            else:
+                sub_lc = sub_lt = sub_lcl = None
+
             emb, emb_len, new_cache = self.perception(
                 processed_signal=processed_signal,
                 processed_signal_length=processed_signal_length,
-                cache_last_channel=cache_lc,
-                cache_last_time=cache_lt,
-                cache_last_channel_len=cache_lcl,
+                cache_last_channel=sub_lc,
+                cache_last_time=sub_lt,
+                cache_last_channel_len=sub_lcl,
                 streaming=True,
             )
-            cache_lc = new_cache["cache_last_channel"]
-            cache_lt = new_cache["cache_last_time"]
-            cache_lcl = new_cache["cache_last_channel_len"]
-            n_enc = int(emb_len[0].item()) if emb_len is not None else emb.shape[1]
-            for f in range(n_enc):
-                enc_buf.append(emb[0, f])
-            pos[0] = end
-            return True
+            if new_cache is not None:
+                for i, b in enumerate(active):
+                    cache_lc[:, b] = new_cache["cache_last_channel"][:, i]
+                    cache_lt[:, b] = new_cache["cache_last_time"][:, i]
+                    cache_lcl[b] = new_cache["cache_last_channel_len"][i]
 
-        def next_chunk_frames(k: int) -> Optional[Tensor]:
-            win_end = (k + 1) * N
-            win_start = _audio_window_start(k * N, win_end, max(0, k - M) * N, W)
-            # Stream just enough audio to cover this chunk's window end.
-            while len(enc_buf) < win_end and pos[0] < n_samples:
-                _stream_step()
-            # Chunk k exists only if its OWN start is within the encoded frames
-            # (mirrors num_chunks = ceil(T_enc / N)); the window may reach further
-            # back (M>0) but must not create a spurious trailing chunk.
-            if k * N >= len(enc_buf):
-                return None
-            return torch.stack(enc_buf[win_start:win_end], dim=0)  # (c, H)
+            for i, b in enumerate(active):
+                n_enc = int(emb_len[i].item()) if emb_len is not None else emb.shape[1]
+                if n_enc > 0:
+                    frames_by_stream[b].append(emb[i, :n_enc])
 
-        return stream_decode_script(
-            llm=self.llm,
-            embed_tokens=self.embed_tokens,
-            instruction_ids=instruction_ids,
-            frames=None,
-            chunk_size=N,
-            vision_start_id=self._cc_vision_start_id,
-            vision_end_id=self._cc_vision_end_id,
-            eot_id=self._cc_eot_id,
-            max_new_tokens=max_new_tokens,
-            device=device,
-            audio_history_chunks=M,
-            contiguous_text_positions=self._contiguous_text_positions,
-            max_history_tokens=max_history_tokens,
-            audio_window_frames=W,
-            next_chunk_frames=next_chunk_frames,
-        )
+        H = self.llm.config.hidden_size
+        dtype = self.embed_tokens.weight.dtype
+        out: List[Tensor] = []
+        for b in range(B):
+            if frames_by_stream[b]:
+                out.append(torch.cat(frames_by_stream[b], dim=0))  # (T_enc_b, H)
+            else:
+                out.append(torch.zeros(0, H, device=device, dtype=dtype))
+        return out
 
     def _state_machine_decode(
         self,
@@ -862,36 +875,36 @@ class ScriptSTTModel(StreamingSTTModel):
         max_new_tokens: int,
         max_history_tokens: int,
         return_chunk_ids: bool = False,
+        warn_chunk_word_start: bool = False,
+        first_token_mask: Optional[Tensor] = None,
     ):
-        """Single-stream SCRIPT state-machine decode over a batch (loops per
-        utterance). Returns the same contract as
-        :func:`batched_stream_decode_script`: ``emitted`` (per-utterance flat
-        token lists) and, when requested, per-token ``chunk_ids``."""
-        # Streaming inference needs the cache-aware config recomputed for cs.
-        self._set_encoder_att_context(cs, recompute_streaming=True)
-        enc = self.perception.encoder
-        if getattr(enc, "streaming_cfg", None) is None:
-            enc.setup_streaming_params()
-
-        B = audios.shape[0]
-        emitted: List[List[int]] = []
-        chunk_ids: List[List[int]] = []
-        for b in range(B):
-            n = int(audio_lens[b].item())
-            per_chunk = self._state_machine_decode_one(
-                audios[b, :n], n, instruction_ids_list[b], cs, max_new_tokens, max_history_tokens
-            )
-            flat: List[int] = []
-            cids: List[int] = []
-            for k, ws in enumerate(per_chunk):
-                flat.extend(ws)
-                cids.extend([k] * len(ws))
-            emitted.append(flat)
-            chunk_ids.append(cids)
-
-        if return_chunk_ids:
-            return emitted, chunk_ids
-        return emitted
+        """Batched SCRIPT state-machine decode: batched cache-aware streaming encode
+        (:meth:`_state_machine_encode_batched`) followed by the batched spine/branch
+        decoder (:func:`batched_stream_decode_script`). Returns that decoder's
+        contract: ``emitted`` (per-utterance flat token lists) and, when requested,
+        per-token ``chunk_ids``."""
+        frames_list = self._state_machine_encode_batched(audios, audio_lens, cs)
+        return batched_stream_decode_script(
+            llm=self.llm,
+            embed_tokens=self.embed_tokens,
+            instruction_ids_list=instruction_ids_list,
+            frames_list=frames_list,
+            chunk_size=cs,
+            vision_start_id=self._cc_vision_start_id,
+            vision_end_id=self._cc_vision_end_id,
+            eot_id=self._cc_eot_id,
+            pad_id=self.text_pad_id,
+            max_new_tokens=max_new_tokens,
+            device=self.device,
+            audio_history_chunks=self._audio_history_chunks,
+            contiguous_text_positions=self._contiguous_text_positions,
+            max_history_tokens=max_history_tokens,
+            audio_window_frames=self._audio_window_frames,
+            return_chunk_ids=return_chunk_ids,
+            is_word_start=self._is_word_start if warn_chunk_word_start else None,
+            warn_chunk_word_start=warn_chunk_word_start,
+            first_token_mask=first_token_mask,
+        )
 
     def generate(
         self,
@@ -913,8 +926,9 @@ class ScriptSTTModel(StreamingSTTModel):
         branch that is evicted after its words are decoded.
 
         With ``use_state_machine_inference=True`` the audio is instead ingested
-        incrementally through the cache-aware streaming encoder (feature buffer +
-        carried cache) and decoded chunk-by-chunk as a per-utterance state machine
+        incrementally through the cache-aware streaming encoder (shared feature
+        buffer + per-stream carried cache, one ``perception`` call per step across
+        the whole batch) and decoded with the batched spine/branch decoder
         (:meth:`_state_machine_decode`), mirroring ``StreamingSTTModel``. Supported
         for plain SCRIPT only (not redecode / last_layer / shared_audio).
         """
@@ -925,6 +939,14 @@ class ScriptSTTModel(StreamingSTTModel):
         B = audios.shape[0]
         if isinstance(system_prompt, str):
             system_prompt = [system_prompt] * B
+
+        # Chunk-start invariant controls (each SCRIPT chunk should emit whole words,
+        # so a chunk's first token must be word-initial). ``debug_chunk_word_start``
+        # logs violations; ``force_chunk_word_start`` masks each chunk's first-token
+        # logits to word-starts + eot.
+        warn_chunk_word_start = bool(generation_kwargs.pop("debug_chunk_word_start", False))
+        force_chunk_word_start = bool(generation_kwargs.pop("force_chunk_word_start", False))
+        first_token_mask = self._get_word_start_first_mask(self.device) if force_chunk_word_start else None
 
         if use_state_machine_inference:
             if self._redecode or self._last_layer_restrict or self._shared_audio_track:
@@ -948,6 +970,8 @@ class ScriptSTTModel(StreamingSTTModel):
                 max_new_tokens,
                 max_history_tokens,
                 return_chunk_ids=return_word_latency,
+                warn_chunk_word_start=warn_chunk_word_start,
+                first_token_mask=first_token_mask,
             )
             emitted = out[0] if isinstance(out, tuple) else out
             hyps = [self.tokenizer.ids_to_text(ids) if ids else "" for ids in emitted]
@@ -1141,9 +1165,11 @@ class ScriptSTTModel(StreamingSTTModel):
             return_chunk_ids=return_word_latency,
             audio_window_frames=self._audio_window_frames,
             delete_id=self._delete_id if self._self_correction else None,
-            is_word_start=self._is_word_start if self._self_correction else None,
+            is_word_start=self._is_word_start if (self._self_correction or warn_chunk_word_start) else None,
             correction_scope=self._self_correction_scope,
             return_raw=return_raw,
+            warn_chunk_word_start=warn_chunk_word_start,
+            first_token_mask=first_token_mask,
         )
         # The decoder returns emitted, then (chunk_ids if requested), then (raw if
         # requested), in that fixed order. Unpack accordingly.
