@@ -78,8 +78,17 @@ CAP="${CAP:-1}"
 PUNCT="${PUNCT:-1}"
 
 # --- Prompt shape (defaults = the granary2_script_promptctl TRAINING render) ---
-PROMPT_TEMPLATE="${PROMPT_TEMPLATE:-You are doing streaming speech recognition. Given the transcript so far and the next audio chunk, output the words spoken in that chunk. Emit the words of each chunk with a fixed delay of {delay} frames. {format_clause}}"
-CHUNK_CLAUSE="${CHUNK_CLAUSE:-Process the audio in chunks of {chunk_size} frames.}"
+# IMPORTANT: these defaults contain literal '}' (from the {delay}/{format_clause}/
+# {chunk_size} placeholders). Putting them directly inside ${VAR:-default} breaks
+# bash brace-matching -- the expansion terminates at a '}' in the default, mangling
+# '{delay}' -> '{delay' so the later substitution never fills it (root cause of the
+# "identical WER across delays" bug). So hold the defaults in plain variables (no
+# ${..:-..} around brace text) and only THEN apply the :- fallback, whose default
+# word is a brace-free variable reference.
+_PROMPT_TEMPLATE_DEFAULT='You are doing streaming speech recognition. Given the transcript so far and the next audio chunk, output the words spoken in that chunk. Emit the words of each chunk with a fixed delay of {delay} frames. {format_clause}'
+_CHUNK_CLAUSE_DEFAULT='Process the audio in chunks of {chunk_size} frames.'
+PROMPT_TEMPLATE="${PROMPT_TEMPLATE:-$_PROMPT_TEMPLATE_DEFAULT}"
+CHUNK_CLAUSE="${CHUNK_CLAUSE:-$_CHUNK_CLAUSE_DEFAULT}"
 STATE_CHUNK_SIZE="${STATE_CHUNK_SIZE:-1}"
 FORMAT_CLAUSE="${FORMAT_CLAUSE:-}"
 PROMPT_SUFFIX="${PROMPT_SUFFIX:-}"
