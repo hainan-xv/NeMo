@@ -127,11 +127,16 @@ EXP_NAME=granary2_script_promptctl_flush
 # FLUSH_PROB: each non-final chunk becomes a flush chunk with this probability (the
 # final chunk always flushes). FLUSH_TOKEN: an UNUSED special token repurposed as
 # <flush> (must be distinct from the self-correction delete_token). Both model.* and
-# data.dataset.* keys are set: model.* is baked into the checkpoint cfg so eval
-# auto-enables the final-chunk flush; data.dataset.* drives training supervision.
+# data.dataset.* keys are set below in the training command: model.* is baked into
+# the checkpoint cfg so eval auto-enables the final-chunk flush; data.dataset.*
+# drives training supervision.
+# NOTE: FLUSH_TOKEN contains Hydra-grammar-special chars ("<|...|>"), so it MUST be
+# passed with the ="'${VAR}'" double-then-single quoting (like the prompt templates
+# below): bash strips the outer double quotes and Hydra receives a single-quoted
+# string. Passing it bare (++model.flush_token=<|object_ref_end|>) makes Hydra throw
+# LexerNoViableAltException.
 FLUSH_PROB="${FLUSH_PROB:-0.1}"
 FLUSH_TOKEN="${FLUSH_TOKEN:-<|object_ref_end|>}"
-FLUSH_ARGS="++model.flush=true ++model.flush_token='${FLUSH_TOKEN}' ++data.dataset.flush=true ++data.dataset.flush_token='${FLUSH_TOKEN}' ++data.dataset.flush_prob=${FLUSH_PROB}"
 
 # --- Prompt-control operating point (CLI overrides on top of the base recipe) ---
 # (1) CHUNK SIZE: one drawn per batch from this set (encoder frames), stated in
@@ -276,7 +281,11 @@ echo "*******STARTING********" \
     ++data.dataset.exact_max_delay=${EXACT_MAX_DELAY} \
     ++data.dataset.vary_text_repr=true \
     ++data.dataset.debug_print_prompt_every=${DEBUG_PROMPT_EVERY} \
-    ${FLUSH_ARGS} \
+    ++model.flush=true \
+    ++model.flush_token="'${FLUSH_TOKEN}'" \
+    ++data.dataset.flush=true \
+    ++data.dataset.flush_token="'${FLUSH_TOKEN}'" \
+    ++data.dataset.flush_prob=${FLUSH_PROB} \
     ++data.dataset.chunk_size_prompt_template="'${CHUNK_SIZE_PROMPT_TEMPLATE}'" \
     ++data.dataset.prompt_template="'${PROMPT_TEMPLATE}'" \
     data.dataset.system_prompt="'${SYSTEM_PROMPT}'" \
