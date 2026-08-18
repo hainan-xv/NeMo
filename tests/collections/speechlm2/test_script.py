@@ -1024,6 +1024,115 @@ def test_batched_decode_matches_per_utterance_fixed_frame():
 
 
 # ---------------------------------------------------------------------------
+# Delay-sized LEFT audio context (audio_left_context_frames > 0)
+#
+# Each branch window is extended left by ``audio_left_context_frames`` frames of
+# pre-chunk history: window = [k*cs - left, (k+1)*cs) = cs + left frames (clamped
+# at 0), so a word held back by the emission delay keeps its own audio in the
+# chunk that emits it.
+# ---------------------------------------------------------------------------
+
+
+def test_left_context_window_helper():
+    # Pure-function check of _audio_window_start's left extension (M=0, W=0).
+    cs, left = 3, 2
+    # chunk k=1: base start = 3, extended left by 2 -> 1.
+    assert _audio_window_start(1 * cs, 2 * cs, 1 * cs, 0, left) == 1
+    # chunk k=0 clamps at 0 (no negative frames).
+    assert _audio_window_start(0, cs, 0, 0, left) == 0
+    # left=0 is a no-op (unchanged base behaviour).
+    assert _audio_window_start(2 * cs, 3 * cs, 2 * cs, 0, 0) == 2 * cs
+
+
+def test_left_context_window_structure():
+    # 4 chunks of 3 frames each; prepend left=2 frames of pre-chunk history.
+    # Global frames: chunk0=[0,1,2], chunk1=[3,4,5], chunk2=[6,7,8], chunk3=[9,10,11].
+    chunks = [ChunkSpec(3, [20]), ChunkSpec(3, [21]), ChunkSpec(3, [22]), ChunkSpec(3, [23])]
+    ex = build_packed_chunk_example(INSTR, chunks, VS, VE, EOT, audio_left_context_frames=2)
+
+    def win(seg):
+        b = (ex.seg_ids == seg).nonzero(as_tuple=True)[0]
+        return ex.audio_frame_index[b][ex.is_audio[b]].tolist()
+
+    assert win(1) == [0, 1, 2]  # clamped at start (no negative frames)
+    assert win(2) == [1, 2, 3, 4, 5]  # 2 left frames + own 3
+    assert win(3) == [4, 5, 6, 7, 8]
+    assert win(4) == [7, 8, 9, 10, 11]
+
+
+def test_left_context_scales_with_chunk_size():
+    # The left slab is a FIXED frame count; total context = chunk_size + left.
+    chunks = [ChunkSpec(5, [20]), ChunkSpec(5, [21])]  # cs=5
+    ex = build_packed_chunk_example(INSTR, chunks, VS, VE, EOT, audio_left_context_frames=3)
+    b2 = (ex.seg_ids == 2).nonzero(as_tuple=True)[0]
+    # chunk1 = frames [5,6,7,8,9]; extended left by 3 -> starts at frame 2 => 8 frames total.
+    assert ex.audio_frame_index[b2][ex.is_audio[b2]].tolist() == [2, 3, 4, 5, 6, 7, 8, 9]
+
+
+@torch.no_grad()
+def test_parity_left_context_packed_vs_separate():
+    """Packed branch logits must match the standalone example when each window is
+    extended left by ``audio_left_context_frames`` frames."""
+    model = _tiny_qwen3()
+    H = model.config.hidden_size
+    instruction = [5, 6, 7]
+    chunks = [ChunkSpec(3, [20, 21]), ChunkSpec(3, [30]), ChunkSpec(3, [40, 41]), ChunkSpec(3, [50])]
+    left = 4
+    total_frames = sum(c.audio_len for c in chunks)
+    torch.manual_seed(2026)
+    global_frames = torch.randn(total_frames, H)
+
+    packed = build_packed_chunk_example(instruction, chunks, VS, VE, EOT, audio_left_context_frames=left)
+    valid = torch.ones_like(packed.input_ids, dtype=torch.bool)
+    mask = build_script_mask(
+        packed.seg_ids[None], packed.position_ids[None], packed.prefix_len[None], valid[None], torch.float32
+    )
+    packed_emb = _embed_by_frame_index(model, packed.input_ids, packed.audio_frame_index, global_frames)
+    packed_logits = model(
+        inputs_embeds=packed_emb[None], attention_mask=mask, position_ids=packed.position_ids[None]
+    ).logits[0]
+
+    separate = build_separate_chunk_examples(instruction, chunks, VS, VE, EOT, audio_left_context_frames=left)
+    for k, sep in enumerate(separate, start=1):
+        sep_emb = _embed_by_frame_index(model, sep.input_ids, sep.audio_frame_index, global_frames)
+        sep_logits = model(inputs_embeds=sep_emb[None]).logits[0]
+        idx = (packed.seg_ids == k).nonzero(as_tuple=True)[0]
+        torch.testing.assert_close(packed_logits[idx], sep_logits[sep.branch_start :], atol=1e-4, rtol=1e-4)
+
+
+@torch.no_grad()
+def test_batched_decode_matches_per_utterance_left_context():
+    """Batched == per-utterance decode with a delay-sized left audio context."""
+    model = _tiny_qwen3()
+    H = model.config.hidden_size
+    embed = model.get_input_embeddings()
+    pad_id = 0
+    chunk_size = 3
+    max_new = 4
+    left = 4
+
+    torch.manual_seed(555)
+    instrs = [[5, 6, 7], [8, 9], [10, 11, 12, 13]]
+    frames_list = [torch.randn(9, H), torch.randn(3, H), torch.randn(12, H)]
+
+    ref = []
+    for instr, frames in zip(instrs, frames_list):
+        per_chunk = stream_decode_script(
+            llm=model, embed_tokens=embed, instruction_ids=instr, frames=frames,
+            chunk_size=chunk_size, vision_start_id=VS, vision_end_id=VE, eot_id=EOT,
+            max_new_tokens=max_new, audio_left_context_frames=left,
+        )
+        ref.append([t for chunk in per_chunk for t in chunk])
+
+    got = batched_stream_decode_script(
+        llm=model, embed_tokens=embed, instruction_ids_list=instrs, frames_list=frames_list,
+        chunk_size=chunk_size, vision_start_id=VS, vision_end_id=VE, eot_id=EOT, pad_id=pad_id,
+        max_new_tokens=max_new, audio_left_context_frames=left,
+    )
+    assert got == ref, f"left-context batched decode diverged:\n batched={got}\n per-utt={ref}"
+
+
+# ---------------------------------------------------------------------------
 # History-word recovery
 # ---------------------------------------------------------------------------
 

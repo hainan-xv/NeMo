@@ -110,10 +110,16 @@ def _branch_positions(
     return prelude + words
 
 
-def _audio_window_start(cur_chunk_start: int, win_end: int, m_window_start: int, audio_window_frames: int) -> int:
+def _audio_window_start(
+    cur_chunk_start: int,
+    win_end: int,
+    m_window_start: int,
+    audio_window_frames: int,
+    left_context_frames: int = 0,
+) -> int:
     """Global start frame of a branch's audio window (window is ``[start, win_end)``).
 
-    Two ways to size the window (see :func:`build_packed_chunk_example`):
+    Two ways to size the base window (see :func:`build_packed_chunk_example`):
 
     * ``audio_window_frames > 0`` (FRAME-based): the last ``audio_window_frames``
       encoder frames ending at the chunk boundary ``win_end`` — a fixed acoustic
@@ -124,10 +130,23 @@ def _audio_window_start(cur_chunk_start: int, win_end: int, m_window_start: int,
       ``audio_history_chunks``.
     * otherwise (CHUNK-based): ``m_window_start`` = the start of chunk
       ``max(0, k - audio_history_chunks)``.
+
+    ``left_context_frames > 0`` then extends the base window LEFTWARD by that many
+    frames (clamped at 0). This gives every branch a fixed slab of pre-chunk
+    acoustic context so that a word held back by the emission delay (up to
+    ``left_context_frames`` frames) still has its OWN audio inside the window of the
+    later chunk that emits it. With the default ``audio_history_chunks==0`` /
+    ``audio_window_frames==0`` this makes the window ``[k*cs - left, (k+1)*cs)`` =
+    ``cs + left`` frames (the chunk plus ``left`` frames of history). Applied
+    identically in training and inference so the two match exactly.
     """
     if audio_window_frames > 0:
-        return max(0, min(cur_chunk_start, win_end - audio_window_frames))
-    return m_window_start
+        start = max(0, min(cur_chunk_start, win_end - audio_window_frames))
+    else:
+        start = m_window_start
+    if left_context_frames > 0:
+        start = max(0, start - int(left_context_frames))
+    return start
 
 
 @dataclass
@@ -200,6 +219,7 @@ def build_packed_chunk_example(
     recover_prev: Optional[List[bool]] = None,
     contiguous_text_positions: bool = False,
     audio_window_frames: int = 0,
+    audio_left_context_frames: int = 0,
     corrupt_prev: Optional[List[Optional[List[int]]]] = None,
     delete_id: Optional[int] = None,
     correction_scope: str = "word",
@@ -308,7 +328,7 @@ def build_packed_chunk_example(
         # fixed frame count (audio_window_frames), ending at the chunk boundary.
         win_end = frame_starts[kc] + ch.audio_len
         win_start = _audio_window_start(
-            frame_starts[kc], win_end, frame_starts[max(0, kc - M)], audio_window_frames
+            frame_starts[kc], win_end, frame_starts[max(0, kc - M)], audio_window_frames, audio_left_context_frames
         )
         window_frames = list(range(win_start, win_end))
         window_len = len(window_frames)
@@ -814,6 +834,7 @@ def build_separate_chunk_examples(
     recover_prev: Optional[List[bool]] = None,
     contiguous_text_positions: bool = False,
     audio_window_frames: int = 0,
+    audio_left_context_frames: int = 0,
     corrupt_prev: Optional[List[Optional[List[int]]]] = None,
     delete_id: Optional[int] = None,
     correction_scope: str = "word",
@@ -844,7 +865,7 @@ def build_separate_chunk_examples(
     for kc, ch in enumerate(chunks):
         win_end = frame_starts[kc] + ch.audio_len
         win_start = _audio_window_start(
-            frame_starts[kc], win_end, frame_starts[max(0, kc - M)], audio_window_frames
+            frame_starts[kc], win_end, frame_starts[max(0, kc - M)], audio_window_frames, audio_left_context_frames
         )
         window_frames = list(range(win_start, win_end))
         window_len = len(window_frames)
@@ -1042,6 +1063,7 @@ def stream_decode_script(
     contiguous_text_positions: bool = False,
     max_history_tokens: int = 0,
     audio_window_frames: int = 0,
+    audio_left_context_frames: int = 0,
     next_chunk_frames: Optional[Callable[[int], Optional[Tensor]]] = None,
 ) -> List[List[int]]:
     """Greedy streaming decode of one utterance in the SCRIPT model.
@@ -1115,9 +1137,12 @@ def stream_decode_script(
 
         def _default_next_chunk_frames(k: int) -> Optional[Tensor]:
             # Audio window: chunk-based (audio_history_chunks) or fixed frame count
-            # (audio_window_frames), ending at this chunk's boundary.
+            # (audio_window_frames), ending at this chunk's boundary, then extended
+            # left by ``audio_left_context_frames`` frames of pre-chunk history.
             win_end = (k + 1) * chunk_size
-            win_start = _audio_window_start(k * chunk_size, win_end, max(0, k - M) * chunk_size, W)
+            win_start = _audio_window_start(
+                k * chunk_size, win_end, max(0, k - M) * chunk_size, W, audio_left_context_frames
+            )
             return frames[win_start:win_end]
 
         frame_source = _default_next_chunk_frames
@@ -1227,6 +1252,7 @@ def batched_stream_decode_script(
     max_history_tokens: int = 0,
     return_chunk_ids: bool = False,
     audio_window_frames: int = 0,
+    audio_left_context_frames: int = 0,
     delete_id: Optional[int] = None,
     is_word_start: Optional[Callable[[int], bool]] = None,
     correction_scope: str = "word",
@@ -1342,9 +1368,12 @@ def batched_stream_decode_script(
         chunk_frames: List[Tensor] = []
         for b in active:
             # Audio window: chunk-based (audio_history_chunks) or fixed frame count
-            # (audio_window_frames), ending at this chunk's boundary.
+            # (audio_window_frames), ending at this chunk's boundary, then extended
+            # left by ``audio_left_context_frames`` frames of pre-chunk history.
             win_end = (k + 1) * chunk_size
-            win_start = _audio_window_start(k * chunk_size, win_end, max(0, k - M) * chunk_size, W)
+            win_start = _audio_window_start(
+                k * chunk_size, win_end, max(0, k - M) * chunk_size, W, audio_left_context_frames
+            )
             fr = frames_list[b][win_start:win_end].to(device=device, dtype=dtype)
             c = int(fr.shape[0])
             # Optionally cap the CONDITIONING history to the most recent
@@ -1742,6 +1771,7 @@ def batched_stream_decode_script_last_layer(
     device: Optional[torch.device] = None,
     audio_history_chunks: int = 0,
     audio_window_frames: int = 0,
+    audio_left_context_frames: int = 0,
     max_history_tokens: int = 0,
     return_chunk_ids: bool = False,
 ):
@@ -1808,7 +1838,9 @@ def batched_stream_decode_script_last_layer(
         chunk_frames: List[Tensor] = []
         for b in active:
             win_end = (k + 1) * chunk_size
-            win_start = _audio_window_start(k * chunk_size, win_end, max(0, k - M) * chunk_size, W)
+            win_start = _audio_window_start(
+                k * chunk_size, win_end, max(0, k - M) * chunk_size, W, audio_left_context_frames
+            )
             fr = frames_list[b][win_start:win_end].to(device=device, dtype=dtype)
             c = int(fr.shape[0])
             hist = emitted[b]

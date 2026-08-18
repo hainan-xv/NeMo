@@ -304,10 +304,24 @@ class ScriptSTTDataset(StreamingSTTDataset):
         # --- Audio history window + history-word recovery ---
         self._audio_history_chunks = max(int(getattr(self.cfg, "audio_history_chunks", 0) or 0), 0)
         self._audio_window_frames = max(int(getattr(self.cfg, "audio_window_frames", 0) or 0), 0)
+        # Extra frames of pre-chunk acoustic history prepended to EVERY branch window
+        # (typically = exact_max_delay). Gives a word held back by the emission delay
+        # its own audio inside the later chunk that emits it. Composes with either
+        # window mode above; applied identically at inference (see ScriptSTTModel).
+        self._audio_left_context_frames = max(int(getattr(self.cfg, "audio_left_context_frames", 0) or 0), 0)
         if self._audio_window_frames > 0 and self._audio_history_chunks > 0:
             raise ValueError(
                 "audio_window_frames and audio_history_chunks are mutually exclusive "
                 "(pick a frame-based OR a chunk-based audio window)."
+            )
+        if self._audio_left_context_frames > 0:
+            logging.info(
+                "ScriptSTTDataset: audio_left_context_frames=%d (each branch window is extended "
+                "left by %d frames of pre-chunk acoustic history, so a delay-held word keeps its "
+                "own audio in the chunk that emits it; total context = chunk_size + %d frames).",
+                self._audio_left_context_frames,
+                self._audio_left_context_frames,
+                self._audio_left_context_frames,
             )
         if self._audio_window_frames > 0:
             logging.info(
@@ -930,6 +944,7 @@ class ScriptSTTDataset(StreamingSTTDataset):
                         recover_prev=recover_prev,
                         contiguous_text_positions=self._contiguous_text_positions,
                         audio_window_frames=self._audio_window_frames,
+                        audio_left_context_frames=self._audio_left_context_frames,
                         corrupt_prev=corrupt_prev,
                         delete_id=self._sc_delete_id if self._self_correction_prefix else None,
                         flush_id=self._flush_id,
@@ -972,7 +987,11 @@ class ScriptSTTDataset(StreamingSTTDataset):
             # (byte-identical) cumsum interleave path.
             audio_frame_index=(
                 packed.audio_frame_index
-                if (self._audio_history_chunks > 0 or self._audio_window_frames > 0)
+                if (
+                    self._audio_history_chunks > 0
+                    or self._audio_window_frames > 0
+                    or self._audio_left_context_frames > 0
+                )
                 else None
             ),
             valid=packed.valid,

@@ -130,6 +130,11 @@ class ScriptSTTModel(StreamingSTTModel):
         self._audio_history_chunks = max(int(getattr(self.core_cfg, "audio_history_chunks", 0) or 0), 0)
         # Fixed-frame audio window (takes precedence over audio_history_chunks).
         self._audio_window_frames = max(int(getattr(self.core_cfg, "audio_window_frames", 0) or 0), 0)
+        # Extra frames of pre-chunk acoustic history prepended to EVERY branch window
+        # (typically = exact_max_delay), so a word held back by the emission delay
+        # still has its own audio inside the later chunk that emits it. Applied
+        # identically in training and inference; composes with the window above.
+        self._audio_left_context_frames = max(int(getattr(self.core_cfg, "audio_left_context_frames", 0) or 0), 0)
         # Shared-audio packed layout (encoder frames laid once, windowed via the mask).
         self._shared_audio_track = bool(getattr(self.core_cfg, "shared_audio_track", False))
 
@@ -319,13 +324,15 @@ class ScriptSTTModel(StreamingSTTModel):
         logging.info("=" * 72)
         logging.info(
             "[SCRIPT] packed spine+branch objective active | audio span %r/%r | eot=%s | "
-            "audio_history_chunks=%d | audio_window_frames=%d | shared_audio_track=%s | "
-            "contiguous_text_positions=%s | attn_impl=%s -- models p(words_k | text_history_<k, audio_{k-M..k}).",
+            "audio_history_chunks=%d | audio_window_frames=%d | audio_left_context_frames=%d | "
+            "shared_audio_track=%s | contiguous_text_positions=%s | attn_impl=%s -- "
+            "models p(words_k | text_history_<k, audio_{k-M..k}).",
             self.audio_open_token,
             self.audio_close_token,
             self._cc_eot_id,
             self._audio_history_chunks,
             self._audio_window_frames,
+            self._audio_left_context_frames,
             self._shared_audio_track,
             self._contiguous_text_positions,
             self.llm.config._attn_implementation,
@@ -673,12 +680,17 @@ class ScriptSTTModel(StreamingSTTModel):
                     correction_scope=self._self_correction_scope,
                     audio_history_chunks=self._audio_history_chunks,
                     audio_window_frames=self._audio_window_frames,
+                    audio_left_context_frames=self._audio_left_context_frames,
                 )
             )
 
         packed = collate_packed_chunk_examples(corrupt_examples, pad_id=self.tokenizer.pad_id)
         dev = self.device
-        windowed = self._audio_history_chunks > 0 or self._audio_window_frames > 0
+        windowed = (
+            self._audio_history_chunks > 0
+            or self._audio_window_frames > 0
+            or self._audio_left_context_frames > 0
+        )
         target_tokens = packed.target_ids.to(dev)
 
         # 3) Grad forward on the corrupted batch.
@@ -931,6 +943,7 @@ class ScriptSTTModel(StreamingSTTModel):
             contiguous_text_positions=self._contiguous_text_positions,
             max_history_tokens=max_history_tokens,
             audio_window_frames=self._audio_window_frames,
+            audio_left_context_frames=self._audio_left_context_frames,
             return_chunk_ids=return_chunk_ids,
             is_word_start=self._is_word_start if (warn_chunk_word_start or insert_word_start_id is not None) else None,
             warn_chunk_word_start=warn_chunk_word_start,
@@ -1154,6 +1167,7 @@ class ScriptSTTModel(StreamingSTTModel):
                 device=self.device,
                 audio_history_chunks=self._audio_history_chunks,
                 audio_window_frames=self._audio_window_frames,
+                audio_left_context_frames=self._audio_left_context_frames,
                 max_history_tokens=max_history_tokens,
                 return_chunk_ids=return_word_latency,
             )
@@ -1203,6 +1217,7 @@ class ScriptSTTModel(StreamingSTTModel):
             max_history_tokens=max_history_tokens,
             return_chunk_ids=return_word_latency,
             audio_window_frames=self._audio_window_frames,
+            audio_left_context_frames=self._audio_left_context_frames,
             delete_id=self._delete_id if self._self_correction else None,
             is_word_start=(
                 self._is_word_start
