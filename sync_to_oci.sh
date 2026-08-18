@@ -25,7 +25,7 @@ echo "==> Local branch: ${current_branch:-<detached HEAD>}  ->  remote branch: $
 # launch/ is tracked normally, but new files still need an explicit add
 # (git add -u only stages already-tracked paths).
 git add -u
-git add .gitignore sync_to_oci.sh launch/script_baseline.sh
+git add .gitignore sync_to_oci.sh launch/script_baseline.sh launch/script_selfcorrect.sh
 # Leaderboard eval: the pooled-shard SLURM launchers + the self-contained decode
 # driver and its helpers (checkpoint averaging, wandb reporting). New/untracked, so
 # they need an explicit add (git add -u only stages already-tracked paths).
