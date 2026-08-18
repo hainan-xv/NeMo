@@ -756,6 +756,24 @@ class ScriptSTTDataset(StreamingSTTDataset):
         if self._self_correction:
             system_prompts = [self._append_correction_clause(p, sc_on) for p in system_prompts]
 
+        # --- Periodic debug: print the EXACT rendered system prompt actually used ---
+        # Enable with ++data.dataset.debug_print_prompt_every=N (batches, per worker);
+        # 0/unset = off. Confirms {delay}/{format_clause}/{chunk_size} are really
+        # substituted at train time (prints the batch's sampled delay/chunk/cap/punct
+        # and the first cut's finalized prompt string that seeds instruction_ids).
+        _prompt_dbg_every = int(getattr(self.cfg, "debug_print_prompt_every", 0) or 0)
+        if _prompt_dbg_every > 0 and system_prompts:
+            self._prompt_dbg_n = getattr(self, "_prompt_dbg_n", 0) + 1
+            if self._prompt_dbg_n == 1 or self._prompt_dbg_n % _prompt_dbg_every == 0:
+                _wi = torch.utils.data.get_worker_info()
+                _wid = _wi.id if _wi is not None else 0
+                print(
+                    f"[SCRIPT prompt debug] worker={_wid} batch#={self._prompt_dbg_n} "
+                    f"chunk_size={chunk_size} delay={num_delay_frames} cap={cap} punct={punct} sc={sc_on}\n"
+                    f"    system_prompt={system_prompts[0]!r}",
+                    flush=True,
+                )
+
         batch_messages = get_llm_messages_for_batch(
             system_role=self.cfg.system_role,
             system_prompt=system_prompts,

@@ -110,6 +110,11 @@ DEBUG_CUDA="${DEBUG_CUDA:-0}"
 # Set DEBUG_VALIDATE_TOKENS=true to check input/target token ids are in range
 # each step (turns an opaque CUDA assert into a clear Python error). Debug only.
 DEBUG_VALIDATE_TOKENS="${DEBUG_VALIDATE_TOKENS:-false}"
+# Set DEBUG_PROMPT_EVERY=N to periodically print the EXACT rendered system prompt
+# (with the batch's sampled delay/chunk/cap/punct) from the dataloader, so you can
+# confirm {delay}/{chunk_size}/{format_clause} are really substituted at train
+# time. Prints on batch #1 then every N batches, per dataloader worker. 0 = off.
+DEBUG_PROMPT_EVERY="${DEBUG_PROMPT_EVERY:-0}"
 
 # Config: OUR SCRIPT recipe, shipped in the synced repo at /code. Same BASE recipe
 # as the baseline -- the prompt-control knobs are added below as ++ CLI overrides
@@ -260,6 +265,7 @@ echo "*******STARTING********" \
     ++data.dataset.exact_delay=true \
     ++data.dataset.exact_max_delay=${EXACT_MAX_DELAY} \
     ++data.dataset.vary_text_repr=true \
+    ++data.dataset.debug_print_prompt_every=${DEBUG_PROMPT_EVERY} \
     ++data.dataset.chunk_size_prompt_template="'${CHUNK_SIZE_PROMPT_TEMPLATE}'" \
     ++data.dataset.prompt_template="'${PROMPT_TEMPLATE}'" \
     data.dataset.system_prompt="'${SYSTEM_PROMPT}'" \
