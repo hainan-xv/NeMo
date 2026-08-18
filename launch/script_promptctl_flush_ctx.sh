@@ -55,7 +55,7 @@
 #   AUDIO_LEFT_CONTEXT_FRAMES -- pre-chunk left audio context in frames (default = EXACT_MAX_DELAY)
 #   FLUSH_PROB   -- non-final-chunk flush probability (default 0.1)
 #   FLUSH_TOKEN  -- unused special token used as <flush> (default <|object_ref_end|>)
-#   INIT_EXP     -- experiment to warm-start from (default granary2_script_promptctl_flush)
+#   INIT_EXP     -- experiment to warm-start from (default granary2_script_promptctl)
 #   INIT_CKPT    -- pin a checkpoint, or "none" to train from base pretrained
 # ============================================================================
 
@@ -170,16 +170,19 @@ PROMPT_TEMPLATE="You are doing streaming speech recognition. Given the transcrip
 # The val references are plain caps+punct transcripts.
 SYSTEM_PROMPT="You are doing streaming speech recognition. Given the transcript so far and the next audio chunk, output the words spoken in that chunk. Emit the words of each chunk with a fixed delay of 3 frames. Write the text with normal capitalization and punctuation. Process the audio in chunks of 14 frames."
 
-# --- Warm-start from the trained flush PROMPT-CONTROL SCRIPT checkpoint ---
-# The left audio context adds NO new parameters (it only feeds more encoder frames
-# into each branch), so warm-start from granary2_script_promptctl_flush by default:
-# it already knows delay conditioning + <flush> and only has to learn to use the
-# newly-visible pre-chunk audio. If INIT_CKPT is empty it is AUTO-RESOLVED below to
-# that exp's most recent checkpoint. Override: INIT_CKPT=/path/to.ckpt to pin one,
-# INIT_EXP=<other_exp> to init from a different run, or INIT_CKPT=none to train from
-# the base pretrained LLM+ASR. The init run MUST share this model's architecture
-# (same base recipe / chunk-size set) or the loaded weights will not line up.
-INIT_EXP="${INIT_EXP:-granary2_script_promptctl_flush}"
+# --- Warm-start from the trained PROMPT-CONTROL SCRIPT checkpoint ---
+# Both <flush> and the left audio context add NO new parameters (flush reuses an
+# unused special token; the left context only feeds more encoder frames into each
+# branch), so warm-start from the regular prompt-control model
+# (granary2_script_promptctl) by default: it already knows the delay/chunk/cap-punct
+# prompt conditioning and only has to learn <flush> + how to use the newly-visible
+# pre-chunk audio. If INIT_CKPT is empty it is AUTO-RESOLVED below to that exp's most
+# recent checkpoint. Override: INIT_CKPT=/path/to.ckpt to pin one, INIT_EXP=<other_exp>
+# to init from a different run (e.g. granary2_script_promptctl_flush), or
+# INIT_CKPT=none to train from the base pretrained LLM+ASR. The init run MUST share
+# this model's architecture (same base recipe / chunk-size set) or the loaded weights
+# will not line up.
+INIT_EXP="${INIT_EXP:-granary2_script_promptctl}"
 INIT_CKPT="${INIT_CKPT:-}"
 
 # Directories for manifests, data, etc.
