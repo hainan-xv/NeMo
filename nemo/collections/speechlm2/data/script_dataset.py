@@ -157,6 +157,8 @@ class ScriptSTTDataset(StreamingSTTDataset):
             self._chunk_rngs: dict[int, np.random.Generator] = {}
         if not hasattr(self, "_delay_rngs"):
             self._delay_rngs: dict[int, np.random.Generator] = {}
+        if not hasattr(self, "_flush_rngs"):
+            self._flush_rngs: dict[int, np.random.Generator] = {}
 
         if self.cfg.chunk_size == 0:
             raise ValueError("ScriptSTTDataset does not support dynamic chunking (chunk_size=0).")
@@ -431,6 +433,41 @@ class ScriptSTTDataset(StreamingSTTDataset):
                 self._sc_prefix_prob, delete_token, self._sc_delete_id,
             )
 
+        # --- Flush token (end-of-audio + on-demand drain of delay-held words) ---
+        # When enabled, training tags FLUSH chunks (always the final chunk; each
+        # non-final chunk with prob flush_prob) whose assistant turn emits every
+        # pending word IGNORING the delay, and the packer inserts a <flush> control
+        # token right after <ve>. At inference the model appends <flush> on the last
+        # chunk to drain words the delay would otherwise strand past the clip end
+        # (the tail-drop fix). Reuses an unused special token (like <del>) so no
+        # embedding resize / checkpoint change is needed.
+        self._flush = bool(getattr(self.cfg, "flush", False))
+        self._flush_prob = float(getattr(self.cfg, "flush_prob", 0.1) or 0.0)
+        self._flush_id = None
+        if self._flush:
+            if self._contiguous_text_positions:
+                raise ValueError("flush is not compatible with contiguous_text_positions.")
+            if not (0.0 <= self._flush_prob <= 1.0):
+                raise ValueError(f"flush_prob must be in [0, 1], got {self._flush_prob}")
+            flush_token = str(getattr(self.cfg, "flush_token", "<|object_ref_end|>"))
+            hf_tok = self.tokenizer.tokenizer
+            self._flush_id = hf_tok.convert_tokens_to_ids(flush_token)
+            unk_f = getattr(hf_tok, "unk_token_id", None)
+            if self._flush_id is None or (unk_f is not None and self._flush_id == unk_f):
+                raise ValueError(
+                    f"flush_token {flush_token!r} is not a valid in-vocab token (id={self._flush_id})."
+                )
+            if self._sc_delete_id is not None and self._flush_id == self._sc_delete_id:
+                raise ValueError(
+                    f"flush_token {flush_token!r} collides with delete_token (id={self._flush_id}); pick another."
+                )
+            logging.info(
+                "ScriptSTTDataset: flush ON (flush_prob=%.2f, flush_token=%r id=%s) -- final chunk always "
+                "flushes; each non-final chunk flushes w.p. flush_prob; a flush emits pending words ignoring "
+                "the delay (empty flush allowed).",
+                self._flush_prob, flush_token, self._flush_id,
+            )
+
         # --- Windowed re-decoding self-correction ---
         # Each chunk c gets one branch per lookahead level j (0..R): predict chunk c
         # from clean history y_0..y_{c-1} and the (M+1)-chunk audio window ending at
@@ -514,6 +551,23 @@ class ScriptSTTDataset(StreamingSTTDataset):
             self._delay_rngs[key] = np.random.default_rng(seed % (2**32))
         return self._delay_rngs[key]
 
+    def _get_flush_rng(self) -> np.random.Generator:
+        """RNG for per-chunk flush sampling, rank/worker-local and seeded
+        independently from the chunk-size / delay RNGs (so enabling flush does not
+        perturb their draws)."""
+        flush_seed = int(getattr(self.cfg, "flush_seed", 2024))
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is not None:
+            key = worker_info.id
+            seed = worker_info.seed + flush_seed
+        else:
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            key = -(rank + 1)
+            seed = flush_seed + rank
+        if key not in self._flush_rngs:
+            self._flush_rngs[key] = np.random.default_rng(seed % (2**32))
+        return self._flush_rngs[key]
+
     def _sample_delay_prompt(self, rng):
         """Sample one (num_delay_frames, prompt) uniformly, or None if disabled."""
         if not self._delay_prompts:
@@ -585,7 +639,10 @@ class ScriptSTTDataset(StreamingSTTDataset):
         out = []
         for m in messages:
             if m["role"] == "assistant":
-                out.append({"role": "assistant", "content": self._apply_text_repr(m["content"], cap, punct)})
+                new_m = {"role": "assistant", "content": self._apply_text_repr(m["content"], cap, punct)}
+                if m.get("flush"):
+                    new_m["flush"] = True  # preserve the flush tag through the transform
+                out.append(new_m)
             else:
                 out.append(m)
         return out
@@ -672,8 +729,10 @@ class ScriptSTTDataset(StreamingSTTDataset):
                 continue
             audio_len = m["content"].count(audio_tag)
             words = ""
+            flush = False
             if i + 1 < n and messages[i + 1]["role"] == "assistant":
                 words = messages[i + 1]["content"]
+                flush = bool(messages[i + 1].get("flush", False))
                 i += 2
             else:
                 i += 1
@@ -684,7 +743,9 @@ class ScriptSTTDataset(StreamingSTTDataset):
             last_word_ids = (
                 self._last_word_ids(words, target_ids) if (compute_last_word and target_ids) else []
             )
-            chunks.append(ChunkSpec(audio_len=audio_len, target_ids=target_ids, last_word_ids=last_word_ids))
+            chunks.append(
+                ChunkSpec(audio_len=audio_len, target_ids=target_ids, last_word_ids=last_word_ids, flush=flush)
+            )
         return chunks
 
     def _sample_recover_flags(self, chunks: List[ChunkSpec], rng) -> Optional[List[bool]]:
@@ -798,6 +859,9 @@ class ScriptSTTDataset(StreamingSTTDataset):
                 if (self.cfg.use_word_length_delay and self.cfg.word_length_delay_stochastic)
                 else None
             ),
+            enable_flush=self._flush,
+            flush_prob=self._flush_prob,
+            flush_rng=self._get_flush_rng() if self._flush else None,
         )
 
         recover_on = self._history_word_recovery_prob > 0.0
@@ -868,6 +932,7 @@ class ScriptSTTDataset(StreamingSTTDataset):
                         audio_window_frames=self._audio_window_frames,
                         corrupt_prev=corrupt_prev,
                         delete_id=self._sc_delete_id if self._self_correction_prefix else None,
+                        flush_id=self._flush_id,
                     )
                 )
 

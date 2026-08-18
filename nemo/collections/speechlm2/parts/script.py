@@ -65,12 +65,16 @@ SPINE_SEG_ID = 0
 
 
 def _branch_positions(
-    pref: int, window_len: int, n_words: int, contiguous_text_positions: bool
+    pref: int, window_len: int, n_words: int, contiguous_text_positions: bool, n_control: int = 0
 ) -> List[int]:
     """RoPE position ids for one branch's tokens.
 
-    Physical branch layout is ``<vs> [window_len audio] <ve> [n_words words] <eot>``
-    (``n_bt = window_len + n_words + 3`` tokens; ``n_words = len(branch_words)``).
+    Physical branch layout is ``<vs> [window_len audio] <ve> [n_control ctrl]
+    [n_words words] <eot>`` (``n_bt = window_len + n_control + n_words + 3`` tokens;
+    ``n_words = len(branch_words)``). ``n_control`` is the number of control tokens
+    (e.g. a ``<flush>`` token) inserted right after ``<ve>``; they take contiguous
+    positions just before the words. ``n_control`` is only supported in the default
+    (non-contiguous) convention.
 
     Two conventions:
 
@@ -95,9 +99,11 @@ def _branch_positions(
       exact parity with an order-causal standalone, so parity tests use configs
       with ``pref >= window_len+2``.
     """
-    n_bt = window_len + n_words + 3  # <vs> + audio + <ve> + words + <eot>
+    n_bt = window_len + n_control + n_words + 3  # <vs> + audio + <ve> + ctrl + words + <eot>
     if not contiguous_text_positions:
         return [pref + off for off in range(n_bt)]
+    if n_control:
+        raise ValueError("control tokens (e.g. <flush>) are not supported with contiguous_text_positions")
     n_prelude = window_len + 2  # <vs> + audio + <ve>
     prelude = [max(0, pref - n_prelude + i) for i in range(n_prelude)]
     words = [pref + j for j in range(n_words + 1)]  # words + eot, contiguous with history
@@ -140,6 +146,11 @@ class ChunkSpec:
     audio_len: int
     target_ids: List[int] = field(default_factory=list)
     last_word_ids: List[int] = field(default_factory=list)
+    # When True, this chunk is a FLUSH chunk: a ``<flush>`` control token is placed
+    # right after ``<ve>`` (before the words) so the model learns to emit every
+    # not-yet-emitted word whose audio has ended by this chunk, DISREGARDING the
+    # prompt-stated delay. Set by the delay/flush logic in ``script_messages``.
+    flush: bool = False
 
 
 @dataclass
@@ -192,6 +203,7 @@ def build_packed_chunk_example(
     corrupt_prev: Optional[List[Optional[List[int]]]] = None,
     delete_id: Optional[int] = None,
     correction_scope: str = "word",
+    flush_id: Optional[int] = None,
 ) -> PackedChunkExample:
     """Build the packed spine+branch layout for one utterance.
 
@@ -347,12 +359,26 @@ def build_packed_chunk_example(
         else:
             branch_words = list(ch.target_ids)
 
-        # branch tokens: [W' context] <vs> [window audio] <ve> [branch_words] <eot>
+        # Optional <flush> control token, placed right after <ve> (before the words).
+        # It tells the model to emit every pending word regardless of the delay. It is
+        # an INPUT signal only -- never a target (the model is never trained to EMIT
+        # it); instead the flush token's position predicts ``branch_words[0]`` (or
+        # ``<eot>`` for an empty flush). Not supported with contiguous_text_positions.
+        flush_prelude: List[int] = []
+        if flush_id is not None and getattr(ch, "flush", False):
+            if contiguous_text_positions:
+                raise ValueError("flush chunks are not supported with contiguous_text_positions")
+            flush_prelude = [flush_id]
+
+        # branch tokens: [W' context] <vs> [window audio] <ve> [<flush>?] [branch_words] <eot>
         branch_tokens: List[int] = (
             list(context) + [vision_start_id] + [AUDIO_TOKEN_IDX] * window_len + [vision_end_id]
         )
         branch_is_audio: List[bool] = [False] * len(context) + [False] + [True] * window_len + [False]
         branch_frame_idx: List[int] = [-1] * len(context) + [-1] + window_frames + [-1]
+        branch_tokens.extend(flush_prelude)
+        branch_is_audio.extend([False] * len(flush_prelude))
+        branch_frame_idx.extend([-1] * len(flush_prelude))
         branch_tokens.extend(branch_words)
         branch_is_audio.extend([False] * len(branch_words))
         branch_frame_idx.extend([-1] * len(branch_words))
@@ -360,12 +386,14 @@ def build_packed_chunk_example(
         branch_is_audio.append(False)
         branch_frame_idx.append(-1)
 
-        # Next-token targets: <ve> predicts branch_words[0]; word i predicts word
-        # i+1; the last word predicts eot. context/<vs>/audio/eot are not supervised.
+        # Next-token targets: the token right BEFORE the words (the <flush> token when
+        # present, else <ve>) predicts branch_words[0]; word i predicts word i+1; the
+        # last word predicts eot. context/<vs>/audio/<ve>/<flush>-input/eot are not
+        # supervised. (When flushing, <ve> is NOT taught to emit <flush>.)
         n_bt = len(branch_tokens)
         next_targets: List[int] = [IGNORE_INDEX] * n_bt
         ve_idx = len(context) + 1 + window_len  # index of <ve> within the branch
-        first_word_pos = ve_idx  # <ve> predicts the first (delete/recovered/normal) target
+        first_word_pos = ve_idx + len(flush_prelude)  # <flush> (or <ve>) predicts branch_words[0]
         for j, tok in enumerate(branch_words):
             next_targets[first_word_pos + j] = tok
         last_word_pos = first_word_pos + len(branch_words)  # predicts eot
@@ -375,10 +403,13 @@ def build_packed_chunk_example(
         if context:
             # W' occupies the history-tail positions pref..pref+|W'|-1; the rest follows.
             branch_positions = [pref + i for i in range(len(context))] + _branch_positions(
-                pref + len(context), window_len, len(branch_words), contiguous_text_positions
+                pref + len(context), window_len, len(branch_words), contiguous_text_positions,
+                n_control=len(flush_prelude),
             )
         else:
-            branch_positions = _branch_positions(pref, window_len, len(branch_words), contiguous_text_positions)
+            branch_positions = _branch_positions(
+                pref, window_len, len(branch_words), contiguous_text_positions, n_control=len(flush_prelude)
+            )
 
         input_ids.extend(branch_tokens)
         position_ids.extend(branch_positions)
@@ -1202,6 +1233,8 @@ def batched_stream_decode_script(
     return_raw: bool = False,
     warn_chunk_word_start: bool = False,
     insert_word_start_id: Optional[int] = None,
+    flush_id: Optional[int] = None,
+    flush_final: bool = True,
 ):
     """Batched greedy SCRIPT decode for B utterances at once.
 
@@ -1245,6 +1278,8 @@ def batched_stream_decode_script(
         return []
     if correction_scope not in ("word", "chunk"):
         raise ValueError(f"correction_scope must be 'word' or 'chunk', got {correction_scope!r}")
+    if flush_id is not None and contiguous_text_positions:
+        raise NotImplementedError("flush decode is not supported with contiguous_text_positions")
     if device is None:
         device = frames_list[0].device
     H = frames_list[0].shape[-1]
@@ -1319,12 +1354,18 @@ def batched_stream_decode_script(
             hist = emitted[b]
             if max_history_tokens and len(hist) > max_history_tokens:
                 hist = hist[-max_history_tokens:]
+            # End-of-audio flush: on this stream's LAST chunk, append the <flush>
+            # control token after <ve> so the model dumps every word still held by
+            # the emission delay (mirrors the always-on final-chunk flush in
+            # training). Without it, tail words held past the clip end are dropped.
+            flush_now = flush_id is not None and flush_final and (k == num_chunks[b] - 1)
             toks = (
                 list(instruction_ids_list[b])
                 + list(hist)
                 + [vision_start_id]
                 + [AUDIO_TOKEN_IDX] * c
                 + [vision_end_id]
+                + ([flush_id] if flush_now else [])
             )
             seqs.append(toks)
             chunk_frames.append(fr)

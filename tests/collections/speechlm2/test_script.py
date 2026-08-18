@@ -104,6 +104,57 @@ def test_empty_chunk_predicts_only_eot():
     assert ex.target_ids[b1].tolist() == [IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX, EOT, IGNORE_INDEX]
 
 
+FLUSH = 89  # toy-vocab <flush> control-token id (distinct from VS/VE/EOT)
+
+
+def test_packed_flush_token_layout():
+    # A flush chunk inserts <flush> right after <ve> (before the words). It is an
+    # INPUT signal: <ve> is NOT taught to emit <flush>; the <flush> position predicts
+    # the first word instead.
+    chunks = [ChunkSpec(audio_len=2, target_ids=[20, 21], flush=True)]
+    ex = build_packed_chunk_example(INSTR, chunks, VS, VE, EOT, flush_id=FLUSH)
+    b1 = (ex.seg_ids == 1).nonzero(as_tuple=True)[0]
+    # branch: <vs> A A <ve> <flush> 20 21 <eot>
+    assert ex.input_ids[b1].tolist() == [VS, AUDIO_TOKEN_IDX, AUDIO_TOKEN_IDX, VE, FLUSH, 20, 21, EOT]
+    assert ex.is_audio[b1].tolist() == [False, True, True, False, False, False, False, False]
+    # positions stay contiguous from prefix_len=2 (8 branch tokens now)
+    assert ex.position_ids[b1].tolist() == list(range(2, 2 + 8))
+    # targets: <ve> IGNORED (never emit <flush>); <flush> predicts 20; 20->21; 21->eot.
+    assert ex.target_ids[b1].tolist() == [
+        IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX, 20, 21, EOT, IGNORE_INDEX
+    ]
+
+
+def test_packed_flush_empty_chunk_predicts_eot():
+    # An EMPTY flush chunk (nothing pending) still gets a <flush> token; that token
+    # predicts <eot> so the model learns "flush with nothing pending -> emit nothing".
+    chunks = [ChunkSpec(audio_len=2, target_ids=[], flush=True)]
+    ex = build_packed_chunk_example(INSTR, chunks, VS, VE, EOT, flush_id=FLUSH)
+    b1 = (ex.seg_ids == 1).nonzero(as_tuple=True)[0]
+    assert ex.input_ids[b1].tolist() == [VS, AUDIO_TOKEN_IDX, AUDIO_TOKEN_IDX, VE, FLUSH, EOT]
+    assert ex.target_ids[b1].tolist() == [
+        IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX, EOT, IGNORE_INDEX
+    ]
+
+
+def test_packed_flush_off_when_chunk_not_flagged():
+    # Passing flush_id but leaving ch.flush False must reproduce the original layout
+    # (backward compatible -- no stray control token).
+    chunks = [ChunkSpec(audio_len=2, target_ids=[20, 21], flush=False)]
+    ex = build_packed_chunk_example(INSTR, chunks, VS, VE, EOT, flush_id=FLUSH)
+    b1 = (ex.seg_ids == 1).nonzero(as_tuple=True)[0]
+    assert FLUSH not in ex.input_ids[b1].tolist()
+    assert ex.input_ids[b1].tolist() == [VS, AUDIO_TOKEN_IDX, AUDIO_TOKEN_IDX, VE, 20, 21, EOT]
+
+
+def test_packed_flush_rejects_contiguous_positions():
+    chunks = [ChunkSpec(audio_len=2, target_ids=[20], flush=True)]
+    with pytest.raises(ValueError):
+        build_packed_chunk_example(
+            INSTR, chunks, VS, VE, EOT, flush_id=FLUSH, contiguous_text_positions=True
+        )
+
+
 # ---------------------------------------------------------------------------
 # Mask tests
 # ---------------------------------------------------------------------------
@@ -221,6 +272,58 @@ def test_messages_to_chunks_explicit_blank_sentinel():
     assert [c.audio_len for c in chunks] == [2, 1]
     assert chunks[0].target_ids == []
     assert chunks[1].target_ids == [ord(c) for c in "hi"]
+
+
+def test_messages_to_chunks_reads_flush_flag():
+    # The per-turn "flush" tag on an assistant message must propagate to ChunkSpec.flush.
+    ds = _make_dataset_stub(blank_token="")
+    messages = [
+        {"role": "system", "content": "prompt"},
+        {"role": "user", "content": "<audio><audio>"},
+        {"role": "assistant", "content": "hello"},
+        {"role": "user", "content": "<audio>"},
+        {"role": "assistant", "content": " world", "flush": True},
+    ]
+    chunks = ds._messages_to_chunks(messages)
+    assert chunks[0].flush is False
+    assert chunks[1].flush is True
+
+
+def test_flush_final_chunk_emits_stranded_tail_word():
+    # With a large delay, the last word is stranded past the final chunk boundary
+    # (ready = end + delay > num_frames). enable_flush makes the FINAL chunk a flush
+    # turn (delay ignored) that still emits it, and tags exactly that turn.
+    from nemo.collections.speechlm2.parts.alignments import WordAlignment
+    from nemo.collections.speechlm2.parts.script_messages import get_llm_messages_for_sample
+
+    aligns = [
+        WordAlignment(text="hello", start_time=0.16, end_time=0.48),  # end frame 6
+        WordAlignment(text="world", start_time=0.60, end_time=0.80),  # end frame 10
+    ]
+    kw = dict(
+        system_role="system",
+        system_prompt="p",
+        audio_tag="<a>",
+        blank_token="",
+        chunk_size=2,
+        audio_duration_secs=1.12,  # -> 14 frames -> 7 chunks (boundaries 2..14)
+        frame_length_in_secs=0.08,
+        alignments=aligns,
+        transcript="hello world",
+    )
+    # delay 6: "world" ready = 10 + 6 = 16 > 14 (stranded). flush_prob=0 -> only the
+    # final chunk flushes.
+    msgs = get_llm_messages_for_sample(num_delay_frames=6, enable_flush=True, flush_prob=0.0, **kw)
+    assistant = [m for m in msgs if m["role"] == "assistant"]
+    assert assistant[-1].get("flush") is True  # final chunk is the flush turn
+    assert sum(1 for m in assistant if m.get("flush")) == 1  # only the final chunk
+    text = " ".join(m["content"] for m in assistant if m["content"].strip())
+    assert "hello" in text and "world" in text  # nothing dropped
+
+    # Without flush the same last word is only saved by the residual dump and NO turn
+    # is tagged -> the model gets no explicit end-of-audio signal.
+    msgs_off = get_llm_messages_for_sample(num_delay_frames=6, enable_flush=False, **kw)
+    assert not any(m.get("flush") for m in msgs_off if m["role"] == "assistant")
 
 
 def _cc_dataset_class():
@@ -579,6 +682,76 @@ def test_stream_decode_matches_forced_packed():
         u = len(words)
         assert pred[idx_k[:u]].tolist() == words, f"chunk {k}: stream words != packed argmax"
         if u < max_new:  # terminated on eot -> that decision must reproduce
+            assert int(pred[idx_k[u]]) == EOT, f"chunk {k}: expected eot at terminating position"
+
+
+@torch.no_grad()
+def test_batched_flush_decode_matches_forced_packed():
+    """With flush_id set, the batched decoder appends <flush> on each stream's FINAL
+    chunk; its greedy output must equal the argmax of a teacher-forced packed forward
+    whose final chunk is a flush ChunkSpec. Validates train/inference parity for the
+    flush path (same audio, positions, conditioning -> identical greedy choices)."""
+    model = _tiny_qwen3()
+    H = model.config.hidden_size
+    embed = model.get_input_embeddings()
+    FLUSH_TID = 88
+
+    instruction = [5, 6, 7]
+    chunk_size = 2
+    n_frames = 6  # -> 3 chunks; the 3rd is the final (flush) chunk
+    n_chunks = 3
+    torch.manual_seed(321)
+    frames = torch.randn(n_frames, H)
+
+    max_new = 4
+    emitted, chunk_ids = batched_stream_decode_script(
+        llm=model,
+        embed_tokens=embed,
+        instruction_ids_list=[instruction],
+        frames_list=[frames],
+        chunk_size=chunk_size,
+        vision_start_id=VS,
+        vision_end_id=VE,
+        eot_id=EOT,
+        pad_id=0,
+        max_new_tokens=max_new,
+        return_chunk_ids=True,
+        flush_id=FLUSH_TID,
+        flush_final=True,
+    )
+    emitted0, chunk_ids0 = emitted[0], chunk_ids[0]
+
+    # Regroup emitted tokens by their chunk id, then rebuild the packed example with
+    # the FINAL chunk marked flush (matching what the decoder fed).
+    per_chunk = [[] for _ in range(n_chunks)]
+    for tok, k in zip(emitted0, chunk_ids0):
+        per_chunk[k].append(tok)
+    chunks = [
+        ChunkSpec(audio_len=chunk_size, target_ids=per_chunk[k], flush=(k == n_chunks - 1))
+        for k in range(n_chunks)
+    ]
+    packed = build_packed_chunk_example(instruction, chunks, VS, VE, EOT, flush_id=FLUSH_TID)
+    valid = torch.ones_like(packed.input_ids, dtype=torch.bool)
+    mask = build_script_mask(
+        packed.seg_ids[None], packed.position_ids[None], packed.prefix_len[None], valid[None], torch.float32
+    )
+    packed_emb = _embed_with_audio(model, packed.input_ids, packed.is_audio, frames)
+    logits = model(
+        inputs_embeds=packed_emb[None], attention_mask=mask, position_ids=packed.position_ids[None]
+    ).logits[0]
+    pred = logits.argmax(dim=-1)
+
+    # The final chunk's branch must contain the <flush> token as an input.
+    b_final = (packed.seg_ids == n_chunks).nonzero(as_tuple=True)[0]
+    assert FLUSH_TID in packed.input_ids[b_final].tolist()
+
+    supervised = packed.target_ids != IGNORE_INDEX
+    for k in range(n_chunks):
+        words = per_chunk[k]
+        idx_k = ((packed.seg_ids == k + 1) & supervised).nonzero(as_tuple=True)[0]
+        u = len(words)
+        assert pred[idx_k[:u]].tolist() == words, f"chunk {k}: stream words != packed argmax"
+        if u < max_new:
             assert int(pred[idx_k[u]]) == EOT, f"chunk {k}: expected eot at terminating position"
 
 

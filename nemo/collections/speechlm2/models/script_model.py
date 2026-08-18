@@ -180,6 +180,31 @@ class ScriptSTTModel(StreamingSTTModel):
         # packed at train time; read from the MODEL config for from_pretrained.
         self._contiguous_text_positions = bool(getattr(self.core_cfg, "contiguous_text_positions", False))
 
+        # --- Flush token (end-of-audio drain of delay-held words) ---
+        # When enabled, generate() appends a <flush> control token on each stream's
+        # FINAL chunk so the model emits every word the emission delay would strand
+        # past the clip end (the tail-drop fix). Mirrors the training-time flush
+        # supervision (ScriptSTTDataset flush). Reuses an unused special token (like
+        # <del>) so no embedding resize is needed. Read from the MODEL config so
+        # from_pretrained rebuilds it for decode.
+        self._flush = bool(getattr(self.core_cfg, "flush", False))
+        self._flush_id = None
+        if self._flush:
+            hf_tok = self.tokenizer.tokenizer
+            flush_token = str(getattr(self.core_cfg, "flush_token", "<|object_ref_end|>"))
+            self._flush_id = hf_tok.convert_tokens_to_ids(flush_token)
+            unk_f = getattr(hf_tok, "unk_token_id", None)
+            if self._flush_id is None or (unk_f is not None and self._flush_id == unk_f):
+                raise ValueError(
+                    f"flush_token {flush_token!r} is not a valid in-vocab token (id={self._flush_id}). "
+                    "Pick an unused tokenizer special token."
+                )
+            logging.info(
+                "[SCRIPT] flush ON | flush_token=%r (id=%s) -- generate() appends <flush> on each stream's "
+                "final chunk to drain delay-held tail words.",
+                flush_token, self._flush_id,
+            )
+
         # --- Last-layer restricted history ---
         # When > 0, the TOP ``script_last_layer_restrict_num_layers`` LLM layer(s)
         # restrict a chunk (branch) query to only the most recent
@@ -882,6 +907,7 @@ class ScriptSTTModel(StreamingSTTModel):
         return_chunk_ids: bool = False,
         warn_chunk_word_start: bool = False,
         insert_word_start_id: Optional[int] = None,
+        flush_id: Optional[int] = None,
     ):
         """Batched SCRIPT state-machine decode: batched cache-aware streaming encode
         (:meth:`_state_machine_encode_batched`) followed by the batched spine/branch
@@ -909,6 +935,7 @@ class ScriptSTTModel(StreamingSTTModel):
             is_word_start=self._is_word_start if (warn_chunk_word_start or insert_word_start_id is not None) else None,
             warn_chunk_word_start=warn_chunk_word_start,
             insert_word_start_id=insert_word_start_id,
+            flush_id=flush_id,
         )
 
     def generate(
@@ -953,6 +980,12 @@ class ScriptSTTModel(StreamingSTTModel):
         force_chunk_word_start = bool(generation_kwargs.pop("force_chunk_word_start", False))
         insert_word_start_id = self._get_word_start_insert_id() if force_chunk_word_start else None
 
+        # End-of-audio flush (drain delay-held tail words). On by default whenever the
+        # model was trained with a flush token; pass ``flush=False`` to A/B it off on
+        # the same checkpoint. No-op when the model has no flush token.
+        flush_override = generation_kwargs.pop("flush", None)
+        flush_id_eff = None if flush_override is False else self._flush_id
+
         if use_state_machine_inference:
             if self._redecode or self._last_layer_restrict or self._shared_audio_track:
                 raise NotImplementedError(
@@ -977,6 +1010,7 @@ class ScriptSTTModel(StreamingSTTModel):
                 return_chunk_ids=return_word_latency,
                 warn_chunk_word_start=warn_chunk_word_start,
                 insert_word_start_id=insert_word_start_id,
+                flush_id=flush_id_eff,
             )
             emitted = out[0] if isinstance(out, tuple) else out
             hyps = [self.tokenizer.ids_to_text(ids) if ids else "" for ids in emitted]
@@ -1179,6 +1213,7 @@ class ScriptSTTModel(StreamingSTTModel):
             return_raw=return_raw,
             warn_chunk_word_start=warn_chunk_word_start,
             insert_word_start_id=insert_word_start_id,
+            flush_id=flush_id_eff,
         )
         # The decoder returns emitted, then (chunk_ids if requested), then (raw if
         # requested), in that fixed order. Unpack accordingly.

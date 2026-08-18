@@ -123,6 +123,9 @@ def get_llm_messages_for_sample(
     word_delay_midpoint: float = 4.5,
     word_delay_slope: float = 1.0,
     delay_rng: Optional[np.random.Generator] = None,
+    enable_flush: bool = False,
+    flush_prob: float = 0.0,
+    flush_rng: Optional[np.random.Generator] = None,
 ) -> List[dict]:
     """
     Get the LLM messages for a sample, using the alignments to determine the turns for the audio and text.
@@ -279,39 +282,63 @@ def get_llm_messages_for_sample(
                     f"chunk_sizes cover {covered_frames} frames, but the sample requires {num_frames}"
                 )
 
+        # Decide FLUSH chunks up front (no-op unless enable_flush). A flush chunk
+        # emits every not-yet-emitted word whose AUDIO has ended by its boundary,
+        # DISREGARDING the emission delay -- teaching the model to dump held words on
+        # demand. The FINAL chunk always flushes (the end-of-audio drain that fixes
+        # tail-drop); each non-final chunk flushes independently with prob flush_prob.
+        # Empty flushes are allowed (they teach "flush with nothing pending -> emit
+        # only <eot>"), which matches the always-on final-chunk flush at inference.
+        n_sched_chunks = len(sample_chunk_sizes)
+        flush_flags = [False] * n_sched_chunks
+        if enable_flush and n_sched_chunks > 0:
+            flush_flags[-1] = True
+            if flush_prob > 0.0 and flush_rng is not None:
+                for ci in range(n_sched_chunks - 1):
+                    if float(flush_rng.random()) < flush_prob:
+                        flush_flags[ci] = True
+
         word_idx = 0
         word_buffer: list[int] = []  # indices of words buffered for words_per_group grouping
         chunk_end_frame = 0
         for chunk_i, current_chunk_size in enumerate(sample_chunk_sizes):
             chunk_end_frame += current_chunk_size
+            is_flush = flush_flags[chunk_i]
 
             # User turn: one audio tag per frame in the chunk
             messages.append({"role": "user", "content": audio_tag * current_chunk_size})
 
-            # Collect indices of words whose end_time (in frames) + delay <= chunk_end_frame
+            # Collect words ready by this chunk. Normally a word is ready when
+            # word_end + delay <= boundary; on a FLUSH chunk the delay is IGNORED, so
+            # every word whose audio ended by the boundary is emitted now.
             while word_idx < len(alignments):
                 word = alignments[word_idx]
                 word_end_frame = math.ceil(word.end_time / frame_length_in_secs)
-                _delay = _resolve_word_delay(
-                    word.text,
-                    num_delay_frames,
-                    use_word_length_delay,
-                    word_length_delay_stochastic,
-                    delay_rng,
-                    word_delay_max,
-                    word_delay_midpoint,
-                    word_delay_slope,
-                )
-                ready_frame = word_end_frame + _delay
+                if is_flush:
+                    ready_frame = word_end_frame
+                else:
+                    _delay = _resolve_word_delay(
+                        word.text,
+                        num_delay_frames,
+                        use_word_length_delay,
+                        word_length_delay_stochastic,
+                        delay_rng,
+                        word_delay_max,
+                        word_delay_midpoint,
+                        word_delay_slope,
+                    )
+                    ready_frame = word_end_frame + _delay
                 if ready_frame <= chunk_end_frame:
                     word_buffer.append(word_idx)
                     word_idx += 1
                 else:
                     break
 
-            # Emit words when buffer reaches words_per_group, or at the last chunk
-            is_last_chunk = chunk_i == len(sample_chunk_sizes) - 1
-            if word_buffer and (len(word_buffer) >= words_per_group or is_last_chunk):
+            # Emit when the group is full, on the last chunk, OR on a flush chunk
+            # (force-emit; an empty flush still emits blank so the model learns the
+            # empty-flush case). Flush turns are tagged so the packer inserts <flush>.
+            is_last_chunk = chunk_i == n_sched_chunks - 1
+            if word_buffer and (len(word_buffer) >= words_per_group or is_last_chunk or is_flush):
                 if word_spans and transcript:
                     first_span = word_spans[word_buffer[0]]
                     last_span = word_spans[word_buffer[-1]]
@@ -321,10 +348,16 @@ def get_llm_messages_for_sample(
                         content = " ".join(alignments[i].text for i in word_buffer)
                 else:
                     content = " ".join(alignments[i].text for i in word_buffer)
-                messages.append({"role": "assistant", "content": content})
+                msg = {"role": "assistant", "content": content}
+                if is_flush:
+                    msg["flush"] = True
+                messages.append(msg)
                 word_buffer = []
             else:
-                messages.append({"role": "assistant", "content": blank_token})
+                msg = {"role": "assistant", "content": blank_token}
+                if is_flush:
+                    msg["flush"] = True
+                messages.append(msg)
 
         # Append any residual words that weren't emitted (e.g., due to delay pushing
         # them past the last chunk boundary, or alignment end_time > audio_duration).
@@ -369,6 +402,9 @@ def get_llm_messages_for_batch(
     word_delay_midpoint: float = 4.5,
     word_delay_slope: float = 1.0,
     delay_rng: Optional[np.random.Generator] = None,
+    enable_flush: bool = False,
+    flush_prob: float = 0.0,
+    flush_rng: Optional[np.random.Generator] = None,
 ) -> List[List[dict]]:
     """
     Get the LLM messages for a batch of samples.
@@ -418,6 +454,9 @@ def get_llm_messages_for_batch(
                 word_delay_midpoint=word_delay_midpoint,
                 word_delay_slope=word_delay_slope,
                 delay_rng=delay_rng,
+                enable_flush=enable_flush,
+                flush_prob=flush_prob,
+                flush_rng=flush_rng,
             )
         )
     return batch_messages
