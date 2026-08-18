@@ -47,7 +47,11 @@
 #   STATE_CHUNK_SIZE=1  1 -> append CHUNK_CLAUSE; 0 -> omit it (e.g. _promptctl_d8)
 #   FORMAT_CLAUSE       override the (CAP, PUNCT)-selected format clause text
 #   PROMPT_SUFFIX       extra trailing clause (e.g. the self-correction clause for _promptctl_all)
-#   SYSTEM_PROMPT       if set, used VERBATIM (skips prompt building) -- escape hatch
+#   SYSTEM_PROMPT       VERBATIM prompt escape hatch. To PREVENT a stale exported
+#                       value from silently poisoning a knob/delay sweep, it is only
+#                       honored when SYSTEM_PROMPT_OVERRIDE=1; otherwise it is IGNORED
+#                       (with a warning) and the prompt is rebuilt from the knobs.
+#   SYSTEM_PROMPT_OVERRIDE=1  opt in to honoring a pre-set SYSTEM_PROMPT verbatim.
 #
 # All other knobs (CHUNK_SIZE decode override, RUN_AVERAGING, CKPT/STEP/USE_LAST,
 # DATASETS, BATCH_SIZE, MAX_NEW_TOKENS, wandb, ...) are handled by the backend
@@ -101,11 +105,36 @@ else
     CLAUSE="Write the text in all lowercase with no punctuation."
 fi
 
+# --- Guard against a stale, accidentally-exported SYSTEM_PROMPT ---
+# A pre-set SYSTEM_PROMPT is a footgun for knob sweeps: if it lingers in the shell
+# (e.g. exported by an earlier command, or left over from a previous run), EVERY
+# run in a `for d in 1 3 6; do DELAY=$d sbatch ...` loop would silently reuse that
+# ONE prompt while EVAL_TAG still stamps the requested d/cap/punct -> identical WER
+# across "different" operating points. So a pre-set SYSTEM_PROMPT is honored
+# VERBATIM only when you explicitly opt in with SYSTEM_PROMPT_OVERRIDE=1; otherwise
+# it is IGNORED (with a warning) and the prompt is rebuilt from the knobs below.
+SYSTEM_PROMPT_OVERRIDE="${SYSTEM_PROMPT_OVERRIDE:-0}"
+VERBATIM_PROMPT=""
+if [[ -n "${SYSTEM_PROMPT:-}" ]]; then
+    if [[ "$SYSTEM_PROMPT_OVERRIDE" == 1 ]]; then
+        VERBATIM_PROMPT="$SYSTEM_PROMPT"
+        echo "==> Using VERBATIM SYSTEM_PROMPT (SYSTEM_PROMPT_OVERRIDE=1); knob-based prompt building skipped."
+    else
+        echo "WARNING: a SYSTEM_PROMPT is set in the environment but SYSTEM_PROMPT_OVERRIDE!=1." >&2
+        echo "         IGNORING it and rebuilding the prompt from knobs" >&2
+        echo "         (delay=${DELAY}, cap=${CAP}, punct=${PUNCT}, chunk=${CHUNK_SIZE}); EVAL_TAG stays accurate." >&2
+        echo "         To use it verbatim: re-run with SYSTEM_PROMPT_OVERRIDE=1. To silence: 'unset SYSTEM_PROMPT'." >&2
+    fi
+fi
+# Clear it so nothing downstream (this script or the backend) can pick up the stale
+# value; we set SYSTEM_PROMPT ourselves below from BUILT_PROMPT.
+unset SYSTEM_PROMPT
+
 # Build the decode prompt from the knobs, EXACTLY like _build_exact_prompt +
 # _append_chunk_clause: fill {delay}/{format_clause}, strip, then (optionally)
-# append the chunk clause and any suffix. SYSTEM_PROMPT (if pre-set) wins verbatim.
-if [[ -n "${SYSTEM_PROMPT:-}" ]]; then
-    BUILT_PROMPT="$SYSTEM_PROMPT"
+# append the chunk clause and any suffix. An opted-in VERBATIM_PROMPT wins.
+if [[ -n "$VERBATIM_PROMPT" ]]; then
+    BUILT_PROMPT="$VERBATIM_PROMPT"
 else
     BUILT_PROMPT="${PROMPT_TEMPLATE//\{delay\}/$DELAY}"
     BUILT_PROMPT="${BUILT_PROMPT//\{format_clause\}/$CLAUSE}"
