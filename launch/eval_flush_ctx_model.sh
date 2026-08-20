@@ -76,6 +76,15 @@ PUNCT="${5:-${PUNCT:-1}}"
 # eval_promptctl.sh reads these from the environment; export so they survive the exec.
 export CHUNK_SIZE DELAY CAP PUNCT
 
+# Default to OFFLINE encode (USE_STATE_MACHINE=0). WER evals must match TRAINING,
+# which always encodes offline; the cache-aware STREAMING encoder used by the state
+# machine does NOT bit-reproduce the offline encode (measured per-frame cosine ~0.9,
+# off-by-one frame count, worst at the tail), which corrupts exactly the tail/delayed
+# words and masks the <flush> + left-context benefit. The launch backend otherwise
+# defaults plain SCRIPT to the state machine (_sm); pin it off here. Override with
+# USE_STATE_MACHINE=1 only for bounded-memory long-form checks.
+export USE_STATE_MACHINE="${USE_STATE_MACHINE:-0}"
+
 # Tag results/wandb so flush-ctx runs are distinguishable at a glance (results land
 # under the model's own exp dir, but this keeps the run label explicit).
 export EVAL_TAG="${EVAL_TAG:-flushctx_c${CHUNK_SIZE}_d${DELAY}_cap${CAP}_punct${PUNCT}}"

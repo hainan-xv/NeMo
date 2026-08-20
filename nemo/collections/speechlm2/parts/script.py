@@ -1143,7 +1143,15 @@ def stream_decode_script(
             win_start = _audio_window_start(
                 k * chunk_size, win_end, max(0, k - M) * chunk_size, W, audio_left_context_frames
             )
-            return frames[win_start:win_end]
+            fr = frames[win_start:win_end]
+            # Match TRAINING: zero-pad the final (partial) chunk back up to the full
+            # window length (see the same fix in batched_stream_decode_script) so the
+            # branch's audio-token count and trailing-silence end-of-audio cue match
+            # what the model was trained on.
+            want = win_end - win_start
+            if fr.shape[0] < want:
+                fr = torch.cat([fr, fr.new_zeros(want - fr.shape[0], fr.shape[1])], dim=0)
+            return fr
 
         frame_source = _default_next_chunk_frames
     else:
@@ -1375,6 +1383,18 @@ def batched_stream_decode_script(
                 k * chunk_size, win_end, max(0, k - M) * chunk_size, W, audio_left_context_frames
             )
             fr = frames_list[b][win_start:win_end].to(device=device, dtype=dtype)
+            # Match TRAINING exactly on the FINAL (partial) chunk. In training every
+            # chunk's audio turn is ``audio_tag * chunk_size`` and the frames past the
+            # real audio (win_end > T_enc) are ZERO-padded by the gather in
+            # ``_build_input_embeds_indexed``; so the branch always has a full
+            # ``win_end - win_start`` audio window ending in trailing silence. At
+            # inference a raw slice truncates that tail, dropping both the audio-token
+            # count AND the trailing-silence end-of-audio cue the flush learned to drain
+            # on -- which strands delay-held tail words at high delay (e.g. d6). Pad the
+            # window back up to the training length so train/inference match.
+            want = win_end - win_start
+            if fr.shape[0] < want:
+                fr = torch.cat([fr, fr.new_zeros(want - fr.shape[0], fr.shape[1])], dim=0)
             c = int(fr.shape[0])
             # Optionally cap the CONDITIONING history to the most recent
             # ``max_history_tokens`` emitted tokens (instruction always kept). This
@@ -1842,6 +1862,11 @@ def batched_stream_decode_script_last_layer(
                 k * chunk_size, win_end, max(0, k - M) * chunk_size, W, audio_left_context_frames
             )
             fr = frames_list[b][win_start:win_end].to(device=device, dtype=dtype)
+            # Match TRAINING: zero-pad the final (partial) chunk to the full window
+            # length (see batched_stream_decode_script) so train/inference agree.
+            want = win_end - win_start
+            if fr.shape[0] < want:
+                fr = torch.cat([fr, fr.new_zeros(want - fr.shape[0], fr.shape[1])], dim=0)
             c = int(fr.shape[0])
             hist = emitted[b]
             if max_history_tokens and len(hist) > max_history_tokens:

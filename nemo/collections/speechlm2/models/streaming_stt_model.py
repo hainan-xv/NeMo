@@ -1324,8 +1324,13 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
 
         - ``chunked_limited`` (the Conformer, and :class:`StreamingTransformerEncoder` when
           configured with ``att_context_style="chunked_limited"``) looks ahead to the chunk end,
-          ``right = chunk_size - 1``. The look-ahead does not compound across layers, so
-          chunk-by-chunk streaming reproduces it exactly.
+          ``right = chunk_size - 1``. The look-ahead does not compound across layers.
+          NOTE: in practice the cache-aware STREAMING encode does NOT bit-reproduce the
+          offline chunked_limited encode -- measured per-frame cosine ~0.9 throughout a
+          clip (worse on the final partial chunk) and an off-by-one frame count. Training
+          always encodes OFFLINE, so SCRIPT WER evals should prefer offline encode
+          (USE_STATE_MACHINE=0); the streaming path is for bounded-memory long-form only.
+          See _tmp_encode_compare.py.
         - A sliding-window :class:`StreamingTransformerEncoder` uses **no** look-ahead
           (``right = 0``). Its per-query right context would compound across layers
           (``n_layers * right`` frames ahead), which the rolling KV cache cannot reproduce, so

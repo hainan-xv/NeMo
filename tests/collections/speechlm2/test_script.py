@@ -756,6 +756,79 @@ def test_batched_flush_decode_matches_forced_packed():
 
 
 @torch.no_grad()
+def test_batched_flush_decode_pads_partial_final_chunk_to_training_length():
+    """Regression: when T_enc is NOT a multiple of chunk_size the FINAL chunk is
+    partial. Training always feeds ``audio_tag * chunk_size`` per chunk and
+    zero-pads the frames past the real audio (win_end > T_enc) via the gather in
+    the packed forward, so the final branch has a full ``chunk_size`` audio window
+    ending in trailing silence. The batched decoder must reproduce that by
+    zero-padding the partial final chunk; otherwise it feeds fewer audio tokens
+    (and loses the end-of-audio cue), stranding delay-held tail words at high
+    delay. Verified by matching a teacher-forced packed forward whose final chunk
+    is a flush ChunkSpec (frames zero-padded to the full window)."""
+    model = _tiny_qwen3()
+    H = model.config.hidden_size
+    embed = model.get_input_embeddings()
+    FLUSH_TID = 88
+
+    instruction = [5, 6, 7]
+    chunk_size = 2
+    n_frames = 5  # NOT a multiple of 2 -> 3 chunks, final chunk is partial (1 frame)
+    n_chunks = 3
+    torch.manual_seed(321)
+    frames = torch.randn(n_frames, H)
+    # Training's zero-padded view: the final chunk's OOB frame (index 5) is a zero
+    # row, so the packed forward conditions on [f0..f4, 0] (6 audio slots).
+    frames_padded = torch.cat([frames, frames.new_zeros(n_chunks * chunk_size - n_frames, H)], dim=0)
+
+    max_new = 4
+    emitted, chunk_ids = batched_stream_decode_script(
+        llm=model,
+        embed_tokens=embed,
+        instruction_ids_list=[instruction],
+        frames_list=[frames],  # raw, partial final chunk -> decoder must pad it
+        chunk_size=chunk_size,
+        vision_start_id=VS,
+        vision_end_id=VE,
+        eot_id=EOT,
+        pad_id=0,
+        max_new_tokens=max_new,
+        return_chunk_ids=True,
+        flush_id=FLUSH_TID,
+        flush_final=True,
+    )
+    emitted0, chunk_ids0 = emitted[0], chunk_ids[0]
+
+    per_chunk = [[] for _ in range(n_chunks)]
+    for tok, k in zip(emitted0, chunk_ids0):
+        per_chunk[k].append(tok)
+    chunks = [
+        ChunkSpec(audio_len=chunk_size, target_ids=per_chunk[k], flush=(k == n_chunks - 1))
+        for k in range(n_chunks)
+    ]
+    packed = build_packed_chunk_example(instruction, chunks, VS, VE, EOT, flush_id=FLUSH_TID)
+    valid = torch.ones_like(packed.input_ids, dtype=torch.bool)
+    mask = build_script_mask(
+        packed.seg_ids[None], packed.position_ids[None], packed.prefix_len[None], valid[None], torch.float32
+    )
+    # Packed conditions on the ZERO-padded frames (matching the decoder's padding).
+    packed_emb = _embed_with_audio(model, packed.input_ids, packed.is_audio, frames_padded)
+    logits = model(
+        inputs_embeds=packed_emb[None], attention_mask=mask, position_ids=packed.position_ids[None]
+    ).logits[0]
+    pred = logits.argmax(dim=-1)
+
+    supervised = packed.target_ids != IGNORE_INDEX
+    for k in range(n_chunks):
+        words = per_chunk[k]
+        idx_k = ((packed.seg_ids == k + 1) & supervised).nonzero(as_tuple=True)[0]
+        u = len(words)
+        assert pred[idx_k[:u]].tolist() == words, f"chunk {k}: stream words != packed argmax (partial-chunk pad)"
+        if u < max_new:
+            assert int(pred[idx_k[u]]) == EOT, f"chunk {k}: expected eot at terminating position"
+
+
+@torch.no_grad()
 def test_stream_decode_next_chunk_frames_matches_frames_arg():
     """The streaming state-machine path (``next_chunk_frames`` callable) must
     produce byte-identical emissions to the default ``frames``-arg path.
