@@ -170,15 +170,34 @@ def read_cache_manifest(
     return paths, refs, durs
 
 
-def load_audio_batch(paths: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Load a batch of (mono, 16 kHz) wavs into a right-padded (B, T) tensor + lengths."""
+_LEADERBOARD_SR = 16000  # cache is pre-staged as 16 kHz mono
+
+
+def _pad_extra_samples(args) -> int:
+    """Trailing-silence pad in samples, from ``--pad_extra_seconds`` (16 kHz)."""
+    return int(round(max(0.0, float(getattr(args, "pad_extra_seconds", 0.0) or 0.0)) * _LEADERBOARD_SR))
+
+
+def load_audio_batch(paths: List[str], pad_extra_samples: int = 0) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Load a batch of (mono, 16 kHz) wavs into a right-padded (B, T) tensor + lengths.
+
+    ``pad_extra_samples`` appends that many zero samples of REAL trailing silence to
+    every clip (counted in the returned lengths, so the encoder actually processes
+    them). Training pads every cut with ``pad_extra_duration`` seconds of silence
+    (0.5 s in all SCRIPT configs); the encoder therefore always sees post-word
+    acoustic context after the final word. Without it, a word held back by the
+    emission delay at the very end of a clip has no trailing frames -- its "due"
+    frame lands in encoder-output zero-padding past T_enc (out-of-distribution vs
+    the conformer-encoded silence seen in training), so the model keeps waiting and
+    the tail word is dropped (worse at higher delay). Matching this pad at eval time
+    removes that train/inference mismatch."""
     arrs = []
     for p in paths:
         a, _sr = soundfile.read(p, dtype="float32")
         if a.ndim == 2:
             a = a.mean(axis=1)
         arrs.append(a)
-    lens = [len(a) for a in arrs]
+    lens = [len(a) + max(0, int(pad_extra_samples)) for a in arrs]
     T = max(lens) if lens else 1
     x = torch.zeros(len(arrs), T, dtype=torch.float32)
     for i, a in enumerate(arrs):
@@ -246,7 +265,7 @@ def evaluate_dataset(model, args, dataset: str, split: str, device: torch.device
         mininterval=float(args.progress_interval), file=sys.stdout,
     )
     for i in range(0, total, bs):
-        audios, audio_lens = load_audio_batch(paths[i : i + bs])
+        audios, audio_lens = load_audio_batch(paths[i : i + bs], _pad_extra_samples(args))
         audios = audios.to(device, non_blocking=True)
         audio_lens = audio_lens.to(device, non_blocking=True)
         with torch.inference_mode():
@@ -354,7 +373,7 @@ def evaluate_shard(model, args, device: torch.device) -> int:
         for i in range(0, total, bs):
             batch = shard[i : i + bs]
             paths = [it["path"] for it in batch]
-            audios, audio_lens = load_audio_batch(paths)
+            audios, audio_lens = load_audio_batch(paths, _pad_extra_samples(args))
             audios = audios.to(device, non_blocking=True)
             audio_lens = audio_lens.to(device, non_blocking=True)
             try:
@@ -468,6 +487,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--min_batch_size", type=int, default=1, help="Lower bound for the OOM batch-halving.")
     p.add_argument("--max_new_tokens", type=int, default=64)
     p.add_argument("--chunk_size", type=int, default=None, help="Decode chunk size override (encoder frames).")
+    p.add_argument(
+        "--pad_extra_seconds",
+        type=float,
+        default=0.5,
+        help="Append this many seconds of REAL trailing silence to every clip before "
+        "encoding, matching training's data.dataset.pad_extra_duration (0.5 s in all "
+        "SCRIPT configs). Gives delay-held final words their post-word acoustic context "
+        "so they are not dropped at the clip end (worse at higher emission delay). "
+        "Set 0.0 to disable (legacy behavior / the train/inference mismatch).",
+    )
     p.add_argument(
         "--self_correct",
         action="store_true",

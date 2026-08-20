@@ -135,6 +135,15 @@ if [[ "$FORCE_WORD_START" == 0 || "$FORCE_WORD_START" == false ]]; then
     FORCE_WORD_START_FLAG="--no_force_word_start"
 fi
 
+# Trailing-silence pad (seconds), DEFAULT 0.5 to MATCH training's
+# data.dataset.pad_extra_duration (0.5 s, prob 1.0 in all SCRIPT configs). Training
+# encodes 0.5 s of real silence after every clip, so delay-held final words always
+# have post-word acoustic context; without it (eval default was 0.0) a word held by
+# the emission delay at the clip end lands in encoder zero-padding past T_enc
+# (out-of-distribution) and is dropped -- worse at higher delay. Set PAD_EXTRA_SECONDS=0
+# to reproduce the old (buggy) behavior for A/B.
+PAD_EXTRA_SECONDS="${PAD_EXTRA_SECONDS:-0.5}"
+
 # Checkpoint averaging (DEFAULT ON): average the top-k (non '-last') checkpoints --
 # the ones exp_manager keeps by val_wer -- into <CKPT_DIR>/<EXP>-averaged.ckpt,
 # cached in the model folder and REUSED on later runs. FORCE_AVERAGE=1 recomputes
@@ -349,6 +358,7 @@ ${AVG_CLAUSE} \
         --system_prompt "\$SP_TEXT" \
         --output_dir "${SHARD_DIR}" \
         ${CHUNK_SIZE:+--chunk_size ${CHUNK_SIZE}} \
+        --pad_extra_seconds ${PAD_EXTRA_SECONDS} \
         ${SELF_CORRECT_FLAG} \
         ${USE_STATE_MACHINE_FLAG} \
         ${FORCE_WORD_START_FLAG} \
