@@ -30,6 +30,9 @@ git add .gitignore sync_to_oci.sh launch/script_baseline.sh launch/script_selfco
 # driver and its helpers (checkpoint averaging, wandb reporting). New/untracked, so
 # they need an explicit add (git add -u only stages already-tracked paths).
 git add launch/eval_leaderboard.sh launch/eval_script_baseline.sh launch/eval_promptctl.sh launch/stage_leaderboard_cache.sh
+# Flush model on the OLD/EARLIER 8-set suite (uncleaned + tedlium): same clean-repo
+# code + flush ckpt as eval_flush_model.sh, only the DATASETS differ. Untracked -> add.
+git add launch/eval_flush_model_oldsuite.sh
 # Legacy A/B launchers: live in the clean repo (so they sync here) but run the
 # PREVIOUS repo's code + model (mount OLD_CODE_DIR as /code, exec the old
 # backend). Untracked, so add them explicitly.
