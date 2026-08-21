@@ -30,10 +30,13 @@ git add .gitignore sync_to_oci.sh launch/script_baseline.sh launch/script_selfco
 # driver and its helpers (checkpoint averaging, wandb reporting). New/untracked, so
 # they need an explicit add (git add -u only stages already-tracked paths).
 git add launch/eval_leaderboard.sh launch/eval_script_baseline.sh launch/eval_promptctl.sh launch/stage_leaderboard_cache.sh
-# Legacy A/B launcher: lives in the clean repo (so it syncs here) but runs the
-# PREVIOUS repo's code + model (mounts OLD_CODE_DIR as /code, execs the old
-# backend). Untracked, so add it explicitly.
-git add launch/eval_promptctl_legacy.sh
+# Legacy A/B launchers: live in the clean repo (so they sync here) but run the
+# PREVIOUS repo's code + model (mount OLD_CODE_DIR as /code, exec the old
+# backend). Untracked, so add them explicitly.
+#   eval_promptctl_legacy.sh              - old granary2_script_promptctl[_d8]
+#   eval_promptctl_all_legacy.sh          - best prior model (promptctl_all), ORIGINAL 8-set suite -> 6.93
+#   eval_promptctl_all_legacy_cleaned.sh  - same model, CLEANED 7-set suite -> comparable to 6.06
+git add launch/eval_promptctl_legacy.sh launch/eval_promptctl_all_legacy.sh launch/eval_promptctl_all_legacy_cleaned.sh
 git add scripts/speechlm_leaderboard_eval.py
 # Prompt-controlled SCRIPT eval: builds the decode prompt from (chunk_size, delay,
 # cap, punct) knobs so it matches the model's training render, then reuses the
