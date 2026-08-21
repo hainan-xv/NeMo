@@ -33,10 +33,11 @@ git add launch/eval_leaderboard.sh launch/eval_script_baseline.sh launch/eval_pr
 # Flush model on the OLD/EARLIER 8-set suite (uncleaned + tedlium): same clean-repo
 # code + flush ckpt as eval_flush_model.sh, only the DATASETS differ. Untracked -> add.
 git add launch/eval_flush_model_oldsuite.sh
-# Nemotron base ASR (cache-aware streaming) leaderboard eval + its old-suite wrapper.
-# Decodes with NeMo's cache-aware streaming entrypoint (the offline path SIGFPEs on
-# this streaming model) + the same leaderboard re-scorer. Untracked -> add.
-git add launch/eval_nemotron_streaming.sh launch/eval_nemotron_nemo_oldsuite.sh
+# Nemotron base ASR on the OLD 8-set suite: thin wrapper around
+# eval_parakeet_leaderboard.sh (transcribe backend = model.transcribe(), the only
+# path that doesn't SIGFPE on this streaming model) with the old DATASETS pinned.
+# Untracked -> add.
+git add launch/eval_nemotron_nemo_oldsuite.sh
 # Legacy A/B launchers: live in the clean repo (so they sync here) but run the
 # PREVIOUS repo's code + model (mount OLD_CODE_DIR as /code, exec the old
 # backend). Untracked, so add them explicitly.
