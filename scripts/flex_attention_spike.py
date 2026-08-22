@@ -67,6 +67,15 @@ def build_batch(batch_size, chunk_frames, window_frames, n_chunks, words_every, 
     return collate_packed_chunk_examples([ex] * batch_size, pad_id=0)
 
 
+def to_device(b_, device):
+    """Move every tensor field of a BatchedPackedChunk onto ``device``.
+
+    The mask_mod closes over these tensors and is evaluated with CUDA indices, so
+    leaving any of them on CPU raises an index/device mismatch inside vmap.
+    """
+    return type(b_)(**{k: (v.to(device) if torch.is_tensor(v) else v) for k, v in vars(b_).items()})
+
+
 def make_mask_mod(b_):
     seg, pos, pref, val = b_.seg_ids, b_.position_ids, b_.prefix_len, b_.valid
 
@@ -175,7 +184,9 @@ def main():
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float32
     log(f"torch {torch.__version__} | {torch.cuda.get_device_name(0)} | dtype={dtype}")
 
-    probe = build_batch(1, args.chunk_frames, args.window_frames, args.n_chunks, args.words_every, 128)
+    probe = to_device(
+        build_batch(1, args.chunk_frames, args.window_frames, args.n_chunks, args.words_every, 128), device
+    )
     T = probe.input_ids.shape[1]
     dense_mb = T * T * 2 / 2**20
     log(f"layout: chunk={args.chunk_frames} window={args.window_frames} n_chunks={args.n_chunks} -> T={T}")
@@ -193,7 +204,7 @@ def main():
     log("=" * 74)
     small = build_batch(1, args.chunk_frames, args.window_frames, 24, args.words_every, 128)
     Ts = small.input_ids.shape[1]
-    small = type(small)(**{k: (v.to(device) if torch.is_tensor(v) else v) for k, v in vars(small).items()})
+    small = to_device(small, device)
     torch.manual_seed(0)
     n_frames = int(small.audio_frame_index.max()) + 1
 
@@ -247,7 +258,7 @@ def main():
             for B in args.batch_sizes:
                 try:
                     b_ = build_batch(B, args.chunk_frames, args.window_frames, args.n_chunks, args.words_every, 128)
-                    b_ = type(b_)(**{k: (v.to(device) if torch.is_tensor(v) else v) for k, v in vars(b_).items()})
+                    b_ = to_device(b_, device)
                     torch.manual_seed(0)
                     nf = int(b_.audio_frame_index.max()) + 1
                     frames = torch.randn(nf, m.config.hidden_size, device=device, dtype=dtype)
