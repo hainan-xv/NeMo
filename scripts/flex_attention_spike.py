@@ -156,26 +156,46 @@ def step(model, b_, mask, embeds, do_backward):
     return logits
 
 
-def measure(model, b_, kind, embeds, device, dtype, do_backward=True, plan=None):
-    """Peak allocated MiB for one forward(+backward), or None on OOM."""
+def measure(model, b_, kind, embeds, device, dtype, do_backward=True, plan=None, iters=3):
+    """(peak MiB, median step seconds) for forward+backward, or (None, None) on OOM.
+
+    Times AFTER a warmup iteration and with explicit synchronisation, since CUDA
+    launches are async and the first call pays compilation/autotune costs.
+    """
+    import time
+
+    from nemo.collections.speechlm2.parts.script_attention import script_attention_plan
+
     model.zero_grad(set_to_none=True)
     gc.collect()
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats(device)
     try:
-        from nemo.collections.speechlm2.parts.script_attention import script_attention_plan
-
         mask = build_mask(kind, b_, dtype, device)
-        with script_attention_plan(plan if kind == "script" else None):
+        ctx = lambda: script_attention_plan(plan if kind == "script" else None)
+        with ctx():  # warmup, excluded from timing
             step(model, b_, mask, embeds, do_backward)
+        torch.cuda.synchronize(device)
         peak = torch.cuda.max_memory_allocated(device) / 2**20
+
+        times = []
+        for _ in range(iters):
+            model.zero_grad(set_to_none=True)
+            torch.cuda.synchronize(device)
+            t0 = time.perf_counter()
+            with ctx():
+                step(model, b_, mask, embeds, do_backward)
+            torch.cuda.synchronize(device)
+            times.append(time.perf_counter() - t0)
+        times.sort()
+        secs = times[len(times) // 2]
     except torch.OutOfMemoryError:
-        peak = None
+        peak, secs = None, None
     finally:
         model.zero_grad(set_to_none=True)
         gc.collect()
         torch.cuda.empty_cache()
-    return peak
+    return peak, secs
 
 
 # ---------------------------------------------------------------------------
@@ -313,7 +333,8 @@ def main():
     log("=" * 74)
     log(f"2. PEAK MEMORY at the OOM shape (T={T}), forward+backward")
     log("=" * 74)
-    log(f"  {'arm':<22} " + " ".join(f"B={b:<9}" for b in args.batch_sizes))
+    log(f"  {'arm':<22} " + " ".join(f"B={b:<13}" for b in args.batch_sizes))
+    log("  (peak GiB / median step seconds, forward+backward, after warmup)")
 
     for kind in ("dense", "flex", "script"):
         impl = {"dense": "eager", "flex": "flex_attention", "script": "script"}[kind]
@@ -343,8 +364,8 @@ def main():
                         from nemo.collections.speechlm2.parts.script_attention import build_attention_plan
 
                         plan = build_attention_plan(exs_for(B)).to(device)
-                    peak = measure(m, b_, kind, emb, device, dtype, plan=plan)
-                    cells.append(f"{peak/1024:.1f}GiB" if peak else "OOM")
+                    peak, secs = measure(m, b_, kind, emb, device, dtype, plan=plan)
+                    cells.append(f"{peak/1024:.1f}G/{secs:.2f}s" if peak else "OOM")
                     del b_, emb, frames
                 except torch.OutOfMemoryError:
                     cells.append("OOM")
@@ -353,7 +374,7 @@ def main():
                     traceback.print_exc()
                 gc.collect()
                 torch.cuda.empty_cache()
-            log(f"  {name:<22} " + " ".join(f"{c:<11}" for c in cells))
+            log(f"  {name:<22} " + " ".join(f"{c:<15}" for c in cells))
             del m
             gc.collect()
             torch.cuda.empty_cache()
