@@ -239,7 +239,7 @@ def main():
             ids[amask] = 0
             emb = m.get_input_embeddings()(ids)
             emb = torch.where(amask.unsqueeze(-1), frames[small.audio_frame_index.clamp(min=0)], emb)
-            mask = build_mask(kind, small, pdtype, device)
+            mask = build_mask("flex" if kind == "flex" else "dense", small, pdtype, device)
             lg = step(m, small, mask, emb, do_backward=True)
             logits[kind] = lg.detach().float().cpu()
             grads[kind] = [
@@ -249,22 +249,37 @@ def main():
             gc.collect()
             torch.cuda.empty_cache()
 
-        a, b = logits["dense"], logits["flex"]
-        dl = (a - b).abs().max().item()
-        rel = dl / a.abs().max().item()
-        # If the mask differed, the models would disagree about WHICH token comes
-        # next, not merely about the last few bits of the logit.
-        agree = (a.argmax(-1) == b.argmax(-1)).float().mean().item()
-        tol = 1e-4 if pdtype is torch.float32 else 5e-2
-        verdict = "PASS" if dl < tol else "FAIL"
+        def cmp(x, y):
+            A, B = logits[x], logits[y]
+            d = (A - B).abs().max().item()
+            # If the MASK differed, the arms would disagree about which token comes
+            # next, not merely about the last bits of a logit.
+            return d, d / A.abs().max().item(), (A.argmax(-1) == B.argmax(-1)).float().mean().item()
+
+        for x, y, note in [
+            ("eager", "sdpa", "CONTROL: identical mask, different kernel"),
+            ("eager", "flex", "flex under test"),
+        ]:
+            d, rel, agree = cmp(x, y)
+            log(
+                f"  [{pdtype_name}] T={Ts} {x:5s} vs {y:5s}  max|dlogit|={d:.3e}  rel={rel:.2e}  "
+                f"argmax={agree*100:6.2f}%   ({note})"
+            )
+        if len({len(g) for g in grads.values()}) == 1 and grads["eager"]:
+            gmax = max(u.abs().max().item() for u in grads["eager"])
+            for x, y in [("eager", "sdpa"), ("eager", "flex")]:
+                dg = max((u - v).abs().max().item() for u, v in zip(grads[x], grads[y]))
+                log(f"  [{pdtype_name}]       {x:5s} vs {y:5s}  max|dgrad| ={dg:.3e}  rel={dg/max(gmax,1e-12):.2e}")
+        # flex is fine if its drift is comparable to the control's; only a much
+        # larger drift indicates it is computing a different function.
+        de = cmp("eager", "sdpa")[0]
+        df = cmp("eager", "flex")[0]
+        ratio = df / max(de, 1e-12)
         log(
-            f"  [{pdtype_name}] T={Ts}  max|dlogit|={dl:.3e}  rel={rel:.2e}  "
-            f"argmax agreement={agree*100:.2f}%  -> {verdict} (tol {tol:g})"
+            f"  [{pdtype_name}] VERDICT: flex drift is {ratio:.2f}x the control -> "
+            f"{'OK (kernel noise)' if ratio <= 3.0 else 'SUSPECT (beyond kernel noise)'}"
         )
-        if len(grads["dense"]) == len(grads["flex"]) and grads["dense"]:
-            dg = max((x - y).abs().max().item() for x, y in zip(grads["dense"], grads["flex"]))
-            gmax = max(x.abs().max().item() for x in grads["dense"])
-            log(f"  [{pdtype_name}] max|dgrad|={dg:.3e}  (grad scale {gmax:.3e}, rel {dg/max(gmax,1e-12):.2e})")
+        log("")
     log("")
 
     # ---------------- 2. memory at the failing shape ----------------
