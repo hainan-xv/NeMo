@@ -54,6 +54,7 @@ SCRIPT_PATHS=(
     scripts/script_leaderboard_eval.py
     scripts/nemotron_leaderboard_eval.py
     scripts/leaderboard_common.py
+    scripts/flex_attention_spike.py
     scripts/average_script_ckpts.py
     scripts/leaderboard_wer.py
     scripts/leaderboard_normalizer/
