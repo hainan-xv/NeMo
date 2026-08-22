@@ -47,17 +47,18 @@ def train(cfg):
 
     dataset_cfg = cfg.data.dataset
 
-    # ``audio_history_chunks`` must agree between the model and the dataset: the
-    # dataset builds each branch's audio window from it, and the model rebuilds
-    # the same window at inference. A mismatch trains and decodes on different
+    # The audio-window settings must agree between the model and the dataset: the
+    # dataset builds each branch's window from them, and the model rebuilds the
+    # same window at inference. A mismatch trains and decodes on different
     # conditioning, which is silent and hard to spot, so fail loudly here.
-    model_hist = int(cfg.model.get("audio_history_chunks", 0) or 0)
-    data_hist = int(dataset_cfg.get("audio_history_chunks", 0) or 0)
-    if model_hist != data_hist:
-        raise ValueError(
-            f"model.audio_history_chunks ({model_hist}) != data.dataset.audio_history_chunks ({data_hist}); "
-            "they must match. Set data.dataset.audio_history_chunks: ${model.audio_history_chunks} in the config."
-        )
+    for key in ("audio_history_chunks", "audio_window_frames"):
+        model_val = int(cfg.model.get(key, 0) or 0)
+        data_val = int(dataset_cfg.get(key, 0) or 0)
+        if model_val != data_val:
+            raise ValueError(
+                f"model.{key} ({model_val}) != data.dataset.{key} ({data_val}); they must match. "
+                f"Set data.dataset.{key}: ${{model.{key}}} in the config."
+            )
 
     # Validation dataset config = training config with val_dataset_overrides on
     # top (e.g. pinning a single chunk_size for the decode-only WER pass).

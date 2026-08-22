@@ -41,6 +41,10 @@ class ScriptSTTModelConfig(StreamingSTTModelConfig):
         audio_history_chunks: ``M`` — how many PREVIOUS chunks' audio each branch
             also sees. MUST equal ``data.dataset.audio_history_chunks``, since
             training and inference build the window from this same number.
+        audio_window_frames: ``F`` — if ``> 0``, every branch gets a FIXED window
+            of ``F`` frames ending at its chunk boundary, so the acoustic context
+            is constant regardless of chunk size. Takes precedence over
+            ``audio_history_chunks``. MUST equal ``data.dataset.audio_window_frames``.
         val_chunk_size: chunk size used for the decode-only validation pass when
             training with multiple chunk sizes. Defaults to 14 when available,
             else the largest candidate.
@@ -63,6 +67,7 @@ class ScriptSTTModelConfig(StreamingSTTModelConfig):
     """
 
     audio_history_chunks: int = 0
+    audio_window_frames: int = 0
     val_chunk_size: Optional[int] = None
     val_max_new_tokens_per_chunk: Optional[int] = None
     val_system_prompt: Optional[str] = None
@@ -120,6 +125,7 @@ class ScriptSTTModel(StreamingSTTModel):
         self.core_cfg: ScriptSTTModelConfig = to_dataclass(ScriptSTTModelConfig, cfg)
 
         self._audio_history_chunks = max(int(self.core_cfg.audio_history_chunks), 0)
+        self._audio_window_frames = max(int(self.core_cfg.audio_window_frames), 0)
 
         # Audio-span delimiters and end-of-turn token, resolved once. These must
         # match ScriptSTTDataset, which builds the training layout with them.
@@ -141,11 +147,12 @@ class ScriptSTTModel(StreamingSTTModel):
             self._val_system_prompt = "Transcribe the audio into text."
 
         logging.info(
-            "ScriptSTTModel: audio delimiters %d / %d, eot_id=%d, audio_history_chunks=%d",
+            "ScriptSTTModel: audio delimiters %d / %d, eot_id=%d, " "audio_history_chunks=%d, audio_window_frames=%d",
             self._vision_start_id,
             self._vision_end_id,
             self._eot_id,
             self._audio_history_chunks,
+            self._audio_window_frames,
         )
 
     # ------------------------------------------------------------------
@@ -473,6 +480,7 @@ class ScriptSTTModel(StreamingSTTModel):
             max_new_tokens=max_new_tokens,
             device=self.device,
             audio_history_chunks=self._audio_history_chunks,
+            audio_window_frames=self._audio_window_frames,
             max_history_tokens=max_history_tokens,
             is_word_start=self._is_word_start if insert_word_start_id is not None else None,
             insert_word_start_id=insert_word_start_id,

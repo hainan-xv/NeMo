@@ -159,6 +159,73 @@ def test_window_never_includes_future_frames():
 
 
 # ---------------------------------------------------------------------------
+# Fixed-frame audio window (audio_window_frames)
+# ---------------------------------------------------------------------------
+
+
+def test_fixed_frame_window_helper():
+    frame_starts = [0, 4, 8, 12]  # four 4-frame chunks
+
+    def start(k, F):
+        return audio_window_start(k, frame_starts, 0, win_end=frame_starts[k] + 4, audio_window_frames=F)
+
+    # F=8: the last 8 frames ending at the boundary, clamped at 0 early on.
+    assert [start(k, 8) for k in range(4)] == [0, 0, 4, 8]
+    # F=4 equals the chunk size, so it degenerates to the per-chunk window.
+    assert [start(k, 4) for k in range(4)] == [0, 4, 8, 12]
+    # F is a FLOOR: a window smaller than the chunk never clips into the chunk.
+    assert [start(k, 2) for k in range(4)] == [0, 4, 8, 12]
+
+
+def test_fixed_frame_window_is_constant_across_chunk_sizes():
+    """The whole point: acoustic context stays 8 frames whatever the chunk size."""
+    for cs in (1, 2, 4, 8):
+        chunks = [ChunkSpec(cs, [20]) for _ in range(6)]
+        ex = build_packed_chunk_example(INSTR, chunks, VS, VE, EOT, audio_window_frames=8)
+        # Later branches (past the initial ramp-up) all see exactly 8 frames.
+        for kc in range(len(chunks)):
+            idx = (ex.seg_ids == kc + 1).nonzero(as_tuple=True)[0]
+            n = sum(1 for f in ex.audio_frame_index[idx].tolist() if f >= 0)
+            boundary = (kc + 1) * cs
+            assert n == min(8, boundary), f"cs={cs} chunk={kc}: {n} frames, expected {min(8, boundary)}"
+
+
+def test_fixed_frame_window_keeps_a_large_chunks_own_audio():
+    """A chunk longer than the window must still see all of its own frames."""
+    chunks = [ChunkSpec(10, [20]), ChunkSpec(10, [21])]
+    ex = build_packed_chunk_example(INSTR, chunks, VS, VE, EOT, audio_window_frames=4)
+    idx = (ex.seg_ids == 2).nonzero(as_tuple=True)[0]
+    frames = [f for f in ex.audio_frame_index[idx].tolist() if f >= 0]
+    assert frames == list(range(10, 20)), "large chunk lost part of its own audio"
+
+
+def test_fixed_frame_window_takes_precedence_over_history_chunks():
+    chunks = [ChunkSpec(4, [20]) for _ in range(4)]
+    both = build_packed_chunk_example(INSTR, chunks, VS, VE, EOT, audio_history_chunks=2, audio_window_frames=8)
+    only = build_packed_chunk_example(INSTR, chunks, VS, VE, EOT, audio_window_frames=8)
+    assert both.audio_frame_index.tolist() == only.audio_frame_index.tolist()
+
+
+def test_fixed_frame_window_never_looks_ahead():
+    chunks = [ChunkSpec(3, [20]), ChunkSpec(3, [21]), ChunkSpec(3, [22])]
+    ex = build_packed_chunk_example(INSTR, chunks, VS, VE, EOT, audio_window_frames=6)
+    for kc in range(len(chunks)):
+        idx = (ex.seg_ids == kc + 1).nonzero(as_tuple=True)[0]
+        frames = [f for f in ex.audio_frame_index[idx].tolist() if f >= 0]
+        assert max(frames) < (kc + 1) * 3
+
+
+def test_window_defaults_are_backward_compatible():
+    """Omitting the new argument must reproduce the old layout byte for byte."""
+    chunks = [ChunkSpec(2, [20, 21]), ChunkSpec(3, [30]), ChunkSpec(2, [])]
+    for M in (0, 1, 2):
+        old = build_packed_chunk_example(INSTR, chunks, VS, VE, EOT, audio_history_chunks=M)
+        new = build_packed_chunk_example(INSTR, chunks, VS, VE, EOT, audio_history_chunks=M, audio_window_frames=0)
+        for f in ("input_ids", "position_ids", "seg_ids", "prefix_len", "target_ids", "audio_frame_index"):
+            assert getattr(old, f).tolist() == getattr(new, f).tolist(), f"M={M} field={f}"
+
+
+# ---------------------------------------------------------------------------
 # Attention mask
 # ---------------------------------------------------------------------------
 
@@ -435,8 +502,11 @@ def _frames_by_index(all_frames, frame_index, is_audio):
 
 
 @torch.no_grad()
-@pytest.mark.parametrize("audio_history_chunks", [0, 1, 2])
-def test_parity_packed_vs_separate_examples(audio_history_chunks):
+@pytest.mark.parametrize(
+    "audio_history_chunks,audio_window_frames",
+    [(0, 0), (1, 0), (2, 0), (0, 4), (0, 6), (0, 8)],
+)
+def test_parity_packed_vs_separate_examples(audio_history_chunks, audio_window_frames):
     """The whole correctness argument: packed branch logits == standalone logits."""
     model = _tiny_qwen3()
     H = model.config.hidden_size
@@ -451,7 +521,15 @@ def test_parity_packed_vs_separate_examples(audio_history_chunks):
     torch.manual_seed(123)
     all_frames = torch.randn(sum(c.audio_len for c in chunks), H)  # global frame table
 
-    packed = build_packed_chunk_example(instruction, chunks, VS, VE, EOT, audio_history_chunks=audio_history_chunks)
+    packed = build_packed_chunk_example(
+        instruction,
+        chunks,
+        VS,
+        VE,
+        EOT,
+        audio_history_chunks=audio_history_chunks,
+        audio_window_frames=audio_window_frames,
+    )
     packed_emb = _embed_with_audio(
         model,
         packed.input_ids,
@@ -465,7 +543,13 @@ def test_parity_packed_vs_separate_examples(audio_history_chunks):
     ).logits[0]
 
     separate = build_separate_chunk_examples(
-        instruction, chunks, VS, VE, EOT, audio_history_chunks=audio_history_chunks
+        instruction,
+        chunks,
+        VS,
+        VE,
+        EOT,
+        audio_history_chunks=audio_history_chunks,
+        audio_window_frames=audio_window_frames,
     )
     for k, sep in enumerate(separate, start=1):
         sep_emb = _embed_with_audio(
@@ -530,8 +614,8 @@ def test_parity_batched():
 
 
 @torch.no_grad()
-@pytest.mark.parametrize("audio_history_chunks", [0, 1])
-def test_batched_decode_matches_per_utterance(audio_history_chunks):
+@pytest.mark.parametrize("audio_history_chunks,audio_window_frames", [(0, 0), (1, 0), (0, 5)])
+def test_batched_decode_matches_per_utterance(audio_history_chunks, audio_window_frames):
     """Batching (with left-padding across ragged streams) must not change the output."""
     model = _tiny_qwen3()
     H = model.config.hidden_size

@@ -42,11 +42,17 @@ class ScriptSTTDataConfig(StreamingSTTDataConfig):
         audio_history_chunks: ``M`` — how many PREVIOUS chunks' audio each branch
             also sees. Must match ``model.audio_history_chunks`` so that training
             and inference build the same window.
+        audio_window_frames: ``F`` — if ``> 0``, give every branch a FIXED window
+            of ``F`` frames ending at its chunk boundary instead of a whole number
+            of chunks, so the acoustic context is constant across chunk sizes.
+            Takes precedence over ``audio_history_chunks``. Must match
+            ``model.audio_window_frames``.
         chunk_size_seed: base seed for the per-batch chunk-size draw. Offset per
             dataloader worker so workers do not draw identical sequences.
     """
 
     audio_history_chunks: int = 0
+    audio_window_frames: int = 0
     chunk_size_seed: int = 1234
 
 
@@ -116,6 +122,14 @@ class ScriptSTTDataset(StreamingSTTDataset):
             )
 
         self._audio_history_chunks = max(int(self.cfg.audio_history_chunks), 0)
+        self._audio_window_frames = max(int(self.cfg.audio_window_frames), 0)
+        if self._audio_window_frames > 0 and self._audio_history_chunks > 0:
+            logging.warning(
+                "Both audio_window_frames=%d and audio_history_chunks=%d are set; "
+                "the fixed-frame window takes precedence and audio_history_chunks is ignored.",
+                self._audio_window_frames,
+                self._audio_history_chunks,
+            )
 
         hf_tok = self.tokenizer.tokenizer
         self.vision_start_id = hf_tok.convert_tokens_to_ids(self.audio_open_token)
@@ -138,13 +152,15 @@ class ScriptSTTDataset(StreamingSTTDataset):
         self._chunk_rngs: dict = {}
 
         logging.info(
-            "ScriptSTTDataset: audio delimiters %r=%d / %r=%d, eot_id=%d, audio_history_chunks=%d",
+            "ScriptSTTDataset: audio delimiters %r=%d / %r=%d, eot_id=%d, "
+            "audio_history_chunks=%d, audio_window_frames=%d",
             self.audio_open_token,
             self.vision_start_id,
             self.audio_close_token,
             self.vision_end_id,
             self.eot_id,
             self._audio_history_chunks,
+            self._audio_window_frames,
         )
 
     def _get_chunk_rng(self) -> np.random.Generator:
@@ -233,6 +249,7 @@ class ScriptSTTDataset(StreamingSTTDataset):
                     vision_end_id=self.vision_end_id,
                     eot_id=self.eot_id,
                     audio_history_chunks=self._audio_history_chunks,
+                    audio_window_frames=self._audio_window_frames,
                 )
             )
 
@@ -250,7 +267,9 @@ class ScriptSTTDataset(StreamingSTTDataset):
             # Only needed when a window reuses frames across branches. With M == 0
             # the audio slots are a plain 0,1,2,... run, so the model can take the
             # cheaper (and numerically identical) cumsum interleave path.
-            audio_frame_index=packed.audio_frame_index if self._audio_history_chunks > 0 else None,
+            audio_frame_index=(
+                packed.audio_frame_index if (self._audio_history_chunks > 0 or self._audio_window_frames > 0) else None
+            ),
             valid=packed.valid,
             text=text,
             cuts=cuts,

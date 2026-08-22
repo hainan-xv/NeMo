@@ -64,21 +64,50 @@ SPINE_SEG_ID = 0
 PAD_SEG_ID = -1
 
 
-def audio_window_start(chunk_index: int, frame_starts: List[int], audio_history_chunks: int) -> int:
+def audio_window_start(
+    chunk_index: int,
+    frame_starts: List[int],
+    audio_history_chunks: int,
+    win_end: Optional[int] = None,
+    audio_window_frames: int = 0,
+) -> int:
     """First global encoder-frame index of branch ``chunk_index``'s audio window.
 
-    The window always ends at the chunk's own boundary (never looks ahead). With
-    ``audio_history_chunks == M`` it begins at the start of chunk
-    ``max(0, k - M)``, so the branch sees the audio of chunks ``[k-M .. k]``.
-    ``M == 0`` (the default) gives each branch only its own chunk's audio.
+    The window always ends at the chunk's own boundary (``win_end``) and never
+    looks ahead. There are two ways to size it:
 
-    ``M > 0`` matters when the emission delay is non-zero: a word held back by
-    the delay is emitted from a LATER chunk, and only a window that reaches back
-    over previous chunks still contains that word's acoustics.
+    * **Chunk-based** (default) — with ``audio_history_chunks == M`` the window
+      begins at the start of chunk ``max(0, k - M)``, so the branch sees the audio
+      of chunks ``[k-M .. k]``. ``M == 0`` gives each branch only its own chunk.
+      The window therefore SCALES with the chunk size.
+
+    * **Frame-based** (``audio_window_frames = F > 0``) — the window is the last
+      ``F`` frames ending at the chunk boundary, giving a CONSTANT acoustic
+      context regardless of the emission granularity. Takes precedence over
+      ``audio_history_chunks``.
+
+    Two properties of the frame-based mode are worth stating explicitly:
+
+    * ``F`` is a **floor, not a cap**. The window never starts after the current
+      chunk's own start, so a chunk longer than ``F`` still shows all of its own
+      frames. A branch must be able to see the audio of the words it is being
+      asked to predict, so clipping into the current chunk would be incoherent.
+    * Early chunks are **clamped at frame 0**, not left-padded, so the first few
+      branches simply have shorter windows.
+
+    Sizing matters when the emission delay is non-zero: a word held back by the
+    delay is emitted from a LATER chunk, and only a window reaching back far
+    enough still contains that word's acoustics.
 
     This helper is shared by the training packer and the inference decoder so the
     two cannot drift apart.
     """
+    F = max(int(audio_window_frames), 0)
+    cur_chunk_start = frame_starts[chunk_index]
+    if F > 0:
+        if win_end is None:
+            raise ValueError("win_end is required when audio_window_frames > 0")
+        return max(0, min(cur_chunk_start, int(win_end) - F))
     return frame_starts[max(0, chunk_index - max(int(audio_history_chunks), 0))]
 
 
@@ -153,6 +182,7 @@ def build_packed_chunk_example(
     eot_id: int,
     supervise_eot: bool = True,
     audio_history_chunks: int = 0,
+    audio_window_frames: int = 0,
 ) -> PackedChunkExample:
     """Build the packed spine+branch layout for one utterance.
 
@@ -176,6 +206,11 @@ def build_packed_chunk_example(
             also included in each branch's window; branch ``k`` then wraps the
             frames of chunks ``[max(0, k-M) .. k]`` (fewer for early chunks, with
             no padding). ``0`` = each branch sees only its own chunk's audio.
+        audio_window_frames: if ``> 0``, size every window by this FIXED number of
+            frames ending at the chunk boundary instead of by whole chunks, giving
+            a constant acoustic context independent of the chunk size. Acts as a
+            floor (a longer chunk keeps all its own frames) and takes precedence
+            over ``audio_history_chunks``. See :func:`audio_window_start`.
 
     Returns:
         PackedChunkExample.
@@ -209,8 +244,8 @@ def build_packed_chunk_example(
         k = kc + 1  # 1-based branch / segment id
         pref = prefix_lens[kc]
 
-        win_start = audio_window_start(kc, frame_starts, audio_history_chunks)
         win_end = frame_starts[kc] + ch.audio_len
+        win_start = audio_window_start(kc, frame_starts, audio_history_chunks, win_end, audio_window_frames)
         window_frames = list(range(win_start, win_end))
         window_len = len(window_frames)
 
@@ -394,6 +429,7 @@ def build_separate_chunk_examples(
     eot_id: int,
     supervise_eot: bool = True,
     audio_history_chunks: int = 0,
+    audio_window_frames: int = 0,
 ) -> List[SeparateChunkExample]:
     """Build the standalone per-chunk examples the packed layout must reproduce.
 
@@ -416,8 +452,8 @@ def build_separate_chunk_examples(
     history: List[int] = list(instruction_ids)
     out: List[SeparateChunkExample] = []
     for kc, ch in enumerate(chunks):
-        win_start = audio_window_start(kc, frame_starts, audio_history_chunks)
         win_end = frame_starts[kc] + ch.audio_len
+        win_start = audio_window_start(kc, frame_starts, audio_history_chunks, win_end, audio_window_frames)
         window_frames = list(range(win_start, win_end))
         window_len = len(window_frames)
 
@@ -470,6 +506,7 @@ def batched_stream_decode_script(
     max_new_tokens: int = 64,
     device: Optional[torch.device] = None,
     audio_history_chunks: int = 0,
+    audio_window_frames: int = 0,
     max_history_tokens: int = 0,
     return_chunk_ids: bool = False,
     is_word_start: Optional[Callable[[int], bool]] = None,
@@ -508,6 +545,7 @@ def batched_stream_decode_script(
         vision_start_id / vision_end_id / eot_id / pad_id: delimiter / end / pad ids.
         max_new_tokens: max tokens decoded per chunk per stream.
         audio_history_chunks: ``M`` — must match the training setting.
+        audio_window_frames: ``F`` — fixed-frame window; must match training.
         max_history_tokens: if ``> 0``, cap the CONDITIONING history to the most
             recent N emitted tokens (the instruction is always kept). Bounds the
             per-chunk prefill so cost is linear rather than quadratic in
@@ -531,6 +569,10 @@ def batched_stream_decode_script(
     num_chunks = [math.ceil(n / chunk_size) if n > 0 else 0 for n in n_frames]
     max_chunks = max(num_chunks) if B else 0
     M = max(int(audio_history_chunks), 0)
+    F = max(int(audio_window_frames), 0)
+    # At inference every chunk is exactly ``chunk_size`` frames (the final one is
+    # zero-padded up to it below), so chunk starts are a simple arithmetic run.
+    _chunk_starts = [k * chunk_size for k in range(max_chunks)]
 
     emitted: List[List[int]] = [[] for _ in range(B)]
     chunk_ids: List[List[int]] = [[] for _ in range(B)]
@@ -545,8 +587,10 @@ def batched_stream_decode_script(
         seqs: List[List[int]] = []
         chunk_frames: List[Tensor] = []
         for b in active:
-            win_start = max(0, k - M) * chunk_size
             win_end = (k + 1) * chunk_size
+            # Same rule as the training packer, via the shared helper, so the
+            # window cannot drift between training and inference.
+            win_start = audio_window_start(k, _chunk_starts, M, win_end, F)
             fr = frames_list[b][win_start:win_end].to(device=device, dtype=dtype)
             # Match TRAINING exactly on the FINAL (partial) chunk. In training every
             # chunk's audio turn is a full ``chunk_size`` frames and the slots past the
