@@ -217,11 +217,15 @@ def main():
     # bf16 across 28 layers disagree by a visible amount even when they compute the
     # same function, so bf16 alone cannot distinguish "wrong mask" from "rounding".
     # fp32 is the decisive arm: a genuine mask difference stays large there.
+    # Three arms, so we have a CONTROL. "eager" and "sdpa" both consume the same
+    # dense SCRIPT mask and compute the same function, so eager-vs-sdpa measures
+    # how far two different kernels drift through 28 layers on identical maths.
+    # flex is only suspect if it drifts materially further than that.
+    ARMS = {"eager": "eager", "sdpa": "sdpa", "flex": "flex_attention"}
     for pdtype_name in args.parity_dtypes:
         pdtype = torch.float32 if pdtype_name == "fp32" else torch.bfloat16
         logits, grads = {}, {}
-        for kind in ("dense", "flex"):
-            impl = "eager" if kind == "dense" else "flex_attention"
+        for kind, impl in ARMS.items():
             # Seed BEFORE constructing the model: get_peft_model draws lora_A
             # randomly, so both arms must be seeded identically or they are
             # different models (lora_B is zero-init, so this shows up in the
