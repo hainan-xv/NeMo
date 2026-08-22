@@ -19,6 +19,7 @@ from .nemotron_voicechat import NemotronVoiceChat
 from .salm import SALM
 from .salm_asr_decoder import SALMWithAsrDecoder
 from .salm_automodel import SALMAutomodel
+from .script_model import ScriptSTTModel
 from .streaming_stt_model import StreamingState, StreamingSTTModel
 from .streaming_stt_model_automodel import StreamingSTTModelAutomodel
 
@@ -31,6 +32,7 @@ __all__ = [
     'SALMAutomodel',
     'SALMWithAsrDecoder',
     'NemotronVoiceChat',
+    'ScriptSTTModel',
     'StreamingState',
     'StreamingSTTModel',
     'StreamingSTTModelAutomodel',

@@ -1,0 +1,432 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""SCRIPT streaming SpeechLM — packed spine + per-chunk branches."""
+
+from collections import defaultdict
+from dataclasses import dataclass
+from typing import List, Optional, Union
+
+import torch
+import torch.nn.functional as F
+from torch import Tensor
+from torch.distributed.tensor.parallel import loss_parallel
+from transformers import GenerationConfig
+
+from nemo.collections.speechlm2.data.script_dataset import ScriptBatch, ScriptSTTDataset
+from nemo.collections.speechlm2.data.streaming_stt_dataset import AUDIO_TOKEN_IDX, IGNORE_INDEX
+from nemo.collections.speechlm2.models.streaming_stt_model import StreamingSTTModel, StreamingSTTModelConfig
+from nemo.collections.speechlm2.parts.metrics.wer import WER
+from nemo.collections.speechlm2.parts.optim_setup import is_frozen
+from nemo.collections.speechlm2.parts.script import batched_stream_decode_script, build_script_mask
+from nemo.collections.speechlm2.parts.utils import to_dataclass
+from nemo.utils import logging
+
+
+@dataclass
+class ScriptSTTModelConfig(StreamingSTTModelConfig):
+    """:class:`StreamingSTTModelConfig` plus SCRIPT's own knobs.
+
+    Attributes:
+        audio_history_chunks: ``M`` — how many PREVIOUS chunks' audio each branch
+            also sees. MUST equal ``data.dataset.audio_history_chunks``, since
+            training and inference build the window from this same number.
+        val_chunk_size: chunk size used for the decode-only validation pass when
+            training with multiple chunk sizes. Defaults to 14 when available,
+            else the largest candidate.
+        val_max_new_tokens_per_chunk: cap on tokens decoded per chunk during
+            validation. Defaults to the validation chunk size.
+        val_system_prompt: instruction used at validation. Defaults to the
+            dataset's ``system_prompt``; set explicitly to pin a fixed operating
+            point that matches training.
+        val_prompt_field: per-cut field that may override ``val_system_prompt``.
+        max_history_tokens: if ``> 0``, cap the conditioning history at inference
+            to the most recent N emitted tokens (the instruction is always kept),
+            making per-chunk cost linear rather than quadratic in duration.
+        encode_batch_size: sub-batch size for the offline encode. A single
+            full-batch encode of long, length-sorted clips can overflow 32-bit
+            CUDA indexing in the subsampling convolution.
+        log_detailed_train_metrics: also log sequence length / target counts.
+    """
+
+    audio_history_chunks: int = 0
+    val_chunk_size: Optional[int] = None
+    val_max_new_tokens_per_chunk: Optional[int] = None
+    val_system_prompt: Optional[str] = None
+    val_prompt_field: str = "system_prompt"
+    max_history_tokens: int = 0
+    encode_batch_size: int = 8
+    log_detailed_train_metrics: bool = False
+
+
+class ScriptSTTModel(StreamingSTTModel):
+    """Streaming ASR as conditional text completion.
+
+    Each utterance is packed as a pure-text **spine** (the instruction plus every
+    word, in order) followed by one **branch** per audio chunk
+    (``<vs> audio_k <ve> w_k <eot>``). A 4D mask
+    (:func:`~nemo.collections.speechlm2.parts.script.build_script_mask`) keeps
+    each branch attending only its own history prefix of the spine, its own
+    audio, and its own earlier tokens — so the whole utterance trains in a single
+    O(L) forward while every chunk still sees exactly the conditioning it would
+    see standing alone: ``p(words_k | text_history_<k, audio_k)``.
+
+    Inference mirrors that conditioning chunk by chunk, re-prefilling the compact
+    text history and attaching only the current chunk's audio window.
+
+    **On "offline" encoding.** Validation and inference encode the whole
+    utterance in one ``perception`` call and then slice frames per chunk. That is
+    a choice about *how* the representation is computed, not a relaxation of the
+    streaming constraint: :meth:`encode_frames` pins the encoder's right context
+    to ``chunk_size - 1`` for chunk-limited encoders, so a frame's receptive
+    field never crosses its own chunk boundary. The dependency structure is
+    identical to true frame-by-frame streaming; only the batching differs.
+    ``test_offline_encode_dependency_is_chunk_limited`` pins this down by
+    perturbing future audio and asserting earlier frames do not move.
+    """
+
+    def __init__(
+        self,
+        cfg: dict,
+        forced_aligner=None,
+        data_cfg=None,
+        val_data_cfg=None,
+        dataset_cls=ScriptSTTDataset,
+    ) -> None:
+        super().__init__(
+            cfg,
+            forced_aligner=forced_aligner,
+            data_cfg=data_cfg,
+            val_data_cfg=val_data_cfg,
+            dataset_cls=dataset_cls,
+        )
+        # The base __init__ coerces cfg through StreamingSTTModelConfig, which
+        # silently drops SCRIPT's extra keys. Re-coerce through the extended
+        # dataclass so they survive (and stay typed).
+        self.core_cfg: ScriptSTTModelConfig = to_dataclass(ScriptSTTModelConfig, cfg)
+
+        self._audio_history_chunks = max(int(self.core_cfg.audio_history_chunks), 0)
+
+        # Audio-span delimiters and end-of-turn token, resolved once. These must
+        # match ScriptSTTDataset, which builds the training layout with them.
+        hf_tok = self.tokenizer.tokenizer
+        self._vision_start_id = hf_tok.convert_tokens_to_ids(ScriptSTTDataset.audio_open_token)
+        self._vision_end_id = hf_tok.convert_tokens_to_ids(ScriptSTTDataset.audio_close_token)
+        self._eot_id = hf_tok.eos_token_id
+        if self._eot_id is None:
+            raise ValueError("Tokenizer has no eos_token_id; it is required as the branch end-of-turn token.")
+
+        self._val_system_prompt = self.core_cfg.val_system_prompt
+        if self._val_system_prompt is None and data_cfg is not None:
+            self._val_system_prompt = data_cfg.get("system_prompt", None)
+        if self._val_system_prompt is None:
+            self._val_system_prompt = "Transcribe the audio into text."
+
+        logging.info(
+            "ScriptSTTModel: audio delimiters %d / %d, eot_id=%d, audio_history_chunks=%d",
+            self._vision_start_id,
+            self._vision_end_id,
+            self._eot_id,
+            self._audio_history_chunks,
+        )
+
+    # ------------------------------------------------------------------
+    # Input construction
+    # ------------------------------------------------------------------
+
+    def _build_input_embeds_indexed(
+        self, input_tokens: Tensor, audios: Tensor, audio_lens: Tensor, audio_frame_index: Tensor
+    ) -> Tensor:
+        """Fill audio slots by EXPLICIT global frame index rather than by cumsum.
+
+        Needed when ``audio_history_chunks > 0``: a branch's window spans several
+        chunks and the same encoder frame appears in more than one branch, so the
+        1:1 positional mapping the cumsum fill assumes no longer holds.
+        Out-of-range indices (the final chunk's ceiling past the real audio)
+        gather a zero-padded frame, which is exactly what the decoder pads to.
+        """
+        audio_mask = input_tokens == AUDIO_TOKEN_IDX  # (B, L)
+        text_tokens = input_tokens.where(~audio_mask, torch.zeros_like(input_tokens))
+        text_embeds = self._embed_tokens(text_tokens)  # (B, L, H)
+        audio_embs, _ = self.perception(input_signal=audios, input_signal_length=audio_lens)  # (B, T_enc, H)
+
+        B, L = input_tokens.shape
+        H = audio_embs.shape[2]
+        T_enc = audio_embs.shape[1]
+        max_idx = int(audio_frame_index.max().item()) if audio_frame_index.numel() else -1
+        if max_idx >= T_enc:
+            audio_embs = F.pad(audio_embs, (0, 0, 0, max_idx - T_enc + 1))
+        gather_idx = audio_frame_index.clamp(min=0).unsqueeze(-1).expand(B, L, H)
+        audio_at = torch.gather(audio_embs, dim=1, index=gather_idx)  # (B, L, H)
+        return torch.where(audio_mask.unsqueeze(-1), audio_at, text_embeds)
+
+    def _script_input_embeds(self, batch: ScriptBatch) -> Tensor:
+        """Interleave encoder frames into the packed ``AUDIO_TOKEN_IDX`` slots."""
+        if batch.audio_frame_index is not None:
+            return self._build_input_embeds_indexed(
+                batch.input_tokens, batch.audios, batch.audio_lens, batch.audio_frame_index
+            )
+        return self._build_input_embeds(batch.input_tokens, batch.audios, batch.audio_lens)["input_embeds"]
+
+    # ------------------------------------------------------------------
+    # Training
+    # ------------------------------------------------------------------
+
+    def training_step(self, batch: ScriptBatch, batch_idx: int):
+        # Keep frozen modules in eval mode (disables dropout / BN updates).
+        for m in (self.perception.preprocessor, self.perception.encoder, self.llm):
+            if is_frozen(m):
+                m.eval()
+
+        # Pin the encoder look-ahead to this batch's chunk size so a frame's
+        # receptive field never crosses its chunk boundary.
+        self._set_encoder_att_context(batch.chunk_size)
+
+        input_embeds = self._script_input_embeds(batch)
+        mask = build_script_mask(batch.seg_ids, batch.position_ids, batch.prefix_len, batch.valid, input_embeds.dtype)
+        out = self._llm_forward(
+            inputs_embeds=input_embeds,
+            attention_mask=mask,
+            position_ids=batch.position_ids,
+            use_cache=False,
+            return_dict=True,
+        )
+        logits = out["logits"]  # (B, T, V)
+
+        target_ids = batch.target_tokens
+        num_targets = (target_ids != IGNORE_INDEX).long().sum()
+        if num_targets == 0:
+            logging.warning("Batch %d has no supervised targets — skipping (zero loss).", batch_idx)
+            return {"loss": torch.zeros((), device=logits.device, requires_grad=True)}
+
+        with loss_parallel():
+            loss = F.cross_entropy(
+                logits.flatten(0, 1),
+                target_ids.flatten(0, 1),
+                reduction="mean",
+                ignore_index=IGNORE_INDEX,
+            )
+
+        metrics = {
+            "loss": loss,
+            "learning_rate": torch.as_tensor(
+                self.trainer.optimizers[0].param_groups[0]["lr"] if self._trainer is not None else 0.0
+            ),
+        }
+        if self.core_cfg.log_detailed_train_metrics:
+            B, T = batch.input_tokens.shape
+            metrics.update(
+                {
+                    "num_targets": num_targets.float(),
+                    "sequence_length": float(T),
+                    "target_to_input_ratio": num_targets / (B * T),
+                }
+            )
+        self.log_dict(metrics, on_step=True)
+        return {"loss": loss}
+
+    # ------------------------------------------------------------------
+    # Validation — decode-only WER
+    # ------------------------------------------------------------------
+
+    @property
+    def val_chunk_size(self) -> Optional[int]:
+        """Chunk size for the validation decode.
+
+        With multi chunk-size training the largest candidate may imply a
+        look-ahead configuration that is slow or unsupported for streaming, so
+        validation pins one well-supported size instead.
+        """
+        if not getattr(self, "_chunk_size_candidates", None):
+            return None
+        configured = self.core_cfg.val_chunk_size
+        if configured is not None:
+            return int(configured)
+        return 14 if 14 in self._chunk_size_candidates else max(self._chunk_size_candidates)
+
+    @property
+    def val_max_new_tokens_per_chunk(self) -> int:
+        """Per-chunk autoregressive cap for validation."""
+        configured = self.core_cfg.val_max_new_tokens_per_chunk
+        if configured is not None:
+            if configured <= 0:
+                raise ValueError("val_max_new_tokens_per_chunk must be positive")
+            return int(configured)
+        return self.val_chunk_size or 64
+
+    def _validation_system_prompts(self, batch) -> Union[str, List[str]]:
+        if getattr(batch, "cuts", None) is None:
+            return self._val_system_prompt
+        return [(cut.custom or {}).get(self.core_cfg.val_prompt_field, self._val_system_prompt) for cut in batch.cuts]
+
+    def on_validation_epoch_start(self) -> None:
+        self._partial_wer_refs: dict = defaultdict(list)
+        self._partial_wer_hyps: dict = defaultdict(list)
+
+    def on_validation_epoch_end(self) -> None:
+        # Gather the decoded strings and compute a true corpus WER. Averaging
+        # rank-local WERs would be wrong when ranks see different word counts.
+        local = {
+            name: {"refs": self._partial_wer_refs[name], "hyps": self._partial_wer_hyps[name]}
+            for name in self._partial_wer_refs
+        }
+        if torch.distributed.is_initialized():
+            gathered = [None] * torch.distributed.get_world_size()
+            torch.distributed.all_gather_object(gathered, local)
+        else:
+            gathered = [local]
+
+        wer = WER(normalize=True, verbose=False)
+        has_data = False
+        for rank_data in gathered:
+            for name, values in rank_data.items():
+                has_data = has_data or bool(values["refs"])
+                wer.update(name, refs=values["refs"], hyps=values["hyps"])
+        if has_data:
+            for metric_name, metric_value in wer.compute().items():
+                log_name = "val_wer" if metric_name == "wer" else f"val_{metric_name}"
+                self.log(log_name, metric_value.to(self.device), on_epoch=True, sync_dist=False)
+
+        self._partial_wer_refs.clear()
+        self._partial_wer_hyps.clear()
+
+    def validation_step(self, batch, batch_idx: int):
+        if isinstance(batch, dict):  # multiple validation dataloaders
+            for name, dataset_batch in batch.items():
+                if dataset_batch is not None:
+                    self._eval_step(dataset_batch, name, batch_idx)
+        else:
+            self._eval_step(batch, "val", batch_idx)
+
+    def _eval_step(self, batch, name: str, batch_idx: int = 0) -> None:
+        # Validation is decode-only: autoregressive WER needs neither word
+        # alignments nor constructed target turns, just audio and reference text.
+        refs = list(batch.text)
+        hyps = self.generate(
+            audios=batch.audios,
+            audio_lens=batch.audio_lens,
+            system_prompt=self._validation_system_prompts(batch),
+            max_new_tokens=self.val_max_new_tokens_per_chunk,
+            generation_config=GenerationConfig(do_sample=False),
+            chunk_size_override=self.val_chunk_size,
+        )
+        self._partial_wer_refs[name].extend(refs)
+        self._partial_wer_hyps[name].extend(hyps)
+
+        if batch_idx % self.core_cfg.log_every_n_steps == 0 and refs and hyps:
+            logging.info(
+                "[%s] decode batch %d (max %d tokens/chunk)\n  ref: `%s`\n  hyp: `%s`",
+                name,
+                batch_idx,
+                self.val_max_new_tokens_per_chunk,
+                refs[0],
+                hyps[0],
+            )
+
+    def on_test_epoch_start(self) -> None:
+        return self.on_validation_epoch_start()
+
+    def on_test_epoch_end(self) -> None:
+        return self.on_validation_epoch_end()
+
+    def test_step(self, *args, **kwargs):
+        return self.validation_step(*args, **kwargs)
+
+    # ------------------------------------------------------------------
+    # Inference
+    # ------------------------------------------------------------------
+
+    def encode_frames(self, audios: Tensor, audio_lens: Tensor, chunk_size: int) -> List[Tensor]:
+        """Encode a batch of waveforms into per-utterance encoder-frame sequences.
+
+        The encoder's right context is pinned to ``chunk_size - 1`` first, so
+        each output frame depends only on audio up to its own chunk's boundary —
+        the same dependency structure as frame-by-frame streaming. Computing all
+        frames in one pass is purely a batching optimization.
+
+        Sub-batched because a single full-batch encode of long, length-sorted
+        clips can overflow 32-bit CUDA indexing in the subsampling convolution.
+        """
+        self._set_encoder_att_context(chunk_size)
+        B = audios.shape[0]
+        frames: List[Optional[Tensor]] = [None] * B
+        step = max(1, int(self.core_cfg.encode_batch_size))
+        for i in range(0, B, step):
+            hi = min(i + step, B)
+            idx = torch.arange(i, hi, device=audio_lens.device)
+            lens = audio_lens[idx]
+            sig = audios[idx, : int(lens.max().item())]
+            emb, emb_len = self.perception(input_signal=sig, input_signal_length=lens)  # (b, T_enc, H)
+            for j, b in enumerate(range(i, hi)):
+                frames[b] = emb[j, : int(emb_len[j].item())].clone()
+        return frames
+
+    @torch.no_grad()
+    def generate(
+        self,
+        audios: Tensor,
+        audio_lens: Tensor,
+        system_prompt: Union[str, List[str]] = "Transcribe the audio into text.",
+        max_new_tokens: int = 64,
+        generation_config: Optional[GenerationConfig] = None,
+        chunk_size_override: Optional[int] = None,
+        **generation_kwargs,
+    ) -> List[str]:
+        """Chunk-by-chunk streaming transcription.
+
+        Encodes the audio once (see :meth:`encode_frames` on why that does not
+        weaken the streaming constraint), then runs the batched greedy
+        spine+branch decode: for each chunk every active stream is shown its
+        compact text history plus that chunk's audio window, exactly as in
+        training.
+
+        Args:
+            audios / audio_lens: waveforms ``(B, T)`` and sample counts ``(B,)``.
+            system_prompt: one instruction, or one per utterance.
+            max_new_tokens: cap on tokens decoded per chunk.
+            chunk_size_override: decode at this chunk size instead of the
+                configured / representative one.
+
+        Returns:
+            ``B`` transcripts.
+        """
+        cs = self._resolve_inference_chunk_size(chunk_size_override)
+        if cs <= 0:
+            raise ValueError(f"SCRIPT generate requires a positive chunk size, got {cs}")
+
+        B = audios.shape[0]
+        if isinstance(system_prompt, str):
+            system_prompt = [system_prompt] * B
+
+        max_history_tokens = int(generation_kwargs.pop("max_history_tokens", self.core_cfg.max_history_tokens))
+
+        frames_list = self.encode_frames(audios, audio_lens, cs)
+        # Same instruction/history separator the dataset uses when building the spine.
+        instruction_ids_list = [self.tokenizer.text_to_ids(system_prompt[b] + "\n") for b in range(B)]
+
+        emitted = batched_stream_decode_script(
+            llm=self.llm,
+            embed_tokens=self._embed_tokens,
+            instruction_ids_list=instruction_ids_list,
+            frames_list=frames_list,
+            chunk_size=cs,
+            vision_start_id=self._vision_start_id,
+            vision_end_id=self._vision_end_id,
+            eot_id=self._eot_id,
+            pad_id=self.text_pad_id,
+            max_new_tokens=max_new_tokens,
+            device=self.device,
+            audio_history_chunks=self._audio_history_chunks,
+            max_history_tokens=max_history_tokens,
+        )
+        return [self.tokenizer.ids_to_text(ids) if ids else "" for ids in emitted]
