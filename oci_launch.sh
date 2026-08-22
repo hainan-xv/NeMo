@@ -78,6 +78,42 @@ fi
 SCRIPT="$1"; shift
 SCRIPT_ARGS=("$@")
 
+# Also forward knobs that were exported in the CALLING shell rather than passed as
+# arguments. `INIT_CKPT=none ./oci_launch.sh launch/x.sh` is the idiom everyone
+# reaches for first, and without this it silently does nothing: the assignment
+# lands in THIS process's environment and never reaches the remote sbatch.
+#
+# The knob names are discovered from the target script itself (every `${NAME:-...}`
+# it reads), so this stays correct as launchers gain options. System and Slurm
+# variables are excluded -- forwarding those would be actively harmful.
+forward_inherited_env() {
+    local script="$1" name
+    local -a found=()
+    while read -r name; do
+        case "$name" in
+            PATH|HOME|USER|SHELL|PWD|TERM|LANG|LC_*|SHLVL|_|HOSTNAME|SSH_*|SLURM_*|BASH_*)
+                continue ;;
+            # NEVER forward credentials. The launch scripts read these from
+            # chmod-600 files on the grid; putting one on a command line would
+            # expose it in the job's argv, in squeue output and in the logs.
+            *TOKEN*|*SECRET*|*PASSWORD*|*PASSWD*|*API_KEY*|*_KEY|KEY_*)
+                continue ;;
+        esac
+        # Only forward if actually set here AND not already given as an argument.
+        [[ -z "${!name+x}" ]] && continue
+        for a in ${ENV_ASSIGNMENTS[@]+"${ENV_ASSIGNMENTS[@]}"}; do
+            [[ "$a" == "${name}="* ]] && continue 2
+        done
+        found+=("${name}=${!name}")
+    done < <(grep -oE '\$\{[A-Za-z_][A-Za-z0-9_]*(:-|\})' "$script" \
+             | sed -E 's/^\$\{//; s/(:-|\})$//' | sort -u)
+    if [[ ${#found[@]} -gt 0 ]]; then
+        # Print names only -- a forwarded value could still be sensitive.
+        echo "==> Forwarding inherited env: ${found[*]%%=*}"
+        ENV_ASSIGNMENTS+=("${found[@]}")
+    fi
+}
+
 # Catch typos locally rather than after an SSH round trip. The grid runs its own
 # checkout, but the file must exist here too or it was never synced.
 if [[ ! -f "$SCRIPT" ]]; then
@@ -86,6 +122,8 @@ if [[ ! -f "$SCRIPT" ]]; then
     ls launch/*.sh 2>/dev/null | sed 's/^/         /' >&2 || true
     exit 1
 fi
+
+forward_inherited_env "$SCRIPT"
 
 # ---------------------------------------------------------------------------
 # 1) Is the grid checkout already up to date?

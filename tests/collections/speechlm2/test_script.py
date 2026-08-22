@@ -1172,3 +1172,132 @@ def test_twod_micro_batching_changes_nothing(micro_batch):
     assert set(g_all) == set(g_mb)
     for name in g_all:
         torch.testing.assert_close(g_all[name], g_mb[name], atol=1e-5, rtol=1e-5, msg=lambda m: f"{name}: {m}")
+
+
+# ---------------------------------------------------------------------------
+# Structured attention: same flat sequence, only the permitted blocks computed
+# ---------------------------------------------------------------------------
+
+from nemo.collections.speechlm2.parts.script_attention import (  # noqa: E402
+    build_attention_plan,
+    register_script_attention,
+    script_attention_plan,
+)
+
+
+def _plan_and_batch(chunk_specs, instruction=None, **kw):
+    instruction = instruction or INSTR
+    exs = [build_packed_chunk_example(instruction, cs, VS, VE, EOT, **kw) for cs in chunk_specs]
+    return collate_packed_chunk_examples(exs, pad_id=0), build_attention_plan(exs)
+
+
+def test_attention_plan_locates_every_token():
+    """The plan must address exactly the spine and branch tokens, once each."""
+    chunks = [ChunkSpec(2, [20, 21]), ChunkSpec(3, [30]), ChunkSpec(2, []), ChunkSpec(2, [40, 41, 42])]
+    batch, plan = _plan_and_batch([chunks], audio_window_frames=6)
+
+    seg = batch.seg_ids[0]
+    covered = sorted(
+        plan.spine_pos[0][plan.spine_valid[0]].tolist() + plan.branch_pos[0][plan.branch_valid[0]].tolist()
+    )
+    assert covered == list(range(int(batch.valid[0].sum()))), "plan does not tile the sequence"
+    # spine slots really are spine tokens; branch slots really are branch tokens
+    assert (seg[plan.spine_pos[0][plan.spine_valid[0]]] == SPINE_SEG_ID).all()
+    assert (seg[plan.branch_pos[0][plan.branch_valid[0]]] >= 1).all()
+    # each branch row carries its own prefix
+    for k in range(int(seg.max())):
+        idx = (seg == k + 1).nonzero(as_tuple=True)[0]
+        assert int(plan.branch_prefix[0, k]) == int(batch.prefix_len[0, idx[0]])
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("window", [0, 6, 28])
+def test_structured_attention_matches_dense(window):
+    """Structured logits must equal the dense-mask logits on the same weights."""
+    register_script_attention()
+    H = 32
+    chunks_a = [ChunkSpec(2, [20, 21]), ChunkSpec(2, [30]), ChunkSpec(2, []), ChunkSpec(2, [40, 41])]
+    chunks_b = [ChunkSpec(2, [50]), ChunkSpec(2, [60, 61, 62]), ChunkSpec(2, [70])]
+    batch, plan = _plan_and_batch([chunks_a, chunks_b], audio_window_frames=window)
+
+    torch.manual_seed(9)
+    frames = torch.randn(64, H)
+    model_dense = _tiny_qwen3()
+    emb = torch.stack(
+        [
+            _embed_with_audio(
+                model_dense,
+                batch.input_ids[i],
+                batch.is_audio[i],
+                frames[batch.audio_frame_index[i][batch.is_audio[i]]],
+            )
+            for i in range(batch.input_ids.shape[0])
+        ]
+    )
+
+    mask = build_script_mask(batch.seg_ids, batch.position_ids, batch.prefix_len, batch.valid, emb.dtype)
+    ref = model_dense(inputs_embeds=emb, attention_mask=mask, position_ids=batch.position_ids).logits
+
+    model_struct = _tiny_qwen3()
+    model_struct.set_attn_implementation("script")
+    with script_attention_plan(plan):
+        got = model_struct(inputs_embeds=emb, attention_mask=None, position_ids=batch.position_ids).logits
+
+    # Compare only real tokens; padded slots are meaningless in either path.
+    for i in range(batch.input_ids.shape[0]):
+        n = int(batch.valid[i].sum())
+        torch.testing.assert_close(got[i, :n], ref[i, :n], atol=1e-4, rtol=1e-4)
+
+
+def test_structured_attention_gradients_match_dense():
+    """Equivalence must hold for the backward, or training would differ."""
+    register_script_attention()
+    H = 32
+    chunks = [ChunkSpec(2, [20, 21]), ChunkSpec(2, [30]), ChunkSpec(2, [40, 41])]
+    batch, plan = _plan_and_batch([chunks], audio_window_frames=6)
+    torch.manual_seed(10)
+    frames = torch.randn(32, H)
+
+    def run(structured):
+        model = _tiny_qwen3()
+        if structured:
+            model.set_attn_implementation("script")
+        model.zero_grad(set_to_none=True)
+        emb = _embed_with_audio(
+            model,
+            batch.input_ids[0],
+            batch.is_audio[0],
+            frames[batch.audio_frame_index[0][batch.is_audio[0]]],
+        )[None]
+        if structured:
+            with script_attention_plan(plan):
+                logits = model(inputs_embeds=emb, attention_mask=None, position_ids=batch.position_ids).logits
+        else:
+            mask = build_script_mask(batch.seg_ids, batch.position_ids, batch.prefix_len, batch.valid, emb.dtype)
+            logits = model(inputs_embeds=emb, attention_mask=mask, position_ids=batch.position_ids).logits
+        loss = torch.nn.functional.cross_entropy(
+            logits.flatten(0, 1), batch.target_ids.flatten(0, 1), ignore_index=IGNORE_INDEX
+        )
+        loss.backward()
+        return float(loss), {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}
+
+    l_ref, g_ref = run(structured=False)
+    l_got, g_got = run(structured=True)
+    assert abs(l_ref - l_got) < 1e-4, f"loss differs: {l_ref} vs {l_got}"
+    assert set(g_ref) == set(g_got)
+    for name in g_ref:
+        torch.testing.assert_close(g_ref[name], g_got[name], atol=1e-4, rtol=1e-4, msg=lambda m: f"{name}: {m}")
+
+
+def test_structured_attention_falls_back_without_a_plan():
+    """No plan active => ordinary SDPA, so decoding keeps working unchanged."""
+    register_script_attention()
+    model = _tiny_qwen3()
+    model.set_attn_implementation("script")
+    ids = torch.tensor([[5, 6, 7, 8]])
+    with torch.no_grad():
+        out = model(input_ids=ids).logits
+    ref_model = _tiny_qwen3()
+    with torch.no_grad():
+        ref = ref_model(input_ids=ids).logits
+    torch.testing.assert_close(out, ref, atol=1e-4, rtol=1e-4)

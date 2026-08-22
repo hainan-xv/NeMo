@@ -56,6 +56,16 @@ def log(m):
 # ---------------------------------------------------------------------------
 
 
+def build_examples(batch_size, chunk_frames, window_frames, n_chunks, words_every):
+    chunks = []
+    for i in range(n_chunks):
+        tgt = [int(20 + (i % 7)), int(40 + (i % 5))] if (i % words_every == 0) else []
+        chunks.append(ChunkSpec(chunk_frames, tgt))
+    instr = list(range(5, 34))
+    ex = build_packed_chunk_example(instr, chunks, VS, VE, EOT, audio_window_frames=window_frames)
+    return [ex] * batch_size
+
+
 def build_batch(batch_size, chunk_frames, window_frames, n_chunks, words_every, vocab):
     """Reproduce the training layout that OOM'd (54s clip, chunk 2, window 28)."""
     chunks = []
@@ -124,6 +134,8 @@ def set_checkpointing(model, on):
 
 def build_mask(kind, b_, dtype, device):
     """Return the object to pass as ``attention_mask`` for this arm."""
+    if kind == "script":
+        return None  # the structured backend reads its plan from the context
     if kind == "dense":
         return build_script_mask(b_.seg_ids, b_.position_ids, b_.prefix_len, b_.valid, dtype)
     from torch.nn.attention.flex_attention import create_block_mask
@@ -144,15 +156,18 @@ def step(model, b_, mask, embeds, do_backward):
     return logits
 
 
-def measure(model, b_, kind, embeds, device, dtype, do_backward=True):
+def measure(model, b_, kind, embeds, device, dtype, do_backward=True, plan=None):
     """Peak allocated MiB for one forward(+backward), or None on OOM."""
     model.zero_grad(set_to_none=True)
     gc.collect()
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats(device)
     try:
+        from nemo.collections.speechlm2.parts.script_attention import script_attention_plan
+
         mask = build_mask(kind, b_, dtype, device)
-        step(model, b_, mask, embeds, do_backward)
+        with script_attention_plan(plan if kind == "script" else None):
+            step(model, b_, mask, embeds, do_backward)
         peak = torch.cuda.max_memory_allocated(device) / 2**20
     except torch.OutOfMemoryError:
         peak = None
@@ -198,6 +213,15 @@ def main():
     dense_mb = T * T * 2 / 2**20
     log(f"layout: chunk={args.chunk_frames} window={args.window_frames} n_chunks={args.n_chunks} -> T={T}")
     log(f"dense mask alone would be {dense_mb:.0f} MiB/sample")
+
+    def exs_for(bs):
+        return build_examples(bs, args.chunk_frames, args.window_frames, args.n_chunks, args.words_every)
+
+    globals()["exs_for"] = exs_for
+
+    from nemo.collections.speechlm2.parts.script_attention import register_script_attention
+
+    register_script_attention()
 
     from torch.nn.attention.flex_attention import create_block_mask
 
@@ -291,8 +315,8 @@ def main():
     log("=" * 74)
     log(f"  {'arm':<22} " + " ".join(f"B={b:<9}" for b in args.batch_sizes))
 
-    for kind in ("dense", "flex"):
-        impl = "eager" if kind == "dense" else "flex_attention"
+    for kind in ("dense", "flex", "script"):
+        impl = {"dense": "eager", "flex": "flex_attention", "script": "script"}[kind]
         for ckpt in (False, True):
             name = f"{kind}{' + ckpt' if ckpt else ''}"
             try:
@@ -314,7 +338,12 @@ def main():
                     ids[am] = 0
                     emb = m.get_input_embeddings()(ids)
                     emb = torch.where(am.unsqueeze(-1), frames[b_.audio_frame_index.clamp(min=0)], emb)
-                    peak = measure(m, b_, kind, emb, device, dtype)
+                    plan = None
+                    if kind == "script":
+                        from nemo.collections.speechlm2.parts.script_attention import build_attention_plan
+
+                        plan = build_attention_plan(exs_for(B)).to(device)
+                    peak = measure(m, b_, kind, emb, device, dtype, plan=plan)
                     cells.append(f"{peak/1024:.1f}GiB" if peak else "OOM")
                     del b_, emb, frames
                 except torch.OutOfMemoryError:
