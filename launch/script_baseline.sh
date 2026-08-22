@@ -95,6 +95,23 @@ CONFIG_PATH=/code/examples/speechlm2/conf/
 CONFIG_NAME="${CONFIG_NAME:-streaming_stt_granary2_lora_script}"
 EXP_NAME="${EXP_NAME:-granary2_script_baseline}"
 
+# --- Tag runs that use a non-default node count ---
+# RESULTS_DIR is derived from EXP_NAME and the recipe sets resume_if_exists=true,
+# so a scaled-down run (e.g. the 1-node interactive debug run submitted by
+# oci_launch_interactive.sh, which overrides --nodes) sharing an EXP_NAME with the
+# full-scale run would RESUME FROM and then OVERWRITE that run's checkpoints, and
+# collide with its wandb run. Append _n<N> whenever the allocation differs from
+# what this script's own "#SBATCH -N" asks for, so the two never touch.
+# Read back from the header rather than hardcoding, so the two cannot drift.
+# Escape hatch: SKIP_NODE_SUFFIX=1 (e.g. to deliberately resume a run at a new scale).
+DESIGN_NODES="$(grep -m1 -E '^#SBATCH[[:space:]]+-N[[:space:]]+[0-9]+' "$0" 2>/dev/null | grep -oE '[0-9]+$' || true)"
+DESIGN_NODES="${DESIGN_NODES:-8}"
+ACTUAL_NODES="${SLURM_JOB_NUM_NODES:-$DESIGN_NODES}"
+if [[ "${SKIP_NODE_SUFFIX:-0}" != "1" && "$ACTUAL_NODES" -ne "$DESIGN_NODES" ]]; then
+    EXP_NAME="${EXP_NAME}_n${ACTUAL_NODES}"
+    echo "==> Allocation is ${ACTUAL_NODES} node(s), not the designed ${DESIGN_NODES}; EXP_NAME -> ${EXP_NAME}"
+fi
+
 # Set HF_HUB_OFFLINE=0 to allow hub downloads (models otherwise load from the
 # absolute local paths in the recipe).
 HF_HUB_OFFLINE_FLAG="${HF_HUB_OFFLINE:-1}"

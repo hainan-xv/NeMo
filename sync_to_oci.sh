@@ -22,17 +22,9 @@
 # ============================================================================
 set -euo pipefail
 
-BRANCH="${BRANCH:-SCRIPT_cc}"
-GITHUB_URL="${GITHUB_URL:-https://github.com/hainan-xv/NeMo.git}"
-OCI_HOST="${OCI_HOST:-draco-oci-dc-03.draco-oci-iad.nvidia.com}"
-OCI_USER="${OCI_USER:-hainanx}"
-SSH_KEY="${SSH_KEY:-$HOME/.ssh/draco-rno}"
-# Deliberately a DIFFERENT directory from the older NeMo_script_clean checkout so
-# this sync cannot hard-reset that tree out from under a running job. Must match
-# CODE_DIR in launch/script_baseline.sh.
-OCI_REPO="${OCI_REPO:-/lustre/fsw/portfolios/nemotron/users/hainanx/NeMo_SCRIPT_cc}"
-
 cd "$(dirname "${BASH_SOURCE[0]}")"
+# Host / key / grid path live in one place, shared with oci_launch.sh.
+source ./oci_env.sh
 
 # The local working branch is decoupled from the published one: whatever HEAD is,
 # it gets pushed to $BRANCH.
@@ -44,6 +36,9 @@ git add -u
 
 SCRIPT_PATHS=(
     sync_to_oci.sh
+    oci_env.sh
+    oci_launch.sh
+    oci_launch_interactive.sh
     launch/
     nemo/collections/speechlm2/parts/script.py
     nemo/collections/speechlm2/parts/script_messages.py
@@ -85,8 +80,7 @@ git push "$GITHUB_URL" "HEAD:$BRANCH"
 
 # --- Update the grid checkout over SSH ---
 # Quoted heredoc: nothing expands locally; the three args carry everything.
-ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no \
-    "${OCI_USER}@${OCI_HOST}" bash -s -- "$GITHUB_URL" "$BRANCH" "$OCI_REPO" <<'REMOTE'
+oci_ssh bash -s -- "$GITHUB_URL" "$BRANCH" "$OCI_REPO" <<'REMOTE'
 set -euo pipefail
 url="$1"; branch="$2"; repo="$3"
 
