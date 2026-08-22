@@ -45,114 +45,28 @@ Usage (reduce):
 """
 
 import argparse
-import glob
 import json
 import os
-import random
 import sys
 import time
 from collections import defaultdict
-from typing import Dict, List, Tuple
+from typing import List
 
-import numpy as np
-import soundfile
 import torch
 from tqdm import tqdm
 
-# leaderboard_wer / leaderboard_normalizer sit next to this file; sys.path[0] is
-# the script's own directory, so a plain import works when run as a script.
+# leaderboard_common sits next to this file; sys.path[0] is the script's own
+# directory, so a plain import works when run as a script. Sharing these with
+# nemotron_leaderboard_eval.py is what makes the two systems' numbers comparable.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from leaderboard_wer import WER  # noqa: E402
-
-_LEADERBOARD_SR = 16000
-
-# The 2026-08 public suite (TED-LIUM dropped; "cleaned" variants where published).
-DEFAULT_DATASETS = [
-    "librispeech:test.clean",
-    "librispeech:test.other",
-    "ami_cleaned:test",
-    "earnings22:test",
-    "gigaspeech_cleaned:test",
-    "spgispeech:test",
-    "voxpopuli_cleaned_aa:test",
-]
-
-
-def _log(msg: str) -> None:
-    print(msg, flush=True)
-
-
-# ---------------------------------------------------------------------------
-# Data
-# ---------------------------------------------------------------------------
-
-
-def parse_entries(spec: str) -> List[Tuple[str, str]]:
-    """``"librispeech:test.clean,ami_cleaned:test"`` -> ``[(name, split), ...]``."""
-    out = []
-    for entry in spec.split(","):
-        entry = entry.strip()
-        if not entry:
-            continue
-        name, _, split = entry.partition(":")
-        out.append((name, split or "test"))
-    return out
-
-
-def read_cache_manifest(cache_dir: str, dataset: str, split: str, max_samples: int = 0):
-    """Read one staged split: ``<cache_dir>/<dataset>/<split>/_cache_manifest.jsonl``."""
-    ds_dir = os.path.join(cache_dir, dataset, split)
-    manifest = os.path.join(ds_dir, "_cache_manifest.jsonl")
-    if not os.path.isfile(manifest):
-        raise FileNotFoundError(
-            f"No staged cache for {dataset}:{split} at {manifest}.\n"
-            f"Stage it first:  sbatch launch/stage_leaderboard_cache.sh"
-        )
-    paths, refs, durs = [], [], []
-    with open(manifest) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            rec = json.loads(line)
-            fp = rec["audio_filepath"]
-            if not os.path.exists(fp):
-                # Cache re-staged under a different root: retry by basename.
-                fp = os.path.join(ds_dir, os.path.basename(fp))
-                if not os.path.exists(fp):
-                    continue
-            paths.append(fp)
-            refs.append(rec.get("reference", rec.get("text", "")))
-            durs.append(float(rec.get("duration", 0.0)))
-            if max_samples and len(paths) >= max_samples:
-                break
-    return paths, refs, durs
-
-
-def load_audio_batch(paths: List[str], pad_extra_seconds: float = 0.0):
-    """Load a batch of 16 kHz mono wavs into ``(audios, audio_lens)``.
-
-    ``pad_extra_seconds`` of REAL trailing silence is appended and counted in
-    ``audio_lens``, mirroring the training dataloader's ``pad_extra_duration``.
-    The encoder therefore sees the same end-of-utterance context it was trained
-    on; dropping it changes exactly the final chunk, where delayed words land.
-    """
-    pad = int(round(pad_extra_seconds * _LEADERBOARD_SR))
-    waves = []
-    for p in paths:
-        w, sr = soundfile.read(p, dtype="float32")
-        if w.ndim > 1:
-            w = w.mean(axis=1)
-        if sr != _LEADERBOARD_SR:  # staging writes 16 kHz; guard against a stale cache
-            raise ValueError(f"{p} has sample rate {sr}, expected {_LEADERBOARD_SR}")
-        waves.append(w)
-    lens = [len(w) + pad for w in waves]
-    max_len = max(lens) if lens else 0
-    out = np.zeros((len(waves), max_len), dtype=np.float32)
-    for i, w in enumerate(waves):
-        out[i, : len(w)] = w
-    return torch.from_numpy(out), torch.tensor(lens, dtype=torch.long)
-
+from leaderboard_common import (  # noqa: E402
+    DEFAULT_DATASETS,
+    _log,
+    aggregate_results,
+    build_global_items,
+    load_audio_batch,
+    select_shard,
+)
 
 # ---------------------------------------------------------------------------
 # Model
@@ -212,37 +126,6 @@ def load_model(ckpt_path: str, model_class_path: str, device: torch.device, dtyp
     if unexpected:
         _log(f"    [warn] {len(unexpected)} unexpected keys (first 5): {list(unexpected)[:5]}")
     return model.eval().to(dtype).to(device)
-
-
-# ---------------------------------------------------------------------------
-# Sharding
-# ---------------------------------------------------------------------------
-
-
-def build_global_items(args) -> List[dict]:
-    """Pool every utterance of every dataset into one flat list."""
-    items: List[dict] = []
-    for name, split in parse_entries(args.datasets):
-        paths, refs, durs = read_cache_manifest(args.cache_dir, name, split, args.max_eval_samples)
-        key = f"{name}/{split}"
-        items.extend({"key": key, "path": p, "ref": r, "dur": d} for p, r, d in zip(paths, refs, durs))
-        _log(f"    {key}: {len(paths)} utts")
-    return items
-
-
-def select_shard(items: List[dict], num_shards: int, shard_index: int, seed: int) -> List[dict]:
-    """Deterministic, length-balanced shard.
-
-    The shuffle uses a seed shared by every process so all shards agree on the
-    same permutation and the union is exactly the pooled list. Sorting by
-    duration afterwards keeps each batch homogeneous, which matters because the
-    batch is padded to its longest clip.
-    """
-    order = list(range(len(items)))
-    random.Random(seed).shuffle(order)
-    shard = [items[j] for pos, j in enumerate(order) if pos % num_shards == shard_index]
-    shard.sort(key=lambda it: it["dur"])
-    return shard
 
 
 # ---------------------------------------------------------------------------
@@ -325,51 +208,6 @@ def evaluate_shard(model, args, device) -> None:
             bar.set_postfix_str(" ".join(f"{k.split('/')[0]}:{done[k]}/{total[k]}" for k in sorted(total)))
 
     _log(f"==> shard {args.shard_index} wrote {out_path} in {time.time() - t0:.1f}s")
-
-
-# ---------------------------------------------------------------------------
-# Aggregation
-# ---------------------------------------------------------------------------
-
-
-def aggregate_results(args) -> int:
-    files = sorted(glob.glob(os.path.join(args.output_dir, "shard*_of*.generations.jsonl")))
-    if not files:
-        _log(f"ERROR: no shard files under {args.output_dir}")
-        return 1
-    _log(f"==> aggregating {len(files)} shard file(s)")
-
-    groups: Dict[str, dict] = defaultdict(lambda: {"refs": [], "hyps": []})
-    for fp in files:
-        with open(fp) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                rec = json.loads(line)
-                groups[rec["key"]]["refs"].append(rec.get("reference", ""))
-                groups[rec["key"]]["hyps"].append(rec.get("hypothesis", ""))
-
-    results = []
-    for key in sorted(groups):
-        g = groups[key]
-        wer = WER(normalize=True, verbose=args.verbose)
-        wer.update(key, refs=g["refs"], hyps=g["hyps"])
-        val = float(wer.compute()["wer"]) * 100.0
-        results.append((key, val, len(g["refs"])))
-        # Machine-readable row; the launcher greps these for the wandb report.
-        _log(f"RESULT\t{key}\t{val:.2f}\t0.0\t{len(g['refs'])}")
-
-    _log("")
-    _log("  {:<30} {:>8} {:>10}".format("Dataset", "WER(%)", "N"))
-    _log("  " + "-" * 50)
-    for key, val, n in results:
-        _log("  {:<30} {:>8.2f} {:>10d}".format(key, val, n))
-    _log("  " + "-" * 50)
-    macro = sum(v for _, v, _ in results) / len(results) if results else 0.0
-    _log("  {:<30} {:>8.2f}".format("Average (macro)", macro))
-    _log(f"RESULT\tAverage\t{macro:.2f}\t0.0\t{sum(n for _, _, n in results)}")
-    return 0
 
 
 # ---------------------------------------------------------------------------
