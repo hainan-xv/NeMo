@@ -1,34 +1,34 @@
 # ============================================================================
 # SCRIPT streaming SpeechLM — Granary 2.0, LoRA, no-blank, val_wer.
-# FIXED-FRAME AUDIO WINDOW variant of streaming_stt_granary2_lora_script.yaml.
+# FLEX-ATTENTION baseline: identical training to
+# streaming_stt_granary2_lora_script.yaml, computed a faster way.
 #
-# The only change from the baseline recipe is model.audio_window_frames: 28.
+# Every training knob below is the same as the baseline recipe -- same chunk
+# sizes, same delay, same audio window, same optimizer, same data, same seed.
+# The ONLY changes are how the SCRIPT attention mask is applied and whether LLM
+# activations are recomputed in backward:
 #
-# In the baseline, each branch's audio window is a whole number of CHUNKS, so the
-# acoustic context scales with the emission granularity: a 2-frame chunk sees
-# 0.16s of audio while a 28-frame chunk sees 2.24s. The model therefore has to
-# cope with wildly different amounts of context depending on the latency it is
-# asked to run at.
+#   baseline: a dense (B, 1, T, T) additive mask. Correct, but the mask is only
+#     ~8% dense at these shapes, so almost all of the T^2 scores are computed and
+#     discarded -- and the score tensor is written and re-read every layer, which
+#     makes the step bandwidth-bound rather than compute-bound.
 #
-# Here every branch instead sees a CONSTANT 28 encoder frames (2.24s) ending at
-# its own chunk boundary, whatever the chunk size. Emission granularity and
-# acoustic context are decoupled: the chunk size still decides how often words
-# come out, but the model always predicts them from the same amount of audio.
+#   here: the same rule as a FlexAttention predicate. Fully-masked 128x128 blocks
+#     are skipped and no mask is materialised. Plus activation checkpointing.
 #
-# Two properties of the fixed window are worth knowing:
-#   * 28 frames is a FLOOR, not a cap. A branch never loses its own chunk's
-#     audio, so the 28-frame chunk still sees exactly its own 28 frames.
-#   * Early chunks are clamped at frame 0 rather than left-padded, so the first
-#     couple of branches simply have shorter windows.
+# The two compute the SAME function -- the predicate is asserted element-by-
+# element against build_script_mask, and logits and gradients were verified
+# against the dense path -- so this run should REPRODUCE the baseline's numbers
+# while being materially faster. Measured on one A100 at the baseline shape
+# (T=2395):
 #
-# This also interacts with the emission delay: a delayed word is emitted from a
-# later chunk, and a 28-frame window reaches back far enough to still contain its
-# acoustics even at the smallest chunk sizes -- which the baseline's per-chunk
-# window does not.
+#     dense + ckpt   13.4 GiB / 1.06 s        flex + ckpt   13.4 GiB / 0.49 s
+#     dense          53.4 GiB / 0.76 s (OOMs at batch 4; flex fits)
 #
-# Warm-start from granary2_script_baseline: the window change alters only how
-# much audio each branch sees, not any tensor shape, so the weights load cleanly
-# and the run only has to adapt to the wider, constant context.
+# Trains FROM SCRATCH with the baseline's seed, so the loss curve can be compared
+# against granary2_script_baseline step for step. A divergence means the backend
+# is wrong, not that the model changed. (For a cheaper check, warm-start from the
+# baseline instead: the first logged loss should match its current loss exactly.)
 # ============================================================================
 
 model:
@@ -44,23 +44,16 @@ model:
   att_context_size: [70, 1]  # left 70; right (look-ahead) set per batch to chunk-1
   audio_pad_to: 0
 
-  # --- SCRIPT ---
-  # Fixed-frame audio window: every branch sees the last 28 encoder frames
-  # (2.24s) ending at its chunk boundary, regardless of the chunk size drawn for
-  # the batch. Takes precedence over audio_history_chunks, which stays 0 here.
-  # Must match data.dataset.audio_window_frames (script_train.py asserts this).
-  audio_window_frames: 28
-  audio_history_chunks: 0
-
-  # --- Attention backend + activation checkpointing ---
-  # REQUIRED here: with a 28-frame window at chunk_size=2 the packed sequence
-  # reaches T~11000, and the dense (B,1,T,T) mask OOMs even at batch 1. The mask
-  # is ~2% dense, so FlexAttention skips ~95% of 128x128 blocks and never
-  # materialises it. Measured on one A100 at T=11001:
-  #     dense + ckpt   37.3 GiB / 7.78 s      flex + ckpt   26.4 GiB / 1.12 s
-  # Both compute the SAME function -- verified logits and gradients.
+  # --- Attention backend (the only change from the baseline recipe) ---
+  # dense | flex | script -- all mathematically identical. See the header for
+  # measured memory/step-time; decoding always falls back to SDPA.
   attn_backend: flex
   activation_checkpointing: true
+
+  # --- SCRIPT ---
+  # M: each branch's audio window spans chunks [k-M .. k]. 0 = current chunk only.
+  # Must match data.dataset.audio_history_chunks (script_train.py asserts this).
+  audio_history_chunks: 0
 
   # Decode-only validation. val_chunk_size pins one well-supported chunk size
   # instead of the largest candidate (whose look-ahead can be slow to stream).
@@ -116,7 +109,6 @@ data:
     frame_length_in_secs: ${model.frame_length_in_secs}
     chunk_size: ${model.chunk_size}
     audio_history_chunks: ${model.audio_history_chunks}
-    audio_window_frames: ${model.audio_window_frames}
     num_delay_frames: 3
     audio_tag: "<audio>"
     blank_token: ${model.blank_token}
@@ -182,7 +174,7 @@ trainer:
 exp_manager:
   exp_dir: null
   explicit_log_dir: null
-  name: streaming_stt_granary2_script_win28
+  name: streaming_stt_granary2_script_flex
   create_tensorboard_logger: true
   create_checkpoint_callback: true
   use_datetime_version: true

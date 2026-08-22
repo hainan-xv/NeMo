@@ -14,6 +14,7 @@
 """SCRIPT streaming SpeechLM — packed spine + per-chunk branches."""
 
 from collections import defaultdict
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import List, Optional, Union
 
@@ -35,8 +36,14 @@ from nemo.collections.speechlm2.parts.script import (
     build_spine_mask,
     build_twod_branch_mask,
 )
+from nemo.collections.speechlm2.parts.script_attention import script_attention_plan
 from nemo.collections.speechlm2.parts.utils import to_dataclass
 from nemo.utils import logging
+
+
+def _maybe_plan(plan):
+    """No-op context when the structured backend is not in use."""
+    return script_attention_plan(plan)
 
 
 @dataclass
@@ -65,6 +72,20 @@ class ScriptSTTModelConfig(StreamingSTTModelConfig):
             (default) processes every branch at once. The loss is unchanged:
             each group contributes a SUM and the batch-wide target count is the
             single denominator.
+        attn_backend: how the SCRIPT mask is applied during TRAINING.
+            ``"dense"`` builds the full ``(B, 1, T, T)`` additive mask -- correct
+            but it materialises a score tensor that is ~98% masked out, and at
+            long T the run is bandwidth-bound on it.
+            ``"flex"`` expresses the same rule as a FlexAttention predicate, so
+            fully-masked 128x128 blocks are skipped and no mask is materialised.
+            Measured at T=11001: 7.78s -> 1.12s per step and 37.3 -> 26.4 GiB.
+            ``"script"`` uses the structured decomposition
+            (:mod:`...parts.script_attention`) -- also exact, slightly slower than
+            flex, but needs no ``torch.compile``.
+            All three compute the SAME function; decoding always uses SDPA.
+        activation_checkpointing: recompute LLM layer activations in backward.
+            Roughly halves activation memory for ~30% more compute, and is what
+            makes the long-sequence configurations fit at all.
         val_chunk_size: chunk size used for the decode-only validation pass when
             training with multiple chunk sizes. Defaults to 14 when available,
             else the largest candidate.
@@ -90,6 +111,8 @@ class ScriptSTTModelConfig(StreamingSTTModelConfig):
     audio_window_frames: int = 0
     twod_layout: bool = False
     twod_branch_micro_batch: int = 0
+    attn_backend: str = "dense"
+    activation_checkpointing: bool = False
     val_chunk_size: Optional[int] = None
     val_max_new_tokens_per_chunk: Optional[int] = None
     val_system_prompt: Optional[str] = None
@@ -149,6 +172,18 @@ class ScriptSTTModel(StreamingSTTModel):
         self._audio_history_chunks = max(int(self.core_cfg.audio_history_chunks), 0)
         self._audio_window_frames = max(int(self.core_cfg.audio_window_frames), 0)
         self._twod_layout = bool(self.core_cfg.twod_layout)
+
+        self._attn_backend = str(self.core_cfg.attn_backend or "dense").lower()
+        if self._attn_backend not in ("dense", "flex", "script"):
+            raise ValueError(f"attn_backend must be dense|flex|script, got {self._attn_backend!r}")
+        if self._attn_backend == "script":
+            from nemo.collections.speechlm2.parts.script_attention import register_script_attention
+
+            register_script_attention()
+        if self.core_cfg.activation_checkpointing:
+            base = self.llm.get_base_model() if hasattr(self.llm, "get_base_model") else self.llm
+            base.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+            logging.info("ScriptSTTModel: activation checkpointing enabled on the LLM")
 
         # Audio-span delimiters and end-of-turn token, resolved once. These must
         # match ScriptSTTDataset, which builds the training layout with them.
@@ -215,6 +250,67 @@ class ScriptSTTModel(StreamingSTTModel):
                 batch.input_tokens, batch.audios, batch.audio_lens, batch.audio_frame_index
             )
         return self._build_input_embeds(batch.input_tokens, batch.audios, batch.audio_lens)["input_embeds"]
+
+    # ------------------------------------------------------------------
+    # Attention backend
+    # ------------------------------------------------------------------
+
+    @contextmanager
+    def _attn_implementation(self, name: str):
+        """Temporarily switch the LLM's attention backend.
+
+        Training may use flex/structured attention, but DECODING must not: the
+        decode loop passes an ordinary 2-D padding mask, which those backends do
+        not interpret. Scoping the switch to the training forward keeps
+        ``generate()`` on plain SDPA without a second model.
+        """
+        llm = self.llm.get_base_model() if hasattr(self.llm, "get_base_model") else self.llm
+        prev = getattr(llm.config, "_attn_implementation", None)
+        if prev == name:
+            yield
+            return
+        llm.set_attn_implementation(name)
+        try:
+            yield
+        finally:
+            if prev is not None:
+                llm.set_attn_implementation(prev)
+
+    @staticmethod
+    def _script_mask_mod(batch: ScriptBatch):
+        """The SCRIPT rule as a FlexAttention predicate.
+
+        A direct transcription of :func:`build_script_mask`; the equality of the
+        two is asserted in the tests.
+        """
+        seg, pos, pref, val = batch.seg_ids, batch.position_ids, batch.prefix_len, batch.valid
+
+        def mask_mod(b, h, q, kv):
+            qs, ks = seg[b, q], seg[b, kv]
+            qp, kp = pos[b, q], pos[b, kv]
+            q_spine, k_spine = qs == 0, ks == 0
+            causal = kp <= qp
+            return (
+                (q_spine & k_spine & causal)
+                | ((~q_spine) & k_spine & (kp < pref[b, q]))
+                | ((qs == ks) & (~q_spine) & causal)
+            ) & val[b, kv]
+
+        return mask_mod
+
+    def _training_attention(self, batch: ScriptBatch, dtype):
+        """(attn_implementation, attention_mask) for this batch's backend."""
+        if self._attn_backend == "flex":
+            from torch.nn.attention.flex_attention import create_block_mask
+
+            B, T = batch.seg_ids.shape
+            block_mask = create_block_mask(
+                self._script_mask_mod(batch), B=B, H=None, Q_LEN=T, KV_LEN=T, device=batch.seg_ids.device
+            )
+            return "flex_attention", block_mask
+        if self._attn_backend == "script":
+            return "script", None
+        return "eager", build_script_mask(batch.seg_ids, batch.position_ids, batch.prefix_len, batch.valid, dtype)
 
     # ------------------------------------------------------------------
     # 2-D layout: spine forwarded once, branches on a batch axis
@@ -357,14 +453,16 @@ class ScriptSTTModel(StreamingSTTModel):
             return self._twod_training_step(batch, batch_idx)
 
         input_embeds = self._script_input_embeds(batch)
-        mask = build_script_mask(batch.seg_ids, batch.position_ids, batch.prefix_len, batch.valid, input_embeds.dtype)
-        out = self._llm_forward(
-            inputs_embeds=input_embeds,
-            attention_mask=mask,
-            position_ids=batch.position_ids,
-            use_cache=False,
-            return_dict=True,
-        )
+        impl, mask = self._training_attention(batch, input_embeds.dtype)
+        plan = getattr(batch, "attn_plan", None)
+        with self._attn_implementation(impl), _maybe_plan(plan if self._attn_backend == "script" else None):
+            out = self._llm_forward(
+                inputs_embeds=input_embeds,
+                attention_mask=mask,
+                position_ids=batch.position_ids,
+                use_cache=False,
+                return_dict=True,
+            )
         logits = out["logits"]  # (B, T, V)
 
         target_ids = batch.target_tokens

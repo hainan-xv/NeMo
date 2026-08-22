@@ -48,6 +48,9 @@
 #
 # Knobs (env overrides):
 #   DELAY                -- emission delay in encoder frames (default 3)
+#   ATTN_BACKEND         -- dense | flex | script (default flex);
+#                           all identical mathematically, flex is fastest
+#   ACT_CKPT             -- recompute LLM activations in backward (default true)
 #   AUDIO_WINDOW_FRAMES  -- fixed audio window in frames (default 28)
 #   AUDIO_HISTORY_CHUNKS -- previous chunks of audio per branch (default 0;
 #                           ignored while AUDIO_WINDOW_FRAMES > 0)
@@ -106,6 +109,9 @@ WARMUP_STEPS="${WARMUP_STEPS:-10000}"
 
 # --- SCRIPT operating point ---
 DELAY="${DELAY:-3}"
+# dense | flex | script -- all mathematically identical; flex is fastest.
+ATTN_BACKEND="${ATTN_BACKEND:-flex}"
+ACT_CKPT="${ACT_CKPT:-true}"
 AUDIO_WINDOW_FRAMES="${AUDIO_WINDOW_FRAMES:-28}"
 AUDIO_HISTORY_CHUNKS="${AUDIO_HISTORY_CHUNKS:-0}"
 CHUNK_SIZES="${CHUNK_SIZES:-[2,4,7,10,14,28]}"
@@ -232,6 +238,8 @@ echo "*******STARTING********" \
     model.audio_history_chunks=${AUDIO_HISTORY_CHUNKS} \
     model.audio_window_frames=${AUDIO_WINDOW_FRAMES} \
     data.dataset.num_delay_frames=${DELAY} \
+    model.attn_backend=${ATTN_BACKEND} \
+    model.activation_checkpointing=${ACT_CKPT} \
     data.dataset.system_prompt="'${SYSTEM_PROMPT}'" \
     data.train_ds.seed=$LHOTSE_RND_SEED \
     ++trainer.limit_train_batches=$VAL_CHECK_INTERVAL \

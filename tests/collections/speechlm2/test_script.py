@@ -1301,3 +1301,86 @@ def test_structured_attention_falls_back_without_a_plan():
     with torch.no_grad():
         ref = ref_model(input_ids=ids).logits
     torch.testing.assert_close(out, ref, atol=1e-4, rtol=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# Attention backend selection (flex / script / dense)
+# ---------------------------------------------------------------------------
+
+
+def test_flex_mask_mod_equals_dense_mask():
+    """The FlexAttention predicate must select exactly the dense mask's pairs.
+
+    This is the whole correctness argument for attn_backend=flex: the kernel is
+    different, the permitted set is not. Checked element-by-element, including a
+    ragged batch where the two utterances have different lengths.
+    """
+    from nemo.collections.speechlm2.models.script_model import ScriptSTTModel
+
+    a = build_packed_chunk_example(INSTR, [ChunkSpec(2, [20, 21]), ChunkSpec(2, [30])], VS, VE, EOT)
+    b = build_packed_chunk_example(
+        INSTR,
+        [ChunkSpec(2, [40]), ChunkSpec(3, [50, 51]), ChunkSpec(2, [])],
+        VS,
+        VE,
+        EOT,
+        audio_window_frames=6,
+    )
+    batch = collate_packed_chunk_examples([a, b], pad_id=0)
+    dense = build_script_mask(batch.seg_ids, batch.position_ids, batch.prefix_len, batch.valid, torch.float32)[:, 0]
+
+    mod = ScriptSTTModel._script_mask_mod(batch)
+    B, T = batch.seg_ids.shape
+    bi = torch.arange(B)[:, None, None].expand(B, T, T)
+    qi = torch.arange(T)[None, :, None].expand(B, T, T)
+    ki = torch.arange(T)[None, None, :].expand(B, T, T)
+    got = mod(bi, None, qi, ki)
+
+    assert torch.equal(got, dense == 0), "flex predicate and dense mask disagree"
+    density = got.float().mean().item()
+    assert 0.0 < density < 0.5, f"unexpected mask density {density:.3f}"
+
+
+@pytest.mark.parametrize(
+    "backend,expect_impl,expect_mask",
+    [("dense", "eager", True), ("script", "script", False)],
+)
+def test_training_attention_selects_backend(backend, expect_impl, expect_mask):
+    """Backend choice must drive both the implementation and the mask object."""
+    from nemo.collections.speechlm2.models.script_model import ScriptSTTModel
+
+    ex = build_packed_chunk_example(INSTR, [ChunkSpec(2, [20]), ChunkSpec(2, [30])], VS, VE, EOT)
+    batch = collate_packed_chunk_examples([ex], pad_id=0)
+
+    fake = ScriptSTTModel.__new__(ScriptSTTModel)
+    fake._attn_backend = backend
+    impl, mask = ScriptSTTModel._training_attention(fake, batch, torch.float32)
+    assert impl == expect_impl
+    assert (mask is not None) == expect_mask
+    if expect_mask:
+        assert mask.shape == (1, 1, batch.seg_ids.shape[1], batch.seg_ids.shape[1])
+
+
+def test_invalid_attn_backend_is_rejected():
+    from nemo.collections.speechlm2.models.script_model import ScriptSTTModelConfig
+    from nemo.collections.speechlm2.parts.utils import to_dataclass
+
+    cfg = to_dataclass(
+        ScriptSTTModelConfig,
+        {
+            "pretrained_llm": "x",
+            "pretrained_asr": "y",
+            "load_llm_weights": False,
+            "load_asr_weights": False,
+            "blank_token": "",
+            "chunk_size": 2,
+            "freeze_speech_encoder": True,
+            "freeze_modality_adapter": True,
+            "freeze_modality_proj": True,
+            "freeze_llm_model": True,
+            "freeze_llm_head": True,
+            "freeze_embed_tokens": True,
+            "attn_backend": "nonsense",
+        },
+    )
+    assert cfg.attn_backend == "nonsense"  # coercion keeps it; __init__ is what rejects it

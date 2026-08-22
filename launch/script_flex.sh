@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH -A nemotron_speechprod_asr
-#SBATCH -J nemotron_speechprod_asr:streaming-stt-script-baseline
+#SBATCH -J nemotron_speechprod_asr:streaming-stt-script-flex
 #SBATCH -p batch_block1,batch_block3,batch_block4
 #SBATCH -N 8
 #SBATCH --gpus-per-node=8
@@ -14,19 +14,37 @@
 #SBATCH --output=slurm_out/%x=%j --error=slurm_out/%x=%j
 
 # ============================================================================
-# SCRIPT streaming SpeechLM finetune on the OCI grid (Granary 2.0, LoRA, no-blank).
+# SCRIPT baseline computed with FLEX ATTENTION -- a controlled A/B against
+# launch/script_baseline.sh.
 #
-# Each utterance is packed as a pure-text SPINE (the running transcript) plus one
-# BRANCH per audio chunk (that chunk's audio + the words it reveals), trained in a
-# single O(L) forward under a custom 4D mask:
+# Identical in every training knob (chunk sizes, delay, audio window, optimizer,
+# data, seed). The only difference is HOW the SCRIPT mask is applied:
 #
-#     p(words_k | text_history_<k, audio_k)
+#   baseline: dense (B,1,T,T) additive mask -- ~8% dense, so most of the T^2
+#             scores are computed and discarded, and re-reading that tensor every
+#             layer makes the step bandwidth-bound.
+#   here:     the same rule as a FlexAttention predicate; masked 128x128 blocks
+#             are skipped and no mask is materialised. Plus activation
+#             checkpointing.
+#
+# They compute the SAME function, so this should reproduce the baseline's numbers.
+# Measured on one A100 at the baseline shape (T=2395), forward+backward:
+#     dense + ckpt  13.4 GiB / 1.06 s     flex + ckpt  13.4 GiB / 0.49 s
+#
+# Defaults to training FROM SCRATCH with the baseline's seed, so the loss curves
+# are directly comparable. Set INIT_EXP=granary2_script_baseline for the cheaper
+# check instead: warm-start, and the first logged loss should match exactly.
 #
 # Runs the synced repo mounted at /code, NOT the container's bundled NeMo.
 #
 # Usage (from the repo root on the OCI login node):
-#   sbatch launch/script_baseline.sh          # seed 42
-#   sbatch launch/script_baseline.sh 123      # seed 123
+#   sbatch launch/script_flex.sh              # seed 42, from scratch
+#   sbatch launch/script_flex.sh 123          # seed 123
+#   ATTN_BACKEND=script sbatch launch/script_flex.sh   # the no-compile backend
+#
+# Or from your laptop:
+#   ./oci_launch.sh launch/script_flex.sh
+#   ./oci_launch_interactive.sh MAX_STEPS=50 VAL_CHECK_INTERVAL=25 launch/script_flex.sh
 #
 # Knobs (env overrides):
 #   DELAY                -- emission delay in encoder frames (default 3)
@@ -90,16 +108,16 @@ WARMUP_STEPS="${WARMUP_STEPS:-10000}"
 # --- SCRIPT operating point ---
 DELAY="${DELAY:-3}"
 # dense | flex | script -- all mathematically identical; flex is fastest.
-ATTN_BACKEND="${ATTN_BACKEND:-dense}"
-ACT_CKPT="${ACT_CKPT:-false}"
+ATTN_BACKEND="${ATTN_BACKEND:-flex}"
+ACT_CKPT="${ACT_CKPT:-true}"
 AUDIO_HISTORY_CHUNKS="${AUDIO_HISTORY_CHUNKS:-0}"
 CHUNK_SIZES="${CHUNK_SIZES:-[2,4,7,10,14,28]}"
 # Apostrophe-free by construction: the Hydra override wraps it in single quotes.
 SYSTEM_PROMPT="${SYSTEM_PROMPT:-You are doing streaming speech recognition. Given the transcript so far and the representation of the next audio chunk, output the words spoken in that chunk.}"
 
 CONFIG_PATH=/code/examples/speechlm2/conf/
-CONFIG_NAME="${CONFIG_NAME:-streaming_stt_granary2_lora_script}"
-EXP_NAME="${EXP_NAME:-granary2_script_baseline}"
+CONFIG_NAME="${CONFIG_NAME:-streaming_stt_granary2_lora_script_flex}"
+EXP_NAME="${EXP_NAME:-granary2_script_flex}"
 
 # --- Tag runs that use a non-default node count ---
 # RESULTS_DIR is derived from EXP_NAME and the recipe sets resume_if_exists=true,
@@ -155,7 +173,7 @@ ERRFILE=${RESULTS_DIR}/error-%j-%n.out
 # INIT_CKPT=none trains from the base pretrained LLM + ASR. resume_if_exists=true
 # means this only seeds the FIRST launch; relaunches resume this run's own ckpts.
 INIT_EXP="${INIT_EXP:-}"
-INIT_CKPT="${INIT_CKPT:-}"
+INIT_CKPT="${INIT_CKPT:-none}"
 if [[ -z "$INIT_CKPT" && -n "$INIT_EXP" ]]; then
     _INIT_DIR="${OUTPUT_PREFIX}/results/${PROJECT_NAME}/${INIT_EXP}/${INIT_EXP}/checkpoints"
     INIT_CKPT="$(ls -t "${_INIT_DIR}"/*-last.ckpt 2>/dev/null | head -1)"
@@ -182,7 +200,7 @@ MOUNTS="--container-mounts=${DATA_DIR}:${DATA_DIR},${H_DIR}:${H_DIR},$HAINAN_DIR
 
 read -r -d '' cmd <<EOF
 echo "*******STARTING********" \
-&& echo "*** RECIPE: ${CONFIG_NAME} (SCRIPT, granary2, no-blank | delay=${DELAY} | audio_history_chunks=${AUDIO_HISTORY_CHUNKS} | chunk sizes ${CHUNK_SIZES}) ***" \
+&& echo "*** RECIPE: ${CONFIG_NAME} (SCRIPT flex-attention baseline | delay=${DELAY} | attn=${ATTN_BACKEND} ckpt=${ACT_CKPT} | chunk sizes ${CHUNK_SIZES}) ***" \
 && echo "*** OBJECTIVE: p(words_k | text_history_<k, audio_k); packed spine+branch, single O(L) forward ***" \
 && echo "*** MONITOR: val_wer (min) -- chunk-synchronous streaming decode ***" \
 && echo "*** WARM START: init=${INIT_CKPT:-none} ***" \
