@@ -56,6 +56,9 @@ class ScriptSTTModelConfig(StreamingSTTModelConfig):
         encode_batch_size: sub-batch size for the offline encode. A single
             full-batch encode of long, length-sorted clips can overflow 32-bit
             CUDA indexing in the subsampling convolution.
+        force_word_start: insert a leading-space token when a chunk's first
+            decoded token is not a word start, so the chunk cannot merge onto the
+            previous chunk's last word. Overridable per ``generate`` call.
         log_detailed_train_metrics: also log sequence length / target counts.
     """
 
@@ -66,6 +69,7 @@ class ScriptSTTModelConfig(StreamingSTTModelConfig):
     val_prompt_field: str = "system_prompt"
     max_history_tokens: int = 0
     encode_batch_size: int = 8
+    force_word_start: bool = True
     log_detailed_train_metrics: bool = False
 
 
@@ -125,6 +129,10 @@ class ScriptSTTModel(StreamingSTTModel):
         self._eot_id = hf_tok.eos_token_id
         if self._eot_id is None:
             raise ValueError("Tokenizer has no eos_token_id; it is required as the branch end-of-turn token.")
+
+        # Lazily resolved leading-space token used to guarantee a word boundary at
+        # the start of a chunk; see _get_word_start_insert_id.
+        self._word_start_insert_id: Optional[int] = None
 
         self._val_system_prompt = self.core_cfg.val_system_prompt
         if self._val_system_prompt is None and data_cfg is not None:
@@ -346,6 +354,39 @@ class ScriptSTTModel(StreamingSTTModel):
     # Inference
     # ------------------------------------------------------------------
 
+    def _is_word_start(self, token_id: int) -> bool:
+        """Whether ``token_id``'s surface form begins a new word.
+
+        Both the GPT-2/Qwen byte-level marker (``Ġ``) and the SentencePiece
+        marker (``▁``) are recognised, so this works across tokenizer families.
+        """
+        tok = self.tokenizer.tokenizer.convert_ids_to_tokens(int(token_id))
+        return isinstance(tok, str) and (tok.startswith("Ġ") or tok.startswith("▁"))
+
+    def _get_word_start_insert_id(self) -> Optional[int]:
+        """Token id of a lone leading-space subword, cached after first lookup.
+
+        Inserted in front of a chunk's first token when that token is not itself a
+        word start, so the chunk cannot merge onto the previous chunk's last word
+        ("border ruffian" -> "bordereruffian"). Returns ``None`` — disabling the
+        guard — if the tokenizer has no such standalone token.
+        """
+        if self._word_start_insert_id is None:
+            hf_tok = self.tokenizer.tokenizer
+            unk = getattr(hf_tok, "unk_token_id", None)
+            self._word_start_insert_id = -1  # sentinel: resolved but absent
+            for marker in ("Ġ", "▁"):
+                tid = hf_tok.convert_tokens_to_ids(marker)
+                if tid is not None and tid >= 0 and (unk is None or tid != unk) and self._is_word_start(tid):
+                    self._word_start_insert_id = int(tid)
+                    break
+            if self._word_start_insert_id == -1:
+                logging.warning(
+                    "ScriptSTTModel: tokenizer has no standalone word-start token; "
+                    "chunk-start word-boundary insertion is disabled."
+                )
+        return self._word_start_insert_id if self._word_start_insert_id != -1 else None
+
     def encode_frames(self, audios: Tensor, audio_lens: Tensor, chunk_size: int) -> List[Tensor]:
         """Encode a batch of waveforms into per-utterance encoder-frame sequences.
 
@@ -409,6 +450,11 @@ class ScriptSTTModel(StreamingSTTModel):
             system_prompt = [system_prompt] * B
 
         max_history_tokens = int(generation_kwargs.pop("max_history_tokens", self.core_cfg.max_history_tokens))
+        # Guarantee that each chunk's first emitted token starts a new word. On by
+        # default: without it a chunk whose first token is a continuation merges
+        # onto the previous chunk's last word.
+        force_word_start = bool(generation_kwargs.pop("force_word_start", self.core_cfg.force_word_start))
+        insert_word_start_id = self._get_word_start_insert_id() if force_word_start else None
 
         frames_list = self.encode_frames(audios, audio_lens, cs)
         # Same instruction/history separator the dataset uses when building the spine.
@@ -428,5 +474,7 @@ class ScriptSTTModel(StreamingSTTModel):
             device=self.device,
             audio_history_chunks=self._audio_history_chunks,
             max_history_tokens=max_history_tokens,
+            is_word_start=self._is_word_start if insert_word_start_id is not None else None,
+            insert_word_start_id=insert_word_start_id,
         )
         return [self.tokenizer.ids_to_text(ids) if ids else "" for ids in emitted]

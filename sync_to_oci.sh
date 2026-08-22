@@ -50,6 +50,12 @@ SCRIPT_PATHS=(
     examples/speechlm2/script_train.py
     'examples/speechlm2/conf/streaming_stt_granary2_lora_script*.yaml'
     tests/collections/speechlm2/test_script.py
+    scripts/script_leaderboard_eval.py
+    scripts/average_script_ckpts.py
+    scripts/leaderboard_wer.py
+    scripts/leaderboard_normalizer/
+    scripts/stage_leaderboard_cache.py
+    scripts/eval_wandb_report.py
 )
 for p in "${SCRIPT_PATHS[@]}"; do
     # Globs may legitimately match nothing; a missing path is not an error.

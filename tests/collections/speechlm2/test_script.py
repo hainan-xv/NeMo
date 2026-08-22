@@ -616,6 +616,55 @@ def test_decode_matches_teacher_forced_packed_layout():
 
 
 @torch.no_grad()
+def test_decode_inserts_word_start_when_chunk_would_merge():
+    """A chunk whose first token is a continuation must not glue onto the previous word.
+
+    SCRIPT emits whole words per chunk and the history already ends with the
+    previous chunk's last word, so a chunk starting with a non-word-start token
+    would render as "border"+"ruffian" -> "borderruffian". The decoder inserts a
+    leading-space token instead of constraining the model's output distribution
+    (constraining can starve a chunk into emitting nothing).
+    """
+    H, cs = 32, 4
+    WORD, SPACE = 40, 41
+
+    class _FixedLLM:
+        """Emits WORD once per chunk, then <eot>."""
+
+        def __call__(self, inputs_embeds, **kw):
+            b, t = inputs_embeds.shape[0], inputs_embeds.shape[1]
+            logits = torch.zeros(b, t, 128)
+            logits[..., WORD if kw.get("past_key_values") is None else EOT] = 1.0
+            return type("Out", (), {"logits": logits, "past_key_values": object()})()
+
+    embed = torch.nn.Embedding(128, H)
+    frames = torch.randn(2 * cs, H)  # exactly two chunks
+
+    def run(**kw):
+        return batched_stream_decode_script(
+            llm=_FixedLLM(),
+            embed_tokens=embed,
+            instruction_ids_list=[[5, 6]],
+            frames_list=[frames],
+            chunk_size=cs,
+            vision_start_id=VS,
+            vision_end_id=VE,
+            eot_id=EOT,
+            pad_id=0,
+            max_new_tokens=4,
+            **kw,
+        )[0]
+
+    # WORD is never a word start, so chunk 2 would merge onto chunk 1's output.
+    assert run() == [WORD, WORD]
+    assert run(is_word_start=lambda t: False, insert_word_start_id=SPACE) == [WORD, SPACE, WORD]
+    # A token that IS a word start needs no help.
+    assert run(is_word_start=lambda t: True, insert_word_start_id=SPACE) == [WORD, WORD]
+    # The guard never fires on the first chunk -- there is nothing to merge onto.
+    assert run(is_word_start=lambda t: False, insert_word_start_id=SPACE)[0] == WORD
+
+
+@torch.no_grad()
 def test_decode_pads_partial_final_chunk_to_training_length():
     """The last chunk is zero-padded to a full window, matching training.
 
