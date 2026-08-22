@@ -177,6 +177,13 @@ def main():
     p.add_argument("--lora_r", type=int, default=128)
     p.add_argument("--lora_alpha", type=int, default=256)
     p.add_argument("--dtype", choices=["bf16", "fp32"], default="bf16")
+    p.add_argument(
+        "--parity_dtypes",
+        nargs="+",
+        default=["fp32", "bf16"],
+        help="run the parity check in each of these; fp32 is the decisive one",
+    )
+    p.add_argument("--skip_memory", action="store_true")
     args = p.parse_args()
 
     assert torch.cuda.is_available(), "this diagnostic needs a GPU"
@@ -202,43 +209,64 @@ def main():
     log("=" * 74)
     log("1. PARITY  (flex BlockMask vs dense 4D mask)")
     log("=" * 74)
-    small = build_batch(1, args.chunk_frames, args.window_frames, 24, args.words_every, 128)
+    small = to_device(build_batch(1, args.chunk_frames, args.window_frames, 24, args.words_every, 128), device)
     Ts = small.input_ids.shape[1]
-    small = to_device(small, device)
-    torch.manual_seed(0)
     n_frames = int(small.audio_frame_index.max()) + 1
 
-    logits, grads = {}, {}
-    for kind in ("dense", "flex"):
-        impl = "eager" if kind == "dense" else "flex_attention"
-        m = load_llm(args.llm, impl, dtype, device, args.lora_r, args.lora_alpha)
-        torch.manual_seed(0)
-        frames = torch.randn(n_frames, m.config.hidden_size, device=device, dtype=dtype)
-        ids = small.input_ids.clone()
-        amask = ids == AUDIO_TOKEN_IDX
-        ids[amask] = 0
-        emb = m.get_input_embeddings()(ids)
-        emb = torch.where(amask.unsqueeze(-1), frames[small.audio_frame_index.clamp(min=0)], emb)
-        mask = build_mask(kind, small, dtype, device)
-        lg = step(m, small, mask, emb, do_backward=True)
-        logits[kind] = lg.detach().float().cpu()
-        g = [p.grad.detach().float().cpu() for _, p in sorted(m.named_parameters()) if p.grad is not None]
-        grads[kind] = g
-        log(f"  {kind:5s}: T={Ts} logits{tuple(lg.shape)} grads_captured={len(g)}")
-        del m, emb, mask, lg
-        gc.collect()
-        torch.cuda.empty_cache()
+    # Run in fp32 as well as bf16. Two different attention kernels accumulating in
+    # bf16 across 28 layers disagree by a visible amount even when they compute the
+    # same function, so bf16 alone cannot distinguish "wrong mask" from "rounding".
+    # fp32 is the decisive arm: a genuine mask difference stays large there.
+    for pdtype_name in args.parity_dtypes:
+        pdtype = torch.float32 if pdtype_name == "fp32" else torch.bfloat16
+        logits, grads = {}, {}
+        for kind in ("dense", "flex"):
+            impl = "eager" if kind == "dense" else "flex_attention"
+            # Seed BEFORE constructing the model: get_peft_model draws lora_A
+            # randomly, so both arms must be seeded identically or they are
+            # different models (lora_B is zero-init, so this shows up in the
+            # gradients rather than the forward).
+            torch.manual_seed(0)
+            m = load_llm(args.llm, impl, pdtype, device, args.lora_r, args.lora_alpha)
+            torch.manual_seed(0)
+            frames = torch.randn(n_frames, m.config.hidden_size, device=device, dtype=pdtype)
+            ids = small.input_ids.clone()
+            amask = ids == AUDIO_TOKEN_IDX
+            ids[amask] = 0
+            emb = m.get_input_embeddings()(ids)
+            emb = torch.where(amask.unsqueeze(-1), frames[small.audio_frame_index.clamp(min=0)], emb)
+            mask = build_mask(kind, small, pdtype, device)
+            lg = step(m, small, mask, emb, do_backward=True)
+            logits[kind] = lg.detach().float().cpu()
+            grads[kind] = [
+                p.grad.detach().float().cpu() for _, p in sorted(m.named_parameters()) if p.grad is not None
+            ]
+            del m, emb, mask, lg, frames
+            gc.collect()
+            torch.cuda.empty_cache()
 
-    dl = (logits["dense"] - logits["flex"]).abs().max().item()
-    log(f"  max |dlogit| = {dl:.3e}   -> {'PASS' if dl < 1e-2 else 'FAIL'} (bf16 tolerance)")
-    if len(grads["dense"]) == len(grads["flex"]) and grads["dense"]:
-        dg = max((a - b).abs().max().item() for a, b in zip(grads["dense"], grads["flex"]))
-        log(f"  max |dgrad|  = {dg:.3e}   -> {'PASS' if dg < 1e-2 else 'FAIL'}")
-    else:
-        log("  gradient comparison skipped (parameter sets differ)")
+        a, b = logits["dense"], logits["flex"]
+        dl = (a - b).abs().max().item()
+        rel = dl / a.abs().max().item()
+        # If the mask differed, the models would disagree about WHICH token comes
+        # next, not merely about the last few bits of the logit.
+        agree = (a.argmax(-1) == b.argmax(-1)).float().mean().item()
+        tol = 1e-4 if pdtype is torch.float32 else 5e-2
+        verdict = "PASS" if dl < tol else "FAIL"
+        log(
+            f"  [{pdtype_name}] T={Ts}  max|dlogit|={dl:.3e}  rel={rel:.2e}  "
+            f"argmax agreement={agree*100:.2f}%  -> {verdict} (tol {tol:g})"
+        )
+        if len(grads["dense"]) == len(grads["flex"]) and grads["dense"]:
+            dg = max((x - y).abs().max().item() for x, y in zip(grads["dense"], grads["flex"]))
+            gmax = max(x.abs().max().item() for x in grads["dense"])
+            log(f"  [{pdtype_name}] max|dgrad|={dg:.3e}  (grad scale {gmax:.3e}, rel {dg/max(gmax,1e-12):.2e})")
     log("")
 
     # ---------------- 2. memory at the failing shape ----------------
+    if args.skip_memory:
+        log("(memory section skipped)")
+        return
     log("=" * 74)
     log(f"2. PEAK MEMORY at the OOM shape (T={T}), forward+backward")
     log("=" * 74)
