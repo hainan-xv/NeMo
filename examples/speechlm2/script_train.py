@@ -51,7 +51,7 @@ def train(cfg):
     # dataset builds each branch's window from them, and the model rebuilds the
     # same window at inference. A mismatch trains and decodes on different
     # conditioning, which is silent and hard to spot, so fail loudly here.
-    for key in ("audio_history_chunks", "audio_window_frames"):
+    for key in ("audio_history_chunks", "audio_window_frames", "twod_layout"):
         model_val = int(cfg.model.get(key, 0) or 0)
         data_val = int(dataset_cfg.get(key, 0) or 0)
         if model_val != data_val:

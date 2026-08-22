@@ -27,7 +27,9 @@ from nemo.collections.speechlm2.parts.alignments import WordAlignment
 from nemo.collections.speechlm2.parts.script import (
     ChunkSpec,
     build_packed_chunk_example,
+    build_twod_chunk_example,
     collate_packed_chunk_examples,
+    collate_twod_chunk_examples,
 )
 from nemo.collections.speechlm2.parts.script_messages import get_llm_messages_for_batch
 from nemo.collections.speechlm2.parts.utils import to_dataclass
@@ -47,12 +49,17 @@ class ScriptSTTDataConfig(StreamingSTTDataConfig):
             of chunks, so the acoustic context is constant across chunk sizes.
             Takes precedence over ``audio_history_chunks``. Must match
             ``model.audio_window_frames``.
+        twod_layout: emit the 2-D layout (spine + branches on a batch axis)
+            instead of one flat packed sequence. Mathematically identical -- see
+            ``test_parity_twod_vs_flat`` -- but it never materialises the
+            cross-branch attention pairs. Must match ``model.twod_layout``.
         chunk_size_seed: base seed for the per-batch chunk-size draw. Offset per
             dataloader worker so workers do not draw identical sequences.
     """
 
     audio_history_chunks: int = 0
     audio_window_frames: int = 0
+    twod_layout: bool = False
     chunk_size_seed: int = 1234
 
 
@@ -90,6 +97,8 @@ class ScriptBatch:
     text: Optional[List[str]] = None
     cuts: Optional[object] = None
     chunk_size: Optional[int] = None
+    # 2-D layout only (twod_layout=True); the flat fields above are then unset.
+    twod: Optional[object] = None
 
 
 class ScriptSTTDataset(StreamingSTTDataset):
@@ -123,6 +132,7 @@ class ScriptSTTDataset(StreamingSTTDataset):
 
         self._audio_history_chunks = max(int(self.cfg.audio_history_chunks), 0)
         self._audio_window_frames = max(int(self.cfg.audio_window_frames), 0)
+        self._twod_layout = bool(self.cfg.twod_layout)
         if self._audio_window_frames > 0 and self._audio_history_chunks > 0:
             logging.warning(
                 "Both audio_window_frames=%d and audio_history_chunks=%d are set; "
@@ -153,7 +163,7 @@ class ScriptSTTDataset(StreamingSTTDataset):
 
         logging.info(
             "ScriptSTTDataset: audio delimiters %r=%d / %r=%d, eot_id=%d, "
-            "audio_history_chunks=%d, audio_window_frames=%d",
+            "audio_history_chunks=%d, audio_window_frames=%d, twod_layout=%s",
             self.audio_open_token,
             self.vision_start_id,
             self.audio_close_token,
@@ -161,6 +171,7 @@ class ScriptSTTDataset(StreamingSTTDataset):
             self.eot_id,
             self._audio_history_chunks,
             self._audio_window_frames,
+            self._twod_layout,
         )
 
     def _get_chunk_rng(self) -> np.random.Generator:
@@ -236,13 +247,14 @@ class ScriptSTTDataset(StreamingSTTDataset):
             transcripts=text,
         )
 
+        builder = build_twod_chunk_example if self._twod_layout else build_packed_chunk_example
         examples = []
         for messages, sysp in zip(batch_messages, system_prompts):
             # Instruction/history separator: the trailing newline keeps the first
             # history word from BPE-merging into the instruction text.
             instruction_ids = self.tokenizer.text_to_ids(sysp + "\n")
             examples.append(
-                build_packed_chunk_example(
+                builder(
                     instruction_ids=instruction_ids,
                     chunks=self._messages_to_chunks(messages),
                     vision_start_id=self.vision_start_id,
@@ -251,6 +263,16 @@ class ScriptSTTDataset(StreamingSTTDataset):
                     audio_history_chunks=self._audio_history_chunks,
                     audio_window_frames=self._audio_window_frames,
                 )
+            )
+
+        if self._twod_layout:
+            return ScriptBatch(
+                audios=audios,
+                audio_lens=audio_lens,
+                twod=collate_twod_chunk_examples(examples, pad_id=self.tokenizer.pad_id),
+                text=text,
+                cuts=cuts,
+                chunk_size=chunk_size,
             )
 
         packed = collate_packed_chunk_examples(examples, pad_id=self.tokenizer.pad_id)

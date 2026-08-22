@@ -40,7 +40,10 @@ from nemo.collections.speechlm2.parts.script import (
     build_packed_chunk_example,
     build_script_mask,
     build_separate_chunk_examples,
+    build_twod_branch_mask,
+    build_twod_chunk_example,
     collate_packed_chunk_examples,
+    collate_twod_chunk_examples,
 )
 from nemo.collections.speechlm2.parts.script_messages import get_llm_messages_for_sample
 
@@ -55,6 +58,18 @@ def _blocked(v) -> bool:
 
 def _allowed(v) -> bool:
     return float(v) == 0.0
+
+
+def _shallow_broadcast(cache, n):
+    """Shallow-copy a KV cache with its layers broadcast to ``n`` rows."""
+    import copy
+
+    out = copy.copy(cache)
+    out.layers = [copy.copy(layer) for layer in cache.layers]
+    for layer in out.layers:
+        layer.keys = layer.keys[:1].expand(n, -1, -1, -1)
+        layer.values = layer.values[:1].expand(n, -1, -1, -1)
+    return out
 
 
 def _mask_of(packed):
@@ -896,3 +911,264 @@ def test_offline_encode_leaks_future_without_chunk_limiting():
     y_perturbed, _ = enc(audio_signal=x_perturbed, length=lens)
 
     assert (y_ref[:, :, :split] - y_perturbed[:, :, :split]).abs().max() > 1e-3
+
+
+# ---------------------------------------------------------------------------
+# 2-D layout: spine forwarded once, branches on a batch axis
+# ---------------------------------------------------------------------------
+
+
+def test_twod_layout_matches_flat_structurally():
+    """The 2-D builder must lay out the same tokens, positions and targets."""
+    chunks = [ChunkSpec(2, [20, 21]), ChunkSpec(3, [30]), ChunkSpec(2, []), ChunkSpec(2, [40, 41, 42])]
+    flat = build_packed_chunk_example(INSTR, chunks, VS, VE, EOT)
+    two = build_twod_chunk_example(INSTR, chunks, VS, VE, EOT)
+
+    assert two.spine_len == flat.spine_len
+    assert two.spine_ids.tolist() == flat.input_ids[: flat.spine_len].tolist()
+    assert two.spine_positions.tolist() == flat.position_ids[: flat.spine_len].tolist()
+
+    for k in range(len(chunks)):
+        idx = (flat.seg_ids == k + 1).nonzero(as_tuple=True)[0]
+        n = int(two.branch_valid[k].sum())
+        assert n == len(idx), f"branch {k}: {n} tokens vs flat {len(idx)}"
+        assert two.branch_ids[k, :n].tolist() == flat.input_ids[idx].tolist()
+        assert two.branch_positions[k, :n].tolist() == flat.position_ids[idx].tolist()
+        assert two.branch_targets[k, :n].tolist() == flat.target_ids[idx].tolist()
+        assert two.branch_frame_index[k, :n].tolist() == flat.audio_frame_index[idx].tolist()
+        assert int(two.branch_prefix[k]) == int(flat.prefix_len[idx[0]])
+
+
+def test_twod_branch_mask_grants_prefix_and_own_causal():
+    chunks = [ChunkSpec(2, [20]), ChunkSpec(2, [21, 22])]
+    two = build_twod_chunk_example(INSTR, chunks, VS, VE, EOT)
+    P = two.spine_len
+    m = build_twod_branch_mask(two.branch_prefix, two.branch_valid, P, torch.float32)[:, 0]
+
+    for k in range(len(chunks)):
+        pref = int(two.branch_prefix[k])
+        n = int(two.branch_valid[k].sum())
+        for j in range(n):
+            for i in range(P):  # spine half: exactly its own history prefix
+                assert _allowed(m[k, j, i]) if i < pref else _blocked(m[k, j, i])
+            for jj in range(two.branch_ids.shape[1]):  # own half: causal, no padding
+                ok = jj <= j and bool(two.branch_valid[k, jj])
+                assert _allowed(m[k, j, P + jj]) if ok else _blocked(m[k, j, P + jj])
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("audio_history_chunks,audio_window_frames", [(0, 0), (1, 0), (0, 6), (0, 28)])
+def test_parity_twod_vs_flat(audio_history_chunks, audio_window_frames):
+    """THE GATE: the 2-D layout must reproduce the flat path's branch logits.
+
+    Forwards the spine once with ``use_cache=True``, broadcasts its K/V across the
+    branch axis, then runs every branch as one batch against a 4D mask. If this
+    holds, the 2-D form is a pure restructuring -- same model, same gradients --
+    and a checkpoint trained either way is valid for the other.
+    """
+    model = _tiny_qwen3()
+    H = model.config.hidden_size
+    instruction = [5, 6, 7]
+    chunks = [
+        ChunkSpec(audio_len=2, target_ids=[20, 21]),
+        ChunkSpec(audio_len=3, target_ids=[30]),
+        ChunkSpec(audio_len=2, target_ids=[]),  # silent chunk
+        ChunkSpec(audio_len=2, target_ids=[40, 41, 42]),  # ragged branch length
+    ]
+    torch.manual_seed(3)
+    frames = torch.randn(sum(c.audio_len for c in chunks), H)
+    kw = dict(audio_history_chunks=audio_history_chunks, audio_window_frames=audio_window_frames)
+
+    # --- reference: one flat sequence + the 4D SCRIPT mask ---
+    flat = build_packed_chunk_example(instruction, chunks, VS, VE, EOT, **kw)
+    flat_emb = _embed_with_audio(model, flat.input_ids, flat.is_audio, frames[flat.audio_frame_index[flat.is_audio]])
+    flat_logits = model(
+        inputs_embeds=flat_emb[None],
+        attention_mask=_mask_of(flat)[None, None],
+        position_ids=flat.position_ids[None],
+    ).logits[0]
+
+    # --- candidate: spine once, branches batched against the shared cache ---
+    two = build_twod_chunk_example(instruction, chunks, VS, VE, EOT, **kw)
+    P, N = two.spine_len, two.branch_ids.shape[0]
+
+    spine_emb = model.get_input_embeddings()(two.spine_ids[None])
+    cache = model(inputs_embeds=spine_emb, position_ids=two.spine_positions[None], use_cache=True).past_key_values
+
+    # Broadcast, never copy: materialising the spine K/V per branch would cost
+    # more than the whole layout saves.
+    for layer in cache.layers:
+        layer.keys = layer.keys.expand(N, -1, -1, -1)
+        layer.values = layer.values.expand(N, -1, -1, -1)
+        assert layer.keys.stride()[0] == 0, "spine cache was copied, not broadcast"
+
+    br_audio = two.branch_frame_index >= 0
+    br_emb = _embed_with_audio(model, two.branch_ids, br_audio, frames[two.branch_frame_index[br_audio]])
+    two_logits = model(
+        inputs_embeds=br_emb,
+        attention_mask=build_twod_branch_mask(two.branch_prefix, two.branch_valid, P, br_emb.dtype),
+        position_ids=two.branch_positions,
+        past_key_values=cache,
+        use_cache=False,
+    ).logits
+
+    for k in range(N):
+        idx = (flat.seg_ids == k + 1).nonzero(as_tuple=True)[0]
+        n = int(two.branch_valid[k].sum())
+        torch.testing.assert_close(two_logits[k, :n], flat_logits[idx], atol=1e-4, rtol=1e-4)
+
+
+def test_parity_twod_vs_flat_gradients():
+    """Equivalence must hold for the backward too, or training would differ."""
+    model = _tiny_qwen3()
+    H = model.config.hidden_size
+    instruction = [5, 6]
+    chunks = [ChunkSpec(2, [20, 21]), ChunkSpec(2, [30]), ChunkSpec(2, [40, 41])]
+    torch.manual_seed(4)
+    frames = torch.randn(sum(c.audio_len for c in chunks), H)
+
+    def loss_and_grads(which):
+        model.zero_grad(set_to_none=True)
+        if which == "flat":
+            flat = build_packed_chunk_example(instruction, chunks, VS, VE, EOT)
+            emb = _embed_with_audio(
+                model, flat.input_ids, flat.is_audio, frames[flat.audio_frame_index[flat.is_audio]]
+            )
+            logits = model(
+                inputs_embeds=emb[None],
+                attention_mask=_mask_of(flat)[None, None],
+                position_ids=flat.position_ids[None],
+            ).logits[0]
+            tgt = flat.target_ids
+        else:
+            two = build_twod_chunk_example(instruction, chunks, VS, VE, EOT)
+            P, N = two.spine_len, two.branch_ids.shape[0]
+            spine_emb = model.get_input_embeddings()(two.spine_ids[None])
+            cache = model(
+                inputs_embeds=spine_emb, position_ids=two.spine_positions[None], use_cache=True
+            ).past_key_values
+            for layer in cache.layers:
+                layer.keys = layer.keys.expand(N, -1, -1, -1)
+                layer.values = layer.values.expand(N, -1, -1, -1)
+            br_audio = two.branch_frame_index >= 0
+            emb = _embed_with_audio(model, two.branch_ids, br_audio, frames[two.branch_frame_index[br_audio]])
+            logits = model(
+                inputs_embeds=emb,
+                attention_mask=build_twod_branch_mask(two.branch_prefix, two.branch_valid, P, emb.dtype),
+                position_ids=two.branch_positions,
+                past_key_values=cache,
+                use_cache=False,
+            ).logits
+            logits, tgt = logits.flatten(0, 1), two.branch_targets.flatten(0, 1)
+        loss = torch.nn.functional.cross_entropy(
+            logits.reshape(-1, logits.shape[-1]), tgt.reshape(-1), ignore_index=IGNORE_INDEX
+        )
+        loss.backward()
+        g = {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}
+        return float(loss), g
+
+    l_flat, g_flat = loss_and_grads("flat")
+    l_two, g_two = loss_and_grads("twod")
+
+    assert abs(l_flat - l_two) < 1e-4, f"loss differs: {l_flat} vs {l_two}"
+    assert set(g_flat) == set(g_two)
+    for name in g_flat:
+        torch.testing.assert_close(g_flat[name], g_two[name], atol=1e-4, rtol=1e-4, msg=lambda m: f"{name}: {m}")
+
+
+def test_collate_twod_shapes_and_padding():
+    a = build_twod_chunk_example(INSTR, [ChunkSpec(2, [20])], VS, VE, EOT)
+    b = build_twod_chunk_example(INSTR, [ChunkSpec(2, [20, 21]), ChunkSpec(3, [30]), ChunkSpec(2, [])], VS, VE, EOT)
+    batch = collate_twod_chunk_examples([a, b], pad_id=7)
+
+    B, N, bb = batch.branch_ids.shape
+    assert B == 2 and N == 3  # padded to the utterance with the most branches
+    assert batch.branch_counts.tolist() == [1, 3]
+    assert batch.spine_lens.tolist() == [a.spine_len, b.spine_len]
+    # Utterance 0 has one real branch; the padded rows must be fully invalid and
+    # fully ignored, or they would contribute phantom loss.
+    assert batch.branch_valid[0, 1:].sum() == 0
+    assert (batch.branch_targets[0, 1:] == IGNORE_INDEX).all()
+    assert (batch.spine_ids[0, a.spine_len :] == 7).all()
+    assert batch.spine_valid[0, a.spine_len :].sum() == 0
+
+
+def test_twod_and_flat_supervise_identical_targets():
+    """Both layouts must carry exactly the same supervised (position, token) set."""
+    chunks = [ChunkSpec(2, [20, 21]), ChunkSpec(3, [30]), ChunkSpec(2, []), ChunkSpec(2, [40, 41, 42])]
+    for M, F in [(0, 0), (1, 0), (0, 28)]:
+        kw = dict(audio_history_chunks=M, audio_window_frames=F)
+        flat = build_packed_chunk_example(INSTR, chunks, VS, VE, EOT, **kw)
+        two = build_twod_chunk_example(INSTR, chunks, VS, VE, EOT, **kw)
+        flat_tgt = flat.target_ids[flat.target_ids != IGNORE_INDEX].tolist()
+        two_tgt = two.branch_targets[two.branch_targets != IGNORE_INDEX].tolist()
+        assert flat_tgt == two_tgt, f"M={M} F={F}: supervision differs"
+        # ...and the same audio frames, in the same order.
+        flat_fr = flat.audio_frame_index[flat.audio_frame_index >= 0].tolist()
+        two_fr = two.branch_frame_index[two.branch_frame_index >= 0].tolist()
+        assert flat_fr == two_fr, f"M={M} F={F}: audio windows differ"
+
+
+@pytest.mark.parametrize("micro_batch", [1, 2, 3, 5])
+def test_twod_micro_batching_changes_nothing(micro_batch):
+    """Splitting the branch axis must not change the loss or any gradient.
+
+    Branches are a BATCH axis in the 2-D layout, so they can be processed in
+    groups with their activations recomputed in backward. That is the whole
+    memory argument, and it is only sound if the split is numerically invisible:
+    each group contributes a SUM and the batch-wide target count is the single
+    denominator.
+    """
+    torch.manual_seed(6)
+    model = _tiny_qwen3()
+    H = model.config.hidden_size
+    instruction = [5, 6, 7]
+    chunks = [
+        ChunkSpec(2, [20, 21]),
+        ChunkSpec(2, [30]),
+        ChunkSpec(2, []),  # silent chunk contributes only <eot>
+        ChunkSpec(2, [40, 41]),
+        ChunkSpec(2, [50]),
+    ]
+    frames = torch.randn(sum(c.audio_len for c in chunks), H)
+    two = build_twod_chunk_example(instruction, chunks, VS, VE, EOT)
+    P, N = two.spine_len, two.branch_ids.shape[0]
+    n_targets = int((two.branch_targets != IGNORE_INDEX).sum())
+
+    def run(step):
+        model.zero_grad(set_to_none=True)
+        spine_emb = model.get_input_embeddings()(two.spine_ids[None])
+        cache = model(inputs_embeds=spine_emb, position_ids=two.spine_positions[None], use_cache=True).past_key_values
+
+        total = None
+        for lo in range(0, N, step):
+            hi = min(lo + step, N)
+            n = hi - lo
+            sub = _shallow_broadcast(cache, n)
+            audio = two.branch_frame_index[lo:hi] >= 0
+            emb = _embed_with_audio(model, two.branch_ids[lo:hi], audio, frames[two.branch_frame_index[lo:hi][audio]])
+            logits = model(
+                inputs_embeds=emb,
+                attention_mask=build_twod_branch_mask(two.branch_prefix[lo:hi], two.branch_valid[lo:hi], P, emb.dtype),
+                position_ids=two.branch_positions[lo:hi],
+                past_key_values=sub,
+                use_cache=False,
+            ).logits
+            s = torch.nn.functional.cross_entropy(
+                logits.flatten(0, 1),
+                two.branch_targets[lo:hi].flatten(0, 1),
+                reduction="sum",
+                ignore_index=IGNORE_INDEX,
+            )
+            total = s if total is None else total + s
+        loss = total / n_targets
+        loss.backward()
+        return float(loss), {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}
+
+    l_all, g_all = run(N)  # every branch at once
+    l_mb, g_mb = run(micro_batch)  # split
+
+    assert abs(l_all - l_mb) < 1e-5, f"loss changed: {l_all} vs {l_mb}"
+    assert set(g_all) == set(g_mb)
+    for name in g_all:
+        torch.testing.assert_close(g_all[name], g_mb[name], atol=1e-5, rtol=1e-5, msg=lambda m: f"{name}: {m}")

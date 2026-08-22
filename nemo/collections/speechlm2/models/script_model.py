@@ -28,7 +28,13 @@ from nemo.collections.speechlm2.data.streaming_stt_dataset import AUDIO_TOKEN_ID
 from nemo.collections.speechlm2.models.streaming_stt_model import StreamingSTTModel, StreamingSTTModelConfig
 from nemo.collections.speechlm2.parts.metrics.wer import WER
 from nemo.collections.speechlm2.parts.optim_setup import is_frozen
-from nemo.collections.speechlm2.parts.script import batched_stream_decode_script, build_script_mask
+from nemo.collections.speechlm2.parts.script import (
+    batched_stream_decode_script,
+    broadcast_spine_cache,
+    build_script_mask,
+    build_spine_mask,
+    build_twod_branch_mask,
+)
 from nemo.collections.speechlm2.parts.utils import to_dataclass
 from nemo.utils import logging
 
@@ -45,6 +51,20 @@ class ScriptSTTModelConfig(StreamingSTTModelConfig):
             of ``F`` frames ending at its chunk boundary, so the acoustic context
             is constant regardless of chunk size. Takes precedence over
             ``audio_history_chunks``. MUST equal ``data.dataset.audio_window_frames``.
+        twod_layout: train with the 2-D layout (spine forwarded once, branches on
+            a batch axis) instead of one flat packed sequence. Provably identical
+            -- see ``test_parity_twod_vs_flat`` and its gradient counterpart --
+            but it never creates the cross-branch attention pairs the flat mask
+            only exists to forbid. Must match ``data.dataset.twod_layout``.
+        twod_branch_micro_batch: with ``twod_layout``, process at most this many
+            branches at a time, recomputing each group's activations in backward
+            (``torch.utils.checkpoint``). Because branches are a BATCH axis rather
+            than one long sequence, this makes activation memory a function of the
+            micro-batch instead of the utterance length -- the flat layout cannot
+            do this, since its branches are a single inseparable sequence. ``0``
+            (default) processes every branch at once. The loss is unchanged:
+            each group contributes a SUM and the batch-wide target count is the
+            single denominator.
         val_chunk_size: chunk size used for the decode-only validation pass when
             training with multiple chunk sizes. Defaults to 14 when available,
             else the largest candidate.
@@ -68,6 +88,8 @@ class ScriptSTTModelConfig(StreamingSTTModelConfig):
 
     audio_history_chunks: int = 0
     audio_window_frames: int = 0
+    twod_layout: bool = False
+    twod_branch_micro_batch: int = 0
     val_chunk_size: Optional[int] = None
     val_max_new_tokens_per_chunk: Optional[int] = None
     val_system_prompt: Optional[str] = None
@@ -126,6 +148,7 @@ class ScriptSTTModel(StreamingSTTModel):
 
         self._audio_history_chunks = max(int(self.core_cfg.audio_history_chunks), 0)
         self._audio_window_frames = max(int(self.core_cfg.audio_window_frames), 0)
+        self._twod_layout = bool(self.core_cfg.twod_layout)
 
         # Audio-span delimiters and end-of-turn token, resolved once. These must
         # match ScriptSTTDataset, which builds the training layout with them.
@@ -194,6 +217,129 @@ class ScriptSTTModel(StreamingSTTModel):
         return self._build_input_embeds(batch.input_tokens, batch.audios, batch.audio_lens)["input_embeds"]
 
     # ------------------------------------------------------------------
+    # 2-D layout: spine forwarded once, branches on a batch axis
+    # ------------------------------------------------------------------
+
+    def _twod_branch_embeds(self, branch_ids: Tensor, branch_frame_index: Tensor, utt_frames: Tensor) -> Tensor:
+        """Embed one utterance's branches, splicing in its encoder frames.
+
+        Args:
+            branch_ids: (N, b) tokens; audio slots hold ``AUDIO_TOKEN_IDX``.
+            branch_frame_index: (N, b) global frame index at audio slots, -1 elsewhere.
+            utt_frames: (T_enc, H) this utterance's encoder output.
+        """
+        audio_mask = branch_ids == AUDIO_TOKEN_IDX
+        text_ids = branch_ids.where(~audio_mask, torch.zeros_like(branch_ids))
+        embeds = self._embed_tokens(text_ids)  # (N, b, H)
+        # A branch window may run past the real audio on the final chunk; those
+        # slots gather a zero frame, matching the flat path's padded gather.
+        need = int(branch_frame_index.max().item()) + 1
+        if need > utt_frames.shape[0]:
+            utt_frames = F.pad(utt_frames, (0, 0, 0, need - utt_frames.shape[0]))
+        gathered = utt_frames[branch_frame_index.clamp(min=0)]  # (N, b, H)
+        return torch.where(audio_mask.unsqueeze(-1), gathered, embeds)
+
+    def _twod_spine_cache(self, two, dtype):
+        """Forward every utterance's spine once and return the shared K/V cache.
+
+        The spine is plain causal text -- exactly its role in the flat layout,
+        where spine tokens never attend audio.
+        """
+        spine_embeds = self._embed_tokens(two.spine_ids)
+        out = self._llm_forward(
+            inputs_embeds=spine_embeds,
+            attention_mask=build_spine_mask(two.spine_positions, two.spine_valid, dtype),
+            position_ids=two.spine_positions,
+            use_cache=True,
+            return_dict=True,
+        )
+        return out.past_key_values
+
+    def _branch_loss_sum(self, two, audio_embs, cache, dtype, i: int, lo: int, hi: int) -> Tensor:
+        """Summed cross-entropy for branches ``[lo, hi)`` of utterance ``i``.
+
+        Returning the SUM (not the mean) lets the caller divide once by the
+        batch-wide target count, so any micro-batch split gives the same loss.
+
+        Kept as one function so it can be wrapped in ``torch.utils.checkpoint``:
+        the logits are ``(hi-lo, b, vocab)`` and the vocabulary is ~152k, so
+        materialising every branch's logits at once is the single largest term in
+        the step. Under checkpointing only one micro-batch's worth exists at a
+        time, recomputed during backward.
+        """
+        n = hi - lo
+        # This utterance's REAL spine length: the batched spine forward pads to the
+        # batch maximum, and the branches must see only the real columns.
+        spine_len = int(two.spine_lens[i])
+        valid = two.branch_valid[i, lo:hi]
+        embeds = self._twod_branch_embeds(two.branch_ids[i, lo:hi], two.branch_frame_index[i, lo:hi], audio_embs[i])
+        out = self._llm_forward(
+            inputs_embeds=embeds,
+            attention_mask=build_twod_branch_mask(two.branch_prefix[i, lo:hi], valid, int(two.spine_lens[i]), dtype),
+            position_ids=two.branch_positions[i, lo:hi],
+            # Fresh shallow copy per micro-batch, so nothing downstream can mutate
+            # the shared spine cache that later micro-batches still need.
+            past_key_values=broadcast_spine_cache(cache, i, n, spine_len),
+            use_cache=False,
+            return_dict=True,
+        )
+        targets = two.branch_targets[i, lo:hi]
+        # Padding slots already carry IGNORE_INDEX, so they contribute nothing.
+        with loss_parallel():
+            return F.cross_entropy(
+                out["logits"].flatten(0, 1),
+                targets.flatten(0, 1),
+                reduction="sum",
+                ignore_index=IGNORE_INDEX,
+            )
+
+    def _twod_training_step(self, batch: ScriptBatch, batch_idx: int):
+        two = batch.twod
+        audio_embs, _ = self.perception(input_signal=batch.audios, input_signal_length=batch.audio_lens)
+        dtype = audio_embs.dtype
+        cache = self._twod_spine_cache(two, dtype)
+
+        # Counted up front so every micro-batch is scaled by the SAME denominator;
+        # the result is then a single mean over all supervised positions in the
+        # batch, identical to the flat path regardless of how branches are split.
+        n_targets = int((two.branch_targets != IGNORE_INDEX).sum())
+
+        mb = max(int(self.core_cfg.twod_branch_micro_batch), 0)
+        use_ckpt = mb > 0 and torch.is_grad_enabled()
+
+        total = None
+        for i in range(two.spine_ids.shape[0]):
+            n = int(two.branch_counts[i])
+            if n == 0:
+                continue
+            step = mb if mb > 0 else n
+            for lo in range(0, n, step):
+                hi = min(lo + step, n)
+                if use_ckpt:
+                    s = torch.utils.checkpoint.checkpoint(
+                        self._branch_loss_sum, two, audio_embs, cache, dtype, i, lo, hi, use_reentrant=False
+                    )
+                else:
+                    s = self._branch_loss_sum(two, audio_embs, cache, dtype, i, lo, hi)
+                total = s if total is None else total + s
+
+        if n_targets == 0 or total is None:
+            logging.warning("Batch %d has no supervised targets — skipping (zero loss).", batch_idx)
+            return {"loss": torch.zeros((), device=batch.audios.device, requires_grad=True)}
+
+        loss = total / n_targets
+        self.log_dict(
+            {
+                "loss": loss,
+                "learning_rate": torch.as_tensor(
+                    self.trainer.optimizers[0].param_groups[0]["lr"] if self._trainer is not None else 0.0
+                ),
+            },
+            on_step=True,
+        )
+        return {"loss": loss}
+
+    # ------------------------------------------------------------------
     # Training
     # ------------------------------------------------------------------
 
@@ -206,6 +352,9 @@ class ScriptSTTModel(StreamingSTTModel):
         # Pin the encoder look-ahead to this batch's chunk size so a frame's
         # receptive field never crosses its chunk boundary.
         self._set_encoder_att_context(batch.chunk_size)
+
+        if self._twod_layout:
+            return self._twod_training_step(batch, batch_idx)
 
         input_embeds = self._script_input_embeds(batch)
         mask = build_script_mask(batch.seg_ids, batch.position_ids, batch.prefix_len, batch.valid, input_embeds.dtype)

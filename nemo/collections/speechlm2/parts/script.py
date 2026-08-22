@@ -398,6 +398,292 @@ def collate_packed_chunk_examples(examples: List[PackedChunkExample], pad_id: in
     )
 
 
+# ---------------------------------------------------------------------------
+# 2-D layout: spine once, branches on a batch axis
+#
+# The flat layout concatenates the spine and every branch into one sequence and
+# relies on :func:`build_script_mask` to forbid the cross-branch pairs. That is
+# correct but wasteful: for N branches of length b the sequence is P + N*b long,
+# so attention computes O((N*b)^2) pairs of which only O(N*b^2) are ever allowed
+# -- at a realistic shape, 124M of 132M pairs exist purely to be masked out.
+#
+# The 2-D layout never creates them. The spine is forwarded ONCE (its tokens
+# attend only each other, exactly as in the flat layout) and its per-layer K/V
+# are reused by every branch; the branches then run as a BATCH of N short
+# sequences, each attending its own slice of the spine plus itself.
+#
+# This is a pure restructuring: same attention support, same position ids, so
+# the branch logits are identical to the flat path. ``test_parity_twod_vs_flat``
+# is the gate on that claim.
+#
+# The spine K/V must be BROADCAST to the branch axis (a stride-0 view), never
+# copied -- materialising it per branch costs more than the layout saves.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TwoDChunkExample:
+    """One utterance as a spine plus a batch of branches.
+
+    Attributes:
+        spine_ids: (P,) instruction followed by every chunk's words.
+        spine_positions: (P,) ``0..P-1``.
+        branch_ids: (N, b) per-branch tokens, right-padded across ragged lengths.
+        branch_positions: (N, b) RoPE positions; branch ``k`` starts at ``prefix_k``.
+        branch_frame_index: (N, b) global encoder-frame index at audio slots, ``-1``
+            elsewhere.
+        branch_targets: (N, b) next-token targets, ``IGNORE_INDEX`` elsewhere.
+        branch_valid: (N, b) False at right-padding.
+        branch_prefix: (N,) how many spine tokens each branch may attend.
+        spine_len: ``P``.
+    """
+
+    spine_ids: Tensor
+    spine_positions: Tensor
+    branch_ids: Tensor
+    branch_positions: Tensor
+    branch_frame_index: Tensor
+    branch_targets: Tensor
+    branch_valid: Tensor
+    branch_prefix: Tensor
+    spine_len: int
+
+
+def build_twod_chunk_example(
+    instruction_ids: List[int],
+    chunks: List[ChunkSpec],
+    vision_start_id: int,
+    vision_end_id: int,
+    eot_id: int,
+    supervise_eot: bool = True,
+    audio_history_chunks: int = 0,
+    audio_window_frames: int = 0,
+    pad_id: int = 0,
+) -> TwoDChunkExample:
+    """Build the 2-D counterpart of :func:`build_packed_chunk_example`.
+
+    Same spine, same branch contents, same positions -- only the arrangement
+    differs. Arguments mirror the flat builder so the two cannot drift.
+    """
+    m = len(instruction_ids)
+
+    spine_ids: List[int] = list(instruction_ids)
+    prefix_lens: List[int] = []
+    frame_starts: List[int] = []
+    running, running_frames = m, 0
+    for ch in chunks:
+        prefix_lens.append(running)
+        frame_starts.append(running_frames)
+        spine_ids.extend(ch.target_ids)
+        running += len(ch.target_ids)
+        running_frames += ch.audio_len
+    P = len(spine_ids)
+
+    rows_ids, rows_pos, rows_fidx, rows_tgt = [], [], [], []
+    for kc, ch in enumerate(chunks):
+        pref = prefix_lens[kc]
+        win_end = frame_starts[kc] + ch.audio_len
+        win_start = audio_window_start(kc, frame_starts, audio_history_chunks, win_end, audio_window_frames)
+        window = list(range(win_start, win_end))
+        w = len(window)
+        words = list(ch.target_ids)
+
+        ids = [vision_start_id] + [AUDIO_TOKEN_IDX] * w + [vision_end_id] + words + [eot_id]
+        fidx = [-1] + window + [-1] + [-1] * len(words) + [-1]
+        tgt = [IGNORE_INDEX] * len(ids)
+        ve = 1 + w  # <ve> predicts the first word
+        for j, tok in enumerate(words):
+            tgt[ve + j] = tok
+        if supervise_eot:
+            tgt[ve + len(words)] = eot_id
+
+        rows_ids.append(ids)
+        rows_pos.append(_branch_positions(pref, w, len(words)))
+        rows_fidx.append(fidx)
+        rows_tgt.append(tgt)
+
+    N = len(chunks)
+    b = max((len(r) for r in rows_ids), default=0)
+
+    def _pad(rows, fill, dtype):
+        out = torch.full((N, b), fill, dtype=dtype)
+        for i, r in enumerate(rows):
+            out[i, : len(r)] = torch.tensor(r, dtype=dtype)
+        return out
+
+    valid = torch.zeros((N, b), dtype=torch.bool)
+    for i, r in enumerate(rows_ids):
+        valid[i, : len(r)] = True
+
+    return TwoDChunkExample(
+        spine_ids=torch.tensor(spine_ids, dtype=torch.long),
+        spine_positions=torch.arange(P, dtype=torch.long),
+        branch_ids=_pad(rows_ids, pad_id, torch.long),
+        branch_positions=_pad(rows_pos, 0, torch.long),
+        branch_frame_index=_pad(rows_fidx, -1, torch.long),
+        branch_targets=_pad(rows_tgt, IGNORE_INDEX, torch.long),
+        branch_valid=valid,
+        branch_prefix=torch.tensor(prefix_lens, dtype=torch.long),
+        spine_len=P,
+    )
+
+
+def build_twod_branch_mask(
+    branch_prefix: Tensor,
+    branch_valid: Tensor,
+    spine_len: int,
+    dtype: torch.dtype,
+) -> Tensor:
+    """4D additive mask for the branch pass, over ``[spine cache | own tokens]``.
+
+    Branch ``k``'s query at offset ``j`` may attend:
+
+    * spine key ``i`` iff ``i < branch_prefix[k]`` -- spine positions equal their
+      index, so this selects exactly ``instruction + w_1..w_{k-1}``;
+    * own key ``jj`` iff ``jj <= j`` and ``jj`` is not padding.
+
+    Args:
+        branch_prefix: (N,) history-prefix length per branch.
+        branch_valid: (N, b) False at right-padding.
+        spine_len: width of the spine cache the branches attend. In a batch this
+            is the PADDED spine length, not any one utterance's own length;
+            padded columns are excluded regardless, because
+            ``branch_prefix`` never exceeds the real spine length.
+        dtype: floating dtype for the additive mask.
+
+    Returns:
+        (N, 1, b, P + b), ``0`` where allowed and ``finfo(dtype).min`` where not.
+    """
+    N, b = branch_valid.shape
+    device = branch_valid.device
+    neg = torch.finfo(dtype).min
+
+    spine_idx = torch.arange(spine_len, device=device)[None, :]  # (1, P)
+    to_spine = spine_idx < branch_prefix[:, None]  # (N, P)
+    to_spine = to_spine[:, None, :].expand(N, b, spine_len)
+
+    q = torch.arange(b, device=device)[:, None]
+    kv = torch.arange(b, device=device)[None, :]
+    causal = (kv <= q)[None, :, :].expand(N, b, b)  # (N, b, b)
+    to_own = causal & branch_valid[:, None, :]
+
+    allowed = torch.cat([to_spine, to_own], dim=-1)  # (N, b, P + b)
+    additive = torch.zeros_like(allowed, dtype=dtype).masked_fill(~allowed, neg)
+    return additive.unsqueeze(1)  # (N, 1, b, P + b)
+
+
+@dataclass
+class BatchedTwoDChunk:
+    """A batch of :class:`TwoDChunkExample`, padded on every ragged axis.
+
+    Spines are padded to ``P``; branches to ``N`` per utterance and ``b`` per
+    branch. The spine pass runs for the whole batch at once, but the branch pass
+    must run PER UTTERANCE, because branch ``k`` of utterance ``i`` may only see
+    utterance ``i``'s spine cache -- and the broadcast that makes cache sharing
+    free is a stride-0 view that cannot be reshaped across utterances without
+    materialising it.
+    """
+
+    spine_ids: Tensor  # (B, P)
+    spine_positions: Tensor  # (B, P)
+    spine_valid: Tensor  # (B, P)
+    branch_ids: Tensor  # (B, N, b)
+    branch_positions: Tensor  # (B, N, b)
+    branch_frame_index: Tensor  # (B, N, b)
+    branch_targets: Tensor  # (B, N, b)
+    branch_valid: Tensor  # (B, N, b)
+    branch_prefix: Tensor  # (B, N)
+    branch_counts: Tensor  # (B,) real branches per utterance
+    spine_lens: Tensor  # (B,)
+
+
+def collate_twod_chunk_examples(examples: List[TwoDChunkExample], pad_id: int) -> BatchedTwoDChunk:
+    """Pad a list of :class:`TwoDChunkExample` into a batch."""
+    B = len(examples)
+    P = max(int(e.spine_ids.numel()) for e in examples)
+    N = max(int(e.branch_ids.shape[0]) for e in examples)
+    b = max(int(e.branch_ids.shape[1]) for e in examples)
+
+    def _spine(attr, fill, dtype):
+        out = torch.full((B, P), fill, dtype=dtype)
+        for i, e in enumerate(examples):
+            v = getattr(e, attr)
+            out[i, : v.numel()] = v.to(dtype)
+        return out
+
+    def _branch(attr, fill, dtype):
+        out = torch.full((B, N, b), fill, dtype=dtype)
+        for i, e in enumerate(examples):
+            v = getattr(e, attr)
+            out[i, : v.shape[0], : v.shape[1]] = v.to(dtype)
+        return out
+
+    spine_valid = torch.zeros((B, P), dtype=torch.bool)
+    branch_valid = torch.zeros((B, N, b), dtype=torch.bool)
+    prefix = torch.zeros((B, N), dtype=torch.long)
+    for i, e in enumerate(examples):
+        spine_valid[i, : e.spine_ids.numel()] = True
+        branch_valid[i, : e.branch_valid.shape[0], : e.branch_valid.shape[1]] = e.branch_valid
+        prefix[i, : e.branch_prefix.numel()] = e.branch_prefix
+
+    return BatchedTwoDChunk(
+        spine_ids=_spine("spine_ids", pad_id, torch.long),
+        spine_positions=_spine("spine_positions", 0, torch.long),
+        spine_valid=spine_valid,
+        branch_ids=_branch("branch_ids", pad_id, torch.long),
+        branch_positions=_branch("branch_positions", 0, torch.long),
+        branch_frame_index=_branch("branch_frame_index", -1, torch.long),
+        branch_targets=_branch("branch_targets", IGNORE_INDEX, torch.long),
+        branch_valid=branch_valid,
+        branch_prefix=prefix,
+        branch_counts=torch.tensor([e.branch_ids.shape[0] for e in examples], dtype=torch.long),
+        spine_lens=torch.tensor([e.spine_len for e in examples], dtype=torch.long),
+    )
+
+
+def build_spine_mask(spine_positions: Tensor, spine_valid: Tensor, dtype: torch.dtype) -> Tensor:
+    """(B, 1, P, P) causal mask for the spine pass, with padding blocked.
+
+    The spine is a plain causal text stream -- exactly its role in the flat
+    layout, where it attends only itself.
+    """
+    q = spine_positions[:, :, None]
+    k = spine_positions[:, None, :]
+    allowed = (k <= q) & spine_valid[:, None, :]
+    return torch.zeros_like(allowed, dtype=dtype).masked_fill(~allowed, torch.finfo(dtype).min).unsqueeze(1)
+
+
+def broadcast_spine_cache(cache, utterance: int, n_branches: int, spine_len: Optional[int] = None):
+    """View utterance ``i``'s spine K/V as a batch of ``n_branches`` copies.
+
+    Returns a shallow copy holding stride-0 expansions, so the K/V are SHARED by
+    every branch rather than duplicated. Materialising them instead would cost
+    more than the whole 2-D layout saves, so the stride is asserted.
+
+    ``spine_len`` trims the cache to this utterance's REAL spine length. The
+    batched spine forward pads every utterance to the batch maximum, and those
+    padded columns must not reach the branches: they carry no information (the
+    branch mask forbids them anyway) but their presence makes the cache width
+    disagree with what the attention implementation derives, and the width has to
+    match exactly.
+    """
+    import copy as _copy
+
+    out = _copy.copy(cache)
+    out.layers = [_copy.copy(layer) for layer in cache.layers]
+    for layer in out.layers:
+        k, v = layer.keys, layer.values
+        if spine_len is not None:
+            k, v = k[:, :, :spine_len], v[:, :, :spine_len]
+        layer.keys = k[utterance : utterance + 1].expand(n_branches, -1, -1, -1)
+        layer.values = v[utterance : utterance + 1].expand(n_branches, -1, -1, -1)
+        # Expanding to a single row is a no-op, so stride-0 is only meaningful
+        # (and only required) when there is more than one branch to share with.
+        if n_branches > 1 and layer.keys.stride()[0] != 0:  # pragma: no cover
+            raise RuntimeError("spine cache was copied instead of broadcast across branches")
+    return out
+
+
 @dataclass
 class SeparateChunkExample:
     """One standalone per-chunk example — the reference formulation.
