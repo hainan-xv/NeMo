@@ -216,7 +216,7 @@ echo "*******STARTING********" \
     model.chunk_size="${CHUNK_SIZES}" \
     model.audio_history_chunks=${AUDIO_HISTORY_CHUNKS} \
     data.dataset.num_delay_frames=${DELAY} \
-    model.attn_backend=${ATTN_BACKEND} \
+    ++model.attn_backend=${ATTN_BACKEND} \
     model.activation_checkpointing=${ACT_CKPT} \
     data.dataset.system_prompt="'${SYSTEM_PROMPT}'" \
     data.train_ds.seed=$LHOTSE_RND_SEED \
