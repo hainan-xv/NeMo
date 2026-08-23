@@ -140,7 +140,14 @@ data:
     force_iterable_dataset: true
     use_bucketing: true
     bucket_duration_bins: [4.32,6.0,7.04,7.92,8.8,9.6,10.4,11.12,11.89,12.66,13.47,14.8,16.92,20.0,22.4,29.44,35.0,39.6]
-    bucket_batch_size: [38,29,25,22,20,18,17,15,14,13,12,11,10,8,7,6,5,4]
+    # Scaled DOWN 3x from the baseline recipe's [38, 29, 25, 22, 20, 18, 17, 15, 14, 13, 12, 11, 10, 8, 7, 6, 5, 4].
+    # A fixed 28-frame window multiplies the token count by F/C, so at
+    # chunk_size=2 a batch carries ~46k tokens where the baseline carries ~8k.
+    # Measured (flex + activation checkpointing, one A100): 22k tokens -> 49.4 GiB,
+    # so the baseline's batch sizes OOM here even though the backend is fine.
+    # Chunk size is drawn PER BATCH, so this must be sized for the worst case
+    # (chunk 2); the larger chunk sizes simply run under-filled.
+    bucket_batch_size: [12,9,8,7,6,6,5,5,4,4,4,3,3,2,2,2,1,1]
     max_duration: 54
     pad_extra_duration: 0.5
     pad_extra_duration_prob: 1.0
