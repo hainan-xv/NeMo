@@ -88,31 +88,38 @@ def find_shard_files(root: str) -> List[str]:
 
 
 def load_run(root: str) -> List[dict]:
-    """Read every shard record under ``root``.
+    """Read every shard record under ``root``, tagged with a positional id.
 
-    Shards partition the utterance list, so duplicates across files mean a shard
-    was decoded twice (e.g. a rerun into the same dir) -- that would double-count
-    in scoring, so it is reported rather than silently merged.
+    Utterances are identified by ``<shard file>#<line>``, NOT by their text. Both
+    drivers build the utterance list with the same ``build_global_items`` +
+    ``select_shard`` (same shuffle seed, same within-shard duration sort), so line
+    *n* of a given shard file is the same clip in every run -- while transcripts
+    are emphatically not unique (AMI alone has hundreds of "yeah" turns, and
+    de-duplicating on text silently discards them).
+
+    True double-counting would come from mixing shard files of different totals
+    (e.g. a ``_of8`` decode and a ``_of4`` rerun in one directory), which is
+    detected explicitly.
     """
     files = find_shard_files(root)
     if not files:
         raise SystemExit(f"ERROR: no shard*_of*.generations.jsonl under {root}")
-    recs, seen, dupes = [], set(), 0
+
+    totals = {m.group(1) for m in (re.search(r"_of(\d+)\.generations", f) for f in files) if m}
+    if len(totals) > 1:
+        print(f"    [warn] mixed shard totals {sorted(totals)} in {root} -- utterances will be double-counted")
+
+    recs = []
     for fp in files:
+        base = os.path.basename(fp)
         with open(fp) as f:
-            for line in f:
+            for i, line in enumerate(f):
                 line = line.strip()
                 if not line:
                     continue
                 rec = json.loads(line)
-                uid = (rec.get("key", ""), rec.get("reference", ""))
-                if uid in seen:
-                    dupes += 1
-                    continue
-                seen.add(uid)
+                rec["_uid"] = f"{base}#{i}"
                 recs.append(rec)
-    if dupes:
-        print(f"    [warn] {dupes} duplicate records ignored (overlapping shard files in {root})")
     return recs
 
 
@@ -210,6 +217,8 @@ class RunStats:
         self.err_pos_sum = 0.0
         self.err_pos_n = 0
         self.rows: List[dict] = []  # {key, ref_len, errors, ins, del, sub, ref, hyp}
+        self.official_by_key: Dict[str, Optional[float]] = {}
+        self.official_macro: Optional[float] = None
         self.by_key: Dict[str, List[int]] = defaultdict(lambda: [0, 0])  # key -> [errors, ref_words]
 
     @property
@@ -345,7 +354,7 @@ def main() -> int:
         for r in recs:
             ref = norm(r.get("reference", "") or "")
             hyp = norm(r.get("hypothesis", "") or "")
-            table[f"{r.get('key','')}||{ref}"] = {"key": r.get("key", ""), "ref": ref, "hyp": hyp}
+            table[r["_uid"]] = {"key": r.get("key", ""), "ref": ref, "hyp": hyp}
         runs[label] = table
         reported[label] = parse_aggregate_log(root)
         print(f"    {len(table)} utterances")
@@ -365,20 +374,42 @@ def main() -> int:
     if ragged and not args.common_only:
         print("    -> rerun with --common-only to compare on the identical utterance set")
 
+    # Positional ids only line up if every run enumerated the utterances the same
+    # way. Verify against the references rather than assuming it: a mismatch means
+    # the runs used different seeds/dataset lists and NOTHING below is comparable.
+    if len(runs) > 1 and common:
+        base_lab = parsed[0][0]
+        for lab in runs:
+            if lab == base_lab:
+                continue
+            bad = sum(1 for uid in common if runs[lab][uid]["ref"] != runs[base_lab][uid]["ref"])
+            if bad:
+                print(
+                    f"    [ERROR] {lab} disagrees with {base_lab} on {bad}/{len(common)} references -- "
+                    f"the runs are NOT aligned (different --shuffle_seed or --datasets?)"
+                )
+
     scored_keys = common if args.common_only else None
 
     # ---- per-run stats ----
+    #
+    # aggregate.log's headline "Average" is the MACRO mean of per-dataset WERs,
+    # not the pooled corpus rate -- the datasets differ hugely in size, so the two
+    # are genuinely different numbers. Reproduce the macro mean here, or the
+    # cross-check compares two different statistics and always disagrees.
     stats: Dict[str, RunStats] = {}
     for lab, table in runs.items():
         st = RunStats(lab)
-        refs, hyps = [], []
+        per_key: Dict[str, Tuple[List[str], List[str]]] = defaultdict(lambda: ([], []))
         for uid, rec in table.items():
             if scored_keys is not None and uid not in scored_keys:
                 continue
             st.add(rec["key"], rec["ref"].split(), rec["hyp"].split())
-            refs.append(rec["ref"])
-            hyps.append(rec["hyp"])
-        st.official = leaderboard_wer(refs, hyps)
+            per_key[rec["key"]][0].append(rec["ref"])
+            per_key[rec["key"]][1].append(rec["hyp"])
+        st.official_by_key = {k: leaderboard_wer(r, h) for k, (r, h) in per_key.items()}
+        vals = [v for v in st.official_by_key.values() if v is not None]
+        st.official_macro = sum(vals) / len(vals) if vals else None
         stats[lab] = st
 
     # ---- headline verification ----
@@ -386,24 +417,27 @@ def main() -> int:
     print("=" * 108)
     print("VERIFICATION -- recomputed from the raw generations")
     print("=" * 108)
-    print(f"  {'run':<20} {'N':>7} {'WER%':>8} {'kaldialign%':>12} {'aggregate.log%':>15}  {'agree':>6}")
+    print(f"  {'run':<20} {'N':>7} {'pooled%':>9} {'macro%':>9} {'aggregate.log%':>15}  {'agree':>6}")
     print("  " + "-" * 104)
     for lab in runs:
         st = stats[lab]
-        off = st.official
+        off = st.official_macro
         rep = reported[lab].get("Average")
         agree = "-"
         if off is not None and rep is not None:
             agree = "yes" if abs(off - rep) < 0.15 else "NO"
         print(
-            f"  {lab:<20} {st.n:>7} {st.wer:>8.2f} "
-            f"{('%.2f' % off) if off is not None else '-':>12} "
+            f"  {lab:<20} {st.n:>7} {st.wer:>9.2f} "
+            f"{('%.2f' % off) if off is not None else '-':>9} "
             f"{('%.2f' % rep) if rep is not None else '-':>15}  {agree:>6}"
         )
     print()
-    print("  WER% is a plain edit distance; kaldialign% adds compound merging and is the")
-    print("  number the leaderboard reports. 'agree' compares it with the run's aggregate.log")
-    print("  -- a 'NO' means the log is stale or was produced from different generations.")
+    print("  pooled% = corpus WER over all utterances (plain edit distance).")
+    print("  macro%  = mean of per-dataset kaldialign WERs -- the statistic aggregate.log")
+    print("            reports as 'Average'. Small datasets count as much as large ones,")
+    print("            which is why it sits well above the pooled rate.")
+    print("  'agree' compares macro% with the run's own aggregate.log; a 'NO' means the log")
+    print("  is stale or was produced from different generations.")
 
     # ---- error decomposition ----
     print()
