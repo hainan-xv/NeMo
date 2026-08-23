@@ -1384,3 +1384,228 @@ def test_invalid_attn_backend_is_rejected():
         },
     )
     assert cfg.attn_backend == "nonsense"  # coercion keeps it; __init__ is what rejects it
+
+
+# ---------------------------------------------------------------------------
+# Prompt-controlled SCRIPT
+# ---------------------------------------------------------------------------
+
+
+def test_text_style_identity_when_both_settings_are_on():
+    """The default style must be byte-for-byte the original transcript."""
+    from nemo.collections.speechlm2.parts.script_prompt import apply_text_style
+
+    for s in ("It's well-known, isn't it? Yes.", " leading space kept.", "", "   "):
+        assert apply_text_style(s, True, True) == s
+
+
+@pytest.mark.parametrize(
+    "text,cap,punct,expected",
+    [
+        ("It's well-known, isn't it? Yes.", True, False, "It's well-known isn't it Yes"),
+        ("It's well-known, isn't it? Yes.", False, True, "it's well-known, isn't it? yes."),
+        ("It's well-known, isn't it? Yes.", False, False, "it's well-known isn't it yes"),
+        # intra-number marks survive; a trailing/standalone mark does not
+        ("Up 1,200 to $3.5 at 9:30 -- yes.", True, False, "Up 1,200 to 3.5 at 9:30 yes"),
+        # collapsing must not leave double spaces behind
+        ("end. Next", True, False, "end Next"),
+        # a punctuation-only chunk becomes empty, i.e. silent
+        ("...", True, False, ""),
+    ],
+)
+def test_text_style_variants(text, cap, punct, expected):
+    from nemo.collections.speechlm2.parts.script_prompt import apply_text_style
+
+    assert apply_text_style(text, cap, punct) == expected
+
+
+def test_text_style_preserves_leading_whitespace():
+    """Chunk text is sliced with its leading space so the first token is a word
+    start; losing it would silently change the tokenization."""
+    from nemo.collections.speechlm2.parts.script_prompt import apply_text_style
+
+    assert apply_text_style(" Hello there.", True, False) == " Hello there"
+    assert apply_text_style("Hello there.", True, False) == "Hello there"
+
+
+def test_control_prompt_states_every_setting():
+    from nemo.collections.speechlm2.parts.script_prompt import ScriptControls, render_control_prompt
+
+    p = render_control_prompt("Base.", ScriptControls(14, 3, True, False))
+    assert (
+        p == "Base. The audio is chunked every 14 frames with an emission delay of 3 frames. "
+        "Use capitalization. Do not use punctuation."
+    )
+
+    # singular/zero wording
+    assert "every 1 frame with" in render_control_prompt("B.", ScriptControls(1, 1, True, True))
+    assert "of 1 frame." in render_control_prompt("B.", ScriptControls(2, 1, True, True))
+    assert "with no emission delay." in render_control_prompt("B.", ScriptControls(2, 0, True, True))
+
+
+def test_control_prompt_is_injective_over_settings():
+    """Distinct operating points must produce distinct prompts, or the model
+    cannot tell them apart."""
+    from nemo.collections.speechlm2.parts.script_prompt import ScriptControls, render_control_prompt
+
+    seen = {
+        render_control_prompt("B.", ScriptControls(c, d, cap, pun))
+        for c in (2, 14)
+        for d in (0, 3)
+        for cap in (True, False)
+        for pun in (True, False)
+    }
+    assert len(seen) == 2 * 2 * 2 * 2
+
+
+def test_messages_respect_capitalization_and_punctuation():
+    """Style flows all the way into the per-chunk supervision."""
+    words = _align(("Hello,", 0.16, 0.48), ("World.", 0.60, 0.80))
+    kw = dict(
+        system_role="system",
+        system_prompt="P",
+        audio_tag="<a>",
+        blank_token="<b>",
+        chunk_size=2,
+        num_delay_frames=0,
+        audio_duration_secs=1.0,
+        frame_length_in_secs=0.08,
+        alignments=words,
+        transcript="Hello, World.",
+    )
+    plain = _assistant_contents(get_llm_messages_for_sample(**kw))
+    styled = _assistant_contents(get_llm_messages_for_sample(capitalization=False, punctuation=False, **kw))
+
+    assert "Hello," in plain and "World." in "".join(plain)
+    # " world" keeps its leading space: that space is the word-start marker the
+    # slice deliberately preserves, and restyling must not eat it.
+    assert [c for c in styled if c != "<b>"] == ["hello", " world"]
+
+
+def test_punctuation_only_chunk_becomes_silent():
+    """Once punctuation is stripped, a chunk whose text was only a mark reveals
+    nothing and must fall back to the blank sentinel."""
+    msgs = get_llm_messages_for_sample(
+        system_role="system",
+        system_prompt="P",
+        audio_tag="<a>",
+        blank_token="<b>",
+        chunk_size=2,
+        num_delay_frames=0,
+        audio_duration_secs=0.4,
+        frame_length_in_secs=0.08,
+        alignments=_align((".", 0.0, 0.16), ("Hi", 0.20, 0.32)),
+        transcript=". Hi",
+        capitalization=True,
+        punctuation=False,
+    )
+    contents = _assistant_contents(msgs)
+    assert contents[0] == "<b>"  # the "." chunk is silent, not an empty string
+    assert "Hi" in "".join(contents)
+
+
+def test_batch_messages_accept_per_sample_controls():
+    """Delay / cap / punct vary per example within one batch; chunk size cannot."""
+    from nemo.collections.speechlm2.parts.script_messages import get_llm_messages_for_batch
+
+    words = [_align(("Hello", 0.16, 0.48)), _align(("Hello", 0.16, 0.48))]
+    batch = get_llm_messages_for_batch(
+        system_role="system",
+        system_prompt=["P", "P"],
+        audio_tag="<a>",
+        blank_token="<b>",
+        chunk_size=2,
+        num_delay_frames=[0, 2],
+        audio_durations_secs=[1.0, 1.0],
+        frame_length_in_secs=0.08,
+        alignments=words,
+        capitalization=[True, False],
+        punctuation=[True, True],
+    )
+    a, b = (_assistant_contents(m) for m in batch)
+    assert a.index("Hello") == 2  # delay 0
+    assert b.index("hello") == 3  # delay 2 -> one chunk later, and lowercased
+
+
+def test_batch_messages_reject_mismatched_control_lengths():
+    from nemo.collections.speechlm2.parts.script_messages import get_llm_messages_for_batch
+
+    with pytest.raises(ValueError, match="num_delay_frames has 3 entries"):
+        get_llm_messages_for_batch(
+            system_role="system",
+            system_prompt=["P", "P"],
+            audio_tag="<a>",
+            blank_token="<b>",
+            chunk_size=2,
+            num_delay_frames=[0, 1, 2],
+            audio_durations_secs=[1.0, 1.0],
+            frame_length_in_secs=0.08,
+            alignments=[_align(("Hi", 0.0, 0.1))] * 2,
+        )
+
+
+def test_sampled_controls_are_deterministic_and_cover_the_space():
+    import numpy as np
+
+    from nemo.collections.speechlm2.parts.script_prompt import sample_controls
+
+    delays = [0, 1, 2, 3, 4, 6, 8]
+
+    def draw(seed):
+        # One generator advanced 400 times -- re-seeding per draw would return
+        # the same controls 400 times and the coverage assertions below would
+        # pass vacuously.
+        rng = np.random.default_rng(seed)
+        return [sample_controls(rng, 14, delays, 0.5, 0.5) for _ in range(400)]
+
+    a, b = draw(0), draw(0)
+    assert a == b, "same seed must give the same controls"
+    assert draw(1) != a, "different seeds must differ"
+
+    assert {c.num_delay_frames for c in a} == set(delays)
+    assert {(c.capitalization, c.punctuation) for c in a} == {
+        (True, True),
+        (True, False),
+        (False, True),
+        (False, False),
+    }
+    assert all(c.chunk_size == 14 for c in a), "chunk size is passed in, never drawn per example"
+
+
+def test_resolve_delay_candidates():
+    from nemo.collections.speechlm2.parts.script_prompt import resolve_delay_candidates
+
+    assert resolve_delay_candidates(None, 3) == [3]
+    assert resolve_delay_candidates(5, 3) == [5]
+    assert resolve_delay_candidates([0, 2, 4], 3) == [0, 2, 4]
+    with pytest.raises(ValueError, match="at least one delay"):
+        resolve_delay_candidates([], 3)
+    with pytest.raises(ValueError, match="non-negative"):
+        resolve_delay_candidates([1, -2], 3)
+
+
+def test_generate_rejects_control_kwargs_when_not_prompt_controlled():
+    """Asking a non-prompt-controlled checkpoint for an operating point must fail
+    loudly. Silently ignoring the request would make the knobs look functional on
+    a model that never learned them."""
+    from types import SimpleNamespace
+
+    from nemo.collections.speechlm2.models.script_model import ScriptSTTModel
+
+    # The guard runs before any weights are touched, so a stub carrying just the
+    # two attributes it reads is enough to exercise it.
+    stub = SimpleNamespace(
+        core_cfg=SimpleNamespace(
+            prompt_control=False,
+            val_num_delay_frames=3,
+            val_capitalization=True,
+            val_punctuation=True,
+        ),
+        _resolve_inference_chunk_size=lambda override: override or 14,
+    )
+    audios = torch.zeros(2, 16000)
+    audio_lens = torch.tensor([16000, 16000])
+
+    for kwargs in ({"num_delay_frames": 6}, {"capitalization": False}, {"punctuation": False}):
+        with pytest.raises(ValueError, match="prompt_control=False"):
+            ScriptSTTModel.generate(stub, audios=audios, audio_lens=audio_lens, system_prompt="P", **kwargs)

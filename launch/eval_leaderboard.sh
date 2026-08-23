@@ -38,6 +38,9 @@
 #   CHUNK_SIZE              decode chunk size in encoder frames
 #   RUN_AVERAGING / CKPT / STEP / USE_LAST     which checkpoint
 #   DATASETS, BATCH_SIZE, MAX_NEW_TOKENS, MAX_EVAL_SAMPLES, FORCE_WORD_START
+#   NUM_DELAY_FRAMES        [prompt-controlled models] delay to request, in frames
+#   CAPITALIZATION          [prompt-controlled models] 1/0
+#   PUNCTUATION             [prompt-controlled models] 1/0
 # ============================================================================
 
 # NOTE: deliberately no `set -euo pipefail` -- the `read -r -d '' <<EOF` heredoc
@@ -64,6 +67,11 @@ CHUNK_SIZE="${CHUNK_SIZE:-}"          # empty => model default (--chunk_size omi
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-64}"
 MAX_HISTORY_TOKENS="${MAX_HISTORY_TOKENS:-0}"
 FORCE_WORD_START="${FORCE_WORD_START:-1}"
+# Prompt-controlled models only. Empty => not requested => flag omitted entirely,
+# because a model trained without prompt control rejects these outright.
+NUM_DELAY_FRAMES="${NUM_DELAY_FRAMES:-}"
+CAPITALIZATION="${CAPITALIZATION:-}"      # 1/0, empty = model default
+PUNCTUATION="${PUNCTUATION:-}"            # 1/0, empty = model default
 # Match training's data.dataset.pad_extra_duration: the trailing silence is real
 # audio the encoder consumes, and it is where delay-held tail words land.
 PAD_EXTRA_SECONDS="${PAD_EXTRA_SECONDS:-0.5}"
@@ -158,6 +166,14 @@ fi
 FORCE_WORD_START_FLAG=""
 [[ "$FORCE_WORD_START" == "0" || "$FORCE_WORD_START" == "false" ]] && FORCE_WORD_START_FLAG="--no_force_word_start"
 
+# Prompt-control flags, emitted only when explicitly set.
+CAP_FLAG=""
+[[ "$CAPITALIZATION" == "1" || "$CAPITALIZATION" == "true"  ]] && CAP_FLAG="--capitalization"
+[[ "$CAPITALIZATION" == "0" || "$CAPITALIZATION" == "false" ]] && CAP_FLAG="--no_capitalization"
+PUNCT_FLAG=""
+[[ "$PUNCTUATION" == "1" || "$PUNCTUATION" == "true"  ]] && PUNCT_FLAG="--punctuation"
+[[ "$PUNCTUATION" == "0" || "$PUNCTUATION" == "false" ]] && PUNCT_FLAG="--no_punctuation"
+
 # The system prompt can contain apostrophes, semicolons and quotes; passing it
 # through the command string would be a quoting minefield. Write it to a file and
 # read it back inside the container instead.
@@ -195,6 +211,9 @@ chunk_size: "${CHUNK_SIZE}"
 max_new_tokens: ${MAX_NEW_TOKENS}
 max_history_tokens: ${MAX_HISTORY_TOKENS}
 force_word_start: ${FORCE_WORD_START}
+num_delay_frames: "${NUM_DELAY_FRAMES}"
+capitalization: "${CAPITALIZATION}"
+punctuation: "${PUNCTUATION}"
 pad_extra_seconds: ${PAD_EXTRA_SECONDS}
 batch_size: ${BATCH_SIZE}
 num_gpus: ${NGPU}
@@ -208,6 +227,7 @@ YAML
 echo "==> exp=${EXP_NAME} project=${PROJECT}"
 echo "==> ckpt=${CKPT}"
 echo "==> chunk_size=${CHUNK_SIZE:-<model default>} force_word_start=${FORCE_WORD_START}"
+[[ -n "${NUM_DELAY_FRAMES}${CAPITALIZATION}${PUNCTUATION}" ]] && echo "==> prompt control: delay=${NUM_DELAY_FRAMES:-<default>} cap=${CAPITALIZATION:-<default>} punct=${PUNCTUATION:-<default>}"
 echo "==> results -> ${RESULTS_DIR}"
 
 # ---------------------------------------------------------------------------
@@ -269,6 +289,8 @@ ${AVG_CLAUSE} \
         --pad_extra_seconds ${PAD_EXTRA_SECONDS} \
         ${CHUNK_SIZE:+--chunk_size ${CHUNK_SIZE}} \
         ${FORCE_WORD_START_FLAG} \
+        ${NUM_DELAY_FRAMES:+--num_delay_frames ${NUM_DELAY_FRAMES}} \
+        ${CAP_FLAG} ${PUNCT_FLAG} \
         > "\${log}" 2>&1 & \
       pids+=(\$!); \
    done \

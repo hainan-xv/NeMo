@@ -44,6 +44,17 @@
 # trained on -- {2, 4, 7, 10, 14, 28} for the current recipes. Anything else is
 # out of distribution. Frames are 0.08s, so 2 -> 0.16s, 14 -> 1.12s.
 #
+# PROMPT-CONTROLLED MODELS
+#   A model trained with model.prompt_control=true also accepts an operating
+#   point, requested as env vars:
+#       NUM_DELAY_FRAMES=6 CAPITALIZATION=1 PUNCTUATION=0 \
+#           ./oci_launch.sh launch/eval_script.sh granary2_script_promptctl 7
+#   Omit them to decode at the checkpoint's val_* defaults. A model trained
+#   WITHOUT prompt control rejects them rather than ignoring them, so a request
+#   the checkpoint cannot honour fails loudly instead of quietly.
+#   Note the leaderboard normalizer lowercases and strips punctuation before
+#   scoring, so CAPITALIZATION/PUNCTUATION will not move the reported WER.
+#
 # All other knobs (RUN_AVERAGING, CKPT/STEP/USE_LAST, DATASETS, BATCH_SIZE,
 # MAX_NEW_TOKENS, MAX_EVAL_SAMPLES, FORCE_WORD_START, wandb, ...) are env vars
 # handled by eval_leaderboard.sh -- see its header.
@@ -76,7 +87,14 @@ SYSTEM_PROMPT="${SYSTEM_PROMPT:-You are doing streaming speech recognition. Give
 # Tag results/wandb by model+chunk so a sweep is readable at a glance.
 EVAL_TAG="${EVAL_TAG:-${EXP_NAME}}"
 
+# Named here (not just read by the backend) so oci_launch.sh's knob discovery,
+# which scans this script for ${NAME:-...}, forwards them from your shell.
+NUM_DELAY_FRAMES="${NUM_DELAY_FRAMES:-}"
+CAPITALIZATION="${CAPITALIZATION:-}"
+PUNCTUATION="${PUNCTUATION:-}"
+
 export EXP_NAME PROJECT MODEL_CLASS SYSTEM_PROMPT CHUNK_SIZE EVAL_TAG OUTPUT_PREFIX
+export NUM_DELAY_FRAMES CAPITALIZATION PUNCTUATION
 
 CKPT_DIR="${OUTPUT_PREFIX}/results/${PROJECT}/${EXP_NAME}/${EXP_NAME}/checkpoints"
 echo "==> SCRIPT leaderboard eval"

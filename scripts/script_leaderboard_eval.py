@@ -170,6 +170,15 @@ def build_gen_kwargs(args) -> dict:
     )
     if args.max_history_tokens > 0:
         kwargs["max_history_tokens"] = args.max_history_tokens
+    # Prompt-control knobs are forwarded ONLY when explicitly requested. A
+    # non-prompt-controlled model raises on them, which is what we want: it means
+    # "this checkpoint cannot honour that request" rather than silently ignoring it.
+    if args.num_delay_frames is not None:
+        kwargs["num_delay_frames"] = args.num_delay_frames
+    if args.capitalization is not None:
+        kwargs["capitalization"] = args.capitalization
+    if args.punctuation is not None:
+        kwargs["punctuation"] = args.punctuation
     return kwargs
 
 
@@ -273,6 +282,28 @@ def parse_args():
         default=0.5,
         help="trailing silence appended per clip; match training's pad_extra_duration",
     )
+
+    # Prompt-controlled models only. Left as None so they are not forwarded at
+    # all unless asked for -- a model trained without prompt control rejects them.
+    p.add_argument(
+        "--num_delay_frames", type=int, default=None, help="[prompt-controlled] emission delay to request, in frames"
+    )
+    p.add_argument(
+        "--capitalization",
+        dest="capitalization",
+        action="store_true",
+        default=None,
+        help="[prompt-controlled] ask for capitalized output",
+    )
+    p.add_argument("--no_capitalization", dest="capitalization", action="store_false")
+    p.add_argument(
+        "--punctuation",
+        dest="punctuation",
+        action="store_true",
+        default=None,
+        help="[prompt-controlled] ask for punctuated output",
+    )
+    p.add_argument("--no_punctuation", dest="punctuation", action="store_false")
 
     p.add_argument("--aggregate", action="store_true", help="reduce shard JSONLs; no GPU or model needed")
     p.add_argument("--progress_interval", type=float, default=5.0, help="tqdm mininterval (log-friendly)")

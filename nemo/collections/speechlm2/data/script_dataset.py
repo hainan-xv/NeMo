@@ -32,6 +32,11 @@ from nemo.collections.speechlm2.parts.script import (
     collate_twod_chunk_examples,
 )
 from nemo.collections.speechlm2.parts.script_messages import get_llm_messages_for_batch
+from nemo.collections.speechlm2.parts.script_prompt import (
+    render_control_prompt,
+    resolve_delay_candidates,
+    sample_controls,
+)
 from nemo.collections.speechlm2.parts.utils import to_dataclass
 from nemo.utils import logging
 
@@ -55,12 +60,29 @@ class ScriptSTTDataConfig(StreamingSTTDataConfig):
             cross-branch attention pairs. Must match ``model.twod_layout``.
         chunk_size_seed: base seed for the per-batch chunk-size draw. Offset per
             dataloader worker so workers do not draw identical sequences.
+        prompt_control: train a PROMPT-CONTROLLED model. Capitalization,
+            punctuation and the emission delay are drawn per example, the targets
+            are restyled to match, and all four settings (including the batch's
+            chunk size) are stated in that example's instruction. One checkpoint
+            then serves every operating point. Off by default, so existing
+            recipes and checkpoints are unaffected.
+        delay_candidates: delays in frames to draw from when ``prompt_control``
+            is on. ``None`` means always use ``num_delay_frames``.
+        capitalization_prob: probability an example keeps its casing.
+        punctuation_prob: probability an example keeps its punctuation.
+        control_seed: base seed for the per-example control draw. Kept separate
+            from ``chunk_size_seed`` so changing one does not reshuffle the other.
     """
 
     audio_history_chunks: int = 0
     audio_window_frames: int = 0
     twod_layout: bool = False
     chunk_size_seed: int = 1234
+    prompt_control: bool = False
+    delay_candidates: Optional[List[int]] = None
+    capitalization_prob: float = 0.5
+    punctuation_prob: float = 0.5
+    control_seed: int = 5678
 
 
 @dataclass
@@ -158,8 +180,34 @@ class ScriptSTTDataset(StreamingSTTDataset):
         if self.eot_id is None:
             raise ValueError("Tokenizer has no eos_token_id; it is required as the branch end-of-turn token.")
 
-        # Per-worker RNG for the per-batch chunk-size draw.
+        # Per-worker RNGs: one for the per-batch chunk-size draw, one for the
+        # per-example control draw. Separate streams so that turning prompt
+        # control on does not perturb the chunk-size sequence.
         self._chunk_rngs: dict = {}
+        self._control_rngs: dict = {}
+
+        self._prompt_control = bool(self.cfg.prompt_control)
+        self._delay_candidates = resolve_delay_candidates(self.cfg.delay_candidates, self.cfg.num_delay_frames)
+        for name, p in (
+            ("capitalization_prob", self.cfg.capitalization_prob),
+            ("punctuation_prob", self.cfg.punctuation_prob),
+        ):
+            if not 0.0 <= float(p) <= 1.0:
+                raise ValueError(f"{name} must be in [0, 1], got {p}")
+        if not self._prompt_control and self.cfg.delay_candidates:
+            logging.warning(
+                "delay_candidates=%s is set but prompt_control is off; the delay stays fixed at "
+                "num_delay_frames=%d. Set data.dataset.prompt_control=true to sample it.",
+                list(self.cfg.delay_candidates),
+                self.cfg.num_delay_frames,
+            )
+        if self._prompt_control:
+            logging.info(
+                "ScriptSTTDataset: prompt control ON — delays=%s, P(cap)=%.2f, P(punct)=%.2f",
+                self._delay_candidates,
+                self.cfg.capitalization_prob,
+                self.cfg.punctuation_prob,
+            )
 
         logging.info(
             "ScriptSTTDataset: audio delimiters %r=%d / %r=%d, eot_id=%d, "
@@ -185,6 +233,14 @@ class ScriptSTTDataset(StreamingSTTDataset):
         if wid not in self._chunk_rngs:
             self._chunk_rngs[wid] = np.random.default_rng(int(self.cfg.chunk_size_seed) + wid)
         return self._chunk_rngs[wid]
+
+    def _get_control_rng(self) -> np.random.Generator:
+        """RNG for the per-example control draw, seeded per dataloader worker."""
+        info = torch.utils.data.get_worker_info()
+        wid = info.id if info is not None else 0
+        if wid not in self._control_rngs:
+            self._control_rngs[wid] = np.random.default_rng(int(self.cfg.control_seed) + wid)
+        return self._control_rngs[wid]
 
     def _messages_to_chunks(self, messages: List[dict]) -> List[ChunkSpec]:
         """Parse alternating user(audio)/assistant(words) turns into ChunkSpecs.
@@ -234,17 +290,42 @@ class ScriptSTTDataset(StreamingSTTDataset):
 
         system_prompts = [cut.custom.get(self.cfg.prompt_field, self.cfg.system_prompt) for cut in cuts]
 
+        # Prompt control: draw each example's settings, restyle its targets to
+        # match, and state all four in its own instruction. Off -> the batch
+        # shares the configured delay and the transcript's own style, and the
+        # prompt is left exactly as before.
+        if self._prompt_control:
+            rng = self._get_control_rng()
+            controls = [
+                sample_controls(
+                    rng,
+                    chunk_size=chunk_size,
+                    delay_candidates=self._delay_candidates,
+                    cap_prob=float(self.cfg.capitalization_prob),
+                    punct_prob=float(self.cfg.punctuation_prob),
+                )
+                for _ in cuts
+            ]
+            system_prompts = [render_control_prompt(p, c) for p, c in zip(system_prompts, controls)]
+            delays = [c.num_delay_frames for c in controls]
+            caps = [c.capitalization for c in controls]
+            puncts = [c.punctuation for c in controls]
+        else:
+            delays, caps, puncts = self.cfg.num_delay_frames, True, True
+
         batch_messages = get_llm_messages_for_batch(
             system_role=self.cfg.system_role,
             system_prompt=system_prompts,
             audio_tag=self.cfg.audio_tag,
             blank_token=self.cfg.blank_token,
             chunk_size=chunk_size,
-            num_delay_frames=self.cfg.num_delay_frames,
+            num_delay_frames=delays,
             audio_durations_secs=audio_durations_secs,
             frame_length_in_secs=self.cfg.frame_length_in_secs,
             alignments=alignments,
             transcripts=text,
+            capitalization=caps,
+            punctuation=puncts,
         )
 
         builder = build_twod_chunk_example if self._twod_layout else build_packed_chunk_example

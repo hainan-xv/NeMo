@@ -51,7 +51,10 @@ def train(cfg):
     # dataset builds each branch's window from them, and the model rebuilds the
     # same window at inference. A mismatch trains and decodes on different
     # conditioning, which is silent and hard to spot, so fail loudly here.
-    for key in ("audio_history_chunks", "audio_window_frames", "twod_layout"):
+    # prompt_control is in the same category: the dataset writes the control
+    # sentence into the instruction, the model rewrites it at inference. If only
+    # one side has it on, every decode is out of distribution.
+    for key in ("audio_history_chunks", "audio_window_frames", "twod_layout", "prompt_control"):
         model_val = int(cfg.model.get(key, 0) or 0)
         data_val = int(dataset_cfg.get(key, 0) or 0)
         if model_val != data_val:

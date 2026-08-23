@@ -37,10 +37,24 @@ parses into :class:`~nemo.collections.speechlm2.parts.script.ChunkSpec` objects.
 """
 
 import math
-from typing import List, Optional
+from typing import List, Optional, Sequence, Union
 
 from nemo.collections.speechlm2.data.streaming_stt_dataset import compute_word_spans
 from nemo.collections.speechlm2.parts.alignments import WordAlignment
+from nemo.collections.speechlm2.parts.script_prompt import apply_text_style
+
+
+def _per_sample(value, n: int, name: str) -> list:
+    """Broadcast a scalar setting to ``n`` samples, or validate a per-sample list.
+
+    Prompt-controlled training draws capitalization / punctuation / delay per
+    example, so these arrive as lists; everything else passes a scalar.
+    """
+    if isinstance(value, (list, tuple)):
+        if len(value) != n:
+            raise ValueError(f"{name} has {len(value)} entries but the batch has {n} samples")
+        return list(value)
+    return [value] * n
 
 
 def get_llm_messages_for_sample(
@@ -54,6 +68,8 @@ def get_llm_messages_for_sample(
     frame_length_in_secs: float,
     alignments: Optional[List[WordAlignment]] = None,
     transcript: Optional[str] = None,
+    capitalization: bool = True,
+    punctuation: bool = True,
 ) -> List[dict]:
     """Build the alternating user/assistant turns for one utterance.
 
@@ -98,6 +114,9 @@ def get_llm_messages_for_sample(
         transcript: the original transcript. When given, each chunk's text is
             sliced out of it by character span, which preserves the original
             punctuation and spacing rather than re-joining word strings.
+        capitalization: keep the transcript's casing; lowercase when False.
+        punctuation: keep sentence punctuation; strip it when False. A chunk
+            whose text is punctuation only becomes a silent chunk.
 
     Returns:
         The messages list described above.
@@ -114,11 +133,16 @@ def get_llm_messages_for_sample(
     word_spans = compute_word_spans(alignments, transcript, preserve_leading_whitespace=True) if transcript else None
 
     def _content_for(indices: List[int]) -> str:
+        text = None
         if word_spans and transcript:
             first, last = word_spans[indices[0]], word_spans[indices[-1]]
             if first is not None and last is not None:
-                return transcript[first[0] : last[1]]
-        return " ".join(alignments[i].text for i in indices)
+                text = transcript[first[0] : last[1]]
+        if text is None:
+            text = " ".join(alignments[i].text for i in indices)
+        # Restyle AFTER slicing: the character spans index into the original
+        # transcript, so stripping punctuation first would invalidate them.
+        return apply_text_style(text, capitalization, punctuation)
 
     num_chunks = math.ceil(num_frames / chunk_size) if num_frames > 0 else 0
 
@@ -138,14 +162,17 @@ def get_llm_messages_for_sample(
             else:
                 break
 
-        messages.append({"role": "assistant", "content": _content_for(ready) if ready else blank_token})
+        # Styling can empty a chunk whose text was punctuation only; that makes it
+        # silent, exactly like a chunk that revealed no words at all.
+        content = _content_for(ready) if ready else ""
+        messages.append({"role": "assistant", "content": content if content.strip() else blank_token})
 
     # Any words the delay pushed past the last chunk boundary (or whose alignment
     # end_time exceeds the clip duration) would otherwise be silently dropped,
     # showing up as deletions at the end of every utterance. Fold them into the
     # final assistant turn so the supervision stays lossless.
-    if word_idx < len(alignments):
-        residual = _content_for(list(range(word_idx, len(alignments))))
+    residual = _content_for(list(range(word_idx, len(alignments)))) if word_idx < len(alignments) else ""
+    if residual.strip():
         if messages[-1]["role"] != "assistant":
             messages.append({"role": "assistant", "content": residual})
         elif messages[-1]["content"] == blank_token:
@@ -162,19 +189,30 @@ def get_llm_messages_for_batch(
     audio_tag: str,
     blank_token: str,
     chunk_size: int,
-    num_delay_frames: int,
+    num_delay_frames: Union[int, Sequence[int]],
     audio_durations_secs: List[float],
     frame_length_in_secs: float,
     alignments: Optional[List[List[WordAlignment]]] = None,
     transcripts: Optional[List[str]] = None,
+    capitalization: Union[bool, Sequence[bool]] = True,
+    punctuation: Union[bool, Sequence[bool]] = True,
 ) -> List[List[dict]]:
     """Per-sample :func:`get_llm_messages_for_sample` over a batch.
 
     ``system_prompt`` is a per-sample list (cuts may carry their own prompt).
+
+    ``num_delay_frames``, ``capitalization`` and ``punctuation`` accept either a
+    scalar (the whole batch shares it) or a per-sample sequence -- prompt-controlled
+    training draws them independently per example. ``chunk_size`` is deliberately
+    scalar-only: the encoder's right context is ``chunk_size - 1``, so it is a
+    property of the batch, not of an example.
     """
     n = len(audio_durations_secs)
     if len(system_prompt) != n:
         raise ValueError(f"system_prompt has {len(system_prompt)} entries but the batch has {n} samples")
+    delays = _per_sample(num_delay_frames, n, "num_delay_frames")
+    caps = _per_sample(capitalization, n, "capitalization")
+    puncts = _per_sample(punctuation, n, "punctuation")
     return [
         get_llm_messages_for_sample(
             system_role=system_role,
@@ -182,11 +220,13 @@ def get_llm_messages_for_batch(
             audio_tag=audio_tag,
             blank_token=blank_token,
             chunk_size=chunk_size,
-            num_delay_frames=num_delay_frames,
+            num_delay_frames=delays[i],
             audio_duration_secs=audio_durations_secs[i],
             frame_length_in_secs=frame_length_in_secs,
             alignments=alignments[i] if alignments is not None else None,
             transcript=transcripts[i] if transcripts is not None else None,
+            capitalization=caps[i],
+            punctuation=puncts[i],
         )
         for i in range(n)
     ]

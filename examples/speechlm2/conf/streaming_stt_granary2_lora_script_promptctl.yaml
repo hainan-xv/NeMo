@@ -1,0 +1,220 @@
+# ============================================================================
+# PROMPT-CONTROLLED SCRIPT — Granary 2.0, LoRA, no-blank, val_wer.
+#
+# Same model and data as streaming_stt_granary2_lora_script_flex.yaml. The one
+# change: four decoding settings are DRAWN per example and STATED in that
+# example's instruction, so a single checkpoint serves every operating point and
+# the caller selects one at inference by asking for it in words.
+#
+#   chunk size    drawn per BATCH from model.chunk_size (it fixes the encoder's
+#                 right context to chunk-1, so it cannot vary within a batch)
+#   delay         drawn per EXAMPLE from data.dataset.delay_candidates
+#   capitalization  drawn per EXAMPLE, p = capitalization_prob
+#   punctuation     drawn per EXAMPLE, p = punctuation_prob
+#
+# The instruction then reads, e.g.:
+#
+#   <base prompt> The audio is chunked every 14 frames with an emission delay of
+#   3 frames. Use capitalization. Do not use punctuation.
+#
+# Targets are restyled to match the draw, so the supervision and the instruction
+# always agree. Training and inference build that sentence with the SAME function
+# (parts/script_prompt.py: render_control_prompt) -- a wording difference between
+# them would be silent out-of-distribution decoding.
+#
+# NOTE ON EVALUATION: the Open-ASR-Leaderboard normalizer lowercases and strips
+# punctuation before scoring, so the cap/punct settings do NOT move leaderboard
+# WER. They need a scorer that keeps case and punctuation to be measured.
+# ============================================================================
+model:
+  pretrained_llm: /lustre/fsw/portfolios/llmservice/users/heh/pretrained_models/huggingface/Qwen/Qwen3-1.7B
+  pretrained_asr: /lustre/fsw/portfolios/llmservice/users/heh/pretrained_models/huggingface/nvidia/nemotron-speech-streaming-en-0.6b/nemotron-speech-streaming-en-0.6b.nemo
+  load_llm_weights: true
+  load_asr_weights: true
+
+  sample_rate: 16000
+  blank_token: ""            # no-blank: silent chunks emit <|im_end|>
+  frame_length_in_secs: 0.08
+  chunk_size: [2, 4, 7, 10, 14, 28]   # multi chunk-size: one drawn per batch
+  att_context_size: [70, 1]  # left 70; right (look-ahead) set per batch to chunk-1
+  audio_pad_to: 0
+
+  # --- Attention backend (the only change from the baseline recipe) ---
+  # dense | flex | script -- all mathematically identical. See the header for
+  # measured memory/step-time; decoding always falls back to SDPA.
+  attn_backend: flex
+  activation_checkpointing: true
+
+  # --- SCRIPT ---
+  # M: each branch's audio window spans chunks [k-M .. k]. 0 = current chunk only.
+  # Must match data.dataset.audio_history_chunks (script_train.py asserts this).
+  audio_history_chunks: 0
+
+  # --- Prompt control ---
+  # Must match data.dataset.prompt_control (script_train.py asserts this).
+  # generate() renders the control sentence through the same function the
+  # dataset used, and rejects the knobs outright when this is false.
+  prompt_control: true
+
+  # Decode-only validation. val_chunk_size pins one well-supported chunk size
+  # instead of the largest candidate (whose look-ahead can be slow to stream).
+  # The other three pin the operating point validation decodes at; references
+  # are restyled to match, so val_wer measures recognition, not style.
+  val_chunk_size: 14
+  val_num_delay_frames: 3
+  val_capitalization: true
+  val_punctuation: true
+  # Bound the per-chunk prefill at inference (0 = unlimited full history).
+  max_history_tokens: 0
+  # Sub-batch size for the offline encode; keeps subsampling conv tensors within
+  # 32-bit CUDA indexing on long, length-sorted clips.
+  encode_batch_size: 8
+  log_detailed_train_metrics: false
+
+  freeze_speech_encoder: false
+  freeze_modality_adapter: false
+  freeze_modality_proj: false
+  freeze_llm_model: true
+  freeze_llm_head: false
+  freeze_embed_tokens: false
+
+  freeze_params: []
+  prevent_freeze_params: []
+
+  lora:
+    task_type: CAUSAL_LM
+    r: 128
+    lora_alpha: 256
+    lora_dropout: 0.01
+
+  perception:
+    modality_adapter:
+      _target_: nemo.collections.speechlm2.modules.perception.IdentityConnector
+    encoder:
+      # The cache-aware encoder otherwise all-reduces max audio length every
+      # forward, which desyncs the data-dependent validation decode across ranks.
+      sync_max_audio_length: false
+
+  optimizer:
+    _target_: torch.optim.AdamW
+    lr: 1e-4
+    betas: [0.9, 0.98]
+    weight_decay: 1e-3
+    foreach: true
+
+  lr_scheduler:
+    _target_: nemo.core.optim.lr_scheduler.CosineAnnealing
+    warmup_steps: 10000
+    min_lr: 1e-6
+    max_steps: ${trainer.max_steps}
+
+data:
+  # --- ScriptSTTDataset config ---
+  dataset:
+    sample_rate: ${model.sample_rate}
+    frame_length_in_secs: ${model.frame_length_in_secs}
+    chunk_size: ${model.chunk_size}
+    audio_history_chunks: ${model.audio_history_chunks}
+
+    # --- Prompt control (paired with model.prompt_control) ---
+    prompt_control: ${model.prompt_control}
+    # Delays in frames (0.08s each): 0 -> 0.00s ... 8 -> 0.64s. num_delay_frames
+    # below is the fallback used only when prompt_control is off.
+    delay_candidates: [0, 1, 2, 3, 4, 6, 8]
+    capitalization_prob: 0.5
+    punctuation_prob: 0.5
+    control_seed: 5678
+    num_delay_frames: 3
+    audio_tag: "<audio>"
+    blank_token: ${model.blank_token}
+    system_role: system
+    system_prompt: "You are doing streaming speech recognition. Given the transcript so far and the representation of the next audio chunk, output the words spoken in that chunk."
+
+  # Decode-only val_wer runs generate() on raw audio; pin a single fixed size.
+  val_dataset_overrides:
+    chunk_size: 14
+    # Validation is decode-only: it uses the audio and batch.text, never the
+    # constructed targets, and the operating point comes from the model's val_*
+    # settings. Drawing controls here would just add nondeterminism, so leave it off.
+    prompt_control: false
+
+  # --- Lhotse dataloader config ---
+  train_ds:
+    sample_rate: ${data.dataset.sample_rate}
+    input_cfg: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/users/dongjig/aligned_amos/granary_v2_en_pnc_qwen_aligned_filtered/granary_v2_en_pnc_qwen_aligned_filtered_safe_iad_s3_audio.yaml
+    skip_missing_manifest_entries: true
+    manifest_filepath: null
+    seed: 42
+    shuffle: true
+    shard_seed: "randomized"
+    num_workers: 8
+    force_iterable_dataset: true
+    use_bucketing: true
+    bucket_duration_bins: [4.32,6.0,7.04,7.92,8.8,9.6,10.4,11.12,11.89,12.66,13.47,14.8,16.92,20.0,22.4,29.44,35.0,39.6]
+    bucket_batch_size: [38,29,25,22,20,18,17,15,14,13,12,11,10,8,7,6,5,4]
+    max_duration: 54
+    pad_extra_duration: 0.5
+    pad_extra_duration_prob: 1.0
+
+  validation_ds:
+    datasets:
+      mcv_11_dev:
+        manifest_filepath: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/users/dongjig/aligned_amos/steve_val_mmlpc_mcv11_2k/mcv11_dev_clean_pcstrip_en_2k_qwen_aligned.json
+    sample_rate: ${data.dataset.sample_rate}
+    batch_size: 4
+    num_workers: 4
+    seed: 42
+    shard_seed: "randomized"
+    shuffle: false
+    pad_extra_duration: 0.5
+    pad_extra_duration_prob: 1.0
+
+trainer:
+  devices: -1
+  accelerator: gpu
+  num_nodes: 1
+  precision: bf16-true
+  logger: false
+  enable_checkpointing: false
+  use_distributed_sampler: false
+  max_steps: 200000
+  limit_train_batches: 2000
+  val_check_interval: ${trainer.limit_train_batches}
+  log_every_n_steps: 10
+  num_sanity_val_steps: 1
+  gradient_clip_val: 1.0
+  accumulate_grad_batches: 1
+  strategy:
+    _target_: lightning.pytorch.strategies.DDPStrategy
+    gradient_as_bucket_view: true
+    find_unused_parameters: true
+
+
+exp_manager:
+  exp_dir: null
+  explicit_log_dir: null
+  name: streaming_stt_granary2_script_flex
+  create_tensorboard_logger: true
+  create_checkpoint_callback: true
+  use_datetime_version: true
+  max_time_per_run: "00:03:50:00"
+
+  resume_from_checkpoint: null
+  resume_if_exists: true
+  resume_ignore_no_checkpoint: true
+
+  create_wandb_logger: false
+  wandb_logger_kwargs:
+    name: ${exp_manager.name}
+    project: null
+    resume: true
+
+  checkpoint_callback_params:
+    filename: "{step}-{val_wer:.4f}"
+    monitor: val_wer
+    mode: min
+    every_n_train_steps: null
+    every_n_epochs: 1
+    save_top_k: 5
+    always_save_nemo: false
+    save_nemo_on_train_end: false

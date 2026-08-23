@@ -37,6 +37,11 @@ from nemo.collections.speechlm2.parts.script import (
     build_twod_branch_mask,
 )
 from nemo.collections.speechlm2.parts.script_attention import script_attention_plan
+from nemo.collections.speechlm2.parts.script_prompt import (
+    ScriptControls,
+    apply_text_style,
+    render_control_prompt,
+)
 from nemo.collections.speechlm2.parts.utils import to_dataclass
 from nemo.utils import logging
 
@@ -105,6 +110,16 @@ class ScriptSTTModelConfig(StreamingSTTModelConfig):
             decoded token is not a word start, so the chunk cannot merge onto the
             previous chunk's last word. Overridable per ``generate`` call.
         log_detailed_train_metrics: also log sequence length / target counts.
+        prompt_control: the model was trained PROMPT-CONTROLLED — its instruction
+            states the chunk size, emission delay, capitalization and punctuation.
+            When on, :meth:`generate` renders those settings into the prompt
+            through the same function the dataset uses, so decoding cannot drift
+            out of distribution by wording the instruction differently. MUST match
+            ``data.dataset.prompt_control``.
+        val_num_delay_frames / val_capitalization / val_punctuation: the operating
+            point validation decodes at, used only when ``prompt_control`` is on.
+            References are restyled to match, or the WER would penalise the model
+            for honouring the style it was asked for.
     """
 
     audio_history_chunks: int = 0
@@ -113,10 +128,14 @@ class ScriptSTTModelConfig(StreamingSTTModelConfig):
     twod_branch_micro_batch: int = 0
     attn_backend: str = "dense"
     activation_checkpointing: bool = False
+    prompt_control: bool = False
     val_chunk_size: Optional[int] = None
     val_max_new_tokens_per_chunk: Optional[int] = None
     val_system_prompt: Optional[str] = None
     val_prompt_field: str = "system_prompt"
+    val_num_delay_frames: int = 3
+    val_capitalization: bool = True
+    val_punctuation: bool = True
     max_history_tokens: int = 0
     encode_batch_size: int = 8
     force_word_start: bool = True
@@ -574,6 +593,11 @@ class ScriptSTTModel(StreamingSTTModel):
         # Validation is decode-only: autoregressive WER needs neither word
         # alignments nor constructed target turns, just audio and reference text.
         refs = list(batch.text)
+        # A prompt-controlled model decodes at a fixed validation operating point.
+        # Restyle the references to that same style, or WER would count the model
+        # honouring the requested style as an error on every word.
+        if self.core_cfg.prompt_control:
+            refs = [apply_text_style(r, self.core_cfg.val_capitalization, self.core_cfg.val_punctuation) for r in refs]
         hyps = self.generate(
             audios=batch.audios,
             audio_lens=batch.audio_lens,
@@ -687,10 +711,16 @@ class ScriptSTTModel(StreamingSTTModel):
 
         Args:
             audios / audio_lens: waveforms ``(B, T)`` and sample counts ``(B,)``.
-            system_prompt: one instruction, or one per utterance.
+            system_prompt: one instruction, or one per utterance. For a
+                prompt-controlled model this is the BASE instruction; the control
+                sentence is appended here, so callers pass the same base string
+                the recipe trained with.
             max_new_tokens: cap on tokens decoded per chunk.
             chunk_size_override: decode at this chunk size instead of the
                 configured / representative one.
+            num_delay_frames / capitalization / punctuation: prompt-controlled
+                models only — the operating point to request. Default to the
+                ``val_*`` config values. Ignored when ``prompt_control`` is off.
 
         Returns:
             ``B`` transcripts.
@@ -702,6 +732,29 @@ class ScriptSTTModel(StreamingSTTModel):
         B = audios.shape[0]
         if isinstance(system_prompt, str):
             system_prompt = [system_prompt] * B
+
+        # Prompt control: state the operating point in the instruction, using the
+        # SAME renderer the dataset used during training.
+        asked = {
+            k: generation_kwargs.pop(k)
+            for k in ("num_delay_frames", "capitalization", "punctuation")
+            if k in generation_kwargs
+        }
+        if self.core_cfg.prompt_control:
+            controls = ScriptControls(
+                chunk_size=cs,
+                num_delay_frames=int(asked.get("num_delay_frames", self.core_cfg.val_num_delay_frames)),
+                capitalization=bool(asked.get("capitalization", self.core_cfg.val_capitalization)),
+                punctuation=bool(asked.get("punctuation", self.core_cfg.val_punctuation)),
+            )
+            system_prompt = [render_control_prompt(p, controls) for p in system_prompt]
+        elif asked:
+            # Silently ignoring these would look like the knobs work when the model
+            # never learned them, which is the expensive kind of mistake.
+            raise ValueError(
+                f"generate() got {sorted(asked)} but this model has prompt_control=False, so it was never "
+                "trained to honour them. Set model.prompt_control=true (and train that way) or drop these arguments."
+            )
 
         max_history_tokens = int(generation_kwargs.pop("max_history_tokens", self.core_cfg.max_history_tokens))
         # Guarantee that each chunk's first emitted token starts a new word. On by
