@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH -A nemotron_speechprod_asr
-#SBATCH -J nemotron_speechprod_asr:streaming-stt-script-flex
+#SBATCH -J nemotron_speechprod_asr:streaming-stt-script-promptctl
 #SBATCH -p batch_block1,batch_block3,batch_block4
 #SBATCH -N 8
 #SBATCH --gpus-per-node=8
