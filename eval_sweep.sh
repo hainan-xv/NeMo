@@ -13,6 +13,7 @@
 #   ./eval_sweep.sh --only nemotron
 #   ./eval_sweep.sh --dry-run                # print submissions, send nothing
 #   ./eval_sweep.sh MAX_EVAL_SAMPLES=32      # quick smoke sweep (env passthrough)
+#   ./eval_sweep.sh --exp granary2_script_win28         # any SCRIPT model
 #   ./eval_sweep.sh --exp granary2_script_baseline_n1   # a 1-node training run
 #
 # CHUNK SIZES
@@ -33,7 +34,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 
 CHUNKS="${CHUNKS:-2 7 14}"
 ONLY="${ONLY:-both}"                 # script | nemotron | both
-SCRIPT_EXP="${SCRIPT_EXP:-granary2_script_baseline}"
+SCRIPT_EXP="${SCRIPT_EXP:-granary2_script_baseline}"   # any SCRIPT exp; see launch/eval_script.sh
 NEMOTRON_MODE="${MODE:-offline}"     # offline | streaming
 DRY_RUN=0
 
@@ -98,7 +99,7 @@ launch() {
 for c in $CHUNKS; do
     if [[ "$ONLY" == "script" || "$ONLY" == "both" ]]; then
         launch "SCRIPT   chunk=${c}" ${ENV_ASSIGNMENTS[@]+"${ENV_ASSIGNMENTS[@]}"} \
-            launch/eval_script_baseline.sh "$SCRIPT_EXP" "$c"
+            launch/eval_script.sh "$SCRIPT_EXP" "$c"
     fi
     if [[ "$ONLY" == "nemotron" || "$ONLY" == "both" ]]; then
         launch "nemotron chunk=${c}" "MODE=${NEMOTRON_MODE}" ${ENV_ASSIGNMENTS[@]+"${ENV_ASSIGNMENTS[@]}"} \
