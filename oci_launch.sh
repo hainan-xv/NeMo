@@ -27,6 +27,7 @@
 # FLAGS
 #   --follow, -f     tail the job's stdout after submitting (Ctrl-C stops the
 #                    tail, NOT the job)
+#   --no-follow      do not tail (the default; accepted for symmetry)
 #   --no-sync        skip the sync check and submit against whatever is on the grid
 #   --force-sync     always run sync_to_oci.sh, even if HEAD already matches
 #   --dry-run, -n    print what would happen; touch nothing
@@ -54,6 +55,7 @@ DRY_RUN=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -f|--follow)   FOLLOW=1; shift ;;
+        --no-follow)   FOLLOW=0; shift ;;   # accepted for symmetry with the interactive wrapper
         --no-sync)     DO_SYNC=0; shift ;;
         --force-sync)  FORCE_SYNC=1; shift ;;
         -n|--dry-run)  DRY_RUN=1; shift ;;
