@@ -40,6 +40,7 @@ SCRIPT_PATHS=(
     oci_launch.sh
     oci_launch_interactive.sh
     eval_sweep.sh
+    eval_all.sh
     launch/
     'nemo/collections/speechlm2/parts/script*.py'
     nemo/collections/speechlm2/data/script_dataset.py
