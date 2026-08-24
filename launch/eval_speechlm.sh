@@ -86,9 +86,17 @@ SYSTEM_PROMPT="${SYSTEM_PROMPT:-Transcribe the audio into text.}"
 # CKPT is set explicitly, so eval_leaderboard.sh disables averaging by itself.
 EVAL_TAG="${EVAL_TAG:-heh_v2}"
 
+# The checkpoint stores bare hub ids, which cannot resolve under HF_HUB_OFFLINE=1.
+# Point at the on-disk snapshots the SCRIPT recipes already use, so all three
+# systems in the comparison load a byte-identical base LLM and encoder.
+HEH_PRETRAINED="${HEH_PRETRAINED:-/lustre/fsw/portfolios/llmservice/users/heh/pretrained_models/huggingface}"
+PRETRAINED_LLM="${PRETRAINED_LLM:-${HEH_PRETRAINED}/Qwen/Qwen3-1.7B}"
+PRETRAINED_ASR="${PRETRAINED_ASR:-${HEH_PRETRAINED}/nvidia/nemotron-speech-streaming-en-0.6b/nemotron-speech-streaming-en-0.6b.nemo}"
+
 STREAMING_EMBS="${STREAMING_EMBS:-0}"
 EMIT_DELAY_FRAMES="${EMIT_DELAY_FRAMES:-0}"
 EXTRA_EVAL_ARGS="${EXTRA_EVAL_ARGS:-} --emit_delay_frames ${EMIT_DELAY_FRAMES}"
+EXTRA_EVAL_ARGS="${EXTRA_EVAL_ARGS} --pretrained_llm ${PRETRAINED_LLM} --pretrained_asr ${PRETRAINED_ASR}"
 [[ "$STREAMING_EMBS" == "1" || "$STREAMING_EMBS" == "true" ]] && EXTRA_EVAL_ARGS="${EXTRA_EVAL_ARGS} --streaming_embs"
 
 export EXP_NAME PROJECT OUTPUT_PREFIX MODEL_CLASS EVAL_DRIVER SYSTEM_PROMPT CHUNK_SIZE EVAL_TAG CKPT EXTRA_EVAL_ARGS
@@ -97,6 +105,8 @@ echo "==> streaming SpeechLM leaderboard eval"
 echo "    checkpoint: ${CKPT}"
 echo "    chunk_size: ${CHUNK_SIZE} frames ($(python3 -c "print(f'{${CHUNK_SIZE}*0.08:.2f}')" 2>/dev/null || echo '?')s)"
 echo "    embs:       $([[ "$STREAMING_EMBS" == "1" ]] && echo 'true cache-aware streaming' || echo 'offline (chunk-limited attention)')"
+echo "    base llm:   ${PRETRAINED_LLM}"
+echo "    base asr:   ${PRETRAINED_ASR}"
 echo "    results ->  ${OUTPUT_PREFIX}/results/${PROJECT}/${EXP_NAME}"
 if [[ ! -f "$CKPT" ]]; then
     echo "ERROR: checkpoint not found: ${CKPT}" >&2

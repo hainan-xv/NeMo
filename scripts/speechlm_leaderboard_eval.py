@@ -96,7 +96,14 @@ def _hubify(path: str) -> str:
     return path
 
 
-def load_model(ckpt_path: str, model_class_path: str, device: torch.device, dtype: torch.dtype):
+def load_model(
+    ckpt_path: str,
+    model_class_path: str,
+    device: torch.device,
+    dtype: torch.dtype,
+    pretrained_llm: str = None,
+    pretrained_asr: str = None,
+):
     """Rebuild the model from its Lightning checkpoint's own hyper-parameters.
 
     Deliberately not ``load_from_checkpoint``: a few config entries need
@@ -116,13 +123,28 @@ def load_model(ckpt_path: str, model_class_path: str, device: torch.device, dtyp
     state_dict = ckpt["state_dict"]
 
     cfg["load_llm_weights"] = False
-    for key in ("pretrained_llm", "pretrained_asr"):
+
+    # Explicit overrides win. This checkpoint stores BARE HUB IDS
+    # ("Qwen/Qwen3-1.7B"), and eval nodes run with HF_HUB_OFFLINE=1 against a
+    # cache that need not contain them -- the tokenizer alone is enough to abort
+    # the whole run. Pointing at the on-disk snapshot the SCRIPT recipes already
+    # use both fixes that and guarantees every system in the comparison loads a
+    # byte-identical base model.
+    for key, override in (("pretrained_llm", pretrained_llm), ("pretrained_asr", pretrained_asr)):
+        if override:
+            if not os.path.exists(override):
+                raise FileNotFoundError(f"--{key} does not exist: {override}")
+            _log(f"    {key}: {cfg.get(key)!r} -> {override} (override)")
+            cfg[key] = override
+            continue
         p = cfg.get(key, "")
         if p and not os.path.exists(p):
             new = _hubify(p)
             if new != p:
                 _log(f"    {key}: {p} -> {new}")
                 cfg[key] = new
+            else:
+                _log(f"    [warn] {key}={p!r} is not a local path; it must be in the offline HF cache")
 
     if "lora" in cfg and cfg["lora"] and "target_modules" not in cfg["lora"]:
         mods = sorted({k.split(".")[-4] for k in state_dict if ".lora_A." in k})
@@ -261,6 +283,14 @@ def parse_args():
         default="nemo.collections.speechlm2.models.streaming_stt_model.StreamingSTTModel",
         help="dotted path of the model class",
     )
+    p.add_argument(
+        "--pretrained_llm",
+        type=str,
+        default=None,
+        help="local path overriding cfg.pretrained_llm (the checkpoint may store a bare hub id, "
+        "which fails under HF_HUB_OFFLINE=1)",
+    )
+    p.add_argument("--pretrained_asr", type=str, default=None, help="local path overriding cfg.pretrained_asr")
     p.add_argument("--cache_dir", type=str, default=None, help="pre-staged leaderboard cache root")
     p.add_argument("--datasets", type=str, default=",".join(DEFAULT_DATASETS), help="comma-separated name:split list")
     p.add_argument("--output_dir", type=str, default=None, help="where shard JSONLs are written/read")
@@ -342,7 +372,7 @@ def main() -> int:
         device = torch.device("cpu")
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float32
 
-    model = load_model(args.ckpt_path, args.model_class, device, dtype)
+    model = load_model(args.ckpt_path, args.model_class, device, dtype, args.pretrained_llm, args.pretrained_asr)
     _log(f"==> system_prompt: {args.system_prompt!r}")
     _log(
         f"==> chunk_size={args.chunk_size} offline_embs={args.offline_embs} "
