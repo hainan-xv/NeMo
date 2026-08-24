@@ -85,43 +85,54 @@ echo "    chunk sizes: ${CHUNKS}"
 echo ""
 
 # ---------------------------------------------------------------------------
-# One round trip: gather the state of every experiment as TSV.
-#   exp <TAB> n_ckpts <TAB> ckpt_epoch <TAB> ckpt_name <TAB> eval_epoch <TAB> eval_dir
+# One round trip: gather the state of every experiment, PER CHUNK SIZE, as TSV.
+#   exp <TAB> n_ckpts <TAB> ckpt_epoch <TAB> ckpt_name <TAB> chunk <TAB> eval_epoch <TAB> eval_dir <TAB> pending_epoch
+#
+# Per chunk size, not per experiment: each chunk size is its own result. An
+# experiment freshly evaluated at chunk 14 has NOT been evaluated at chunk 2, and
+# comparing against "the newest eval of any chunk size" would call it up to date
+# and silently skip the chunk sizes you asked for.
+#
+# Rows with chunk "-" carry an experiment-level skip (no checkpoints at all).
 # ---------------------------------------------------------------------------
-SCAN=$(oci_ssh bash -s -- "$RESULTS_ROOT" <<'REMOTE'
+SCAN=$(oci_ssh bash -s -- "$RESULTS_ROOT" $CHUNKS <<'REMOTE'
 set -u
-ROOT="$1"
+ROOT="$1"; shift
+CHUNK_LIST="$*"
 [ -d "$ROOT" ] || { echo "__NOROOT__"; exit 0; }
 for d in "$ROOT"/*/; do
     exp=$(basename "$d")
     ck="${d}${exp}/checkpoints"
     if [ ! -d "$ck" ]; then
-        printf '%s\t-1\t0\t-\t0\t-\t0\n' "$exp"
+        printf '%s\t-1\t0\t-\t-\t0\t-\t0\n' "$exp"
         continue
     fi
     # The set eval_leaderboard.sh averages over: no rolling -last, no prior average.
     mapfile -t cks < <(ls -t "$ck"/*.ckpt 2>/dev/null | grep -v -- '-last\.ckpt$' | grep -v -- '-averaged\.ckpt$')
     n=${#cks[@]}
-    cepoch=0; cname="-"
-    if [ "$n" -gt 0 ]; then
-        cepoch=$(stat -c %Y "${cks[0]}" 2>/dev/null || echo 0)
-        cname=$(basename "${cks[0]}")
+    if [ "$n" -eq 0 ]; then
+        printf '%s\t0\t0\t-\t-\t0\t-\t0\n' "$exp"
+        continue
     fi
-    # Newest eval that actually completed, and the newest that has NOT -- the
-    # latter is most likely an eval currently in flight, which we must not
-    # duplicate when this script is run repeatedly (e.g. from cron).
-    eepoch=0; edir="-"; pepoch=0
-    for ed in "$d"leaderboard_eval_*/; do
-        [ -d "$ed" ] || continue
-        t=$(stat -c %Y "$ed" 2>/dev/null || echo 0)
-        if [ -f "${ed}aggregate.log" ] && grep -q "^RESULT.Average" "${ed}aggregate.log" 2>/dev/null; then
-            at=$(stat -c %Y "${ed}aggregate.log" 2>/dev/null || echo 0)
-            if [ "$at" -gt "$eepoch" ]; then eepoch=$at; edir=$(basename "$ed"); fi
-        else
-            if [ "$t" -gt "$pepoch" ]; then pepoch=$t; fi
-        fi
+    cepoch=$(stat -c %Y "${cks[0]}" 2>/dev/null || echo 0)
+    cname=$(basename "${cks[0]}")
+
+    for c in $CHUNK_LIST; do
+        # Only this chunk size's eval dirs. The trailing underscore in the glob
+        # keeps chunk 2 from matching chunk 28's directories.
+        eepoch=0; edir="-"; pepoch=0
+        for ed in "$d"leaderboard_eval_chunk"${c}"_*/; do
+            [ -d "$ed" ] || continue
+            t=$(stat -c %Y "$ed" 2>/dev/null || echo 0)
+            if [ -f "${ed}aggregate.log" ] && grep -q "^RESULT.Average" "${ed}aggregate.log" 2>/dev/null; then
+                at=$(stat -c %Y "${ed}aggregate.log" 2>/dev/null || echo 0)
+                if [ "$at" -gt "$eepoch" ]; then eepoch=$at; edir=$(basename "$ed"); fi
+            else
+                if [ "$t" -gt "$pepoch" ]; then pepoch=$t; fi
+            fi
+        done
+        printf '%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\n' "$exp" "$n" "$cepoch" "$cname" "$c" "$eepoch" "$edir" "$pepoch"
     done
-    printf '%s\t%d\t%s\t%s\t%s\t%s\t%s\n' "$exp" "$n" "$cepoch" "$cname" "$eepoch" "$edir" "$pepoch"
 done
 REMOTE
 )
@@ -147,12 +158,12 @@ ago() {  # epoch -> "3h ago" / "never"
     else                           echo "$((s/86400))d ago"; fi
 }
 
-TO_EVAL=()
-printf "  %-38s %6s %14s %14s  %s\n" "experiment" "ckpts" "newest ckpt" "last eval" "decision"
-printf "  %s\n" "$(printf '%.0s-' {1..104})"
+TO_EVAL=()   # "exp<TAB>chunk" pairs
+printf "  %-34s %5s %6s %13s %13s  %s\n" "experiment" "chunk" "ckpts" "newest ckpt" "last eval" "decision"
+printf "  %s\n" "$(printf '%.0s-' {1..108})"
 
 now=$(date +%s)
-while IFS=$'\t' read -r exp n cepoch cname eepoch edir pepoch; do
+while IFS=$'\t' read -r exp n cepoch cname chunk eepoch edir pepoch; do
     [[ -z "$exp" ]] && continue
     # An eval directory with no finished aggregate.log, created recently, means a
     # job is probably still running. Bounded by INFLIGHT_MAX_AGE so a CRASHED eval
@@ -170,31 +181,30 @@ while IFS=$'\t' read -r exp n cepoch cname eepoch edir pepoch; do
     elif [[ -n "$SKIP_PATTERN" ]] && [[ "$exp" =~ $SKIP_PATTERN ]]; then
         decision="skip: matches --skip"
     elif [[ "$inflight" -eq 1 && "$FORCE" -eq 0 ]]; then
-        decision="skip: an eval started $(ago "$pepoch") has not finished (--force to override)"
+        decision="skip: a chunk-${chunk} eval started $(ago "$pepoch") has not finished (--force)"
     elif [[ "$FORCE" -eq 1 ]]; then
         decision="EVAL (forced)"
-        TO_EVAL+=("$exp")
+        TO_EVAL+=("${exp}"$'\t'"${chunk}")
     elif [[ "$eepoch" == "0" ]]; then
-        decision="EVAL: never evaluated"
-        TO_EVAL+=("$exp")
+        decision="EVAL: never evaluated at chunk ${chunk}"
+        TO_EVAL+=("${exp}"$'\t'"${chunk}")
     elif [[ "$cepoch" -gt "$eepoch" ]]; then
-        decision="EVAL: new checkpoints since last eval"
-        TO_EVAL+=("$exp")
+        decision="EVAL: new checkpoints since the chunk-${chunk} eval"
+        TO_EVAL+=("${exp}"$'\t'"${chunk}")
     else
         decision="up to date"
     fi
-    printf "  %-38s %6s %14s %14s  %s\n" "$exp" \
+    printf "  %-34s %5s %6s %13s %13s  %s\n" "$exp" "$chunk" \
         "$([[ "$n" == "-1" ]] && echo "-" || echo "$n")" "$(ago "$cepoch")" "$(ago "$eepoch")" "$decision"
 done <<< "$SCAN"
 
 echo ""
 if [[ ${#TO_EVAL[@]} -eq 0 ]]; then
-    echo "Nothing to do — every experiment is up to date."
+    echo "Nothing to do — every experiment is up to date at every requested chunk size."
     exit 0
 fi
 
-n_jobs=$(( ${#TO_EVAL[@]} * $(wc -w <<< "$CHUNKS") ))
-echo "==> ${#TO_EVAL[@]} experiment(s) to evaluate x $(wc -w <<< "$CHUNKS") chunk size(s) = ${n_jobs} job(s)"
+echo "==> ${#TO_EVAL[@]} job(s) to submit"
 echo ""
 
 # ---------------------------------------------------------------------------
@@ -204,29 +214,28 @@ DRY_FLAG=""; [[ "$DRY_RUN" -eq 1 ]] && DRY_FLAG="--dry-run"
 
 submitted=()
 first=1
-for exp in "${TO_EVAL[@]}"; do
-    for c in $CHUNKS; do
-        sync_flag="--no-sync"
-        if [[ "$first" -eq 1 ]]; then sync_flag=""; first=0; fi   # sync-check once
+for pair in "${TO_EVAL[@]}"; do
+    IFS=$'\t' read -r exp c <<< "$pair"
+    sync_flag="--no-sync"
+    if [[ "$first" -eq 1 ]]; then sync_flag=""; first=0; fi   # sync-check once
 
-        label="${exp} chunk=${c}"
-        echo "--- ${label} ---"
-        # FORCE_AVERAGE=1: the averaged checkpoint is cached, so without this the
-        # eval would silently score the OLD average and the whole run would be
-        # pointless. This is the "regenerate the averaged checkpoint" step.
-        if ! out="$(./oci_launch.sh $sync_flag $DRY_FLAG \
-                        FORCE_AVERAGE=1 ${ENV_ASSIGNMENTS[@]+"${ENV_ASSIGNMENTS[@]}"} \
-                        launch/eval_script.sh "$exp" "$c" 2>&1)"; then
-            echo "$out"
-            echo "    !! FAILED to submit" >&2
-            submitted+=("${label}: FAILED")
-            continue
-        fi
-        echo "$out" | grep -E '^(==>|    )' || true
-        jid="$(sed -n 's/^==> Job \([0-9]*\) submitted.*/\1/p' <<< "$out" | tail -1)"
-        submitted+=("${label}: ${jid:-dry-run}")
-        echo ""
-    done
+    label="${exp} chunk=${c}"
+    echo "--- ${label} ---"
+    # FORCE_AVERAGE=1: the averaged checkpoint is cached, so without this the
+    # eval would silently score the OLD average and the whole run would be
+    # pointless. This is the "regenerate the averaged checkpoint" step.
+    if ! out="$(./oci_launch.sh $sync_flag $DRY_FLAG \
+                    FORCE_AVERAGE=1 ${ENV_ASSIGNMENTS[@]+"${ENV_ASSIGNMENTS[@]}"} \
+                    launch/eval_script.sh "$exp" "$c" 2>&1)"; then
+        echo "$out"
+        echo "    !! FAILED to submit" >&2
+        submitted+=("${label}: FAILED")
+        continue
+    fi
+    echo "$out" | grep -E '^(==>|    )' || true
+    jid="$(sed -n 's/^==> Job \([0-9]*\) submitted.*/\1/p' <<< "$out" | tail -1)"
+    submitted+=("${label}: ${jid:-dry-run}")
+    echo ""
 done
 
 echo "===================== submitted ====================="
