@@ -55,8 +55,9 @@
 # ENV
 #   CKPT             exact checkpoint path (default: the step=200000-last above)
 #   EXP_NAME         label for OUR results dir (default speechlm_heh_noblank_v2)
-#   STREAMING_EMBS=1 use true cache-aware streaming perception instead of the
-#                    batched offline embeddings (slower; the deployment number)
+#   OFFLINE_EMBS=1   batch the per-chunk embeddings instead of true streaming.
+#                    DIAGNOSTIC ONLY -- measured 17.79 vs 5.51 macro on this
+#                    checkpoint; it does not reproduce the streaming decode.
 #   EMIT_DELAY_FRAMES  inference-time emission delay (default 0)
 #   Everything else (DATASETS, BATCH_SIZE, MAX_NEW_TOKENS, MAX_EVAL_SAMPLES,
 #   wandb, ...) is handled by eval_leaderboard.sh -- see its header.
@@ -93,7 +94,11 @@ HEH_PRETRAINED="${HEH_PRETRAINED:-/lustre/fsw/portfolios/llmservice/users/heh/pr
 PRETRAINED_LLM="${PRETRAINED_LLM:-${HEH_PRETRAINED}/Qwen/Qwen3-1.7B}"
 PRETRAINED_ASR="${PRETRAINED_ASR:-${HEH_PRETRAINED}/nvidia/nemotron-speech-streaming-en-0.6b/nemotron-speech-streaming-en-0.6b.nemo}"
 
-STREAMING_EMBS="${STREAMING_EMBS:-0}"
+# Streaming by default: on this checkpoint the offline path scores 17.79 macro
+# against streaming's 5.51 (chunk 14, 64 utts/dataset), dropping words at chunk
+# starts. OFFLINE_EMBS=1 is a diagnostic, not a reporting mode.
+STREAMING_EMBS="${STREAMING_EMBS:-1}"
+[[ "${OFFLINE_EMBS:-0}" == "1" ]] && STREAMING_EMBS=0
 EMIT_DELAY_FRAMES="${EMIT_DELAY_FRAMES:-0}"
 EXTRA_EVAL_ARGS="${EXTRA_EVAL_ARGS:-} --emit_delay_frames ${EMIT_DELAY_FRAMES}"
 EXTRA_EVAL_ARGS="${EXTRA_EVAL_ARGS} --pretrained_llm ${PRETRAINED_LLM} --pretrained_asr ${PRETRAINED_ASR}"

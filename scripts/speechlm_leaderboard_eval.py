@@ -31,17 +31,26 @@ special-casing one driver.
 
 ENCODING MODE
 -------------
-``--offline_embs`` (default) builds the per-chunk embeddings in one pass.
-``generate`` pins ``att_context_size = [left, chunk-1]`` for the call either way,
-so a frame never depends on audio past its own chunk boundary: the dependency
-structure is the streaming one even though the computation is batched. This is
-the matched comparison against SCRIPT (whose evaluation encodes the same way) and
-against ``nemotron_leaderboard_eval.py --mode offline``, and it is much faster.
+``--streaming_embs`` (DEFAULT) runs the true cache-aware streaming perception.
+This is the model's own default path and the honest deployment number.
 
-``--streaming_embs`` runs the true cache-aware streaming perception instead. That
-is the honest deployment number and exercises cache-boundary effects. The two
-should agree closely; a large gap points at a streaming-path problem rather than
-a model quality difference.
+``--offline_embs`` batches the per-chunk embeddings instead. It is faster, and
+``generate`` pins ``att_context_size = [left, chunk-1]`` either way -- but on this
+checkpoint the two paths DO NOT agree, and offline is badly worse:
+
+    chunk 14, 64 utts/dataset      streaming  5.51 macro   offline  17.79 macro
+                                   LS clean   2.65         LS clean 14.02
+
+The offline hypotheses drop words at chunk starts ("a quarter of an hour" ->
+"A of an hour"), i.e. the batched chunk assembly does not reproduce the streaming
+one here even though the attention context matches. So offline is retained only
+as a diagnostic; do not use it for reported numbers without re-verifying it
+against streaming on the model at hand.
+
+NOTE the resulting asymmetry: SCRIPT and nemotron are evaluated with offline,
+chunk-limited encoding (verified equivalent for those models), while this one
+uses true streaming. Streaming is the stricter of the two, so this model is not
+being flattered by the difference.
 
 Usage (decode one shard):
 
@@ -325,15 +334,15 @@ def parse_args():
         "--offline_embs",
         dest="offline_embs",
         action="store_true",
-        default=True,
-        help="batch the per-chunk embeddings (default). Attention is still chunk-limited, so the "
-        "dependency structure is the streaming one -- this is the matched comparison against SCRIPT.",
+        default=False,
+        help="DIAGNOSTIC ONLY: batch the per-chunk embeddings. Measured 17.79 vs 5.51 macro against "
+        "streaming on this checkpoint -- it does not reproduce the streaming decode. See the module docstring.",
     )
     p.add_argument(
         "--streaming_embs",
         dest="offline_embs",
         action="store_false",
-        help="true cache-aware streaming perception instead; slower, the honest deployment number",
+        help="true cache-aware streaming perception (default)",
     )
     p.add_argument(
         "--pad_extra_seconds",
