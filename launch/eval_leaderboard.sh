@@ -36,6 +36,8 @@
 #   EXP_NAME / PROJECT      which run's checkpoints to evaluate
 #   SYSTEM_PROMPT           MUST match the model's training instruction
 #   CHUNK_SIZE              decode chunk size in encoder frames
+#   EVAL_DRIVER             driver under scripts/ (default script_leaderboard_eval.py;
+#                           use speechlm_leaderboard_eval.py for StreamingSTTModel)
 #   RUN_AVERAGING / CKPT / STEP / USE_LAST     which checkpoint
 #   DATASETS, BATCH_SIZE, MAX_NEW_TOKENS, MAX_EVAL_SAMPLES, FORCE_WORD_START
 #   NUM_DELAY_FRAMES        [prompt-controlled models] delay to request, in frames
@@ -57,6 +59,7 @@ mkdir -p slurm_out
 # --- What to evaluate ---
 EXP_NAME="${1:-${EXP_NAME:-granary2_script_baseline}}"
 PROJECT="${PROJECT:-SpeechlmScriptCC}"
+EVAL_DRIVER="${EVAL_DRIVER:-script_leaderboard_eval.py}"   # which driver under scripts/
 MODEL_CLASS="${MODEL_CLASS:-nemo.collections.speechlm2.models.script_model.ScriptSTTModel}"
 
 # --- Decode configuration ---
@@ -163,6 +166,8 @@ else
 fi
 
 # --- Optional flags ---
+EXTRA_EVAL_ARGS="${EXTRA_EVAL_ARGS:-}"   # verbatim extra flags for the chosen driver
+
 FORCE_WORD_START_FLAG=""
 [[ "$FORCE_WORD_START" == "0" || "$FORCE_WORD_START" == "false" ]] && FORCE_WORD_START_FLAG="--no_force_word_start"
 
@@ -204,6 +209,7 @@ eval_tag: "${EVAL_TAG:-}"
 model_class: "${MODEL_CLASS}"
 checkpoint: "${CKPT}"
 run_averaging: ${RUN_AVERAGING}
+eval_driver: "${EVAL_DRIVER}"
 num_averaged_inputs: ${#_AVG_IN[@]}
 system_prompt: |
   ${SYSTEM_PROMPT}
@@ -246,6 +252,22 @@ if [[ "$REPORT_WANDB" == "1" ]]; then
     WANDB_CLAUSE="&& { export WANDB_API_KEY='${WANDB_TOKEN}'; python /code/scripts/eval_wandb_report.py --project '${WANDB_EVAL_PROJECT}' --run_name '${WANDB_RUN_NAME}' --results_dir '${RESULTS_DIR}' --group '${EXP_NAME}' --job_type script 2>&1 | tee '${RESULTS_DIR}/wandb_report.log' || true; }"
 fi
 
+# Driver-specific flags. --max_history_tokens, --force_word_start and the
+# prompt-control knobs exist only in script_leaderboard_eval.py; handing them to
+# another driver is an argparse failure, not a no-op.
+if [[ "$EVAL_DRIVER" == "script_leaderboard_eval.py" ]]; then
+    DRIVER_ARGS="--max_history_tokens ${MAX_HISTORY_TOKENS} ${FORCE_WORD_START_FLAG}"
+    DRIVER_ARGS="${DRIVER_ARGS} ${NUM_DELAY_FRAMES:+--num_delay_frames ${NUM_DELAY_FRAMES}} ${CAP_FLAG} ${PUNCT_FLAG}"
+else
+    DRIVER_ARGS=""
+    for v in MAX_HISTORY_TOKENS:0 NUM_DELAY_FRAMES: CAPITALIZATION: PUNCTUATION:; do
+        name="${v%%:*}"; default="${v#*:}"
+        if [[ -n "${!name:-}" && "${!name}" != "$default" ]]; then
+            echo "WARNING: ${name}=${!name} is a SCRIPT-only knob; ignored for EVAL_DRIVER=${EVAL_DRIVER}" >&2
+        fi
+    done
+fi
+
 read -r -d '' cmd <<EOF
 echo "*******STARTING LEADERBOARD EVAL********" \
 && nvidia-smi \
@@ -259,7 +281,7 @@ echo "*******STARTING LEADERBOARD EVAL********" \
 && export TOKENIZERS_PARALLELISM=false \
 && export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 && export TMPDIR=${OCI_TMP_DIR} && mkdir -p ${OCI_TMP_DIR} \
-&& python -c "from nemo.collections.speechlm2 import ScriptSTTModel; print('SCRIPT model available')" \
+&& python -c "from nemo.utils.model_utils import import_class_by_path as I; I('${MODEL_CLASS}'); print('model class OK: ${MODEL_CLASS}')" \
 && python -c "import kaldialign; assert hasattr(kaldialign,'batch_error_rate')" 2>/dev/null || pip install -U --quiet kaldialign \
 ${AVG_CLAUSE} \
 && if [[ ! -f "${CKPT}" ]]; then echo "ERROR: checkpoint missing: ${CKPT}"; exit 1; fi \
@@ -271,7 +293,7 @@ ${AVG_CLAUSE} \
 && for gpu in \$(seq 0 \$(( ${NGPU} - 1 ))); do \
       log="${RESULTS_DIR}/shard_\${gpu}.log"; \
       echo "  [gpu \$gpu] shard \$gpu/${NGPU} -> \${log}"; \
-      CUDA_VISIBLE_DEVICES=\$gpu python /code/scripts/script_leaderboard_eval.py \
+      CUDA_VISIBLE_DEVICES=\$gpu python /code/scripts/${EVAL_DRIVER} \
         --ckpt_path "${CKPT}" \
         --model_class "${MODEL_CLASS}" \
         --datasets "${DATASETS_CSV}" \
@@ -288,16 +310,14 @@ ${AVG_CLAUSE} \
         --system_prompt "\$SP_TEXT" \
         --pad_extra_seconds ${PAD_EXTRA_SECONDS} \
         ${CHUNK_SIZE:+--chunk_size ${CHUNK_SIZE}} \
-        ${FORCE_WORD_START_FLAG} \
-        ${NUM_DELAY_FRAMES:+--num_delay_frames ${NUM_DELAY_FRAMES}} \
-        ${CAP_FLAG} ${PUNCT_FLAG} \
+        ${DRIVER_ARGS} ${EXTRA_EVAL_ARGS} \
         > "\${log}" 2>&1 & \
       pids+=(\$!); \
    done \
 && fail=0 && for p in "\${pids[@]}"; do wait "\$p" || fail=1; done \
 && echo "" \
 && echo "==================== Leaderboard WER ====================" \
-&& python /code/scripts/script_leaderboard_eval.py --aggregate --output_dir "${SHARD_DIR}" 2>&1 | tee "${RESULTS_DIR}/aggregate.log" \
+&& python /code/scripts/${EVAL_DRIVER} --aggregate --output_dir "${SHARD_DIR}" 2>&1 | tee "${RESULTS_DIR}/aggregate.log" \
 ${WANDB_CLAUSE} \
 && echo "" \
 && echo "Per-shard logs + generations under: ${RESULTS_DIR}" \
@@ -306,6 +326,7 @@ EOF
 
 # Write the command to a file rather than passing `bash -c "$cmd"`: the system
 # prompt may contain apostrophes that would otherwise break the quoting.
+
 CMD_FILE="${RESULTS_DIR}/container_cmd.sh"
 printf '%s\n' "$cmd" > "$CMD_FILE"
 chmod +x "$CMD_FILE"
