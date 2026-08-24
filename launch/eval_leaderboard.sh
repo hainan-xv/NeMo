@@ -305,7 +305,6 @@ ${AVG_CLAUSE} \
         --device 0 \
         --batch_size ${BATCH_SIZE} \
         --max_new_tokens ${MAX_NEW_TOKENS} \
-        --max_history_tokens ${MAX_HISTORY_TOKENS} \
         --max_eval_samples ${MAX_EVAL_SAMPLES} \
         --system_prompt "\$SP_TEXT" \
         --pad_extra_seconds ${PAD_EXTRA_SECONDS} \
