@@ -81,10 +81,18 @@ for exp in "$@"; do
         echo -e "$exp\t$c\t$wer\t$t"
         found=1
     done
-    [ "$found" -eq 0 ] && echo -e "$exp\t-\tNONE\t0"
+    if [ "$found" -eq 0 ]; then echo -e "$exp\t-\tNONE\t0"; fi
 done
+# Explicit: a trailing `[ ... ] && ...` that evaluates false would make this
+# remote script exit 1, which under `set -e` locally kills the report before it
+# prints anything.
+exit 0
 REMOTE
 )
+    if [[ -z "${ROWS//[[:space:]]/}" ]]; then
+        echo "  ERROR: the scan returned nothing -- could not read ${RESULTS_ROOT} on the grid." >&2
+        exit 1
+    fi
     python3 - "$CHUNKS" <<PY
 import sys, collections
 rows = """$ROWS""".strip().split("\n")
