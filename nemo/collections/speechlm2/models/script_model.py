@@ -37,6 +37,7 @@ from nemo.collections.speechlm2.parts.script import (
     build_twod_branch_mask,
 )
 from nemo.collections.speechlm2.parts.script_attention import script_attention_plan
+from nemo.collections.speechlm2.parts.script_fsm import fsm_stream_decode_script, streaming_encode_frames
 from nemo.collections.speechlm2.parts.script_prompt import (
     ScriptControls,
     apply_text_style,
@@ -800,6 +801,12 @@ class ScriptSTTModel(StreamingSTTModel):
                 "trained to honour them. Set model.prompt_control=true (and train that way) or drop these arguments."
             )
 
+        # FSM decode knobs. Separable on purpose: streaming_encode swaps the
+        # OFFLINE encode for the cache-aware one (the change that was worth 12
+        # WER points on the interleaved model), state_machine swaps the bulk
+        # prefill for explicit per-stream stepping. Either can be used alone.
+        streaming_encode = bool(generation_kwargs.pop("streaming_encode", False))
+        state_machine = bool(generation_kwargs.pop("use_state_machine_inference", False))
         max_history_tokens = int(generation_kwargs.pop("max_history_tokens", self.core_cfg.max_history_tokens))
         # Guarantee that each chunk's first emitted token starts a new word. On by
         # default: without it a chunk whose first token is a continuation merges
@@ -807,11 +814,15 @@ class ScriptSTTModel(StreamingSTTModel):
         force_word_start = bool(generation_kwargs.pop("force_word_start", self.core_cfg.force_word_start))
         insert_word_start_id = self._get_word_start_insert_id() if force_word_start else None
 
-        frames_list = self.encode_frames(audios, audio_lens, cs)
+        if streaming_encode:
+            frames_list = streaming_encode_frames(self, audios, audio_lens, cs)
+        else:
+            frames_list = self.encode_frames(audios, audio_lens, cs)
         # Same instruction/history separator the dataset uses when building the spine.
         instruction_ids_list = [self.tokenizer.text_to_ids(system_prompt[b] + "\n") for b in range(B)]
 
-        emitted = batched_stream_decode_script(
+        decode_fn = fsm_stream_decode_script if state_machine else batched_stream_decode_script
+        emitted = decode_fn(
             llm=self.llm,
             embed_tokens=self._embed_tokens,
             instruction_ids_list=instruction_ids_list,

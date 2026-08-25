@@ -1888,3 +1888,162 @@ def test_decode_keeps_gate_in_history_but_not_in_output():
     assert batched_stream_decode_script(llm=FakeLLM([READ, 82]), gate_in_history=True, **kw) == [[READ]]
     # and with the flag off, neither appears
     assert batched_stream_decode_script(llm=FakeLLM([WRITE, 11, 82]), gate_in_history=False, **kw) == [[11]]
+
+
+# ---------------------------------------------------------------------------
+# FSM decode
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# FSM decode
+#
+# These check that the state machine is CORRECT -- that it feeds the training
+# conditioning and honours the gate. They deliberately do NOT assert it matches
+# batched_stream_decode_script token for token: the FSM is meant to be the
+# faithful streaming algorithm, and it is an empirical question whether it beats
+# the bulk-prefill path, not something to pin down by construction.
+# ---------------------------------------------------------------------------
+
+TEXT_MARK = 7.0
+
+
+def _text_emb(ids):
+    """Text embeddings carry a marker so a stub LLM can tell them from audio."""
+    return torch.full((*ids.shape, 8), TEXT_MARK)
+
+
+class _StubLLM:
+    """Emits ``plan`` in order, one token per GENERATION step.
+
+    A generation step is a single-token step whose input is a TEXT embedding:
+    that is ``<ve>`` (whose logits predict the first word) and then each token
+    fed back. Single-token AUDIO steps and the multi-token prefix prefill are
+    not decision points and must not advance the plan -- which is exactly the
+    distinction the FSM's per-frame stepping makes visible.
+    """
+
+    def __init__(self, plan, vocab=200):
+        self.plan, self.vocab, self.i = plan, vocab, -1
+        self.audio_steps = 0
+        self.fed = []
+
+    def __call__(self, inputs_embeds=None, **kw):
+        from types import SimpleNamespace
+
+        n, steps, _ = inputs_embeds.shape
+        is_text = bool(torch.isclose(inputs_embeds.reshape(-1)[0], torch.tensor(TEXT_MARK)))
+        if steps > 1:
+            self.i = -1  # multi-token prefill = start of a new chunk
+        elif steps == 1 and not is_text:
+            self.audio_steps += 1
+            self.fed.append(inputs_embeds[0, 0].clone())
+        elif steps == 1 and is_text:
+            self.i += 1
+        logits = torch.full((n, steps, self.vocab), -1e9)
+        logits[:, -1, self.plan[min(max(self.i, 0), len(self.plan) - 1)]] = 0.0
+        return SimpleNamespace(logits=logits, past_key_values=None)
+
+
+def test_fsm_feeds_one_audio_frame_per_step_and_the_training_window():
+    """The FSM must feed exactly the window the training packer would build."""
+    from nemo.collections.speechlm2.parts.script_fsm import fsm_stream_decode_script
+
+    frames = torch.arange(6 * 8, dtype=torch.float32).reshape(6, 8)
+    llm = _StubLLM([82])  # emit <eot> immediately: no words, isolate the audio path
+    fsm_stream_decode_script(
+        llm=llm,
+        embed_tokens=_text_emb,
+        instruction_ids_list=[[5]],
+        frames_list=[frames],
+        chunk_size=2,
+        vision_start_id=80,
+        vision_end_id=81,
+        eot_id=82,
+        pad_id=0,
+        max_new_tokens=4,
+    )
+    # 3 chunks x 2 frames, one frame per step, in order.
+    assert llm.audio_steps == 6, llm.audio_steps
+    assert torch.allclose(torch.stack(llm.fed), frames), "frames fed out of order or altered"
+
+
+def test_fsm_window_follows_audio_window_frames():
+    """With a fixed frame window every branch sees F frames, not one chunk."""
+    from nemo.collections.speechlm2.parts.script_fsm import fsm_stream_decode_script
+
+    frames = torch.randn(8, 8)
+    llm = _StubLLM([82])
+    fsm_stream_decode_script(
+        llm=llm,
+        embed_tokens=_text_emb,
+        instruction_ids_list=[[5]],
+        frames_list=[frames],
+        chunk_size=2,
+        vision_start_id=80,
+        vision_end_id=81,
+        eot_id=82,
+        pad_id=0,
+        max_new_tokens=4,
+        audio_window_frames=4,
+    )
+    # chunks end at frames 2,4,6,8 -> windows [0:2],[0:4],[2:6],[4:8] = 2+4+4+4
+    assert llm.audio_steps == 14, llm.audio_steps
+
+
+def test_fsm_emits_words_and_stops_at_eot():
+    from nemo.collections.speechlm2.parts.script_fsm import fsm_stream_decode_script
+
+    out = fsm_stream_decode_script(
+        llm=_StubLLM([11, 12, 82]),
+        embed_tokens=_text_emb,
+        instruction_ids_list=[[5]],
+        frames_list=[torch.zeros(2, 8)],
+        chunk_size=2,
+        vision_start_id=80,
+        vision_end_id=81,
+        eot_id=82,
+        pad_id=0,
+        max_new_tokens=6,
+    )
+    assert out == [[11, 12]], out
+
+
+def test_fsm_honours_the_read_write_gate():
+    from nemo.collections.speechlm2.parts.script_fsm import fsm_stream_decode_script
+
+    kw = dict(
+        embed_tokens=_text_emb,
+        instruction_ids_list=[[5]],
+        frames_list=[torch.zeros(2, 8)],
+        chunk_size=2,
+        vision_start_id=80,
+        vision_end_id=81,
+        eot_id=82,
+        pad_id=0,
+        max_new_tokens=6,
+        read_id=READ,
+        write_id=WRITE,
+    )
+    assert fsm_stream_decode_script(llm=_StubLLM([WRITE, 11, 82]), **kw) == [[11]]
+    assert fsm_stream_decode_script(llm=_StubLLM([READ, 82]), **kw) == [[]]
+    assert fsm_stream_decode_script(llm=_StubLLM([WRITE, 11, 82]), gate_in_history=True, **kw) == [[WRITE, 11]]
+
+
+def test_fsm_handles_ragged_batches():
+    """Streams of different lengths must each stop at their own last chunk."""
+    from nemo.collections.speechlm2.parts.script_fsm import fsm_stream_decode_script
+
+    out = fsm_stream_decode_script(
+        llm=_StubLLM([11, 82]),
+        embed_tokens=_text_emb,
+        instruction_ids_list=[[5], [6, 7]],
+        frames_list=[torch.zeros(6, 8), torch.zeros(2, 8)],
+        chunk_size=2,
+        vision_start_id=80,
+        vision_end_id=81,
+        eot_id=82,
+        pad_id=0,
+        max_new_tokens=4,
+    )
+    assert len(out) == 2
+    assert len(out[0]) == 3 * len(out[1]), (out, "3 chunks vs 1")

@@ -173,6 +173,10 @@ def build_gen_kwargs(args) -> dict:
     # Prompt-control knobs are forwarded ONLY when explicitly requested. A
     # non-prompt-controlled model raises on them, which is what we want: it means
     # "this checkpoint cannot honour that request" rather than silently ignoring it.
+    if args.state_machine:
+        kwargs["use_state_machine_inference"] = True
+    if args.streaming_encode:
+        kwargs["streaming_encode"] = True
     if args.num_delay_frames is not None:
         kwargs["num_delay_frames"] = args.num_delay_frames
     if args.capitalization is not None:
@@ -285,6 +289,20 @@ def parse_args():
 
     # Prompt-controlled models only. Left as None so they are not forwarded at
     # all unless asked for -- a model trained without prompt control rejects them.
+    # FSM decode. Separable so a difference can be attributed to one or the other.
+    p.add_argument(
+        "--state_machine",
+        action="store_true",
+        default=False,
+        help="decode via the per-stream state machine (one frame/token per step) instead of bulk prefill",
+    )
+    p.add_argument(
+        "--streaming_encode",
+        action="store_true",
+        default=False,
+        help="encode with the CACHE-AWARE streaming encoder chunk by chunk instead of one offline pass. "
+        "On the interleaved model this distinction was worth 12 WER points, so it is the prime suspect.",
+    )
     p.add_argument(
         "--num_delay_frames", type=int, default=None, help="[prompt-controlled] emission delay to request, in frames"
     )

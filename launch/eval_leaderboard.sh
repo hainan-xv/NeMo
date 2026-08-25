@@ -258,6 +258,8 @@ fi
 if [[ "$EVAL_DRIVER" == "script_leaderboard_eval.py" ]]; then
     DRIVER_ARGS="--max_history_tokens ${MAX_HISTORY_TOKENS} ${FORCE_WORD_START_FLAG}"
     DRIVER_ARGS="${DRIVER_ARGS} ${NUM_DELAY_FRAMES:+--num_delay_frames ${NUM_DELAY_FRAMES}} ${CAP_FLAG} ${PUNCT_FLAG}"
+    [[ "${STATE_MACHINE:-}" == "1" ]] && DRIVER_ARGS="${DRIVER_ARGS} --state_machine"
+    [[ "${STREAMING_ENCODE:-}" == "1" ]] && DRIVER_ARGS="${DRIVER_ARGS} --streaming_encode"
 else
     DRIVER_ARGS=""
     for v in MAX_HISTORY_TOKENS:0 NUM_DELAY_FRAMES: CAPITALIZATION: PUNCTUATION:; do

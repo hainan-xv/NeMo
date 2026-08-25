@@ -89,12 +89,16 @@ EVAL_TAG="${EVAL_TAG:-${EXP_NAME}}"
 
 # Named here (not just read by the backend) so oci_launch.sh's knob discovery,
 # which scans this script for ${NAME:-...}, forwards them from your shell.
+# FSM decode (see scripts/script_fsm.py). Independent switches.
+STATE_MACHINE="${STATE_MACHINE:-}"       # 1 = per-stream state machine decode
+STREAMING_ENCODE="${STREAMING_ENCODE:-}" # 1 = cache-aware streaming perception
+
 NUM_DELAY_FRAMES="${NUM_DELAY_FRAMES:-}"
 CAPITALIZATION="${CAPITALIZATION:-}"
 PUNCTUATION="${PUNCTUATION:-}"
 
 export EXP_NAME PROJECT MODEL_CLASS SYSTEM_PROMPT CHUNK_SIZE EVAL_TAG OUTPUT_PREFIX
-export NUM_DELAY_FRAMES CAPITALIZATION PUNCTUATION
+export NUM_DELAY_FRAMES CAPITALIZATION PUNCTUATION STATE_MACHINE STREAMING_ENCODE
 
 CKPT_DIR="${OUTPUT_PREFIX}/results/${PROJECT}/${EXP_NAME}/${EXP_NAME}/checkpoints"
 echo "==> SCRIPT leaderboard eval"
