@@ -42,6 +42,7 @@ SCRIPT_PATHS=(
     eval_sweep.sh
     eval_all.sh
     eval_promptctl_sweep.sh
+    eval_readwrite.sh
     launch/
     'nemo/collections/speechlm2/parts/script*.py'
     nemo/collections/speechlm2/data/script_dataset.py
