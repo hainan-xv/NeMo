@@ -133,10 +133,19 @@ class ChunkSpec:
         target_ids: token ids of the words revealed by this chunk (``w_k``). May
             be empty for a silent chunk, in which case the branch only predicts
             ``eot_id``.
+        gate_id: optional read/write token prepended to the BRANCH only. The
+            branch then predicts ``[gate] w_k <eot>`` -- an explicit emit/no-emit
+            decision -- while the SPINE still receives ``target_ids`` alone.
+            Keeping it out of the spine is deliberate: the spine is the running
+            transcript, and the exactness property the parity tests check
+            (packed branch logits == standalone per-chunk logits) depends on it
+            containing nothing else. A silent chunk carries ``gate_id`` = the
+            read token with empty ``target_ids``.
     """
 
     audio_len: int
     target_ids: List[int] = field(default_factory=list)
+    gate_id: Optional[int] = None
 
 
 @dataclass
@@ -250,8 +259,10 @@ def build_packed_chunk_example(
         window_len = len(window_frames)
 
         branch_words = list(ch.target_ids)
+        if ch.gate_id is not None:
+            branch_words = [ch.gate_id] + branch_words
 
-        # branch tokens: <vs> [window audio] <ve> [branch_words] <eot>
+        # branch tokens: <vs> [window audio] <ve> [gate] [branch_words] <eot>
         branch_tokens: List[int] = [vision_start_id] + [AUDIO_TOKEN_IDX] * window_len + [vision_end_id]
         branch_is_audio: List[bool] = [False] + [True] * window_len + [False]
         branch_frame_idx: List[int] = [-1] + window_frames + [-1]
@@ -487,6 +498,8 @@ def build_twod_chunk_example(
         window = list(range(win_start, win_end))
         w = len(window)
         words = list(ch.target_ids)
+        if ch.gate_id is not None:
+            words = [ch.gate_id] + words
 
         ids = [vision_start_id] + [AUDIO_TOKEN_IDX] * w + [vision_end_id] + words + [eot_id]
         fidx = [-1] + window + [-1] + [-1] * len(words) + [-1]
@@ -744,6 +757,8 @@ def build_separate_chunk_examples(
         window_len = len(window_frames)
 
         branch_words = list(ch.target_ids)
+        if ch.gate_id is not None:
+            branch_words = [ch.gate_id] + branch_words
         prefix = list(history)
         branch_start = len(prefix)
 
@@ -797,6 +812,8 @@ def batched_stream_decode_script(
     return_chunk_ids: bool = False,
     is_word_start: Optional[Callable[[int], bool]] = None,
     insert_word_start_id: Optional[int] = None,
+    read_id: Optional[int] = None,
+    write_id: Optional[int] = None,
 ):
     """Batched greedy SCRIPT decode for ``B`` utterances at once.
 
@@ -973,6 +990,17 @@ def batched_stream_decode_script(
 
         for i, b in enumerate(active):
             toks = words[i]
+            # Read/write gate: the branch predicts [gate] w_k <eot>. Strip the
+            # gate here so it never reaches ``emitted`` -- the history is the
+            # running TRANSCRIPT, exactly as in training, where the gate lives in
+            # the branch and the spine holds words alone. A read decision
+            # discards anything that followed it: a chunk that declared silence
+            # must not also contribute words.
+            if read_id is not None and toks and toks[0] == read_id:
+                toks = []
+            elif write_id is not None and toks and toks[0] == write_id:
+                toks = toks[1:]
+
             # Chunk-start fix-up: guarantee a word boundary without having
             # restricted what the model was allowed to emit.
             if (

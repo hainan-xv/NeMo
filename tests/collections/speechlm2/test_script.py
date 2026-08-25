@@ -1609,3 +1609,147 @@ def test_generate_rejects_control_kwargs_when_not_prompt_controlled():
     for kwargs in ({"num_delay_frames": 6}, {"capitalization": False}, {"punctuation": False}):
         with pytest.raises(ValueError, match="prompt_control=False"):
             ScriptSTTModel.generate(stub, audios=audios, audio_lens=audio_lens, system_prompt="P", **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Read/write gate
+# ---------------------------------------------------------------------------
+
+READ, WRITE = 90, 91
+
+
+def _rw_chunks():
+    """Two chunks: the first silent, the second revealing two words."""
+    return [
+        ChunkSpec(audio_len=2, target_ids=[], gate_id=READ),
+        ChunkSpec(audio_len=2, target_ids=[11, 12], gate_id=WRITE),
+    ]
+
+
+def test_gate_never_enters_the_spine():
+    """THE invariant: the spine is the running transcript and nothing else.
+
+    A gate token leaking into the spine would change the conditioning history and
+    break the exactness property the parity tests rely on.
+    """
+    ex = build_packed_chunk_example(
+        instruction_ids=[5, 6], chunks=_rw_chunks(), vision_start_id=80, vision_end_id=81, eot_id=82
+    )
+    spine = ex.input_ids[: ex.spine_len].tolist()
+    assert spine == [5, 6, 11, 12], spine
+    assert READ not in spine and WRITE not in spine
+
+
+def test_gate_is_supervised_as_the_branch_first_token():
+    """<ve> predicts the gate, the gate predicts the first word, last word -> eot."""
+    ex = build_packed_chunk_example(
+        instruction_ids=[5, 6], chunks=_rw_chunks(), vision_start_id=80, vision_end_id=81, eot_id=82
+    )
+    for k, expect in ((1, [READ, 82]), (2, [WRITE, 11, 12, 82])):
+        sup = ex.target_ids[(ex.seg_ids == k) & (ex.target_ids != IGNORE_INDEX)]
+        assert sup.tolist() == expect, (k, sup.tolist())
+
+
+def test_gate_off_by_default_is_byte_identical():
+    """gate_id=None must reproduce the pre-existing layout exactly."""
+    plain = [ChunkSpec(audio_len=2, target_ids=[]), ChunkSpec(audio_len=2, target_ids=[11, 12])]
+    kw = dict(instruction_ids=[5, 6], vision_start_id=80, vision_end_id=81, eot_id=82)
+    a = build_packed_chunk_example(chunks=plain, **kw)
+    b = build_packed_chunk_example(
+        chunks=[ChunkSpec(audio_len=c.audio_len, target_ids=c.target_ids, gate_id=None) for c in plain], **kw
+    )
+    for f in ("input_ids", "position_ids", "seg_ids", "prefix_len", "target_ids", "is_audio"):
+        assert torch.equal(getattr(a, f), getattr(b, f)), f
+
+
+@pytest.mark.parametrize("layout", ["packed", "twod", "separate"])
+def test_all_three_builders_apply_the_gate(layout):
+    """The gate must reach every layout, or they silently disagree."""
+    chunks, kw = _rw_chunks(), dict(instruction_ids=[5, 6], vision_start_id=80, vision_end_id=81, eot_id=82)
+    if layout == "packed":
+        ex = build_packed_chunk_example(chunks=chunks, **kw)
+        ids = ex.input_ids[ex.spine_len :].tolist()
+    elif layout == "twod":
+        ex = build_twod_chunk_example(chunks=chunks, **kw)
+        ids = ex.branch_ids.flatten().tolist()
+    else:
+        exs = build_separate_chunk_examples(chunks=chunks, **kw)
+        ids = [t for e in exs for t in e.input_ids.tolist()]
+    assert READ in ids and WRITE in ids, layout
+
+
+def test_parity_packed_vs_separate_with_gate():
+    """Exactness must survive the gate: packed branches == standalone examples."""
+    chunks = [
+        ChunkSpec(audio_len=2, target_ids=[], gate_id=READ),
+        ChunkSpec(audio_len=2, target_ids=[11, 12], gate_id=WRITE),
+        ChunkSpec(audio_len=2, target_ids=[], gate_id=READ),
+        ChunkSpec(audio_len=2, target_ids=[13], gate_id=WRITE),
+    ]
+    kw = dict(instruction_ids=[5, 6], vision_start_id=80, vision_end_id=81, eot_id=82)
+    packed = build_packed_chunk_example(chunks=chunks, **kw)
+    separate = build_separate_chunk_examples(chunks=chunks, **kw)
+    for k, sep in enumerate(separate, start=1):
+        got = packed.input_ids[packed.seg_ids == k].tolist()
+        # A standalone example is [history..., <vs> audio <ve> gate words <eot>];
+        # its branch is the tail after the history prefix.
+        exp = sep.input_ids[sep.branch_start :].tolist()
+        assert got == exp, (k, got, exp)
+
+
+def test_decode_strips_the_gate_and_read_suppresses_words():
+    """Decode must remove the gate before it reaches the history, and a <read>
+    decision must discard anything that followed it."""
+    from nemo.collections.speechlm2.parts.script import batched_stream_decode_script
+
+    # Scripted "model": emits a fixed token sequence per chunk, then eot.
+    class FakeLLM:
+        def __init__(self, plan):
+            self.plan, self.step = plan, 0
+
+        def __call__(self, inputs_embeds=None, **kw):
+            n = inputs_embeds.shape[0]
+            tid = self.plan[min(self.step, len(self.plan) - 1)]
+            self.step += 1
+            logits = torch.full((n, 1, 200), -1e9)
+            logits[:, 0, tid] = 0.0
+            return SimpleNamespace(logits=logits, past_key_values=None)
+
+    from types import SimpleNamespace
+
+    emb = lambda ids: torch.zeros(*ids.shape, 8)
+    frames = [torch.zeros(2, 8)]
+
+    # chunk 0: <write> 11 <eot>
+    out = batched_stream_decode_script(
+        llm=FakeLLM([WRITE, 11, 82]),
+        embed_tokens=emb,
+        instruction_ids_list=[[5]],
+        frames_list=frames,
+        chunk_size=2,
+        vision_start_id=80,
+        vision_end_id=81,
+        eot_id=82,
+        pad_id=0,
+        max_new_tokens=8,
+        read_id=READ,
+        write_id=WRITE,
+    )
+    assert out == [[11]], out
+
+    # chunk 0: <read> then a stray word -> everything discarded
+    out = batched_stream_decode_script(
+        llm=FakeLLM([READ, 11, 82]),
+        embed_tokens=emb,
+        instruction_ids_list=[[5]],
+        frames_list=frames,
+        chunk_size=2,
+        vision_start_id=80,
+        vision_end_id=81,
+        eot_id=82,
+        pad_id=0,
+        max_new_tokens=8,
+        read_id=READ,
+        write_id=WRITE,
+    )
+    assert out == [[]], out

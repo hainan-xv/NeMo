@@ -60,6 +60,16 @@ class ScriptSTTDataConfig(StreamingSTTDataConfig):
             cross-branch attention pairs. Must match ``model.twod_layout``.
         chunk_size_seed: base seed for the per-batch chunk-size draw. Offset per
             dataloader worker so workers do not draw identical sequences.
+        read_write: give every branch an EXPLICIT emit/no-emit gate. A silent
+            chunk's branch predicts ``<read> <eot>``; a chunk that reveals words
+            predicts ``<write> w_k <eot>``. Without it (the default) the decision
+            is implicit -- a silent branch simply predicts ``<eot>`` first.
+            The gate is BRANCH-ONLY: the spine still holds words alone, so the
+            model does not condition on its own past gate decisions the way an
+            interleaved SpeechLM does. Must match ``model.read_write``.
+        read_token / write_token: the two gate tokens. Defaults are unused
+            in-vocab Qwen specials, so no embedding resize is needed and a
+            read/write run can still warm-start from a plain SCRIPT checkpoint.
         prompt_control: train a PROMPT-CONTROLLED model. Capitalization,
             punctuation and the emission delay are drawn per example, the targets
             are restyled to match, and all four settings (including the batch's
@@ -78,6 +88,9 @@ class ScriptSTTDataConfig(StreamingSTTDataConfig):
     audio_window_frames: int = 0
     twod_layout: bool = False
     chunk_size_seed: int = 1234
+    read_write: bool = False
+    read_token: str = "<|box_start|>"
+    write_token: str = "<|box_end|>"
     prompt_control: bool = False
     delay_candidates: Optional[List[int]] = None
     capitalization_prob: float = 0.5
@@ -176,6 +189,27 @@ class ScriptSTTDataset(StreamingSTTDataset):
                     f"{name}={tok!r} is not a single in-vocabulary token for this tokenizer (got id={tid}). "
                     "Choose a delimiter that already exists in the vocab."
                 )
+        # Read/write gate ids, validated exactly like the audio delimiters: they
+        # must already be single tokens in the vocabulary, so enabling the gate
+        # never resizes the embedding table (which would break warm-starting
+        # from a plain SCRIPT checkpoint).
+        self._read_write = bool(self.cfg.read_write)
+        self.read_id = self.write_id = None
+        if self._read_write:
+            self.read_id = hf_tok.convert_tokens_to_ids(self.cfg.read_token)
+            self.write_id = hf_tok.convert_tokens_to_ids(self.cfg.write_token)
+            for name, tid, tok in (
+                ("read_token", self.read_id, self.cfg.read_token),
+                ("write_token", self.write_id, self.cfg.write_token),
+            ):
+                if tid is None or (unk is not None and tid == unk):
+                    raise ValueError(
+                        f"{name}={tok!r} is not a single in-vocabulary token for this tokenizer (got id={tid}). "
+                        "Choose one that already exists in the vocab, or the embedding table would need resizing."
+                    )
+            if self.read_id == self.write_id:
+                raise ValueError(f"read_token and write_token must differ; both are {self.cfg.read_token!r}")
+
         self.eot_id = hf_tok.eos_token_id
         if self.eot_id is None:
             raise ValueError("Tokenizer has no eos_token_id; it is required as the branch end-of-turn token.")
@@ -269,7 +303,12 @@ class ScriptSTTDataset(StreamingSTTDataset):
             if words == self.cfg.blank_token:
                 words = ""
             target_ids = self.tokenizer.text_to_ids(words) if words.strip() else []
-            chunks.append(ChunkSpec(audio_len=audio_len, target_ids=target_ids))
+            # The gate goes on the BRANCH only; target_ids (which also feeds the
+            # spine) stays the plain word sequence.
+            gate = None
+            if self._read_write:
+                gate = self.write_id if target_ids else self.read_id
+            chunks.append(ChunkSpec(audio_len=audio_len, target_ids=target_ids, gate_id=gate))
         return chunks
 
     def get_batch_data(

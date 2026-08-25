@@ -110,6 +110,13 @@ class ScriptSTTModelConfig(StreamingSTTModelConfig):
             decoded token is not a word start, so the chunk cannot merge onto the
             previous chunk's last word. Overridable per ``generate`` call.
         log_detailed_train_metrics: also log sequence length / target counts.
+        read_write: the branches carry an EXPLICIT emit/no-emit gate -- a silent
+            chunk predicts ``<read> <eot>``, an emitting chunk ``<write> w_k <eot>``.
+            The gate is stripped at decode so it never enters the history, which
+            stays the running transcript. MUST match ``data.dataset.read_write``.
+        read_token / write_token: the gate tokens. Defaults are unused in-vocab
+            Qwen specials, so no embedding resize is needed. MUST match the
+            dataset's.
         prompt_control: the model was trained PROMPT-CONTROLLED — its instruction
             states the chunk size, emission delay, capitalization and punctuation.
             When on, :meth:`generate` renders those settings into the prompt
@@ -129,6 +136,9 @@ class ScriptSTTModelConfig(StreamingSTTModelConfig):
     attn_backend: str = "dense"
     activation_checkpointing: bool = False
     prompt_control: bool = False
+    read_write: bool = False
+    read_token: str = "<|box_start|>"
+    write_token: str = "<|box_end|>"
     val_chunk_size: Optional[int] = None
     val_max_new_tokens_per_chunk: Optional[int] = None
     val_system_prompt: Optional[str] = None
@@ -212,6 +222,30 @@ class ScriptSTTModel(StreamingSTTModel):
         self._eot_id = hf_tok.eos_token_id
         if self._eot_id is None:
             raise ValueError("Tokenizer has no eos_token_id; it is required as the branch end-of-turn token.")
+
+        # Read/write gate. Resolved here so decode strips exactly the ids the
+        # dataset supervised; a mismatch would leave gate tokens in the output.
+        self._read_write = bool(self.core_cfg.read_write)
+        self._read_id = self._write_id = None
+        if self._read_write:
+            self._read_id = hf_tok.convert_tokens_to_ids(self.core_cfg.read_token)
+            self._write_id = hf_tok.convert_tokens_to_ids(self.core_cfg.write_token)
+            unk = getattr(hf_tok, "unk_token_id", None)
+            for name, tid, tok in (
+                ("read_token", self._read_id, self.core_cfg.read_token),
+                ("write_token", self._write_id, self.core_cfg.write_token),
+            ):
+                if tid is None or (unk is not None and tid == unk):
+                    raise ValueError(f"model.{name}={tok!r} is not a single in-vocabulary token (got id={tid}).")
+            if self._read_id == self._write_id:
+                raise ValueError("model.read_token and model.write_token must differ")
+            logging.info(
+                "ScriptSTTModel: read/write gate ON — read=%r(%d) write=%r(%d)",
+                self.core_cfg.read_token,
+                self._read_id,
+                self.core_cfg.write_token,
+                self._write_id,
+            )
 
         # Lazily resolved leading-space token used to guarantee a word boundary at
         # the start of a chunk; see _get_word_start_insert_id.
@@ -776,6 +810,8 @@ class ScriptSTTModel(StreamingSTTModel):
             vision_start_id=self._vision_start_id,
             vision_end_id=self._vision_end_id,
             eot_id=self._eot_id,
+            read_id=self._read_id,
+            write_id=self._write_id,
             pad_id=self.text_pad_id,
             max_new_tokens=max_new_tokens,
             device=self.device,
