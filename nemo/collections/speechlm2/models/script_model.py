@@ -114,6 +114,12 @@ class ScriptSTTModelConfig(StreamingSTTModelConfig):
             chunk predicts ``<read> <eot>``, an emitting chunk ``<write> w_k <eot>``.
             The gate is stripped at decode so it never enters the history, which
             stays the running transcript. MUST match ``data.dataset.read_write``.
+        gate_in_history: keep the gate in the conditioning history, so the spine
+            is the concatenation of what each branch emitted. This is what gives
+            the model elapsed-time information -- otherwise the history grows only
+            with words and a branch cannot tell how long a silence lasted. The
+            gate is still stripped from the returned TEXT. Requires ``read_write``
+            and MUST match ``data.dataset.gate_in_history``.
         read_token / write_token: the gate tokens. Defaults are unused in-vocab
             Qwen specials, so no embedding resize is needed. MUST match the
             dataset's.
@@ -139,6 +145,7 @@ class ScriptSTTModelConfig(StreamingSTTModelConfig):
     read_write: bool = False
     read_token: str = "<|box_start|>"
     write_token: str = "<|box_end|>"
+    gate_in_history: bool = False
     val_chunk_size: Optional[int] = None
     val_max_new_tokens_per_chunk: Optional[int] = None
     val_system_prompt: Optional[str] = None
@@ -226,6 +233,9 @@ class ScriptSTTModel(StreamingSTTModel):
         # Read/write gate. Resolved here so decode strips exactly the ids the
         # dataset supervised; a mismatch would leave gate tokens in the output.
         self._read_write = bool(self.core_cfg.read_write)
+        self._gate_in_history = bool(self.core_cfg.gate_in_history)
+        if self._gate_in_history and not self._read_write:
+            raise ValueError("model.gate_in_history=True requires model.read_write=True")
         self._read_id = self._write_id = None
         if self._read_write:
             self._read_id = hf_tok.convert_tokens_to_ids(self.core_cfg.read_token)
@@ -812,6 +822,7 @@ class ScriptSTTModel(StreamingSTTModel):
             eot_id=self._eot_id,
             read_id=self._read_id,
             write_id=self._write_id,
+            gate_in_history=self._gate_in_history,
             pad_id=self.text_pad_id,
             max_new_tokens=max_new_tokens,
             device=self.device,
@@ -821,4 +832,9 @@ class ScriptSTTModel(StreamingSTTModel):
             is_word_start=self._is_word_start if insert_word_start_id is not None else None,
             insert_word_start_id=insert_word_start_id,
         )
+        # The history may legitimately contain gate tokens (gate_in_history);
+        # they are conditioning, not transcript, so never let them reach the text.
+        drop = {t for t in (self._read_id, self._write_id) if t is not None}
+        if drop:
+            emitted = [[t for t in ids if t not in drop] for ids in emitted]
         return [self.tokenizer.ids_to_text(ids) if ids else "" for ids in emitted]

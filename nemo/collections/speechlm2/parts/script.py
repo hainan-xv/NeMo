@@ -148,6 +148,26 @@ class ChunkSpec:
     gate_id: Optional[int] = None
 
 
+def spine_contribution(ch: "ChunkSpec", gate_in_history: bool) -> List[int]:
+    """What chunk ``ch`` appends to the running history (spine).
+
+    The single source of truth for every builder. ``build_packed_chunk_example``
+    (training), ``build_twod_chunk_example`` and ``build_separate_chunk_examples``
+    (the parity reference) MUST agree here: if they diverge, the packed layout
+    trains on a different history than the reference formulation defines, and the
+    parity test only catches it if it compares prefixes as well as branches.
+
+    With ``gate_in_history`` the read/write token joins the words, so the history
+    becomes literally the concatenation of what each branch emitted -- and its
+    length grows with the CHUNK count, which is what gives the model any sense of
+    elapsed time. Without it the history is words alone and carries no signal for
+    how long a silence lasted.
+    """
+    if gate_in_history and ch.gate_id is not None:
+        return [ch.gate_id] + list(ch.target_ids)
+    return list(ch.target_ids)
+
+
 @dataclass
 class PackedChunkExample:
     """A single utterance packed as spine + per-chunk branches.
@@ -192,6 +212,7 @@ def build_packed_chunk_example(
     supervise_eot: bool = True,
     audio_history_chunks: int = 0,
     audio_window_frames: int = 0,
+    gate_in_history: bool = False,
 ) -> PackedChunkExample:
     """Build the packed spine+branch layout for one utterance.
 
@@ -235,8 +256,9 @@ def build_packed_chunk_example(
     for ch in chunks:
         prefix_lens.append(running)
         frame_starts.append(running_frames)
-        spine_ids.extend(ch.target_ids)
-        running += len(ch.target_ids)
+        _contrib = spine_contribution(ch, gate_in_history)
+        spine_ids.extend(_contrib)
+        running += len(_contrib)
         running_frames += ch.audio_len
     P = len(spine_ids)
 
@@ -469,6 +491,7 @@ def build_twod_chunk_example(
     supervise_eot: bool = True,
     audio_history_chunks: int = 0,
     audio_window_frames: int = 0,
+    gate_in_history: bool = False,
     pad_id: int = 0,
 ) -> TwoDChunkExample:
     """Build the 2-D counterpart of :func:`build_packed_chunk_example`.
@@ -485,8 +508,9 @@ def build_twod_chunk_example(
     for ch in chunks:
         prefix_lens.append(running)
         frame_starts.append(running_frames)
-        spine_ids.extend(ch.target_ids)
-        running += len(ch.target_ids)
+        _contrib = spine_contribution(ch, gate_in_history)
+        spine_ids.extend(_contrib)
+        running += len(_contrib)
         running_frames += ch.audio_len
     P = len(spine_ids)
 
@@ -729,6 +753,7 @@ def build_separate_chunk_examples(
     supervise_eot: bool = True,
     audio_history_chunks: int = 0,
     audio_window_frames: int = 0,
+    gate_in_history: bool = False,
 ) -> List[SeparateChunkExample]:
     """Build the standalone per-chunk examples the packed layout must reproduce.
 
@@ -745,7 +770,7 @@ def build_separate_chunk_examples(
     for ch in chunks:
         prefix_lens.append(running)
         frame_starts.append(running_frames)
-        running += len(ch.target_ids)
+        running += len(spine_contribution(ch, gate_in_history))
         running_frames += ch.audio_len
 
     history: List[int] = list(instruction_ids)
@@ -788,7 +813,7 @@ def build_separate_chunk_examples(
                 branch_start=branch_start,
             )
         )
-        history.extend(branch_words)
+        history.extend(spine_contribution(ch, gate_in_history))
 
     return out
 
@@ -814,6 +839,7 @@ def batched_stream_decode_script(
     insert_word_start_id: Optional[int] = None,
     read_id: Optional[int] = None,
     write_id: Optional[int] = None,
+    gate_in_history: bool = False,
 ):
     """Batched greedy SCRIPT decode for ``B`` utterances at once.
 
@@ -990,19 +1016,19 @@ def batched_stream_decode_script(
 
         for i, b in enumerate(active):
             toks = words[i]
-            # Read/write gate: the branch predicts [gate] w_k <eot>. Strip the
-            # gate here so it never reaches ``emitted`` -- the history is the
-            # running TRANSCRIPT, exactly as in training, where the gate lives in
-            # the branch and the spine holds words alone. A read decision
-            # discards anything that followed it: a chunk that declared silence
-            # must not also contribute words.
+            # Read/write gate: the branch predicts [gate] w_k <eot>. Split it off
+            # the words. A read decision discards anything that followed it -- a
+            # chunk that declared silence must not also contribute words.
+            gate = None
             if read_id is not None and toks and toks[0] == read_id:
-                toks = []
+                gate, toks = read_id, []
             elif write_id is not None and toks and toks[0] == write_id:
-                toks = toks[1:]
+                gate, toks = write_id, toks[1:]
 
             # Chunk-start fix-up: guarantee a word boundary without having
-            # restricted what the model was allowed to emit.
+            # restricted what the model was allowed to emit. Applied to the first
+            # WORD -- the gate is a special token and is never a word start, so
+            # testing it here would insert a space in front of the gate instead.
             if (
                 insert_word_start_id is not None
                 and is_word_start is not None
@@ -1011,6 +1037,13 @@ def batched_stream_decode_script(
                 and not is_word_start(toks[0])
             ):
                 toks = [insert_word_start_id] + toks
+
+            # ``emitted`` is the conditioning history, and must match what the
+            # training spine held. With gate_in_history the gate goes back in
+            # front; the caller strips gate ids when detokenizing, so the OUTPUT
+            # text is unaffected either way.
+            if gate_in_history and gate is not None:
+                toks = [gate] + toks
             emitted[b].extend(toks)
             chunk_ids[b].extend([k] * len(toks))
 

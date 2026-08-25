@@ -67,6 +67,14 @@ class ScriptSTTDataConfig(StreamingSTTDataConfig):
             The gate is BRANCH-ONLY: the spine still holds words alone, so the
             model does not condition on its own past gate decisions the way an
             interleaved SpeechLM does. Must match ``model.read_write``.
+        gate_in_history: also put the gate token into the HISTORY, so the spine
+            becomes the concatenation of what each branch emitted rather than
+            words alone. This is what gives the model elapsed-time information:
+            without it the history grows only with WORDS, so a branch cannot tell
+            whether one chunk or fifty of silence preceded it. Costs one spine
+            token per chunk, which bites hardest at small chunk sizes (a 30s clip
+            at chunk_size=2 has ~188 chunks against ~110 word tokens). Requires
+            ``read_write``. Must match ``model.gate_in_history``.
         read_token / write_token: the two gate tokens. Defaults are unused
             in-vocab Qwen specials, so no embedding resize is needed and a
             read/write run can still warm-start from a plain SCRIPT checkpoint.
@@ -91,6 +99,7 @@ class ScriptSTTDataConfig(StreamingSTTDataConfig):
     read_write: bool = False
     read_token: str = "<|box_start|>"
     write_token: str = "<|box_end|>"
+    gate_in_history: bool = False
     prompt_control: bool = False
     delay_candidates: Optional[List[int]] = None
     capitalization_prob: float = 0.5
@@ -194,6 +203,12 @@ class ScriptSTTDataset(StreamingSTTDataset):
         # never resizes the embedding table (which would break warm-starting
         # from a plain SCRIPT checkpoint).
         self._read_write = bool(self.cfg.read_write)
+        self._gate_in_history = bool(self.cfg.gate_in_history)
+        if self._gate_in_history and not self._read_write:
+            raise ValueError(
+                "gate_in_history=True requires read_write=True: without the gate there is no "
+                "token to put in the history."
+            )
         self.read_id = self.write_id = None
         if self._read_write:
             self.read_id = hf_tok.convert_tokens_to_ids(self.cfg.read_token)
@@ -382,6 +397,7 @@ class ScriptSTTDataset(StreamingSTTDataset):
                     eot_id=self.eot_id,
                     audio_history_chunks=self._audio_history_chunks,
                     audio_window_frames=self._audio_window_frames,
+                    gate_in_history=self._gate_in_history,
                 )
             )
 

@@ -1753,3 +1753,138 @@ def test_decode_strips_the_gate_and_read_suppresses_words():
         write_id=WRITE,
     )
     assert out == [[]], out
+
+
+# ---------------------------------------------------------------------------
+# Gate in history
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("gate_in_history", [False, True])
+def test_gate_in_history_controls_the_spine(gate_in_history):
+    """Off: the spine is words alone. On: it is what each branch emitted."""
+    ex = build_packed_chunk_example(
+        instruction_ids=[5, 6],
+        chunks=_rw_chunks(),
+        vision_start_id=80,
+        vision_end_id=81,
+        eot_id=82,
+        gate_in_history=gate_in_history,
+    )
+    spine = ex.input_ids[: ex.spine_len].tolist()
+    assert spine == ([5, 6, READ, WRITE, 11, 12] if gate_in_history else [5, 6, 11, 12]), spine
+
+
+def test_gate_in_history_gives_the_spine_a_length_that_tracks_chunks():
+    """The whole point: with words alone the history cannot express elapsed time.
+
+    Two utterances with the SAME words but different amounts of leading silence
+    must produce different histories -- otherwise a branch cannot tell whether one
+    chunk or many passed before it.
+    """
+
+    def spine(n_silent, **kw):
+        chunks = [ChunkSpec(audio_len=2, target_ids=[], gate_id=READ) for _ in range(n_silent)]
+        chunks.append(ChunkSpec(audio_len=2, target_ids=[11], gate_id=WRITE))
+        ex = build_packed_chunk_example(
+            instruction_ids=[5], chunks=chunks, vision_start_id=80, vision_end_id=81, eot_id=82, **kw
+        )
+        return ex.input_ids[: ex.spine_len].tolist()
+
+    assert spine(1) == spine(5), "without the gate the two are indistinguishable"
+    assert spine(1, gate_in_history=True) != spine(5, gate_in_history=True)
+    assert len(spine(5, gate_in_history=True)) - len(spine(1, gate_in_history=True)) == 4
+
+
+@pytest.mark.parametrize("gate_in_history", [False, True])
+def test_packed_and_separate_agree_on_the_HISTORY(gate_in_history):
+    """Regression guard: every builder must define the history identically.
+
+    The branch-only parity test does NOT catch a divergence here -- it compares
+    branch tokens and never looks at the prefix, which is exactly how the packed
+    spine and the separate reference drifted apart once already.
+    """
+    chunks = [
+        ChunkSpec(audio_len=2, target_ids=[], gate_id=READ),
+        ChunkSpec(audio_len=2, target_ids=[11, 12], gate_id=WRITE),
+        ChunkSpec(audio_len=2, target_ids=[], gate_id=READ),
+        ChunkSpec(audio_len=2, target_ids=[13], gate_id=WRITE),
+    ]
+    kw = dict(
+        instruction_ids=[5, 6],
+        chunks=chunks,
+        vision_start_id=80,
+        vision_end_id=81,
+        eot_id=82,
+        gate_in_history=gate_in_history,
+    )
+    packed = build_packed_chunk_example(**kw)
+    separate = build_separate_chunk_examples(**kw)
+    spine = packed.input_ids[: packed.spine_len].tolist()
+    for k, sep in enumerate(separate):
+        # Each standalone example's prefix IS the history at that chunk, which
+        # must equal the packed spine truncated to that branch's prefix_len.
+        pref_len = int(packed.prefix_len[packed.seg_ids == k + 1][0])
+        assert sep.input_ids[: sep.branch_start].tolist() == spine[:pref_len], k
+
+
+def test_twod_matches_packed_spine_with_gate_in_history():
+    ex_p = build_packed_chunk_example(
+        instruction_ids=[5, 6],
+        chunks=_rw_chunks(),
+        vision_start_id=80,
+        vision_end_id=81,
+        eot_id=82,
+        gate_in_history=True,
+    )
+    ex_t = build_twod_chunk_example(
+        instruction_ids=[5, 6],
+        chunks=_rw_chunks(),
+        vision_start_id=80,
+        vision_end_id=81,
+        eot_id=82,
+        gate_in_history=True,
+    )
+    assert ex_t.spine_ids.tolist() == ex_p.input_ids[: ex_p.spine_len].tolist()
+
+
+def test_decode_keeps_gate_in_history_but_not_in_output():
+    """With gate_in_history the gate must persist in the conditioning history
+    while the returned token stream still excludes it from the text."""
+    from types import SimpleNamespace
+
+    from nemo.collections.speechlm2.parts.script import batched_stream_decode_script
+
+    class FakeLLM:
+        def __init__(self, plan):
+            self.plan, self.step = plan, 0
+
+        def __call__(self, inputs_embeds=None, **kw):
+            n = inputs_embeds.shape[0]
+            tid = self.plan[min(self.step, len(self.plan) - 1)]
+            self.step += 1
+            logits = torch.full((n, 1, 200), -1e9)
+            logits[:, 0, tid] = 0.0
+            return SimpleNamespace(logits=logits, past_key_values=None)
+
+    emb = lambda ids: torch.zeros(*ids.shape, 8)  # noqa: E731
+    frames = [torch.zeros(2, 8)]
+    kw = dict(
+        embed_tokens=emb,
+        instruction_ids_list=[[5]],
+        frames_list=frames,
+        chunk_size=2,
+        vision_start_id=80,
+        vision_end_id=81,
+        eot_id=82,
+        pad_id=0,
+        max_new_tokens=8,
+        read_id=READ,
+        write_id=WRITE,
+    )
+    # write + word, gate retained in the history
+    assert batched_stream_decode_script(llm=FakeLLM([WRITE, 11, 82]), gate_in_history=True, **kw) == [[WRITE, 11]]
+    # a read chunk still contributes its gate -- that is the elapsed-time signal
+    assert batched_stream_decode_script(llm=FakeLLM([READ, 82]), gate_in_history=True, **kw) == [[READ]]
+    # and with the flag off, neither appears
+    assert batched_stream_decode_script(llm=FakeLLM([WRITE, 11, 82]), gate_in_history=False, **kw) == [[11]]

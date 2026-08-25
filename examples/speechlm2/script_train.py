@@ -54,7 +54,14 @@ def train(cfg):
     # prompt_control is in the same category: the dataset writes the control
     # sentence into the instruction, the model rewrites it at inference. If only
     # one side has it on, every decode is out of distribution.
-    for key in ("audio_history_chunks", "audio_window_frames", "twod_layout", "prompt_control", "read_write"):
+    for key in (
+        "audio_history_chunks",
+        "audio_window_frames",
+        "twod_layout",
+        "prompt_control",
+        "read_write",
+        "gate_in_history",
+    ):
         model_val = int(cfg.model.get(key, 0) or 0)
         data_val = int(dataset_cfg.get(key, 0) or 0)
         if model_val != data_val:
