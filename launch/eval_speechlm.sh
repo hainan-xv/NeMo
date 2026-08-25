@@ -97,18 +97,25 @@ PRETRAINED_ASR="${PRETRAINED_ASR:-${HEH_PRETRAINED}/nvidia/nemotron-speech-strea
 # Streaming by default: on this checkpoint the offline path scores 17.79 macro
 # against streaming's 5.51 (chunk 14, 64 utts/dataset), dropping words at chunk
 # starts. OFFLINE_EMBS=1 is a diagnostic, not a reporting mode.
+# FSM decode path instead of bulk-prefill chunked decode. Off by default; the
+# model code calls it "not recommended" for fixed chunk sizes, but the two paths
+# are not guaranteed to agree.
+STATE_MACHINE="${STATE_MACHINE:-0}"
+
 STREAMING_EMBS="${STREAMING_EMBS:-1}"
 [[ "${OFFLINE_EMBS:-0}" == "1" ]] && STREAMING_EMBS=0
 EMIT_DELAY_FRAMES="${EMIT_DELAY_FRAMES:-0}"
 EXTRA_EVAL_ARGS="${EXTRA_EVAL_ARGS:-} --emit_delay_frames ${EMIT_DELAY_FRAMES}"
 EXTRA_EVAL_ARGS="${EXTRA_EVAL_ARGS} --pretrained_llm ${PRETRAINED_LLM} --pretrained_asr ${PRETRAINED_ASR}"
 [[ "$STREAMING_EMBS" == "1" || "$STREAMING_EMBS" == "true" ]] && EXTRA_EVAL_ARGS="${EXTRA_EVAL_ARGS} --streaming_embs"
+[[ "$STATE_MACHINE" == "1" || "$STATE_MACHINE" == "true" ]] && EXTRA_EVAL_ARGS="${EXTRA_EVAL_ARGS} --state_machine"
 
 export EXP_NAME PROJECT OUTPUT_PREFIX MODEL_CLASS EVAL_DRIVER SYSTEM_PROMPT CHUNK_SIZE EVAL_TAG CKPT EXTRA_EVAL_ARGS
 
 echo "==> streaming SpeechLM leaderboard eval"
 echo "    checkpoint: ${CKPT}"
 echo "    chunk_size: ${CHUNK_SIZE} frames ($(python3 -c "print(f'{${CHUNK_SIZE}*0.08:.2f}')" 2>/dev/null || echo '?')s)"
+echo "    decode:     $([[ "$STATE_MACHINE" == "1" ]] && echo 'state machine (FSM)' || echo 'chunked (bulk prefill)')"
 echo "    embs:       $([[ "$STREAMING_EMBS" == "1" ]] && echo 'true cache-aware streaming' || echo 'offline (chunk-limited attention)')"
 echo "    base llm:   ${PRETRAINED_LLM}"
 echo "    base asr:   ${PRETRAINED_ASR}"

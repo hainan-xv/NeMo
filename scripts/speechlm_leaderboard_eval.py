@@ -230,6 +230,7 @@ def build_gen_kwargs(args) -> dict:
         generation_config=GenerationConfig(do_sample=False),
         chunk_size_override=(args.chunk_size if args.chunk_size and args.chunk_size > 0 else None),
         use_offline_embs=args.offline_embs,
+        use_state_machine_inference=args.state_machine,
         emit_delay_frames=args.emit_delay_frames,
         # Both are expensive and unused for WER; alignments are on by default.
         return_alignments=False,
@@ -345,6 +346,14 @@ def parse_args():
         help="true cache-aware streaming perception (default)",
     )
     p.add_argument(
+        "--state_machine",
+        action="store_true",
+        default=False,
+        help="decode through the FSM path (_generate_dynamic_streaming) with the chunk size pinned, "
+        "instead of the bulk-prefill chunked path. The code marks this 'not recommended' for "
+        "chunk_size > 0, but the two paths can disagree and that disagreement is worth measuring.",
+    )
+    p.add_argument(
         "--pad_extra_seconds",
         type=float,
         default=0.5,
@@ -385,6 +394,7 @@ def main() -> int:
     _log(f"==> system_prompt: {args.system_prompt!r}")
     _log(
         f"==> chunk_size={args.chunk_size} offline_embs={args.offline_embs} "
+        f"state_machine={args.state_machine} "
         f"emit_delay_frames={args.emit_delay_frames} pad_extra_seconds={args.pad_extra_seconds}"
     )
     evaluate_shard(model, args, device)
