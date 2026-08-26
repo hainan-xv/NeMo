@@ -339,7 +339,10 @@ MOUNTS="--container-mounts=/lustre/fsw:/lustre/fsw,${CODE_DIR}:/code,${OUTPUT_PR
 WANDB_CLAUSE=""
 if [[ "$REPORT_WANDB" == "1" ]]; then
     WANDB_GROUP="${WANDB_GROUP:-${EXP_NAME}_${CKPT_TS}}"
-    WANDB_RUN_NAME="${WANDB_RUN_NAME:-${DECODE_LABEL}}"
+    # Fully self-describing: model + checkpoint version + decode config. The run
+    # name has to stand alone in lists, notifications and exports, where the
+    # group is not shown alongside it.
+    WANDB_RUN_NAME="${WANDB_RUN_NAME:-${EXP_NAME}_${CKPT_TS}_${DECODE_LABEL}}"
     WANDB_EVAL_PROJECT="${WANDB_EVAL_PROJECT:-${PROJECT}_eval_v2}"
     WANDB_CLAUSE="&& { export WANDB_API_KEY='${WANDB_TOKEN}'; python /code/scripts/eval_wandb_report.py --project '${WANDB_EVAL_PROJECT}' --run_name '${WANDB_RUN_NAME}' --results_dir '${RESULTS_DIR}' --group '${WANDB_GROUP}' --job_type script 2>&1 | tee '${RESULTS_DIR}/wandb_report.log' || true; }"
 fi
