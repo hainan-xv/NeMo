@@ -124,13 +124,13 @@ else
 fi
 DECODE_LABEL="chunk${CHUNK_SIZE:-default}_${MODE}"
 
-# <exp>/<checkpoint timestamp>/<decode config>/ -- the model name is not repeated
+# <exp>/eval_<checkpoint timestamp>/<decode config>/ -- the model name is not repeated
 # (this is already under the experiment dir) and the timestamp is the MODEL's,
 # not the job's. Re-running the same config replaces it; KEEP_HISTORY=1 appends
 # the job id instead.
 RESULTS_SUBDIR="${DECODE_LABEL}"
 [[ "${KEEP_HISTORY:-0}" == "1" ]] && RESULTS_SUBDIR="${DECODE_LABEL}_${JOB_TAG}"
-RESULTS_DIR="${OUTPUT_PREFIX}/results/${PROJECT}/${EXP_NAME}/${CKPT_TS}/${RESULTS_SUBDIR}"
+RESULTS_DIR="${OUTPUT_PREFIX}/results/${PROJECT}/${EXP_NAME}/eval_${CKPT_TS}/${RESULTS_SUBDIR}"
 SHARD_DIR="${RESULTS_DIR}/shards"
 mkdir -p "$SHARD_DIR" "$HFCACHE"
 OUTFILE="${RESULTS_DIR}/slurm-%j-%n.out"

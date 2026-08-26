@@ -280,6 +280,6 @@ printf '  %s\n' "${submitted[@]}"
 echo ""
 if [[ "$DRY_RUN" -eq 0 ]]; then
     echo "Watch:   ssh ${OCI_USER}@${OCI_HOST} squeue -u \$USER"
-    echo "Results: ${RESULTS_ROOT}/${EXP_NAME}/<ckpt_ts>/chunk<C>_d<D>_c<0|1>_p<0|1>/aggregate.log"
+    echo "Results: ${RESULTS_ROOT}/${EXP_NAME}/eval_<ckpt_ts>/chunk<C>_d<D>_c<0|1>_p<0|1>/aggregate.log"
     echo "Compare: python scripts/analyze_eval_errors.py <label>=<dir> ..."
 fi

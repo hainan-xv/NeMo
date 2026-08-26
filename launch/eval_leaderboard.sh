@@ -236,7 +236,7 @@ DECODE_LABEL="chunk${CHUNK_SIZE:-default}"
 [[ "${RUN_AVERAGING}" != "1" && "${USE_LAST}" != "1" ]] && DECODE_LABEL="${DECODE_LABEL}_single"
 
 # ---------------------------------------------------------------------------
-# Result location:  <exp>/<checkpoint timestamp>/<decode config>/
+# Result location:  <exp>/eval_<checkpoint timestamp>/<decode config>/
 #
 # The model name is NOT repeated -- this already sits under the experiment
 # directory. The timestamp is the CHECKPOINT's, not the job's, so every decode
@@ -249,7 +249,7 @@ DECODE_LABEL="chunk${CHUNK_SIZE:-default}"
 # ---------------------------------------------------------------------------
 RESULTS_SUBDIR="${DECODE_LABEL}"
 [[ "${KEEP_HISTORY:-0}" == "1" ]] && RESULTS_SUBDIR="${DECODE_LABEL}_${JOB_TAG}"
-RESULTS_DIR="${OUTPUT_PREFIX}/results/${PROJECT}/${EXP_NAME}/${CKPT_TS}/${RESULTS_SUBDIR}"
+RESULTS_DIR="${OUTPUT_PREFIX}/results/${PROJECT}/${EXP_NAME}/eval_${CKPT_TS}/${RESULTS_SUBDIR}"
 SHARD_DIR="${RESULTS_DIR}/shards"
 mkdir -p "$SHARD_DIR"
 OUTFILE="${RESULTS_DIR}/slurm-%j-%n.out"
@@ -269,7 +269,19 @@ printf '%s' "$SYSTEM_PROMPT" > "${SHARD_DIR}/system_prompt.txt"
 # bake in the placeholder and the averaging step would run with no inputs.
 AVG_CLAUSE=""
 if [[ "$DO_AVG" == "1" ]]; then
-    AVG_CLAUSE="&& if [[ '${FORCE_AVERAGE}' == '1' || ! -f '${CKPT}' ]]; then echo '==> Averaging ${#_AVG_IN[@]} checkpoints -> ${CKPT}'; python /code/scripts/average_script_ckpts.py --output '${CKPT}' \$(cat '${AVG_INPUTS_FILE}'); else echo '==> Reusing cached averaged checkpoint: ${CKPT}'; fi "
+    # Averaging is SHARED STATE: evaluating one model at several chunk sizes runs
+    # concurrent jobs that all point at the same averaged checkpoint. Writing it
+    # in place let one job read a half-written file ("PytorchStreamReader failed
+    # ... failed finding central directory"). So:
+    #   * write to a per-job temp and rename -- rename is atomic on the same
+    #     filesystem, so a reader sees either no file or a complete one. If two
+    #     jobs both average, they duplicate work but neither corrupts anything.
+    #   * regenerate when the cache is missing, EMPTY, not a readable zip, or
+    #     older than the newest checkpoint feeding it. Existence alone is not
+    #     evidence the file is usable.
+    AVG_TMP="${CKPT}.tmp.${JOB_TAG}"
+    AVG_NEWEST_IN="${_AVG_IN[0]}"
+    AVG_CLAUSE="&& { if [[ '${FORCE_AVERAGE}' == '1' ]] || [[ ! -s '${CKPT}' ]] || [[ '${CKPT}' -ot '${AVG_NEWEST_IN}' ]] || ! python -c \"import zipfile,sys; sys.exit(0 if zipfile.is_zipfile('${CKPT}') else 1)\" 2>/dev/null; then echo '==> Averaging ${#_AVG_IN[@]} checkpoints -> ${CKPT}'; python /code/scripts/average_script_ckpts.py --output '${AVG_TMP}' \$(cat '${AVG_INPUTS_FILE}') && mv -f '${AVG_TMP}' '${CKPT}'; else echo '==> Reusing cached averaged checkpoint: ${CKPT}'; fi; } "
 fi
 
 
