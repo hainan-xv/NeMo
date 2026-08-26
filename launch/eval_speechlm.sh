@@ -111,6 +111,10 @@ EXTRA_EVAL_ARGS="${EXTRA_EVAL_ARGS} --pretrained_llm ${PRETRAINED_LLM} --pretrai
 [[ "$STATE_MACHINE" == "1" || "$STATE_MACHINE" == "true" ]] && EXTRA_EVAL_ARGS="${EXTRA_EVAL_ARGS} --state_machine"
 
 export EXP_NAME PROJECT OUTPUT_PREFIX MODEL_CLASS EVAL_DRIVER SYSTEM_PROMPT CHUNK_SIZE EVAL_TAG CKPT EXTRA_EVAL_ARGS
+# STATE_MACHINE must be EXPORTED, not just set: eval_leaderboard.sh is reached via
+# exec and builds DECODE_LABEL from it. Without this the FSM and bulk-prefill
+# decodes would both land in .../chunk<C>/ and silently overwrite each other.
+export STATE_MACHINE STREAMING_EMBS
 
 echo "==> streaming SpeechLM leaderboard eval"
 echo "    checkpoint: ${CKPT}"
