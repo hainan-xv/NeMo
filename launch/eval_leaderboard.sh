@@ -386,20 +386,15 @@ ${AVG_CLAUSE} \
 && echo "Fanning ${NGPU} balanced shards across ${NGPU} GPUs (seed=${SHUFFLE_SEED})..." \
 && rm -f ${SHARD_DIR}/shard*_of*.generations.jsonl \
 && SP_TEXT=\$(cat '${SHARD_DIR}/system_prompt.txt') \
-&& pids=() \
-&& for gpu in \$(seq 0 \$(( ${NGPU} - 1 ))); do \
-      log="${RESULTS_DIR}/shard_\${gpu}.log"; \
-      echo "  [gpu \$gpu] shard \$gpu/${NGPU} -> \${log}"; \
-      CUDA_VISIBLE_DEVICES=\$gpu python /code/scripts/${EVAL_DRIVER} \
+&& bash /code/scripts/run_eval_shards.sh \
+      --ngpu ${NGPU} --shard-dir "${SHARD_DIR}" --log-dir "${RESULTS_DIR}" \
+      --driver /code/scripts/${EVAL_DRIVER} -- \
         --ckpt_path "${CKPT}" \
         --model_class "${MODEL_CLASS}" \
         --datasets "${DATASETS_CSV}" \
         --cache_dir "${CACHE_DIR}" \
         --output_dir "${SHARD_DIR}" \
-        --num_shards ${NGPU} \
-        --shard_index \$gpu \
         --shuffle_seed ${SHUFFLE_SEED} \
-        --device 0 \
         --batch_size ${BATCH_SIZE} \
         --max_new_tokens ${MAX_NEW_TOKENS} \
         --max_eval_samples ${MAX_EVAL_SAMPLES} \
@@ -407,11 +402,6 @@ ${AVG_CLAUSE} \
         --pad_extra_seconds ${PAD_EXTRA_SECONDS} \
         ${CHUNK_SIZE:+--chunk_size ${CHUNK_SIZE}} \
         ${DRIVER_ARGS} ${EXTRA_EVAL_ARGS} \
-        > "\${log}" 2>&1 & \
-      pids+=(\$!); \
-   done \
-&& fail=0 && for p in "\${pids[@]}"; do wait "\$p" || fail=1; done \
-&& echo "" \
 && echo "==================== Leaderboard WER ====================" \
 && python /code/scripts/${EVAL_DRIVER} --aggregate --output_dir "${SHARD_DIR}" 2>&1 | tee "${RESULTS_DIR}/aggregate.log" \
 ${WANDB_CLAUSE} \

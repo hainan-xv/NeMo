@@ -184,6 +184,21 @@ def aggregate_results(args) -> int:
                 groups[rec["key"]]["refs"].append(rec.get("reference", ""))
                 groups[rec["key"]]["hyps"].append(rec.get("hypothesis", ""))
 
+    # Empty hypotheses are indistinguishable from a very bad model once they reach
+    # the scorer -- they simply count as 100% deletions. A dead GPU once produced
+    # 9,362 blanks (1/8 of the corpus) and scored 18.16 macro instead of ~6.5 with
+    # nothing in this log to explain it. Surface the rate so that can never be
+    # mistaken for a model result again.
+    n_all = sum(len(g["hyps"]) for g in groups.values())
+    n_empty = sum(1 for g in groups.values() for h in g["hyps"] if not h.strip())
+    if n_all:
+        pct = 100.0 * n_empty / n_all
+        _log(f"==> empty hypotheses: {n_empty}/{n_all} ({pct:.2f}%)")
+        if pct >= 1.0:
+            _log("*** WARNING: a large share of hypotheses are EMPTY. This usually means a")
+            _log("*** GPU died and its shard was written as blanks, NOT that the model is bad.")
+            _log("*** Check shard_*.log for 'batch at .* failed' before trusting these numbers.")
+
     results = []
     for key in sorted(groups):
         g = groups[key]

@@ -241,10 +241,16 @@ def build_gen_kwargs(args) -> dict:
 def evaluate_shard(model, args, device) -> None:
     items = build_global_items(args)
     shard = select_shard(items, args.num_shards, args.shard_index, args.shuffle_seed)
-    _log(f"==> shard {args.shard_index}/{args.num_shards}: {len(shard)} of {len(items)} pooled utts")
+    suffix = ""
+    if args.subshard_count > 1:
+        # Strided so each slice keeps the duration-sorted mix; contiguous slices
+        # would hand one GPU all the long clips.
+        shard = shard[args.subshard_index :: args.subshard_count]
+        suffix = f"_sub{args.subshard_index}of{args.subshard_count}"
+    _log(f"==> shard {args.shard_index}/{args.num_shards}{suffix}: " f"{len(shard)} of {len(items)} pooled utts")
 
     os.makedirs(args.output_dir, exist_ok=True)
-    out_path = os.path.join(args.output_dir, f"shard{args.shard_index}_of{args.num_shards}.generations.jsonl")
+    out_path = os.path.join(args.output_dir, f"shard{args.shard_index}_of{args.num_shards}{suffix}.generations.jsonl")
     gen_kwargs = build_gen_kwargs(args)
 
     done = defaultdict(int)
@@ -310,6 +316,11 @@ def parse_args():
 
     p.add_argument("--num_shards", type=int, default=1)
     p.add_argument("--shard_index", type=int, default=0)
+    # Recovery: re-decode ONE shard split across several GPUs. Used when a GPU
+    # dies mid-run -- its shard is redistributed over the survivors rather than
+    # the whole eval being thrown away (or, worse, scored with empty hypotheses).
+    p.add_argument("--subshard_count", type=int, default=1, help="split the selected shard this many ways")
+    p.add_argument("--subshard_index", type=int, default=0, help="which slice of the split to decode")
     p.add_argument(
         "--shuffle_seed", type=int, default=1234, help="must be identical across shards, and across systems compared"
     )

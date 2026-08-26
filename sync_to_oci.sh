@@ -57,6 +57,7 @@ SCRIPT_PATHS=(
     scripts/nemotron_leaderboard_eval.py
     scripts/speechlm_leaderboard_eval.py
     scripts/leaderboard_common.py
+    scripts/run_eval_shards.sh
     scripts/analyze_eval_errors.py
     scripts/flex_attention_spike.py
     scripts/average_script_ckpts.py
