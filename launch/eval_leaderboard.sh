@@ -187,12 +187,7 @@ PUNCT_FLAG=""
 # The system prompt can contain apostrophes, semicolons and quotes; passing it
 # through the command string would be a quoting minefield. Write it to a file and
 # read it back inside the container instead.
-printf '%s' "$SYSTEM_PROMPT" > "${SHARD_DIR}/system_prompt.txt"
 
-AVG_CLAUSE=""
-if [[ "$DO_AVG" == "1" ]]; then
-    AVG_CLAUSE="&& if [[ '${FORCE_AVERAGE}' == '1' || ! -f '${CKPT}' ]]; then echo '==> Averaging ${#_AVG_IN[@]} checkpoints -> ${CKPT}'; python /code/scripts/average_script_ckpts.py --output '${CKPT}' \$(cat '${AVG_INPUTS_FILE}'); else echo '==> Reusing cached averaged checkpoint: ${CKPT}'; fi "
-fi
 
 # --- wandb (optional) ---
 REPORT_WANDB="${REPORT_WANDB:-auto}"
@@ -262,6 +257,19 @@ ERRFILE="${RESULTS_DIR}/error-%j-%n.out"
 if [[ "$AVG_INPUTS_FILE" == "__DEFERRED__" ]]; then
     AVG_INPUTS_FILE="${SHARD_DIR}/avg_inputs.txt"
     printf '%s\n' "${_AVG_IN[@]}" > "$AVG_INPUTS_FILE"
+fi
+
+# Written here for the same reason as AVG_CLAUSE: SHARD_DIR does not exist
+# until RESULTS_DIR is built. The decode reads this file back, so writing it
+# earlier left every shard with an empty system prompt.
+printf '%s' "$SYSTEM_PROMPT" > "${SHARD_DIR}/system_prompt.txt"
+
+# Built HERE, not earlier: it embeds $(cat '$AVG_INPUTS_FILE'), and that path
+# is only known once RESULTS_DIR/SHARD_DIR exist. Constructing it above would
+# bake in the placeholder and the averaging step would run with no inputs.
+AVG_CLAUSE=""
+if [[ "$DO_AVG" == "1" ]]; then
+    AVG_CLAUSE="&& if [[ '${FORCE_AVERAGE}' == '1' || ! -f '${CKPT}' ]]; then echo '==> Averaging ${#_AVG_IN[@]} checkpoints -> ${CKPT}'; python /code/scripts/average_script_ckpts.py --output '${CKPT}' \$(cat '${AVG_INPUTS_FILE}'); else echo '==> Reusing cached averaged checkpoint: ${CKPT}'; fi "
 fi
 
 
