@@ -44,7 +44,9 @@
 #   CAPITALIZATION          [prompt-controlled models] 1/0
 #   PUNCTUATION             [prompt-controlled models] 1/0
 #
-# WANDB LAYOUT
+# WANDB LAYOUT   (project: <PROJECT>_eval_v2 -- deliberately separate from the
+#                 older <PROJECT>_leaderboard_eval, whose runs use the previous
+#                 naming and would clutter the same page)
 #   group    = <exp_name>_<checkpoint timestamp>   e.g. granary2_script_baseline_20260824_2117
 #   run name = the decode configuration           e.g. chunk7_d6_c1_p0, chunk14_sm_se
 #   So one group holds one MODEL VERSION, and each decode setting is a separate
@@ -301,7 +303,7 @@ WANDB_CLAUSE=""
 if [[ "$REPORT_WANDB" == "1" ]]; then
     WANDB_GROUP="${WANDB_GROUP:-${EXP_NAME}_${CKPT_TS}}"
     WANDB_RUN_NAME="${WANDB_RUN_NAME:-${DECODE_LABEL}}"
-    WANDB_EVAL_PROJECT="${WANDB_EVAL_PROJECT:-${PROJECT}_leaderboard_eval}"
+    WANDB_EVAL_PROJECT="${WANDB_EVAL_PROJECT:-${PROJECT}_eval_v2}"
     WANDB_CLAUSE="&& { export WANDB_API_KEY='${WANDB_TOKEN}'; python /code/scripts/eval_wandb_report.py --project '${WANDB_EVAL_PROJECT}' --run_name '${WANDB_RUN_NAME}' --results_dir '${RESULTS_DIR}' --group '${WANDB_GROUP}' --job_type script 2>&1 | tee '${RESULTS_DIR}/wandb_report.log' || true; }"
 fi
 
