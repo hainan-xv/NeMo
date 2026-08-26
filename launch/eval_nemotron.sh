@@ -51,6 +51,16 @@
 # Or from your laptop:
 #   ./oci_launch.sh launch/eval_nemotron.sh 14
 #   ./oci_launch_interactive.sh MAX_EVAL_SAMPLES=32 launch/eval_nemotron.sh 14
+#
+# WANDB LAYOUT
+#   group    = <exp_name>_<checkpoint timestamp>   e.g. granary2_script_baseline_20260824_2117
+#   run name = the decode configuration           e.g. chunk7_d6_c1_p0, chunk14_sm_se
+#   So one group holds one MODEL VERSION, and each decode setting is a separate
+#   line inside it -- directly comparable. Retraining produces a new group rather
+#   than mixing old and new numbers on the same axis. Override with WANDB_GROUP /
+#   WANDB_RUN_NAME.
+#   Re-running the SAME checkpoint at the SAME setting reuses the line name on
+#   purpose, so repeats overlay and their spread is visible.
 # ============================================================================
 
 # No `set -euo pipefail`: the heredoc read and the ls|grep pipelines below
@@ -148,11 +158,22 @@ echo "    results ->  ${RESULTS_DIR}"
 # broad catch-alls come first so ancestor binds do not shadow the leaves.
 MOUNTS="--container-mounts=/lustre/fsw:/lustre/fsw,/lustre/fs12:/lustre/fs12,${CODE_DIR}:/code,${OUTPUT_PREFIX}:${OUTPUT_PREFIX},${CACHE_DIR}:${CACHE_DIR},${H_DIR}:${H_DIR},${HFCACHE}:/hfcache/"
 
+# wandb identity: GROUP = <model>_<checkpoint timestamp>, RUN NAME = decode config.
+# Same convention as launch/eval_leaderboard.sh so all three systems line up in
+# one project. The .nemo file's mtime stands in for a checkpoint timestamp.
+if [[ -e "$MODEL_PATH" ]]; then
+    CKPT_TS="$(date -r "$MODEL_PATH" +%Y%m%d_%H%M 2>/dev/null || echo unknown)"
+else
+    CKPT_TS="unknown"
+fi
+DECODE_LABEL="chunk${CHUNK_SIZE:-default}_${MODE}"
+
 WANDB_CLAUSE=""
 if [[ "$REPORT_WANDB" == "1" ]]; then
-    WANDB_RUN_NAME="${WANDB_RUN_NAME:-${EXP_NAME}_chunk${CHUNK_SIZE}_${EVAL_TAG}}_${RUN_TS}"
+    WANDB_GROUP="${WANDB_GROUP:-${EXP_NAME}_${CKPT_TS}}"
+    WANDB_RUN_NAME="${WANDB_RUN_NAME:-${DECODE_LABEL}}"
     WANDB_EVAL_PROJECT="${WANDB_EVAL_PROJECT:-${PROJECT}_leaderboard_eval}"
-    WANDB_CLAUSE="&& { export WANDB_API_KEY='${WANDB_TOKEN}'; python /code/scripts/eval_wandb_report.py --project '${WANDB_EVAL_PROJECT}' --run_name '${WANDB_RUN_NAME}' --results_dir '${RESULTS_DIR}' --group '${EXP_NAME}' --job_type nemotron 2>&1 | tee '${RESULTS_DIR}/wandb_report.log' || true; }"
+    WANDB_CLAUSE="&& { export WANDB_API_KEY='${WANDB_TOKEN}'; python /code/scripts/eval_wandb_report.py --project '${WANDB_EVAL_PROJECT}' --run_name '${WANDB_RUN_NAME}' --results_dir '${RESULTS_DIR}' --group '${WANDB_GROUP}' --job_type nemotron 2>&1 | tee '${RESULTS_DIR}/wandb_report.log' || true; }"
 fi
 
 read -r -d '' cmd <<EOF

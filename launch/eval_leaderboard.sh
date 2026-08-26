@@ -43,6 +43,16 @@
 #   NUM_DELAY_FRAMES        [prompt-controlled models] delay to request, in frames
 #   CAPITALIZATION          [prompt-controlled models] 1/0
 #   PUNCTUATION             [prompt-controlled models] 1/0
+#
+# WANDB LAYOUT
+#   group    = <exp_name>_<checkpoint timestamp>   e.g. granary2_script_baseline_20260824_2117
+#   run name = the decode configuration           e.g. chunk7_d6_c1_p0, chunk14_sm_se
+#   So one group holds one MODEL VERSION, and each decode setting is a separate
+#   line inside it -- directly comparable. Retraining produces a new group rather
+#   than mixing old and new numbers on the same axis. Override with WANDB_GROUP /
+#   WANDB_RUN_NAME.
+#   Re-running the SAME checkpoint at the SAME setting reuses the line name on
+#   purpose, so repeats overlay and their spread is visible.
 # ============================================================================
 
 # NOTE: deliberately no `set -euo pipefail` -- the `read -r -d '' <<EOF` heredoc
@@ -199,6 +209,43 @@ case "${REPORT_WANDB,,}" in
 esac
 
 # --- Run manifest, so a results dir is self-describing months later ---
+# ---------------------------------------------------------------------------
+# wandb identity
+#
+#   GROUP    = <model>_<checkpoint timestamp>   -- one group per model VERSION
+#   RUN NAME = the decode configuration          -- one line per operating point
+#
+# So every decode setting for a given checkpoint lands as a separate line inside
+# one group, and re-training the model starts a fresh group rather than mixing
+# old and new numbers on the same axis.
+#
+# The timestamp comes from the newest checkpoint that FEEDS this eval, not from
+# the file named in $CKPT: under averaging that file is produced inside the
+# container and does not exist yet at this point.
+CKPT_STAMP_SRC="$CKPT"
+[[ "$DO_AVG" == "1" && ${#_AVG_IN[@]} -gt 0 ]] && CKPT_STAMP_SRC="${_AVG_IN[0]}"
+if [[ -n "$CKPT_STAMP_SRC" && -e "$CKPT_STAMP_SRC" ]]; then
+    CKPT_TS="$(date -r "$CKPT_STAMP_SRC" +%Y%m%d_%H%M 2>/dev/null || echo unknown)"
+else
+    CKPT_TS="unknown"
+fi
+# Step number, when the filename carries one -- more meaningful than a date when
+# skimming a wandb group, so it rides along in the config.
+CKPT_STEP="$(basename "${CKPT_STAMP_SRC:-}" 2>/dev/null | grep -oE 'step=[0-9]+' | head -1 | cut -d= -f2)"
+
+# The line label: every knob that changes what is decoded, and nothing else.
+# Deliberately excludes the run timestamp, so re-evaluating the same checkpoint
+# at the same setting overlays instead of adding a near-duplicate line.
+DECODE_LABEL="chunk${CHUNK_SIZE:-default}"
+[[ -n "${NUM_DELAY_FRAMES}" ]] && DECODE_LABEL="${DECODE_LABEL}_d${NUM_DELAY_FRAMES}"
+[[ -n "${CAPITALIZATION}"   ]] && DECODE_LABEL="${DECODE_LABEL}_c${CAPITALIZATION}"
+[[ -n "${PUNCTUATION}"      ]] && DECODE_LABEL="${DECODE_LABEL}_p${PUNCTUATION}"
+[[ "${STATE_MACHINE:-}"    == "1" ]] && DECODE_LABEL="${DECODE_LABEL}_sm"
+[[ "${STREAMING_ENCODE:-}" == "1" ]] && DECODE_LABEL="${DECODE_LABEL}_se"
+[[ "${USE_LAST}" == "1" ]] && DECODE_LABEL="${DECODE_LABEL}_last"
+[[ "${RUN_AVERAGING}" != "1" && "${USE_LAST}" != "1" ]] && DECODE_LABEL="${DECODE_LABEL}_single"
+
+
 cat > "${RESULTS_DIR}/run_config.yaml" <<YAML
 timestamp: "${RUN_TS}"
 job_id: "${JOB_TAG}"
@@ -209,6 +256,11 @@ eval_tag: "${EVAL_TAG:-}"
 model_class: "${MODEL_CLASS}"
 checkpoint: "${CKPT}"
 run_averaging: ${RUN_AVERAGING}
+ckpt_timestamp: "${CKPT_TS}"
+ckpt_step: "${CKPT_STEP}"
+decode_label: "${DECODE_LABEL}"
+state_machine: "${STATE_MACHINE:-}"
+streaming_encode: "${STREAMING_ENCODE:-}"
 eval_driver: "${EVAL_DRIVER}"
 num_averaged_inputs: ${#_AVG_IN[@]}
 system_prompt: |
@@ -247,9 +299,10 @@ MOUNTS="--container-mounts=/lustre/fsw:/lustre/fsw,${CODE_DIR}:/code,${OUTPUT_PR
 
 WANDB_CLAUSE=""
 if [[ "$REPORT_WANDB" == "1" ]]; then
-    WANDB_RUN_NAME="${WANDB_RUN_NAME:-${EXP_NAME}${EVAL_TAG_SUFFIX}${CHUNK_TAG}}_${RUN_TS}"
+    WANDB_GROUP="${WANDB_GROUP:-${EXP_NAME}_${CKPT_TS}}"
+    WANDB_RUN_NAME="${WANDB_RUN_NAME:-${DECODE_LABEL}}"
     WANDB_EVAL_PROJECT="${WANDB_EVAL_PROJECT:-${PROJECT}_leaderboard_eval}"
-    WANDB_CLAUSE="&& { export WANDB_API_KEY='${WANDB_TOKEN}'; python /code/scripts/eval_wandb_report.py --project '${WANDB_EVAL_PROJECT}' --run_name '${WANDB_RUN_NAME}' --results_dir '${RESULTS_DIR}' --group '${EXP_NAME}' --job_type script 2>&1 | tee '${RESULTS_DIR}/wandb_report.log' || true; }"
+    WANDB_CLAUSE="&& { export WANDB_API_KEY='${WANDB_TOKEN}'; python /code/scripts/eval_wandb_report.py --project '${WANDB_EVAL_PROJECT}' --run_name '${WANDB_RUN_NAME}' --results_dir '${RESULTS_DIR}' --group '${WANDB_GROUP}' --job_type script 2>&1 | tee '${RESULTS_DIR}/wandb_report.log' || true; }"
 fi
 
 # Driver-specific flags. --max_history_tokens, --force_word_start and the
