@@ -121,7 +121,12 @@ for d in "$ROOT"/*/; do
         # Only this chunk size's eval dirs. The trailing underscore in the glob
         # keeps chunk 2 from matching chunk 28's directories.
         eepoch=0; edir="-"; pepoch=0
-        for ed in "$d"leaderboard_eval_chunk"${c}"_*/; do
+        # Two layouts:
+        #   new  <exp>/<ckpt_ts>/chunk<C>[_extras]/
+        #   old  <exp>/leaderboard_eval_chunk<C>_.../     (kept so historical
+        #        results still count; drop this glob once they are gone)
+        # The trailing _ / end-anchor keeps chunk 2 from matching chunk 28.
+        for ed in "$d"*/chunk"${c}"/ "$d"*/chunk"${c}"_*/ "$d"leaderboard_eval_chunk"${c}"_*/; do
             [ -d "$ed" ] || continue
             t=$(stat -c %Y "$ed" 2>/dev/null || echo 0)
             if [ -f "${ed}aggregate.log" ] && grep -q "^RESULT.Average" "${ed}aggregate.log" 2>/dev/null; then
@@ -243,5 +248,5 @@ printf '  %s\n' "${submitted[@]}"
 echo ""
 if [[ "$DRY_RUN" -eq 0 ]]; then
     echo "Watch:   ssh ${OCI_USER}@${OCI_HOST} squeue -u \$USER"
-    echo "Results: ${RESULTS_ROOT}/<exp>/leaderboard_eval_*/aggregate.log"
+    echo "Results: ${RESULTS_ROOT}/<exp>/<ckpt_ts>/<decode_config>/aggregate.log"
 fi

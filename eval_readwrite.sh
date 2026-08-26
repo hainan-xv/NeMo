@@ -70,13 +70,14 @@ ROOT="$1"; shift
 for exp in "$@"; do
     [ -d "$ROOT/$exp" ] || { echo -e "$exp\t-\tMISSING"; continue; }
     found=0
-    for d in "$ROOT/$exp"/leaderboard_eval_chunk*/; do
+    # new layout <exp>/<ckpt_ts>/chunk<C>.../ plus the old flat one.
+    for d in "$ROOT/$exp"/*/chunk*/ "$ROOT/$exp"/leaderboard_eval_chunk*/; do
         [ -d "$d" ] || continue
         a="${d}aggregate.log"
         [ -f "$a" ] || continue
         wer=$(grep -P "^RESULT\tAverage\t" "$a" 2>/dev/null | cut -f3 | tail -1)
         [ -n "$wer" ] || continue
-        c=$(basename "$d"); c="${c#leaderboard_eval_chunk}"; c="${c%%_*}"
+        c=$(basename "$d"); c="${c#leaderboard_eval_chunk}"; c="${c#chunk}"; c="${c%%_*}"
         t=$(stat -c %Y "$a")
         echo -e "$exp\t$c\t$wer\t$t"
         found=1

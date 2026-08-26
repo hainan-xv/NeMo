@@ -126,13 +126,7 @@ fi
 # --- Result location ---
 RUN_TS="$(date +%Y%m%d_%H%M%S)"
 JOB_TAG="${SLURM_JOB_ID:-local$$}"
-CHUNK_TAG=""; [[ -n "$CHUNK_SIZE" ]] && CHUNK_TAG="_chunk${CHUNK_SIZE}"
-EVAL_TAG_SUFFIX=""; [[ -n "${EVAL_TAG:-}" ]] && EVAL_TAG_SUFFIX="_${EVAL_TAG}"
-RESULTS_DIR="${OUTPUT_PREFIX}/results/${PROJECT}/${EXP_NAME}/leaderboard_eval${CHUNK_TAG}${EVAL_TAG_SUFFIX}_${RUN_TS}_${JOB_TAG}"
-SHARD_DIR="${RESULTS_DIR}/shards"
-mkdir -p "$SHARD_DIR" "$HFCACHE"
-OUTFILE="${RESULTS_DIR}/slurm-%j-%n.out"
-ERRFILE="${RESULTS_DIR}/error-%j-%n.out"
+mkdir -p "$HFCACHE"
 
 # ---------------------------------------------------------------------------
 # Resolve the checkpoint. exp_manager nests the run name twice.
@@ -156,8 +150,7 @@ if [[ "$RUN_AVERAGING" == "1" ]]; then
     fi
     CKPT="$AVG_CKPT"
     DO_AVG=1
-    AVG_INPUTS_FILE="${SHARD_DIR}/avg_inputs.txt"
-    printf '%s\n' "${_AVG_IN[@]}" > "$AVG_INPUTS_FILE"
+    AVG_INPUTS_FILE="__DEFERRED__"   # path needs SHARD_DIR; written below
     echo "==> Will average ${#_AVG_IN[@]} checkpoint(s) -> ${AVG_CKPT} (cached; reused unless FORCE_AVERAGE=1)"
 else
     if [[ -z "$CKPT" ]]; then
@@ -246,6 +239,30 @@ DECODE_LABEL="chunk${CHUNK_SIZE:-default}"
 [[ "${STREAMING_ENCODE:-}" == "1" ]] && DECODE_LABEL="${DECODE_LABEL}_se"
 [[ "${USE_LAST}" == "1" ]] && DECODE_LABEL="${DECODE_LABEL}_last"
 [[ "${RUN_AVERAGING}" != "1" && "${USE_LAST}" != "1" ]] && DECODE_LABEL="${DECODE_LABEL}_single"
+
+# ---------------------------------------------------------------------------
+# Result location:  <exp>/<checkpoint timestamp>/<decode config>/
+#
+# The model name is NOT repeated -- this already sits under the experiment
+# directory. The timestamp is the CHECKPOINT's, not the job's, so every decode
+# of the same model version collects under one folder and re-evaluating after
+# more training starts a new one.
+#
+# Re-running the same checkpoint at the same decode config REPLACES that folder.
+# That keeps paths predictable; set KEEP_HISTORY=1 to append the job id instead
+# and retain both.
+# ---------------------------------------------------------------------------
+RESULTS_SUBDIR="${DECODE_LABEL}"
+[[ "${KEEP_HISTORY:-0}" == "1" ]] && RESULTS_SUBDIR="${DECODE_LABEL}_${JOB_TAG}"
+RESULTS_DIR="${OUTPUT_PREFIX}/results/${PROJECT}/${EXP_NAME}/${CKPT_TS}/${RESULTS_SUBDIR}"
+SHARD_DIR="${RESULTS_DIR}/shards"
+mkdir -p "$SHARD_DIR"
+OUTFILE="${RESULTS_DIR}/slurm-%j-%n.out"
+ERRFILE="${RESULTS_DIR}/error-%j-%n.out"
+if [[ "$AVG_INPUTS_FILE" == "__DEFERRED__" ]]; then
+    AVG_INPUTS_FILE="${SHARD_DIR}/avg_inputs.txt"
+    printf '%s\n' "${_AVG_IN[@]}" > "$AVG_INPUTS_FILE"
+fi
 
 
 cat > "${RESULTS_DIR}/run_config.yaml" <<YAML

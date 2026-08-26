@@ -115,7 +115,22 @@ fi
 RUN_TS="$(date +%Y%m%d_%H%M%S)"
 JOB_TAG="${SLURM_JOB_ID:-local$$}"
 EVAL_TAG="${EVAL_TAG:-${MODE}}"
-RESULTS_DIR="${OUTPUT_PREFIX}/results/${PROJECT}/${EXP_NAME}/leaderboard_eval_chunk${CHUNK_SIZE}_${EVAL_TAG}_${RUN_TS}_${JOB_TAG}"
+# Identity: the .nemo mtime stands in for a checkpoint timestamp, and the decode
+# config names the leaf. Same convention as launch/eval_leaderboard.sh.
+if [[ -e "$MODEL_PATH" ]]; then
+    CKPT_TS="$(date -r "$MODEL_PATH" +%Y%m%d_%H%M 2>/dev/null || echo unknown)"
+else
+    CKPT_TS="unknown"
+fi
+DECODE_LABEL="chunk${CHUNK_SIZE:-default}_${MODE}"
+
+# <exp>/<checkpoint timestamp>/<decode config>/ -- the model name is not repeated
+# (this is already under the experiment dir) and the timestamp is the MODEL's,
+# not the job's. Re-running the same config replaces it; KEEP_HISTORY=1 appends
+# the job id instead.
+RESULTS_SUBDIR="${DECODE_LABEL}"
+[[ "${KEEP_HISTORY:-0}" == "1" ]] && RESULTS_SUBDIR="${DECODE_LABEL}_${JOB_TAG}"
+RESULTS_DIR="${OUTPUT_PREFIX}/results/${PROJECT}/${EXP_NAME}/${CKPT_TS}/${RESULTS_SUBDIR}"
 SHARD_DIR="${RESULTS_DIR}/shards"
 mkdir -p "$SHARD_DIR" "$HFCACHE"
 OUTFILE="${RESULTS_DIR}/slurm-%j-%n.out"
@@ -159,16 +174,6 @@ echo "    results ->  ${RESULTS_DIR}"
 # fs12 while the code/cache/results live on fsw, so BOTH must be bound. The
 # broad catch-alls come first so ancestor binds do not shadow the leaves.
 MOUNTS="--container-mounts=/lustre/fsw:/lustre/fsw,/lustre/fs12:/lustre/fs12,${CODE_DIR}:/code,${OUTPUT_PREFIX}:${OUTPUT_PREFIX},${CACHE_DIR}:${CACHE_DIR},${H_DIR}:${H_DIR},${HFCACHE}:/hfcache/"
-
-# wandb identity: GROUP = <model>_<checkpoint timestamp>, RUN NAME = decode config.
-# Same convention as launch/eval_leaderboard.sh so all three systems line up in
-# one project. The .nemo file's mtime stands in for a checkpoint timestamp.
-if [[ -e "$MODEL_PATH" ]]; then
-    CKPT_TS="$(date -r "$MODEL_PATH" +%Y%m%d_%H%M 2>/dev/null || echo unknown)"
-else
-    CKPT_TS="unknown"
-fi
-DECODE_LABEL="chunk${CHUNK_SIZE:-default}_${MODE}"
 
 WANDB_CLAUSE=""
 if [[ "$REPORT_WANDB" == "1" ]]; then
