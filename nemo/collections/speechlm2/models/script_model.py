@@ -349,6 +349,12 @@ class ScriptSTTModel(StreamingSTTModel):
         two is asserted in the tests.
         """
         # order_ids, NOT position_ids: masking is structural.
+        if batch.order_ids is None:
+            raise ValueError(
+                "ScriptBatch.order_ids is None -- the dataset did not populate the structural "
+                "indices the mask is built from. Without them the mask would silently fall back "
+                "to RoPE geometry, which is exactly what position schemes are allowed to change."
+            )
         seg, pos, pref, val = batch.seg_ids, batch.order_ids, batch.prefix_len, batch.valid
 
         def mask_mod(b, h, q, kv):

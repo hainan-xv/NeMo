@@ -2138,3 +2138,42 @@ def test_mask_is_identical_under_both_position_schemes():
     assert torch.equal(a.order_ids, b.order_ids)
     assert not torch.equal(a.position_ids, b.position_ids), "schemes should differ in RoPE space"
     assert torch.equal(_mask_of(a), _mask_of(b))
+
+
+def test_script_batch_carries_order_ids_end_to_end():
+    """Regression: the dataset must populate order_ids on the batch it emits.
+
+    The unit tests build batches by calling collate_* directly, so a missing
+    field in ScriptSTTDataset.get_batch_data slipped through and only surfaced
+    on the cluster as `TypeError: 'NoneType' object is not subscriptable` deep
+    inside the FlexAttention vmap. This asserts the batch object the model
+    actually receives is complete.
+    """
+    import inspect
+
+    from nemo.collections.speechlm2.data.script_dataset import ScriptBatch, ScriptSTTDataset
+
+    # Every field the mask consumes must be handed to ScriptBatch by the dataset.
+    src = inspect.getsource(ScriptSTTDataset.get_batch_data)
+    for field in ("order_ids", "seg_ids", "prefix_len", "position_ids"):
+        assert f"{field}=packed.{field}" in src, f"get_batch_data never sets {field}"
+
+    # And a batch built the way the dataset builds it must mask cleanly.
+    chunks = [ChunkSpec(2, [201]), ChunkSpec(2, [202, 203])]
+    packed = build_packed_chunk_example(
+        instruction_ids=[1, 2, 3], chunks=chunks, vision_start_id=80, vision_end_id=81, eot_id=82
+    )
+    batched = collate_packed_chunk_examples([packed], pad_id=0)
+    b = ScriptBatch(
+        input_tokens=batched.input_ids,
+        position_ids=batched.position_ids,
+        order_ids=batched.order_ids,
+        seg_ids=batched.seg_ids,
+        prefix_len=batched.prefix_len,
+        target_tokens=batched.target_ids,
+        is_audio=batched.is_audio,
+        valid=batched.valid,
+    )
+    assert b.order_ids is not None
+    m = build_script_mask(b.seg_ids, b.order_ids, b.prefix_len, b.valid, torch.float32)
+    assert m.shape[-1] == b.input_tokens.shape[-1]

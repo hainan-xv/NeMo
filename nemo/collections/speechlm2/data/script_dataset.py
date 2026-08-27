@@ -424,6 +424,7 @@ class ScriptSTTDataset(StreamingSTTDataset):
             audio_lens=audio_lens,
             input_tokens=packed.input_ids,
             position_ids=packed.position_ids,
+            order_ids=packed.order_ids,
             seg_ids=packed.seg_ids,
             prefix_len=packed.prefix_len,
             target_tokens=packed.target_ids,
