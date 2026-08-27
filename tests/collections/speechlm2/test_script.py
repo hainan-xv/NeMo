@@ -2177,3 +2177,59 @@ def test_script_batch_carries_order_ids_end_to_end():
     assert b.order_ids is not None
     m = build_script_mask(b.seg_ids, b.order_ids, b.prefix_len, b.valid, torch.float32)
     assert m.shape[-1] == b.input_tokens.shape[-1]
+
+
+def test_sampled_position_scheme_draws_both_and_is_deterministic():
+    """`sampled` must actually produce both layouts, reproducibly."""
+    import numpy as np
+
+    def draw(seed, p=0.5, n=400):
+        rng = np.random.default_rng(seed)
+        return ["continuous" if rng.random() < p else "branch" for _ in range(n)]
+
+    a, b = draw(0), draw(0)
+    assert a == b, "same seed must give the same sequence of schemes"
+    assert draw(1) != a, "different seeds must differ"
+    assert set(a) == {"branch", "continuous"}
+    frac = a.count("continuous") / len(a)
+    assert 0.4 < frac < 0.6, frac
+    # the probability knob must actually bite
+    assert draw(0, p=0.0).count("continuous") == 0
+    assert draw(0, p=1.0).count("branch") == 0
+
+
+def test_dataset_rejects_a_bad_position_scheme():
+    from nemo.collections.speechlm2.data.script_dataset import ScriptSTTDataConfig
+    from nemo.collections.speechlm2.parts.utils import to_dataclass
+
+    cfg = to_dataclass(
+        ScriptSTTDataConfig,
+        {"sample_rate": 16000, "frame_length_in_secs": 0.08, "chunk_size": 2, "position_scheme": "nonsense"},
+    )
+    assert cfg.position_scheme == "nonsense"  # coercion keeps it; __init__ rejects it
+    assert cfg.continuous_prob == 0.5  # default P(continuous)
+
+
+def test_model_resolves_sampled_to_a_concrete_decode_scheme():
+    """A model trained with `sampled` must decode with ONE concrete layout, and
+    say which -- decoding has no notion of sampling."""
+    from nemo.collections.speechlm2.models.script_model import ScriptSTTModelConfig
+    from nemo.collections.speechlm2.parts.utils import to_dataclass
+
+    base = dict(
+        pretrained_llm="x",
+        pretrained_asr="y",
+        load_llm_weights=False,
+        load_asr_weights=False,
+        blank_token="",
+        chunk_size=2,
+        freeze_speech_encoder=True,
+        freeze_modality_adapter=True,
+        freeze_modality_proj=True,
+        freeze_llm_model=True,
+        freeze_llm_head=True,
+        freeze_embed_tokens=True,
+    )
+    cfg = to_dataclass(ScriptSTTModelConfig, {**base, "position_scheme": "sampled"})
+    assert cfg.position_scheme == "sampled"
+    assert cfg.val_position_scheme == "continuous"  # the concrete decode default

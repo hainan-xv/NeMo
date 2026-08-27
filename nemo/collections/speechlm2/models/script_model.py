@@ -121,6 +121,10 @@ class ScriptSTTModelConfig(StreamingSTTModelConfig):
             with words and a branch cannot tell how long a silence lasted. The
             gate is still stripped from the returned TEXT. Requires ``read_write``
             and MUST match ``data.dataset.gate_in_history``.
+        position_scheme: ``branch`` | ``continuous`` | ``sampled``. MUST match
+            ``data.dataset.position_scheme``.
+        val_position_scheme: which concrete layout to DECODE with when the model
+            was trained with ``sampled``. Decoding has no notion of sampling.
         read_token / write_token: the gate tokens. Defaults are unused in-vocab
             Qwen specials, so no embedding resize is needed. MUST match the
             dataset's.
@@ -148,6 +152,7 @@ class ScriptSTTModelConfig(StreamingSTTModelConfig):
     write_token: str = "<|box_end|>"
     gate_in_history: bool = False
     position_scheme: str = "branch"
+    val_position_scheme: str = "continuous"
     val_chunk_size: Optional[int] = None
     val_max_new_tokens_per_chunk: Optional[int] = None
     val_system_prompt: Optional[str] = None
@@ -234,6 +239,25 @@ class ScriptSTTModel(StreamingSTTModel):
 
         # Read/write gate. Resolved here so decode strips exactly the ids the
         # dataset supervised; a mismatch would leave gate tokens in the output.
+        # Decoding needs a CONCRETE layout: "sampled" is a training-time
+        # augmentation and has no meaning for a single forward pass. Resolve it
+        # here so the choice is explicit and logged, rather than defaulting
+        # silently to whichever branch of an if-statement runs first.
+        if self.core_cfg.position_scheme not in ("branch", "continuous", "sampled"):
+            raise ValueError(f"model.position_scheme={self.core_cfg.position_scheme!r} is not valid")
+        self._decode_position_scheme = self.core_cfg.position_scheme
+        if self._decode_position_scheme == "sampled":
+            self._decode_position_scheme = self.core_cfg.val_position_scheme
+            if self._decode_position_scheme not in ("branch", "continuous"):
+                raise ValueError(
+                    f"val_position_scheme must be 'branch' or 'continuous' when position_scheme="
+                    f"'sampled', got {self.core_cfg.val_position_scheme!r}"
+                )
+            logging.info(
+                "ScriptSTTModel: trained with SAMPLED positions; decoding with %r",
+                self._decode_position_scheme,
+            )
+
         self._read_write = bool(self.core_cfg.read_write)
         self._gate_in_history = bool(self.core_cfg.gate_in_history)
         if self._gate_in_history and not self._read_write:
@@ -842,7 +866,7 @@ class ScriptSTTModel(StreamingSTTModel):
             read_id=self._read_id,
             write_id=self._write_id,
             gate_in_history=self._gate_in_history,
-            position_scheme=self.core_cfg.position_scheme,
+            position_scheme=self._decode_position_scheme,
             pad_id=self.text_pad_id,
             max_new_tokens=max_new_tokens,
             device=self.device,

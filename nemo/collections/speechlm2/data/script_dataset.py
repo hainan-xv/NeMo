@@ -75,6 +75,18 @@ class ScriptSTTDataConfig(StreamingSTTDataConfig):
             token per chunk, which bites hardest at small chunk sizes (a 30s clip
             at chunk_size=2 has ~188 chunks against ~110 word tokens). Requires
             ``read_write``. Must match ``model.gate_in_history``.
+        position_scheme: ``branch`` | ``continuous`` | ``sampled``. ``sampled``
+            draws one of the two schemes PER BATCH (like chunk_size), with
+            probability ``continuous_prob`` of ``continuous``. Note the two are
+            not two views of one fact: under ``branch`` the offset between
+            consecutive words reveals whether a chunk boundary fell between them,
+            and ``continuous`` erases exactly that. Sampling therefore trades a
+            usable cue for robustness to both layouts -- worth measuring, not
+            obviously a win.
+        continuous_prob: P(continuous) when ``position_scheme='sampled'``.
+        position_seed: base seed for the per-batch scheme draw, offset per
+            dataloader worker. Separate from the chunk and control seeds so
+            enabling sampling does not perturb either of those streams.
         read_token / write_token: the two gate tokens. Defaults are unused
             in-vocab Qwen specials, so no embedding resize is needed and a
             read/write run can still warm-start from a plain SCRIPT checkpoint.
@@ -101,6 +113,8 @@ class ScriptSTTDataConfig(StreamingSTTDataConfig):
     write_token: str = "<|box_end|>"
     gate_in_history: bool = False
     position_scheme: str = "branch"
+    continuous_prob: float = 0.5
+    position_seed: int = 91011
     prompt_control: bool = False
     delay_candidates: Optional[List[int]] = None
     capitalization_prob: float = 0.5
@@ -240,6 +254,19 @@ class ScriptSTTDataset(StreamingSTTDataset):
         self._chunk_rngs: dict = {}
         self._control_rngs: dict = {}
 
+        if self.cfg.position_scheme not in ("branch", "continuous", "sampled"):
+            raise ValueError(
+                f"position_scheme must be 'branch', 'continuous' or 'sampled', " f"got {self.cfg.position_scheme!r}"
+            )
+        if not 0.0 <= float(self.cfg.continuous_prob) <= 1.0:
+            raise ValueError(f"continuous_prob must be in [0, 1], got {self.cfg.continuous_prob}")
+        self._position_rngs: dict = {}
+        if self.cfg.position_scheme == "sampled":
+            logging.info(
+                "ScriptSTTDataset: position scheme SAMPLED per batch — P(continuous)=%.2f",
+                self.cfg.continuous_prob,
+            )
+
         self._prompt_control = bool(self.cfg.prompt_control)
         self._delay_candidates = resolve_delay_candidates(self.cfg.delay_candidates, self.cfg.num_delay_frames)
         for name, p in (
@@ -287,6 +314,14 @@ class ScriptSTTDataset(StreamingSTTDataset):
         if wid not in self._chunk_rngs:
             self._chunk_rngs[wid] = np.random.default_rng(int(self.cfg.chunk_size_seed) + wid)
         return self._chunk_rngs[wid]
+
+    def _get_position_rng(self) -> np.random.Generator:
+        """RNG for the per-batch position-scheme draw, seeded per worker."""
+        info = torch.utils.data.get_worker_info()
+        wid = info.id if info is not None else 0
+        if wid not in self._position_rngs:
+            self._position_rngs[wid] = np.random.default_rng(int(self.cfg.position_seed) + wid)
+        return self._position_rngs[wid]
 
     def _get_control_rng(self) -> np.random.Generator:
         """RNG for the per-example control draw, seeded per dataloader worker."""
@@ -347,6 +382,13 @@ class ScriptSTTDataset(StreamingSTTDataset):
         else:
             chunk_size = int(self.cfg.chunk_size)
 
+        # One position scheme per batch, drawn like the chunk size.
+        position_scheme = self.cfg.position_scheme
+        if position_scheme == "sampled":
+            position_scheme = (
+                "continuous" if self._get_position_rng().random() < float(self.cfg.continuous_prob) else "branch"
+            )
+
         system_prompts = [cut.custom.get(self.cfg.prompt_field, self.cfg.system_prompt) for cut in cuts]
 
         # Prompt control: draw each example's settings, restyle its targets to
@@ -403,7 +445,7 @@ class ScriptSTTDataset(StreamingSTTDataset):
                     audio_history_chunks=self._audio_history_chunks,
                     audio_window_frames=self._audio_window_frames,
                     gate_in_history=self._gate_in_history,
-                    position_scheme=self.cfg.position_scheme,
+                    position_scheme=position_scheme,
                 )
             )
 
