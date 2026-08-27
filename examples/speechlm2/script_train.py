@@ -70,6 +70,17 @@ def train(cfg):
                 f"Set data.dataset.{key}: ${{model.{key}}} in the config."
             )
 
+    # position_scheme is a STRING, so it cannot ride the int() loop above.
+    ps_model = str(cfg.model.get("position_scheme", "branch"))
+    ps_data = str(dataset_cfg.get("position_scheme", "branch"))
+    if ps_model != ps_data:
+        raise ValueError(
+            f"model.position_scheme ({ps_model}) != data.dataset.position_scheme ({ps_data}); "
+            "they must match, or training and inference lay out RoPE positions differently."
+        )
+    if ps_model not in ("branch", "continuous"):
+        raise ValueError(f"position_scheme must be 'branch' or 'continuous', got {ps_model!r}")
+
     # Validation dataset config = training config with val_dataset_overrides on
     # top (e.g. pinning a single chunk_size for the decode-only WER pass).
     val_dataset_overrides = cfg.data.get("val_dataset_overrides", None)

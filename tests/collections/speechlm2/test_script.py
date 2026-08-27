@@ -75,7 +75,7 @@ def _shallow_broadcast(cache, n):
 def _mask_of(packed):
     valid = torch.ones_like(packed.input_ids, dtype=torch.bool)
     return build_script_mask(
-        packed.seg_ids[None], packed.position_ids[None], packed.prefix_len[None], valid[None], torch.float32
+        packed.seg_ids[None], packed.order_ids[None], packed.prefix_len[None], valid[None], torch.float32
     )[0, 0]
 
 
@@ -292,7 +292,7 @@ def test_mask_padding_blocked():
     a = build_packed_chunk_example(INSTR, [ChunkSpec(2, [20])], VS, VE, EOT)
     b = build_packed_chunk_example(INSTR, [ChunkSpec(2, [20]), ChunkSpec(2, [21])], VS, VE, EOT)
     batch = collate_packed_chunk_examples([a, b], pad_id=0)
-    m = build_script_mask(batch.seg_ids, batch.position_ids, batch.prefix_len, batch.valid, torch.float32)
+    m = build_script_mask(batch.seg_ids, batch.order_ids, batch.prefix_len, batch.valid, torch.float32)
 
     n_real = int(a.input_ids.numel())
     T = batch.input_ids.shape[1]
@@ -517,11 +517,12 @@ def _frames_by_index(all_frames, frame_index, is_audio):
 
 
 @torch.no_grad()
+@pytest.mark.parametrize("position_scheme", ["branch", "continuous"])
 @pytest.mark.parametrize(
     "audio_history_chunks,audio_window_frames",
     [(0, 0), (1, 0), (2, 0), (0, 4), (0, 6), (0, 8)],
 )
-def test_parity_packed_vs_separate_examples(audio_history_chunks, audio_window_frames):
+def test_parity_packed_vs_separate_examples(audio_history_chunks, audio_window_frames, position_scheme):
     """The whole correctness argument: packed branch logits == standalone logits."""
     model = _tiny_qwen3()
     H = model.config.hidden_size
@@ -544,6 +545,7 @@ def test_parity_packed_vs_separate_examples(audio_history_chunks, audio_window_f
         EOT,
         audio_history_chunks=audio_history_chunks,
         audio_window_frames=audio_window_frames,
+        position_scheme=position_scheme,
     )
     packed_emb = _embed_with_audio(
         model,
@@ -565,6 +567,7 @@ def test_parity_packed_vs_separate_examples(audio_history_chunks, audio_window_f
         EOT,
         audio_history_chunks=audio_history_chunks,
         audio_window_frames=audio_window_frames,
+        position_scheme=position_scheme,
     )
     for k, sep in enumerate(separate, start=1):
         sep_emb = _embed_with_audio(
@@ -573,7 +576,9 @@ def test_parity_packed_vs_separate_examples(audio_history_chunks, audio_window_f
             sep.is_audio,
             _frames_by_index(all_frames, sep.audio_frame_index, sep.is_audio),
         )
-        sep_logits = model(inputs_embeds=sep_emb[None]).logits[0]  # plain causal, positions 0..L-1
+        # Positions come from the builder: under the continuous scheme they are
+        # NOT 0..L-1, and defaulting would compare different geometries.
+        sep_logits = model(inputs_embeds=sep_emb[None], position_ids=sep.position_ids[None]).logits[0]
 
         packed_branch = packed_logits[(packed.seg_ids == k).nonzero(as_tuple=True)[0]]
         sep_branch = sep_logits[sep.branch_start :]
@@ -597,7 +602,7 @@ def test_parity_batched():
 
     examples = [build_packed_chunk_example(instruction, chs, VS, VE, EOT) for chs in utts]
     batch = collate_packed_chunk_examples(examples, pad_id=0)
-    mask = build_script_mask(batch.seg_ids, batch.position_ids, batch.prefix_len, batch.valid, torch.float32)
+    mask = build_script_mask(batch.seg_ids, batch.order_ids, batch.prefix_len, batch.valid, torch.float32)
 
     embs = []
     for i, ex in enumerate(examples):
@@ -1235,7 +1240,7 @@ def test_structured_attention_matches_dense(window):
         ]
     )
 
-    mask = build_script_mask(batch.seg_ids, batch.position_ids, batch.prefix_len, batch.valid, emb.dtype)
+    mask = build_script_mask(batch.seg_ids, batch.order_ids, batch.prefix_len, batch.valid, emb.dtype)
     ref = model_dense(inputs_embeds=emb, attention_mask=mask, position_ids=batch.position_ids).logits
 
     model_struct = _tiny_qwen3()
@@ -1273,7 +1278,7 @@ def test_structured_attention_gradients_match_dense():
             with script_attention_plan(plan):
                 logits = model(inputs_embeds=emb, attention_mask=None, position_ids=batch.position_ids).logits
         else:
-            mask = build_script_mask(batch.seg_ids, batch.position_ids, batch.prefix_len, batch.valid, emb.dtype)
+            mask = build_script_mask(batch.seg_ids, batch.order_ids, batch.prefix_len, batch.valid, emb.dtype)
             logits = model(inputs_embeds=emb, attention_mask=mask, position_ids=batch.position_ids).logits
         loss = torch.nn.functional.cross_entropy(
             logits.flatten(0, 1), batch.target_ids.flatten(0, 1), ignore_index=IGNORE_INDEX
@@ -1327,7 +1332,7 @@ def test_flex_mask_mod_equals_dense_mask():
         audio_window_frames=6,
     )
     batch = collate_packed_chunk_examples([a, b], pad_id=0)
-    dense = build_script_mask(batch.seg_ids, batch.position_ids, batch.prefix_len, batch.valid, torch.float32)[:, 0]
+    dense = build_script_mask(batch.seg_ids, batch.order_ids, batch.prefix_len, batch.valid, torch.float32)[:, 0]
 
     mod = ScriptSTTModel._script_mask_mod(batch)
     B, T = batch.seg_ids.shape
@@ -2047,3 +2052,89 @@ def test_fsm_handles_ragged_batches():
     )
     assert len(out) == 2
     assert len(out[0]) == 3 * len(out[1]), (out, "3 chunks vs 1")
+
+
+# ---------------------------------------------------------------------------
+# Position scheme
+# ---------------------------------------------------------------------------
+
+
+def _word_pos(ex, token):
+    """Position of `token` wherever it is predicted inside a branch."""
+    for i, (t, s, a) in enumerate(zip(ex.input_ids.tolist(), ex.seg_ids.tolist(), ex.is_audio.tolist())):
+        if s > 0 and not a and t == token:
+            return int(ex.position_ids[i])
+    return None
+
+
+def _spine_pos(ex, token):
+    for i, (t, s) in enumerate(zip(ex.input_ids.tolist(), ex.seg_ids.tolist())):
+        if s == 0 and t == token:
+            return int(ex.position_ids[i])
+    return None
+
+
+@pytest.mark.parametrize("scheme,expect_equal", [("branch", False), ("continuous", True)])
+def test_position_scheme_and_chunk_boundary_invariance(scheme, expect_equal):
+    """The point of the continuous scheme: where the chunk boundary fell must not
+    change the text geometry.
+
+    Same transcript "one two three", two splits:
+      A  previous chunk silent, this chunk emits all three
+      B  previous chunk emitted "one", this chunk emits "two three"
+    The offset from "one" to "two" should be identical under `continuous` and
+    differs sharply under `branch` (the audio block sits between them in B).
+    """
+    ONE, TWO, THREE, W = 201, 202, 203, 4
+    kw = dict(instruction_ids=[1, 2, 3], vision_start_id=80, vision_end_id=81, eot_id=82, position_scheme=scheme)
+    a = build_packed_chunk_example(chunks=[ChunkSpec(W, []), ChunkSpec(W, [ONE, TWO, THREE])], **kw)
+    b = build_packed_chunk_example(chunks=[ChunkSpec(W, [ONE]), ChunkSpec(W, [TWO, THREE])], **kw)
+    # In A both words are predicted in branch 2; in B "one" lives in the history.
+    off_a = _word_pos(a, TWO) - _word_pos(a, ONE)
+    off_b = _word_pos(b, TWO) - _spine_pos(b, ONE)
+    if expect_equal:
+        assert off_a == off_b == 1, (off_a, off_b)
+    else:
+        assert off_a != off_b, (off_a, off_b)
+
+
+def test_continuous_scheme_puts_words_on_their_spine_positions():
+    """Under `continuous` a branch predicts each word at exactly the position the
+    spine gives it -- that is what makes the text one continuous sequence."""
+    chunks = [ChunkSpec(3, [201]), ChunkSpec(3, [202, 203]), ChunkSpec(3, [204])]
+    ex = build_packed_chunk_example(
+        instruction_ids=[1, 2, 3],
+        chunks=chunks,
+        vision_start_id=80,
+        vision_end_id=81,
+        eot_id=82,
+        position_scheme="continuous",
+    )
+    for tok in (201, 202, 203, 204):
+        assert _word_pos(ex, tok) == _spine_pos(ex, tok), tok
+
+
+def test_position_ids_are_never_negative():
+    """The continuous scheme shifts branches left; ids must stay valid indices."""
+    for W in (2, 8, 28):
+        ex = build_packed_chunk_example(
+            instruction_ids=[1],
+            chunks=[ChunkSpec(W, [201]), ChunkSpec(W, [202])],
+            vision_start_id=80,
+            vision_end_id=81,
+            eot_id=82,
+            position_scheme="continuous",
+        )
+        assert int(ex.position_ids.min()) >= 0, (W, int(ex.position_ids.min()))
+
+
+def test_mask_is_identical_under_both_position_schemes():
+    """THE decoupling guarantee: the mask is structural, so moving positions
+    around cannot change who attends to whom."""
+    chunks = [ChunkSpec(3, [201]), ChunkSpec(3, [202, 203])]
+    kw = dict(instruction_ids=[1, 2, 3], chunks=chunks, vision_start_id=80, vision_end_id=81, eot_id=82)
+    a = build_packed_chunk_example(position_scheme="branch", **kw)
+    b = build_packed_chunk_example(position_scheme="continuous", **kw)
+    assert torch.equal(a.order_ids, b.order_ids)
+    assert not torch.equal(a.position_ids, b.position_ids), "schemes should differ in RoPE space"
+    assert torch.equal(_mask_of(a), _mask_of(b))

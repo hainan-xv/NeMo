@@ -111,6 +111,34 @@ def audio_window_start(
     return frame_starts[max(0, chunk_index - max(int(audio_history_chunks), 0))]
 
 
+BRANCH_SCHEME, CONTINUOUS_SCHEME = "branch", "continuous"
+
+
+def branch_position_start(pref: int, window_len: int, position_scheme: str = BRANCH_SCHEME) -> int:
+    """Where a branch's positions begin.
+
+    ``branch`` (default): right after the history, so the branch reads
+    ``[history] <vs> audio <ve> words`` as one causal run. The audio therefore
+    sits BETWEEN the history and the words it predicts, which means a word is
+    adjacent to words emitted in the SAME chunk but ``window_len + 3`` away from
+    the word before it if that one was emitted in the PREVIOUS chunk. The same
+    transcript thus has different position geometry depending on where the chunk
+    boundaries fell -- an inconsistency the model must absorb, and one that a
+    prompt-controlled model meets at every latency setting.
+
+    ``continuous``: shift the branch left by ``window_len + 2`` so its predicted
+    words land on exactly the positions they occupy in the spine. Text is then a
+    single continuous sequence in position space and the chunking is invisible to
+    it; the audio window instead overlaps the tail of the history, which is the
+    intent -- the audio and the words it realises describe the same moment.
+    Positions may go negative here and are shifted back en masse by the caller;
+    RoPE is relative, so a uniform shift changes nothing.
+    """
+    if position_scheme == CONTINUOUS_SCHEME:
+        return pref - (window_len + 2)
+    return pref
+
+
 def _branch_positions(pref: int, window_len: int, n_words: int) -> List[int]:
     """RoPE position ids for one branch.
 
@@ -177,6 +205,12 @@ class PackedChunkExample:
 
     Attributes:
         input_ids: (T,) token ids; audio-frame positions hold ``AUDIO_TOKEN_IDX``.
+        order_ids: (T,) STRUCTURAL index used only for masking -- spine tokens get
+            their spine index, branch tokens their offset within the branch. Kept
+            separate from ``position_ids`` so the mask does not depend on RoPE
+            geometry: a position scheme may legitimately shift branches or make
+            audio collide with history, and none of that should change who may
+            attend to whom.
         position_ids: (T,) RoPE position per token (spine = its index; a branch
             token = ``prefix_len_k + local_offset``).
         seg_ids: (T,) ``0`` for spine tokens, ``k >= 1`` for branch-k tokens.
@@ -195,6 +229,7 @@ class PackedChunkExample:
 
     input_ids: Tensor
     position_ids: Tensor
+    order_ids: Tensor
     seg_ids: Tensor
     prefix_len: Tensor
     target_ids: Tensor
@@ -213,6 +248,7 @@ def build_packed_chunk_example(
     audio_history_chunks: int = 0,
     audio_window_frames: int = 0,
     gate_in_history: bool = False,
+    position_scheme: str = BRANCH_SCHEME,
 ) -> PackedChunkExample:
     """Build the packed spine+branch layout for one utterance.
 
@@ -264,6 +300,7 @@ def build_packed_chunk_example(
 
     input_ids: List[int] = list(spine_ids)
     position_ids: List[int] = list(range(P))
+    order_ids: List[int] = list(range(P))  # spine: its index
     seg_ids: List[int] = [SPINE_SEG_ID] * P
     prefix_len: List[int] = [0] * P
     target_ids: List[int] = [IGNORE_INDEX] * P  # the spine is context only — no loss
@@ -307,16 +344,27 @@ def build_packed_chunk_example(
             next_targets[ve_idx + len(branch_words)] = eot_id
 
         input_ids.extend(branch_tokens)
-        position_ids.extend(_branch_positions(pref, window_len, len(branch_words)))
+        position_ids.extend(
+            _branch_positions(branch_position_start(pref, window_len, position_scheme), window_len, len(branch_words))
+        )
+        order_ids.extend(range(n_bt))  # branch: offset within the branch
         seg_ids.extend([k] * n_bt)
         prefix_len.extend([pref] * n_bt)
         target_ids.extend(next_targets)
         is_audio.extend(branch_is_audio)
         audio_frame_index.extend(branch_frame_idx)
 
+    # The continuous scheme can push early branches below zero. RoPE depends only
+    # on differences, so lifting every position by a constant is a no-op for the
+    # model while keeping the ids valid indices into the cos/sin cache.
+    shift = -min(position_ids) if position_ids and min(position_ids) < 0 else 0
+    if shift:
+        position_ids = [q + shift for q in position_ids]
+
     return PackedChunkExample(
         input_ids=torch.tensor(input_ids, dtype=torch.long),
         position_ids=torch.tensor(position_ids, dtype=torch.long),
+        order_ids=torch.tensor(order_ids, dtype=torch.long),
         seg_ids=torch.tensor(seg_ids, dtype=torch.long),
         prefix_len=torch.tensor(prefix_len, dtype=torch.long),
         target_ids=torch.tensor(target_ids, dtype=torch.long),
@@ -328,14 +376,15 @@ def build_packed_chunk_example(
 
 def build_script_mask(
     seg_ids: Tensor,
-    position_ids: Tensor,
+    order_ids: Tensor,
     prefix_len: Tensor,
     valid: Tensor,
     dtype: torch.dtype,
 ) -> Tensor:
     """Build the 4D additive attention mask for a packed SCRIPT batch.
 
-    A query at position ``q`` may attend key ``j`` iff the key is valid and one of:
+    A query ``q`` may attend key ``j`` iff the key is valid and one of the
+    following holds, all expressed in STRUCTURAL indices (``order_ids``):
 
     * **spine query, spine key** — causal within the spine (``pos[j] <= pos[q]``),
       so spine tokens see only other spine tokens and stay pure text.
@@ -351,7 +400,8 @@ def build_script_mask(
 
     Args:
         seg_ids: (B, T) ``0`` = spine, ``>= 1`` = branch id, ``-1`` = padding.
-        position_ids: (B, T) RoPE positions (also used for causality / prefix).
+        order_ids: (B, T) STRUCTURAL indices (spine index / branch offset). NOT the
+            RoPE positions -- masking must not depend on position geometry.
         prefix_len: (B, T) per-branch-token history-prefix length (0 for spine).
         valid: (B, T) bool, False at padding.
         dtype: floating dtype for the additive mask.
@@ -362,8 +412,8 @@ def build_script_mask(
     """
     q_seg = seg_ids[:, :, None]  # (B, T, 1)
     k_seg = seg_ids[:, None, :]  # (B, 1, T)
-    q_pos = position_ids[:, :, None]
-    k_pos = position_ids[:, None, :]
+    q_pos = order_ids[:, :, None]
+    k_pos = order_ids[:, None, :]
     q_prefix = prefix_len[:, :, None]
     k_valid = valid[:, None, :]
 
@@ -389,6 +439,7 @@ class BatchedPackedChunk:
 
     input_ids: Tensor  # (B, T)
     position_ids: Tensor  # (B, T)
+    order_ids: Tensor  # (B, T)
     seg_ids: Tensor  # (B, T)
     prefix_len: Tensor  # (B, T)
     target_ids: Tensor  # (B, T)
@@ -421,6 +472,7 @@ def collate_packed_chunk_examples(examples: List[PackedChunkExample], pad_id: in
     return BatchedPackedChunk(
         input_ids=_pad([e.input_ids for e in examples], pad_id, torch.long),
         position_ids=_pad([e.position_ids for e in examples], 0, torch.long),
+        order_ids=_pad([e.order_ids for e in examples], 0, torch.long),
         seg_ids=_pad([e.seg_ids for e in examples], PAD_SEG_ID, torch.long),
         prefix_len=_pad([e.prefix_len for e in examples], 0, torch.long),
         target_ids=_pad([e.target_ids for e in examples], IGNORE_INDEX, torch.long),
@@ -492,6 +544,7 @@ def build_twod_chunk_example(
     audio_history_chunks: int = 0,
     audio_window_frames: int = 0,
     gate_in_history: bool = False,
+    position_scheme: str = BRANCH_SCHEME,
     pad_id: int = 0,
 ) -> TwoDChunkExample:
     """Build the 2-D counterpart of :func:`build_packed_chunk_example`.
@@ -535,7 +588,7 @@ def build_twod_chunk_example(
             tgt[ve + len(words)] = eot_id
 
         rows_ids.append(ids)
-        rows_pos.append(_branch_positions(pref, w, len(words)))
+        rows_pos.append(_branch_positions(branch_position_start(pref, w, position_scheme), w, len(words)))
         rows_fidx.append(fidx)
         rows_tgt.append(tgt)
 
@@ -735,6 +788,11 @@ class SeparateChunkExample:
         is_audio: (L,) True at audio-frame positions.
         audio_frame_index: (L,) global encoder-frame index at audio slots, -1 elsewhere.
         branch_start: index where this example's branch begins (audio + words + eot).
+        position_ids: (L,) RoPE positions. Under ``branch`` these are 0..L-1; under
+            ``continuous`` the branch is shifted so its words land on their
+            transcript positions, so they must be passed explicitly -- comparing a
+            packed branch against a standalone forward that defaulted to 0..L-1
+            would silently compare two different position geometries.
     """
 
     input_ids: Tensor
@@ -742,6 +800,7 @@ class SeparateChunkExample:
     is_audio: Tensor
     audio_frame_index: Tensor
     branch_start: int
+    position_ids: Tensor
 
 
 def build_separate_chunk_examples(
@@ -754,6 +813,7 @@ def build_separate_chunk_examples(
     audio_history_chunks: int = 0,
     audio_window_frames: int = 0,
     gate_in_history: bool = False,
+    position_scheme: str = BRANCH_SCHEME,
 ) -> List[SeparateChunkExample]:
     """Build the standalone per-chunk examples the packed layout must reproduce.
 
@@ -797,6 +857,12 @@ def build_separate_chunk_examples(
         aud.append(False)
         fidx.append(-1)
 
+        # Positions: history keeps 0..pref-1; the branch starts per the scheme.
+        b0 = branch_position_start(len(prefix), window_len, position_scheme)
+        _sep_positions = list(range(len(prefix))) + [b0 + o for o in range(len(ids) - len(prefix))]
+        _shift = -min(_sep_positions) if min(_sep_positions) < 0 else 0
+        if _shift:
+            _sep_positions = [q + _shift for q in _sep_positions]
         tgt = [IGNORE_INDEX] * len(ids)
         ve_idx = branch_start + 1 + window_len
         for j, tok in enumerate(branch_words):
@@ -811,6 +877,7 @@ def build_separate_chunk_examples(
                 is_audio=torch.tensor(aud, dtype=torch.bool),
                 audio_frame_index=torch.tensor(fidx, dtype=torch.long),
                 branch_start=branch_start,
+                position_ids=torch.tensor(_sep_positions, dtype=torch.long),
             )
         )
         history.extend(spine_contribution(ch, gate_in_history))
@@ -840,6 +907,7 @@ def batched_stream_decode_script(
     read_id: Optional[int] = None,
     write_id: Optional[int] = None,
     gate_in_history: bool = False,
+    position_scheme: str = BRANCH_SCHEME,
 ):
     """Batched greedy SCRIPT decode for ``B`` utterances at once.
 
@@ -969,6 +1037,19 @@ def batched_stream_decode_script(
 
         valid = input_tokens != pad_id  # (na, L)
         position_ids = (valid.long().cumsum(dim=1) - 1).clamp(min=0)
+        if position_scheme == CONTINUOUS_SCHEME:
+            # Text stays one continuous run: the words this chunk emits carry on
+            # from the history, and <vs>/audio/<ve> are placed BEFORE them, so the
+            # audio overlaps the history tail instead of displacing the text.
+            hist_len = valid.long().sum(dim=1) - (
+                1 + torch.tensor([int(fr.shape[0]) for fr in chunk_frames], device=device) + 1
+            )
+            for i in range(na):
+                h = int(hist_len[i])
+                c = int(chunk_frames[i].shape[0])
+                tail = torch.arange(-(c + 2), 0, device=device) + h
+                position_ids[i, L - (c + 2) :] = tail
+            position_ids = position_ids - position_ids.min(dim=1, keepdim=True).values
         cur_pos = position_ids[:, -1] + 1  # (na,)
 
         out = llm(

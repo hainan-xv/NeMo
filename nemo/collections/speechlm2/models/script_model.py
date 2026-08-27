@@ -147,6 +147,7 @@ class ScriptSTTModelConfig(StreamingSTTModelConfig):
     read_token: str = "<|box_start|>"
     write_token: str = "<|box_end|>"
     gate_in_history: bool = False
+    position_scheme: str = "branch"
     val_chunk_size: Optional[int] = None
     val_max_new_tokens_per_chunk: Optional[int] = None
     val_system_prompt: Optional[str] = None
@@ -347,7 +348,8 @@ class ScriptSTTModel(StreamingSTTModel):
         A direct transcription of :func:`build_script_mask`; the equality of the
         two is asserted in the tests.
         """
-        seg, pos, pref, val = batch.seg_ids, batch.position_ids, batch.prefix_len, batch.valid
+        # order_ids, NOT position_ids: masking is structural.
+        seg, pos, pref, val = batch.seg_ids, batch.order_ids, batch.prefix_len, batch.valid
 
         def mask_mod(b, h, q, kv):
             qs, ks = seg[b, q], seg[b, kv]
@@ -374,7 +376,7 @@ class ScriptSTTModel(StreamingSTTModel):
             return "flex_attention", block_mask
         if self._attn_backend == "script":
             return "script", None
-        return "eager", build_script_mask(batch.seg_ids, batch.position_ids, batch.prefix_len, batch.valid, dtype)
+        return "eager", build_script_mask(batch.seg_ids, batch.order_ids, batch.prefix_len, batch.valid, dtype)
 
     # ------------------------------------------------------------------
     # 2-D layout: spine forwarded once, branches on a batch axis
@@ -834,6 +836,7 @@ class ScriptSTTModel(StreamingSTTModel):
             read_id=self._read_id,
             write_id=self._write_id,
             gate_in_history=self._gate_in_history,
+            position_scheme=self.core_cfg.position_scheme,
             pad_id=self.text_pad_id,
             max_new_tokens=max_new_tokens,
             device=self.device,

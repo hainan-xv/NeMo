@@ -87,7 +87,7 @@ def to_device(b_, device):
 
 
 def make_mask_mod(b_):
-    seg, pos, pref, val = b_.seg_ids, b_.position_ids, b_.prefix_len, b_.valid
+    seg, pos, pref, val = b_.seg_ids, b_.order_ids, b_.prefix_len, b_.valid
 
     def mask_mod(b, h, q, kv):
         qs, ks = seg[b, q], seg[b, kv]
@@ -137,7 +137,7 @@ def build_mask(kind, b_, dtype, device):
     if kind == "script":
         return None  # the structured backend reads its plan from the context
     if kind == "dense":
-        return build_script_mask(b_.seg_ids, b_.position_ids, b_.prefix_len, b_.valid, dtype)
+        return build_script_mask(b_.seg_ids, b_.order_ids, b_.prefix_len, b_.valid, dtype)
     from torch.nn.attention.flex_attention import create_block_mask
 
     B, T = b_.seg_ids.shape

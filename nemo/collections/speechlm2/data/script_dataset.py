@@ -100,6 +100,7 @@ class ScriptSTTDataConfig(StreamingSTTDataConfig):
     read_token: str = "<|box_start|>"
     write_token: str = "<|box_end|>"
     gate_in_history: bool = False
+    position_scheme: str = "branch"
     prompt_control: bool = False
     delay_candidates: Optional[List[int]] = None
     capitalization_prob: float = 0.5
@@ -115,6 +116,9 @@ class ScriptBatch:
         audios / audio_lens: raw waveforms ``(B, T_samples)`` and sample counts ``(B,)``.
         input_tokens: (B, T) token ids; audio-frame slots hold ``AUDIO_TOKEN_IDX``.
         position_ids: (B, T) RoPE positions (spine index, or branch prefix+offset).
+        order_ids: (B, T) structural indices used for masking only -- deliberately
+            independent of position_ids, so a position scheme cannot change who
+            attends to whom.
         seg_ids: (B, T) ``0`` spine, ``>= 1`` branch id, ``-1`` padding.
         prefix_len: (B, T) per-branch-token history-prefix length.
         target_tokens: (B, T) next-token targets; ``IGNORE_INDEX`` except branch words.
@@ -132,6 +136,7 @@ class ScriptBatch:
     audio_lens: Optional[torch.Tensor] = None
     input_tokens: Optional[torch.Tensor] = None
     position_ids: Optional[torch.Tensor] = None
+    order_ids: Optional[torch.Tensor] = None
     seg_ids: Optional[torch.Tensor] = None
     prefix_len: Optional[torch.Tensor] = None
     target_tokens: Optional[torch.Tensor] = None
@@ -398,6 +403,7 @@ class ScriptSTTDataset(StreamingSTTDataset):
                     audio_history_chunks=self._audio_history_chunks,
                     audio_window_frames=self._audio_window_frames,
                     gate_in_history=self._gate_in_history,
+                    position_scheme=self.cfg.position_scheme,
                 )
             )
 
