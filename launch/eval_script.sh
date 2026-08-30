@@ -93,12 +93,21 @@ EVAL_TAG="${EVAL_TAG:-${EXP_NAME}}"
 STATE_MACHINE="${STATE_MACHINE:-}"       # 1 = per-stream state machine decode
 STREAMING_ENCODE="${STREAMING_ENCODE:-}" # 1 = cache-aware streaming perception
 
+# Declared here, not just documented, because oci_launch.sh only forwards a var
+# it can SEE as ${NAME:-...} in this file. Left empty so eval_leaderboard.sh keeps
+# its own defaults; a comment-only mention would be dropped silently, and for a
+# full-context model that means generation truncated at 64 tokens with nothing
+# in the log to say so.
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-}"
+BATCH_SIZE="${BATCH_SIZE:-}"
+
 NUM_DELAY_FRAMES="${NUM_DELAY_FRAMES:-}"
 CAPITALIZATION="${CAPITALIZATION:-}"
 PUNCTUATION="${PUNCTUATION:-}"
 
 export EXP_NAME PROJECT MODEL_CLASS SYSTEM_PROMPT CHUNK_SIZE EVAL_TAG OUTPUT_PREFIX
 export NUM_DELAY_FRAMES CAPITALIZATION PUNCTUATION STATE_MACHINE STREAMING_ENCODE
+export MAX_NEW_TOKENS BATCH_SIZE
 
 CKPT_DIR="${OUTPUT_PREFIX}/results/${PROJECT}/${EXP_NAME}/${EXP_NAME}/checkpoints"
 echo "==> SCRIPT leaderboard eval"

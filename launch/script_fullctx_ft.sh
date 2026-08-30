@@ -25,8 +25,12 @@
 # acoustic context -- which is the number this run exists to produce.
 #
 # NOTE when evaluating: raise the per-turn cap, e.g.
-#     MAX_NEW_TOKENS=256 ./oci_launch.sh launch/eval_script.sh granary2_script_fullctx_ft 14
+#     ./oci_launch.sh MAX_NEW_TOKENS=256 launch/eval_script.sh granary2_script_fullctx_ft 14
 # The default 64 is sized for one chunk and would truncate the longest ~1%.
+#
+# The assignment must come AFTER oci_launch.sh, not before it: the inherited-env
+# forwarder denylists any name matching *TOKEN*, so an exported MAX_NEW_TOKENS is
+# dropped as if it were a credential and the eval silently runs at 64.
 #
 # WARM START (this is the only difference from launch/script_flex.sh).
 # Initializes from granary2_script_baseline's latest checkpoint instead of
