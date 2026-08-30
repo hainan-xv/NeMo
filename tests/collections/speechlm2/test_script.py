@@ -1359,6 +1359,7 @@ def test_training_attention_selects_backend(backend, expect_impl, expect_mask):
 
     fake = ScriptSTTModel.__new__(ScriptSTTModel)
     fake._attn_backend = backend
+    fake._bidirectional_audio = False
     impl, mask = ScriptSTTModel._training_attention(fake, batch, torch.float32)
     assert impl == expect_impl
     assert (mask is not None) == expect_mask
@@ -2275,3 +2276,431 @@ def test_full_context_matches_the_standalone_offline_example():
     assert len(sep) == 1
     branch = packed.input_ids[packed.seg_ids == 1].tolist()
     assert branch == sep[0].input_ids[sep[0].branch_start :].tolist()
+
+
+# ======================================================================
+# Bidirectional audio within a branch
+# ======================================================================
+
+
+def _bidir_batch():
+    ex = build_packed_chunk_example(INSTR, [ChunkSpec(3, [20, 21]), ChunkSpec(3, [30])], VS, VE, EOT)
+    return ex, collate_packed_chunk_examples([ex], pad_id=0)
+
+
+def test_bidirectional_audio_opens_exactly_the_audio_block():
+    """The new rule adds audio->later-audio pairs and NOTHING else."""
+    ex, batch = _bidir_batch()
+    args = (batch.seg_ids, batch.order_ids, batch.prefix_len, batch.valid, torch.float32)
+    causal = build_script_mask(*args) == 0
+    bidir = build_script_mask(*args, is_audio=batch.is_audio) == 0
+
+    # Strictly more permissive.
+    assert (bidir | causal).equal(bidir), "bidirectional rule must not REMOVE any pair"
+    added = bidir & ~causal
+    assert added.any(), "expected the audio block to gain pairs"
+
+    seg, aud = batch.seg_ids[0], batch.is_audio[0]
+    qs, ks = torch.where(added[0, 0])
+    # Every added pair: same branch, both ends audio, and strictly anti-causal.
+    assert bool((seg[qs] == seg[ks]).all()) and bool((seg[qs] != SPINE_SEG_ID).all())
+    assert bool(aud[qs].all()) and bool(aud[ks].all())
+    assert bool((ks > qs).all()), "added pairs must be exactly the backward-looking ones"
+
+
+def test_bidirectional_audio_still_blocks_cross_branch_and_spine():
+    """The isolation guarantees survive: no branch sees another branch's audio."""
+    ex, batch = _bidir_batch()
+    m = (
+        build_script_mask(
+            batch.seg_ids, batch.order_ids, batch.prefix_len, batch.valid, torch.float32, is_audio=batch.is_audio
+        )[0, 0]
+        == 0
+    )
+    seg, aud = batch.seg_ids[0], batch.is_audio[0]
+    T = seg.shape[0]
+    for q in range(T):
+        for k in range(T):
+            if not m[q, k]:
+                continue
+            if seg[q] != SPINE_SEG_ID and seg[k] != SPINE_SEG_ID:
+                assert seg[q] == seg[k], f"branch {int(seg[q])} attends branch {int(seg[k])}"
+            if seg[q] == SPINE_SEG_ID:
+                assert seg[k] == SPINE_SEG_ID and not aud[k], "spine must stay pure text"
+
+
+def test_bidirectional_audio_text_stays_causal():
+    """Only the audio goes bidirectional; predicted words keep the causal rule."""
+    ex, batch = _bidir_batch()
+    m = (
+        build_script_mask(
+            batch.seg_ids, batch.order_ids, batch.prefix_len, batch.valid, torch.float32, is_audio=batch.is_audio
+        )[0, 0]
+        == 0
+    )
+    seg, aud, order = batch.seg_ids[0], batch.is_audio[0], batch.order_ids[0]
+    for q in range(seg.shape[0]):
+        if seg[q] == SPINE_SEG_ID or aud[q]:
+            continue
+        for k in range(seg.shape[0]):
+            if m[q, k] and seg[k] == seg[q]:
+                assert order[k] <= order[q], "a branch TEXT token attended a later token"
+
+
+def test_bidirectional_audio_every_frame_sees_the_text_history():
+    """Each audio frame attends the full instruction + words-so-far prefix."""
+    ex, batch = _bidir_batch()
+    m = (
+        build_script_mask(
+            batch.seg_ids, batch.order_ids, batch.prefix_len, batch.valid, torch.float32, is_audio=batch.is_audio
+        )[0, 0]
+        == 0
+    )
+    seg, aud, pref = batch.seg_ids[0], batch.is_audio[0], batch.prefix_len[0]
+    P = int(ex.spine_len)
+    for q in range(seg.shape[0]):
+        if not aud[q]:
+            continue
+        want = torch.zeros(seg.shape[0], dtype=torch.bool)
+        want[: int(pref[q])] = True
+        assert bool((m[q, :P] == want[:P]).all()), f"audio frame {q} does not see exactly its history"
+
+
+def test_bidirectional_audio_flex_predicate_matches_dense():
+    """flex and dense must implement the same rule (as for the causal one)."""
+    from nemo.collections.speechlm2.models.script_model import ScriptSTTModel
+
+    ex, batch = _bidir_batch()
+    dense = build_script_mask(
+        batch.seg_ids, batch.order_ids, batch.prefix_len, batch.valid, torch.float32, is_audio=batch.is_audio
+    )[:, 0]
+    mod = ScriptSTTModel._script_mask_mod(batch, bidirectional_audio=True)
+    B, T = batch.seg_ids.shape
+    bi = torch.arange(B)[:, None, None].expand(B, T, T)
+    qi = torch.arange(T)[None, :, None].expand(B, T, T)
+    ki = torch.arange(T)[None, None, :].expand(B, T, T)
+    assert torch.equal(mod(bi, None, qi, ki), dense == 0)
+
+
+def test_bidirectional_audio_twod_mask_matches_flat():
+    """The 2-D branch mask must encode the same rule as the flat one."""
+    from nemo.collections.speechlm2.parts.script import build_twod_branch_mask
+
+    ex, batch = _bidir_batch()
+    flat = (
+        build_script_mask(
+            batch.seg_ids, batch.order_ids, batch.prefix_len, batch.valid, torch.float32, is_audio=batch.is_audio
+        )[0, 0]
+        == 0
+    )
+    P = int(ex.spine_len)
+    rows = [(batch.seg_ids[0] == k + 1).nonzero(as_tuple=True)[0] for k in range(int(batch.seg_ids[0].max()))]
+    b = max(int(r.numel()) for r in rows)
+    N = len(rows)
+    bprefix = torch.zeros(N, dtype=torch.long)
+    bvalid = torch.zeros(N, b, dtype=torch.bool)
+    baud = torch.zeros(N, b, dtype=torch.bool)
+    for k, r in enumerate(rows):
+        m_ = int(r.numel())
+        bprefix[k] = batch.prefix_len[0, r[0]]
+        bvalid[k, :m_] = True
+        baud[k, :m_] = batch.is_audio[0, r]
+    two = build_twod_branch_mask(bprefix, bvalid, P, torch.float32, branch_is_audio=baud)[:, 0] == 0
+    for k, r in enumerate(rows):
+        m_ = int(r.numel())
+        assert torch.equal(two[k, :m_, :P], flat[r][:, :P]), f"branch {k}: spine part differs"
+        assert torch.equal(two[k, :m_, P : P + m_], flat[r][:, r]), f"branch {k}: own part differs"
+
+
+def test_bidirectional_audio_structured_backend_matches_dense():
+    """The structured `script` kernel must reproduce the dense-masked attention."""
+    from nemo.collections.speechlm2.parts.script_attention import (
+        build_attention_plan,
+        script_attention_plan,
+        script_structured_attention,
+    )
+
+    torch.manual_seed(0)
+    ex, batch = _bidir_batch()
+    plan = build_attention_plan([ex], bidirectional_audio=True)
+    B, T, h, d = 1, batch.seg_ids.shape[1], 2, 8
+    q, k, v = (torch.randn(B, h, T, d) for _ in range(3))
+
+    mask = build_script_mask(
+        batch.seg_ids, batch.order_ids, batch.prefix_len, batch.valid, torch.float32, is_audio=batch.is_audio
+    )
+    ref = torch.softmax(torch.einsum("bhid,bhjd->bhij", q, k) * d**-0.5 + mask, dim=-1) @ v
+
+    class _M:
+        training = False
+
+    with script_attention_plan(plan):
+        got, _ = script_structured_attention(_M(), q, k, v, None, scaling=d**-0.5)
+    got = got.transpose(1, 2)
+    valid = batch.valid[0]
+    assert torch.allclose(got[:, :, valid], ref[:, :, valid], atol=1e-5), "structured != dense"
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("audio_window_frames", [0, 4])
+def test_parity_bidirectional_audio_packed_vs_separate(audio_window_frames):
+    """The correctness argument must survive the new rule.
+
+    Packed branch logits still have to equal the standalone example's, now with
+    both sides using the bidirectional-audio mask. This is what keeps a branch
+    exactly a prefix-LM run over its own history + audio.
+    """
+    model = _tiny_qwen3()
+    H = model.config.hidden_size
+
+    instruction = [5, 6, 7]
+    chunks = [
+        ChunkSpec(audio_len=2, target_ids=[20, 21]),
+        ChunkSpec(audio_len=3, target_ids=[30]),
+        ChunkSpec(audio_len=1, target_ids=[]),
+        ChunkSpec(audio_len=2, target_ids=[40, 41]),
+    ]
+    torch.manual_seed(321)
+    all_frames = torch.randn(sum(c.audio_len for c in chunks), H)
+
+    packed = build_packed_chunk_example(instruction, chunks, VS, VE, EOT, audio_window_frames=audio_window_frames)
+    valid = torch.ones_like(packed.input_ids, dtype=torch.bool)
+    mask = build_script_mask(
+        packed.seg_ids[None],
+        packed.order_ids[None],
+        packed.prefix_len[None],
+        valid[None],
+        torch.float32,
+        is_audio=packed.is_audio[None],
+    )
+    packed_emb = _embed_with_audio(
+        model,
+        packed.input_ids,
+        packed.is_audio,
+        _frames_by_index(all_frames, packed.audio_frame_index, packed.is_audio),
+    )
+    packed_logits = model(
+        inputs_embeds=packed_emb[None], attention_mask=mask, position_ids=packed.position_ids[None]
+    ).logits[0]
+
+    separate = build_separate_chunk_examples(instruction, chunks, VS, VE, EOT, audio_window_frames=audio_window_frames)
+    for k, sep in enumerate(separate, start=1):
+        sep_emb = _embed_with_audio(
+            model, sep.input_ids, sep.is_audio, _frames_by_index(all_frames, sep.audio_frame_index, sep.is_audio)
+        )
+        # The standalone run needs the SAME rule: causal, plus its own audio run
+        # attending itself both ways. Without this it would be plain causal and
+        # the comparison would be meaningless.
+        L = int(sep.input_ids.shape[0])
+        aud = sep.is_audio
+        allow = torch.ones(L, L, dtype=torch.bool).tril() | (aud[:, None] & aud[None, :])
+        sep_mask = torch.zeros(1, 1, L, L).masked_fill(~allow, torch.finfo(torch.float32).min)
+        sep_logits = model(
+            inputs_embeds=sep_emb[None], attention_mask=sep_mask, position_ids=sep.position_ids[None]
+        ).logits[0]
+
+        packed_branch = packed_logits[(packed.seg_ids == k).nonzero(as_tuple=True)[0]]
+        sep_branch = sep_logits[sep.branch_start :]
+        assert packed_branch.shape == sep_branch.shape
+        torch.testing.assert_close(packed_branch, sep_branch, atol=1e-4, rtol=1e-4)
+
+
+@torch.no_grad()
+def test_bidirectional_audio_actually_changes_the_logits():
+    """Guard against the flag being silently inert."""
+    model = _tiny_qwen3()
+    H = model.config.hidden_size
+    chunks = [ChunkSpec(audio_len=4, target_ids=[20, 21]), ChunkSpec(audio_len=4, target_ids=[30])]
+    torch.manual_seed(11)
+    frames = torch.randn(sum(c.audio_len for c in chunks), H)
+
+    ex = build_packed_chunk_example(INSTR, chunks, VS, VE, EOT)
+    emb = _embed_with_audio(
+        model, ex.input_ids, ex.is_audio, _frames_by_index(frames, ex.audio_frame_index, ex.is_audio)
+    )
+    valid = torch.ones_like(ex.input_ids, dtype=torch.bool)
+    args = (ex.seg_ids[None], ex.order_ids[None], ex.prefix_len[None], valid[None], torch.float32)
+
+    def run(mask):
+        return model(inputs_embeds=emb[None], attention_mask=mask, position_ids=ex.position_ids[None]).logits[0]
+
+    causal = run(build_script_mask(*args))
+    bidir = run(build_script_mask(*args, is_audio=ex.is_audio[None]))
+    assert not torch.allclose(causal, bidir, atol=1e-6), "bidirectional_audio had no effect"
+
+    # ...but only through the audio: the SPINE is pure text and must be untouched.
+    spine = (ex.seg_ids == SPINE_SEG_ID).nonzero(as_tuple=True)[0]
+    torch.testing.assert_close(causal[spine], bidir[spine], atol=1e-6, rtol=1e-6)
+
+
+@torch.no_grad()
+def test_bidirectional_audio_decode_matches_teacher_forced_layout():
+    """Decode must condition exactly as training does under the new rule.
+
+    The decode path cannot rely on HF's implicit causal mask any more -- it has
+    to hand the prefill an explicit 4-D one. This decodes greedily with
+    bidirectional audio, feeds the result back as training targets under the
+    bidirectional PACKED mask, and checks the teacher-forced argmax reproduces
+    it. A mismatch here is the train/decode skew that would otherwise only show
+    up as an unexplained WER gap.
+    """
+    model = _tiny_qwen3()
+    H = model.config.hidden_size
+    torch.manual_seed(5)
+
+    cs = 3
+    instruction = [5, 6]
+    frames = torch.randn(9, H)  # exactly 3 chunks
+
+    emitted, chunk_ids = batched_stream_decode_script(
+        llm=model,
+        embed_tokens=model.get_input_embeddings(),
+        instruction_ids_list=[instruction],
+        frames_list=[frames],
+        chunk_size=cs,
+        vision_start_id=VS,
+        vision_end_id=VE,
+        eot_id=EOT,
+        pad_id=0,
+        max_new_tokens=4,
+        return_chunk_ids=True,
+        bidirectional_audio=True,
+    )
+    emitted, chunk_ids = emitted[0], chunk_ids[0]
+
+    per_chunk = [[] for _ in range(3)]
+    for tok, k in zip(emitted, chunk_ids):
+        per_chunk[k].append(tok)
+    chunks = [ChunkSpec(audio_len=cs, target_ids=toks) for toks in per_chunk]
+
+    packed = build_packed_chunk_example(instruction, chunks, VS, VE, EOT, supervise_eot=False)
+    emb = _embed_with_audio(
+        model, packed.input_ids, packed.is_audio, frames[packed.audio_frame_index[packed.is_audio]]
+    )
+    valid = torch.ones_like(packed.input_ids, dtype=torch.bool)
+    mask = build_script_mask(
+        packed.seg_ids[None],
+        packed.order_ids[None],
+        packed.prefix_len[None],
+        valid[None],
+        torch.float32,
+        is_audio=packed.is_audio[None],
+    )
+    logits = model(inputs_embeds=emb[None], attention_mask=mask, position_ids=packed.position_ids[None]).logits[0]
+
+    sup = (packed.target_ids != IGNORE_INDEX).nonzero(as_tuple=True)[0]
+    assert sup.numel() > 0
+    torch.testing.assert_close(logits[sup].argmax(dim=-1), packed.target_ids[sup])
+
+
+@torch.no_grad()
+def test_bidirectional_audio_decode_passes_the_right_prefill_mask():
+    """The decode flag must reach the LLM, and open exactly the audio block.
+
+    Asserted on the mask handed to the model rather than on the decoded tokens:
+    the rule shifts logits by ~1e-3 on a tiny random model, which almost never
+    flips a greedy argmax, so a token-level check would pass whether or not the
+    flag did anything.
+    """
+    model = _tiny_qwen3()
+    H = model.config.hidden_size
+    torch.manual_seed(9)
+    frames = torch.randn(12, H)
+
+    class _Spy:
+        """Records the attention_mask of each PREFILL call (the multi-token ones)."""
+
+        def __init__(self, inner):
+            self.inner, self.prefills = inner, []
+            self.config, self.device = inner.config, next(inner.parameters()).device
+
+        def __call__(self, **kw):
+            if kw["inputs_embeds"].shape[1] > 1:
+                self.prefills.append(kw["attention_mask"])
+            return self.inner(**kw)
+
+        def get_input_embeddings(self):
+            return self.inner.get_input_embeddings()
+
+    def run(flag):
+        spy = _Spy(model)
+        batched_stream_decode_script(
+            llm=spy,
+            embed_tokens=model.get_input_embeddings(),
+            instruction_ids_list=[[5, 6]],
+            frames_list=[frames],
+            chunk_size=4,
+            vision_start_id=VS,
+            vision_end_id=VE,
+            eot_id=EOT,
+            pad_id=0,
+            max_new_tokens=4,
+            bidirectional_audio=flag,
+        )
+        return spy.prefills
+
+    causal_masks = run(False)
+    bidir_masks = run(True)
+    assert causal_masks and bidir_masks
+    # Without the flag the decoder keeps the cheap 2-D validity mask.
+    assert all(m.dim() == 2 for m in causal_masks)
+
+    for m in bidir_masks:
+        assert m.dim() == 4, "prefill must get an explicit 4-D mask under bidirectional audio"
+        allow = m[0, 0] == 0
+        L = allow.shape[0]
+        tri = torch.ones(L, L, dtype=torch.bool).tril()
+        added = allow & ~tri
+        assert added.any(), "no backward audio pairs were opened"
+        # Every extra pair is strictly anti-causal and both ends lie in one
+        # contiguous run -- the chunk's audio block.
+        q, k = torch.where(added)
+        assert bool((k > q).all())
+        span = torch.cat([q, k]).unique()
+        assert bool((span.max() - span.min() + 1) == span.numel()), "opened pairs are not one block"
+
+
+def test_bidirectional_audio_rejects_state_machine_decode():
+    """The FSM cannot honour the rule, so it must refuse rather than mis-decode."""
+    from nemo.collections.speechlm2.models.script_model import ScriptSTTModel
+
+    fake = ScriptSTTModel.__new__(ScriptSTTModel)
+    fake._bidirectional_audio = True
+    with pytest.raises(ValueError, match="incompatible with bidirectional_audio"):
+        ScriptSTTModel._reject_fsm_with_bidirectional_audio(fake, state_machine=True)
+    # ...and stays silent when either half is off.
+    ScriptSTTModel._reject_fsm_with_bidirectional_audio(fake, state_machine=False)
+    fake._bidirectional_audio = False
+    ScriptSTTModel._reject_fsm_with_bidirectional_audio(fake, state_machine=True)
+
+
+@torch.no_grad()
+def test_bidirectional_audio_flex_attention_matches_dense_numerically():
+    """End-to-end flex numerics, not just predicate equality.
+
+    The predicate test compares booleans; this one compiles the block mask and
+    runs flex_attention against dense-masked attention. The previous flex bug in
+    this file (a None tensor inside the vmap) was invisible to a predicate-level
+    check because the tests never built a real BlockMask.
+    """
+    from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+
+    from nemo.collections.speechlm2.models.script_model import ScriptSTTModel
+
+    ex = build_packed_chunk_example(INSTR, [ChunkSpec(4, [20, 21]), ChunkSpec(4, [30])], VS, VE, EOT)
+    batch = collate_packed_chunk_examples([ex], pad_id=0)
+    B, T = batch.seg_ids.shape
+    h, d = 2, 8
+    torch.manual_seed(0)
+    q, k, v = (torch.randn(B, h, T, d) for _ in range(3))
+
+    bm = create_block_mask(ScriptSTTModel._script_mask_mod(batch, True), B=B, H=None, Q_LEN=T, KV_LEN=T, device="cpu")
+    got = flex_attention(q, k, v, block_mask=bm, scale=d**-0.5)
+
+    mask = build_script_mask(
+        batch.seg_ids, batch.order_ids, batch.prefix_len, batch.valid, torch.float32, is_audio=batch.is_audio
+    )
+    ref = torch.softmax(torch.einsum("bhid,bhjd->bhij", q, k) * d**-0.5 + mask, dim=-1) @ v
+
+    valid = batch.valid[0]
+    torch.testing.assert_close(got[:, :, valid], ref[:, :, valid], atol=1e-5, rtol=1e-5)

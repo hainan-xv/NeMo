@@ -380,6 +380,7 @@ def build_script_mask(
     prefix_len: Tensor,
     valid: Tensor,
     dtype: torch.dtype,
+    is_audio: Optional[Tensor] = None,
 ) -> Tensor:
     """Build the 4D additive attention mask for a packed SCRIPT batch.
 
@@ -390,13 +391,31 @@ def build_script_mask(
       so spine tokens see only other spine tokens and stay pure text.
     * **branch query, spine key** — ``j`` lies in the branch's history prefix
       (``pos[j] < prefix_len[q]``). Spine positions equal their index, so this is
-      exactly ``instruction + w_1..w_{k-1}``.
+      exactly ``instruction + w_1..w_{k-1}``. This already covers the branch's
+      AUDIO tokens, so every frame sees the full text history regardless of
+      ``is_audio``.
     * **branch query, same-branch key** — causal within the branch
       (``pos[j] <= pos[q]``), covering its own audio and its earlier words.
+    * **branch audio, same-branch audio** — only when ``is_audio`` is given: the
+      branch's audio block attends ITSELF BOTH WAYS, so an early frame sees a
+      later one. See below.
 
     Everything else is blocked: a branch never sees another branch, another
     chunk's audio, or spine words at or after its own; the spine never sees any
     branch or any audio.
+
+    BIDIRECTIONAL AUDIO (``is_audio`` given). The branch's audio occupies one
+    contiguous run, and every frame of it has already arrived when the branch
+    starts -- the model waits for the chunk boundary either way -- so letting the
+    block attend itself both ways leaks nothing about the future and costs no
+    extra FLOPs (the block is materialised and then masked regardless). It makes
+    the LLM-side rule agree with the ENCODER, which is already bidirectional
+    within a chunk under ``chunked_limited``. Text after the audio stays causal,
+    which makes each branch an ordinary prefix-LM block.
+
+    Note this changes only the audio positions' own hidden states: the word
+    tokens sit after the audio and already attend all of it under the causal
+    rule. What they gain is more deeply contextualised keys/values to read.
 
     Args:
         seg_ids: (B, T) ``0`` = spine, ``>= 1`` = branch id, ``-1`` = padding.
@@ -405,6 +424,9 @@ def build_script_mask(
         prefix_len: (B, T) per-branch-token history-prefix length (0 for spine).
         valid: (B, T) bool, False at padding.
         dtype: floating dtype for the additive mask.
+        is_audio: (B, T) True at audio-frame slots. Pass it to make the audio
+            bidirectional within its branch; pass ``None`` (the default) for the
+            strictly causal rule.
 
     Returns:
         (B, 1, T, T) additive mask: ``0`` where allowed, ``finfo(dtype).min``
@@ -425,6 +447,9 @@ def build_script_mask(
     spine_to_spine = q_is_spine & k_is_spine & causal
     branch_to_prefix = (~q_is_spine) & k_is_spine & (k_pos < q_prefix)
     branch_to_own = same_branch & causal
+    if is_audio is not None:
+        # Same branch, both ends audio -> allowed in either direction.
+        branch_to_own = branch_to_own | (same_branch & is_audio[:, :, None] & is_audio[:, None, :])
 
     allowed = (spine_to_spine | branch_to_prefix | branch_to_own) & k_valid  # (B, T, T)
 
@@ -623,6 +648,7 @@ def build_twod_branch_mask(
     branch_valid: Tensor,
     spine_len: int,
     dtype: torch.dtype,
+    branch_is_audio: Optional[Tensor] = None,
 ) -> Tensor:
     """4D additive mask for the branch pass, over ``[spine cache | own tokens]``.
 
@@ -630,7 +656,11 @@ def build_twod_branch_mask(
 
     * spine key ``i`` iff ``i < branch_prefix[k]`` -- spine positions equal their
       index, so this selects exactly ``instruction + w_1..w_{k-1}``;
-    * own key ``jj`` iff ``jj <= j`` and ``jj`` is not padding.
+    * own key ``jj`` iff ``jj <= j`` and ``jj`` is not padding;
+    * own key ``jj`` iff both ``j`` and ``jj`` are audio, when ``branch_is_audio``
+      is given -- the 2-D counterpart of the bidirectional-audio rule in
+      :func:`build_script_mask`, and it must be passed here whenever it is passed
+      there or the two layouts stop being equivalent.
 
     Args:
         branch_prefix: (N,) history-prefix length per branch.
@@ -640,6 +670,7 @@ def build_twod_branch_mask(
             padded columns are excluded regardless, because
             ``branch_prefix`` never exceeds the real spine length.
         dtype: floating dtype for the additive mask.
+        branch_is_audio: (N, b) True at audio slots, or ``None`` for causal-only.
 
     Returns:
         (N, 1, b, P + b), ``0`` where allowed and ``finfo(dtype).min`` where not.
@@ -655,6 +686,8 @@ def build_twod_branch_mask(
     q = torch.arange(b, device=device)[:, None]
     kv = torch.arange(b, device=device)[None, :]
     causal = (kv <= q)[None, :, :].expand(N, b, b)  # (N, b, b)
+    if branch_is_audio is not None:
+        causal = causal | (branch_is_audio[:, :, None] & branch_is_audio[:, None, :])
     to_own = causal & branch_valid[:, None, :]
 
     allowed = torch.cat([to_spine, to_own], dim=-1)  # (N, b, P + b)
@@ -907,6 +940,7 @@ def batched_stream_decode_script(
     read_id: Optional[int] = None,
     write_id: Optional[int] = None,
     gate_in_history: bool = False,
+    bidirectional_audio: bool = False,
     position_scheme: str = BRANCH_SCHEME,
 ):
     """Batched greedy SCRIPT decode for ``B`` utterances at once.
@@ -1036,6 +1070,21 @@ def batched_stream_decode_script(
         embeds = torch.where(audio_mask.unsqueeze(-1), audio_at, text_embeds)
 
         valid = input_tokens != pad_id  # (na, L)
+
+        # Prefill mask. Normally a 2-D validity mask is enough and HF derives the
+        # causal rule itself; with bidirectional audio we must hand it an explicit
+        # 4-D mask, because the rule is no longer causal. Every frame of this
+        # chunk is already in this one prefill call, so the block can attend
+        # itself both ways in a single pass -- the KV entries are then frozen and
+        # the generated words read them causally, exactly as before.
+        if bidirectional_audio:
+            neg = torch.finfo(dtype).min
+            tri = torch.ones(L, L, dtype=torch.bool, device=device).tril()[None]  # (1, L, L)
+            allow = (tri | (audio_mask[:, :, None] & audio_mask[:, None, :])) & valid[:, None, :]
+            prefill_mask = torch.zeros(na, 1, L, L, dtype=dtype, device=device).masked_fill(~allow[:, None], neg)
+        else:
+            prefill_mask = valid.long()
+
         position_ids = (valid.long().cumsum(dim=1) - 1).clamp(min=0)
         if position_scheme == CONTINUOUS_SCHEME:
             # Text stays one continuous run: the words this chunk emits carry on
@@ -1054,7 +1103,7 @@ def batched_stream_decode_script(
 
         out = llm(
             inputs_embeds=embeds,
-            attention_mask=valid.long(),
+            attention_mask=prefill_mask,
             position_ids=position_ids,
             use_cache=True,
             return_dict=True,

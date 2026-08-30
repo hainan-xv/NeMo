@@ -15,7 +15,7 @@
 
 from collections import defaultdict
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import List, Optional, Union
 
 import torch
@@ -78,6 +78,16 @@ class ScriptSTTModelConfig(StreamingSTTModelConfig):
             (default) processes every branch at once. The loss is unchanged:
             each group contributes a SUM and the batch-wide target count is the
             single denominator.
+        bidirectional_audio: let each branch's audio block attend ITSELF both ways,
+            so an early frame in a chunk sees a later one. Streaming-legal: the
+            whole block has already arrived when the branch starts, and the model
+            waits for the chunk boundary either way. It costs no extra FLOPs (the
+            block is computed and then masked regardless) and makes the LLM-side
+            rule agree with the encoder, which is already bidirectional within a
+            chunk under `chunked_limited`. Text after the audio stays causal.
+            NOTE: the LLM was pretrained strictly causally and has never seen a
+            negative relative RoPE offset, so warm-starting into this rule is a
+            genuine distribution shift the fine-tune has to absorb.
         attn_backend: how the SCRIPT mask is applied during TRAINING.
             ``"dense"`` builds the full ``(B, 1, T, T)`` additive mask -- correct
             but it materialises a score tensor that is ~98% masked out, and at
@@ -152,6 +162,7 @@ class ScriptSTTModelConfig(StreamingSTTModelConfig):
     twod_branch_micro_batch: int = 0
     attn_backend: str = "dense"
     activation_checkpointing: bool = False
+    bidirectional_audio: bool = False
     prompt_control: bool = False
     read_write: bool = False
     read_token: str = "<|box_start|>"
@@ -223,6 +234,7 @@ class ScriptSTTModel(StreamingSTTModel):
         self._audio_window_frames = max(int(self.core_cfg.audio_window_frames), 0)
         self._twod_layout = bool(self.core_cfg.twod_layout)
 
+        self._bidirectional_audio = bool(self.core_cfg.bidirectional_audio)
         self._attn_backend = str(self.core_cfg.attn_backend or "dense").lower()
         if self._attn_backend not in ("dense", "flex", "script"):
             raise ValueError(f"attn_backend must be dense|flex|script, got {self._attn_backend!r}")
@@ -373,7 +385,7 @@ class ScriptSTTModel(StreamingSTTModel):
                 llm.set_attn_implementation(prev)
 
     @staticmethod
-    def _script_mask_mod(batch: ScriptBatch):
+    def _script_mask_mod(batch: ScriptBatch, bidirectional_audio: bool = False):
         """The SCRIPT rule as a FlexAttention predicate.
 
         A direct transcription of :func:`build_script_mask`; the equality of the
@@ -387,33 +399,75 @@ class ScriptSTTModel(StreamingSTTModel):
                 "to RoPE geometry, which is exactly what position schemes are allowed to change."
             )
         seg, pos, pref, val = batch.seg_ids, batch.order_ids, batch.prefix_len, batch.valid
+        aud = batch.is_audio if bidirectional_audio else None
+        if bidirectional_audio and aud is None:
+            raise ValueError(
+                "bidirectional_audio is set but ScriptBatch.is_audio is None -- without it the "
+                "flex predicate would silently fall back to the causal rule while the dense path "
+                "used the bidirectional one, and the two backends would train different models."
+            )
 
         def mask_mod(b, h, q, kv):
             qs, ks = seg[b, q], seg[b, kv]
             qp, kp = pos[b, q], pos[b, kv]
             q_spine, k_spine = qs == 0, ks == 0
             causal = kp <= qp
-            return (
-                (q_spine & k_spine & causal)
-                | ((~q_spine) & k_spine & (kp < pref[b, q]))
-                | ((qs == ks) & (~q_spine) & causal)
-            ) & val[b, kv]
+            same_branch = (qs == ks) & (~q_spine)
+            own = same_branch & causal
+            if aud is not None:
+                own = own | (same_branch & aud[b, q] & aud[b, kv])
+            return ((q_spine & k_spine & causal) | ((~q_spine) & k_spine & (kp < pref[b, q])) | own) & val[b, kv]
 
         return mask_mod
 
+    def _reject_fsm_with_bidirectional_audio(self, state_machine: bool) -> None:
+        """The FSM decode path cannot implement bidirectional audio.
+
+        It ingests the window ONE FRAME AT A TIME behind a KV cache, so an early
+        frame can never see a later one whatever mask it is handed -- that is the
+        point of the state machine. Silently decoding a bidirectionally-trained
+        model that way is a train/decode mismatch that would surface only as an
+        unexplained WER gap, so refuse instead.
+        """
+        if state_machine and self._bidirectional_audio:
+            raise ValueError(
+                "use_state_machine_inference is incompatible with bidirectional_audio: the FSM "
+                "ingests the window one frame at a time behind a KV cache, so an early frame can "
+                "never see a later one no matter what mask it is given. Use the default decode "
+                "path, or train with bidirectional_audio=false."
+            )
+
     def _training_attention(self, batch: ScriptBatch, dtype):
         """(attn_implementation, attention_mask) for this batch's backend."""
+        if self._bidirectional_audio and batch.is_audio is None:
+            raise ValueError(
+                "bidirectional_audio is set but ScriptBatch.is_audio is None -- the mask would "
+                "silently fall back to the causal rule, so the model would train under a rule it "
+                "was not configured for and nothing would say so."
+            )
         if self._attn_backend == "flex":
             from torch.nn.attention.flex_attention import create_block_mask
 
             B, T = batch.seg_ids.shape
             block_mask = create_block_mask(
-                self._script_mask_mod(batch), B=B, H=None, Q_LEN=T, KV_LEN=T, device=batch.seg_ids.device
+                self._script_mask_mod(batch, self._bidirectional_audio),
+                B=B,
+                H=None,
+                Q_LEN=T,
+                KV_LEN=T,
+                device=batch.seg_ids.device,
             )
             return "flex_attention", block_mask
         if self._attn_backend == "script":
             return "script", None
-        return "eager", build_script_mask(batch.seg_ids, batch.order_ids, batch.prefix_len, batch.valid, dtype)
+        return "eager", build_script_mask(
+            batch.seg_ids,
+            batch.order_ids,
+            batch.prefix_len,
+            batch.valid,
+            dtype,
+            is_audio=batch.is_audio if self._bidirectional_audio else None,
+        )
 
     # ------------------------------------------------------------------
     # 2-D layout: spine forwarded once, branches on a batch axis
@@ -474,7 +528,15 @@ class ScriptSTTModel(StreamingSTTModel):
         embeds = self._twod_branch_embeds(two.branch_ids[i, lo:hi], two.branch_frame_index[i, lo:hi], audio_embs[i])
         out = self._llm_forward(
             inputs_embeds=embeds,
-            attention_mask=build_twod_branch_mask(two.branch_prefix[i, lo:hi], valid, int(two.spine_lens[i]), dtype),
+            attention_mask=build_twod_branch_mask(
+                two.branch_prefix[i, lo:hi],
+                valid,
+                int(two.spine_lens[i]),
+                dtype,
+                # Audio slots still hold the placeholder id at this point, so the
+                # branch grid identifies them without a separate field.
+                branch_is_audio=((two.branch_ids[i, lo:hi] == AUDIO_TOKEN_IDX) if self._bidirectional_audio else None),
+            ),
             position_ids=two.branch_positions[i, lo:hi],
             # Fresh shallow copy per micro-batch, so nothing downstream can mutate
             # the shared spine cache that later micro-batches still need.
@@ -558,6 +620,19 @@ class ScriptSTTModel(StreamingSTTModel):
         input_embeds = self._script_input_embeds(batch)
         impl, mask = self._training_attention(batch, input_embeds.dtype)
         plan = getattr(batch, "attn_plan", None)
+        if self._attn_backend == "script" and plan is None:
+            # The structured backend needs the plan to know the block layout; with
+            # none active it falls through to plain SDPA, which is BOTH causal and
+            # blind to the cross-branch rule the whole design rests on. Refuse
+            # rather than train a silently different model.
+            raise ValueError(
+                "attn_backend='script' but the batch carries no attn_plan, so the structured "
+                "kernel would fall back to unmasked SDPA -- branches would attend each other. "
+                "Use attn_backend='dense' or 'flex', or populate batch.attn_plan via "
+                "script_attention.build_attention_plan()."
+            )
+        if plan is not None and self._bidirectional_audio:
+            plan = replace(plan, bidirectional_audio=True)
         with self._attn_implementation(impl), _maybe_plan(plan if self._attn_backend == "script" else None):
             out = self._llm_forward(
                 inputs_embeds=input_embeds,
@@ -860,6 +935,7 @@ class ScriptSTTModel(StreamingSTTModel):
         # Same instruction/history separator the dataset uses when building the spine.
         instruction_ids_list = [self.tokenizer.text_to_ids(system_prompt[b] + "\n") for b in range(B)]
 
+        self._reject_fsm_with_bidirectional_audio(state_machine)
         decode_fn = fsm_stream_decode_script if state_machine else batched_stream_decode_script
         # full_context: keep the ENCODER at chunk size `cs` (already applied by
         # encode_frames) but hand the decoder a chunk large enough that every
@@ -889,6 +965,7 @@ class ScriptSTTModel(StreamingSTTModel):
             max_history_tokens=max_history_tokens,
             is_word_start=self._is_word_start if insert_word_start_id is not None else None,
             insert_word_start_id=insert_word_start_id,
+            **({"bidirectional_audio": True} if self._bidirectional_audio else {}),
         )
         # The history may legitimately contain gate tokens (gate_in_history);
         # they are conditioning, not transcript, so never let them reach the text.

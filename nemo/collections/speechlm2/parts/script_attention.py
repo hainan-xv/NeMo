@@ -68,6 +68,12 @@ class ScriptAttentionPlan:
         branch_pos: (B, N, b) flat index of each branch token.
         branch_valid: (B, N, b) False at ragged/padded branch slots.
         branch_prefix: (B, N) how many spine tokens each branch may attend.
+        branch_is_audio: (B, N, b) True at audio slots. Always populated; it is
+            only CONSULTED when ``bidirectional_audio`` is set, so one plan can
+            serve either rule.
+        bidirectional_audio: let each branch's audio block attend itself both
+            ways, matching :func:`~...parts.script.build_script_mask` when that
+            function is given ``is_audio``.
     """
 
     spine_pos: Tensor
@@ -75,6 +81,8 @@ class ScriptAttentionPlan:
     branch_pos: Tensor
     branch_valid: Tensor
     branch_prefix: Tensor
+    branch_is_audio: Optional[Tensor] = None
+    bidirectional_audio: bool = False
 
     def to(self, device) -> "ScriptAttentionPlan":
         return ScriptAttentionPlan(
@@ -83,10 +91,12 @@ class ScriptAttentionPlan:
             branch_pos=self.branch_pos.to(device),
             branch_valid=self.branch_valid.to(device),
             branch_prefix=self.branch_prefix.to(device),
+            branch_is_audio=None if self.branch_is_audio is None else self.branch_is_audio.to(device),
+            bidirectional_audio=self.bidirectional_audio,
         )
 
 
-def build_attention_plan(examples: List[PackedChunkExample]) -> ScriptAttentionPlan:
+def build_attention_plan(examples: List[PackedChunkExample], bidirectional_audio: bool = False) -> ScriptAttentionPlan:
     """Derive the plan from the same examples the flat collate consumes."""
     B = len(examples)
     spine_lens = [int(e.spine_len) for e in examples]
@@ -105,6 +115,7 @@ def build_attention_plan(examples: List[PackedChunkExample]) -> ScriptAttentionP
     branch_pos = torch.zeros(B, N, b, dtype=torch.long)
     branch_valid = torch.zeros(B, N, b, dtype=torch.bool)
     branch_prefix = torch.zeros(B, N, dtype=torch.long)
+    branch_is_audio = torch.zeros(B, N, b, dtype=torch.bool)
 
     for i, (e, rows) in enumerate(zip(examples, rows_per_example)):
         p = spine_lens[i]
@@ -115,8 +126,17 @@ def build_attention_plan(examples: List[PackedChunkExample]) -> ScriptAttentionP
             branch_pos[i, k, :m] = r
             branch_valid[i, k, :m] = True
             branch_prefix[i, k] = int(e.prefix_len[r[0]])
+            branch_is_audio[i, k, :m] = e.is_audio[r]
 
-    return ScriptAttentionPlan(spine_pos, spine_valid, branch_pos, branch_valid, branch_prefix)
+    return ScriptAttentionPlan(
+        spine_pos,
+        spine_valid,
+        branch_pos,
+        branch_valid,
+        branch_prefix,
+        branch_is_audio=branch_is_audio,
+        bidirectional_audio=bidirectional_audio,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +232,12 @@ def script_structured_attention(
     s_own = torch.einsum("bhnid,bhnjd->bhnij", q_br, k_br) * scale
     j = torch.arange(b, device=query.device)
     causal = (j[None, :] <= j[:, None])[None, None, None]
+    if plan.bidirectional_audio and plan.branch_is_audio is not None:
+        # (B, N, b, b) rather than the shared (b, b): the audio run's length
+        # varies per branch whenever audio_window_frames is 0, so this cannot be
+        # a single triangular matrix. Still h-times smaller than s_own.
+        aud = plan.branch_is_audio
+        causal = causal | (aud[:, :, :, None] & aud[:, :, None, :])[:, None]
     s_own = s_own.masked_fill(~(causal & br_valid[:, None, :, None, :]), neg)
 
     # ONE softmax over [spine keys | own keys] -- this is what makes it exact
