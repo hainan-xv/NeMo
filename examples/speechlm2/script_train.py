@@ -61,6 +61,7 @@ def train(cfg):
         "prompt_control",
         "read_write",
         "gate_in_history",
+        "full_context",
     ):
         model_val = int(cfg.model.get(key, 0) or 0)
         data_val = int(dataset_cfg.get(key, 0) or 0)

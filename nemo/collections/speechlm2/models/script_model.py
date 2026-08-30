@@ -121,6 +121,12 @@ class ScriptSTTModelConfig(StreamingSTTModelConfig):
             with words and a branch cannot tell how long a silence lasted. The
             gate is still stripped from the returned TEXT. Requires ``read_write``
             and MUST match ``data.dataset.gate_in_history``.
+        full_context: OFFLINE upper bound -- the LLM sees every encoder frame at
+            once and emits the whole transcript in one turn. The ENCODER is
+            unchanged (``att_context_size`` still follows the chunk size), so this
+            ablates the chunked TEXT structure alone. MUST match
+            ``data.dataset.full_context``. Note a full transcript needs a much
+            larger ``max_new_tokens`` than a chunk does.
         position_scheme: ``branch`` | ``continuous`` | ``sampled``. MUST match
             ``data.dataset.position_scheme``.
         val_position_scheme: which concrete layout to DECODE with when the model
@@ -152,6 +158,7 @@ class ScriptSTTModelConfig(StreamingSTTModelConfig):
     write_token: str = "<|box_end|>"
     gate_in_history: bool = False
     position_scheme: str = "branch"
+    full_context: bool = False
     val_position_scheme: str = "continuous"
     val_chunk_size: Optional[int] = None
     val_max_new_tokens_per_chunk: Optional[int] = None
@@ -854,12 +861,19 @@ class ScriptSTTModel(StreamingSTTModel):
         instruction_ids_list = [self.tokenizer.text_to_ids(system_prompt[b] + "\n") for b in range(B)]
 
         decode_fn = fsm_stream_decode_script if state_machine else batched_stream_decode_script
+        # full_context: keep the ENCODER at chunk size `cs` (already applied by
+        # encode_frames) but hand the decoder a chunk large enough that every
+        # utterance is a single branch -- the LLM then sees all the audio at once.
+        decode_chunk = cs
+        if self.core_cfg.full_context:
+            decode_chunk = max(1, max((int(f.shape[0]) for f in frames_list), default=1))
+
         emitted = decode_fn(
             llm=self.llm,
             embed_tokens=self._embed_tokens,
             instruction_ids_list=instruction_ids_list,
             frames_list=frames_list,
-            chunk_size=cs,
+            chunk_size=decode_chunk,
             vision_start_id=self._vision_start_id,
             vision_end_id=self._vision_end_id,
             eot_id=self._eot_id,

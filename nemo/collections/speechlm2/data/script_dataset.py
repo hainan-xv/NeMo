@@ -13,6 +13,7 @@
 # limitations under the License.
 """Dataset producing SCRIPT's packed spine+branch batches."""
 
+import math
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -75,6 +76,14 @@ class ScriptSTTDataConfig(StreamingSTTDataConfig):
             token per chunk, which bites hardest at small chunk sizes (a 30s clip
             at chunk_size=2 has ~188 chunks against ~110 word tokens). Requires
             ``read_write``. Must match ``model.gate_in_history``.
+        full_context: OFFLINE upper bound. The utterance becomes ONE chunk: the
+            LLM sees every encoder frame at once and predicts the whole
+            transcript, instead of alternating chunk-by-chunk. The ENCODER is
+            unchanged -- ``att_context_size`` still follows the sampled chunk
+            size, so frames remain chunk-limited and streaming-equivalent. That
+            makes this an ablation of the chunked TEXT structure alone: any gap
+            to SCRIPT is the cost of emitting incrementally, not of restricted
+            acoustic context.
         position_scheme: ``branch`` | ``continuous`` | ``sampled``. ``sampled``
             draws one of the two schemes PER BATCH (like chunk_size), with
             probability ``continuous_prob`` of ``continuous``. Note the two are
@@ -113,6 +122,7 @@ class ScriptSTTDataConfig(StreamingSTTDataConfig):
     write_token: str = "<|box_end|>"
     gate_in_history: bool = False
     position_scheme: str = "branch"
+    full_context: bool = False
     continuous_prob: float = 0.5
     position_seed: int = 91011
     prompt_control: bool = False
@@ -431,14 +441,28 @@ class ScriptSTTDataset(StreamingSTTDataset):
 
         builder = build_twod_chunk_example if self._twod_layout else build_packed_chunk_example
         examples = []
-        for messages, sysp in zip(batch_messages, system_prompts):
+        for bi, (messages, sysp) in enumerate(zip(batch_messages, system_prompts)):
             # Instruction/history separator: the trailing newline keeps the first
             # history word from BPE-merging into the instruction text.
             instruction_ids = self.tokenizer.text_to_ids(sysp + "\n")
+            if self.cfg.full_context:
+                # ONE chunk: every frame, the whole transcript. The batch's
+                # chunk_size is left untouched so the ENCODER keeps its
+                # chunk-limited look-ahead -- only the LLM-side layout changes.
+                n_frames = math.ceil(audio_durations_secs[bi] / self.cfg.frame_length_in_secs)
+                full_text = text[bi] if text is not None else ""
+                chunks = [
+                    ChunkSpec(
+                        audio_len=max(1, int(n_frames)),
+                        target_ids=self.tokenizer.text_to_ids(full_text) if full_text.strip() else [],
+                    )
+                ]
+            else:
+                chunks = self._messages_to_chunks(messages)
             examples.append(
                 builder(
                     instruction_ids=instruction_ids,
-                    chunks=self._messages_to_chunks(messages),
+                    chunks=chunks,
                     vision_start_id=self.vision_start_id,
                     vision_end_id=self.vision_end_id,
                     eot_id=self.eot_id,

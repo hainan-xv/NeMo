@@ -2233,3 +2233,45 @@ def test_model_resolves_sampled_to_a_concrete_decode_scheme():
     cfg = to_dataclass(ScriptSTTModelConfig, {**base, "position_scheme": "sampled"})
     assert cfg.position_scheme == "sampled"
     assert cfg.val_position_scheme == "continuous"  # the concrete decode default
+
+
+# ---------------------------------------------------------------------------
+# Full-context (offline) ablation
+# ---------------------------------------------------------------------------
+
+
+def test_full_context_layout_is_a_single_branch_over_all_frames():
+    """The offline upper bound: one branch, every frame, the whole transcript.
+
+    This is the SCRIPT layout with a single chunk, so the same builder produces
+    it -- what makes it an ABLATION rather than a different model is that the
+    encoder keeps its chunk-limited look-ahead, which lives in att_context_size
+    and not in this layout.
+    """
+    words = [201, 202, 203, 204]
+    ex = build_packed_chunk_example(
+        instruction_ids=[1, 2, 3],
+        chunks=[ChunkSpec(audio_len=12, target_ids=words)],
+        vision_start_id=80,
+        vision_end_id=81,
+        eot_id=82,
+    )
+    assert int(ex.seg_ids.max()) == 1, "exactly one branch"
+    assert int(ex.is_audio.sum()) == 12, "all frames in that branch"
+    # the branch predicts the entire transcript, then <eot>
+    sup = ex.target_ids[(ex.seg_ids == 1) & (ex.target_ids != IGNORE_INDEX)]
+    assert sup.tolist() == words + [82]
+    # its history prefix is the instruction alone -- there is no earlier chunk
+    assert int(ex.prefix_len[ex.seg_ids == 1][0]) == 3
+
+
+def test_full_context_matches_the_standalone_offline_example():
+    """One chunk means packed == standalone trivially; assert it, so a future
+    layout change cannot silently break the offline arm."""
+    chunks = [ChunkSpec(audio_len=6, target_ids=[201, 202])]
+    kw = dict(instruction_ids=[1, 2], chunks=chunks, vision_start_id=80, vision_end_id=81, eot_id=82)
+    packed = build_packed_chunk_example(**kw)
+    sep = build_separate_chunk_examples(**kw)
+    assert len(sep) == 1
+    branch = packed.input_ids[packed.seg_ids == 1].tolist()
+    assert branch == sep[0].input_ids[sep[0].branch_start :].tolist()
