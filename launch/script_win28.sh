@@ -188,6 +188,22 @@ if [[ -z "$INIT_CKPT" && -n "$INIT_EXP" ]]; then
         echo "WARNING: no checkpoint under ${_INIT_DIR}; training from base pretrained."
     fi
 fi
+
+# A warm start restores the FULL training state, global_step included. If the
+# parent is already at or past MAX_STEPS this run has nothing to do: Lightning
+# prints "max_steps reached", exits 0 after ~3 minutes, and Slurm reports
+# COMPLETED with no checkpoints -- a failure that looks like a success. Job
+# 12865606 died exactly this way. Fail loudly instead.
+if [[ -n "$INIT_CKPT" && "$INIT_CKPT" != "none" ]]; then
+    _INIT_STEP="$(basename "$INIT_CKPT" | grep -oE 'step=[0-9]+' | head -1 | cut -d= -f2)"
+    if [[ -n "$_INIT_STEP" && "$_INIT_STEP" -ge "$MAX_STEPS" ]]; then
+        echo "ERROR: warm-start checkpoint is at step ${_INIT_STEP}, but MAX_STEPS=${MAX_STEPS}." >&2
+        echo "       resume_from_checkpoint restores global_step, so training would stop" >&2
+        echo "       immediately and the job would exit 0 having trained nothing." >&2
+        echo "       Raise it:  MAX_STEPS=$((_INIT_STEP + 100000)) ./oci_launch.sh <this script>" >&2
+        exit 1
+    fi
+fi
 # Checkpoint filenames contain '=' (step=..-val_wer=..), which breaks Hydra
 # override parsing, and they live outside the mounted dirs. Expose one through a
 # clean-named symlink under the (mounted) results dir and mount its source dir.
