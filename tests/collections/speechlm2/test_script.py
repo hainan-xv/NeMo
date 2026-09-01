@@ -2704,3 +2704,50 @@ def test_bidirectional_audio_flex_attention_matches_dense_numerically():
 
     valid = batch.valid[0]
     torch.testing.assert_close(got[:, :, valid], ref[:, :, valid], atol=1e-5, rtol=1e-5)
+
+
+@torch.no_grad()
+def test_full_context_with_bidirectional_audio_is_one_unrestricted_block():
+    """The combination actually launched: offline layout + unmasked audio.
+
+    full_context makes the branch span the whole utterance, so bidirectional
+    audio has maximal surface -- every frame attends every other frame. Neither
+    feature's own tests cover the pair, and this is the configuration being
+    trained, so pin its shape here.
+    """
+    n_frames, words = 12, [20, 21, 22]
+    ex = build_packed_chunk_example(INSTR, [ChunkSpec(audio_len=n_frames, target_ids=words)], VS, VE, EOT)
+    batch = collate_packed_chunk_examples([ex], pad_id=0)
+
+    # One branch, and it carries every frame.
+    assert int(batch.seg_ids[0].max()) == 1
+    assert int(batch.is_audio[0].sum()) == n_frames
+
+    allow = (
+        build_script_mask(
+            batch.seg_ids, batch.order_ids, batch.prefix_len, batch.valid, torch.float32, is_audio=batch.is_audio
+        )[0, 0]
+        == 0
+    )
+    aud = batch.is_audio[0].nonzero(as_tuple=True)[0]
+
+    # Every audio pair, in both directions -- no chunk boundary survives.
+    assert bool(allow[aud][:, aud].all()), "audio block is not fully connected"
+
+    # The text it predicts is still causal, and still sees all the audio.
+    seg, order = batch.seg_ids[0], batch.order_ids[0]
+    txt = [
+        i
+        for i in range(seg.shape[0])
+        if seg[i] != SPINE_SEG_ID and not batch.is_audio[0, i] and order[i] > order[aud[-1]]
+    ]
+    assert txt, "expected predicted-word positions after the audio"
+    for q in txt:
+        assert bool(allow[q, aud].all()), "a predicted word cannot see all the audio"
+        for k in txt:
+            if allow[q, k]:
+                assert order[k] <= order[q], "predicted words are no longer causal"
+
+    # The spine stays pure text under the combination.
+    spine = (seg == SPINE_SEG_ID).nonzero(as_tuple=True)[0]
+    assert not bool(allow[spine][:, aud].any()), "spine attended audio"
