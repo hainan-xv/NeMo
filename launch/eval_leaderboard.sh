@@ -96,7 +96,8 @@ MAX_EVAL_SAMPLES="${MAX_EVAL_SAMPLES:-0}"   # 0 = all
 SHUFFLE_SEED="${SHUFFLE_SEED:-1234}"        # must be identical across shards
 NGPU="${NGPU:-8}"
 
-DATASETS="${DATASETS:-librispeech:test.clean librispeech:test.other ami_cleaned:test earnings22:test gigaspeech_cleaned:test spgispeech:test voxpopuli_cleaned_aa:test}"
+_DEFAULT_DATASETS="librispeech:test.clean librispeech:test.other ami_cleaned:test earnings22:test gigaspeech_cleaned:test spgispeech:test voxpopuli_cleaned_aa:test"
+DATASETS="${DATASETS:-${_DEFAULT_DATASETS}}"
 DATASETS_CSV="$(echo "$DATASETS" | tr -s ' ' ',')"
 
 # --- Checkpoint selection ---
@@ -227,6 +228,14 @@ CKPT_STEP="$(basename "${CKPT_STAMP_SRC:-}" 2>/dev/null | grep -oE 'step=[0-9]+'
 # Deliberately excludes the run timestamp, so re-evaluating the same checkpoint
 # at the same setting overlays instead of adding a near-duplicate line.
 DECODE_LABEL="chunk${CHUNK_SIZE:-default}"
+# A non-default dataset MUST show up in the label. Without this a
+# speech_commands run at chunk 14 writes to the same <exp>/eval_<ts>/chunk14/ as
+# the leaderboard run and silently overwrites it -- two incomparable numbers in
+# one folder, with nothing to say which is which.
+if [[ -n "${DATASETS:-}" && "${DATASETS}" != "${_DEFAULT_DATASETS}" ]]; then
+    _DS_SLUG="$(echo "${DATASETS}" | tr ' ,' '__' | tr -cd '[:alnum:]_-' | cut -c1-40)"
+    DECODE_LABEL="${_DS_SLUG}_${DECODE_LABEL}"
+fi
 [[ -n "${NUM_DELAY_FRAMES}" ]] && DECODE_LABEL="${DECODE_LABEL}_d${NUM_DELAY_FRAMES}"
 [[ -n "${CAPITALIZATION}"   ]] && DECODE_LABEL="${DECODE_LABEL}_c${CAPITALIZATION}"
 [[ -n "${PUNCTUATION}"      ]] && DECODE_LABEL="${DECODE_LABEL}_p${PUNCTUATION}"

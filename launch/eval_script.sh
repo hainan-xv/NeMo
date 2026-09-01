@@ -98,6 +98,7 @@ STREAMING_ENCODE="${STREAMING_ENCODE:-}" # 1 = cache-aware streaming perception
 # its own defaults; a comment-only mention would be dropped silently, and for a
 # full-context model that means generation truncated at 64 tokens with nothing
 # in the log to say so.
+DATASETS="${DATASETS:-}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-}"
 BATCH_SIZE="${BATCH_SIZE:-}"
 
@@ -106,6 +107,7 @@ CAPITALIZATION="${CAPITALIZATION:-}"
 PUNCTUATION="${PUNCTUATION:-}"
 
 export EXP_NAME PROJECT MODEL_CLASS SYSTEM_PROMPT CHUNK_SIZE EVAL_TAG OUTPUT_PREFIX
+export DATASETS
 export NUM_DELAY_FRAMES CAPITALIZATION PUNCTUATION STATE_MACHINE STREAMING_ENCODE
 export MAX_NEW_TOKENS BATCH_SIZE
 

@@ -110,7 +110,12 @@ EXTRA_EVAL_ARGS="${EXTRA_EVAL_ARGS} --pretrained_llm ${PRETRAINED_LLM} --pretrai
 [[ "$STREAMING_EMBS" == "1" || "$STREAMING_EMBS" == "true" ]] && EXTRA_EVAL_ARGS="${EXTRA_EVAL_ARGS} --streaming_embs"
 [[ "$STATE_MACHINE" == "1" || "$STATE_MACHINE" == "true" ]] && EXTRA_EVAL_ARGS="${EXTRA_EVAL_ARGS} --state_machine"
 
+# Declared so oci_launch.sh forwards it; a comment-only mention is dropped
+# silently and you would evaluate the default suite instead.
+DATASETS="${DATASETS:-}"
+
 export EXP_NAME PROJECT OUTPUT_PREFIX MODEL_CLASS EVAL_DRIVER SYSTEM_PROMPT CHUNK_SIZE EVAL_TAG CKPT EXTRA_EVAL_ARGS
+export DATASETS
 # STATE_MACHINE must be EXPORTED, not just set: eval_leaderboard.sh is reached via
 # exec and builds DECODE_LABEL from it. Without this the FSM and bulk-prefill
 # decodes would both land in .../chunk<C>/ and silently overwrite each other.
