@@ -324,6 +324,9 @@ class StreamingSTTGenerateResult:
 
     # Per-cut decoded transcript (markers stripped). Always present.
     texts: list[str] = field(default_factory=list)
+    # Per-cut [[chunk_index, text_emitted_by_that_chunk], ...]. Populated when
+    # generate(return_chunk_ids=True) on the chunked-streaming path.
+    per_chunk_texts: Optional[list[list]] = None
     # Per-cut per-word alignments: list[list[{"text", "start_time", "end_time"}]].
     # Populated when return_alignments=True (default).
     pred_alignments: Optional[list[list[dict]]] = None
@@ -2977,6 +2980,8 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         num_chunks_per_stream = [math.ceil(ns / chunk_samples) if ns > 0 else 0 for ns in n_samples_list]
         max_chunks = max(num_chunks_per_stream)
         all_token_ids: list[list[int]] = [[] for _ in range(B)]
+        # Opt-in per-chunk capture; None keeps the normal path allocation-free.
+        per_chunk_tokens = [[] for _ in range(B)] if generation_kwargs.pop("return_chunk_ids", False) else None
 
         for chunk_i in range(max_chunks):
             # Build B audio chunks (zero-pad finished streams)
@@ -3025,9 +3030,20 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 # Only collect tokens for streams that are still active
                 if chunk_i < num_chunks_per_stream[b]:
                     all_token_ids[b].extend(chunk_tokens[b])
+                    if per_chunk_tokens is not None:
+                        per_chunk_tokens[b].append((chunk_i, list(chunk_tokens[b])))
 
         texts = [decode_with_blank(toks, self.blank_token, self.tokenizer) for toks in all_token_ids]
         result = StreamingSTTGenerateResult(texts=texts)
+        if per_chunk_tokens is not None:
+            # What each chunk emitted, decoded exactly as the full text is, so the
+            # pieces concatenate back to it. Lets a word be located inside its
+            # emitting chunk -- the interleaved analogue of SCRIPT's per-branch
+            # attribution.
+            result.per_chunk_texts = [
+                [[ci, decode_with_blank(toks, self.blank_token, self.tokenizer)] for ci, toks in rows if toks]
+                for rows in per_chunk_tokens
+            ]
 
         # TODO: capture per-chunk content_score for "binary"/"blank_only" modes
         # at the first text-generation step inside _chunked_streaming_step.

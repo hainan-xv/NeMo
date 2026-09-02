@@ -16,7 +16,7 @@
 from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from typing import List, Optional, Union
+from typing import Dict, List, Optional, Union
 
 import torch
 import torch.nn.functional as F
@@ -935,6 +935,12 @@ class ScriptSTTModel(StreamingSTTModel):
         # Same instruction/history separator the dataset uses when building the spine.
         instruction_ids_list = [self.tokenizer.text_to_ids(system_prompt[b] + "\n") for b in range(B)]
 
+        return_chunk_ids = bool(generation_kwargs.pop("return_chunk_ids", False))
+        if return_chunk_ids and state_machine:
+            raise ValueError(
+                "return_chunk_ids is not supported by the state-machine decode path; it emits "
+                "per-stream rather than per-chunk, so a chunk index would be meaningless."
+            )
         self._reject_fsm_with_bidirectional_audio(state_machine)
         decode_fn = fsm_stream_decode_script if state_machine else batched_stream_decode_script
         # full_context: keep the ENCODER at chunk size `cs` (already applied by
@@ -966,10 +972,34 @@ class ScriptSTTModel(StreamingSTTModel):
             is_word_start=self._is_word_start if insert_word_start_id is not None else None,
             insert_word_start_id=insert_word_start_id,
             **({"bidirectional_audio": True} if self._bidirectional_audio else {}),
+            **({"return_chunk_ids": True} if return_chunk_ids else {}),
         )
+        chunk_ids = None
+        if return_chunk_ids:
+            emitted, chunk_ids = emitted
         # The history may legitimately contain gate tokens (gate_in_history);
         # they are conditioning, not transcript, so never let them reach the text.
         drop = {t for t in (self._read_id, self._write_id) if t is not None}
         if drop:
-            emitted = [[t for t in ids if t not in drop] for ids in emitted]
-        return [self.tokenizer.ids_to_text(ids) if ids else "" for ids in emitted]
+            if chunk_ids is None:
+                emitted = [[t for t in ids if t not in drop] for ids in emitted]
+            else:
+                # Filter tokens and their chunk labels TOGETHER, or the two lists
+                # silently desync and every word after a gate is attributed to
+                # the wrong chunk.
+                kept = [[(t, k) for t, k in zip(ids, ks) if t not in drop] for ids, ks in zip(emitted, chunk_ids)]
+                emitted = [[t for t, _ in pair] for pair in kept]
+                chunk_ids = [[k for _, k in pair] for pair in kept]
+        texts = [self.tokenizer.ids_to_text(ids) if ids else "" for ids in emitted]
+        if not return_chunk_ids:
+            return texts
+        # Per chunk, the text it emitted -- so a word can be located inside its
+        # chunk. Detokenised per group rather than sliced out of `texts`, because
+        # the tokenizer's word-start convention makes offsets unreliable.
+        per_chunk = []
+        for ids, ks in zip(emitted, chunk_ids):
+            groups: Dict[int, List[int]] = {}
+            for t, k in zip(ids, ks):
+                groups.setdefault(int(k), []).append(t)
+            per_chunk.append([[k, self.tokenizer.ids_to_text(v) if v else ""] for k, v in sorted(groups.items())])
+        return texts, per_chunk

@@ -58,6 +58,8 @@ MAX_EVAL_SAMPLES="${MAX_EVAL_SAMPLES:-0}"
 PAD_EXTRA_SECONDS="${PAD_EXTRA_SECONDS:-0.5}"
 SHUFFLE_SEED="${SHUFFLE_SEED:-1234}"
 MAX_HISTORY_TOKENS="${MAX_HISTORY_TOKENS:-0}"
+# Appended verbatim to the driver command (e.g. --emit_chunk_ids).
+EXTRA_DRIVER_ARGS="${EXTRA_DRIVER_ARGS:-}"
 
 SCRIPT_PROMPT="You are doing streaming speech recognition. Given the transcript so far and the representation of the next audio chunk, output the words spoken in that chunk."
 
@@ -103,7 +105,13 @@ case "$MODEL_KEY" in
         # path scored 17.79 macro against streaming's 5.51 (it drops words at
         # chunk starts). offline_embs is a diagnostic, not a reporting mode.
         EMIT_DELAY_FRAMES="${EMIT_DELAY_FRAMES:-0}"
+        # FSM (state-machine) decode by DEFAULT. This is the path the model was
+        # designed for and the one the paper's numbers use: on the leaderboard it
+        # scores 6.03 macro / 10.16 AMI against the chunked-streaming path's
+        # 6.63 / 10.80. Evaluating it any other way understates it.
+        STATE_MACHINE="${STATE_MACHINE:-1}"
         DRIVER_ARGS="--streaming_embs --emit_delay_frames ${EMIT_DELAY_FRAMES}"
+        [[ "$STATE_MACHINE" == "1" ]] && DRIVER_ARGS="${DRIVER_ARGS} --state_machine"
         DRIVER_ARGS="${DRIVER_ARGS} --pretrained_llm ${PRETRAINED_LLM} --pretrained_asr ${PRETRAINED_ASR}"
         ;;
     nemotron)
@@ -196,6 +204,8 @@ else
     # shellcheck disable=SC2206
     COMMON+=(${DRIVER_ARGS})
 fi
+# shellcheck disable=SC2206
+[[ -n "$EXTRA_DRIVER_ARGS" ]] && COMMON+=(${EXTRA_DRIVER_ARGS})
 
 # NOTE: run_eval_shards.sh recovers a dead GPU by re-running its slice with
 # --subshard_count/--subshard_index. The nemotron driver does not define those,

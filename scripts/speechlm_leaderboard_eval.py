@@ -198,12 +198,52 @@ def _texts_of(result) -> List[str]:
     raise TypeError(f"generate() returned {type(result).__name__}, which has no .texts and is not a list")
 
 
-def _generate(model, audios, audio_lens, gen_kwargs, min_batch_size: int) -> List[str]:
-    """Decode one batch, halving on CUDA OOM down to ``min_batch_size``."""
+_CHUNK_SECONDS = 0.0  # set from --chunk_size at startup
+
+
+def _aligns_of(result, n: int):
+    """Per-utterance [[chunk_index, text], ...], or None if not produced.
+
+    Uses per_chunk_texts, not pred_alignments: alignments are only populated on
+    the dynamic/FSM decode path, while the leaderboard runs the chunked-streaming
+    path. Reading the wrong field yields silently empty results.
+    """
+    al = getattr(result, "per_chunk_texts", None)
+    if al is not None:
+        return [list(a) if a is not None else None for a in al]
+    # FSM path: per_chunk_texts is not produced, but per-word alignments are.
+    # Group words into chunks by emission time so both decode paths yield the
+    # same [[chunk_index, text], ...] shape.
+    pa = getattr(result, "pred_alignments", None)
+    if pa is None:
+        return [None] * n
+    out = []
+    for words in pa:
+        if not words:
+            out.append([])
+            continue
+        groups = {}
+        for w in words:
+            t = w.get("start_time")
+            if t is None:
+                continue
+            ci = int(t // _CHUNK_SECONDS) if _CHUNK_SECONDS else 0
+            groups.setdefault(ci, []).append(w.get("text", ""))
+        out.append([[ci, " ".join(ws)] for ci, ws in sorted(groups.items())])
+    return out
+
+
+def _generate(model, audios, audio_lens, gen_kwargs, min_batch_size: int):
+    """Decode one batch, halving on CUDA OOM down to ``min_batch_size``.
+
+    Returns texts, or (texts, alignments) when alignments were requested.
+    """
     n = int(audios.shape[0])
+    want_align = bool(gen_kwargs.get("return_chunk_ids"))
     try:
         with torch.inference_mode():
-            return _texts_of(model.generate(audios=audios, audio_lens=audio_lens, **gen_kwargs))
+            res = model.generate(audios=audios, audio_lens=audio_lens, **gen_kwargs)
+            return (_texts_of(res), _aligns_of(res, n)) if want_align else _texts_of(res)
     except torch.cuda.OutOfMemoryError:
         if n <= min_batch_size:
             raise
@@ -212,13 +252,20 @@ def _generate(model, audios, audio_lens, gen_kwargs, min_batch_size: int) -> Lis
     torch.cuda.empty_cache()
     half = max(min_batch_size, n // 2)
     _log(f"    [oom] retrying {n} utts as sub-batches of {half}")
-    out: List[str] = []
+    out: List = []
+    out_align: List = []
     for i in range(0, n, half):
         sl = slice(i, min(i + half, n))
         sub_lens = audio_lens[sl]
         sub_audios = audios[sl, : int(sub_lens.max().item())]
-        out.extend(_generate(model, sub_audios, sub_lens, gen_kwargs, min_batch_size))
-    return out
+        res = _generate(model, sub_audios, sub_lens, gen_kwargs, min_batch_size)
+        if want_align:
+            t, a = res
+            out.extend(t)
+            out_align.extend(a)
+        else:
+            out.extend(res)
+    return (out, out_align) if want_align else out
 
 
 def build_gen_kwargs(args) -> dict:
@@ -231,9 +278,11 @@ def build_gen_kwargs(args) -> dict:
         chunk_size_override=(args.chunk_size if args.chunk_size and args.chunk_size > 0 else None),
         use_offline_embs=args.offline_embs,
         use_state_machine_inference=args.state_machine,
+        return_chunk_ids=bool(getattr(args, "emit_chunk_ids", False)),
+        # The FSM path ignores return_chunk_ids and reports alignments instead.
+        return_alignments=bool(getattr(args, "emit_chunk_ids", False)) and args.state_machine,
         emit_delay_frames=args.emit_delay_frames,
         # Both are expensive and unused for WER; alignments are on by default.
-        return_alignments=False,
         return_debug_logs=False,
     )
 
@@ -268,15 +317,21 @@ def evaluate_shard(model, args, device) -> None:
             paths = [b["path"] for b in batch]
             try:
                 audios, audio_lens = load_audio_batch(paths, args.pad_extra_seconds)
-                hyps = _generate(model, audios.to(device), audio_lens.to(device), gen_kwargs, args.min_batch_size)
+                out = _generate(model, audios.to(device), audio_lens.to(device), gen_kwargs, args.min_batch_size)
+                hyps, aligns = out if args.emit_chunk_ids else (out, [None] * len(batch))
             except Exception as e:  # a bad batch must not kill the whole shard
                 _log(f"    [WARN] batch at {i} failed ({type(e).__name__}: {e}); emitting empty hypotheses")
                 hyps = [""] * len(batch)
+                aligns = [None] * len(batch)
             if len(hyps) != len(batch):
                 _log(f"    [WARN] got {len(hyps)} hypotheses for {len(batch)} utts; padding")
                 hyps = (list(hyps) + [""] * len(batch))[: len(batch)]
-            for b, hyp in zip(batch, hyps):
-                fout.write(json.dumps({"key": b["key"], "reference": b["ref"], "hypothesis": hyp}) + "\n")
+            for b, hyp, al in zip(batch, hyps, aligns):
+                rec = {"key": b["key"], "reference": b["ref"], "hypothesis": hyp}
+                if al is not None:
+                    # What each chunk emitted, straight from the decoder.
+                    rec["chunks"] = al  # [[chunk_index, text], ...]
+                fout.write(json.dumps(rec) + "\n")
                 done[b["key"]] += 1
             fout.flush()
             bar.set_postfix_str(" ".join(f"{k.split('/')[0]}:{done[k]}/{total[k]}" for k in sorted(total)))
@@ -371,6 +426,11 @@ def parse_args():
         help="trailing silence appended per clip; match training's pad_extra_duration",
     )
 
+    p.add_argument(
+        "--emit_chunk_ids",
+        action="store_true",
+        help="record per-word alignments (adds 'align'); the chunk index is derived from word times",
+    )
     p.add_argument("--aggregate", action="store_true", help="reduce shard JSONLs; no GPU or model needed")
     p.add_argument("--progress_interval", type=float, default=5.0, help="tqdm mininterval (log-friendly)")
     p.add_argument("--verbose", action="store_true", help="print sample normalized ref/hyp pairs")
@@ -379,6 +439,11 @@ def parse_args():
 
 def main() -> int:
     args = parse_args()
+    # The FSM path reports word TIMES rather than chunk indices, so deriving the
+    # chunk requires its duration (encoder frames are 0.08 s). Without this every
+    # word would land in chunk 0 and the position analysis would be meaningless.
+    global _CHUNK_SECONDS
+    _CHUNK_SECONDS = (args.chunk_size or 0) * 0.08
 
     if args.aggregate:
         if not args.output_dir:

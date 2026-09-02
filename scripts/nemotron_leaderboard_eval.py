@@ -156,7 +156,32 @@ def transcribe_offline(model, paths: List[str], batch_size: int) -> List[str]:
     return _texts_from(hyps)
 
 
-def transcribe_streaming(model, paths: List[str], pad_and_drop_preencoded: bool = False) -> List[str]:
+def _per_step_emissions(step_texts, n_utts):
+    """Per-utterance [[step_index, text_emitted_at_that_step], ...].
+
+    ``step_texts[t][u]`` is utterance u's CUMULATIVE transcript after step t, so
+    what step t emitted is the suffix beyond step t-1. Compared on the common
+    word prefix rather than by string slicing: RNN-T may revise its tail between
+    steps, and a raw suffix diff would then attribute the rewritten words to the
+    wrong step.
+    """
+    out = []
+    for u in range(n_utts):
+        prev, per = [], []
+        for t, texts in enumerate(step_texts):
+            cur = (texts[u] if u < len(texts) else "").split()
+            c = 0
+            while c < len(prev) and c < len(cur) and prev[c] == cur[c]:
+                c += 1
+            new = cur[c:]
+            if new:
+                per.append([t, " ".join(new)])
+            prev = cur
+        out.append(per)
+    return out
+
+
+def transcribe_streaming(model, paths: List[str], pad_and_drop_preencoded: bool = False, per_step: bool = False):
     """True cache-aware streaming: feed mel chunks, carry the caches across steps.
 
     Mirrors NeMo's ``speech_to_text_cache_aware_streaming_infer.py``. Note the
@@ -180,6 +205,10 @@ def transcribe_streaming(model, paths: List[str], pad_and_drop_preencoded: bool 
     previous_hypotheses = None
     pred_out_stream = None
     transcribed = []
+    # Cumulative transcript after each streaming step. Differencing consecutive
+    # entries gives what THAT step emitted -- the RNN-T analogue of SCRIPT's
+    # per-chunk emission, without touching the decoder.
+    step_texts: List[List[str]] = []
 
     for step_num, (chunk_audio, chunk_lengths) in enumerate(buf):
         # Step 0 has no cache yet, so nothing to drop after pre-encoding.
@@ -209,7 +238,11 @@ def transcribe_streaming(model, paths: List[str], pad_and_drop_preencoded: bool 
                 drop_extra_pre_encoded=drop,
                 return_transcription=True,
             )
+        if per_step:
+            step_texts.append(list(_texts_from(transcribed)))
     buf.reset_buffer()
+    if per_step:
+        return _texts_from(transcribed), step_texts
     return _texts_from(transcribed)
 
 
@@ -235,17 +268,29 @@ def evaluate_shard(model, args) -> None:
             paths = [b["path"] for b in batch]
             try:
                 if args.mode == "streaming":
-                    hyps = transcribe_streaming(model, paths, args.pad_and_drop_preencoded)
+                    if args.emit_chunk_ids:
+                        hyps, step_texts = transcribe_streaming(
+                            model, paths, args.pad_and_drop_preencoded, per_step=True
+                        )
+                        chunks = _per_step_emissions(step_texts, len(paths))
+                    else:
+                        hyps = transcribe_streaming(model, paths, args.pad_and_drop_preencoded)
                 else:
                     hyps = transcribe_offline(model, paths, len(paths))
             except Exception as e:  # one bad batch must not kill the shard
                 _log(f"    [WARN] batch at {i} failed ({type(e).__name__}: {e}); emitting empty hypotheses")
                 hyps = [""] * len(batch)
+                chunks = [None] * len(batch)
             if len(hyps) != len(batch):
                 _log(f"    [WARN] got {len(hyps)} hyps for {len(batch)} utts; padding")
                 hyps = (list(hyps) + [""] * len(batch))[: len(batch)]
-            for b, hyp in zip(batch, hyps):
-                fout.write(json.dumps({"key": b["key"], "reference": b["ref"], "hypothesis": hyp}) + "\n")
+            if not args.emit_chunk_ids or args.mode != "streaming":
+                chunks = [None] * len(batch)
+            for b, hyp, ch in zip(batch, hyps, chunks):
+                rec = {"key": b["key"], "reference": b["ref"], "hypothesis": hyp}
+                if ch is not None:
+                    rec["chunks"] = ch
+                fout.write(json.dumps(rec) + "\n")
                 done[b["key"]] += 1
             fout.flush()
             bar.set_postfix_str(" ".join(f"{k.split('/')[0]}:{done[k]}/{total[k]}" for k in sorted(total)))
@@ -308,6 +353,11 @@ def parse_args():
         help="streaming mode: also cache/drop pre-encoded frames on step 0",
     )
 
+    p.add_argument(
+        "--emit_chunk_ids",
+        action="store_true",
+        help="record which streaming step emitted each word (adds 'chunks'); --mode streaming only",
+    )
     p.add_argument("--aggregate", action="store_true", help="reduce shard JSONLs; no GPU or model needed")
     p.add_argument("--progress_interval", type=float, default=5.0)
     p.add_argument("--verbose", action="store_true")

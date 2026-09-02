@@ -147,15 +147,26 @@ def _generate(model, audios, audio_lens, gen_kwargs, min_batch_size: int):
     torch.cuda.empty_cache()
     half = max(min_batch_size, n // 2)
     _log(f"    [oom] retrying {n} utts as sub-batches of {half}")
-    out: List[str] = []
+    # generate() returns a plain list of texts, or (texts, per_chunk) when
+    # return_chunk_ids is set. Accumulate whichever shape came back -- extending
+    # a list of strings with a tuple would silently produce garbage.
+    out: List = []
+    out_chunks: List = []
+    tupled = bool(gen_kwargs.get("return_chunk_ids"))
     for i in range(0, n, half):
         sl = slice(i, min(i + half, n))
         sub_lens = audio_lens[sl]
         # Trim to the sub-batch's own longest clip; keeping the parent batch's
         # padding width would defeat the point of splitting.
         sub_audios = audios[sl, : int(sub_lens.max().item())]
-        out.extend(_generate(model, sub_audios, sub_lens, gen_kwargs, min_batch_size))
-    return out
+        res = _generate(model, sub_audios, sub_lens, gen_kwargs, min_batch_size)
+        if tupled:
+            texts, chunks = res
+            out.extend(texts)
+            out_chunks.extend(chunks)
+        else:
+            out.extend(res)
+    return (out, out_chunks) if tupled else out
 
 
 def build_gen_kwargs(args) -> dict:
@@ -170,6 +181,8 @@ def build_gen_kwargs(args) -> dict:
     )
     if args.max_history_tokens > 0:
         kwargs["max_history_tokens"] = args.max_history_tokens
+    if args.emit_chunk_ids:
+        kwargs["return_chunk_ids"] = True
     # Prompt-control knobs are forwarded ONLY when explicitly requested. A
     # non-prompt-controlled model raises on them, which is what we want: it means
     # "this checkpoint cannot honour that request" rather than silently ignoring it.
@@ -216,12 +229,20 @@ def evaluate_shard(model, args, device) -> None:
             paths = [b["path"] for b in batch]
             try:
                 audios, audio_lens = load_audio_batch(paths, args.pad_extra_seconds)
-                hyps = _generate(model, audios.to(device), audio_lens.to(device), gen_kwargs, args.min_batch_size)
+                out = _generate(model, audios.to(device), audio_lens.to(device), gen_kwargs, args.min_batch_size)
+                # generate() returns (texts, per_chunk) under --emit_chunk_ids and
+                # a bare list otherwise. Unpack explicitly: zipping the tuple
+                # itself writes the whole batch's texts as ONE record.
+                hyps, chunks = out if args.emit_chunk_ids else (out, [None] * len(batch))
             except Exception as e:  # a bad batch must not kill the whole shard
                 _log(f"    [WARN] batch at {i} failed ({type(e).__name__}: {e}); emitting empty hypotheses")
                 hyps = [""] * len(batch)
-            for b, hyp in zip(batch, hyps):
-                fout.write(json.dumps({"key": b["key"], "reference": b["ref"], "hypothesis": hyp}) + "\n")
+                chunks = [None] * len(batch)
+            for b, hyp, ch in zip(batch, hyps, chunks):
+                rec = {"key": b["key"], "reference": b["ref"], "hypothesis": hyp}
+                if ch is not None:
+                    rec["chunks"] = ch  # [[chunk_index, text], ...]
+                fout.write(json.dumps(rec) + "\n")
                 done[b["key"]] += 1
             fout.flush()
             bar.set_postfix_str(" ".join(f"{k.split('/')[0]}:{done[k]}/{total[k]}" for k in sorted(total)))
@@ -282,6 +303,11 @@ def parse_args():
     )
     p.add_argument(
         "--max_history_tokens", type=int, default=0, help="cap conditioning history; 0 = model config default"
+    )
+    p.add_argument(
+        "--emit_chunk_ids",
+        action="store_true",
+        help="also record which chunk emitted each word (adds a 'chunks' field) for locating errors within a chunk",
     )
     p.add_argument(
         "--force_word_start",

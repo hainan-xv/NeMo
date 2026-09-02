@@ -100,7 +100,7 @@ PRETRAINED_ASR="${PRETRAINED_ASR:-${HEH_PRETRAINED}/nvidia/nemotron-speech-strea
 # FSM decode path instead of bulk-prefill chunked decode. Off by default; the
 # model code calls it "not recommended" for fixed chunk sizes, but the two paths
 # are not guaranteed to agree.
-STATE_MACHINE="${STATE_MACHINE:-0}"
+STATE_MACHINE="${STATE_MACHINE:-1}"  # FSM by default: 6.03 macro vs 6.63 for chunked decode
 
 STREAMING_EMBS="${STREAMING_EMBS:-1}"
 [[ "${OFFLINE_EMBS:-0}" == "1" ]] && STREAMING_EMBS=0
