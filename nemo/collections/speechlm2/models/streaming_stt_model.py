@@ -1488,13 +1488,27 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             return logits.argmax(dim=-1)
 
         cfg = generation_config or GenerationConfig()
-        do_sample = generation_kwargs.get('do_sample', cfg.do_sample)
-        temperature = generation_kwargs.get('temperature', cfg.temperature)
-        top_k = generation_kwargs.get('top_k', cfg.top_k)
-        top_p = generation_kwargs.get('top_p', cfg.top_p)
-        repetition_penalty = generation_kwargs.get('repetition_penalty', cfg.repetition_penalty)
-        no_repeat_ngram_size = generation_kwargs.get('no_repeat_ngram_size', cfg.no_repeat_ngram_size)
-        suppress_tokens = generation_kwargs.get('suppress_tokens', cfg.suppress_tokens)
+
+        def _opt(name, default):
+            """Read a sampling knob, treating None as "disabled".
+
+            transformers >= 5 defaults every one of these to None rather than to
+            its neutral value, and None is also how a user spells "leave it off".
+            Comparing None to a number raises -- `no_repeat_ngram_size > 0` threw
+            TypeError, and `repetition_penalty != 1.0` is True for None, so it
+            reached a division by None one line later. Both are on the GREEDY
+            path, so this took out plain argmax decoding, not just sampling.
+            """
+            v = generation_kwargs.get(name, getattr(cfg, name, None))
+            return default if v is None else v
+
+        do_sample = _opt('do_sample', False)
+        temperature = _opt('temperature', 1.0)
+        top_k = _opt('top_k', 0)
+        top_p = _opt('top_p', 1.0)
+        repetition_penalty = _opt('repetition_penalty', 1.0)
+        no_repeat_ngram_size = _opt('no_repeat_ngram_size', 0)
+        suppress_tokens = _opt('suppress_tokens', None)
 
         # --- logit manipulation (order matters) ---
 

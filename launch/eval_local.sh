@@ -18,8 +18,9 @@
 #
 #   launch/eval_local.sh script       14
 #   launch/eval_local.sh fullctx      14
+#   launch/eval_local.sh speechlm     14      # colleague's interleaved model
 #   launch/eval_local.sh nemotron     14
-#   for m in script fullctx nemotron; do launch/eval_local.sh $m 14; done
+#   for m in script fullctx speechlm nemotron; do launch/eval_local.sh $m 14; done
 #
 # KNOBS (env)
 #   DATASETS           default "speech_commands:test"
@@ -42,7 +43,7 @@ cd "$HERE"
 MODEL_KEY="${1:-}"
 CHUNK_SIZE="${2:-${CHUNK_SIZE:-14}}"
 if [[ -z "$MODEL_KEY" ]]; then
-    echo "usage: launch/eval_local.sh <script|fullctx|nemotron> [chunk_size]" >&2
+    echo "usage: launch/eval_local.sh <script|fullctx|speechlm|nemotron> [chunk_size]" >&2
     exit 1
 fi
 
@@ -79,6 +80,32 @@ case "$MODEL_KEY" in
         SYSTEM_PROMPT="$SCRIPT_PROMPT"
         DRIVER_ARGS="--max_history_tokens ${MAX_HISTORY_TOKENS}"
         ;;
+    speechlm)
+        # The colleague's INTERLEAVED streaming SpeechLM: one causal
+        # audio-text-audio-text stream rather than SCRIPT's spine + branches.
+        # Same base LLM and encoder as our models, so the comparison isolates the
+        # LAYOUT.
+        EXP="speechlm_heh_best"
+        CKPT="${SPEECHLM_CKPT:-${CKPT_DIR}/heh.ckpt}"
+        DRIVER="scripts/speechlm_leaderboard_eval.py"
+        MODEL_CLASS="nemo.collections.speechlm2.models.streaming_stt_model.StreamingSTTModel"
+        # This model's OWN training instruction -- NOT the SCRIPT prompt. Using
+        # ours would put it out of distribution and understate it.
+        SYSTEM_PROMPT="${SYSTEM_PROMPT:-Transcribe the audio into text.}"
+        # The checkpoint stores bare hub ids, which cannot resolve offline; point
+        # at the same local snapshots the other models load, so all four systems
+        # share a byte-identical base LLM and encoder.
+        _QWEN="$(ls -d "$HOME"/.cache/huggingface/hub/models--Qwen--Qwen3-1.7B/snapshots/*/ 2>/dev/null | head -1)"
+        _ASR="$(find "$HOME/.cache/huggingface/hub/models--nvidia--nemotron-speech-streaming-en-0.6b" -name '*.nemo' 2>/dev/null | head -1)"
+        PRETRAINED_LLM="${PRETRAINED_LLM:-${_QWEN%/}}"
+        PRETRAINED_ASR="${PRETRAINED_ASR:-${_ASR}}"
+        # --streaming_embs, not --offline_embs: on this checkpoint the offline
+        # path scored 17.79 macro against streaming's 5.51 (it drops words at
+        # chunk starts). offline_embs is a diagnostic, not a reporting mode.
+        EMIT_DELAY_FRAMES="${EMIT_DELAY_FRAMES:-0}"
+        DRIVER_ARGS="--streaming_embs --emit_delay_frames ${EMIT_DELAY_FRAMES}"
+        DRIVER_ARGS="${DRIVER_ARGS} --pretrained_llm ${PRETRAINED_LLM} --pretrained_asr ${PRETRAINED_ASR}"
+        ;;
     nemotron)
         # The streaming RNNT/cache-aware ASR baseline -- no LLM, so it has no
         # generative prior to over-generate WITH. That is exactly why it belongs
@@ -97,7 +124,7 @@ case "$MODEL_KEY" in
         DRIVER_ARGS="--mode ${NEMOTRON_MODE}"
         ;;
     *)
-        echo "ERROR: unknown model key '${MODEL_KEY}' (want script|fullctx|nemotron)" >&2
+        echo "ERROR: unknown model key '${MODEL_KEY}' (want script|fullctx|speechlm|nemotron)" >&2
         exit 1 ;;
 esac
 

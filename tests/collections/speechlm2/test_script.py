@@ -2751,3 +2751,41 @@ def test_full_context_with_bidirectional_audio_is_one_unrestricted_block():
     # The spine stays pure text under the combination.
     spine = (seg == SPINE_SEG_ID).nonzero(as_tuple=True)[0]
     assert not bool(allow[spine][:, aud].any()), "spine attended audio"
+
+
+# ======================================================================
+# StreamingSTTModel._sample_token: None-valued generation knobs
+# ======================================================================
+
+
+@pytest.mark.parametrize("do_sample", [False, True])
+def test_sample_token_treats_none_knobs_as_disabled(do_sample):
+    """transformers >= 5 defaults every sampling knob to None.
+
+    None means "leave it off", but the code compared it to numbers:
+    `no_repeat_ngram_size > 0` raised TypeError, and `repetition_penalty != 1.0`
+    is True for None, reaching a division by None. Both sit BEFORE the greedy
+    fast path, so an ordinary argmax decode died on a bare
+    GenerationConfig(do_sample=False) -- which is exactly what the leaderboard
+    driver passes.
+    """
+    from transformers import GenerationConfig
+
+    from nemo.collections.speechlm2.models.streaming_stt_model import StreamingSTTModel
+
+    cfg = GenerationConfig(do_sample=do_sample)
+    # Guard the premise: if a future transformers stops defaulting these to
+    # None, this test would silently stop testing anything.
+    assert cfg.no_repeat_ngram_size is None and cfg.repetition_penalty is None
+
+    torch.manual_seed(0)
+    logits = torch.randn(3, 32)
+    fake = StreamingSTTModel.__new__(StreamingSTTModel)
+    out = StreamingSTTModel._sample_token(fake, logits, [7, 7, 9], cfg)
+
+    assert out.shape == (3,)
+    assert out.dtype == torch.long
+    assert bool(((out >= 0) & (out < 32)).all())
+    if not do_sample:
+        # Disabled knobs must leave the greedy result untouched.
+        torch.testing.assert_close(out, logits.argmax(dim=-1))
