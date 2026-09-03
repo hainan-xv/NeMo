@@ -52,7 +52,6 @@ Existing checkpoints keep Qwen's tokenizer, ids and embedding table untouched.
 import os
 import shutil
 import tarfile
-import tempfile
 from typing import Dict, List, Optional, Sequence
 
 import torch
