@@ -283,6 +283,11 @@ class StreamingSTTModelConfig:
     # positions are masked to IGNORE_INDEX in the LM CE — the aux head owns
     # the boundary decision exclusively.
     chunk_classifier_keep_lm_supervision_at_audio: bool = False
+    # Replace the LLM's text vocabulary with the ASR encoder's SentencePiece one
+    # (151,936 -> 1,024 pieces; 311M -> 2.1M embedding parameters). Off by
+    # default: existing checkpoints keep Qwen's tokenizer, ids and embeddings
+    # untouched. See parts/asr_vocab.py for the trade-offs.
+    text_vocab_from_asr: bool = False
 
 
 @dataclass
@@ -387,6 +392,13 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         self.embed_tokens = self.llm.model.embed_tokens
         del self.llm.model.embed_tokens
 
+        # Optional: swap the text vocabulary for the ASR encoder's. Done here --
+        # after _register_special_tokens(), so every special string the model
+        # resolves by name already exists on the donor and can be carried over,
+        # and after embed_tokens is detached, so the donor table is in hand.
+        if getattr(self.core_cfg, "text_vocab_from_asr", False):
+            self._swap_to_asr_vocab()
+
         # --- Speech encoder (perception module) ---
         self.perception = setup_perception(
             cfg=self.cfg,
@@ -461,6 +473,65 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         else:
             self._chunk_size_candidates = None
             self._chunk_size_repr = int(cs)
+
+    def _swap_to_asr_vocab(self) -> None:
+        """Replace the LLM's text vocabulary with the ASR encoder's.
+
+        The donor LLM's 151,936-piece table is 311M parameters and a softmax over
+        151,936 classes at every decode step; the ASR encoder we already load
+        ships 1,024 SentencePiece pieces. Text becomes ~1.62x more tokens, so
+        this trades head cost for sequence length -- see parts/asr_vocab.py.
+
+        Every special string is carried across from the donor's added vocabulary,
+        so the call sites -- which resolve ``<|vision_start|>`` and friends BY
+        STRING -- keep working with no changes; only the ids move.
+
+        Input and output stay TIED, as they are in Qwen3, so the swap costs one
+        table rather than two.
+        """
+        import tempfile
+
+        from nemo.collections.speechlm2.parts.asr_vocab import (
+            AsrVocabTokenizer,
+            build_embedding_from_donor,
+            extract_spm_from_nemo,
+            summarize_swap,
+        )
+
+        donor_tok = self.tokenizer.tokenizer
+        donor_w = self.embed_tokens.weight.data
+        hidden = int(donor_w.shape[1])
+
+        # Carry over the donor's added tokens (26 for Qwen3, covering
+        # <|vision_start|>, <|im_end|>, <|box_start|>, ...) plus anything
+        # _register_special_tokens() added, e.g. the blank token.
+        specials = list(dict.fromkeys(list(donor_tok.get_added_vocab().keys()) + list(donor_tok.all_special_tokens)))
+
+        spm_path = extract_spm_from_nemo(self.core_cfg.pretrained_asr, tempfile.mkdtemp(prefix="asr_vocab_"))
+        new_tok = AsrVocabTokenizer(spm_path, special_tokens=specials, eos_token=donor_tok.eos_token)
+
+        # float32 for the averaging, then back to the model's dtype: the mean of
+        # a few bf16 vectors loses precision that costs nothing to keep here.
+        new_w = build_embedding_from_donor(new_tok, donor_tok, donor_w.float()).to(donor_w.dtype)
+
+        emb = torch.nn.Embedding(len(new_tok), hidden, dtype=donor_w.dtype, device=donor_w.device)
+        with torch.no_grad():
+            emb.weight.copy_(new_w)
+        self.embed_tokens = emb
+
+        head = torch.nn.Linear(hidden, len(new_tok), bias=False, dtype=donor_w.dtype, device=donor_w.device)
+        head.weight = self.embed_tokens.weight  # tied, as tie_word_embeddings=True
+        self.llm.lm_head = head
+        self.llm.config.vocab_size = len(new_tok)
+        self.tokenizer = new_tok
+
+        info = summarize_swap(donor_tok, new_tok, hidden)
+        logging.info(
+            f"Swapped text vocabulary for the ASR encoder's: {info['old_vocab']:,} -> {info['new_vocab']:,} "
+            f"pieces ({info['shrink_factor']:.0f}x), embedding {info['old_embed_params'] / 1e6:.0f}M -> "
+            f"{info['new_embed_params'] / 1e6:.1f}M parameters. NOTE: text is ~1.6x more tokens, and "
+            f"capitalisation/punctuation are largely unrepresentable in this vocabulary."
+        )
 
     def _resize_llm_embeddings(self) -> None:
         """Grow the LLM's embedding table to cover newly added special tokens."""

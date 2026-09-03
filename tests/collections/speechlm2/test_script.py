@@ -26,6 +26,8 @@ Two tests carry the correctness argument:
 
 import math
 
+import os
+
 import pytest
 import torch
 
@@ -2971,3 +2973,89 @@ def test_emission_penalty_lambda_matches_the_equivalent_schedule():
     assert run(emission_penalty_lambda=lam) == run(emission_penalty=equivalent)
     # lam=0 is off.
     assert run(emission_penalty_lambda=0.0) == run()
+
+
+# ======================================================================
+# ASR-vocabulary swap
+# ======================================================================
+
+
+def _asr_spm_path(tmp_path):
+    import glob
+
+    from nemo.collections.speechlm2.parts.asr_vocab import extract_spm_from_nemo
+
+    hits = glob.glob(
+        os.path.expanduser("~/.cache/huggingface/hub/models--nvidia--nemotron-speech-streaming-en-0.6b/**/*.nemo"),
+        recursive=True,
+    )
+    if not hits:
+        pytest.skip("nemotron ASR .nemo not present in the local HF cache")
+    return extract_spm_from_nemo(hits[0], str(tmp_path))
+
+
+def test_asr_vocab_tokenizer_roundtrips_and_keeps_special_strings(tmp_path):
+    """Call sites resolve markers BY STRING, so the strings must survive the swap."""
+    from nemo.collections.speechlm2.parts.asr_vocab import AsrVocabTokenizer
+
+    specials = ["<|vision_start|>", "<|vision_end|>", "<|im_end|>", "<|box_start|>", "<|box_end|>"]
+    tok = AsrVocabTokenizer(_asr_spm_path(tmp_path), special_tokens=specials, eos_token="<|im_end|>")
+
+    assert len(tok) == 1024 + len(specials), "specials must be appended AFTER the SentencePiece pieces"
+    # A piece keeps the id the ASR model gave it.
+    assert tok.convert_ids_to_tokens(0) == "<unk>"
+    for s in specials:
+        i = tok.convert_tokens_to_ids(s)
+        assert i >= 1024 and tok.convert_ids_to_tokens(i) == s
+    assert tok.eos_token_id == tok.convert_tokens_to_ids("<|im_end|>")
+
+    for text in ("the evaluation is complete", "hello world", "Marvin said okay."):
+        assert tok.ids_to_text(tok.text_to_ids(text)) == text
+
+
+def test_asr_vocab_embedding_init_is_donor_averaged(tmp_path):
+    """New pieces must inherit the donor's geometry, not be random.
+
+    ``in`` exists verbatim in Qwen and must be COPIED; ``▁the`` does not and must
+    equal the mean of Qwen's embeddings for " the". Getting the word-initial
+    mapping backwards (looking up "the" instead of " the") would seed every
+    word-initial piece with a mid-word vector, which is silent and costly.
+    """
+    import glob
+
+    from transformers import AutoTokenizer
+
+    from nemo.collections.speechlm2.parts.asr_vocab import AsrVocabTokenizer, build_embedding_from_donor
+
+    qdirs = glob.glob(os.path.expanduser("~/.cache/huggingface/hub/models--Qwen--Qwen3-1.7B/snapshots/*/"))
+    if not qdirs:
+        pytest.skip("Qwen3-1.7B not present in the local HF cache")
+    donor = AutoTokenizer.from_pretrained(qdirs[0])
+
+    tok = AsrVocabTokenizer(_asr_spm_path(tmp_path), special_tokens=["<|im_end|>"], eos_token="<|im_end|>")
+    torch.manual_seed(0)
+    donor_w = torch.randn(len(donor), 16)
+    new_w = build_embedding_from_donor(tok, donor, donor_w, verbose=False)
+
+    assert new_w.shape == (len(tok), 16)
+    assert torch.isfinite(new_w).all()
+
+    vocab = donor.get_vocab()
+    # verbatim copy
+    i = tok.convert_tokens_to_ids("in")
+    if i > 0 and "in" in vocab:
+        torch.testing.assert_close(new_w[i], donor_w[vocab["in"]])
+    # word-initial piece -> donor's " the", NOT "the"
+    j = tok.convert_tokens_to_ids("▁the")
+    expected = donor_w[torch.tensor(donor.encode(" the", add_special_tokens=False))].mean(0)
+    torch.testing.assert_close(new_w[j], expected)
+    # the special keeps its own pretrained vector
+    k = tok.convert_tokens_to_ids("<|im_end|>")
+    torch.testing.assert_close(new_w[k], donor_w[vocab["<|im_end|>"]])
+
+
+def test_asr_vocab_is_off_by_default():
+    """Backward compatibility: existing configs must not trigger the swap."""
+    from nemo.collections.speechlm2.models.streaming_stt_model import StreamingSTTModelConfig
+
+    assert StreamingSTTModelConfig.text_vocab_from_asr is False
