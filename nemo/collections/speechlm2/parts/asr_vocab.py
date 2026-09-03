@@ -58,6 +58,7 @@ import torch
 from torch import Tensor
 
 from nemo.collections.common.tokenizers.sentencepiece_tokenizer import SentencePieceTokenizer
+from nemo.collections.common.tokenizers.tokenizer_spec import TokenizerSpec
 from nemo.utils import logging
 
 # SentencePiece marks a word-initial piece with this; the SCRIPT word-start
@@ -88,7 +89,7 @@ def extract_spm_from_nemo(nemo_path: str, out_dir: str) -> str:
     return dest
 
 
-class AsrVocabTokenizer:
+class AsrVocabTokenizer(TokenizerSpec):
     """The ASR SentencePiece vocabulary behind the interface the SpeechLM expects.
 
     The model reaches for two different shapes: NeMo's (``text_to_ids`` /
@@ -99,6 +100,13 @@ class AsrVocabTokenizer:
 
     Special tokens are appended after the SentencePiece pieces, so a piece keeps
     the id the ASR model gave it.
+
+    Subclasses TokenizerSpec because NeMo DISPATCHES ON IT: Lhotse's dataloader
+    wraps the tokenizer in TokenizerWrapper, which routes a TokenizerSpec through
+    ``text_to_ids`` and anything else through ``tokenizer(text)`` -- the parser
+    protocol. The tokenizer this replaces (NeMo's AutoTokenizer) is a
+    TokenizerSpec, so being one keeps the dispatch identical instead of landing
+    in a branch meant for character parsers.
     """
 
     def __init__(
@@ -254,6 +262,9 @@ class AsrVocabTokenizer:
     def bos_id(self) -> Optional[int]:
         # No bos in this vocabulary; the SCRIPT/streaming path never uses one.
         return None
+
+    def tokens_to_ids(self, tokens) -> List[int]:
+        return [self._token_to_id(t) for t in tokens]
 
     def ids_to_tokens(self, ids) -> List[str]:
         return [self._id_to_token(int(i)) for i in ids]

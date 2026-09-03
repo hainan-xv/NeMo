@@ -3125,3 +3125,30 @@ def test_asr_vocab_encode_matches_text_to_ids(tmp_path):
     v = tok.get_vocab()
     assert len(v) == len(tok) and v is tok.get_vocab(), "get_vocab must be complete and cached"
     assert tok.decode(tok.encode("hello world")) == "hello world"
+
+
+def test_asr_vocab_is_a_tokenizer_spec_and_dispatches_like_the_baseline(tmp_path):
+    """Lhotse's dataloader DISPATCHES ON TYPE, not on duck-typing.
+
+    TokenizerWrapper routes a TokenizerSpec through ``text_to_ids`` and anything
+    else through ``tokenizer(text)`` -- the character-parser protocol. The
+    tokenizer this replaces (NeMo's AutoTokenizer) is a TokenizerSpec, so the
+    replacement must be one too; otherwise training dies mid-dataloader with
+    "'AsrVocabTokenizer' object is not callable", which is what happened.
+    """
+    from nemo.collections.common.tokenizers.aggregate_tokenizer import TokenizerWrapper
+    from nemo.collections.common.tokenizers.huggingface.auto_tokenizer import AutoTokenizer
+    from nemo.collections.common.tokenizers.tokenizer_spec import TokenizerSpec
+
+    from nemo.collections.speechlm2.parts.asr_vocab import AsrVocabTokenizer
+
+    tok = AsrVocabTokenizer(_asr_spm_path(tmp_path), special_tokens=["<|im_end|>"], eos_token="<|im_end|>")
+    assert isinstance(tok, TokenizerSpec)
+    # Same dispatch branch as the tokenizer it replaces.
+    assert issubclass(AutoTokenizer, TokenizerSpec)
+    wrapper = TokenizerWrapper(tok)
+    assert wrapper._impl.__name__ == "_call_tokenizer"
+
+    text = "the evaluation is complete"
+    assert wrapper(text, None) == tok.text_to_ids(text)  # how the dataloader calls it
+    assert tok.tokens_to_ids(tok.text_to_tokens(text)) == tok.text_to_ids(text)
