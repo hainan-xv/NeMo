@@ -3059,3 +3059,31 @@ def test_asr_vocab_is_off_by_default():
     from nemo.collections.speechlm2.models.streaming_stt_model import StreamingSTTModelConfig
 
     assert StreamingSTTModelConfig.text_vocab_from_asr is False
+
+
+def test_asr_vocab_exposes_the_nemo_and_hf_attributes_the_pipeline_uses(tmp_path):
+    """The swap is only non-invasive if the wrapper covers every attribute used.
+
+    The dataset pads with ``tokenizer.pad_id`` and validates its delimiters via
+    ``getattr(tok, "unk_token_id", None)`` -- if the latter is missing the check
+    is skipped and an out-of-vocabulary marker silently becomes <unk>.
+    """
+    from nemo.collections.speechlm2.parts.asr_vocab import AsrVocabTokenizer
+
+    tok = AsrVocabTokenizer(
+        _asr_spm_path(tmp_path),
+        special_tokens=["<|vision_start|>", "<|im_end|>", "<|endoftext|>"],
+        eos_token="<|im_end|>",
+        pad_token="<|endoftext|>",
+    )
+    # pad_id must be a REAL index -- collators index with it.
+    assert 0 <= tok.pad_id < len(tok)
+    assert tok.eos_id == tok.convert_tokens_to_ids("<|im_end|>")
+    assert tok.unk_token_id == 0
+
+    # The dataset's out-of-vocabulary guard must be able to fire.
+    assert tok.convert_tokens_to_ids("<|definitely_not_a_token|>") == tok.unk_token_id
+    assert tok.convert_tokens_to_ids("<|vision_start|>") != tok.unk_token_id
+
+    ids = tok.text_to_ids("hello world")
+    assert tok.tokens_to_text(tok.ids_to_tokens(ids), remove_special_tokens=True) == "hello world"

@@ -101,7 +101,13 @@ class AsrVocabTokenizer:
     the id the ASR model gave it.
     """
 
-    def __init__(self, spm_path: str, special_tokens: Sequence[str] = (), eos_token: Optional[str] = None):
+    def __init__(
+        self,
+        spm_path: str,
+        special_tokens: Sequence[str] = (),
+        eos_token: Optional[str] = None,
+        pad_token: Optional[str] = None,
+    ):
         specials = list(dict.fromkeys(t for t in special_tokens if t))  # de-duplicate, keep order
         # legacy=True is the mode that allows appending special tokens BEYOND the
         # trained SentencePiece range; without it the class refuses them outright
@@ -110,6 +116,7 @@ class AsrVocabTokenizer:
         self._spm = SentencePieceTokenizer(model_path=spm_path, special_tokens=specials, legacy=True)
         self._specials = specials
         self._eos_token = eos_token
+        self._pad_token = pad_token or eos_token
         # `self.tokenizer` mirrors the HF wrapper attribute the call sites use.
         self.tokenizer = self
 
@@ -161,7 +168,49 @@ class AsrVocabTokenizer:
 
     @property
     def pad_token_id(self) -> Optional[int]:
+        return self.pad_id
+
+    # --- NeMo id accessors ---------------------------------------------------------
+    # This SentencePiece model declares no bos/eos/pad of its own (all -1), so
+    # they resolve through the carried-over donor specials instead. pad_id must
+    # be a REAL id: the collators pad with it, and -1 would index out of range.
+    @property
+    def pad_id(self) -> int:
+        if self._pad_token is None:
+            raise ValueError("AsrVocabTokenizer has no pad token; pass pad_token= or eos_token=")
+        return self._token_to_id(self._pad_token)
+
+    @property
+    def unk_token_id(self) -> int:
+        """SentencePiece's <unk>, id 0 here.
+
+        Exposed because the SCRIPT dataset validates its delimiters with
+        ``getattr(tok, "unk_token_id", None)`` and skips the check when it is
+        absent -- an out-of-vocabulary marker would then silently map to <unk>
+        and train against the wrong id.
+        """
+        return int(self._spm.tokenizer.unk_id())
+
+    @property
+    def unk_id(self) -> int:
+        return self.unk_token_id
+
+    @property
+    def eos_id(self) -> Optional[int]:
         return self.eos_token_id
+
+    @property
+    def bos_id(self) -> Optional[int]:
+        # No bos in this vocabulary; the SCRIPT/streaming path never uses one.
+        return None
+
+    def ids_to_tokens(self, ids) -> List[str]:
+        return [self._id_to_token(int(i)) for i in ids]
+
+    def tokens_to_text(self, tokens, remove_special_tokens: bool = False) -> str:
+        if remove_special_tokens:
+            tokens = [t for t in tokens if t not in self._spm.special_token_to_id]
+        return self._spm.tokens_to_text(list(tokens))
 
     def add_special_tokens(self, tokens) -> int:
         """Accepts HF's ``{"additional_special_tokens": [...]}`` or a bare list."""

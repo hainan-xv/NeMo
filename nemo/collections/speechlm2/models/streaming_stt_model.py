@@ -508,7 +508,9 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         specials = list(dict.fromkeys(list(donor_tok.get_added_vocab().keys()) + list(donor_tok.all_special_tokens)))
 
         spm_path = extract_spm_from_nemo(self.core_cfg.pretrained_asr, tempfile.mkdtemp(prefix="asr_vocab_"))
-        new_tok = AsrVocabTokenizer(spm_path, special_tokens=specials, eos_token=donor_tok.eos_token)
+        new_tok = AsrVocabTokenizer(
+            spm_path, special_tokens=specials, eos_token=donor_tok.eos_token, pad_token=donor_tok.pad_token
+        )
 
         # float32 for the averaging, then back to the model's dtype: the mean of
         # a few bf16 vectors loses precision that costs nothing to keep here.
