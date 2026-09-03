@@ -215,6 +215,12 @@ class ScriptSTTDataset(StreamingSTTDataset):
             )
 
         hf_tok = self.tokenizer.tokenizer
+
+        # Does a leading space become its own token? SentencePiece: yes (the
+        # boundary is already in the piece). Byte-level BPE: no (folded in).
+        self._leading_space_is_a_token = len(self.tokenizer.text_to_ids(" word")) > len(
+            self.tokenizer.text_to_ids("word")
+        )
         self.vision_start_id = hf_tok.convert_tokens_to_ids(self.audio_open_token)
         self.vision_end_id = hf_tok.convert_tokens_to_ids(self.audio_close_token)
         unk = getattr(hf_tok, "unk_token_id", None)
@@ -341,6 +347,32 @@ class ScriptSTTDataset(StreamingSTTDataset):
             self._control_rngs[wid] = np.random.default_rng(int(self.cfg.control_seed) + wid)
         return self._control_rngs[wid]
 
+    def _tokenize_target(self, text: str) -> List[int]:
+        """Tokenize a chunk's words, without a redundant word-start token.
+
+        SCRIPT marks a word start with a LEADING SPACE in the chunk text. Byte-
+        level BPE folds that into the token (" station" -> one token, Gstation),
+        but SentencePiece already encodes the boundary inside the piece
+        (U+2581 st), so the leading space becomes a separate, contentless token:
+
+            ' station' -> ['_', '_st', 'at', 'ion']     <- the bare '_' is spurious
+            'station'  -> ['_st', 'at', 'ion']
+
+        Trained on those targets the model learns to emit that bare separator, so
+        decoding yields "The  station" with a doubled space. Beyond the cosmetics
+        it wastes one token per chunk on a vocabulary already paying 1.62x in
+        length, shifts every within-chunk word position by one, and permanently
+        satisfies the force_word_start guard -- which then never fires when a
+        chunk really would merge onto the previous word.
+
+        So drop ONE leading space when, and only when, this tokenizer would turn
+        it into its own token. Probed behaviourally rather than by tokenizer
+        class, so it stays correct across families.
+        """
+        if self._leading_space_is_a_token and text.startswith(" "):
+            text = text[1:]
+        return self.tokenizer.text_to_ids(text)
+
     def _messages_to_chunks(self, messages: List[dict]) -> List[ChunkSpec]:
         """Parse alternating user(audio)/assistant(words) turns into ChunkSpecs.
 
@@ -367,7 +399,7 @@ class ScriptSTTDataset(StreamingSTTDataset):
             # The blank sentinel (including "" in no-blank mode) means a silent chunk.
             if words == self.cfg.blank_token:
                 words = ""
-            target_ids = self.tokenizer.text_to_ids(words) if words.strip() else []
+            target_ids = self._tokenize_target(words) if words.strip() else []
             # The gate goes on the BRANCH only; target_ids (which also feeds the
             # spine) stays the plain word sequence.
             gate = None
@@ -454,7 +486,7 @@ class ScriptSTTDataset(StreamingSTTDataset):
                 chunks = [
                     ChunkSpec(
                         audio_len=max(1, int(n_frames)),
-                        target_ids=self.tokenizer.text_to_ids(full_text) if full_text.strip() else [],
+                        target_ids=self._tokenize_target(full_text) if full_text.strip() else [],
                     )
                 ]
             else:

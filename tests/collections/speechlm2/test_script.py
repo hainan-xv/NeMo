@@ -3199,3 +3199,53 @@ def test_init_weights_from_refuses_a_checkpoint_that_matches_nothing(tmp_path):
     torch.save({"state_dict": {"totally.unrelated.weight": torch.zeros(3, 3)}}, ckpt)
     with pytest.raises(ValueError, match="matched NOTHING"):
         StreamingSTTModel._init_weights_from(model, str(ckpt))
+
+
+def test_leading_space_is_not_tokenised_twice_for_sentencepiece(tmp_path):
+    """SCRIPT's leading-space word-start marker must not become its own token.
+
+    Byte-level BPE folds the space into the token (" station" -> Gstation), but
+    SentencePiece already carries the boundary inside the piece, so the space
+    becomes a separate contentless token. Trained on those targets the model
+    emits it, and decoding doubles every chunk-boundary space
+    ("The  station"). It also wastes a token per chunk, shifts every
+    within-chunk word position by one, and permanently satisfies the
+    force_word_start guard so it can never fire.
+    """
+    from nemo.collections.speechlm2.parts.asr_vocab import AsrVocabTokenizer
+
+    tok = AsrVocabTokenizer(_asr_spm_path(tmp_path), special_tokens=["<|im_end|>"], eos_token="<|im_end|>")
+    mark = chr(0x2581)
+
+    # The premise: this tokenizer does turn a leading space into a token.
+    assert len(tok.text_to_ids(" word")) == len(tok.text_to_ids("word")) + 1
+    assert tok.convert_ids_to_tokens(tok.text_to_ids(" word")[0]) == mark
+
+    def target(text):  # what _tokenize_target does
+        return tok.text_to_ids(text[1:] if text.startswith(" ") else text)
+
+    chunks = ["The", " station is owned by Alpha", " Media."]
+    fixed = [i for c in chunks for i in target(c)]
+    naive = [i for c in chunks for i in tok.text_to_ids(c)]
+
+    assert tok.ids_to_text(fixed) == "The station is owned by Alpha Media."
+    assert tok.ids_to_text(naive) == "The  station is owned by Alpha  Media."  # the reported symptom
+    assert len(fixed) == len(naive) - 2  # one wasted token per chunk boundary
+    # No target may begin with the bare marker.
+    for c in chunks:
+        ids = target(c)
+        assert tok.convert_ids_to_tokens(ids[0]) != mark
+
+
+def test_leading_space_probe_leaves_byte_level_bpe_alone():
+    """The fix must be a no-op for Qwen, or every existing recipe changes."""
+    import glob
+
+    from transformers import AutoTokenizer
+
+    qdirs = glob.glob(os.path.expanduser("~/.cache/huggingface/hub/models--Qwen--Qwen3-1.7B/snapshots/*/"))
+    if not qdirs:
+        pytest.skip("Qwen3-1.7B not present in the local HF cache")
+    q = AutoTokenizer.from_pretrained(qdirs[0])
+    # Byte-level BPE folds the space in, so the probe is False and nothing is stripped.
+    assert len(q.encode(" word", add_special_tokens=False)) == len(q.encode("word", add_special_tokens=False))
