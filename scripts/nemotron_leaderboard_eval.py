@@ -159,24 +159,41 @@ def transcribe_offline(model, paths: List[str], batch_size: int) -> List[str]:
 def _per_step_emissions(step_texts, n_utts):
     """Per-utterance [[step_index, text_emitted_at_that_step], ...].
 
-    ``step_texts[t][u]`` is utterance u's CUMULATIVE transcript after step t, so
-    what step t emitted is the suffix beyond step t-1. Compared on the common
-    word prefix rather than by string slicing: RNN-T may revise its tail between
-    steps, and a raw suffix diff would then attribute the rewritten words to the
-    wrong step.
+    ``step_texts[t][u]`` is utterance u's CUMULATIVE transcript after step t.
+
+    RNN-T REVISES its tail between steps ("the eval" -> "the evaluation is"), so
+    an append-only diff emits the superseded words as well as their replacements
+    and the pieces no longer reconstruct the final transcript. Those phantom
+    words then align as insertions: on AMI this corrupted 42.7% of records and
+    inflated the measured insertion count roughly four-fold.
+
+    So carry a per-word owner list alongside the cumulative words: on each step
+    truncate both at the common prefix -- dropping whatever was revised away --
+    then attribute the new tail to the current step. The reconstruction is then
+    equal to the final transcript by construction, which
+    ``test_per_step_emissions_reconstructs_the_transcript`` asserts.
     """
     out = []
     for u in range(n_utts):
-        prev, per = [], []
+        words: List[str] = []
+        owner: List[int] = []
+        prev: List[str] = []
         for t, texts in enumerate(step_texts):
             cur = (texts[u] if u < len(texts) else "").split()
             c = 0
             while c < len(prev) and c < len(cur) and prev[c] == cur[c]:
                 c += 1
-            new = cur[c:]
-            if new:
-                per.append([t, " ".join(new)])
+            del words[c:]
+            del owner[c:]
+            words.extend(cur[c:])
+            owner.extend([t] * (len(cur) - c))
             prev = cur
+        per: List[list] = []
+        for w, o in zip(words, owner):
+            if per and per[-1][0] == o:
+                per[-1][1] += " " + w
+            else:
+                per.append([o, w])
         out.append(per)
     return out
 

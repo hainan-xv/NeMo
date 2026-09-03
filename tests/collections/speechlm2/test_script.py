@@ -2789,3 +2789,185 @@ def test_sample_token_treats_none_knobs_as_disabled(do_sample):
     if not do_sample:
         # Disabled knobs must leave the greedy result untouched.
         torch.testing.assert_close(out, logits.argmax(dim=-1))
+
+
+def test_per_step_emissions_reconstructs_the_transcript():
+    """RNN-T per-step attribution must not invent words.
+
+    The decoder REVISES its tail between streaming steps, so an append-only diff
+    of consecutive cumulative transcripts emits both the superseded words and
+    their replacements. Those phantoms align as insertions -- on AMI that
+    corrupted 42.7% of records and inflated the insertion count ~4x. The
+    invariant that catches it: the per-step pieces must concatenate back to the
+    final cumulative transcript.
+    """
+    import importlib.util
+    import pathlib
+
+    src = pathlib.Path(__file__).resolve().parents[3] / "scripts" / "nemotron_leaderboard_eval.py"
+    text = src.read_text()
+    start = text.index("def _per_step_emissions(")
+    ns = {"List": list}
+    exec(text[start : text.index("\n\n\n", start)], ns)  # noqa: S102 - test-only extraction
+    per_step = ns["_per_step_emissions"]
+
+    cases = [
+        (["the eval", "the evaluation is"], "the evaluation is"),  # tail revised
+        (["Okay", "Okay."], "Okay."),  # last word rewritten
+        (["a", "a b", "a b c"], "a b c"),  # pure append
+        (["", "", "hi there"], "hi there"),  # silent leading steps
+        (["x y z", "x q"], "x q"),  # tail shortened AND changed
+    ]
+    for steps, expected in cases:
+        out = per_step([[s] for s in steps], 1)[0]
+        assert " ".join(t for _, t in out).split() == expected.split(), f"{steps} -> {out}"
+        # Steps must be non-decreasing and each word owned by exactly one step.
+        assert [k for k, _ in out] == sorted(k for k, _ in out)
+
+
+# ======================================================================
+# Position-dependent emission penalty (inference-only)
+# ======================================================================
+
+
+def test_emission_penalty_schedule_repeats_its_last_value():
+    from nemo.collections.speechlm2.parts.script import emission_penalty_at
+
+    sched = [0.0, 0.5, 2.0]
+    assert [emission_penalty_at(k, 0.0, sched) for k in range(5)] == [0.0, 0.5, 2.0, 2.0, 2.0]
+    # Absent / empty must be a hard no-op, not a zero-length lookup error.
+    assert emission_penalty_at(0, 0.0, None) == 0.0
+    assert emission_penalty_at(7, 0.0, []) == 0.0
+    # Linear form: first word always free, each later one costs lam more.
+    assert [emission_penalty_at(k, 0.5) for k in range(4)] == [0.0, 0.5, 1.0, 1.5]
+    assert [emission_penalty_at(k, 0.0) for k in range(4)] == [0.0] * 4
+    # An explicit schedule takes precedence over lam.
+    assert emission_penalty_at(3, 99.0, [0.0, 0.25]) == 0.25
+
+
+@torch.no_grad()
+def test_emission_penalty_off_is_bit_identical():
+    """Default (None) must not perturb decoding at all."""
+    model = _tiny_qwen3()
+    H = model.config.hidden_size
+    torch.manual_seed(4)
+    frames = torch.randn(12, H)
+
+    def run(pen):
+        return batched_stream_decode_script(
+            llm=model,
+            embed_tokens=model.get_input_embeddings(),
+            instruction_ids_list=[[5, 6]],
+            frames_list=[frames],
+            chunk_size=4,
+            vision_start_id=VS,
+            vision_end_id=VE,
+            eot_id=EOT,
+            pad_id=0,
+            max_new_tokens=6,
+            emission_penalty=pen,
+        )[0]
+
+    base = run(None)
+    assert run([]) == base, "empty schedule changed the output"
+    assert run([0.0, 0.0, 0.0]) == base, "all-zero schedule changed the output"
+
+
+@torch.no_grad()
+def test_emission_penalty_shortens_chunks_monotonically():
+    """A larger penalty must never make a chunk emit MORE words."""
+    model = _tiny_qwen3()
+    H = model.config.hidden_size
+    torch.manual_seed(4)
+    frames = torch.randn(20, H)
+
+    lens = []
+    for p in (0.0, 2.0, 10.0, 1e4):
+        out = batched_stream_decode_script(
+            llm=model,
+            embed_tokens=model.get_input_embeddings(),
+            instruction_ids_list=[[5, 6]],
+            frames_list=[frames],
+            chunk_size=4,
+            vision_start_id=VS,
+            vision_end_id=VE,
+            eot_id=EOT,
+            pad_id=0,
+            max_new_tokens=6,
+            emission_penalty=[p],
+        )[0]
+        lens.append(len(out))
+    assert lens == sorted(lens, reverse=True), f"not monotone in penalty: {lens}"
+    assert lens[-1] == 0, "an overwhelming penalty must stop every chunk immediately"
+
+
+@torch.no_grad()
+def test_emission_penalty_is_position_dependent():
+    """The whole point: position 0 and position 1 must be controllable apart.
+
+    A schedule that is free at the first word but prohibitive afterwards should
+    leave at most one word per chunk, while the flat-zero schedule does not.
+    """
+    model = _tiny_qwen3()
+    H = model.config.hidden_size
+    torch.manual_seed(4)
+    frames = torch.randn(20, H)
+
+    def run(pen):
+        return batched_stream_decode_script(
+            llm=model,
+            embed_tokens=model.get_input_embeddings(),
+            instruction_ids_list=[[5, 6]],
+            frames_list=[frames],
+            chunk_size=4,
+            vision_start_id=VS,
+            vision_end_id=VE,
+            eot_id=EOT,
+            pad_id=0,
+            max_new_tokens=6,
+            return_chunk_ids=True,
+            emission_penalty=pen,
+        )
+
+    _, free_ids = run([0.0])
+    toks, gated_ids = run([0.0, 1e4])
+    from collections import Counter
+
+    per_chunk_gated = Counter(gated_ids[0])
+    assert per_chunk_gated and max(per_chunk_gated.values()) <= 1, f"expected <=1 word/chunk, got {per_chunk_gated}"
+    assert max(Counter(free_ids[0]).values()) > 1, "baseline should emit multi-word chunks for this to be meaningful"
+
+
+@torch.no_grad()
+def test_emission_penalty_lambda_matches_the_equivalent_schedule():
+    """lam=L must decode identically to the explicit ramp [0, L, 2L, ...].
+
+    The two forms are one code path with two front-ends; if they ever diverge,
+    a swept lambda would not mean what the ablation schedules meant.
+    """
+    model = _tiny_qwen3()
+    H = model.config.hidden_size
+    torch.manual_seed(4)
+    frames = torch.randn(20, H)
+
+    def run(**kw):
+        return batched_stream_decode_script(
+            llm=model,
+            embed_tokens=model.get_input_embeddings(),
+            instruction_ids_list=[[5, 6]],
+            frames_list=[frames],
+            chunk_size=4,
+            vision_start_id=VS,
+            vision_end_id=VE,
+            eot_id=EOT,
+            pad_id=0,
+            max_new_tokens=6,
+            **kw,
+        )[0]
+
+    lam = 0.5
+    # max_new_tokens=6 bounds the words per chunk, so 8 entries cover every position.
+    equivalent = [k * lam for k in range(8)]
+    assert run(emission_penalty_lambda=lam) == run(emission_penalty=equivalent)
+    # lam=0 is off.
+    assert run(emission_penalty_lambda=0.0) == run()

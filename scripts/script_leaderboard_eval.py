@@ -183,6 +183,10 @@ def build_gen_kwargs(args) -> dict:
         kwargs["max_history_tokens"] = args.max_history_tokens
     if args.emit_chunk_ids:
         kwargs["return_chunk_ids"] = True
+    if args.emission_penalty_lambda:
+        kwargs["emission_penalty_lambda"] = args.emission_penalty_lambda
+    if args.emission_penalty:
+        kwargs["emission_penalty"] = args.emission_penalty
     # Prompt-control knobs are forwarded ONLY when explicitly requested. A
     # non-prompt-controlled model raises on them, which is what we want: it means
     # "this checkpoint cannot honour that request" rather than silently ignoring it.
@@ -303,6 +307,26 @@ def parse_args():
     )
     p.add_argument(
         "--max_history_tokens", type=int, default=0, help="cap conditioning history; 0 = model config default"
+    )
+    p.add_argument(
+        "--emission_penalty_lambda",
+        type=float,
+        default=0.0,
+        help=(
+            "position-dependent word-insertion penalty, linear form: the k-th word of a chunk "
+            "(0-based) gets a logit bonus of k*lambda on <eot>. 0 = off. This is the knob to use"
+        ),
+    )
+    p.add_argument(
+        "--emission_penalty",
+        type=float,
+        nargs="+",
+        default=None,
+        help=(
+            "position-dependent word-insertion penalty: logit bonus added to <eot> before the "
+            "1st, 2nd, ... word of each chunk (last value repeats). e.g. '0 0.5 1.0'. "
+            "Inference-only; omit for unchanged behaviour"
+        ),
     )
     p.add_argument(
         "--emit_chunk_ids",

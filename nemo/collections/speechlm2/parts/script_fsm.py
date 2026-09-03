@@ -55,7 +55,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from nemo.collections.speechlm2.parts.script import AUDIO_TOKEN_IDX, audio_window_start
+from nemo.collections.speechlm2.parts.script import AUDIO_TOKEN_IDX, BRANCH_SCHEME, audio_window_start
 
 
 @torch.no_grad()
@@ -163,6 +163,7 @@ def fsm_stream_decode_script(
     read_id: Optional[int] = None,
     write_id: Optional[int] = None,
     gate_in_history: bool = False,
+    position_scheme: str = BRANCH_SCHEME,
 ):
     """Per-stream state machine over SCRIPT's chunk structure.
 
@@ -170,6 +171,17 @@ def fsm_stream_decode_script(
     ``p(words_k | text_history_<k, audio_k)`` -- but advanced through explicit
     states, one token per step, rather than prefilled in bulk.
     """
+    if position_scheme != BRANCH_SCHEME:
+        # This path lays out positions branch-style (the branch starts right
+        # after the history). A continuous-scheme checkpoint expects its branch
+        # shifted left by window+2; decoding it here would silently apply the
+        # wrong RoPE geometry and look like a quality regression rather than a
+        # configuration error.
+        raise NotImplementedError(
+            f"fsm_stream_decode_script only implements position_scheme='{BRANCH_SCHEME}', "
+            f"got '{position_scheme}'. Use the default decode path for that checkpoint."
+        )
+
     B = len(frames_list)
     if B == 0:
         return []

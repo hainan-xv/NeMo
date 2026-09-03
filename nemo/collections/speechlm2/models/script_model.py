@@ -935,6 +935,12 @@ class ScriptSTTModel(StreamingSTTModel):
         # Same instruction/history separator the dataset uses when building the spine.
         instruction_ids_list = [self.tokenizer.text_to_ids(system_prompt[b] + "\n") for b in range(B)]
 
+        # Inference-only: a per-emission-index word-insertion penalty (bonus on
+        # <eot>). Popped here so a model that ignores it never sees the kwarg.
+        emission_penalty_lambda = float(generation_kwargs.pop("emission_penalty_lambda", 0.0) or 0.0)
+        emission_penalty = generation_kwargs.pop("emission_penalty", None)
+        if emission_penalty is not None:
+            emission_penalty = [float(x) for x in emission_penalty]
         return_chunk_ids = bool(generation_kwargs.pop("return_chunk_ids", False))
         if return_chunk_ids and state_machine:
             raise ValueError(
@@ -973,6 +979,8 @@ class ScriptSTTModel(StreamingSTTModel):
             insert_word_start_id=insert_word_start_id,
             **({"bidirectional_audio": True} if self._bidirectional_audio else {}),
             **({"return_chunk_ids": True} if return_chunk_ids else {}),
+            **({"emission_penalty": emission_penalty} if emission_penalty else {}),
+            **({"emission_penalty_lambda": emission_penalty_lambda} if emission_penalty_lambda else {}),
         )
         chunk_ids = None
         if return_chunk_ids:
