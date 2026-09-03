@@ -3087,3 +3087,41 @@ def test_asr_vocab_exposes_the_nemo_and_hf_attributes_the_pipeline_uses(tmp_path
 
     ids = tok.text_to_ids("hello world")
     assert tok.tokens_to_text(tok.ids_to_tokens(ids), remove_special_tokens=True) == "hello world"
+
+
+def test_asr_vocab_covers_every_tokenizer_attribute_speechlm2_uses():
+    """The swap is only safe if the wrapper covers the WHOLE interface.
+
+    Both cluster jobs died on ``AttributeError: 'AsrVocabTokenizer' object has no
+    attribute 'encode'`` because the original audit checked four files by hand
+    and missed callers elsewhere in the package. Derive the requirement from the
+    source instead, so a newly-used attribute fails here rather than an hour into
+    a run.
+    """
+    import pathlib
+    import re
+
+    from nemo.collections.speechlm2.parts.asr_vocab import AsrVocabTokenizer
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "nemo" / "collections" / "speechlm2"
+    used = set()
+    for f in root.rglob("*.py"):
+        text = f.read_text()
+        used |= set(re.findall(r"tokenizer\.tokenizer\.([a-zA-Z_]+)", text))
+        used |= set(re.findall(r"self\.tokenizer\.([a-zA-Z_]+)", text))
+    used.discard("tokenizer")  # the self-reference the wrapper provides
+
+    missing = sorted(a for a in used if not hasattr(AsrVocabTokenizer, a))
+    assert not missing, f"AsrVocabTokenizer is missing attributes speechlm2 uses: {missing}"
+
+
+def test_asr_vocab_encode_matches_text_to_ids(tmp_path):
+    """`encode` is the HF spelling of `text_to_ids`; they must not diverge."""
+    from nemo.collections.speechlm2.parts.asr_vocab import AsrVocabTokenizer
+
+    tok = AsrVocabTokenizer(_asr_spm_path(tmp_path), special_tokens=["<|im_end|>"], eos_token="<|im_end|>")
+    for text in ("hello world", "the evaluation is complete", "<audio><audio>"):
+        assert tok.encode(text, add_special_tokens=False) == tok.text_to_ids(text)
+    v = tok.get_vocab()
+    assert len(v) == len(tok) and v is tok.get_vocab(), "get_vocab must be complete and cached"
+    assert tok.decode(tok.encode("hello world")) == "hello world"

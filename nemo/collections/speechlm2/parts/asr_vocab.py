@@ -117,6 +117,7 @@ class AsrVocabTokenizer:
         self._specials = specials
         self._eos_token = eos_token
         self._pad_token = pad_token or eos_token
+        self._vocab_cache: Optional[Dict[str, int]] = None
         # `self.tokenizer` mirrors the HF wrapper attribute the call sites use.
         self.tokenizer = self
 
@@ -138,6 +139,30 @@ class AsrVocabTokenizer:
         return self._spm.vocab_size
 
     # --- HuggingFace-shaped interface ---------------------------------------------
+    def encode(self, text: str, add_special_tokens: bool = False, **kwargs) -> List[int]:
+        """HF-style alias for :meth:`text_to_ids`.
+
+        ``add_special_tokens`` is accepted and ignored: this tokenizer never
+        prepends bos/eos of its own, so False (what every call site passes) is
+        already the behaviour.
+        """
+        return self.text_to_ids(text)
+
+    def decode(self, ids, skip_special_tokens: bool = False, **kwargs) -> str:
+        if skip_special_tokens:
+            ids = [i for i in ids if int(i) not in self._spm.id_to_special_token]
+        return self.ids_to_text(ids)
+
+    def get_vocab(self) -> Dict[str, int]:
+        """token -> id for the whole vocabulary, built once and cached."""
+        if self._vocab_cache is None:
+            self._vocab_cache = {self._id_to_token(i): i for i in range(len(self))}
+        return self._vocab_cache
+
+    @property
+    def vocab(self) -> Dict[str, int]:
+        return self.get_vocab()
+
     def convert_tokens_to_ids(self, tokens):
         if isinstance(tokens, str):
             return self._token_to_id(tokens)
@@ -180,6 +205,32 @@ class AsrVocabTokenizer:
             raise ValueError("AsrVocabTokenizer has no pad token; pass pad_token= or eos_token=")
         return self._token_to_id(self._pad_token)
 
+    # NeMo tokenizers expose the token STRINGS as bos/eos/pad and the ids as
+    # bos_id/eos_id/pad_id; HF uses *_token / *_token_id. Both spellings appear
+    # across speechlm2, so both are provided.
+    @property
+    def eos(self) -> Optional[str]:
+        return self._eos_token
+
+    @property
+    def pad(self) -> Optional[str]:
+        return self._pad_token
+
+    @property
+    def bos(self) -> None:
+        return None
+
+    @property
+    def bos_token(self) -> None:
+        return None
+
+    @property
+    def pad_token(self) -> Optional[str]:
+        return self._pad_token
+
+    def token_to_id(self, token: str) -> int:
+        return self._token_to_id(token)
+
     @property
     def unk_token_id(self) -> int:
         """SentencePiece's <unk>, id 0 here.
@@ -220,6 +271,7 @@ class AsrVocabTokenizer:
         if new:
             self._spm.add_special_tokens(new)
             self._specials.extend(new)
+            self._vocab_cache = None  # ids shifted; a stale map would silently mis-resolve
         return len(new)
 
 
