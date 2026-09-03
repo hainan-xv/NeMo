@@ -100,7 +100,7 @@ CONTAINER="/lustre/fsw/portfolios/llmservice/users/heh/containers/nemo-26.02-str
 PROJECT_NAME=SpeechlmScriptCC
 
 # --- Training parameters ---
-MAX_STEPS="${MAX_STEPS:-300000}"
+MAX_STEPS="${MAX_STEPS:-400000}"
 VAL_CHECK_INTERVAL="${VAL_CHECK_INTERVAL:-4000}"
 LR="${LR:-0.0001}"
 WARMUP_STEPS="${WARMUP_STEPS:-10000}"
@@ -172,8 +172,8 @@ ERRFILE=${RESULTS_DIR}/error-%j-%n.out
 # Empty INIT_CKPT with a set INIT_EXP auto-resolves that run's latest checkpoint.
 # INIT_CKPT=none trains from the base pretrained LLM + ASR. resume_if_exists=true
 # means this only seeds the FIRST launch; relaunches resume this run's own ckpts.
-INIT_EXP="${INIT_EXP:-}"
-INIT_CKPT="${INIT_CKPT:-none}"
+INIT_EXP="${INIT_EXP:-granary2_script_baseline}"
+INIT_CKPT="${INIT_CKPT:-}"
 if [[ -z "$INIT_CKPT" && -n "$INIT_EXP" ]]; then
     _INIT_DIR="${OUTPUT_PREFIX}/results/${PROJECT_NAME}/${INIT_EXP}/${INIT_EXP}/checkpoints"
     INIT_CKPT="$(ls -t "${_INIT_DIR}"/*-last.ckpt 2>/dev/null | head -1)"
@@ -186,21 +186,9 @@ if [[ -z "$INIT_CKPT" && -n "$INIT_EXP" ]]; then
     fi
 fi
 
-# A warm start restores the FULL training state, global_step included. If the
-# parent is already at or past MAX_STEPS this run has nothing to do: Lightning
-# prints "max_steps reached", exits 0 after ~3 minutes, and Slurm reports
-# COMPLETED with no checkpoints -- a failure that looks like a success. Job
-# 12865606 died exactly this way. Fail loudly instead.
-if [[ -n "$INIT_CKPT" && "$INIT_CKPT" != "none" ]]; then
-    _INIT_STEP="$(basename "$INIT_CKPT" | grep -oE 'step=[0-9]+' | head -1 | cut -d= -f2)"
-    if [[ -n "$_INIT_STEP" && "$_INIT_STEP" -ge "$MAX_STEPS" ]]; then
-        echo "ERROR: warm-start checkpoint is at step ${_INIT_STEP}, but MAX_STEPS=${MAX_STEPS}." >&2
-        echo "       resume_from_checkpoint restores global_step, so training would stop" >&2
-        echo "       immediately and the job would exit 0 having trained nothing." >&2
-        echo "       Raise it:  MAX_STEPS=$((_INIT_STEP + 100000)) ./oci_launch.sh <this script>" >&2
-        exit 1
-    fi
-fi
+# NOTE: the max-steps guard used by the other launchers does not apply here --
+# this is a weights-only init with a fresh step counter, so a donor at 300k
+# steps does not exhaust MAX_STEPS.
 # Checkpoint filenames contain '=' (step=..-val_wer=..), which breaks Hydra
 # override parsing, and they live outside the mounted dirs. Expose one through a
 # clean-named symlink under the (mounted) results dir and mount its source dir.
@@ -209,7 +197,16 @@ INIT_MOUNT=""
 if [[ -n "$INIT_CKPT" && "$INIT_CKPT" != "none" ]]; then
     ln -sfn "$INIT_CKPT" "${RESULTS_DIR}/init_from.ckpt"
     INIT_MOUNT="$(dirname "$INIT_CKPT")"
-    INIT_CKPT_ARG="++exp_manager.resume_from_checkpoint=/results/init_from.ckpt"
+    # WEIGHTS ONLY, not exp_manager.resume_from_checkpoint: the embedding and the
+    # tied head have different shapes under the ASR vocabulary (1050 vs 151936
+    # rows), so a full resume would fail on shape mismatch -- and its optimizer
+    # moments for those tensors would be meaningless anyway. This inherits the
+    # 1061 shape-compatible tensors (LLM body, LoRA, encoder, projections) and
+    # leaves the two vocabulary tensors at their donor-averaged init.
+    #
+    # It also means the STEP COUNTER STARTS AT 0, so MAX_STEPS is this run's own
+    # budget rather than a continuation of the donor's.
+    INIT_CKPT_ARG="++model.init_weights_from=/results/init_from.ckpt"
 fi
 
 MOUNTS="--container-mounts=${DATA_DIR}:${DATA_DIR},${H_DIR}:${H_DIR},$HAINAN_DIR:$HAINAN_DIR,$CODE_DIR:/code,$RESULTS_DIR:/results,$DATA_DIR:/data,$PRETRAINED_MODEL_DIR:/pretrained,$CHECKPOINT_DIR:/checkpoints,${QUESTIONS_DIR}:/questions/,${HFCACHE}:/hfcache/,$DONGJI_ROOT:$DONGJI_ROOT${INIT_MOUNT:+,${INIT_MOUNT}:${INIT_MOUNT}}"

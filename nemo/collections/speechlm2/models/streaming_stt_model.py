@@ -288,6 +288,11 @@ class StreamingSTTModelConfig:
     # default: existing checkpoints keep Qwen's tokenizer, ids and embeddings
     # untouched. See parts/asr_vocab.py for the trade-offs.
     text_vocab_from_asr: bool = False
+    # Warm-start WEIGHTS ONLY from a checkpoint, skipping tensors whose shape no
+    # longer matches (e.g. the embedding and tied head after a vocabulary swap).
+    # Unlike exp_manager.resume_from_checkpoint this restores no optimizer state
+    # and no step counter, so max_steps counts THIS run's steps.
+    init_weights_from: str = ""
 
 
 @dataclass
@@ -440,6 +445,9 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
 
         self._setup_forced_aligner(forced_aligner, data_cfg, val_data_cfg, dataset_cls)
 
+        if getattr(self.core_cfg, "init_weights_from", ""):
+            self._init_weights_from(self.core_cfg.init_weights_from)
+
         logging.info("\n" + str(ModelSummary(self, max_depth=2)))
 
     # ------------------------------------------------------------------
@@ -473,6 +481,51 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         else:
             self._chunk_size_candidates = None
             self._chunk_size_repr = int(cs)
+
+    def _init_weights_from(self, path: str) -> None:
+        """Load compatible weights from a checkpoint, skipping the rest.
+
+        For warm-starting across a change that alters some parameter SHAPES --
+        the ASR-vocabulary swap replaces a (151936, 2048) embedding and tied head
+        with (1050, 2048) -- everything else (LLM body, LoRA adapters, encoder,
+        projections) is unchanged and worth inheriting.
+
+        Deliberately weights-only: no optimizer state (its moments for the
+        replaced tensors are meaningless, and it is keyed by parameter index,
+        which shifts) and no step counter, so ``max_steps`` counts this run's
+        steps rather than continuing the donor's.
+
+        Shape-mismatched and missing tensors are REPORTED, not silently dropped:
+        a warm start that quietly inherits nothing looks like a bad
+        initialisation rather than a broken path.
+        """
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
+        src = ckpt.get("state_dict", ckpt)
+        own = self.state_dict()
+
+        keep, mismatched, unexpected = {}, [], []
+        for k, v in src.items():
+            if k not in own:
+                unexpected.append(k)
+            elif hasattr(v, "shape") and tuple(v.shape) != tuple(own[k].shape):
+                mismatched.append((k, tuple(v.shape), tuple(own[k].shape)))
+            else:
+                keep[k] = v
+        missing = [k for k in own if k not in keep]
+
+        self.load_state_dict(keep, strict=False)
+        logging.info(
+            f"init_weights_from({path}): loaded {len(keep)}/{len(own)} tensors; "
+            f"{len(mismatched)} shape-mismatched, {len(missing)} left at their initial values, "
+            f"{len(unexpected)} unexpected in the checkpoint."
+        )
+        for k, got, want in mismatched[:8]:
+            logging.info(f"  shape mismatch, kept as initialised: {k} ckpt{got} != model{want}")
+        if not keep:
+            raise ValueError(
+                f"init_weights_from({path}) matched NOTHING -- every key was unexpected or "
+                f"mismatched. Check that the checkpoint is for this architecture."
+            )
 
     def _swap_to_asr_vocab(self) -> None:
         """Replace the LLM's text vocabulary with the ASR encoder's.

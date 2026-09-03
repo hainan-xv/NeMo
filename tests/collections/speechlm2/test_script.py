@@ -3152,3 +3152,50 @@ def test_asr_vocab_is_a_tokenizer_spec_and_dispatches_like_the_baseline(tmp_path
     text = "the evaluation is complete"
     assert wrapper(text, None) == tok.text_to_ids(text)  # how the dataloader calls it
     assert tok.tokens_to_ids(tok.text_to_tokens(text)) == tok.text_to_ids(text)
+
+
+def test_init_weights_from_skips_shape_mismatches(tmp_path):
+    """Warm-starting across a vocabulary change must inherit the compatible parts.
+
+    The embedding and tied head change shape (151936 -> 1050 rows); everything
+    else -- LLM body, LoRA adapters, encoder -- is unchanged and worth keeping.
+    A full resume would fail outright on the mismatch, so this path filters and
+    REPORTS rather than silently loading nothing.
+    """
+    import torch.nn as nn
+
+    from nemo.collections.speechlm2.models.streaming_stt_model import StreamingSTTModel
+
+    class _Tiny(nn.Module):
+        def __init__(self, vocab):
+            super().__init__()
+            self.embed_tokens = nn.Embedding(vocab, 4)
+            self.body = nn.Linear(4, 4)
+
+    donor, model = _Tiny(50), _Tiny(7)
+    with torch.no_grad():
+        donor.body.weight.fill_(1.234)
+    ckpt = tmp_path / "donor.ckpt"
+    torch.save({"state_dict": donor.state_dict()}, ckpt)
+
+    before = model.embed_tokens.weight.clone()
+    StreamingSTTModel._init_weights_from(model, str(ckpt))
+
+    # compatible tensor inherited...
+    torch.testing.assert_close(model.body.weight, donor.body.weight)
+    # ...mismatched one left exactly as initialised
+    assert model.embed_tokens.weight.shape == (7, 4)
+    torch.testing.assert_close(model.embed_tokens.weight, before)
+
+
+def test_init_weights_from_refuses_a_checkpoint_that_matches_nothing(tmp_path):
+    """A warm start that inherits nothing must fail loudly, not look like bad init."""
+    import torch.nn as nn
+
+    from nemo.collections.speechlm2.models.streaming_stt_model import StreamingSTTModel
+
+    model = nn.Linear(4, 4)
+    ckpt = tmp_path / "unrelated.ckpt"
+    torch.save({"state_dict": {"totally.unrelated.weight": torch.zeros(3, 3)}}, ckpt)
+    with pytest.raises(ValueError, match="matched NOTHING"):
+        StreamingSTTModel._init_weights_from(model, str(ckpt))
