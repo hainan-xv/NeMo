@@ -103,7 +103,12 @@ VAL_CHECK_INTERVAL="${VAL_CHECK_INTERVAL:-16000}"
 LOG_TRAIN_DECODE_EVERY="${LOG_TRAIN_DECODE_EVERY:-500}"
 LOG_TRAIN_DECODE_N="${LOG_TRAIN_DECODE_N:-2}"
 LR="${LR:-0.0001}"
-WARMUP_STEPS="${WARMUP_STEPS:-10000}"
+# 2500, the recipe's own value. The previous 10000 was inherited from the SCRIPT
+# launcher, where a 1.7B LLM genuinely needs a long warmup. CHAT has no LLM, and
+# with a 16000-step epoch a 10000-step warmup meant most of "epoch 0" ran at a
+# fraction of the target learning rate -- which on its own makes convergence look
+# far slower than a normal RNN-T fine-tune.
+WARMUP_STEPS="${WARMUP_STEPS:-2500}"
 
 # --- SCRIPT operating point ---
 DELAY="${DELAY:-3}"

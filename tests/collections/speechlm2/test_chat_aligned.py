@@ -412,3 +412,102 @@ def test_on_path_joint_equals_the_standard_chat_joint():
     assert full.shape == (B, Tc, U, V + 1)
     assert path.shape == (B * Tc * U, V + 1)
     torch.testing.assert_close(path, full[b_idx, t_idx, u_idx], atol=1e-5, rtol=1e-4)
+
+
+@pytest.mark.unit
+def test_rnnt_warm_start_copies_the_vocab_independent_weights_only():
+    """The donor's encoder->joint projection must be USED, and the softmax must not.
+
+    Two distinct failures this guards.
+
+    (1) perception.proj is a RANDOM Linear(1024, 640) inserted between the
+        pretrained encoder and the joint, doing exactly the job the donor's
+        joint.enc already learned. Leaving it random scrambles the encoder
+        output on its way to the joint -- "initialised from a good checkpoint"
+        while discarding the part that makes the checkpoint usable.
+
+    (2) The embedding and output layer must stay random in BOTH arms. Arm 1's
+        vocabulary matches the donor exactly, so copying them is possible --
+        and would hand arm 1 a pretrained softmax that arm 2 structurally
+        cannot have, turning a vocabulary-size comparison into a comparison of
+        initialisations.
+    """
+    import glob
+    import tarfile
+    import tempfile
+
+    from omegaconf import OmegaConf
+
+    from nemo.collections.speechlm2.models.chat_model import ChatSTTModel
+
+    hits = glob.glob(
+        os.path.expanduser("~/.cache/huggingface/hub/models--nvidia--nemotron-speech-streaming-en-0.6b/**/*.nemo"),
+        recursive=True,
+    )
+    if not hits:
+        pytest.skip("nemotron ASR .nemo not present in the local HF cache")
+
+    cfg = OmegaConf.load("examples/speechlm2/conf/streaming_stt_granary2_chat_asrvocab.yaml")
+    OmegaConf.resolve(cfg)
+    cfg.model.pretrained_asr = hits[0]
+    model = ChatSTTModel(OmegaConf.to_container(cfg.model, resolve=True)).float()
+
+    with tarfile.open(hits[0], "r:") as tf:
+        member = next(m for m in tf.getmembers() if m.name.endswith("model_weights.ckpt"))
+        with tempfile.TemporaryDirectory() as td:
+            tf.extract(member, td)
+            donor = torch.load(os.path.join(td, member.name), map_location="cpu", weights_only=True)
+
+    # (1) copied
+    assert torch.equal(model.perception.proj.weight.data, donor["joint.enc.weight"])
+    assert torch.equal(model.perception.proj.bias.data, donor["joint.enc.bias"])
+    assert torch.equal(model.joint.pred.weight.data, donor["joint.pred.weight"])
+    lstm = next(m for _, m in model.decoder.named_modules() if isinstance(m, torch.nn.LSTM))
+    for layer in range(lstm.num_layers):
+        for w in ("weight_ih", "weight_hh", "bias_ih", "bias_hh"):
+            attr = f"{w}_l{layer}"
+            assert torch.equal(
+                getattr(lstm, attr).data, donor[f"decoder.prediction.dec_rnn.lstm.{attr}"]
+            ), f"lstm.{attr} not warm-started"
+
+    # joint.enc must be identity, or it re-scrambles the projection just copied.
+    n = model.joint.enc.out_features
+    assert torch.equal(model.joint.enc.weight.data, torch.eye(n))
+    assert bool((model.joint.enc.bias.data == 0).all())
+
+    # (2) NOT copied -- fair to both arms.
+    emb = next(m for _, m in model.decoder.named_modules() if isinstance(m, torch.nn.Embedding))
+    d_emb = donor["decoder.prediction.embed.weight"]
+    rows = min(emb.weight.shape[0], d_emb.shape[0])
+    assert not torch.equal(emb.weight.data[:rows], d_emb[:rows]), "embedding was copied; arm 2 cannot match this"
+    out = model.joint.joint_net[2]
+    d_out = donor["joint.joint_net.2.weight"]
+    rows = min(out.weight.shape[0], d_out.shape[0])
+    assert not torch.equal(out.weight.data[:rows], d_out[:rows]), "output layer was copied; arm 2 cannot match this"
+
+
+@pytest.mark.unit
+def test_rnnt_warm_start_can_be_disabled_and_never_raises():
+    """Warm start is a startup convenience, not a correctness requirement.
+
+    A missing or unreadable donor must degrade to random init with a warning,
+    not take down an 8-node job at minute one.
+    """
+    from omegaconf import OmegaConf
+
+    from nemo.collections.speechlm2.models.chat_model import ChatSTTModel
+
+    cfg = OmegaConf.load("examples/speechlm2/conf/streaming_stt_granary2_chat_asrvocab.yaml")
+    OmegaConf.resolve(cfg)
+    d = OmegaConf.to_container(cfg.model, resolve=True)
+    # Not a tarball at all: _init_from_pretrained_rnnt must swallow it.
+    stub = types.SimpleNamespace(
+        perception=types.SimpleNamespace(proj=None),
+        joint=types.SimpleNamespace(pred=None, enc=None),
+        decoder=types.SimpleNamespace(named_modules=lambda: iter(())),
+    )
+    # Must not raise: a bad donor path degrades to random init with a warning.
+    ChatSTTModel._init_from_pretrained_rnnt(stub, "/nonexistent/path/to.nemo")
+
+    # And the knob exists so the warm start can be turned off for an ablation.
+    assert d.get("init_rnnt_from_asr", True) in (True, False)

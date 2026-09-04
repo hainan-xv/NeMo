@@ -43,6 +43,7 @@ convenient. That is the same deliberate trade the SpeechLM makes to keep
 streaming latency controllable.
 """
 
+import os
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Optional
@@ -145,6 +146,125 @@ class ChatSTTModel(LightningModule):
             f"ChatSTTModel: vocab={V} (+1 blank), chunk_size={self.chunk_size}, "
             f"att_context_size={att}, joint_hidden={self.core_cfg.joint_hidden}"
         )
+
+        if self.cfg.get("init_rnnt_from_asr", True) and self.core_cfg.pretrained_asr:
+            self._init_from_pretrained_rnnt(self.core_cfg.pretrained_asr)
+
+    def _init_from_pretrained_rnnt(self, nemo_path: str) -> None:
+        """Warm-start the VOCABULARY-INDEPENDENT parts of the pretrained RNN-T.
+
+        Loading only the encoder wastes most of a checkpoint that is otherwise
+        shape-compatible, and worse, actively damages the part we do load. The
+        pretrained model maps its 1024-d encoder into the joint's 640-d space
+        with ``joint.enc``; we replaced that learned projection with a RANDOM
+        ``perception.proj`` of exactly the same shape, so the encoder's output
+        arrives at the joint scrambled. "Initialised from a good checkpoint" was
+        therefore only half true, and it is the most likely reason convergence
+        looked slower than a normal RNN-T fine-tune.
+
+        WHAT IS COPIED, AND WHY ONLY THIS. Only weights whose meaning does not
+        depend on the vocabulary:
+
+          pretrained joint.enc  (640x1024) -> perception.proj   ... encoder into joint space
+          our joint.enc         (640x640)  -> IDENTITY          ... so the composition is a no-op
+          pretrained joint.pred (640x640)  -> joint.pred        ... prediction state into joint space
+          pretrained LSTM       (2 x 640)  -> decoder LSTM      ... the language model itself
+
+        The embedding table and the output layer are deliberately left RANDOM in
+        both arms even though arm 1's vocabulary matches the donor exactly.
+        Copying them would hand arm 1 a pretrained softmax and embedding while
+        arm 2 (Qwen) structurally cannot have them -- which would confound the
+        one variable the two arms exist to isolate. A vocabulary-size comparison
+        where one side starts from a matching pretrained output layer measures
+        the initialisation, not the vocabulary.
+
+        Q/K/V are new to the attention joint and have no donor.
+        """
+        import tarfile
+        import tempfile
+
+        try:
+            with tarfile.open(nemo_path, "r:") as tf:
+                member = next((m for m in tf.getmembers() if m.name.endswith("model_weights.ckpt")), None)
+                if member is None:
+                    logging.warning(f"{nemo_path} has no model_weights.ckpt; skipping RNN-T warm start.")
+                    return
+                with tempfile.TemporaryDirectory() as td:
+                    tf.extract(member, td)
+                    sd = torch.load(os.path.join(td, member.name), map_location="cpu", weights_only=True)
+        except Exception as e:  # noqa: BLE001
+            logging.warning(f"could not read pretrained RNN-T weights from {nemo_path}: {e!r}")
+            return
+
+        copied, skipped = [], []
+
+        def _copy(dst: torch.Tensor, src_key: str, label: str) -> None:
+            src = sd.get(src_key)
+            if src is None:
+                skipped.append(f"{label} (no {src_key} in donor)")
+            elif tuple(src.shape) != tuple(dst.shape):
+                skipped.append(f"{label} (shape {tuple(src.shape)} != {tuple(dst.shape)})")
+            else:
+                with torch.no_grad():
+                    dst.copy_(src.to(dst.dtype))
+                copied.append(label)
+
+        # 1. The encoder -> joint-space projection, the piece whose loss hurt most.
+        proj = getattr(self.perception, "proj", None)
+        if isinstance(proj, torch.nn.Linear):
+            _copy(proj.weight, "joint.enc.weight", "perception.proj.weight <- joint.enc")
+            _copy(proj.bias, "joint.enc.bias", "perception.proj.bias <- joint.enc")
+            # Our joint.enc now sees an already-projected 640-d input, so start it
+            # at identity: the composition then reproduces the donor's mapping
+            # exactly instead of passing it through a second random matrix.
+            enc_lin = getattr(self.joint, "enc", None)
+            if isinstance(enc_lin, torch.nn.Linear) and enc_lin.in_features == enc_lin.out_features:
+                with torch.no_grad():
+                    enc_lin.weight.copy_(torch.eye(enc_lin.out_features, dtype=enc_lin.weight.dtype))
+                    enc_lin.bias.zero_()
+                copied.append("joint.enc <- identity")
+        else:
+            skipped.append("perception.proj (absent; encoder dim already matches joint_hidden)")
+
+        # 2. Prediction state -> joint space.
+        pred_lin = getattr(self.joint, "pred", None)
+        if isinstance(pred_lin, torch.nn.Linear):
+            _copy(pred_lin.weight, "joint.pred.weight", "joint.pred.weight")
+            _copy(pred_lin.bias, "joint.pred.bias", "joint.pred.bias")
+
+        # 3. The prediction network's LSTM -- the donor's language model. Its
+        #    embedding is NOT copied (see the docstring).
+        lstm = None
+        for name, mod in self.decoder.named_modules():
+            if isinstance(mod, torch.nn.LSTM):
+                lstm = mod
+                break
+        if lstm is None:
+            skipped.append("prediction LSTM (not found)")
+        else:
+            for layer in range(lstm.num_layers):
+                for w in ("weight_ih", "weight_hh", "bias_ih", "bias_hh"):
+                    attr = f"{w}_l{layer}"
+                    dst = getattr(lstm, attr, None)
+                    if dst is None:
+                        skipped.append(f"lstm.{attr} (absent)")
+                        continue
+                    _copy(dst, f"decoder.prediction.dec_rnn.lstm.{attr}", f"lstm.{attr}")
+
+        logging.info(
+            "ChatSTTModel RNN-T warm start from %s\n  copied (%d): %s\n  left random: %s\n"
+            "  embedding + output layer are intentionally random in BOTH arms so the\n"
+            "  vocabulary comparison is not confounded by a matching pretrained softmax.",
+            nemo_path,
+            len(copied),
+            ", ".join(copied) or "nothing",
+            ", ".join(skipped + ["joint.Q/K/V (new to the attention joint)"]),
+        )
+        if not copied:
+            logging.warning(
+                "RNN-T warm start copied NOTHING -- the model is training its decoder, joint and "
+                "encoder projection from scratch. Check that pretrained_asr is an RNN-T .nemo."
+            )
 
     def _encode(self, audios, audio_lens):
         """Encoder output as (B, T, D), with the orientation ASSERTED, not guessed.

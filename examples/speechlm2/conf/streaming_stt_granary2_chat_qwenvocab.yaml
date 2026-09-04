@@ -68,6 +68,14 @@ model:
       sync_max_audio_length: false
 
   load_asr_weights: true
+  # Warm-start the VOCABULARY-INDEPENDENT parts of the pretrained RNN-T: the
+  # donor's joint.enc into perception.proj (which is otherwise a random
+  # Linear(1024,640) scrambling the encoder on its way to the joint), joint.pred,
+  # and the prediction network's LSTM. The embedding and output layer are left
+  # random in BOTH arms on purpose -- arm 1's vocabulary matches the donor and
+  # arm 2's cannot, so copying them would compare initialisations, not
+  # vocabularies. Set false to ablate.
+  init_rnnt_from_asr: true
   freeze_speech_encoder: false
   audio_pad_to: 0
 
