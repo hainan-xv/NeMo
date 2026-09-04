@@ -13,9 +13,12 @@
 # its last token -- the SAME assignment the SpeechLM trains on, taken from the
 # same dataset class -- reduces the loss to cross-entropy over U + T steps.
 #
-# CAVEAT: this is not the transducer objective. The model cannot discover its own
-# emission times, so absolute WER is not comparable to a properly-trained RNN-T.
-# The comparison that is valid is arm-1 vs arm-2.
+# A FIXED ALIGNMENT IS NOT A HANDICAP HERE. Marginalising exists to learn an
+# alignment you lack; given a good one, conditioning on it is hard EM. The
+# SpeechLM trains this way and reaches 5.96 macro vs the RNN-T's 5.82. And the
+# CHAT greedy decode walks chunks emitting until a blank -- exactly the training
+# path -- so training and inference are the same procedure. What is fixed is
+# emission LATENCY (aligned chunk + delay), the same trade the SpeechLM makes.
 #
 # chunk_size is FIXED at 14 and must match on both sides: the dataset's chunk
 # indices and the joint's own re-chunking have to agree, and chat_train.py

@@ -25,10 +25,22 @@ the loss is plain cross-entropy along a single path of U + T steps, scored by
 ``RNNTAttJoint.joint_on_path``. Memory then grows with the path, not with
 T * U * V, and the two vocabularies become directly comparable.
 
-WHAT THIS IS NOT. Training on one alignment is not the transducer objective. The
-model can no longer discover its own emission times, and a model trained this way
-is not expected to match a properly-trained RNN-T on absolute WER. The question
-here is the RELATIVE effect of vocabulary size, holding everything else fixed.
+WHY A FIXED ALIGNMENT IS NOT A HANDICAP. Marginalising over alignments exists to
+LEARN an alignment you do not have; given a good one, conditioning on it is hard
+EM rather than soft EM. The SpeechLM is trained exactly this way -- same forced
+alignment, same delay, same chunk assignment -- and reaches 5.96 macro against
+the RNN-T baseline's 5.82, so the recipe demonstrably works at this scale.
+
+Crucially, DECODING MIRRORS TRAINING: RNNTAttJoint's CHAT greedy decode walks
+chunks and emits tokens within a chunk until a blank, with the prediction state
+advancing only on real tokens -- precisely the path built here. There is no
+search over alignments at inference, so there is no train/test mismatch of the
+kind that would otherwise punish single-path training.
+
+What IS fixed by construction is emission latency: a word is emitted at its
+aligned chunk plus the configured delay, rather than wherever the model finds
+convenient. That is the same deliberate trade the SpeechLM makes to keep
+streaming latency controllable.
 """
 
 from dataclasses import dataclass

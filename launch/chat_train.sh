@@ -32,8 +32,10 @@
 # SpeechLM uses, from the same dataset class -- reducing the loss to
 # cross-entropy over U + T steps.
 #
-# CAVEAT: this is not the transducer objective, so absolute WER is not
-# comparable to a properly-trained RNN-T. Arm-1 vs arm-2 is the valid comparison.
+# The fixed alignment is not a handicap: the SpeechLM trains the same way and is
+# competitive with the RNN-T baseline, and CHAT's greedy decode walks chunks
+# emitting until a blank -- the same procedure as training, so no train/test
+# mismatch. What is fixed is emission latency (aligned chunk + delay).
 #
 # Trains from the pretrained ASR encoder (INIT_CKPT=none): no SCRIPT checkpoint
 # is shape-compatible with a transducer.
