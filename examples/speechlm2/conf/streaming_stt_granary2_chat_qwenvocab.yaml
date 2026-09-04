@@ -48,6 +48,15 @@ model:
   pred_rnn_layers: 2
   joint_hidden: 640
 
+
+  perception:
+    modality_adapter:
+      _target_: nemo.collections.speechlm2.modules.perception.IdentityConnector
+    encoder:
+      # The cache-aware encoder otherwise all-reduces max audio length every
+      # forward, which desyncs the data-dependent validation decode across ranks.
+      sync_max_audio_length: false
+
   load_asr_weights: true
   freeze_speech_encoder: false
   audio_pad_to: 0
