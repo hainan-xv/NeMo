@@ -173,24 +173,32 @@ class ChatSTTModel(LightningModule):
         g, _, _ = self.decoder(targets=batch.pred_input, target_length=batch.pred_lens)
         g = g.transpose(1, 2)
 
-        logits = self.joint.joint_on_path(enc, g, batch.b_idx, batch.t_idx, batch.u_idx, enc_len)
+        # The dataset estimates frames from DURATION (ceil(secs / frame_length))
+        # while the joint chunks the ACTUAL encoder output, and subsampling
+        # boundary effects make those differ by a frame at the tail -- which
+        # flips the final chunk. A +/-1 discrepancy is benign: the surplus chunk
+        # simply carries no target. A larger one means the two sides disagree
+        # about chunk_size or framing, which is a real misconfiguration.
+        n_joint = torch.div(enc_len + self.chunk_size - 1, self.chunk_size, rounding_mode="floor")
+        n_data = batch.n_chunks.to(n_joint.device)
+        drift = (n_joint - n_data).abs()
+        if bool((drift > 1).any()):
+            bad = (drift > 1).nonzero(as_tuple=True)[0][:5].tolist()
+            raise RuntimeError(
+                "chunk-count mismatch beyond tail rounding: "
+                f"joint={n_joint[bad].tolist()} vs dataset={n_data[bad].tolist()} (utterances {bad}). "
+                "The two must use the same chunk_size and frame_length_in_secs."
+            )
 
-        # The dataset numbers chunks from the message structure; the joint numbers
-        # them by re-chunking the encoder output. If those disagree, t_idx points
-        # at the wrong chunk -- or out of range -- and the model simply fails to
-        # learn, with nothing in the logs to say why. Check rather than trust.
-        produced = self.joint.num_chunks_per_utterance
-        if produced is not None:
-            expected = batch.n_chunks.to(produced.device)
-            if not torch.equal(produced, expected):
-                bad = (produced != expected).nonzero(as_tuple=True)[0][:5].tolist()
-                raise RuntimeError(
-                    "chunk-count mismatch between the dataset's alignment and the joint's chunking: "
-                    f"joint={produced[bad].tolist()} vs dataset={expected[bad].tolist()} (utterances {bad}). "
-                    "The two must use the same chunk_size and the same frame count."
-                )
+        # Drop any step whose chunk the encoder did not produce, so t_idx can
+        # never index past the joint's chunk axis.
+        keep = batch.t_idx < n_joint[batch.b_idx]
+        b_idx, t_idx, u_idx = batch.b_idx[keep], batch.t_idx[keep], batch.u_idx[keep]
+        labels = batch.labels[keep]
 
-        return F.cross_entropy(logits.float(), batch.labels)
+        logits = self.joint.joint_on_path(enc, g, b_idx, t_idx, u_idx, enc_len)
+
+        return F.cross_entropy(logits.float(), labels)
 
     @property
     def decoding(self):
