@@ -18,6 +18,7 @@ import types
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from nemo.collections.speechlm2.data.chat_dataset import build_path
 
@@ -511,3 +512,122 @@ def test_rnnt_warm_start_can_be_disabled_and_never_raises():
 
     # And the knob exists so the warm start can be turned off for an ablation.
     assert d.get("init_rnnt_from_asr", True) in (True, False)
+
+
+@pytest.mark.unit
+def test_batched_loss_and_grads_match_sequential_with_ragged_lengths():
+    """A padded batch must give the same loss and gradients as one-at-a-time.
+
+    RAGGED ON BOTH AXES on purpose: different audio lengths AND different token
+    counts. Equal-length inputs would pass trivially while padding leakage --
+    the encoder attending across the pad boundary, the chunk mask admitting pad
+    frames, the prediction LSTM's padded tail bleeding into valid states --
+    went undetected. Any of those would make training depend on how utterances
+    happen to be bucketed together, which is invisible in a loss curve and
+    impossible to reproduce.
+
+    Compared at float32 in eval() so dropout is off; the encoder uses
+    layer_norm (no BatchNorm anywhere), so batch composition cannot shift
+    normalisation statistics and the equality holds in train mode too.
+    """
+    import glob
+    import math
+
+    from omegaconf import OmegaConf
+
+    from nemo.collections.speechlm2.data.chat_dataset import build_path
+    from nemo.collections.speechlm2.models.chat_model import ChatSTTModel
+
+    hits = glob.glob(
+        os.path.expanduser("~/.cache/huggingface/hub/models--nvidia--nemotron-speech-streaming-en-0.6b/**/*.nemo"),
+        recursive=True,
+    )
+    if not hits:
+        pytest.skip("nemotron ASR .nemo not present in the local HF cache")
+
+    cfg = OmegaConf.load("examples/speechlm2/conf/streaming_stt_granary2_chat_asrvocab.yaml")
+    OmegaConf.resolve(cfg)
+    cfg.model.pretrained_asr = hits[0]
+    model = ChatSTTModel(OmegaConf.to_container(cfg.model, resolve=True)).float()
+    model.eval()
+
+    SR, C, BLANK = 16000, model.chunk_size, model.blank_id
+    torch.manual_seed(0)
+    secs = [2.0, 3.7, 5.1, 8.3]
+    audios = [torch.randn(1, int(s * SR)) * 0.1 for s in secs]
+    lens = [torch.tensor([a.shape[1]]) for a in audios]
+
+    n_chunks = []
+    with torch.no_grad():
+        for a, l in zip(audios, lens):
+            _, el = model._encode(a, l)
+            n_chunks.append(int(math.ceil(int(el[0]) / C)))
+
+    rng = torch.Generator().manual_seed(1)
+    chunk_tokens = [
+        [
+            [
+                int(torch.randint(1, 900, (1,), generator=rng))
+                for _ in range(int(torch.randint(0, 4, (1,), generator=rng)))
+            ]
+            for _ in range(n)
+        ]
+        for n in n_chunks
+    ]
+    paths = []
+    for ct in chunk_tokens:
+        t, u, lab = build_path(ct, BLANK)
+        paths.append((torch.tensor(t), torch.tensor(u), torch.tensor(lab), [x for c in ct for x in c]))
+    assert len({len(p[3]) for p in paths}) > 1, "token counts must differ or the test is trivial"
+
+    def forward_one(a, l, t_idx, u_idx, toks):
+        enc, enc_len = model._encode(a, l)
+        pin = torch.tensor([toks] if toks else [[BLANK]], dtype=torch.long)
+        g, _, _ = model.decoder(targets=pin, target_length=torch.tensor([len(toks)]))
+        return model.joint.joint_on_path(enc, g.transpose(1, 2), torch.zeros_like(t_idx), t_idx, u_idx, enc_len)
+
+    # --- sequential ---
+    model.zero_grad(set_to_none=True)
+    seq_logits, total = [], 0
+    for a, l, p in zip(audios, lens, paths):
+        lg = forward_one(a, l, p[0], p[1], p[3])
+        seq_logits.append(lg)
+        total += lg.shape[0]
+    seq_loss = sum(F.cross_entropy(lg.float(), p[2], reduction="sum") for lg, p in zip(seq_logits, paths)) / total
+    seq_loss.backward()
+    seq_grads = {n: p.grad.detach().clone() for n, p in model.named_parameters() if p.grad is not None}
+
+    # --- batched ---
+    model.zero_grad(set_to_none=True)
+    n_max = max(a.shape[1] for a in audios)
+    A = torch.zeros(len(audios), n_max)
+    for i, a in enumerate(audios):
+        A[i, : a.shape[1]] = a[0]
+    AL = torch.tensor([a.shape[1] for a in audios])
+    rows = [p[3] for p in paths]
+    U = max(max(len(r) for r in rows), 1)
+    PIN = torch.full((len(rows), U), BLANK, dtype=torch.long)
+    for i, r in enumerate(rows):
+        PIN[i, : len(r)] = torch.tensor(r, dtype=torch.long)
+    B_ = torch.cat([torch.full_like(p[0], i) for i, p in enumerate(paths)])
+    T_ = torch.cat([p[0] for p in paths])
+    U_ = torch.cat([p[1] for p in paths])
+    L_ = torch.cat([p[2] for p in paths])
+
+    enc, enc_len = model._encode(A, AL)
+    g, _, _ = model.decoder(targets=PIN, target_length=torch.tensor([len(r) for r in rows]))
+    bat_logits = model.joint.joint_on_path(enc, g.transpose(1, 2), B_, T_, U_, enc_len)
+    bat_loss = F.cross_entropy(bat_logits.float(), L_)
+    bat_loss.backward()
+    bat_grads = {n: p.grad.detach().clone() for n, p in model.named_parameters() if p.grad is not None}
+
+    assert abs(seq_loss.item() - bat_loss.item()) < 1e-5, f"{seq_loss.item()} vs {bat_loss.item()}"
+
+    off = 0
+    for i, p in enumerate(paths):
+        n = p[0].shape[0]
+        torch.testing.assert_close(seq_logits[i], bat_logits[off : off + n], atol=1e-4, rtol=1e-3)
+        off += n
+
+    for name, gseq in seq_grads.items():
+        torch.testing.assert_close(gseq, bat_grads[name], atol=1e-4, rtol=1e-3, msg=lambda m, n=name: f"{n}: {m}")
