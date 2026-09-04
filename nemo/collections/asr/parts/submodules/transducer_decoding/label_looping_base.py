@@ -232,6 +232,7 @@ class GreedyBatchedLabelLoopingComputerBase(WithOptionalCudaGraphs, ABC):
         encoder_output_length: torch.Tensor,
         prev_batched_state: Optional[BatchedLabelLoopingState] = None,
         multi_biasing_ids: Optional[torch.Tensor] = None,
+        chunk_frame_lengths: Optional[torch.Tensor] = None,
     ) -> tuple[BatchedHyps, BatchedLabelLoopingState]:
         """
         Pure PyTorch implementation
@@ -241,6 +242,8 @@ class GreedyBatchedLabelLoopingComputerBase(WithOptionalCudaGraphs, ABC):
             encoder_output_length: lengths of the utterances in `encoder_output`
             prev_batched_state: previous batched decoding state
             multi_biasing_ids: optional tensor [Batch] with ids of fused biasing models
+            chunk_frame_lengths: Optional tensor of shape [B, T] containing the number of valid
+                frames in each chunk. Required for CHAT models with cross-attention in the joint.
         """
         raise NotImplementedError
 
@@ -251,6 +254,7 @@ class GreedyBatchedLabelLoopingComputerBase(WithOptionalCudaGraphs, ABC):
         encoder_output_length: torch.Tensor,
         prev_batched_state: Optional[BatchedLabelLoopingState] = None,
         multi_biasing_ids: Optional[torch.Tensor] = None,
+        chunk_frame_lengths: Optional[torch.Tensor] = None,
     ) -> tuple[BatchedHyps, BatchedLabelLoopingState]:
         """
         Implementation with CUDA graphs.
@@ -260,6 +264,8 @@ class GreedyBatchedLabelLoopingComputerBase(WithOptionalCudaGraphs, ABC):
             encoder_output_length: lengths of the utterances in `encoder_output`
             prev_batched_state: previous batched decoding state
             multi_biasing_ids: optional tensor [Batch] with ids of multi-biasing models
+            chunk_frame_lengths: Optional tensor of shape [B, T] containing the number of valid
+                frames in each chunk. Required for CHAT models with cross-attention in the joint.
         """
         raise NotImplementedError
 
@@ -307,6 +313,7 @@ class GreedyBatchedLabelLoopingComputerBase(WithOptionalCudaGraphs, ABC):
         out_len: torch.Tensor,
         prev_batched_state: Optional[BatchedLabelLoopingState] = None,
         multi_biasing_ids: Optional[torch.Tensor] = None,
+        chunk_frame_lengths: Optional[torch.Tensor] = None,
     ) -> tuple[BatchedHyps, BatchedLabelLoopingState]:
         """
         Entry point for the decoding algorithm
@@ -316,21 +323,33 @@ class GreedyBatchedLabelLoopingComputerBase(WithOptionalCudaGraphs, ABC):
             out_len: encoder output length
             prev_batched_state: previous batched decoding state
             multi_biasing_ids: optional tensor [Batch] with ids of fused biasing models
+            chunk_frame_lengths: Optional tensor of shape [B, T] containing the number of valid
+                frames in each chunk. Required for CHAT models with cross-attention in the joint.
         """
         if self.cuda_graphs_mode is not None and x.device.type == "cuda":
-            # disable CUDA graphs if Mixed Precision is used due to incorrect behavior
-            with torch.amp.autocast(device_type="cuda", enabled=False):
-                # TODO(vbataev): fix issue with mixed precision, remove this restriction
-                return self.cuda_graphs_impl(
-                    encoder_output=x,
-                    encoder_output_length=out_len,
-                    prev_batched_state=prev_batched_state,
-                    multi_biasing_ids=multi_biasing_ids,
-                )
+            if chunk_frame_lengths is not None:
+                if not getattr(self, '_chat_cuda_graphs_warned', False):
+                    logging.warning(
+                        "CHAT mode does not support CUDA graphs yet. "
+                        "Falling back to the standard PyTorch decoding path."
+                    )
+                    self._chat_cuda_graphs_warned = True
+            else:
+                # disable CUDA graphs if Mixed Precision is used due to incorrect behavior
+                with torch.amp.autocast(device_type="cuda", enabled=False):
+                    # TODO(vbataev): fix issue with mixed precision, remove this restriction
+                    return self.cuda_graphs_impl(
+                        encoder_output=x,
+                        encoder_output_length=out_len,
+                        prev_batched_state=prev_batched_state,
+                        multi_biasing_ids=multi_biasing_ids,
+                        chunk_frame_lengths=chunk_frame_lengths,
+                    )
 
         return self.torch_impl(
             encoder_output=x,
             encoder_output_length=out_len,
             prev_batched_state=prev_batched_state,
             multi_biasing_ids=multi_biasing_ids,
+            chunk_frame_lengths=chunk_frame_lengths,
         )

@@ -167,7 +167,9 @@ def max_symbols_setup():
         def project_prednet(self, prednet_output: torch.Tensor) -> torch.Tensor:
             return prednet_output
 
-        def joint_after_projection(self, f: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
+        def joint_after_projection(
+            self, f: torch.Tensor, g: torch.Tensor, f_len: Optional[torch.Tensor] = None
+        ) -> torch.Tensor:
             return f.unsqueeze(dim=2) + g.unsqueeze(dim=1)
 
     setup = {}

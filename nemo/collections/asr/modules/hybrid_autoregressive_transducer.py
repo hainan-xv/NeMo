@@ -138,8 +138,14 @@ class HATJoint(rnnt.RNNTJoint):
     def return_hat_ilm(self, hat_subtract_ilm):
         self._return_hat_ilm = hat_subtract_ilm
 
-    def joint_after_projection(self, f: torch.Tensor, g: torch.Tensor) -> Union[torch.Tensor, HATJointOutput]:
+    def joint_after_projection(
+        self, f: torch.Tensor, g: torch.Tensor, f_len: Optional[torch.Tensor] = None
+    ) -> Union[torch.Tensor, HATJointOutput]:
         """
+        Note: ``f_len`` is accepted to match the base-class signature introduced for
+        CHAT (whose cross-attention joint needs the encoder lengths). HAT's joint
+        is additive and frame-local, so it is unused here.
+
         Compute the joint step of the network after Encoder/Decoder projection.
 
         Here,
