@@ -3249,3 +3249,49 @@ def test_leading_space_probe_leaves_byte_level_bpe_alone():
     q = AutoTokenizer.from_pretrained(qdirs[0])
     # Byte-level BPE folds the space in, so the probe is False and nothing is stripped.
     assert len(q.encode(" word", add_special_tokens=False)) == len(q.encode("word", add_special_tokens=False))
+
+
+def test_init_weights_from_is_skipped_when_the_path_is_gone(tmp_path, caplog):
+    """A warm start must not be re-run when LOADING the checkpoint it produced.
+
+    The checkpoint saves the config it was trained with, including the
+    warm-start path -- a file staged inside the training container. Every later
+    load_from_checkpoint then tries to re-apply it and dies with
+    "No such file or directory: /results/init_from.ckpt", which is exactly how
+    the first ASR-vocab eval failed. Re-running it is also pointless: the
+    checkpoint's own weights supersede it.
+    """
+    import logging as pylogging
+
+    import torch.nn as nn
+
+    from nemo.collections.speechlm2.models.streaming_stt_model import StreamingSTTModel
+
+    model = nn.Linear(4, 4)
+    before = model.weight.clone()
+    with caplog.at_level(pylogging.WARNING):
+        StreamingSTTModel._init_weights_from(model, str(tmp_path / "does_not_exist.ckpt"))
+    torch.testing.assert_close(model.weight, before)  # untouched, no exception
+
+
+def test_init_weights_from_clears_itself_from_saved_hyperparameters(tmp_path):
+    """It is a one-time init, so it must not be baked into future checkpoints."""
+    import torch.nn as nn
+
+    from nemo.collections.speechlm2.models.streaming_stt_model import StreamingSTTModel
+
+    class _M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.body = nn.Linear(4, 4)
+
+    donor = _M()
+    ckpt = tmp_path / "donor.ckpt"
+    torch.save({"state_dict": donor.state_dict()}, ckpt)
+
+    model = _M()
+    model.hparams = {"init_weights_from": str(ckpt)}
+    model.cfg = {"init_weights_from": str(ckpt)}
+    StreamingSTTModel._init_weights_from(model, str(ckpt))
+    assert model.hparams["init_weights_from"] == ""
+    assert model.cfg["init_weights_from"] == ""

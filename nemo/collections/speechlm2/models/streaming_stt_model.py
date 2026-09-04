@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import math
+import os
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -499,6 +500,18 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         a warm start that quietly inherits nothing looks like a bad
         initialisation rather than a broken path.
         """
+        if not os.path.exists(path):
+            # A checkpoint saves the config it was TRAINED with, so this path --
+            # which pointed at a file staged inside the training container --
+            # comes back on every later load_from_checkpoint. Re-running the warm
+            # start then is both impossible and pointless: the checkpoint's own
+            # weights overwrite it immediately. Skip, loudly.
+            logging.warning(
+                f"init_weights_from({path}) does not exist; skipping. This is expected when "
+                f"LOADING a checkpoint that was trained with a warm start -- its own weights "
+                f"supersede it. If you are starting a NEW run, the path is wrong."
+            )
+            return
         ckpt = torch.load(path, map_location="cpu", weights_only=False)
         src = ckpt.get("state_dict", ckpt)
         own = self.state_dict()
@@ -514,6 +527,15 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         missing = [k for k in own if k not in keep]
 
         self.load_state_dict(keep, strict=False)
+        # Drop it from the saved hyperparameters: it is a one-time initialisation,
+        # and persisting it makes every future load of this checkpoint try to
+        # re-run it against a path that no longer exists.
+        for holder in (getattr(self, "hparams", None), getattr(self, "cfg", None)):
+            try:
+                if holder is not None and "init_weights_from" in holder:
+                    holder["init_weights_from"] = ""
+            except (TypeError, KeyError):
+                pass
         logging.info(
             f"init_weights_from({path}): loaded {len(keep)}/{len(own)} tensors; "
             f"{len(mismatched)} shape-mismatched, {len(missing)} left at their initial values, "
