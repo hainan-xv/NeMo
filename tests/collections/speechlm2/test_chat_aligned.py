@@ -13,6 +13,8 @@
 # limitations under the License.
 """The forced-alignment path CHAT is trained on."""
 
+import os
+
 import pytest
 import torch
 
@@ -211,3 +213,57 @@ def test_chat_greedy_decode_follows_the_training_convention():
         ts = ts.tolist() if torch.is_tensor(ts) else list(ts)
         assert ts == sorted(ts), f"chunk indices not monotone: {ts}"
         assert all(0 <= t < 3 for t in ts), f"chunk index out of range: {ts}"
+
+
+@pytest.mark.unit
+def test_dataset_chunk_estimate_tracks_the_encoder_within_one():
+    """The dataset and the encoder count chunks INDEPENDENTLY; they must agree.
+
+    The dataset derives frames from duration (ceil(secs / frame_length)); the
+    joint chunks the encoder's actual output. Subsampling shifts the tail, so
+    they can differ by one -- which the model tolerates by dropping path steps
+    past the encoder's last chunk. A drift of TWO would mean the two sides
+    disagree about framing, and every word after that point would be scored
+    against the wrong chunk.
+
+    This is the check that would have caught the cluster failure
+    (joint=21 vs dataset=20). The earlier local test computed BOTH counts from
+    the encoder, so it was consistent by construction and blind to the drift.
+    """
+    import glob
+    import math
+
+    from omegaconf import OmegaConf
+
+    from nemo.collections.speechlm2.models.chat_model import ChatSTTModel
+
+    hits = glob.glob(
+        os.path.expanduser("~/.cache/huggingface/hub/models--nvidia--nemotron-speech-streaming-en-0.6b/**/*.nemo"),
+        recursive=True,
+    )
+    if not hits:
+        pytest.skip("nemotron ASR .nemo not present in the local HF cache")
+
+    cfg = OmegaConf.load("examples/speechlm2/conf/streaming_stt_granary2_chat_asrvocab.yaml")
+    OmegaConf.resolve(cfg)
+    cfg.model.pretrained_asr = hits[0]
+    model = ChatSTTModel(OmegaConf.to_container(cfg.model, resolve=True)).float()
+
+    chunk = model.chunk_size
+    frame_len = float(cfg.data.dataset.frame_length_in_secs)
+    sr = int(cfg.data.dataset.sample_rate)
+
+    worst = 0
+    for secs in (1.0, 2.3, 3.7, 5.0, 7.11, 9.42, 12.0):
+        n = int(secs * sr)
+        with torch.no_grad():
+            enc, enc_len = model._encode(torch.randn(1, n), torch.tensor([n]))
+        enc_chunks = math.ceil(int(enc_len[0]) / chunk)
+        # Exactly how the dataset estimates it, from duration alone.
+        data_chunks = math.ceil(math.ceil(secs / frame_len) / chunk)
+        worst = max(worst, abs(enc_chunks - data_chunks))
+        assert abs(enc_chunks - data_chunks) <= 1, (
+            f"{secs}s: encoder says {enc_chunks} chunks, dataset estimates {data_chunks}. "
+            "A drift > 1 misassigns every word after the divergence."
+        )
+    assert worst <= 1
