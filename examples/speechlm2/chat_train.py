@@ -24,8 +24,8 @@ from a large vocabulary the way the SpeechLM does.
 import os
 
 import torch
+from lightning.pytorch import Trainer
 from omegaconf import OmegaConf
-from pytorch_lightning import Trainer
 
 from nemo.collections.speechlm2.data import DataModule
 from nemo.collections.speechlm2.data.chat_dataset import ChatAlignedDataset

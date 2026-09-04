@@ -48,8 +48,8 @@ from typing import Optional
 
 import torch
 import torch.nn.functional as F
+from lightning import LightningModule
 from omegaconf import DictConfig
-from pytorch_lightning import LightningModule
 
 from nemo.collections.asr.modules import RNNTAttJoint, RNNTDecoder
 from nemo.collections.speechlm2.parts.optim_setup import configure_optimizers
