@@ -41,7 +41,7 @@ Length is therefore ``sum(len(tokens)) + n_chunks``, versus the ``T x U`` lattic
 the standard loss would score.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional
 
 import torch
@@ -67,6 +67,8 @@ class ChatAlignedBatch:
         n_chunks: (B,) chunks per utterance, for cross-checking against the
             encoder's own chunking.
         chunk_size: the chunk size these indices were built for.
+        text: (B,) reference transcripts. Carried because validation is
+            decode-only WER, which needs the references and none of the path.
     """
 
     audios: torch.Tensor
@@ -79,6 +81,7 @@ class ChatAlignedBatch:
     pred_lens: torch.Tensor
     n_chunks: torch.Tensor
     chunk_size: int
+    text: List[str] = field(default_factory=list)
 
     def to(self, device) -> "ChatAlignedBatch":
         f = lambda x: x.to(device) if torch.is_tensor(x) else x  # noqa: E731
@@ -93,6 +96,7 @@ class ChatAlignedBatch:
             pred_lens=f(self.pred_lens),
             n_chunks=f(self.n_chunks),
             chunk_size=self.chunk_size,
+            text=self.text,
         )
 
 
@@ -195,6 +199,7 @@ class ChatAlignedDataset(ScriptSTTDataset):
             pred_lens=torch.tensor([len(r) for r in pred_rows], dtype=torch.long),
             n_chunks=torch.tensor(n_chunks, dtype=torch.long),
             chunk_size=chunk_size,
+            text=list(text) if text is not None else [],
         )
 
 

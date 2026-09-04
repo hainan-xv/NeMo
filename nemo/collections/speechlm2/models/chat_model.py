@@ -253,7 +253,14 @@ class ChatSTTModel(LightningModule):
             self._eval_step(batch, "val", batch_idx)
 
     def _eval_step(self, batch, name: str, batch_idx: int = 0) -> None:
-        refs = list(batch.text)
+        refs = list(getattr(batch, "text", []) or [])
+        if not refs:
+            # Without references WER is undefined, and silently logging 0 or
+            # skipping would look like a healthy validation pass.
+            raise RuntimeError(
+                f"validation batch '{name}' carries no reference text; ChatAlignedBatch.text must be "
+                "populated for decode-only WER."
+            )
         ids = self.transcribe_ids(batch.audios, batch.audio_lens)
         hyps = [self._detokenize(seq) for seq in ids]
         self._partial_wer_refs[name].extend(refs)
