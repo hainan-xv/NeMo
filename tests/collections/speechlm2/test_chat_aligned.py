@@ -77,16 +77,81 @@ def test_chunk_index_is_non_decreasing_and_covers_every_chunk():
 
 
 @pytest.mark.unit
-def test_prediction_input_row_u_is_the_state_after_u_labels():
-    """pred_input[u] must be the token whose output state u_idx=u refers to."""
+def test_u_indexes_the_decoder_output_which_is_u_plus_one_long():
+    """RNNTDecoder prepends its own SOS and returns U+1 states.
+
+    So the dataset passes emitted tokens ONLY, and u_idx must stay within
+    [0, U]. Prefixing a start symbol in the dataset would double it and shift
+    every prediction state by one -- training the joint against the wrong state
+    while looking entirely healthy.
+    """
     chunks = [[11, 12], [], [13]]
-    SOS = 0
-    pred = [SOS] + [tok for c in chunks for tok in c]
+    tokens = [tok for c in chunks for tok in c]  # what the dataset emits
+    U = len(tokens)
     t, u, lab = build_path(chunks, 99)
-    # For every step, u indexes a valid prediction-network position.
-    assert max(u) < len(pred), "u must never exceed the prediction network's length"
-    # The token emitted at step i is produced FROM state u[i]; after emitting it,
-    # the next state is u[i]+1, whose input token is exactly that label.
-    for i, (ui, li) in enumerate(zip(u, lab)):
+    assert max(u) <= U, "u must index the decoder's U+1 outputs"
+    # State u was produced after consuming tokens[:u].
+    for ui, li in zip(u, lab):
         if li != 99:
-            assert pred[ui + 1] == li
+            assert tokens[ui] == li, "the label at state u is the u-th emitted token"
+
+
+@pytest.mark.unit
+def test_forced_path_loss_flows_to_encoder_prednet_and_joint():
+    """End-to-end: the path objective must train all three components.
+
+    Built from the modules directly rather than the full model, so the test does
+    not need pretrained weights. What it pins is the wiring: decoder output
+    indexed by u, encoder chunks indexed by t, cross-entropy over the path, and
+    gradient reaching every part.
+    """
+    from nemo.collections.asr.modules import RNNTAttJoint, RNNTDecoder
+    from nemo.collections.speechlm2.data.chat_dataset import build_path
+
+    V, D, CHUNK = 20, 16, 4
+    torch.manual_seed(0)
+    dec = RNNTDecoder(prednet={"pred_hidden": D, "pred_rnn_layers": 1, "dropout": 0.0}, vocab_size=V)
+    joint = RNNTAttJoint(
+        jointnet={"encoder_hidden": D, "pred_hidden": D, "joint_hidden": D, "activation": "relu", "dropout": 0.0},
+        num_classes=V,
+        chunk_size=CHUNK,
+    )
+    BLANK = V
+
+    chunks_per_utt = [[[1, 2], [], [3]], [[4], [5, 6], []]]
+    b_idx, t_idx, u_idx, labels, rows = [], [], [], [], []
+    for bi, chunks in enumerate(chunks_per_utt):
+        t, u, lab = build_path(chunks, BLANK)
+        b_idx += [bi] * len(t)
+        t_idx += t
+        u_idx += u
+        labels += lab
+        rows.append([tok for c in chunks for tok in c])
+
+    U = max(len(r) for r in rows)
+    pred_input = torch.full((2, U), BLANK, dtype=torch.long)
+    for i, r in enumerate(rows):
+        pred_input[i, : len(r)] = torch.tensor(r)
+    pred_lens = torch.tensor([len(r) for r in rows])
+
+    # 3 chunks per utterance, matching chunks_per_utt.
+    n_frames = CHUNK * 3
+    enc = torch.randn(2, n_frames, D, requires_grad=True)
+    enc_len = torch.tensor([n_frames, n_frames])
+
+    g, _, _ = dec(targets=pred_input, target_length=pred_lens)
+    g = g.transpose(1, 2)
+    assert g.shape[1] == U + 1, "decoder must emit U+1 states (it prepends SOS itself)"
+
+    logits = joint.joint_on_path(enc, g, torch.tensor(b_idx), torch.tensor(t_idx), torch.tensor(u_idx), enc_len)
+    assert logits.shape == (len(labels), V + 1)
+    # The dataset's chunk count must equal the joint's own chunking.
+    assert joint.num_chunks_per_utterance.tolist() == [3, 3]
+
+    loss = torch.nn.functional.cross_entropy(logits.float(), torch.tensor(labels))
+    assert torch.isfinite(loss)
+    loss.backward()
+
+    assert enc.grad is not None and enc.grad.abs().sum() > 0, "no gradient to the encoder"
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in dec.parameters()), "no gradient to prednet"
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in joint.parameters()), "no gradient to joint"

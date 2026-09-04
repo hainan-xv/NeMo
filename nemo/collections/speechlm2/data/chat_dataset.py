@@ -60,9 +60,10 @@ class ChatAlignedBatch:
         b_idx, t_idx, u_idx: (N,) the path -- which utterance, which chunk, and
             how many labels have been emitted, for each scored step.
         labels: (N,) target at each step; ``blank_id`` terminates every chunk.
-        pred_input: (B, U_max + 1) prediction-network input, SOS-prefixed and
-            right-padded.
-        pred_lens: (B,) real length of each ``pred_input`` row (``U + 1``).
+        pred_input: (B, U_max) emitted tokens, right-padded. No start symbol --
+            RNNTDecoder prepends its own.
+        pred_lens: (B,) number of real tokens U in each row (the decoder's own
+            SOS makes its output U + 1 long).
         n_chunks: (B,) chunks per utterance, for cross-checking against the
             encoder's own chunking.
         chunk_size: the chunk size these indices were built for.
@@ -125,15 +126,11 @@ class ChatAlignedDataset(ScriptSTTDataset):
     the batch layout differs.
     """
 
-    def __init__(self, cfg, tokenizer, blank_id: Optional[int] = None, sos_id: Optional[int] = None):
+    def __init__(self, cfg, tokenizer, blank_id: Optional[int] = None):
         super().__init__(cfg, tokenizer)
         # The transducer's blank is an extra class at the END of the vocabulary,
         # the standard NeMo convention (num_classes == vocab_size, blank == V).
         self.blank_id = int(len(self.tokenizer) if blank_id is None else blank_id)
-        # The prediction network's start symbol. NeMo's RNNTDecoder maps SOS to
-        # the blank embedding, so re-using blank_id here is the convention, not a
-        # collision: it is only ever an INPUT, never a target.
-        self.sos_id = int(self.blank_id if sos_id is None else sos_id)
 
     def get_batch_data(self, cuts, audios, audio_lens, alignments, text) -> ChatAlignedBatch:
         chunk_size = int(self.cfg.chunk_size)
@@ -172,11 +169,17 @@ class ChatAlignedDataset(ScriptSTTDataset):
             all_u.extend(u_idx)
             all_lab.extend(labels)
             n_chunks.append(len(chunk_tokens))
-            # Prediction-network input: SOS then every emitted token, so row u
-            # holds the state after u labels -- matching u_idx exactly.
-            pred_rows.append([self.sos_id] + [t for toks in chunk_tokens for t in toks])
+            # Emitted tokens only, WITHOUT a start symbol: RNNTDecoder.forward
+            # prepends SOS itself (add_sos=True in training) and returns U+1
+            # states, so row u is the state after u labels -- exactly what u_idx
+            # indexes. Prefixing SOS here would double it and shift every state
+            # by one, which trains the joint against the wrong prediction state
+            # while looking perfectly healthy.
+            pred_rows.append([t for toks in chunk_tokens for t in toks])
 
-        u_max = max(len(r) for r in pred_rows) if pred_rows else 1
+        # At least width 1: an all-silent batch has U=0, and the decoder still
+        # needs a tensor to consume.
+        u_max = max([len(r) for r in pred_rows] + [1])
         pred_input = torch.full((len(pred_rows), u_max), self.blank_id, dtype=torch.long)
         for i, r in enumerate(pred_rows):
             pred_input[i, : len(r)] = torch.tensor(r, dtype=torch.long)
