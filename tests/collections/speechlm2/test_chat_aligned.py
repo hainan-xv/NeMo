@@ -369,3 +369,46 @@ def test_train_decode_logging_is_gated_and_never_kills_the_run():
     boom = make(2000)
     boom.transcribe_ids = lambda a, l: (_ for _ in ()).throw(RuntimeError("cuda oom"))
     ChatSTTModel._maybe_log_train_decode(boom, batch)  # must not raise
+
+
+@pytest.mark.unit
+def test_on_path_joint_equals_the_standard_chat_joint():
+    """joint_on_path must be the ORDINARY CHAT joint, evaluated at fewer points.
+
+    This is the load-bearing claim of the whole design: the forced-alignment
+    arm is meant to differ from standard CHAT only in WHICH (b, t, u) pairs are
+    scored, never in HOW they are scored. If the on-path route diverged --
+    a missing residual, a different mask, an unscaled softmax -- the model would
+    still train, and would still decode with the full joint, so the mismatch
+    would show up only as unexplained WER.
+
+    Compared over EVERY triple, with ragged encoder lengths so the padding mask
+    and the appended zero frame are both exercised.
+    """
+    from nemo.collections.asr.modules import RNNTAttJoint
+
+    torch.manual_seed(0)
+    V, D, CHUNK = 15, 16, 4
+    joint = RNNTAttJoint(
+        jointnet={"encoder_hidden": D, "pred_hidden": D, "joint_hidden": D, "activation": "relu", "dropout": 0.0},
+        num_classes=V,
+        chunk_size=CHUNK,
+    )
+    joint.eval()  # dropout off, or the two routes draw different masks
+
+    B, T_frames, U = 3, CHUNK * 4, 6
+    f_raw = torch.randn(B, T_frames, D)
+    g = torch.randn(B, U, D)
+    # Ragged on purpose: equal lengths would leave the padding mask untested.
+    f_len = torch.tensor([T_frames, T_frames - 3, T_frames - CHUNK - 1])
+
+    with torch.no_grad():
+        full = joint.joint(f_raw, g, f_len)
+        Tc = full.shape[1]
+        b_idx, t_idx, u_idx = torch.meshgrid(torch.arange(B), torch.arange(Tc), torch.arange(U), indexing="ij")
+        b_idx, t_idx, u_idx = b_idx.reshape(-1), t_idx.reshape(-1), u_idx.reshape(-1)
+        path = joint.joint_on_path(f_raw, g, b_idx, t_idx, u_idx, f_len)
+
+    assert full.shape == (B, Tc, U, V + 1)
+    assert path.shape == (B * Tc * U, V + 1)
+    torch.testing.assert_close(path, full[b_idx, t_idx, u_idx], atol=1e-5, rtol=1e-4)
