@@ -239,7 +239,7 @@ echo "*******STARTING********" \
     ++exp_manager.name=$EXP_NAME \
     ++exp_manager.wandb_logger_kwargs.name=${EXP_NAME} \
     ++exp_manager.wandb_logger_kwargs.project=${PROJECT_NAME} \
-    ++exp_manager.checkpoint_callback_params.monitor=val_loss \
+    ++exp_manager.checkpoint_callback_params.monitor=val_wer \
     ++exp_manager.checkpoint_callback_params.mode=min \
     ++exp_manager.checkpoint_callback_params.save_top_k=5 \
     ${INIT_CKPT_ARG}

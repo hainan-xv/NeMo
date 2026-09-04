@@ -115,6 +115,10 @@ def train(cfg):
     with trainer.init_module():
         model = ChatSTTModel(OmegaConf.to_container(cfg.model, resolve=True))
 
+    # Validation decodes to TEXT, so the model needs the tokenizer it was built
+    # around; without it WER would compare token ids against reference words.
+    model.tokenizer = tokenizer
+
     dataset = ChatAlignedDataset(cfg=dataset_cfg, tokenizer=tokenizer, blank_id=model.blank_id)
     val_dataset = (
         ChatAlignedDataset(cfg=val_dataset_cfg, tokenizer=tokenizer, blank_id=model.blank_id)

@@ -43,6 +43,7 @@ convenient. That is the same deliberate trade the SpeechLM makes to keep
 streaming latency controllable.
 """
 
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Optional
 
@@ -52,6 +53,7 @@ from lightning import LightningModule
 from omegaconf import DictConfig
 
 from nemo.collections.asr.modules import RNNTAttJoint, RNNTDecoder
+from nemo.collections.speechlm2.parts.metrics.wer import WER
 from nemo.collections.speechlm2.parts.optim_setup import configure_optimizers
 from nemo.collections.speechlm2.parts.pretrained import setup_perception
 from nemo.collections.speechlm2.parts.utils import to_dataclass
@@ -227,10 +229,75 @@ class ChatSTTModel(LightningModule):
         self.log("train_loss", loss, prog_bar=True, sync_dist=True)
         return loss
 
+    # ------------------------------------------------------------------
+    # Validation: autoregressive decoding -> WER. No loss.
+    # ------------------------------------------------------------------
+    def on_validation_epoch_start(self) -> None:
+        self._partial_wer_refs = defaultdict(list)
+        self._partial_wer_hyps = defaultdict(list)
+
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
-        loss = self.forward_loss(batch)
-        self.log("val_loss", loss, prog_bar=True, sync_dist=True)
-        return loss
+        """Decode-only WER, exactly as the SpeechLM validates.
+
+        No validation LOSS: the training objective is the forced-alignment path,
+        and the validation set is a plain manifest with no word alignments, so
+        there is no chunk assignment to score against. WER needs none of that --
+        only audio and reference text -- and it measures the thing we actually
+        care about.
+        """
+        if isinstance(batch, dict) and not hasattr(batch, "audios"):
+            for name, sub in batch.items():
+                if sub is not None:
+                    self._eval_step(sub, name, batch_idx)
+        else:
+            self._eval_step(batch, "val", batch_idx)
+
+    def _eval_step(self, batch, name: str, batch_idx: int = 0) -> None:
+        refs = list(batch.text)
+        ids = self.transcribe_ids(batch.audios, batch.audio_lens)
+        hyps = [self._detokenize(seq) for seq in ids]
+        self._partial_wer_refs[name].extend(refs)
+        self._partial_wer_hyps[name].extend(hyps)
+        if batch_idx == 0 and refs and hyps:
+            logging.info("[%s] decode batch %d\n  ref: `%s`\n  hyp: `%s`", name, batch_idx, refs[0], hyps[0])
+
+    def _detokenize(self, ids) -> str:
+        """Ids -> text via whatever tokenizer this arm was built with.
+
+        The tokenizer lives on the dataset, so it is attached by the training
+        script; without it WER would silently score ids against words.
+        """
+        tok = getattr(self, "tokenizer", None)
+        if tok is None:
+            raise RuntimeError(
+                "ChatSTTModel has no tokenizer attached; set model.tokenizer before validation "
+                "or WER would compare token ids against reference text."
+            )
+        return tok.ids_to_text(list(ids)) if ids else ""
+
+    def on_validation_epoch_end(self) -> None:
+        # Gather decoded strings and compute a true corpus WER: averaging
+        # rank-local WERs would be wrong when ranks see different word counts.
+        local = {
+            n: {"refs": self._partial_wer_refs[n], "hyps": self._partial_wer_hyps[n]} for n in self._partial_wer_refs
+        }
+        if torch.distributed.is_initialized():
+            gathered = [None] * torch.distributed.get_world_size()
+            torch.distributed.all_gather_object(gathered, local)
+        else:
+            gathered = [local]
+
+        wer = WER(normalize=True, verbose=False)
+        has_data = False
+        for rank_data in gathered:
+            for n, v in rank_data.items():
+                has_data = has_data or bool(v["refs"])
+                wer.update(n, refs=v["refs"], hyps=v["hyps"])
+        if has_data:
+            for k, v in wer.compute().items():
+                self.log("val_wer" if k == "wer" else f"val_{k}", v.to(self.device), on_epoch=True, sync_dist=False)
+        self._partial_wer_refs.clear()
+        self._partial_wer_hyps.clear()
 
     def configure_optimizers(self):
         return configure_optimizers(self)
