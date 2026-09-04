@@ -16,10 +16,20 @@
 # ============================================================================
 # CHAT transducer trained on a FORCED ALIGNMENT -- two vocabulary arms.
 #
-#   ./oci_launch.sh launch/chat_train.sh                      # ~1k ASR vocabulary
-#   EXP_NAME=granary2_chat_qwenvocab \
-#   CONFIG_NAME=streaming_stt_granary2_chat_qwenvocab \
-#       ./oci_launch.sh launch/chat_train.sh                  # 151,936 Qwen vocabulary
+# THIS script is arm 1, the ~1,024-piece ASR vocabulary. Arm 2 (151,936-piece
+# Qwen) is launch/chat_train_qwen.sh, a thin wrapper that sets CONFIG_NAME and
+# EXP_NAME and execs this file, so the recipe below is shared verbatim by both
+# and the arms cannot drift apart. Neither takes arguments:
+#
+#   sbatch launch/chat_train.sh          # arm 1: ~1k ASR vocabulary
+#   sbatch launch/chat_train_qwen.sh     # arm 2: 151,936 Qwen vocabulary
+#
+# (or the same paths via ./oci_launch.sh from a local checkout.)
+#
+# Anything changed here therefore applies to BOTH arms -- which is the point.
+# Anything that should apply to only one belongs in the recipe pair
+# examples/speechlm2/conf/streaming_stt_granary2_chat_{asrvocab,qwenvocab}.yaml,
+# currently a 3-line diff.
 #
 # The arms differ ONLY in the tokenizer, which is the point: the SpeechLM lost
 # just ~0.14 WER going from 151,936 pieces to 1,024, and whether a transducer
