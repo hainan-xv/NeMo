@@ -210,7 +210,14 @@ class ChatSTTModel(LightningModule):
             # A plain id list: WER is scored downstream against detokenised text,
             # so the vocabulary only has to be the right SIZE here.
             vocab = [str(i) for i in range(int(self.core_cfg.vocab_size))]
-            cfg = OmegaConf.create({"strategy": "greedy_batch", "greedy": {"max_symbols": self.max_symbols}})
+            # strategy="greedy", NOT "greedy_batch": the CHAT-aware decode
+            # (_greedy_decode_chat) lives in GreedyRNNTInfer, the non-batched
+            # class. greedy_batch routes to the label-looping computer, which
+            # reshapes the encoder output on assumptions CHAT's chunked layout
+            # does not satisfy and dies inside project_encoder. Slower, since it
+            # walks utterances one at a time, but validation is small and this is
+            # the path whose emission rule matches training.
+            cfg = OmegaConf.create({"strategy": "greedy", "greedy": {"max_symbols": self.max_symbols}})
             self._decoding = RNNTDecoding(decoding_cfg=cfg, decoder=self.decoder, joint=self.joint, vocabulary=vocab)
         return self._decoding
 
