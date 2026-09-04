@@ -155,3 +155,59 @@ def test_forced_path_loss_flows_to_encoder_prednet_and_joint():
     assert enc.grad is not None and enc.grad.abs().sum() > 0, "no gradient to the encoder"
     assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in dec.parameters()), "no gradient to prednet"
     assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in joint.parameters()), "no gradient to joint"
+
+
+@pytest.mark.unit
+def test_chat_greedy_decode_follows_the_training_convention():
+    """Inference must walk chunks emitting until a blank -- the training path.
+
+    This is the property that makes single-path training sound: there is no
+    search over alignments at decode time, so training and inference are the
+    same procedure. If the decoder instead advanced chunks on a different rule,
+    the forced-alignment objective would be optimising something the decoder
+    never does.
+    """
+    from omegaconf import OmegaConf
+
+    from nemo.collections.asr.modules import RNNTAttJoint, RNNTDecoder
+    from nemo.collections.asr.parts.submodules.rnnt_decoding import RNNTDecoding
+
+    V, D, CHUNK = 12, 16, 4
+    torch.manual_seed(0)
+    dec = RNNTDecoder(prednet={"pred_hidden": D, "pred_rnn_layers": 1, "dropout": 0.0}, vocab_size=V)
+    joint = RNNTAttJoint(
+        jointnet={"encoder_hidden": D, "pred_hidden": D, "joint_hidden": D, "activation": "relu", "dropout": 0.0},
+        num_classes=V,
+        chunk_size=CHUNK,
+    )
+    # The joint advertises the hook the decoding layer looks for; that is what
+    # routes it through the CHAT path rather than the standard one.
+    assert hasattr(joint, "chunk_encoder_for_decoding")
+
+    decoding = RNNTDecoding(
+        decoding_cfg=OmegaConf.create({"strategy": "greedy_batch", "greedy": {"max_symbols": 8}}),
+        decoder=dec,
+        joint=joint,
+        vocabulary=[str(i) for i in range(V)],
+    )
+
+    B, n_frames = 2, CHUNK * 3
+    enc = torch.randn(B, n_frames, D)
+    enc_len = torch.tensor([n_frames, n_frames])
+    hyps = decoding.rnnt_decoder_predictions_tensor(
+        encoder_output=enc.transpose(1, 2), encoded_lengths=enc_len, return_hypotheses=True
+    )
+    if isinstance(hyps, tuple):
+        hyps = hyps[0]
+
+    assert len(hyps) == B
+    for h in hyps:
+        y = h.y_sequence
+        y = y.tolist() if torch.is_tensor(y) else list(y)
+        # Blank is never an OUTPUT token -- it only terminates a chunk.
+        assert all(0 <= t < V for t in y), f"decoded id outside the vocabulary: {y}"
+        # Timestamps are chunk indices, and a transducer cannot revisit a chunk.
+        ts = h.timestamp
+        ts = ts.tolist() if torch.is_tensor(ts) else list(ts)
+        assert ts == sorted(ts), f"chunk indices not monotone: {ts}"
+        assert all(0 <= t < 3 for t in ts), f"chunk index out of range: {ts}"

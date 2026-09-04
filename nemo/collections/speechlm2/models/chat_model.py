@@ -86,6 +86,11 @@ class ChatSTTModelConfig:
     load_asr_weights: bool = True
     freeze_speech_encoder: bool = False
     audio_pad_to: int = 0
+    # Cap on tokens emitted per chunk at decode time. The default of 10 is tight
+    # for the ~1k vocabulary (~1.9 tokens/word, so a dense 1.12s chunk can want
+    # 7-8) and roomy for Qwen (~1.16). Left generous so a truncation cannot
+    # quietly bias the comparison toward the larger vocabulary.
+    max_symbols: int = 24
 
 
 class ChatSTTModel(LightningModule):
@@ -98,6 +103,8 @@ class ChatSTTModel(LightningModule):
         self.core_cfg: ChatSTTModelConfig = to_dataclass(ChatSTTModelConfig, cfg)
 
         self.chunk_size = int(self.core_cfg.chunk_size)
+        self.max_symbols = int(self.core_cfg.max_symbols)
+        self._decoding = None
         # Pin the encoder's look-ahead to this chunk size so a frame never
         # depends on audio past its own chunk boundary -- the same constraint the
         # SpeechLM encoder runs under, which is what keeps the comparison honest.
@@ -165,6 +172,55 @@ class ChatSTTModel(LightningModule):
                 )
 
         return F.cross_entropy(logits.float(), batch.labels)
+
+    @property
+    def decoding(self):
+        """Lazily-built :class:`RNNTDecoding` for greedy CHAT decoding.
+
+        Inference needs no new algorithm: ``rnnt_decoder_predictions_tensor``
+        already detects ``chunk_encoder_for_decoding`` on the joint, chunks the
+        encoder output and forwards ``chunk_frame_lengths``, and the CHAT greedy
+        loop walks chunks emitting until a blank -- the same procedure this model
+        is trained on. All that was missing was the decoding object itself.
+        """
+        if getattr(self, "_decoding", None) is None:
+            from omegaconf import OmegaConf
+
+            from nemo.collections.asr.parts.submodules.rnnt_decoding import RNNTDecoding
+
+            # A plain id list: WER is scored downstream against detokenised text,
+            # so the vocabulary only has to be the right SIZE here.
+            vocab = [str(i) for i in range(int(self.core_cfg.vocab_size))]
+            cfg = OmegaConf.create({"strategy": "greedy_batch", "greedy": {"max_symbols": self.max_symbols}})
+            self._decoding = RNNTDecoding(decoding_cfg=cfg, decoder=self.decoder, joint=self.joint, vocabulary=vocab)
+        return self._decoding
+
+    @torch.no_grad()
+    def transcribe_ids(self, audios: torch.Tensor, audio_lens: torch.Tensor):
+        """Greedy CHAT decode -> per-utterance token id lists.
+
+        Ids rather than text: the tokenizer lives on the dataset side, and the
+        two vocabulary arms detokenise differently, so the caller converts.
+        """
+        was_training = self.training
+        self.eval()
+        try:
+            enc, enc_len = self.perception(input_signal=audios, input_signal_length=audio_lens)
+            if enc.shape[1] != enc_len.max():
+                enc = enc.transpose(1, 2)
+            # rnnt_decoder_predictions_tensor expects (B, D, T).
+            hyps = self.decoding.rnnt_decoder_predictions_tensor(
+                encoder_output=enc.transpose(1, 2), encoded_lengths=enc_len, return_hypotheses=True
+            )
+            if isinstance(hyps, tuple):
+                hyps = hyps[0]
+            out = []
+            for h in hyps:
+                y = h.y_sequence
+                out.append(y.tolist() if torch.is_tensor(y) else list(y))
+            return out
+        finally:
+            self.train(was_training)
 
     def training_step(self, batch, batch_idx):
         loss = self.forward_loss(batch)
