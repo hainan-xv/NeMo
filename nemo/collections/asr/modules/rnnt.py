@@ -2018,6 +2018,89 @@ class RNNTAttJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMix
         num_chunks = (chunk_lengths != 0).sum(dim=1)
         return chunked.transpose(1, 2), num_chunks, chunk_lengths
 
+    def cross_attention_on_path(self, f, g, sizes, b_idx, t_idx, u_idx, num_heads=4):
+        """Cross-attention evaluated ONLY at the given (batch, chunk, label) triples.
+
+        ``cross_attention`` expands every query over every chunk and returns
+        [B, T, U, D], which the joint net then turns into [B, T, U, V+1]. That
+        tensor is what makes a large vocabulary impossible to train: it grows as
+        T*U*V. When the alignment is FIXED -- as it is when word-to-chunk
+        assignment comes from forced alignment -- only the pairs on the path are
+        ever needed, so this computes N of them instead of T*U.
+
+        Args:
+            f: chunked encoder output, [B, T, C, D].
+            g: prediction-network output, [B, U, D].
+            sizes: valid frames per chunk, [B, T], or None.
+            b_idx, t_idx, u_idx: [N] indices selecting the path.
+
+        Returns:
+            [N, D], matching ``cross_attention(f, g, sizes)[b_idx, t_idx, u_idx]``.
+        """
+        # Same trailing zero frame as the full path: a chunk with no valid frames
+        # must still have something to attend, and the mask below always keeps it.
+        zeros = torch.zeros_like(f[:, :, :1, :])
+        f = torch.cat([f, zeros], dim=2)  # [B, T, C+1, D]
+        C, D = f.shape[2], f.shape[3]
+        assert D % num_heads == 0, f"D ({D}) must be divisible by num_heads ({num_heads})"
+        head_dim = D // num_heads
+        N = b_idx.shape[0]
+
+        q = self.Q(g[b_idx, u_idx])  # [N, D]
+        chunks = f[b_idx, t_idx]  # [N, C+1, D]
+        k = self.K(chunks)
+        v = self.V(chunks)
+
+        q = q.view(N, num_heads, 1, head_dim)
+        k = k.view(N, C, num_heads, head_dim).transpose(1, 2)  # [N, H, C, head_dim]
+        v = v.view(N, C, num_heads, head_dim).transpose(1, 2)
+
+        scores = torch.matmul(q, k.transpose(-1, -2))  # [N, H, 1, C]
+        if sizes is not None:
+            valid = sizes[b_idx].gather(1, t_idx.view(-1, 1)).view(N, 1, 1, 1)
+            idx = torch.arange(C, device=scores.device).view(1, 1, 1, C)
+            # Identical rule to cross_attention: drop padding, always keep the
+            # appended zero frame.
+            scores = scores.masked_fill(torch.logical_and(idx >= valid, idx != C - 1), -19999)
+
+        w = F.softmax(scores / (head_dim**0.5), dim=-1)
+        w = self.attention_dropout(w)
+        attended = torch.matmul(w, v)  # [N, H, 1, head_dim]
+        attended = attended.transpose(1, 2).reshape(N, D)
+        return attended + g[b_idx, u_idx]  # same residual as the full path
+
+    def joint_on_path(self, f, g, b_idx, t_idx, u_idx, f_len=None):
+        """Joint logits at the aligned (b, t, u) triples only -> [N, V+1].
+
+        The memory-safe counterpart of ``joint``: never forms [B, T, U, V+1].
+        ``f`` is the RAW encoder output [B, T_frames, D]; it is chunked here
+        exactly as ``joint`` does, so both agree on chunk boundaries.
+        """
+        if f_len is not None and f_len.dim() == 1 and self.chunk_size > 0:
+            f, chunk_lengths = chunk_concat_audio(f, f_len, self.chunk_size)
+            self.num_chunks_per_utterance = (chunk_lengths != 0).sum(dim=1)
+        else:
+            chunk_lengths = f_len
+            self.num_chunks_per_utterance = None
+        f = self.project_encoder(f)
+        g = self.project_prednet(g)
+        B, T, D = f.shape
+        f = torch.reshape(f, [B, T, -1, self.joint_hidden])
+        inp = self.cross_attention_on_path(f, g, chunk_lengths, b_idx, t_idx, u_idx)
+        res = self.joint_net(inp)  # [N, V + 1]
+
+        # Mirror joint_after_projection's normalisation exactly. Skipping it would
+        # make the training objective operate on different values from the ones
+        # the model produces at decode time -- and, with `log_softmax=None`, the
+        # behaviour even depends on the device, so it must be replicated rather
+        # than assumed.
+        if self.log_softmax is None:
+            if not res.is_cuda:
+                res = (res / self.temperature).log_softmax(dim=-1) if self.temperature != 1.0 else res.log_softmax(-1)
+        elif self.log_softmax:
+            res = (res / self.temperature).log_softmax(dim=-1) if self.temperature != 1.0 else res.log_softmax(-1)
+        return res
+
     def cross_attention(self, f, g, sizes, num_heads=4):
         """
         Multi-head cross-attention function
