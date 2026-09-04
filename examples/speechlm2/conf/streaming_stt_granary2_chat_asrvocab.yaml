@@ -1,0 +1,167 @@
+# ============================================================================
+# CHAT (Chunk-wise Attention Transducer) trained on a FORCED ALIGNMENT.
+#
+# Arm 1 of 2: the ASR encoder's own ~1,024-piece SentencePiece vocabulary.
+# The companion recipe (…_chat_qwenvocab) is identical except for the tokenizer,
+# so the pair isolates the effect of vocabulary size on a transducer -- the
+# question raised by the SpeechLM result, where dropping 151,936 pieces to 1,024
+# cost only ~0.14 WER.
+#
+# WHY FORCED ALIGNMENT. The RNN-T loss marginalises over alignments and needs a
+# [B, T, U, V] tensor; at V=151,936 that does not fit, so the large-vocabulary
+# arm would be impossible to train at all. Fixing each word to the chunk holding
+# its last token -- the SAME assignment the SpeechLM trains on, taken from the
+# same dataset class -- reduces the loss to cross-entropy over U + T steps.
+#
+# CAVEAT: this is not the transducer objective. The model cannot discover its own
+# emission times, so absolute WER is not comparable to a properly-trained RNN-T.
+# The comparison that is valid is arm-1 vs arm-2.
+#
+# chunk_size is FIXED at 14 and must match on both sides: the dataset's chunk
+# indices and the joint's own re-chunking have to agree, and chat_train.py
+# refuses to start if they do not.
+# ============================================================================
+
+model:
+  pretrained_asr: /lustre/fsw/portfolios/llmservice/users/heh/pretrained_models/huggingface/nvidia/nemotron-speech-streaming-en-0.6b/nemotron-speech-streaming-en-0.6b.nemo
+  pretrained_llm: ""
+
+  # --- the knob under test ---
+  text_vocab_from_asr: true
+  vocab_size: 1024          # corrected from the tokenizer at startup
+
+  chunk_size: 14
+
+  # Referenced by the data section below (kept identical to the SCRIPT recipe so
+  # the two train on the same audio framing and chunk assignment).
+  sample_rate: 16000
+  frame_length_in_secs: 0.08
+  blank_token: ""
+  audio_history_chunks: 0
+
+  att_context_size: [70, 13]   # [left, chunk-1]: no frame sees past its chunk
+
+  pred_hidden: 640
+  pred_rnn_layers: 2
+  joint_hidden: 640
+
+  load_asr_weights: true
+  freeze_speech_encoder: false
+  audio_pad_to: 0
+
+  optim:
+    name: adamw
+    lr: 1e-4
+    weight_decay: 1e-3
+    betas: [0.9, 0.98]
+  optimizer:
+    _target_: torch.optim.AdamW
+    lr: 1e-4
+    weight_decay: 1e-3
+    betas: [0.9, 0.98]
+    foreach: true
+  lr_scheduler:
+    _target_: nemo.core.optim.lr_scheduler.CosineAnnealing
+    warmup_steps: 2500
+    min_lr: 1e-6
+    max_steps: ${trainer.max_steps}
+  freeze_params: []
+  prevent_freeze_params: []
+
+data:
+  # --- ScriptSTTDataset config ---
+  dataset:
+    sample_rate: ${model.sample_rate}
+    frame_length_in_secs: ${model.frame_length_in_secs}
+    chunk_size: ${model.chunk_size}
+    audio_history_chunks: ${model.audio_history_chunks}
+    num_delay_frames: 3
+    audio_tag: "<audio>"
+    blank_token: ${model.blank_token}
+    system_role: system
+    system_prompt: "You are doing streaming speech recognition. Given the transcript so far and the representation of the next audio chunk, output the words spoken in that chunk."
+
+  # Decode-only val_wer runs generate() on raw audio; pin a single fixed size.
+  val_dataset_overrides:
+    chunk_size: 14
+
+  # --- Lhotse dataloader config ---
+  train_ds:
+    sample_rate: ${data.dataset.sample_rate}
+    input_cfg: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/users/dongjig/aligned_amos/granary_v2_en_pnc_qwen_aligned_filtered/granary_v2_en_pnc_qwen_aligned_filtered_safe_iad_s3_audio.yaml
+    skip_missing_manifest_entries: true
+    manifest_filepath: null
+    seed: 42
+    shuffle: true
+    shard_seed: "randomized"
+    num_workers: 8
+    force_iterable_dataset: true
+    use_bucketing: true
+    bucket_duration_bins: [4.32,6.0,7.04,7.92,8.8,9.6,10.4,11.12,11.89,12.66,13.47,14.8,16.92,20.0,22.4,29.44,35.0,39.6]
+    bucket_batch_size: [38,29,25,22,20,18,17,15,14,13,12,11,10,8,7,6,5,4]
+    max_duration: 54
+    pad_extra_duration: 0.5
+    pad_extra_duration_prob: 1.0
+
+  validation_ds:
+    datasets:
+      mcv_11_dev:
+        manifest_filepath: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/users/dongjig/aligned_amos/steve_val_mmlpc_mcv11_2k/mcv11_dev_clean_pcstrip_en_2k_qwen_aligned.json
+    sample_rate: ${data.dataset.sample_rate}
+    batch_size: 4
+    num_workers: 4
+    seed: 42
+    shard_seed: "randomized"
+    shuffle: false
+    pad_extra_duration: 0.5
+    pad_extra_duration_prob: 1.0
+
+trainer:
+  devices: -1
+  accelerator: gpu
+  num_nodes: 1
+  precision: bf16-true
+  logger: false
+  enable_checkpointing: false
+  use_distributed_sampler: false
+  max_steps: 200000
+  limit_train_batches: 2000
+  val_check_interval: ${trainer.limit_train_batches}
+  log_every_n_steps: 10
+  num_sanity_val_steps: 1
+  gradient_clip_val: 1.0
+  accumulate_grad_batches: 1
+  strategy:
+    _target_: lightning.pytorch.strategies.DDPStrategy
+    gradient_as_bucket_view: true
+    find_unused_parameters: true
+
+
+exp_manager:
+  exp_dir: null
+  explicit_log_dir: null
+  name: streaming_stt_granary2_script_flex
+  create_tensorboard_logger: true
+  create_checkpoint_callback: true
+  use_datetime_version: true
+  max_time_per_run: "00:03:50:00"
+
+  resume_from_checkpoint: null
+  resume_if_exists: true
+  resume_ignore_no_checkpoint: true
+
+  create_wandb_logger: false
+  wandb_logger_kwargs:
+    name: ${exp_manager.name}
+    project: null
+    resume: true
+
+  checkpoint_callback_params:
+    filename: "{step}-{val_wer:.4f}"
+    monitor: val_wer
+    mode: min
+    every_n_train_steps: null
+    every_n_epochs: 1
+    save_top_k: 5
+    always_save_nemo: false
+    save_nemo_on_train_end: false
