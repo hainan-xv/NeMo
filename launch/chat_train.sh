@@ -88,7 +88,20 @@ PROJECT_NAME=SpeechlmScriptCC
 
 # --- Training parameters ---
 MAX_STEPS="${MAX_STEPS:-300000}"
-VAL_CHECK_INTERVAL="${VAL_CHECK_INTERVAL:-4000}"
+# 16000, 4x the SCRIPT recipe's 4000. This drives BOTH limit_train_batches (the
+# "epoch" length) and val_check_interval below, so it is the whole train/validate
+# cycle. CHAT steps ~5 it/s against the SpeechLM's much slower step -- it has no
+# 1.7B LLM in the loop -- so a 4000-step epoch meant validating and
+# checkpointing every ~14 minutes, which is mostly overhead. Per-step decode
+# visibility is now LOG_TRAIN_DECODE_EVERY's job instead, so the long cycle
+# costs no insight.
+VAL_CHECK_INTERVAL="${VAL_CHECK_INTERVAL:-16000}"
+
+# Print ref / forced-alignment target / greedy hypothesis on TRAINING data every
+# N steps (0 disables). Cheap: one greedy decode of LOG_TRAIN_DECODE_N
+# utterances on rank 0.
+LOG_TRAIN_DECODE_EVERY="${LOG_TRAIN_DECODE_EVERY:-500}"
+LOG_TRAIN_DECODE_N="${LOG_TRAIN_DECODE_N:-2}"
 LR="${LR:-0.0001}"
 WARMUP_STEPS="${WARMUP_STEPS:-10000}"
 
@@ -235,6 +248,8 @@ echo "*******STARTING********" \
     model.optimizer.lr=$LR \
     model.lr_scheduler.warmup_steps=$WARMUP_STEPS \
     data.dataset.num_delay_frames=${DELAY} \
+    ++model.log_train_decode_every_n_steps=${LOG_TRAIN_DECODE_EVERY} \
+    ++model.log_train_decode_examples=${LOG_TRAIN_DECODE_N} \
     data.train_ds.seed=$LHOTSE_RND_SEED \
     ++trainer.limit_train_batches=$VAL_CHECK_INTERVAL \
     ++trainer.val_check_interval=$VAL_CHECK_INTERVAL \

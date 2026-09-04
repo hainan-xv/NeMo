@@ -14,6 +14,7 @@
 """The forced-alignment path CHAT is trained on."""
 
 import os
+import types
 
 import pytest
 import torch
@@ -267,3 +268,104 @@ def test_dataset_chunk_estimate_tracks_the_encoder_within_one():
             "A drift > 1 misassigns every word after the divergence."
         )
     assert worst <= 1
+
+
+@pytest.mark.unit
+def test_target_text_reconstructs_the_transcript_from_the_path():
+    """The logged `tgt` line must be the transcript, or it is worse than useless.
+
+    Its whole purpose is to answer "is the model learning the wrong thing?" --
+    so if blanks leaked in, or u/t indices were transposed, the line would look
+    wrong for a HEALTHY model and send you hunting a bug that isn't there.
+    Round-trip it: a path built from known chunk tokens, stripped of blanks,
+    must give back exactly the tokens that went in, in order.
+    """
+    from nemo.collections.speechlm2.models.chat_model import ChatSTTModel
+
+    blank = 99
+    chunk_tokens = [[1, 2], [], [3], [4, 5, 6], []]
+    t_idx, u_idx, labels = build_path(chunk_tokens, blank)
+
+    batch = types.SimpleNamespace(
+        b_idx=torch.zeros(len(labels), dtype=torch.long),
+        labels=torch.tensor(labels, dtype=torch.long),
+    )
+    model = types.SimpleNamespace(
+        blank_id=blank,
+        _detokenize=lambda ids: " ".join(str(i) for i in ids),
+    )
+    got = ChatSTTModel._target_text(model, batch, 0)
+    assert got == "1 2 3 4 5 6"
+
+    # And it must SELECT by utterance: with two utterances interleaved in one
+    # batch, taking the wrong rows would silently log utterance 0's transcript
+    # for every example, which reads as plausible.
+    b2 = types.SimpleNamespace(
+        b_idx=torch.tensor([0, 0, 0, 1, 1, 1], dtype=torch.long),
+        labels=torch.tensor([1, 2, blank, 7, 8, blank], dtype=torch.long),
+    )
+    assert ChatSTTModel._target_text(model, b2, 0) == "1 2"
+    assert ChatSTTModel._target_text(model, b2, 1) == "7 8"
+
+
+@pytest.mark.unit
+def test_train_decode_logging_is_gated_and_never_kills_the_run():
+    """Fires on the right steps, once each, and swallows its own failures.
+
+    A diagnostic that throws would turn a healthy run into a crashed one, and a
+    diagnostic that fires every micro-batch under gradient accumulation would
+    decode several times per step for no extra information.
+    """
+    from nemo.collections.speechlm2.models.chat_model import ChatSTTModel
+
+    calls = []
+
+    def make(step, every=500):
+        m = types.SimpleNamespace(
+            cfg={"log_train_decode_every_n_steps": every, "log_train_decode_examples": 2},
+            global_step=step,
+            _last_decode_step=None,
+            blank_id=99,
+            transcribe_ids=lambda a, l: calls.append(int(m.global_step)) or [[1]],
+            _detokenize=lambda ids: "x",
+            _target_text=lambda b, i: "y",
+        )
+        # cfg.get must behave like DictConfig's.
+        m.cfg = type(
+            "C",
+            (),
+            {
+                "get": lambda _s, k, d=None: {
+                    "log_train_decode_every_n_steps": every,
+                    "log_train_decode_examples": 2,
+                }.get(k, d)
+            },
+        )()
+        return m
+
+    batch = types.SimpleNamespace(
+        audios=torch.zeros(2, 16000),
+        audio_lens=torch.tensor([16000, 16000]),
+        text=["a", "b"],
+    )
+
+    ChatSTTModel._maybe_log_train_decode(make(499), batch)
+    assert calls == [], "fired on a step that is not a multiple of the interval"
+
+    ChatSTTModel._maybe_log_train_decode(make(500), batch)
+    assert calls == [500], "did not fire on the interval"
+
+    # Same global step twice (gradient accumulation) -> decode once.
+    m = make(1000)
+    ChatSTTModel._maybe_log_train_decode(m, batch)
+    ChatSTTModel._maybe_log_train_decode(m, batch)
+    assert calls == [500, 1000], f"fired more than once per global step: {calls}"
+
+    # every=0 disables.
+    ChatSTTModel._maybe_log_train_decode(make(500, every=0), batch)
+    assert calls == [500, 1000]
+
+    # A failure inside the decode must NOT propagate.
+    boom = make(2000)
+    boom.transcribe_ids = lambda a, l: (_ for _ in ()).throw(RuntimeError("cuda oom"))
+    ChatSTTModel._maybe_log_train_decode(boom, batch)  # must not raise

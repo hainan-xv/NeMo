@@ -257,7 +257,79 @@ class ChatSTTModel(LightningModule):
     def training_step(self, batch, batch_idx):
         loss = self.forward_loss(batch)
         self.log("train_loss", loss, prog_bar=True, sync_dist=True)
+        self._maybe_log_train_decode(batch)
         return loss
+
+    @torch.no_grad()
+    def _maybe_log_train_decode(self, batch) -> None:
+        """Periodically print ref / forced-alignment target / greedy hyp.
+
+        WHY, when val_wer already exists: val_wer is one number every few
+        thousand steps, and while it sits near 1.0 -- as it does for the first
+        tens of thousands of steps, when the model is still emitting mostly
+        blanks -- it cannot distinguish "learning slowly but correctly" from
+        "learning something wrong". The decoded strings can: a hypothesis that
+        is empty, or stuck on one token, or a fluent transcript of the wrong
+        audio, each look completely different long before WER separates them.
+
+        The TARGET line is the reason to do this on TRAINING data specifically.
+        It is the forced-alignment path the loss is actually computed against,
+        reconstructed from the batch's own labels -- so if the alignment,
+        tokenisation or chunk assignment were wrong, this line would show it
+        directly, while a validation decode (which has no alignment) could not.
+        A target that does not read like the reference means the model is
+        learning exactly what it was told to, and the fault is upstream.
+
+        Rank 0 only. That is safe under DDP, where parameters are replicated and
+        a no_grad forward runs no collectives -- but it would DEADLOCK under
+        FSDP, where the forward all-gathers shards and every rank must
+        participate. If this model ever moves to FSDP, decode on all ranks and
+        print on one.
+        """
+        every = int(self.cfg.get("log_train_decode_every_n_steps", 0) or 0)
+        if every <= 0 or self.global_step <= 0 or self.global_step % every != 0:
+            return
+        if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+            return
+        # Once per global step, not once per micro-batch under accumulation.
+        if getattr(self, "_last_decode_step", None) == self.global_step:
+            return
+        self._last_decode_step = self.global_step
+
+        n = max(1, int(self.cfg.get("log_train_decode_examples", 2) or 2))
+        n = min(n, int(batch.audios.shape[0]))
+        try:
+            lens = batch.audio_lens[:n]
+            ids = self.transcribe_ids(batch.audios[:n, : int(lens.max())], lens)
+            refs = list(getattr(batch, "text", []) or [])
+            lines = []
+            for i in range(n):
+                ref = refs[i] if i < len(refs) else "<no reference in batch>"
+                lines.append(
+                    f"\n  [{i}] ref: `{ref}`"
+                    f"\n      tgt: `{self._target_text(batch, i)}`"
+                    f"\n      hyp: `{self._detokenize(ids[i])}`"
+                )
+            logging.info("train decode @ step %d%s", self.global_step, "".join(lines))
+        except Exception as e:  # noqa: BLE001
+            # Diagnostics must never take down a training run that is otherwise
+            # healthy -- losing the printout is an annoyance, losing the run is
+            # hours of GPU time.
+            logging.warning(f"train decode logging failed at step {self.global_step}: {e!r}")
+
+    def _target_text(self, batch, i: int) -> str:
+        """The forced-alignment target for utterance i, as text.
+
+        Blanks are dropped: they are the per-chunk terminators, not content, so
+        including them would make every target unreadable. What remains is
+        exactly the token sequence the loss pushes the model to emit.
+        """
+        sel = batch.b_idx == i
+        if not bool(sel.any()):
+            return ""
+        labels = batch.labels[sel]
+        toks = [int(t) for t in labels[labels != self.blank_id].tolist()]
+        return self._detokenize(toks)
 
     # ------------------------------------------------------------------
     # Validation: autoregressive decoding -> WER. No loss.

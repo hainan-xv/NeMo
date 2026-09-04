@@ -48,6 +48,16 @@ model:
   pred_rnn_layers: 2
   joint_hidden: 640
 
+  # --- periodic training-data decode ---
+  # Print ref / forced-alignment target / greedy hypothesis every N steps.
+  # val_wer is one number every val_check_interval steps, and while it sits near
+  # 1.0 it cannot tell "learning slowly" from "learning the wrong thing"; the
+  # decoded strings can. The target line is reconstructed from the batch's own
+  # labels, so a bad alignment or tokenisation shows up directly.
+  # 0 disables. Cost is one greedy decode of a couple of utterances on rank 0.
+  log_train_decode_every_n_steps: 500
+  log_train_decode_examples: 2
+
 
   perception:
     modality_adapter:
@@ -137,7 +147,10 @@ trainer:
   enable_checkpointing: false
   use_distributed_sampler: false
   max_steps: 200000
-  limit_train_batches: 2000
+  # 4x the SCRIPT recipe: CHAT has no LLM in the loop and steps ~5 it/s, so a
+  # short epoch spent most of its time validating and checkpointing. Per-step
+  # visibility comes from log_train_decode_every_n_steps instead.
+  limit_train_batches: 16000
   val_check_interval: ${trainer.limit_train_batches}
   log_every_n_steps: 10
   num_sanity_val_steps: 1
