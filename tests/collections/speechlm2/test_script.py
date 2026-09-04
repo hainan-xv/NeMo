@@ -28,6 +28,7 @@ import math
 
 import os
 
+import re
 import pytest
 import torch
 
@@ -3295,3 +3296,127 @@ def test_init_weights_from_clears_itself_from_saved_hyperparameters(tmp_path):
     StreamingSTTModel._init_weights_from(model, str(ckpt))
     assert model.hparams["init_weights_from"] == ""
     assert model.cfg["init_weights_from"] == ""
+
+
+# ---------------------------------------------------------------------------
+# Chunk texts must partition the transcript.
+# ---------------------------------------------------------------------------
+
+
+class _AlignedWord:
+    """Minimal WordAlignment stand-in."""
+
+    def __init__(self, text, start, end):
+        self.text = self.word = text
+        self.start = self.start_time = start
+        self.end = self.end_time = end
+
+
+def _chunk_texts(transcript, align_words, dur=0.45, chunk_size=14, cap=True, punc=True):
+    from nemo.collections.speechlm2.parts.script_messages import get_llm_messages_for_batch
+
+    al, t = [], 0.0
+    for w in align_words:
+        al.append(_AlignedWord(w, t, t + dur))
+        t += dur
+    msgs = get_llm_messages_for_batch(
+        system_role="system",
+        system_prompt=["p"],
+        audio_tag="<a>",
+        blank_token="",
+        chunk_size=chunk_size,
+        num_delay_frames=3,
+        audio_durations_secs=[t],
+        frame_length_in_secs=0.08,
+        alignments=[al],
+        transcripts=[transcript],
+        capitalization=cap,
+        punctuation=punc,
+    )[0]
+    return [m["content"] for m in msgs if m["role"] == "assistant"]
+
+
+def _spoken_words(transcript):
+    """What an aligner emits: bare words, without surrounding punctuation."""
+    out = []
+    for w in transcript.split():
+        w = re.sub(r"^[^\w]+|[^\w]+$", "", w)
+        if w:
+            out.append(w)
+    return out
+
+
+@pytest.mark.unit
+def test_chunk_texts_do_not_drop_punctuation_between_words():
+    """Regression: `corporal. "He` must not become `corporal.He`.
+
+    Chunk text used to be sliced as transcript[first_span[0]:last_span[1]] per
+    chunk, so any character between one chunk's last span and the next chunk's
+    first span belonged to no slice and vanished. A word's span runs forward
+    through TRAILING punctuation but stops at whitespace; the next word's span
+    runs backward through whitespace but stops at anything else -- so an OPENING
+    quote sits in the gap. Observed in training as targets that fused words
+    across chunk boundaries.
+    """
+    transcript = (
+        'It is very pitiful," she said. "He is not all bad. He is very far from '
+        'being that," interrupted the corporal. "He might have made good, even'
+    )
+    chunks = _chunk_texts(transcript, _spoken_words(transcript))
+    assert "".join(chunks) == transcript
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "transcript",
+    [
+        'He said (quietly) that the plan -- his plan -- would work out fine in the end.',
+        'She replied: "yes". Then [nothing] happened, and the double opt-in process began.',
+        "And I'm thinking that's a brilliant idea. Because I personally like the double opt-in process.",
+        'A quote at the very end, he said "so"',
+    ],
+)
+def test_chunk_texts_reproduce_the_transcript_exactly(transcript):
+    """Concatenated chunk texts ARE the training target, so they must be lossless.
+
+    Checked with the aligner's bare word list, which is the realistic case: the
+    aligner reports spoken words without the transcript's surrounding quotes,
+    brackets and dashes.
+    """
+    chunks = _chunk_texts(transcript, _spoken_words(transcript))
+    assert "".join(chunks) == transcript
+
+
+@pytest.mark.unit
+def test_chunk_texts_are_lossless_across_chunk_sizes_and_word_rates():
+    """The partition must hold however the chunk boundaries fall.
+
+    A boundary landing exactly on a gap is what triggered the original bug, so
+    sweep enough configurations that some boundaries land there.
+    """
+    transcript = (
+        'He said "one" and then (two) -- three, "four." Five [six] seven U.S. eight '
+        "don't nine \"ten\" eleven, twelve."
+    )
+    words = _spoken_words(transcript)
+    for chunk_size in (2, 7, 14, 28):
+        for dur in (0.2, 0.45, 0.9):
+            chunks = _chunk_texts(transcript, words, dur=dur, chunk_size=chunk_size)
+            assert "".join(chunks) == transcript, f"lost text at chunk_size={chunk_size}, dur={dur}"
+
+
+@pytest.mark.unit
+def test_no_doubled_space_when_residual_words_are_appended():
+    """Residual text already carries its leading whitespace.
+
+    Words pushed past the last chunk boundary by the emission delay are folded
+    into the final assistant turn. Now that chunk text starts at the running
+    cursor, joining that with an extra " " would put two spaces in the target --
+    the same class of defect as the doubled space the SentencePiece word-start
+    fix removed.
+    """
+    transcript = "one two three four five six seven eight nine ten eleven twelve thirteen"
+    chunks = _chunk_texts(transcript, _spoken_words(transcript))
+    joined = "".join(chunks)
+    assert "  " not in joined, f"doubled space in target: {joined!r}"
+    assert joined == transcript

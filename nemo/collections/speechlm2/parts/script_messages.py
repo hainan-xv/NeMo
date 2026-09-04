@@ -132,13 +132,47 @@ def get_llm_messages_for_sample(
     # Character spans let us reproduce the transcript's own punctuation/spacing.
     word_spans = compute_word_spans(alignments, transcript, preserve_leading_whitespace=True) if transcript else None
 
+    # Chunk texts must TILE the transcript, not be sliced from it independently.
+    #
+    # Slicing each chunk as transcript[first[0]:last[1]] silently drops every
+    # character falling between one chunk's last span and the next chunk's first
+    # span. Such gaps are routine: a word's span runs forward through TRAILING
+    # punctuation but stops at whitespace, and the next word's span runs backward
+    # through whitespace but stops at anything else -- so an OPENING quote,
+    # bracket or dash sitting between two words belongs to no span at all.
+    #
+    # Seen in training (job 13090447, step 3000): the reference
+    #   ... interrupted the corporal. "He might have made good, even
+    # produced the target
+    #   ... interrupted the corporal.He might have made good, even
+    # losing both the space and the quote, because the aligner's word is `He`
+    # while the transcript reads `"He`.
+    #
+    # The concatenated chunk texts ARE the transcript the model is trained to
+    # emit, so a dropped character is a silent, permanent corruption of the
+    # target that also teaches the model to fuse words across chunk boundaries.
+    # Taking transcript[cursor:end] instead makes the chunks a partition: every
+    # character appears exactly once and concatenation reproduces the transcript.
+    text_cursor = 0
+
     def _content_for(indices: List[int]) -> str:
+        nonlocal text_cursor
         text = None
         if word_spans and transcript:
-            first, last = word_spans[indices[0]], word_spans[indices[-1]]
-            if first is not None and last is not None:
-                text = transcript[first[0] : last[1]]
+            # The LAST located word, so a single unfound word does not discard
+            # the whole group's punctuation by falling back to a bare join.
+            end = None
+            for i in reversed(indices):
+                if word_spans[i] is not None:
+                    end = word_spans[i][1]
+                    break
+            if end is not None and end >= text_cursor:
+                text = transcript[text_cursor:end]
+                text_cursor = end
         if text is None:
+            # No span located: fall back to the aligner's own words. The cursor
+            # does not move, so this group's transcript text is picked up by the
+            # next group rather than being lost.
             text = " ".join(alignments[i].text for i in indices)
         # Restyle AFTER slicing: the character spans index into the original
         # transcript, so stripping punctuation first would invalidate them.
@@ -178,7 +212,24 @@ def get_llm_messages_for_sample(
         elif messages[-1]["content"] == blank_token:
             messages[-1]["content"] = residual
         else:
-            messages[-1]["content"] += " " + residual
+            # No separator: residual starts at the cursor, so it already carries
+            # whatever whitespace the transcript has there. Adding one would
+            # double it.
+            messages[-1]["content"] += residual
+
+    # Anything after the last aligned word's span -- trailing punctuation that no
+    # word's span reached, e.g. a dash separated from the final word by a space.
+    # Without this the chunks still would not partition the transcript, and the
+    # target would end short of the reference.
+    if transcript and text_cursor < len(transcript):
+        tail = apply_text_style(transcript[text_cursor:], capitalization, punctuation)
+        if tail.strip():
+            if messages and messages[-1]["role"] == "assistant" and messages[-1]["content"] != blank_token:
+                messages[-1]["content"] += tail
+            elif messages and messages[-1]["role"] == "assistant":
+                messages[-1]["content"] = tail
+            else:
+                messages.append({"role": "assistant", "content": tail})
 
     return messages
 
