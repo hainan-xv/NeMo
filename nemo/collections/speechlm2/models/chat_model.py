@@ -146,11 +146,28 @@ class ChatSTTModel(LightningModule):
             f"att_context_size={att}, joint_hidden={self.core_cfg.joint_hidden}"
         )
 
+    def _encode(self, audios, audio_lens):
+        """Encoder output as (B, T, D), with the orientation ASSERTED, not guessed.
+
+        The previous heuristic compared shape[1] to max(enc_len), which silently
+        picks the wrong axis whenever the feature dim happens to equal the frame
+        count -- and a mis-oriented tensor does not fail here, it fails deep
+        inside the joint's reshape with an unreadable size error.
+        """
+        enc, enc_len = self.perception(input_signal=audios, input_signal_length=audio_lens)
+        D = int(self.core_cfg.joint_hidden)
+        if enc.shape[-1] != D and enc.shape[1] == D:
+            enc = enc.transpose(1, 2)  # (B, D, T) -> (B, T, D)
+        if enc.shape[-1] != D:
+            raise RuntimeError(
+                f"encoder output {tuple(enc.shape)} has neither axis equal to joint_hidden={D}; "
+                "the joint cannot reshape it. Check perception's output_dim."
+            )
+        return enc, enc_len
+
     def forward_loss(self, batch) -> torch.Tensor:
         """Cross-entropy along the forced path."""
-        enc, enc_len = self.perception(input_signal=batch.audios, input_signal_length=batch.audio_lens)
-        if enc.shape[1] != enc_len.max():  # perception may return (B, D, T)
-            enc = enc.transpose(1, 2)
+        enc, enc_len = self._encode(batch.audios, batch.audio_lens)
 
         # (B, D, U+1) -> (B, U+1, D); the decoder prepends its own SOS.
         g, _, _ = self.decoder(targets=batch.pred_input, target_length=batch.pred_lens)
@@ -207,9 +224,7 @@ class ChatSTTModel(LightningModule):
         was_training = self.training
         self.eval()
         try:
-            enc, enc_len = self.perception(input_signal=audios, input_signal_length=audio_lens)
-            if enc.shape[1] != enc_len.max():
-                enc = enc.transpose(1, 2)
+            enc, enc_len = self._encode(audios, audio_lens)
             # rnnt_decoder_predictions_tensor expects (B, D, T).
             hyps = self.decoding.rnnt_decoder_predictions_tensor(
                 encoder_output=enc.transpose(1, 2), encoded_lengths=enc_len, return_hypotheses=True
