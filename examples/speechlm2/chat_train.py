@@ -29,6 +29,7 @@ from omegaconf import OmegaConf
 
 from nemo.collections.speechlm2.data import DataModule
 from nemo.collections.speechlm2.data.chat_dataset import ChatAlignedDataset
+from nemo.collections.speechlm2.data.script_dataset import ScriptSTTDataset
 from nemo.collections.speechlm2.models.chat_model import ChatSTTModel
 from nemo.core.config import hydra_runner
 from nemo.utils import logging
@@ -51,7 +52,23 @@ def _build_tokenizer(cfg):
         from nemo.collections.speechlm2.parts.asr_vocab import AsrVocabTokenizer, extract_spm_from_nemo
 
         spm = extract_spm_from_nemo(cfg.model.pretrained_asr, tempfile.mkdtemp(prefix="chat_vocab_"))
-        tok = AsrVocabTokenizer(spm)
+        # ChatAlignedDataset inherits ScriptSTTDataset's __init__, which validates
+        # SCRIPT's audio delimiters against the tokenizer. CHAT never emits them --
+        # it builds no packed spine/branch layout -- but they must RESOLVE, so
+        # carry them as specials. They land past the SentencePiece range and are
+        # never a target, so they cost two unused classes and nothing else.
+        # ChatAlignedDataset inherits ScriptSTTDataset's __init__, which validates
+        # SCRIPT's audio delimiters and requires an eos_token as the branch
+        # end-of-turn marker. CHAT uses none of them -- it builds no packed
+        # spine/branch layout, and BLANK terminates each chunk -- but they must
+        # RESOLVE. They land past the SentencePiece range and are never targets,
+        # so they cost a few unused classes and nothing else.
+        EOT = "<|im_end|>"
+        specials = [ScriptSTTDataset.audio_open_token, ScriptSTTDataset.audio_close_token, EOT]
+        blank_tok = cfg.data.dataset.get("blank_token", "") or ""
+        if blank_tok:
+            specials.append(blank_tok)
+        tok = AsrVocabTokenizer(spm, special_tokens=specials, eos_token=EOT, pad_token=EOT)
         logging.info(f"CHAT vocabulary: ASR SentencePiece from {cfg.model.pretrained_asr} -> {len(tok)} pieces")
         return tok
 
