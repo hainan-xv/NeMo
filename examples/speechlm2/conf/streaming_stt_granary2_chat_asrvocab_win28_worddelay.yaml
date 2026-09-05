@@ -1,0 +1,254 @@
+# ============================================================================
+# CHAT (Chunk-wise Attention Transducer) trained on a FORCED ALIGNMENT.
+#
+# ASR ~1,024-piece vocabulary + a 28-frame JOINT WINDOW (joint_history_chunks: 1).
+# The companion recipe (…_chat_qwenvocab) is identical except for the tokenizer,
+# so the pair isolates the effect of vocabulary size on a transducer -- the
+# question raised by the SpeechLM result, where dropping 151,936 pieces to 1,024
+# cost only ~0.14 WER.
+#
+# WHY FORCED ALIGNMENT. The RNN-T loss marginalises over alignments and needs a
+# [B, T, U, V] tensor; at V=151,936 that does not fit, so the large-vocabulary
+# arm would be impossible to train at all. Fixing each word to the chunk holding
+# its last token -- the SAME assignment the SpeechLM trains on, taken from the
+# same dataset class -- reduces the loss to cross-entropy over U + T steps.
+#
+# A FIXED ALIGNMENT IS NOT A HANDICAP HERE. Marginalising exists to learn an
+# alignment you lack; given a good one, conditioning on it is hard EM. The
+# SpeechLM trains this way and reaches 5.96 macro vs the RNN-T's 5.82. And the
+# CHAT greedy decode walks chunks emitting until a blank -- exactly the training
+# path -- so training and inference are the same procedure. What is fixed is
+# emission LATENCY (aligned chunk + delay), the same trade the SpeechLM makes.
+#
+# chunk_size is FIXED at 14 and must match on both sides: the dataset's chunk
+# indices and the joint's own re-chunking have to agree, and chat_train.py
+# refuses to start if they do not.
+# ============================================================================
+
+model:
+  pretrained_asr: /lustre/fsw/portfolios/llmservice/users/heh/pretrained_models/huggingface/nvidia/nemotron-speech-streaming-en-0.6b/nemotron-speech-streaming-en-0.6b.nemo
+  pretrained_llm: ""
+
+  # --- the knob under test ---
+  text_vocab_from_asr: true
+  vocab_size: 1024          # corrected from the tokenizer at startup
+
+  chunk_size: 14
+
+  # Referenced by the data section below (kept identical to the SCRIPT recipe so
+  # the two train on the same audio framing and chunk assignment).
+  sample_rate: 16000
+  frame_length_in_secs: 0.08
+  blank_token: ""
+  audio_history_chunks: 0
+
+  att_context_size: [70, 13]   # [left, chunk-1]: no frame sees past its chunk
+
+  pred_hidden: 640
+  pred_rnn_layers: 2
+  joint_hidden: 640
+
+  # The joint attends to the previous chunk as well as its own: 28 frames read
+  # on a 14-frame emission grid. Word-to-chunk assignment is by the word's LAST
+  # frame, so a word straddling a boundary has its onset in the previous chunk.
+  #
+  # Expected to matter MORE here than for Qwen: this vocabulary emits ~1.9
+  # tokens/word against Qwen's ~1.16, so each word-end burst is longer and more
+  # often multi-token, making the straddling-word burden heavier.
+  #
+  # Emission granularity, latency and look-ahead are unchanged -- the window
+  # ends at the current chunk's last frame.
+  joint_history_chunks: 1
+
+  # --- periodic training-data decode ---
+  # Print ref / forced-alignment target / greedy hypothesis every N steps.
+  # val_wer is one number every val_check_interval steps, and while it sits near
+  # 1.0 it cannot tell "learning slowly" from "learning the wrong thing"; the
+  # decoded strings can. The target line is reconstructed from the batch's own
+  # labels, so a bad alignment or tokenisation shows up directly.
+  # 0 disables. Cost is one greedy decode of a couple of utterances on rank 0.
+  log_train_decode_every_n_steps: 500
+  log_train_decode_examples: 2
+
+
+  perception:
+    modality_adapter:
+      _target_: nemo.collections.speechlm2.modules.perception.IdentityConnector
+    encoder:
+      # The cache-aware encoder otherwise all-reduces max audio length every
+      # forward, which desyncs the data-dependent validation decode across ranks.
+      sync_max_audio_length: false
+
+  load_asr_weights: true
+  # Warm-start the VOCABULARY-INDEPENDENT parts of the pretrained RNN-T: the
+  # donor's joint.enc into perception.proj (which is otherwise a random
+  # Linear(1024,640) scrambling the encoder on its way to the joint), joint.pred,
+  # and the prediction network's LSTM. The embedding and output layer are left
+  # random in BOTH arms on purpose -- arm 1's vocabulary matches the donor and
+  # arm 2's cannot, so copying them would compare initialisations, not
+  # vocabularies. Set false to ablate.
+  init_rnnt_from_asr: true
+  freeze_speech_encoder: false
+  audio_pad_to: 0
+
+  optim:
+    name: adamw
+    lr: 1e-4
+    weight_decay: 1e-3
+    betas: [0.9, 0.98]
+  # Per-group learning rates. The 609M encoder is PRETRAINED and only needs
+  # fine-tuning; the prediction network, joint and the joint's Q/K/V are trained
+  # from SCRATCH and were badly starved by a single shared rate.
+  #
+  # For scale: the donor RNN-T -- the model this encoder comes from -- trained
+  # with NoamAnnealing(lr=3.0, d_model=1024, warmup=8000), peaking at 1.05e-3.
+  # A flat 1e-4 is 10.5x below that peak and 4-8x below it for all of training,
+  # for components no better initialised than the donor's were.
+  #
+  # So: base 1e-3 for the from-scratch parts (matching the donor's peak), with
+  # the encoder held at 0.1x = 1e-4, exactly the rate it has been getting and
+  # which is demonstrably safe for it.
+  lr_multipliers:
+    '^perception\.encoder\.': 0.1
+
+  optimizer:
+    _target_: torch.optim.AdamW
+    lr: 1e-3
+    weight_decay: 1e-3
+    betas: [0.9, 0.98]
+    foreach: true
+  lr_scheduler:
+    _target_: nemo.core.optim.lr_scheduler.CosineAnnealing
+    warmup_steps: 2500
+    min_lr: 1e-6
+    max_steps: ${trainer.max_steps}
+  freeze_params: []
+  prevent_freeze_params: []
+
+data:
+  # --- ScriptSTTDataset config ---
+  dataset:
+    sample_rate: ${model.sample_rate}
+    frame_length_in_secs: ${model.frame_length_in_secs}
+    chunk_size: ${model.chunk_size}
+    audio_history_chunks: ${model.audio_history_chunks}
+    # 0: ALL emission delay now comes from the stochastic word delay below,
+    # rather than a fixed 0.24s applied uniformly to every word.
+    num_delay_frames: 0
+    # For each non-empty chunk, hold back its last k words for the next chunk,
+    # with P(k >= j) = 0.5^j: unchanged half the time, one word a quarter of the
+    # time, two an eighth, and so on. Mean one word held back.
+    #
+    # The frame delay gives every word exactly one emission time, which the model
+    # is free to memorise. This makes emission timing a DISTRIBUTION instead --
+    # the transducer analogue of the alignment freedom that marginalising over
+    # paths would give, and which single-path training gives up.
+    #
+    # A held-back word is frozen where it lands, so added latency is capped at
+    # one chunk (1.12s) and the utterance tail cannot drift.
+    word_delay_prob: 0.5
+    word_delay_seed: 1234
+    audio_tag: "<audio>"
+    blank_token: ${model.blank_token}
+    system_role: system
+    system_prompt: "You are doing streaming speech recognition. Given the transcript so far and the representation of the next audio chunk, output the words spoken in that chunk."
+
+  # Decode-only val_wer runs generate() on raw audio; pin a single fixed size.
+  val_dataset_overrides:
+    chunk_size: 14
+
+  # --- Lhotse dataloader config ---
+  train_ds:
+    sample_rate: ${data.dataset.sample_rate}
+    input_cfg: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/users/dongjig/aligned_amos/granary_v2_en_pnc_qwen_aligned_filtered/granary_v2_en_pnc_qwen_aligned_filtered_safe_iad_s3_audio.yaml
+    skip_missing_manifest_entries: true
+    manifest_filepath: null
+    seed: 42
+    shuffle: true
+    shard_seed: "randomized"
+    num_workers: 8
+    force_iterable_dataset: true
+    use_bucketing: true
+    bucket_duration_bins: [4.32,6.0,7.04,7.92,8.8,9.6,10.4,11.12,11.89,12.66,13.47,14.8,16.92,20.0,22.4,29.44,35.0,39.6]
+    bucket_batch_size: [38,29,25,22,20,18,17,15,14,13,12,11,10,8,7,6,5,4]
+    max_duration: 54
+    pad_extra_duration: 0.5
+    pad_extra_duration_prob: 1.0
+
+  validation_ds:
+    datasets:
+      mcv_11_dev:
+        manifest_filepath: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/users/dongjig/aligned_amos/steve_val_mmlpc_mcv11_2k/mcv11_dev_clean_pcstrip_en_2k_qwen_aligned.json
+    sample_rate: ${data.dataset.sample_rate}
+    batch_size: 4
+    num_workers: 4
+    seed: 42
+    shard_seed: "randomized"
+    shuffle: false
+    pad_extra_duration: 0.5
+    pad_extra_duration_prob: 1.0
+
+trainer:
+  devices: -1
+  accelerator: gpu
+  num_nodes: 1
+  # bf16-MIXED, not bf16-true: keep master weights and optimizer states in fp32
+  # while computing in bf16.
+  #
+  # Under bf16-true the 8-node Qwen arm went from train_loss 1.400 to nan in a
+  # SINGLE step (job 13096766, epoch 1 step 2333) with no preceding spike -- the
+  # signature of an update-precision failure rather than optimisation
+  # divergence. It has a 97.2M-parameter output layer trained from scratch,
+  # 148x the 1k arm's 0.66M, so it is by far the most precision-sensitive tensor
+  # here; the 1k arm on the identical config survived, and the 1-node Qwen run
+  # survived because it resumed from a trained checkpoint where gradients are
+  # small. bf16 optimizer state cannot represent the small second-moment values
+  # that layer produces.
+  precision: bf16-mixed
+  logger: false
+  enable_checkpointing: false
+  use_distributed_sampler: false
+  max_steps: 200000
+  # 4x the SCRIPT recipe: CHAT has no LLM in the loop and steps ~5 it/s, so a
+  # short epoch spent most of its time validating and checkpointing. Per-step
+  # visibility comes from log_train_decode_every_n_steps instead.
+  limit_train_batches: 16000
+  val_check_interval: ${trainer.limit_train_batches}
+  log_every_n_steps: 10
+  num_sanity_val_steps: 1
+  gradient_clip_val: 1.0
+  accumulate_grad_batches: 1
+  strategy:
+    _target_: lightning.pytorch.strategies.DDPStrategy
+    gradient_as_bucket_view: true
+    find_unused_parameters: true
+
+
+exp_manager:
+  exp_dir: null
+  explicit_log_dir: null
+  name: streaming_stt_granary2_script_flex
+  create_tensorboard_logger: true
+  create_checkpoint_callback: true
+  use_datetime_version: true
+  max_time_per_run: "00:03:50:00"
+
+  resume_from_checkpoint: null
+  resume_if_exists: true
+  resume_ignore_no_checkpoint: true
+
+  create_wandb_logger: false
+  wandb_logger_kwargs:
+    name: ${exp_manager.name}
+    project: null
+    resume: true
+
+  checkpoint_callback_params:
+    filename: "{step}-{val_wer:.4f}"
+    monitor: val_wer
+    mode: min
+    every_n_train_steps: null
+    every_n_epochs: 1
+    save_top_k: 5
+    always_save_nemo: false
+    save_nemo_on_train_end: false

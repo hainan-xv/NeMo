@@ -37,6 +37,7 @@ parses into :class:`~nemo.collections.speechlm2.parts.script.ChunkSpec` objects.
 """
 
 import math
+import random
 from typing import List, Optional, Sequence, Union
 
 from nemo.collections.speechlm2.data.streaming_stt_dataset import compute_word_spans
@@ -70,6 +71,8 @@ def get_llm_messages_for_sample(
     transcript: Optional[str] = None,
     capitalization: bool = True,
     punctuation: bool = True,
+    word_delay_prob: float = 0.0,
+    rng: Optional[random.Random] = None,
 ) -> List[dict]:
     """Build the alternating user/assistant turns for one utterance.
 
@@ -202,13 +205,12 @@ def get_llm_messages_for_sample(
 
     num_chunks = math.ceil(num_frames / chunk_size) if num_frames > 0 else 0
 
+    # PASS 1: which words each chunk reveals under the frame-delay rule.
+    chunk_words: List[List[int]] = []
     word_idx = 0
     chunk_end_frame = 0
     for _ in range(num_chunks):
         chunk_end_frame += chunk_size
-        messages.append({"role": "user", "content": audio_tag * chunk_size})
-
-        # Collect every word that has become ready by this chunk's boundary.
         ready: List[int] = []
         while word_idx < len(alignments):
             word_end_frame = math.ceil(alignments[word_idx].end_time / frame_length_in_secs)
@@ -217,10 +219,53 @@ def get_llm_messages_for_sample(
                 word_idx += 1
             else:
                 break
+        chunk_words.append(ready)
 
+    # PASS 2: stochastic WORD-level delay, applied on top of the frame delay.
+    #
+    # For each non-empty chunk, hold back its last k words for the next chunk,
+    # with P(k >= j) = word_delay_prob^j. At the default 0.5 that leaves a chunk
+    # alone half the time, holds back one word a quarter of the time, two an
+    # eighth, and so on -- one word held back on average.
+    #
+    # WHY. The frame delay applies one fixed latency to every word, so the model
+    # sees exactly one emission time per word and is free to depend on it.
+    # Randomising the boundary makes emission timing a distribution instead of a
+    # constant -- the transducer analogue of the alignment freedom that
+    # marginalising over paths would provide, which single-path training gives up.
+    #
+    # A held-back word is FROZEN where it lands: only a chunk's OWN words are
+    # eligible, never ones pushed in from the previous chunk. That caps the added
+    # latency at exactly one chunk. Without it a word could slip arbitrarily far
+    # and the tail of an utterance would drift.
+    #
+    # The final chunk has nowhere to push to, so its words are never delayed.
+    if word_delay_prob > 0.0 and rng is not None and num_chunks > 1:
+        pushed: List[List[int]] = [[] for _ in range(num_chunks)]
+        for t in range(num_chunks - 1):
+            own = chunk_words[t]
+            if not own:
+                continue
+            k = 0
+            while k < len(own) and rng.random() < word_delay_prob:
+                k += 1
+            if k:
+                pushed[t + 1] = own[-k:]
+                chunk_words[t] = own[:-k]
+        # Prepended only AFTER the loop, so a pushed-in word is never itself
+        # eligible. Pushed words precede the receiving chunk's own words in the
+        # transcript, so every chunk's list stays in transcript order -- which is
+        # what the cursor in _content_for relies on.
+        for t in range(num_chunks):
+            if pushed[t]:
+                chunk_words[t] = pushed[t] + chunk_words[t]
+
+    # PASS 3: emit the turns.
+    for t in range(num_chunks):
+        messages.append({"role": "user", "content": audio_tag * chunk_size})
         # Styling can empty a chunk whose text was punctuation only; that makes it
         # silent, exactly like a chunk that revealed no words at all.
-        content = _content_for(ready) if ready else ""
+        content = _content_for(chunk_words[t]) if chunk_words[t] else ""
         messages.append({"role": "assistant", "content": content if content.strip() else blank_token})
 
     # Any words the delay pushed past the last chunk boundary (or whose alignment
@@ -269,6 +314,8 @@ def get_llm_messages_for_batch(
     transcripts: Optional[List[str]] = None,
     capitalization: Union[bool, Sequence[bool]] = True,
     punctuation: Union[bool, Sequence[bool]] = True,
+    word_delay_prob: float = 0.0,
+    rng: Optional[random.Random] = None,
 ) -> List[List[dict]]:
     """Per-sample :func:`get_llm_messages_for_sample` over a batch.
 
@@ -300,6 +347,8 @@ def get_llm_messages_for_batch(
             transcript=transcripts[i] if transcripts is not None else None,
             capitalization=caps[i],
             punctuation=puncts[i],
+            word_delay_prob=word_delay_prob,
+            rng=rng,
         )
         for i in range(n)
     ]

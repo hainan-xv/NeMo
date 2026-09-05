@@ -24,11 +24,11 @@ Two tests carry the correctness argument:
   offline is a batching optimization; the dependency structure stays streaming.
 """
 
+import collections
 import math
-
 import os
-
 import re
+
 import pytest
 import torch
 
@@ -3140,7 +3140,6 @@ def test_asr_vocab_is_a_tokenizer_spec_and_dispatches_like_the_baseline(tmp_path
     from nemo.collections.common.tokenizers.aggregate_tokenizer import TokenizerWrapper
     from nemo.collections.common.tokenizers.huggingface.auto_tokenizer import AutoTokenizer
     from nemo.collections.common.tokenizers.tokenizer_spec import TokenizerSpec
-
     from nemo.collections.speechlm2.parts.asr_vocab import AsrVocabTokenizer
 
     tok = AsrVocabTokenizer(_asr_spm_path(tmp_path), special_tokens=["<|im_end|>"], eos_token="<|im_end|>")
@@ -3458,3 +3457,116 @@ def test_all_words_unlocatable_loses_nothing():
     # Nothing is emitted (no span ever resolves), but nothing is duplicated
     # either -- the failure mode we are guarding is invented text, not silence.
     assert "zzz" not in joined and "yyy" not in joined, f"aligner spellings leaked: {joined!r}"
+
+
+# ---------------------------------------------------------------------------
+# Stochastic word-level emission delay.
+# ---------------------------------------------------------------------------
+
+
+def _wd_chunks(transcript, prob, seed, dur=0.30, chunk_size=14, delay=0):
+    import random as _random
+
+    from nemo.collections.speechlm2.parts.script_messages import get_llm_messages_for_batch
+
+    al, t = [], 0.0
+    for w in transcript.split():
+        al.append(_AlignedWord(w, t, t + dur))
+        t += dur
+    msgs = get_llm_messages_for_batch(
+        system_role="system",
+        system_prompt=["p"],
+        audio_tag="<a>",
+        blank_token="<b>",
+        chunk_size=chunk_size,
+        num_delay_frames=delay,
+        audio_durations_secs=[t],
+        frame_length_in_secs=0.08,
+        alignments=[al],
+        transcripts=[transcript],
+        capitalization=True,
+        punctuation=True,
+        word_delay_prob=prob,
+        rng=_random.Random(seed),
+    )[0]
+    return [m["content"] for m in msgs if m["role"] == "assistant"]
+
+
+_WD_TEXT = "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen"
+
+
+@pytest.mark.unit
+def test_word_delay_off_by_default_is_a_strict_noop():
+    """prob=0 must reproduce the frame-delay assignment exactly.
+
+    Every run to date used this path, so the restructure into three passes must
+    not perturb it.
+    """
+    assert _wd_chunks(_WD_TEXT, prob=0.0, seed=0) == _wd_chunks(_WD_TEXT, prob=0.0, seed=99)
+
+
+@pytest.mark.unit
+def test_word_delay_never_loses_or_reorders_text():
+    """The transcript must survive the perturbation intact, for every seed.
+
+    Holding words back rewrites the target, so a bug here would corrupt training
+    data in a way that looks like a plausible transcript -- the hardest kind to
+    notice.
+    """
+    for seed in range(200):
+        chunks = _wd_chunks(_WD_TEXT, prob=0.5, seed=seed)
+        joined = " ".join(c for c in chunks if c != "<b>")
+        assert re.sub(r"\s+", " ", joined).strip() == _WD_TEXT, f"seed {seed}: {joined!r}"
+
+
+@pytest.mark.unit
+def test_word_delay_moves_a_word_at_most_one_chunk():
+    """A held-back word is FROZEN where it lands.
+
+    Only a chunk's own words are eligible, never ones pushed in from the
+    previous chunk. Without that a word could slip arbitrarily far and the tail
+    of the utterance would drift, which is unbounded added latency.
+    """
+    base = _wd_chunks(_WD_TEXT, prob=0.0, seed=0)
+    words = _WD_TEXT.split()
+
+    def chunk_of(chunks, w):
+        return next(i for i, c in enumerate(chunks) if re.search(rf"\b{w}\b", c))
+
+    seen_moved = 0
+    for seed in range(200):
+        chunks = _wd_chunks(_WD_TEXT, prob=0.5, seed=seed)
+        for w in words:
+            shift = chunk_of(chunks, w) - chunk_of(base, w)
+            assert shift in (0, 1), f"seed {seed}: {w!r} moved {shift} chunks"
+            seen_moved += shift
+    assert seen_moved > 0, "nothing ever moved -- the mechanism is not firing"
+
+
+@pytest.mark.unit
+def test_word_delay_k_distribution_is_geometric():
+    """P(k >= j) = p^j, i.e. p(0.5): unchanged 1/2, one word 1/4, two 1/8.
+
+    This is the shape that was specified; a plain per-word coin flip or an
+    off-by-one in the loop would give a different curve while still 'working'.
+    """
+    import random as _random
+
+    rng = _random.Random(0)
+    N, plenty = 20000, 50
+    counts = collections.Counter()
+    for _ in range(N):
+        k = 0
+        while k < plenty and rng.random() < 0.5:
+            k += 1
+        counts[k] += 1
+    for j in range(4):
+        assert abs(counts[j] / N - 0.5 ** (j + 1)) < 0.015, f"P(k={j})={counts[j]/N:.3f}"
+
+
+@pytest.mark.unit
+def test_word_delay_last_chunk_never_pushes():
+    """The final chunk has nowhere to push, so its words must stay put."""
+    for seed in range(50):
+        chunks = _wd_chunks(_WD_TEXT, prob=0.9, seed=seed)
+        assert chunks[-1] != "<b>" or all(c == "<b>" for c in chunks), f"seed {seed}: tail lost"

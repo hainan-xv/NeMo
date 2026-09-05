@@ -41,6 +41,7 @@ Length is therefore ``sum(len(tokens)) + n_chunks``, versus the ``T x U`` lattic
 the standard loss would score.
 """
 
+import random
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -132,9 +133,26 @@ class ChatAlignedDataset(ScriptSTTDataset):
 
     def __init__(self, cfg, tokenizer, blank_id: Optional[int] = None):
         super().__init__(cfg, tokenizer)
+        # Stochastic WORD-level emission delay. 0 disables it.
+        self._word_delay_prob = float(getattr(cfg, "word_delay_prob", 0.0) or 0.0)
+        self._word_delay_rngs: dict = {}
         # The transducer's blank is an extra class at the END of the vocabulary,
         # the standard NeMo convention (num_classes == vocab_size, blank == V).
         self.blank_id = int(len(self.tokenizer) if blank_id is None else blank_id)
+
+    def _get_word_delay_rng(self) -> random.Random:
+        """RNG for the word-delay draw, seeded per dataloader worker.
+
+        Workers must not draw identical sequences, or every worker would perturb
+        its batches the same way and the augmentation would be far less diverse
+        than it looks -- the same reason the chunk-size and control draws are
+        offset by worker id.
+        """
+        info = torch.utils.data.get_worker_info()
+        wid = info.id if info is not None else 0
+        if wid not in self._word_delay_rngs:
+            self._word_delay_rngs[wid] = random.Random(int(getattr(self.cfg, "word_delay_seed", 1234)) + wid)
+        return self._word_delay_rngs[wid]
 
     def get_batch_data(self, cuts, audios, audio_lens, alignments, text) -> ChatAlignedBatch:
         chunk_size = int(self.cfg.chunk_size)
@@ -159,6 +177,8 @@ class ChatAlignedDataset(ScriptSTTDataset):
             transcripts=text,
             capitalization=True,
             punctuation=True,
+            word_delay_prob=self._word_delay_prob,
+            rng=self._get_word_delay_rng() if self._word_delay_prob > 0.0 else None,
         )
 
         all_b, all_t, all_u, all_lab = [], [], [], []
