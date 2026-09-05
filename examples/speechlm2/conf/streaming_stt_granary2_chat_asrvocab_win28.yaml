@@ -162,7 +162,19 @@ trainer:
   devices: -1
   accelerator: gpu
   num_nodes: 1
-  precision: bf16-true
+  # bf16-MIXED, not bf16-true: keep master weights and optimizer states in fp32
+  # while computing in bf16.
+  #
+  # Under bf16-true the 8-node Qwen arm went from train_loss 1.400 to nan in a
+  # SINGLE step (job 13096766, epoch 1 step 2333) with no preceding spike -- the
+  # signature of an update-precision failure rather than optimisation
+  # divergence. It has a 97.2M-parameter output layer trained from scratch,
+  # 148x the 1k arm's 0.66M, so it is by far the most precision-sensitive tensor
+  # here; the 1k arm on the identical config survived, and the 1-node Qwen run
+  # survived because it resumed from a trained checkpoint where gradients are
+  # small. bf16 optimizer state cannot represent the small second-moment values
+  # that layer produces.
+  precision: bf16-mixed
   logger: false
   enable_checkpointing: false
   use_distributed_sampler: false

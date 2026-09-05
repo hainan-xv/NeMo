@@ -808,3 +808,59 @@ def test_decode_symbol_cap_does_not_scale_with_the_attention_window(M):
         f"M={M}: a chunk emitted {max(per_chunk.values())} symbols, cap should be {C} "
         "(the cap is following the attention window, not the emission grid)"
     )
+
+
+@pytest.mark.unit
+def test_nonfinite_loss_is_skipped_then_fails_loudly():
+    """A nan step must be skipped, and a RUN of them must kill the job.
+
+    Job 13096766 hit nan at epoch 1 step 2333 and then spent 3.5 hours on 8
+    nodes writing val_wer=1.0 checkpoints while Slurm reported COMPLETED --
+    a failure that looks like a success. One bad batch is survivable; once the
+    weights are nan every later step is too, so continuing is pure waste.
+    """
+    from nemo.collections.speechlm2.models.chat_model import ChatSTTModel
+
+    class Stub:
+        cfg = {"max_nonfinite_steps": 3}
+        global_step = 0
+
+        def __init__(self):
+            self.logged = []
+
+        def forward_loss(self, batch):
+            return self._loss
+
+        def log(self, *a, **k):
+            self.logged.append(a)
+
+        def _maybe_log_train_decode(self, batch):
+            pass
+
+    s = Stub()
+    s.cfg = type("C", (), {"get": lambda _s, k, d=None: 3 if k == "max_nonfinite_steps" else d})()
+
+    # A finite loss passes straight through and is logged.
+    s._loss = torch.tensor(1.5)
+    out = ChatSTTModel.training_step(s, None, 0)
+    assert out is not None and s.logged, "a healthy step must train and log"
+
+    # nan is skipped (returns None -> Lightning does no update).
+    s._loss = torch.tensor(float("nan"))
+    assert ChatSTTModel.training_step(s, None, 1) is None
+    assert ChatSTTModel.training_step(s, None, 2) is None
+
+    # ...until the run of them proves the weights are gone.
+    with pytest.raises(RuntimeError, match="non-finite"):
+        ChatSTTModel.training_step(s, None, 3)
+
+    # A finite step in between must RESET the counter, or an isolated bad batch
+    # every few thousand steps would eventually trip the abort.
+    s2 = Stub()
+    s2.cfg = type("C", (), {"get": lambda _s, k, d=None: 3 if k == "max_nonfinite_steps" else d})()
+    for _ in range(2):
+        s2._loss = torch.tensor(float("inf"))
+        assert ChatSTTModel.training_step(s2, None, 0) is None
+    s2._loss = torch.tensor(1.0)
+    assert ChatSTTModel.training_step(s2, None, 0) is not None
+    assert s2._nonfinite_steps == 0

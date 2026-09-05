@@ -393,6 +393,43 @@ class ChatSTTModel(LightningModule):
 
     def training_step(self, batch, batch_idx):
         loss = self.forward_loss(batch)
+
+        # Skip a non-finite step instead of letting it poison the weights.
+        #
+        # Job 13096766 went from train_loss 1.400 to nan in one step and then
+        # spent its remaining 3.5 hours on 8 nodes writing val_wer=1.0
+        # checkpoints. Once nan reaches the weights every later step is nan too,
+        # so the run is dead but Slurm reports COMPLETED -- a failure that looks
+        # like a success, which is the expensive kind.
+        #
+        # The decision MUST be identical on every rank: returning None on one
+        # rank while others run backward desynchronises DDP's gradient
+        # all-reduce and hangs the job. So the flag is all-reduced first.
+        bad = torch.zeros((), device=loss.device)
+        if not torch.isfinite(loss.detach()):
+            bad.fill_(1.0)
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(bad, op=torch.distributed.ReduceOp.MAX)
+
+        if bool(bad.item()):
+            self._nonfinite_steps = getattr(self, "_nonfinite_steps", 0) + 1
+            logging.warning(
+                f"non-finite training loss at step {self.global_step} "
+                f"({self._nonfinite_steps} in a row); skipping the update."
+            )
+            # A one-off bad batch is survivable. A run of them means the weights
+            # are ALREADY non-finite, so every future step will be too -- fail
+            # loudly rather than burn the rest of the allocation.
+            if self._nonfinite_steps >= int(self.cfg.get("max_nonfinite_steps", 25)):
+                raise RuntimeError(
+                    f"training loss has been non-finite for {self._nonfinite_steps} consecutive steps; "
+                    "the weights are almost certainly nan. Check precision (bf16-true keeps optimizer "
+                    "state in bf16 and is not safe for the large-vocabulary arm), learning rate, and "
+                    "gradient clipping."
+                )
+            return None
+
+        self._nonfinite_steps = 0
         self.log("train_loss", loss, prog_bar=True, sync_dist=True)
         self._maybe_log_train_decode(batch)
         return loss
