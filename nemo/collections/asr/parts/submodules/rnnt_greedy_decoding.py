@@ -608,6 +608,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
             )
         n_chunks = len(out_len_list)
         pending = None  # state saved before a retraction, for the no-re-emission fallback
+        carried = 0  # words handed INTO the current chunk; these are frozen, not re-eligible
 
         for time_idx in range(n_chunks):
             if out_len_list[time_idx] == 0:
@@ -673,8 +674,21 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
 
             # Hand back this chunk's last `retract_words` words -- never on the
             # final chunk, which has no successor to re-emit them.
-            if retract_words > 0 and time_idx < n_chunks - 1 and len(word_starts) >= retract_words:
-                keep_n, state, last_tok, score = word_starts[-retract_words]
+            #
+            # Only this chunk's OWN words are eligible. The first `carried` word
+            # starts are re-emissions of words handed in from the previous chunk,
+            # and training freezes those: a word is pushed forward at most once,
+            # which is what caps the added latency at a single chunk.
+            #
+            # Without this a chunk that emits FEWER OWN WORDS THAN k re-defers
+            # the words it was just given, and they slide forward again and
+            # again, drifting away from the audio that evidences them. It bites
+            # k=2 far harder than k=1: chunks average ~3 words and many have 0-1,
+            # so "own < k" is common at k=2 and rare at k=1 -- which is the shape
+            # of the measured result (retract 1 helped, retract 2 hurt).
+            eligible = word_starts[carried:]
+            if retract_words > 0 and time_idx < n_chunks - 1 and len(eligible) >= retract_words:
+                keep_n, state, last_tok, score = eligible[-retract_words]
                 pending = (
                     list(hypothesis.y_sequence),
                     hypothesis.dec_state,
@@ -687,6 +701,9 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                 hypothesis.dec_state = state
                 hypothesis.last_token = last_tok
                 hypothesis.score = score
+                carried = retract_words
+            else:
+                carried = 0
 
         # Words handed forward out of the final decoded chunk have nowhere to be
         # re-emitted, so restore them rather than dropping the tail.

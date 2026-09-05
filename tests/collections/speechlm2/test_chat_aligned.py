@@ -1098,3 +1098,47 @@ def test_spec_augment_is_configured_and_train_only():
         c, _ = model._encode(audio, alen)
         d, _ = model._encode(audio, alen)
     assert not torch.allclose(c, d, atol=1e-3), "train mode is deterministic -- augmentation is not firing"
+
+
+@pytest.mark.unit
+def test_retract_never_defers_the_same_word_twice():
+    """A handed-forward word is FROZEN, exactly as in training.
+
+    Chunk word lists are [re-emitted..., own...], so the last k are the chunk's
+    own words only if it emitted at least k of them. Chunks average ~3 words and
+    many have 0-1, so without this rule a chunk that emits fewer own words than
+    k re-defers the words it was just handed, and they slide forward again and
+    again, drifting away from the audio that evidences them.
+
+    Here chunk1 emits ONLY the word handed to it (10) and nothing of its own, so
+    10 must be committed, not deferred a second time.
+    """
+    BLANK = 99
+    #   chunk0: 10 .        -> hands word 10 forward
+    #   chunk1: 10 .        -> re-emits 10 only; nothing of its own to give up
+    #   chunk2: 20 .  (last)
+    script = [10, BLANK, 10, BLANK, 20, BLANK]
+    d = _retract_decoder(script, BLANK, word_starts={10, 20}, retract=1)
+    x = torch.zeros(3, 1, d.joint.encoder_hidden * d.joint.chunk_size)
+    with torch.no_grad():
+        h = d._greedy_decode_chat(x, torch.tensor([[4, 4, 4]]))
+    assert h.y_sequence == [10, 20], f"word was deferred twice: {h.y_sequence}"
+
+
+@pytest.mark.unit
+def test_retract_two_only_takes_the_chunks_own_words():
+    """With k=2, a chunk holding 2 carried + 1 own word may retract nothing.
+
+    It has fewer own words than k, so under the frozen rule there is nothing
+    eligible and everything it emitted must be committed.
+    """
+    BLANK = 99
+    #   chunk0: 10 20 .          -> hands both forward (k=2)
+    #   chunk1: 10 20 30 .       -> 10,20 are carried; only 30 is its own -> no retraction
+    #   chunk2: 40 .   (last)
+    script = [10, 20, BLANK, 10, 20, 30, BLANK, 40, BLANK]
+    d = _retract_decoder(script, BLANK, word_starts={10, 20, 30, 40}, retract=2)
+    x = torch.zeros(3, 1, d.joint.encoder_hidden * d.joint.chunk_size)
+    with torch.no_grad():
+        h = d._greedy_decode_chat(x, torch.tensor([[4, 4, 4]]))
+    assert h.y_sequence == [10, 20, 30, 40], f"carried words were re-deferred: {h.y_sequence}"
