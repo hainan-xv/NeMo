@@ -88,14 +88,23 @@ PROJECT_NAME=SpeechlmScriptCC
 
 # --- Training parameters ---
 MAX_STEPS="${MAX_STEPS:-300000}"
-# 16000, 4x the SCRIPT recipe's 4000. This drives BOTH limit_train_batches (the
-# "epoch" length) and val_check_interval below, so it is the whole train/validate
-# cycle. CHAT steps ~5 it/s against the SpeechLM's much slower step -- it has no
-# 1.7B LLM in the loop -- so a 4000-step epoch meant validating and
-# checkpointing every ~14 minutes, which is mostly overhead. Per-step decode
-# visibility is now LOG_TRAIN_DECODE_EVERY's job instead, so the long cycle
-# costs no insight.
-VAL_CHECK_INTERVAL="${VAL_CHECK_INTERVAL:-16000}"
+# Epoch length in optimizer steps (Lightning's limit_train_batches).
+EPOCH_STEPS="${EPOCH_STEPS:-16000}"
+# How many times per epoch to run validation AND save a checkpoint.
+#
+# These used to be the same number: one validation per epoch, at the epoch
+# boundary. That gave a single val_wer every ~57 minutes, so a 4-hour job
+# produced only four points on the curve and lost up to an hour of progress
+# whenever it hit the wall clock. Four per epoch costs a few minutes of decode
+# and gives 4x the resolution plus 4x the resume granularity.
+VALS_PER_EPOCH="${VALS_PER_EPOCH:-4}"
+VAL_CHECK_INTERVAL="${VAL_CHECK_INTERVAL:-$((EPOCH_STEPS / VALS_PER_EPOCH))}"
+if (( VAL_CHECK_INTERVAL <= 0 || EPOCH_STEPS % VAL_CHECK_INTERVAL != 0 )); then
+    echo "ERROR: EPOCH_STEPS=${EPOCH_STEPS} must be a positive multiple of the validation" >&2
+    echo "       interval ${VAL_CHECK_INTERVAL}; otherwise Lightning validates at a point that" >&2
+    echo "       never coincides with the checkpoint step and val_wer is never recorded." >&2
+    exit 1
+fi
 
 # Print ref / forced-alignment target / greedy hypothesis on TRAINING data every
 # N steps (0 disables). Cheap: one greedy decode of LOG_TRAIN_DECODE_N
@@ -228,6 +237,7 @@ echo "*******STARTING********" \
 && echo "*** OBJECTIVE: p(words_k | text_history_<k, audio_k); packed spine+branch, single O(L) forward ***" \
 && echo "*** MONITOR: val_wer (min) -- chunk-synchronous streaming decode ***" \
 && echo "*** WARM START: init=${INIT_CKPT:-none} ***" \
+&& echo "*** SCHEDULE: epoch=${EPOCH_STEPS} steps, validate+checkpoint every ${VAL_CHECK_INTERVAL} (${VALS_PER_EPOCH}x/epoch) ***" \
 && echo "*** SEED: ${LHOTSE_RND_SEED} ***" \
 && nvidia-smi \
 && export WANDB_API_KEY=${WANDB} \
@@ -259,7 +269,7 @@ echo "*******STARTING********" \
     ++model.log_train_decode_every_n_steps=${LOG_TRAIN_DECODE_EVERY} \
     ++model.log_train_decode_examples=${LOG_TRAIN_DECODE_N} \
     data.train_ds.seed=$LHOTSE_RND_SEED \
-    ++trainer.limit_train_batches=$VAL_CHECK_INTERVAL \
+    ++trainer.limit_train_batches=$EPOCH_STEPS \
     ++trainer.val_check_interval=$VAL_CHECK_INTERVAL \
     trainer.max_steps=$MAX_STEPS \
     trainer.devices=$GPUS_PER_NODE \
@@ -275,6 +285,8 @@ echo "*******STARTING********" \
     ++exp_manager.checkpoint_callback_params.monitor=val_wer \
     ++exp_manager.checkpoint_callback_params.mode=min \
     ++exp_manager.checkpoint_callback_params.save_top_k=5 \
+    ++exp_manager.checkpoint_callback_params.every_n_train_steps=$VAL_CHECK_INTERVAL \
+    ++exp_manager.checkpoint_callback_params.every_n_epochs=0 \
     ${INIT_CKPT_ARG}
 EOF
 
