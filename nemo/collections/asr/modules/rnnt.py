@@ -1906,11 +1906,15 @@ class RNNTAttJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMix
         experimental_fuse_loss_wer: Any = None,
         masking_prob: float = -1.0,
         chunk_size: int = -1,
+        history_chunks: int = 0,
     ):
         super().__init__()
 
         self.vocabulary = vocabulary
         self.chunk_size = chunk_size
+        # Frames the joint may ATTEND to, beyond the chunk it is emitting for.
+        # 0 = standard CHAT. See _apply_history_window.
+        self.history_chunks = int(history_chunks)
 
         self._vocab_size = num_classes
         self._num_extra_outputs = num_extra_outputs
@@ -1990,10 +1994,68 @@ class RNNTAttJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMix
         """
         if f_len is not None and f_len.dim() == 1 and self.chunk_size > 0:
             chunked, chunk_lengths = chunk_concat_audio(f, f_len, self.chunk_size)
+            # Recorded BEFORE windowing: the number of chunks to emit for is a
+            # property of the audio, not of how many frames each chunk may read.
             self.num_chunks_per_utterance = (chunk_lengths != 0).sum(dim=1)
+            chunked, chunk_lengths = self._apply_history_window(chunked, chunk_lengths)
             return self.joint_after_projection(self.project_encoder(chunked), self.project_prednet(g), chunk_lengths)
         self.num_chunks_per_utterance = None
         return self.joint_after_projection(self.project_encoder(f), self.project_prednet(g), f_len)
+
+    def _apply_history_window(self, chunked: torch.Tensor, chunk_lengths: torch.Tensor):
+        """Widen each chunk's ATTENDABLE frames to include the previous M chunks.
+
+        Emission granularity is unchanged -- the joint still produces one
+        distribution per (chunk, label) pair, and a word is still emitted at its
+        assigned chunk. Only the key/value set grows, from the chunk's own C
+        frames to (M+1)*C. With C=14 and M=1 the joint reads 28 frames while
+        emitting on a 14-frame grid, the transducer analogue of SCRIPT's win28.
+
+        WHY THIS HELPS. Word-to-chunk assignment is by the word's LAST frame, so
+        a word straddling a boundary has its onset in the previous chunk. The
+        joint could previously only see the chunk it was emitting for, and had to
+        recover the onset from whatever the encoder's left context had folded
+        into those frames. Here it can attend to the onset directly.
+
+        WHY THIS IS DONE AT CHUNKING, NOT INSIDE THE ATTENTION. Greedy decoding
+        slices ONE chunk out of the encoder tensor and calls the joint on it, so
+        a window built inside the attention would exist in training and vanish at
+        inference. Building it here means the chunk the decoder slices is already
+        the widened window, and training and decoding stay identical by
+        construction.
+
+        NO LOOK-AHEAD IS INTRODUCED. The window spans frames
+        [max(0, t-M)*C, (t+1)*C), which ends exactly at chunk t's last frame, so
+        the model still never sees audio past the chunk it is emitting for.
+
+        The valid frames are kept as a PREFIX of the window, which is what the
+        attention mask assumes: it masks positions >= a single per-chunk count.
+        """
+        M = self.history_chunks
+        if M <= 0:
+            return chunked, chunk_lengths
+
+        B, T, CD = chunked.shape
+        C = self.chunk_size
+        D = CD // C
+        W = (M + 1) * C
+        dev = chunked.device
+
+        flat = chunked.reshape(B, T * C, D)
+        t_ar = torch.arange(T, device=dev)
+        start = (t_ar - M).clamp(min=0) * C  # [T]
+        idx = start.view(1, T, 1) + torch.arange(W, device=dev).view(1, 1, W)  # [1, T, W]
+        idx = idx.clamp(max=T * C - 1).expand(B, T, W)
+        gathered = flat.gather(1, idx.reshape(B, T * W, 1).expand(B, T * W, D))
+        windowed = gathered.reshape(B, T, W * D)
+
+        # Frames of real history in front of this chunk: min(t, M) * C.
+        hist = t_ar.clamp(max=M) * C  # [T]
+        valid = hist.view(1, T) + chunk_lengths
+        # A chunk past the end of the audio stays empty -- it has no target and
+        # must not become "valid" merely because history sits in front of it.
+        valid = torch.where(chunk_lengths > 0, valid, torch.zeros_like(valid))
+        return windowed, valid
 
     def chunk_encoder_for_decoding(
         self, encoded: torch.Tensor, encoded_len: torch.Tensor
@@ -2016,6 +2078,9 @@ class RNNTAttJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMix
         """
         chunked, chunk_lengths = chunk_concat_audio(encoded.transpose(1, 2), encoded_len, self.chunk_size)
         num_chunks = (chunk_lengths != 0).sum(dim=1)
+        # Widen here so the single chunk the greedy loop slices out already
+        # carries its history; the decode path then needs no change at all.
+        chunked, chunk_lengths = self._apply_history_window(chunked, chunk_lengths)
         return chunked.transpose(1, 2), num_chunks, chunk_lengths
 
     def cross_attention_on_path(self, f, g, sizes, b_idx, t_idx, u_idx, num_heads=4):
@@ -2079,6 +2144,7 @@ class RNNTAttJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMix
         if f_len is not None and f_len.dim() == 1 and self.chunk_size > 0:
             f, chunk_lengths = chunk_concat_audio(f, f_len, self.chunk_size)
             self.num_chunks_per_utterance = (chunk_lengths != 0).sum(dim=1)
+            f, chunk_lengths = self._apply_history_window(f, chunk_lengths)
         else:
             chunk_lengths = f_len
             self.num_chunks_per_utterance = None

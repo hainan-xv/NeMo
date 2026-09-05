@@ -631,3 +631,132 @@ def test_batched_loss_and_grads_match_sequential_with_ragged_lengths():
 
     for name, gseq in seq_grads.items():
         torch.testing.assert_close(gseq, bat_grads[name], atol=1e-4, rtol=1e-3, msg=lambda m, n=name: f"{n}: {m}")
+
+
+def _att_joint(V, D, C, M, seed=0):
+    from nemo.collections.asr.modules import RNNTAttJoint
+
+    torch.manual_seed(seed)
+    return RNNTAttJoint(
+        jointnet={"encoder_hidden": D, "pred_hidden": D, "joint_hidden": D, "activation": "relu", "dropout": 0.0},
+        num_classes=V,
+        chunk_size=C,
+        history_chunks=M,
+    )
+
+
+@pytest.mark.unit
+def test_history_window_default_is_standard_chat():
+    """history_chunks=0 must leave the joint byte-identical to before.
+
+    The two vocabulary arms and every earlier result depend on the default path
+    being untouched, so this is a compatibility lock, not a feature test.
+    """
+    from nemo.collections.asr.parts.utils.chunking_utils import chunk_concat_audio
+
+    V, D, C = 12, 8, 4
+    j = _att_joint(V, D, C, 0)
+    f = torch.randn(2, C * 5, D)
+    f_len = torch.tensor([C * 5, C * 5 - 2])
+    chunked, lens = chunk_concat_audio(f, f_len, C)
+    w, wl = j._apply_history_window(chunked, lens)
+    assert w is chunked and wl is lens, "M=0 must be a no-op, not a copy"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("M", [1, 2])
+def test_history_window_adds_previous_chunks_without_lookahead(M):
+    """The window spans [max(0,t-M)*C, (t+1)*C) -- history only, never future.
+
+    Look-ahead here would be silent and fatal: it would inflate offline metrics
+    while being impossible to reproduce in a streaming deployment, since the
+    audio simply has not arrived yet.
+    """
+    from nemo.collections.asr.parts.utils.chunking_utils import chunk_concat_audio
+
+    V, D, C, T = 12, 8, 4, 6
+    j = _att_joint(V, D, C, M)
+    f = torch.arange(1 * T * C * D, dtype=torch.float32).reshape(1, T * C, D)
+    f_len = torch.tensor([T * C])
+    chunked, lens = chunk_concat_audio(f, f_len, C)
+    w, wl = j._apply_history_window(chunked, lens)
+
+    W = (M + 1) * C
+    assert w.shape == (1, T, W * D)
+    wv = w.reshape(1, T, W, D)
+    for t in range(T):
+        start = max(0, t - M) * C
+        n_valid = int(wl[0, t])
+        assert n_valid == min(t, M) * C + int(lens[0, t])
+        # Every VALID position must be a real frame at or before this chunk's end.
+        for jpos in range(n_valid):
+            src = start + jpos
+            assert src < (t + 1) * C, f"chunk {t} position {jpos} reads frame {src}, past its own end"
+            torch.testing.assert_close(wv[0, t, jpos], f[0, src])
+
+
+@pytest.mark.unit
+def test_history_window_joint_output_is_independent_of_future_audio():
+    """End-to-end causality: perturbing later audio cannot change chunk t.
+
+    Stronger than inspecting indices -- it exercises the gather, the mask and
+    the attention together, which is where an off-by-one would actually land.
+    """
+    V, D, C, M, T = 12, 8, 4, 1, 6
+    j = _att_joint(V, D, C, M).eval()
+    torch.manual_seed(0)
+    f = torch.randn(1, T * C, D)
+    f_len = torch.tensor([T * C])
+    g = torch.randn(1, 3, D)
+
+    with torch.no_grad():
+        base = j.joint(f, g, f_len)
+        f2 = f.clone()
+        t_cut = 3
+        f2[0, (t_cut + 1) * C :] = torch.randn_like(f2[0, (t_cut + 1) * C :])  # future only
+        pert = j.joint(f2, g, f_len)
+
+    torch.testing.assert_close(base[:, : t_cut + 1], pert[:, : t_cut + 1], atol=1e-5, rtol=1e-4)
+    assert not torch.allclose(base[:, t_cut + 1 :], pert[:, t_cut + 1 :]), "future change had no effect anywhere"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("M", [0, 1, 2])
+def test_on_path_joint_matches_full_joint_with_history(M):
+    """joint_on_path must stay the full joint evaluated at a subset, for any M.
+
+    The windowing is applied in two different call sites; if they ever disagreed,
+    training would optimise different values from the ones decoding produces.
+    """
+    V, D, C = 15, 16, 4
+    j = _att_joint(V, D, C, M).eval()
+    torch.manual_seed(1)
+    B, T_frames, U = 3, C * 5, 6
+    f = torch.randn(B, T_frames, D)
+    g = torch.randn(B, U, D)
+    f_len = torch.tensor([T_frames, T_frames - 3, T_frames - C - 1])
+
+    with torch.no_grad():
+        full = j.joint(f, g, f_len)
+        Tc = full.shape[1]
+        b, t, u = torch.meshgrid(torch.arange(B), torch.arange(Tc), torch.arange(U), indexing="ij")
+        b, t, u = b.reshape(-1), t.reshape(-1), u.reshape(-1)
+        path = j.joint_on_path(f, g, b, t, u, f_len)
+
+    torch.testing.assert_close(path, full[b, t, u], atol=1e-5, rtol=1e-4)
+
+
+@pytest.mark.unit
+def test_history_window_changes_the_logits():
+    """A window that made no difference would be a silent no-op experiment."""
+    V, D, C = 15, 16, 4
+    torch.manual_seed(1)
+    f = torch.randn(2, C * 5, D)
+    g = torch.randn(2, 4, D)
+    f_len = torch.tensor([C * 5, C * 5])
+    with torch.no_grad():
+        a = _att_joint(V, D, C, 0, seed=7).eval().joint(f, g, f_len)
+        b = _att_joint(V, D, C, 1, seed=7).eval().joint(f, g, f_len)
+    assert a.shape == b.shape
+    # Chunk 0 has no history either way; later chunks must differ.
+    assert not torch.allclose(a[:, 1:], b[:, 1:], atol=1e-6)

@@ -89,6 +89,12 @@ class ChatSTTModelConfig:
     load_asr_weights: bool = True
     freeze_speech_encoder: bool = False
     audio_pad_to: int = 0
+    # Extra PREVIOUS chunks the joint may attend to when emitting for a chunk.
+    # 0 = standard CHAT (the joint sees only the chunk it emits for). 1 gives a
+    # 28-frame window on a 14-frame emission grid -- the transducer analogue of
+    # SCRIPT's win28 -- so a word straddling a boundary has its onset visible.
+    # Emission granularity and latency are unchanged; no look-ahead is added.
+    joint_history_chunks: int = 0
     # Cap on tokens emitted per chunk at decode time. The default of 10 is tight
     # for the ~1k vocabulary (~1.9 tokens/word, so a dense 1.12s chunk can want
     # 7-8) and roomy for Qwen (~1.16). Left generous so a truncation cannot
@@ -141,10 +147,13 @@ class ChatSTTModel(LightningModule):
             },
             num_classes=V,
             chunk_size=self.chunk_size,
+            history_chunks=int(self.core_cfg.joint_history_chunks),
         )
         logging.info(
             f"ChatSTTModel: vocab={V} (+1 blank), chunk_size={self.chunk_size}, "
-            f"att_context_size={att}, joint_hidden={self.core_cfg.joint_hidden}"
+            f"att_context_size={att}, joint_hidden={self.core_cfg.joint_hidden}, "
+            f"joint_history_chunks={self.core_cfg.joint_history_chunks} "
+            f"(joint attends to {(int(self.core_cfg.joint_history_chunks) + 1) * self.chunk_size} frames)"
         )
 
         if self.cfg.get("init_rnnt_from_asr", True) and self.core_cfg.pretrained_asr:
