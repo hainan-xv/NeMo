@@ -811,56 +811,80 @@ def test_decode_symbol_cap_does_not_scale_with_the_attention_window(M):
 
 
 @pytest.mark.unit
-def test_nonfinite_loss_is_skipped_then_fails_loudly():
-    """A nan step must be skipped, and a RUN of them must kill the job.
+def test_nonfinite_loss_zeroes_grads_and_never_returns_none():
+    """A nan step must neutralise its update WITHOUT returning None.
 
-    Job 13096766 hit nan at epoch 1 step 2333 and then spent 3.5 hours on 8
-    nodes writing val_wer=1.0 checkpoints while Slurm reported COMPLETED --
-    a failure that looks like a success. One bad batch is survivable; once the
-    weights are nan every later step is too, so continuing is pure waste.
+    Lightning rejects a None return under distributed training outright --
+    "Skipping the training_step by returning None in distributed training is not
+    supported" -- which killed job 13104496 at step 3. So the loss is returned
+    as usual and the resulting non-finite gradients are zeroed before the
+    optimizer step, keeping every rank in the backward pass and DDP's
+    all-reduce in lockstep.
+
+    A RUN of nan steps still aborts: job 13096766 spent 3.5 hours on 8 nodes
+    writing val_wer=1.0 checkpoints while Slurm reported COMPLETED.
     """
     from nemo.collections.speechlm2.models.chat_model import ChatSTTModel
 
-    class Stub:
-        cfg = {"max_nonfinite_steps": 3}
-        global_step = 0
+    def stub(limit=3):
+        s = types.SimpleNamespace(global_step=0, logged=[])
+        s.cfg = type("C", (), {"get": lambda _s, k, d=None: limit if k == "max_nonfinite_steps" else d})()
+        s.forward_loss = lambda b: s._loss
+        s.log = lambda *a, **k: s.logged.append(a)
+        s._maybe_log_train_decode = lambda b: None
+        p = torch.nn.Parameter(torch.ones(3))
+        p.grad = torch.full((3,), float("nan"))
+        s._p = p
+        s.parameters = lambda: iter([p])
+        return s
 
-        def __init__(self):
-            self.logged = []
-
-        def forward_loss(self, batch):
-            return self._loss
-
-        def log(self, *a, **k):
-            self.logged.append(a)
-
-        def _maybe_log_train_decode(self, batch):
-            pass
-
-    s = Stub()
-    s.cfg = type("C", (), {"get": lambda _s, k, d=None: 3 if k == "max_nonfinite_steps" else d})()
-
-    # A finite loss passes straight through and is logged.
+    s = stub()
     s._loss = torch.tensor(1.5)
     out = ChatSTTModel.training_step(s, None, 0)
     assert out is not None and s.logged, "a healthy step must train and log"
+    assert s._skip_update is False
 
-    # nan is skipped (returns None -> Lightning does no update).
+    # nan: still returns a loss (never None), and marks the step for zeroing.
     s._loss = torch.tensor(float("nan"))
-    assert ChatSTTModel.training_step(s, None, 1) is None
-    assert ChatSTTModel.training_step(s, None, 2) is None
+    out = ChatSTTModel.training_step(s, None, 1)
+    assert out is not None, "returning None is unsupported under DDP"
+    assert s._skip_update is True
 
-    # ...until the run of them proves the weights are gone.
+    # ...and the gradients are actually zeroed before the optimizer steps.
+    ChatSTTModel.on_before_optimizer_step(s, None)
+    assert torch.equal(s._p.grad, torch.zeros(3)), "non-finite grads must be zeroed"
+
+    # A finite step resets the counter, so isolated bad batches never accumulate.
+    s._loss = torch.tensor(1.0)
+    ChatSTTModel.training_step(s, None, 2)
+    assert s._nonfinite_steps == 0
+
+    # A sustained run aborts rather than burning the allocation.
+    s2 = stub(limit=2)
+    s2._loss = torch.tensor(float("inf"))
+    ChatSTTModel.training_step(s2, None, 0)
     with pytest.raises(RuntimeError, match="non-finite"):
-        ChatSTTModel.training_step(s, None, 3)
+        ChatSTTModel.training_step(s2, None, 1)
 
-    # A finite step in between must RESET the counter, or an isolated bad batch
-    # every few thousand steps would eventually trip the abort.
-    s2 = Stub()
-    s2.cfg = type("C", (), {"get": lambda _s, k, d=None: 3 if k == "max_nonfinite_steps" else d})()
-    for _ in range(2):
-        s2._loss = torch.tensor(float("inf"))
-        assert ChatSTTModel.training_step(s2, None, 0) is None
-    s2._loss = torch.tensor(1.0)
-    assert ChatSTTModel.training_step(s2, None, 0) is not None
-    assert s2._nonfinite_steps == 0
+
+@pytest.mark.unit
+def test_empty_path_does_not_produce_nan():
+    """An empty forced-alignment path must not poison the run.
+
+    F.cross_entropy over zero positions returns nan (mean of nothing), and that
+    nan reaches the weights. A batch can be empty when no utterance in it has
+    alignable words -- rare, but with 64 ranks drawing batches it happens, and
+    it took down job 13104496 at step 3 with the loss still at its initial
+    value. The replacement must stay CONNECTED to the graph so every rank runs
+    backward and DDP does not desynchronise.
+    """
+    import torch.nn.functional as F
+
+    assert torch.isnan(F.cross_entropy(torch.zeros(0, 5, requires_grad=True), torch.zeros(0, dtype=torch.long)))
+
+    enc = torch.randn(2, 8, 4, requires_grad=True)
+    logits = torch.zeros(0, 5, requires_grad=True)
+    loss = logits.sum() * 0.0 + enc.sum() * 0.0
+    assert torch.isfinite(loss), "the empty-path surrogate must be finite"
+    loss.backward()
+    assert enc.grad is not None and torch.equal(enc.grad, torch.zeros_like(enc)), "must contribute zero gradient"

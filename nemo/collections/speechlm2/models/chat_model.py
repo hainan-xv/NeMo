@@ -335,6 +335,18 @@ class ChatSTTModel(LightningModule):
 
         logits = self.joint.joint_on_path(enc, g, b_idx, t_idx, u_idx, enc_len)
 
+        if labels.numel() == 0:
+            # cross_entropy over an EMPTY path returns nan (mean of nothing), and
+            # that nan reaches the weights and kills the run. A batch can end up
+            # empty when every utterance in it has no alignable words -- rare,
+            # but with 64 ranks drawing batches it happens, and it took down job
+            # 13104496 at step 3 while the loss was still at its initial value.
+            #
+            # Return a graph-connected zero instead: backward runs on every rank
+            # (so DDP stays in lockstep) and contributes no gradient.
+            logging.warning(f"empty forced-alignment path at step {self.global_step}; contributing zero loss.")
+            return logits.sum() * 0.0 + enc.sum() * 0.0
+
         return F.cross_entropy(logits.float(), labels)
 
     @property
@@ -394,31 +406,36 @@ class ChatSTTModel(LightningModule):
     def training_step(self, batch, batch_idx):
         loss = self.forward_loss(batch)
 
-        # Skip a non-finite step instead of letting it poison the weights.
+        # Neutralise a non-finite step instead of letting it poison the weights.
         #
         # Job 13096766 went from train_loss 1.400 to nan in one step and then
-        # spent its remaining 3.5 hours on 8 nodes writing val_wer=1.0
-        # checkpoints. Once nan reaches the weights every later step is nan too,
-        # so the run is dead but Slurm reports COMPLETED -- a failure that looks
-        # like a success, which is the expensive kind.
+        # spent 3.5 hours on 8 nodes writing val_wer=1.0 checkpoints while Slurm
+        # reported COMPLETED -- a failure that looks like a success.
         #
-        # The decision MUST be identical on every rank: returning None on one
-        # rank while others run backward desynchronises DDP's gradient
-        # all-reduce and hangs the job. So the flag is all-reduced first.
+        # This must NOT be done by returning None: Lightning rejects that under
+        # distributed training outright ("Skipping the training_step by returning
+        # None in distributed training is not supported"), which is how job
+        # 13104496 died at step 3. Instead the loss is returned as usual and the
+        # resulting non-finite gradients are zeroed in on_before_optimizer_step,
+        # so every rank runs backward and DDP's all-reduce stays in lockstep.
+        #
+        # The flag is all-reduced so every rank makes the SAME decision; a
+        # disagreement would leave ranks with different gradients.
         bad = torch.zeros((), device=loss.device)
         if not torch.isfinite(loss.detach()):
             bad.fill_(1.0)
         if torch.distributed.is_initialized():
             torch.distributed.all_reduce(bad, op=torch.distributed.ReduceOp.MAX)
+        self._skip_update = bool(bad.item())
 
-        if bool(bad.item()):
+        if self._skip_update:
             self._nonfinite_steps = getattr(self, "_nonfinite_steps", 0) + 1
             logging.warning(
                 f"non-finite training loss at step {self.global_step} "
-                f"({self._nonfinite_steps} in a row); skipping the update."
+                f"({self._nonfinite_steps} in a row); zeroing gradients for this step."
             )
-            # A one-off bad batch is survivable. A run of them means the weights
-            # are ALREADY non-finite, so every future step will be too -- fail
+            # A one-off bad batch is survivable. A RUN of them means the weights
+            # are already non-finite, so every future step will be too -- fail
             # loudly rather than burn the rest of the allocation.
             if self._nonfinite_steps >= int(self.cfg.get("max_nonfinite_steps", 25)):
                 raise RuntimeError(
@@ -427,12 +444,24 @@ class ChatSTTModel(LightningModule):
                     "state in bf16 and is not safe for the large-vocabulary arm), learning rate, and "
                     "gradient clipping."
                 )
-            return None
+            return loss
 
         self._nonfinite_steps = 0
         self.log("train_loss", loss, prog_bar=True, sync_dist=True)
         self._maybe_log_train_decode(batch)
         return loss
+
+    def on_before_optimizer_step(self, optimizer):
+        """Zero the gradients of a step whose loss was non-finite.
+
+        Runs after backward on every rank, so the update is neutralised without
+        any rank skipping the step -- which is what keeps DDP synchronised.
+        """
+        if not getattr(self, "_skip_update", False):
+            return
+        for p in self.parameters():
+            if p.grad is not None:
+                p.grad.zero_()
 
     @torch.no_grad()
     def _maybe_log_train_decode(self, batch) -> None:
