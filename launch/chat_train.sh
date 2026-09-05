@@ -88,22 +88,22 @@ PROJECT_NAME=SpeechlmScriptCC
 
 # --- Training parameters ---
 MAX_STEPS="${MAX_STEPS:-300000}"
-# Epoch length in optimizer steps (Lightning's limit_train_batches).
-EPOCH_STEPS="${EPOCH_STEPS:-16000}"
-# How many times per epoch to run validation AND save a checkpoint.
+# Steps per epoch. Validation AND checkpointing both happen at the epoch
+# boundary, so this is also the validate/checkpoint cadence.
 #
-# These used to be the same number: one validation per epoch, at the epoch
-# boundary. That gave a single val_wer every ~57 minutes, so a 4-hour job
-# produced only four points on the curve and lost up to an hour of progress
-# whenever it hit the wall clock. Four per epoch costs a few minutes of decode
-# and gives 4x the resolution plus 4x the resume granularity.
-VALS_PER_EPOCH="${VALS_PER_EPOCH:-4}"
-VAL_CHECK_INTERVAL="${VAL_CHECK_INTERVAL:-$((EPOCH_STEPS / VALS_PER_EPOCH))}"
-if (( VAL_CHECK_INTERVAL <= 0 || EPOCH_STEPS % VAL_CHECK_INTERVAL != 0 )); then
-    echo "ERROR: EPOCH_STEPS=${EPOCH_STEPS} must be a positive multiple of the validation" >&2
-    echo "       interval ${VAL_CHECK_INTERVAL}; otherwise Lightning validates at a point that" >&2
-    echo "       never coincides with the checkpoint step and val_wer is never recorded." >&2
-    exit 1
+# 4000, i.e. 4x per 16000 steps. This is deliberately done by SHORTENING THE
+# EPOCH rather than by setting checkpoint_callback_params.every_n_train_steps:
+# that fires on the training step, BEFORE validation has produced val_wer, so
+# ModelCheckpoint finds no value for its monitor and silently saves nothing.
+# Job 13107995 ran to step 7481 with a validation at 4000 and ended up with only
+# a `-last` checkpoint -- no top-k entry, so no best-model selection at all.
+# Tying both to the epoch boundary is the arrangement that demonstrably works.
+EPOCH_STEPS="${EPOCH_STEPS:-4000}"
+VAL_CHECK_INTERVAL="${VAL_CHECK_INTERVAL:-$EPOCH_STEPS}"
+if (( VAL_CHECK_INTERVAL != EPOCH_STEPS )); then
+    echo "WARNING: VAL_CHECK_INTERVAL=${VAL_CHECK_INTERVAL} differs from EPOCH_STEPS=${EPOCH_STEPS}." >&2
+    echo "         Checkpoints are written at the EPOCH boundary, so any validation that does" >&2
+    echo "         not coincide with one produces a val_wer that is never checkpointed." >&2
 fi
 
 # Print ref / forced-alignment target / greedy hypothesis on TRAINING data every
@@ -237,7 +237,7 @@ echo "*******STARTING********" \
 && echo "*** OBJECTIVE: p(words_k | text_history_<k, audio_k); packed spine+branch, single O(L) forward ***" \
 && echo "*** MONITOR: val_wer (min) -- chunk-synchronous streaming decode ***" \
 && echo "*** WARM START: init=${INIT_CKPT:-none} ***" \
-&& echo "*** SCHEDULE: epoch=${EPOCH_STEPS} steps, validate+checkpoint every ${VAL_CHECK_INTERVAL} (${VALS_PER_EPOCH}x/epoch) ***" \
+&& echo "*** SCHEDULE: epoch=${EPOCH_STEPS} steps; validate+checkpoint at every epoch boundary ***" \
 && echo "*** SEED: ${LHOTSE_RND_SEED} ***" \
 && nvidia-smi \
 && export WANDB_API_KEY=${WANDB} \
@@ -285,8 +285,6 @@ echo "*******STARTING********" \
     ++exp_manager.checkpoint_callback_params.monitor=val_wer \
     ++exp_manager.checkpoint_callback_params.mode=min \
     ++exp_manager.checkpoint_callback_params.save_top_k=5 \
-    ++exp_manager.checkpoint_callback_params.every_n_train_steps=$VAL_CHECK_INTERVAL \
-    ++exp_manager.checkpoint_callback_params.every_n_epochs=0 \
     ${INIT_CKPT_ARG}
 EOF
 
