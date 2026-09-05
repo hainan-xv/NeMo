@@ -60,6 +60,26 @@ model:
 
 
   perception:
+    # SpecAugment, matching the donor RNN-T's own recipe (freq_masks 2,
+    # time_masks 10, freq_width 27, time_width 0.05).
+    #
+    # setup_perception copies the donor's preprocessor and encoder configs but
+    # NOT its spec_augment, so every run so far trained the encoder with no
+    # input-level augmentation at all -- while carrying dropout 0.1 in all 101
+    # dropout modules. val_wer bottomed at step 16000 in both word-delay arms
+    # and then drifted up (0.0953 -> 0.0975, 0.1015 -> 0.1024) with train_loss
+    # still falling through 0.335, which is what a missing input augmentation
+    # looks like.
+    #
+    # AudioPerceptionModule already supports this key and applies it only under
+    # self.training, so validation and inference are unaffected. Set to null to
+    # disable.
+    spec_augment:
+      _target_: nemo.collections.asr.modules.SpectrogramAugmentation
+      freq_masks: 2
+      time_masks: 10
+      freq_width: 27
+      time_width: 0.05
     modality_adapter:
       _target_: nemo.collections.speechlm2.modules.perception.IdentityConnector
     encoder:

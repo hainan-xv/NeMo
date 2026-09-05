@@ -1044,3 +1044,57 @@ def test_retract_requires_word_start_ids():
     x = torch.zeros(1, 1, d.joint.encoder_hidden * d.joint.chunk_size)
     with pytest.raises(ValueError, match="word_start_ids"):
         d._greedy_decode_chat(x, torch.tensor([[4]]))
+
+
+@pytest.mark.unit
+def test_spec_augment_is_configured_and_train_only():
+    """The encoder must get input-level augmentation, and only while training.
+
+    setup_perception copies the donor ASR model's preprocessor and encoder
+    configs but NOT its spec_augment, so every CHAT run before this trained with
+    dropout 0.1 in all 101 dropout modules and no input augmentation at all.
+    val_wer bottomed at step 16000 in both word-delay arms and then drifted up
+    while train_loss kept falling through 0.335.
+
+    Also pins that it is train-ONLY: augmenting during validation would make
+    val_wer noisy and pessimistic, and augmenting at inference would be simply
+    wrong.
+    """
+    import glob
+
+    from omegaconf import OmegaConf
+
+    from nemo.collections.speechlm2.models.chat_model import ChatSTTModel
+
+    hits = glob.glob(
+        os.path.expanduser("~/.cache/huggingface/hub/models--nvidia--nemotron-speech-streaming-en-0.6b/**/*.nemo"),
+        recursive=True,
+    )
+    if not hits:
+        pytest.skip("nemotron ASR .nemo not present in the local HF cache")
+
+    cfg = OmegaConf.load("examples/speechlm2/conf/streaming_stt_granary2_chat_asrvocab_win28_worddelay.yaml")
+    OmegaConf.resolve(cfg)
+    cfg.model.pretrained_asr = hits[0]
+    cfg.model.init_rnnt_from_asr = False
+    model = ChatSTTModel(OmegaConf.to_container(cfg.model, resolve=True)).float()
+
+    sa = model.perception.spec_augmentation
+    assert sa is not None, "spec_augment did not survive setup_perception"
+    assert (sa.spec_augment.freq_masks, sa.spec_augment.time_masks) == (2, 10)
+
+    torch.manual_seed(0)
+    n = 16000 * 3
+    audio, alen = torch.randn(1, n) * 0.1, torch.tensor([n])
+
+    model.eval()
+    with torch.no_grad():
+        a, _ = model._encode(audio, alen)
+        b, _ = model._encode(audio, alen)
+    torch.testing.assert_close(a, b, atol=1e-5, rtol=1e-4)  # eval: no augmentation
+
+    model.train()
+    with torch.no_grad():
+        c, _ = model._encode(audio, alen)
+        d, _ = model._encode(audio, alen)
+    assert not torch.allclose(c, d, atol=1e-3), "train mode is deterministic -- augmentation is not firing"
