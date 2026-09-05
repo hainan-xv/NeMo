@@ -19,6 +19,15 @@ encoder and OOMs a 48 GB card by B=60, while the path form runs B=120 in 12 GB.
 
 So this formulation buys FEASIBILITY at large vocabulary, not throughput.
 
+WHY V=1,028 IS NOT A WIN, MEASURED BY KERNEL. The path form does genuinely LESS
+GPU work there -- 2.65 ms busy against the full joint's 4.25 ms, a real 1.6x --
+but it issues 139 small kernels (gathers, reshapes, per-position attention)
+against 114 large ones, so it idles 3.85 ms between launches versus 0.85 ms and
+loses on wall-clock. The tell is that its wall time is FLAT across a 4x range of
+B/T/U (6.3/6.5/5.8/6.1 ms) while the full joint's scales: it is latency-bound,
+not FLOP-bound. At V=151,937 launch overhead is ~1% and the 9.2x GPU-busy ratio
+shows up as an 8.9x wall speedup.
+
 Only the JOINT + LOSS differ between the two training modes -- the encoder and
 prediction network are identical and are excluded, since including a shared 609M
 forward would dilute exactly the ratio we are trying to measure. Encoder cost is
