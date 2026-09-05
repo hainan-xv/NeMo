@@ -191,7 +191,16 @@ ERRFILE=${RESULTS_DIR}/error-%j-%n.out
 # means this only seeds the FIRST launch; relaunches resume this run's own ckpts.
 INIT_EXP="${INIT_EXP:-}"
 INIT_CKPT="${INIT_CKPT:-none}"
-if [[ -z "$INIT_CKPT" && -n "$INIT_EXP" ]]; then
+# Auto-resolve when INIT_EXP is set and no explicit checkpoint was given.
+#
+# This used to require INIT_CKPT to be EMPTY, but its default is the string
+# "none" -- so `INIT_EXP=... ./oci_launch.sh ...` silently did nothing and the
+# run trained from scratch while reporting "WARM START: init=none" in a log
+# nobody reads at submission time. Jobs 13113422/13113423 were launched that way
+# and got 200 steps in before it was noticed. Treat "none" as "not specified"
+# whenever INIT_EXP is present: setting INIT_EXP always means "start from that
+# run".
+if [[ -n "$INIT_EXP" ]] && [[ -z "$INIT_CKPT" || "$INIT_CKPT" == "none" ]]; then
     _INIT_DIR="${OUTPUT_PREFIX}/results/${PROJECT_NAME}/${INIT_EXP}/${INIT_EXP}/checkpoints"
     INIT_CKPT="$(ls -t "${_INIT_DIR}"/*-last.ckpt 2>/dev/null | head -1)"
     [[ -z "$INIT_CKPT" ]] && INIT_CKPT="$(ls "${_INIT_DIR}"/*.ckpt 2>/dev/null | grep -v -- '-averaged\.ckpt$' | sort -t= -k2 -g | tail -1)"
@@ -199,7 +208,13 @@ if [[ -z "$INIT_CKPT" && -n "$INIT_EXP" ]]; then
     if [[ -n "$INIT_CKPT" ]]; then
         echo "==> Auto-resolved INIT_CKPT from ${INIT_EXP}: ${INIT_CKPT}"
     else
-        echo "WARNING: no checkpoint under ${_INIT_DIR}; training from base pretrained."
+        # Hard failure, not a warning. Asking to warm-start from a run and
+        # silently getting a from-scratch run instead wastes a whole allocation
+        # and is invisible unless someone reads the loss at step 1.
+        echo "ERROR: INIT_EXP=${INIT_EXP} was requested but no checkpoint was found under" >&2
+        echo "       ${_INIT_DIR}" >&2
+        echo "       Set INIT_CKPT=none explicitly if you really want to train from scratch." >&2
+        exit 1
     fi
 fi
 
