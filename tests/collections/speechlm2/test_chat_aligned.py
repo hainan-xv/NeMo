@@ -811,60 +811,79 @@ def test_decode_symbol_cap_does_not_scale_with_the_attention_window(M):
 
 
 @pytest.mark.unit
-def test_nonfinite_loss_zeroes_grads_and_never_returns_none():
-    """A nan step must neutralise its update WITHOUT returning None.
+def test_nonfinite_GRADIENTS_are_caught_even_when_the_loss_is_finite():
+    """The check must be on gradients, not just the loss.
 
-    Lightning rejects a None return under distributed training outright --
-    "Skipping the training_step by returning None in distributed training is not
-    supported" -- which killed job 13104496 at step 3. So the loss is returned
-    as usual and the resulting non-finite gradients are zeroed before the
-    optimizer step, keeping every rank in the backward pass and DDP's
-    all-reduce in lockstep.
-
-    A RUN of nan steps still aborts: job 13096766 spent 3.5 hours on 8 nodes
-    writing val_wer=1.0 checkpoints while Slurm reported COMPLETED.
+    Job 13105689 died with a FINITE loss of 6.95 at step 7 and non-finite
+    weights by step 8, with warmup still holding the LR near 2.8e-6 -- so not
+    an LR problem, and invisible to a loss-only check. Gradient clipping makes
+    it catastrophic: one nan gradient makes the total norm nan, so the clip
+    coefficient is nan, so EVERY parameter's gradient becomes nan.
     """
     from nemo.collections.speechlm2.models.chat_model import ChatSTTModel
 
-    def stub(limit=3):
-        s = types.SimpleNamespace(global_step=0, logged=[])
+    def stub(limit=25):
+        s = types.SimpleNamespace(global_step=0, logged=[], device=torch.device("cpu"))
         s.cfg = type("C", (), {"get": lambda _s, k, d=None: limit if k == "max_nonfinite_steps" else d})()
         s.forward_loss = lambda b: s._loss
         s.log = lambda *a, **k: s.logged.append(a)
         s._maybe_log_train_decode = lambda b: None
-        p = torch.nn.Parameter(torch.ones(3))
-        p.grad = torch.full((3,), float("nan"))
-        s._p = p
-        s.parameters = lambda: iter([p])
+        s._ps = [torch.nn.Parameter(torch.ones(3)) for _ in range(2)]
+        s.parameters = lambda: iter(s._ps)
         return s
 
+    # Finite loss, but one parameter has a nan gradient -> must still be caught.
     s = stub()
-    s._loss = torch.tensor(1.5)
+    s._loss = torch.tensor(6.95)
     out = ChatSTTModel.training_step(s, None, 0)
-    assert out is not None and s.logged, "a healthy step must train and log"
-    assert s._skip_update is False
-
-    # nan: still returns a loss (never None), and marks the step for zeroing.
-    s._loss = torch.tensor(float("nan"))
-    out = ChatSTTModel.training_step(s, None, 1)
     assert out is not None, "returning None is unsupported under DDP"
-    assert s._skip_update is True
-
-    # ...and the gradients are actually zeroed before the optimizer steps.
+    assert s.logged, "a finite loss must still be logged"
+    s._ps[0].grad = torch.tensor([1.0, float("nan"), 2.0])
+    s._ps[1].grad = torch.ones(3)
     ChatSTTModel.on_before_optimizer_step(s, None)
-    assert torch.equal(s._p.grad, torch.zeros(3)), "non-finite grads must be zeroed"
+    for p in s._ps:
+        assert torch.equal(p.grad, torch.zeros(3)), "a nan gradient must zero ALL gradients"
+    assert s._nonfinite_steps == 1
 
-    # A finite step resets the counter, so isolated bad batches never accumulate.
-    s._loss = torch.tensor(1.0)
-    ChatSTTModel.training_step(s, None, 2)
+    # Healthy gradients pass through untouched and reset the counter.
+    s._ps[0].grad = torch.ones(3)
+    s._ps[1].grad = torch.full((3,), 2.0)
+    ChatSTTModel.on_before_optimizer_step(s, None)
+    assert torch.equal(s._ps[1].grad, torch.full((3,), 2.0)), "healthy gradients must not be touched"
     assert s._nonfinite_steps == 0
+
+    # A non-finite LOSS is caught too, even if grads happen to look finite.
+    s._loss = torch.tensor(float("nan"))
+    ChatSTTModel.training_step(s, None, 1)
+    assert s._loss_nonfinite is True
+    s._ps[0].grad = torch.ones(3)
+    s._ps[1].grad = torch.ones(3)
+    ChatSTTModel.on_before_optimizer_step(s, None)
+    assert torch.equal(s._ps[0].grad, torch.zeros(3))
 
     # A sustained run aborts rather than burning the allocation.
     s2 = stub(limit=2)
-    s2._loss = torch.tensor(float("inf"))
-    ChatSTTModel.training_step(s2, None, 0)
+    s2._loss = torch.tensor(1.0)
+    for _ in range(1):
+        ChatSTTModel.training_step(s2, None, 0)
+        s2._ps[0].grad = torch.full((3,), float("inf"))
+        s2._ps[1].grad = torch.ones(3)
+        ChatSTTModel.on_before_optimizer_step(s2, None)
+    s2._ps[0].grad = torch.full((3,), float("inf"))
+    s2._ps[1].grad = torch.ones(3)
     with pytest.raises(RuntimeError, match="non-finite"):
-        ChatSTTModel.training_step(s2, None, 1)
+        ChatSTTModel.on_before_optimizer_step(s2, None)
+
+
+@pytest.mark.unit
+def test_one_nan_gradient_poisons_everything_through_clipping():
+    """Why the guard must run BEFORE the optimizer sees the gradients."""
+    a = torch.nn.Parameter(torch.ones(3))
+    b = torch.nn.Parameter(torch.ones(3))
+    a.grad = torch.tensor([1.0, float("nan"), 2.0])
+    b.grad = torch.ones(3)
+    torch.nn.utils.clip_grad_norm_([a, b], 1.0)
+    assert torch.isnan(b.grad).all(), "a single nan must contaminate every parameter via the clip coefficient"
 
 
 @pytest.mark.unit
