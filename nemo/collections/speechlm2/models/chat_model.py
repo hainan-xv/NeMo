@@ -95,11 +95,19 @@ class ChatSTTModelConfig:
     # SCRIPT's win28 -- so a word straddling a boundary has its onset visible.
     # Emission granularity and latency are unchanged; no look-ahead is added.
     joint_history_chunks: int = 0
-    # Cap on tokens emitted per chunk at decode time. The default of 10 is tight
-    # for the ~1k vocabulary (~1.9 tokens/word, so a dense 1.12s chunk can want
-    # 7-8) and roomy for Qwen (~1.16). Left generous so a truncation cannot
-    # quietly bias the comparison toward the larger vocabulary.
-    max_symbols: int = 24
+    # Cap on tokens emitted per chunk at decode time.
+    #
+    # 14 = chunk_size, which is what has ACTUALLY been in force for every run so
+    # far: the CHAT greedy decode used to derive this from the frame count of
+    # the chunk slice and ignore whatever was configured here. Now that the
+    # configured value is honoured, keep it at the emission grid so the running
+    # arms are unaffected and the win28 window does not inflate it.
+    #
+    # Headroom check: at ~1.9 tokens/word the 1k vocabulary needs ~6 tokens for a
+    # typical 1.12s chunk and ~10 for a dense one, so 14 does not truncate; Qwen
+    # (~1.16) needs far fewer. The cap therefore cannot bias the vocabulary
+    # comparison, while still bounding a repetition loop.
+    max_symbols: int = 14
 
 
 class ChatSTTModel(LightningModule):

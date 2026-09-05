@@ -564,7 +564,21 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
         assert partial_hypotheses is None
         out_len_list = out_len.tolist()[0]
 
-        self.max_symbols = x.shape[-1] // self.joint.encoder_hidden
+        # Cap on symbols emitted per chunk. Honour the CONFIGURED value, and fall
+        # back to the EMISSION chunk size.
+        #
+        # This previously read `x.shape[-1] // self.joint.encoder_hidden`, the
+        # frame count of the tensor slice, which had two problems. It silently
+        # overrode max_symbols_per_step, so a configured cap never took effect;
+        # and it scaled with the joint's ATTENTION WINDOW rather than its
+        # emission grid, so turning on history_chunks doubled the cap and let a
+        # repetition loop run twice as long before being cut off. The cap is a
+        # property of how much text one chunk may emit, not of how much audio the
+        # joint is allowed to look at.
+        max_symbols = self.max_symbols
+        if max_symbols is None:
+            chunk_size = getattr(self.joint, "chunk_size", 0) or 0
+            max_symbols = chunk_size if chunk_size > 0 else x.shape[-1] // self.joint.encoder_hidden
 
         for time_idx in range(len(out_len_list)):
             if out_len_list[time_idx] == 0:
@@ -573,7 +587,7 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
 
             not_blank = True
             symbols_added = 0
-            while not_blank and symbols_added < self.max_symbols:
+            while not_blank and symbols_added < max_symbols:
                 last_label = label_collate([[hypothesis.last_token]])
 
                 g, hidden_prime = self._pred_step(last_label, hypothesis.dec_state)

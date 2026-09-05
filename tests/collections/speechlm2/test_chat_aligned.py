@@ -760,3 +760,51 @@ def test_history_window_changes_the_logits():
     assert a.shape == b.shape
     # Chunk 0 has no history either way; later chunks must differ.
     assert not torch.allclose(a[:, 1:], b[:, 1:], atol=1e-6)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("M", [0, 1, 2])
+def test_decode_symbol_cap_does_not_scale_with_the_attention_window(M):
+    """The per-chunk symbol cap must track the EMISSION grid, not the window.
+
+    The CHAT greedy decode derived this cap from the frame count of the chunk
+    slice. Widening the joint's attention window therefore doubled it, and a
+    model that fails to emit blank -- which is every model early in training --
+    produced twice as much repetition before being cut off. Observed as
+    `in how many in how many in how many ...` filling a chunk.
+
+    It also meant a configured max_symbols_per_step was silently ignored.
+    """
+    from omegaconf import OmegaConf
+
+    from nemo.collections.asr.modules import RNNTDecoder
+    from nemo.collections.asr.parts.submodules.rnnt_decoding import RNNTDecoding
+
+    V, D, C = 12, 16, 4
+    joint = _att_joint(V, D, C, M).eval()
+    dec = RNNTDecoder(prednet={"pred_hidden": D, "pred_rnn_layers": 1, "dropout": 0.0}, vocab_size=V)
+
+    # No configured cap -> falls back to the emission chunk size, for every M.
+    cfg = OmegaConf.create({"strategy": "greedy", "greedy": {"max_symbols": None}})
+    d = RNNTDecoding(decoding_cfg=cfg, decoder=dec, joint=joint, vocabulary=[str(i) for i in range(V)])
+    inner = d.decoding
+
+    torch.manual_seed(0)
+    B, T_frames = 1, C * 4
+    enc = torch.randn(B, T_frames, D)
+    enc_len = torch.tensor([T_frames])
+    chunked, n_chunks, chunk_lens = joint.chunk_encoder_for_decoding(enc.transpose(1, 2), enc_len)
+    W = (M + 1) * C
+    assert chunked.shape[1] == W * D, "chunked width must be the window, which is what used to set the cap"
+
+    with torch.no_grad():
+        hyp = inner._greedy_decode_chat(chunked[0].transpose(0, 1).unsqueeze(1), chunk_lens[:1])
+
+    # Whatever the model emits, no chunk may exceed the emission grid.
+    from collections import Counter
+
+    per_chunk = Counter(hyp.timestamp)
+    assert not per_chunk or max(per_chunk.values()) <= C, (
+        f"M={M}: a chunk emitted {max(per_chunk.values())} symbols, cap should be {C} "
+        "(the cap is following the attention window, not the emission grid)"
+    )
