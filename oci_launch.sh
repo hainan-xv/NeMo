@@ -88,9 +88,34 @@ SCRIPT_ARGS=("$@")
 # The knob names are discovered from the target script itself (every `${NAME:-...}`
 # it reads), so this stays correct as launchers gain options. System and Slurm
 # variables are excluded -- forwarding those would be actively harmful.
+# A launcher may be a thin WRAPPER that sets a couple of variables and execs the
+# real recipe (chat_train_qwen_win28.sh -> chat_train.sh). The wrapper mentions
+# almost none of the knobs, so scanning it alone silently forwards nothing:
+# `INIT_EXP=<run> ./oci_launch.sh launch/chat_train_win28_recover.sh` looked
+# correct, forwarded nothing, and trained from scratch. Jobs 13113422 and
+# 13113896 were both lost that way. Follow one exec hop and scan the target too.
+exec_target_of() {
+    local script="$1" tail_line target dir
+    tail_line="$(grep -oE '^[[:space:]]*exec bash "[^"]+"' "$script" | tail -1)" || return 0
+    [[ -z "$tail_line" ]] && return 0
+    target="$(sed -E 's/.*exec bash "([^"]+)".*/\1/' <<<"$tail_line")"
+    # Wrappers resolve the path at runtime (${LAUNCH_DIR}/chat_train.sh), so take
+    # the basename and look for it beside the wrapper.
+    dir="$(cd "$(dirname "$script")" && pwd)"
+    target="${dir}/$(basename "$target")"
+    [[ -f "$target" && "$target" != "$script" ]] && echo "$target"
+}
+
 forward_inherited_env() {
     local script="$1" name
     local -a found=()
+    local -a scripts=("$script")
+    local hop
+    hop="$(exec_target_of "$script")"
+    if [[ -n "$hop" ]]; then
+        scripts+=("$hop")
+        echo "==> Knob discovery follows exec into $(basename "$hop")"
+    fi
     while read -r name; do
         case "$name" in
             PATH|HOME|USER|SHELL|PWD|TERM|LANG|LC_*|SHLVL|_|HOSTNAME|SSH_*|SLURM_*|BASH_*)
@@ -107,7 +132,7 @@ forward_inherited_env() {
             [[ "$a" == "${name}="* ]] && continue 2
         done
         found+=("${name}=${!name}")
-    done < <(grep -oE '\$\{[A-Za-z_][A-Za-z0-9_]*(:-|\})' "$script" \
+    done < <(grep -hoE '\$\{[A-Za-z_][A-Za-z0-9_]*(:-|\})' "${scripts[@]}" \
              | sed -E 's/^\$\{//; s/(:-|\})$//' | sort -u)
     if [[ ${#found[@]} -gt 0 ]]; then
         # Print names only -- a forwarded value could still be sensitive.
