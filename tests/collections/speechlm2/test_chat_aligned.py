@@ -907,3 +907,140 @@ def test_empty_path_does_not_produce_nan():
     assert torch.isfinite(loss), "the empty-path surrogate must be finite"
     loss.backward()
     assert enc.grad is not None and torch.equal(enc.grad, torch.zeros_like(enc)), "must contribute zero gradient"
+
+
+# ---------------------------------------------------------------------------
+# Retract-by-k decoding.
+# ---------------------------------------------------------------------------
+
+
+def _retract_decoder(script, blank, word_starts, retract):
+    """A GreedyRNNTInfer whose joint replays `script`: a token per chunk-step.
+
+    Lets the retraction logic be tested exactly, without depending on what a
+    partially-trained model happens to emit.
+    """
+    from nemo.collections.asr.parts.submodules.rnnt_greedy_decoding import GreedyRNNTInfer
+
+    class FakeJoint(torch.nn.Module):
+        encoder_hidden = 4
+        chunk_size = 4
+
+    class FakeDec(torch.nn.Module):
+        blank_idx = blank
+
+        def batch_select_state(self, s, i):
+            return s
+
+    d = GreedyRNNTInfer.__new__(GreedyRNNTInfer)
+    d.joint, d.decoder = FakeJoint(), FakeDec()
+    d._blank_index, d._SOS = blank, blank
+    d.max_symbols = 10
+    d.preserve_alignments = d.preserve_frame_confidence = False
+    d.retract_words, d.word_start_ids = retract, frozenset(word_starts)
+    # `script` is consumed one entry per (chunk, symbol) call.
+    d._script = list(script)
+    d._pred_step = lambda lbl, st: (torch.zeros(1, 1, 1), ("state", len(d._script)))
+
+    def _joint_step(f, g, ln, log_normalize=None):
+        tok = d._script.pop(0)
+        out = torch.full((1, 1, 1, blank + 1), -10.0)
+        out[0, 0, 0, tok] = 10.0
+        return out
+
+    d._joint_step = _joint_step
+    return d
+
+
+@pytest.mark.unit
+def test_retract_hands_the_last_word_to_the_next_chunk():
+    """chunk t's last word is rolled back so chunk t+1 can re-emit it.
+
+    Word ids here: 10 and 20 start words, 11 continues word 10. The script emits
+    [10, 11] then blank in chunk 0, so `10 11` is one word; with retract=1 it
+    must be handed forward and re-emitted from chunk 1.
+    """
+    BLANK = 99
+    # A model trained with the word delay RE-EMITS what was handed to it:
+    #   chunk0: 10 11 .            -> emits word "10 11", hands it forward
+    #   chunk1: 10 11 20 .         -> re-emits it, adds word 20, hands 20 forward
+    #   chunk2: 20 30 .   (last)   -> re-emits 20, adds 30, no retraction
+    script = [10, 11, BLANK, 10, 11, 20, BLANK, 20, 30, BLANK]
+    d = _retract_decoder(script, BLANK, word_starts={10, 20, 30}, retract=1)
+    x = torch.zeros(3, 1, d.joint.encoder_hidden * d.joint.chunk_size)
+    out_len = torch.tensor([[4, 4, 4]])
+    with torch.no_grad():
+        h = d._greedy_decode_chat(x, out_len)
+    assert h.y_sequence == [10, 11, 20, 30], h.y_sequence
+
+
+@pytest.mark.unit
+def test_retract_lets_the_model_change_its_mind():
+    """A handed-forward word is NOT guaranteed to come back -- that is the point.
+
+    Retraction exists so the model can re-decide a boundary word with more right
+    context. If it emits something different, the original is replaced rather
+    than kept: keeping both would make corrections impossible and simply insert
+    words. The only protections are a chunk that emits NOTHING (restored, since
+    that is a blank-happy decoder rather than a decision) and the final chunk.
+    """
+    BLANK = 99
+    #   chunk0: 10 .        -> hands word 10 forward
+    #   chunk1: 20 .  (last) -> emits 20 instead; 10 is REPLACED, not kept
+    script = [10, BLANK, 20, BLANK]
+    d = _retract_decoder(script, BLANK, word_starts={10, 20}, retract=1)
+    x = torch.zeros(2, 1, d.joint.encoder_hidden * d.joint.chunk_size)
+    with torch.no_grad():
+        h = d._greedy_decode_chat(x, torch.tensor([[4, 4]]))
+    assert h.y_sequence == [20], f"expected the correction to replace the word, got {h.y_sequence}"
+
+
+@pytest.mark.unit
+def test_retract_never_fires_on_the_final_chunk():
+    """The last chunk has no successor, so its words must survive."""
+    BLANK = 99
+    script = [10, BLANK, 20, BLANK]  # chunk0: word 10 | chunk1 (last): word 20
+    d = _retract_decoder(script, BLANK, word_starts={10, 20}, retract=1)
+    x = torch.zeros(2, 1, d.joint.encoder_hidden * d.joint.chunk_size)
+    with torch.no_grad():
+        h = d._greedy_decode_chat(x, torch.tensor([[4, 4]]))
+    assert 20 in h.y_sequence, f"final chunk's word was dropped: {h.y_sequence}"
+
+
+@pytest.mark.unit
+def test_retract_restores_the_word_if_the_next_chunk_emits_nothing():
+    """A handed-forward word must not vanish when the model declines to re-emit.
+
+    Without this, every silent chunk permanently deletes the previous chunk's
+    last word -- and a blank-happy decoder early in training would shred the
+    transcript.
+    """
+    BLANK = 99
+    script = [10, BLANK, BLANK, 20, BLANK]  # chunk1 emits nothing at all
+    d = _retract_decoder(script, BLANK, word_starts={10, 20}, retract=1)
+    x = torch.zeros(3, 1, d.joint.encoder_hidden * d.joint.chunk_size)
+    with torch.no_grad():
+        h = d._greedy_decode_chat(x, torch.tensor([[4, 4, 4]]))
+    assert 10 in h.y_sequence, f"handed-forward word was lost: {h.y_sequence}"
+
+
+@pytest.mark.unit
+def test_retract_off_is_a_strict_noop():
+    """retract_words=0 must decode exactly as before."""
+    BLANK = 99
+    script = [10, 11, BLANK, 20, BLANK]
+    a = _retract_decoder(script, BLANK, word_starts={10, 20}, retract=0)
+    x = torch.zeros(2, 1, a.joint.encoder_hidden * a.joint.chunk_size)
+    with torch.no_grad():
+        h = a._greedy_decode_chat(x, torch.tensor([[4, 4]]))
+    assert h.y_sequence == [10, 11, 20], h.y_sequence
+
+
+@pytest.mark.unit
+def test_retract_requires_word_start_ids():
+    """Without them a rollback would land mid-word -- fail loudly, not silently."""
+    BLANK = 99
+    d = _retract_decoder([10, BLANK], BLANK, word_starts=set(), retract=1)
+    x = torch.zeros(1, 1, d.joint.encoder_hidden * d.joint.chunk_size)
+    with pytest.raises(ValueError, match="word_start_ids"):
+        d._greedy_decode_chat(x, torch.tensor([[4]]))

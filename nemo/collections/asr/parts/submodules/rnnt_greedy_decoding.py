@@ -580,13 +580,46 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
             chunk_size = getattr(self.joint, "chunk_size", 0) or 0
             max_symbols = chunk_size if chunk_size > 0 else x.shape[-1] // self.joint.encoder_hidden
 
-        for time_idx in range(len(out_len_list)):
+        # --- retract-by-k decoding -------------------------------------------
+        # After finishing a chunk, hand its last k WORDS back to the next chunk
+        # by rolling the decoder to the state it had before those words. The
+        # model then re-decides them with the following chunk's audio as right
+        # context, so the boundary words -- the ones whose acoustics straddle a
+        # chunk edge, and which are therefore hardest -- are decided on more
+        # evidence. The encoder's look-ahead and the chunk grid are untouched.
+        #
+        # This is only legal because of the stochastic WORD DELAY used in
+        # training (data.dataset.word_delay_prob). Under a fixed frame delay a
+        # word is only ever emitted at one chunk, so "chunk t ended without its
+        # last word" is a state the model has never seen and cannot be expected
+        # to recover from. With the word delay that state occurs in a quarter of
+        # chunks, and re-emitting at t+1 is something it was explicitly trained
+        # to do.
+        #
+        # Only words emitted in the CURRENT chunk are eligible, mirroring the
+        # "frozen" rule in training: a word handed forward is never handed
+        # forward again, so the added latency is capped at one chunk.
+        retract_words = int(getattr(self, "retract_words", 0) or 0)
+        word_start_ids = getattr(self, "word_start_ids", None)
+        if retract_words > 0 and not word_start_ids:
+            raise ValueError(
+                "retract_words > 0 needs word_start_ids (the token ids that begin a word) so the "
+                "decoder can tell where words start; it only sees token ids."
+            )
+        n_chunks = len(out_len_list)
+        pending = None  # state saved before a retraction, for the no-re-emission fallback
+
+        for time_idx in range(n_chunks):
             if out_len_list[time_idx] == 0:
                 break
             f = x.narrow(dim=0, start=time_idx, length=1)
 
             not_blank = True
             symbols_added = 0
+            emitted_here = 0
+            # Checkpoints taken BEFORE each word of this chunk, so a rollback
+            # lands exactly on a word boundary rather than mid-word.
+            word_starts = []
             while not_blank and symbols_added < max_symbols:
                 last_label = label_collate([[hypothesis.last_token]])
 
@@ -608,14 +641,64 @@ class GreedyRNNTInfer(_GreedyRNNTInfer):
                 if k == self._blank_index:
                     not_blank = False
                 else:
+                    if retract_words > 0 and k in word_start_ids:
+                        word_starts.append(
+                            (len(hypothesis.y_sequence), hypothesis.dec_state, hypothesis.last_token, hypothesis.score)
+                        )
                     # Append token to label set, update RNN state.
                     hypothesis.y_sequence.append(k)
                     hypothesis.score += float(v)
                     hypothesis.timestamp.append(time_idx)
                     hypothesis.dec_state = hidden_prime
                     hypothesis.last_token = k
+                    emitted_here += 1
 
                 symbols_added += 1
+
+            # If the previous chunk handed words forward and this one emitted
+            # nothing at all, the words would be lost outright. Put them back:
+            # the model declining to re-emit is far more likely to be a blank-
+            # happy decoder than a considered deletion, especially early in
+            # training.
+            if pending is not None:
+                if emitted_here == 0:
+                    (
+                        hypothesis.y_sequence,
+                        hypothesis.dec_state,
+                        hypothesis.last_token,
+                        hypothesis.score,
+                        hypothesis.timestamp,
+                    ) = pending
+                pending = None
+
+            # Hand back this chunk's last `retract_words` words -- never on the
+            # final chunk, which has no successor to re-emit them.
+            if retract_words > 0 and time_idx < n_chunks - 1 and len(word_starts) >= retract_words:
+                keep_n, state, last_tok, score = word_starts[-retract_words]
+                pending = (
+                    list(hypothesis.y_sequence),
+                    hypothesis.dec_state,
+                    hypothesis.last_token,
+                    hypothesis.score,
+                    list(hypothesis.timestamp),
+                )
+                hypothesis.y_sequence = hypothesis.y_sequence[:keep_n]
+                hypothesis.timestamp = hypothesis.timestamp[:keep_n]
+                hypothesis.dec_state = state
+                hypothesis.last_token = last_tok
+                hypothesis.score = score
+
+        # Words handed forward out of the final decoded chunk have nowhere to be
+        # re-emitted, so restore them rather than dropping the tail.
+        if pending is not None:
+            (
+                hypothesis.y_sequence,
+                hypothesis.dec_state,
+                hypothesis.last_token,
+                hypothesis.score,
+                hypothesis.timestamp,
+            ) = pending
+
         hypothesis.dec_state = self.decoder.batch_select_state(hypothesis.dec_state, 0)
 
         return hypothesis

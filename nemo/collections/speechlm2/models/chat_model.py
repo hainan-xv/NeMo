@@ -376,7 +376,62 @@ class ChatSTTModel(LightningModule):
             # the path whose emission rule matches training.
             cfg = OmegaConf.create({"strategy": "greedy", "greedy": {"max_symbols": self.max_symbols}})
             self._decoding = RNNTDecoding(decoding_cfg=cfg, decoder=self.decoder, joint=self.joint, vocabulary=vocab)
+
+            # Retract-by-k: hand a chunk's last k words to the next chunk so the
+            # model re-decides them with more right context. Set on the inner
+            # greedy object rather than through the constructor, which is shared
+            # with every other RNN-T model in the collection.
+            retract = int(self.cfg.get("retract_words", 0) or 0)
+            if retract > 0:
+                inner = self._decoding.decoding
+                inner.retract_words = retract
+                # The decoder sees only token IDS, so it cannot tell where a word
+                # begins; it needs the set of ids that start one.
+                inner.word_start_ids = self.word_start_ids()
+                logging.info(
+                    f"CHAT decoding: retract_words={retract}, "
+                    f"{len(inner.word_start_ids)} word-start token ids of {int(self.core_cfg.vocab_size)}"
+                )
         return self._decoding
+
+    def word_start_ids(self) -> frozenset:
+        """Token ids that begin a new word, for retract-by-k decoding.
+
+        Detected from the piece string's word-boundary marker -- U+2581 for
+        SentencePiece, U+0120 for byte-level BPE -- which is how both families
+        encode "this token starts a word". Cached: for Qwen this scans 151,936
+        pieces.
+
+        Getting this wrong is not a crash but a silent quality loss: retraction
+        would roll back to a mid-word position, leaving a word fragment committed
+        and the model asked to continue from a state training never produced.
+        """
+        if getattr(self, "_word_start_ids", None) is None:
+            tok = getattr(self, "tokenizer", None)
+            if tok is None:
+                raise RuntimeError("retract decoding needs model.tokenizer to find word-start token ids")
+            hf = getattr(tok, "tokenizer", None)
+            n = int(self.core_cfg.vocab_size)
+            ids = set()
+            for i in range(n):
+                piece = None
+                try:
+                    if hf is not None and hasattr(hf, "convert_ids_to_tokens"):
+                        piece = hf.convert_ids_to_tokens(i)
+                    elif hasattr(tok, "ids_to_tokens"):
+                        got = tok.ids_to_tokens([i])
+                        piece = got[0] if got else None
+                except Exception:  # noqa: BLE001
+                    piece = None
+                if isinstance(piece, str) and (piece.startswith("\u2581") or piece.startswith("\u0120")):
+                    ids.add(i)
+            if not ids:
+                raise RuntimeError(
+                    "found no word-start token ids: this tokenizer marks word boundaries some other way, "
+                    "so retract decoding would roll back to mid-word positions."
+                )
+            self._word_start_ids = frozenset(ids)
+        return self._word_start_ids
 
     @torch.no_grad()
     def transcribe_ids(self, audios: torch.Tensor, audio_lens: torch.Tensor):
