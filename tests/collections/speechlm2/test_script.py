@@ -3420,3 +3420,41 @@ def test_no_doubled_space_when_residual_words_are_appended():
     joined = "".join(chunks)
     assert "  " not in joined, f"doubled space in target: {joined!r}"
     assert joined == transcript
+
+
+@pytest.mark.unit
+def test_unlocatable_word_does_not_duplicate_text():
+    """A word the aligner spells differently must not be emitted TWICE.
+
+    compute_word_spans locates each word by searching the transcript, so an
+    aligner that reports `fortyeight` for a hyphenated `forty-eight` yields no
+    span. The old fallback emitted the aligner's own word forms while leaving
+    the cursor, so the next chunk re-emitted the same region from the
+    transcript -- the text appeared twice, in two spellings:
+
+        ref: ... his wait of forty-eight hours ...
+        tgt: ... his wait offortyeight forty-eight hours ...
+
+    which trains the model to say the word twice. Observed in job 13103451.
+    Emitting nothing is correct: the cursor has not moved, so the next chunk's
+    slice covers the text and it is merely emitted one chunk later.
+    """
+    transcript = "his wait of forty-eight hours tonight"
+    align = ["his", "wait", "of", "fortyeight", "hours", "tonight"]
+    # ~1 word per chunk, so the unlocatable word lands ALONE -- with no located
+    # neighbour in its group, which is the case that used to duplicate.
+    chunks = _chunk_texts(transcript, align, dur=1.15)
+    joined = "".join(chunks)
+    assert "fortyeight forty-eight" not in joined, f"word duplicated: {joined!r}"
+    assert joined == transcript, f"{joined!r} != {transcript!r}"
+
+
+@pytest.mark.unit
+def test_all_words_unlocatable_loses_nothing():
+    """Even if NO word can be located, later chunks must still cover the text."""
+    transcript = "alpha beta gamma delta"
+    chunks = _chunk_texts(transcript, ["zzz", "yyy", "xxx", "www"], dur=1.15)
+    joined = "".join(chunks)
+    # Nothing is emitted (no span ever resolves), but nothing is duplicated
+    # either -- the failure mode we are guarding is invented text, not silence.
+    assert "zzz" not in joined and "yyy" not in joined, f"aligner spellings leaked: {joined!r}"

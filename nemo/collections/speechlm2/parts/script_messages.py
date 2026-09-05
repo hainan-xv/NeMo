@@ -169,11 +169,33 @@ def get_llm_messages_for_sample(
             if end is not None and end >= text_cursor:
                 text = transcript[text_cursor:end]
                 text_cursor = end
-        if text is None:
-            # No span located: fall back to the aligner's own words. The cursor
-            # does not move, so this group's transcript text is picked up by the
-            # next group rather than being lost.
+        if text is None and not (word_spans and transcript):
+            # No transcript at all: the aligner's words are the ONLY source of
+            # text, so use them. Nothing can be duplicated here because there is
+            # no transcript for a later chunk to slice from.
             text = " ".join(alignments[i].text for i in indices)
+        elif text is None:
+            # There IS a transcript, but this group's words were not located in
+            # it. Emit nothing, and leave the cursor where it is.
+            #
+            # Falling back to the aligner's own word forms here DUPLICATES text.
+            # The cursor does not advance, so the next group emits
+            # transcript[cursor:...] spanning this same region -- which therefore
+            # appears twice, once in the aligner's spelling and once in the
+            # transcript's. Seen in training as
+            #
+            #   ref: ... his wait of forty-eight hours ...
+            #   tgt: ... his wait offortyeight forty-eight hours ...
+            #
+            # because the aligner reports "fortyeight" for a hyphenated
+            # "forty-eight", so find() fails; when that word lands alone in a
+            # chunk there is no located neighbour to rescue the slice. The model
+            # is then trained to emit the word twice, in two different spellings.
+            #
+            # Emitting nothing makes this chunk silent and lets the NEXT chunk's
+            # slice cover the text, since the cursor did not move. Nothing is
+            # lost -- those words are simply emitted one chunk later.
+            return ""
         # Restyle AFTER slicing: the character spans index into the original
         # transcript, so stripping punctuation first would invalidate them.
         return apply_text_style(text, capitalization, punctuation)
