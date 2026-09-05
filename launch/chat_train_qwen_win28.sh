@@ -42,7 +42,9 @@
 set -uo pipefail
 
 export CONFIG_NAME=streaming_stt_granary2_chat_qwenvocab_win28
-export EXP_NAME=granary2_chat_qwenvocab_win28
+# Overridable, so an LR sweep can be given its own results directory
+# instead of resuming and overwriting the main run of this arm.
+export EXP_NAME="${EXP_NAME:-granary2_chat_qwenvocab_win28}"
 
 # Under sbatch, Slurm COPIES the submitted script into a spool directory, so
 # BASH_SOURCE points somewhere with no sibling chat_train.sh -- prefer

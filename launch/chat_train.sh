@@ -102,7 +102,10 @@ VAL_CHECK_INTERVAL="${VAL_CHECK_INTERVAL:-16000}"
 # utterances on rank 0.
 LOG_TRAIN_DECODE_EVERY="${LOG_TRAIN_DECODE_EVERY:-500}"
 LOG_TRAIN_DECODE_N="${LOG_TRAIN_DECODE_N:-2}"
-LR="${LR:-0.0001}"
+# 1e-3 for the from-scratch parts; the encoder is held at 0.1x of this by
+# model.lr_multipliers. Was 1e-4, which is 10.5x below the peak LR the donor
+# RNN-T was trained at.
+LR="${LR:-0.001}"
 # 2500, the recipe's own value. The previous 10000 was inherited from the SCRIPT
 # launcher, where a 1.7B LLM genuinely needs a long warmup. CHAT has no LLM, and
 # with a 16000-step epoch a 10000-step warmup meant most of "epoch 0" ran at a

@@ -84,9 +84,24 @@ model:
     lr: 1e-4
     weight_decay: 1e-3
     betas: [0.9, 0.98]
+  # Per-group learning rates. The 609M encoder is PRETRAINED and only needs
+  # fine-tuning; the prediction network, joint and the joint's Q/K/V are trained
+  # from SCRATCH and were badly starved by a single shared rate.
+  #
+  # For scale: the donor RNN-T -- the model this encoder comes from -- trained
+  # with NoamAnnealing(lr=3.0, d_model=1024, warmup=8000), peaking at 1.05e-3.
+  # A flat 1e-4 is 10.5x below that peak and 4-8x below it for all of training,
+  # for components no better initialised than the donor's were.
+  #
+  # So: base 1e-3 for the from-scratch parts (matching the donor's peak), with
+  # the encoder held at 0.1x = 1e-4, exactly the rate it has been getting and
+  # which is demonstrably safe for it.
+  lr_multipliers:
+    '^perception\.encoder\.': 0.1
+
   optimizer:
     _target_: torch.optim.AdamW
-    lr: 1e-4
+    lr: 1e-3
     weight_decay: 1e-3
     betas: [0.9, 0.98]
     foreach: true

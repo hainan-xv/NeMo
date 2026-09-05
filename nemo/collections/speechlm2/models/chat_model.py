@@ -51,7 +51,7 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 from lightning import LightningModule
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 from nemo.collections.asr.modules import RNNTAttJoint, RNNTDecoder
 from nemo.collections.speechlm2.parts.metrics.wer import WER
@@ -583,7 +583,81 @@ class ChatSTTModel(LightningModule):
         self._partial_wer_hyps.clear()
 
     def configure_optimizers(self):
-        return configure_optimizers(self)
+        """Per-group learning rates: pretrained encoder low, from-scratch parts high.
+
+        A single learning rate has to serve two very different populations here.
+        The 609M encoder is pretrained and only needs fine-tuning, while the
+        prediction network, the joint, and the joint's Q/K/V are trained from
+        SCRATCH. Set the rate low enough to be safe for the encoder and the new
+        parts crawl; set it high enough for the new parts and the encoder is at
+        risk early.
+
+        How far off the single rate was: the donor RNN-T -- the model this very
+        encoder comes from -- trained with NoamAnnealing(lr=3.0, d_model=1024,
+        warmup=8000), whose peak is 1.05e-3. We were running a flat 1e-4, i.e.
+        10.5x below peak and 4-8x below it for the whole of training, for
+        components that are no better initialised than the donor's were.
+
+        ``lr_multipliers`` maps a regex over parameter names to a factor on the
+        base LR, so the encoder can stay at its current effective rate while the
+        from-scratch parts get the rate the architecture actually wants. The
+        scheduler is unaffected: PyTorch records each group's initial LR as its
+        base and scales all groups together, so the ratio holds throughout.
+        """
+        mults = self.cfg.get("lr_multipliers", None)
+        if not mults:
+            return configure_optimizers(self)
+
+        import re
+
+        # freeze_and_subset yields bare parameters, but grouping needs the NAMES,
+        # so apply the same freeze rules here rather than calling it.
+        freeze = [re.compile(x) for x in (self.cfg.get("freeze_params", []) or [])]
+        keep = [re.compile(x) for x in (self.cfg.get("prevent_freeze_params", []) or [])]
+        named = []
+        for name, p in self.named_parameters():
+            if any(k.match(name) for k in keep):
+                named.append((name, p))
+                continue
+            if any(f.match(name) for f in freeze):
+                p.requires_grad = False
+                continue
+            named.append((name, p))
+        base_lr = float(self.cfg.optimizer.lr)
+        buckets: dict[float, list] = {}
+        assigned: dict[float, list] = {}
+        for name, p in named:
+            mult = 1.0
+            for pattern, m in mults.items():
+                if re.search(pattern, name):
+                    mult = float(m)
+                    break
+            buckets.setdefault(mult, []).append(p)
+            assigned.setdefault(mult, []).append(name)
+
+        groups = [{"params": ps, "lr": base_lr * mult} for mult, ps in sorted(buckets.items())]
+        opt_cfg = OmegaConf.to_container(self.cfg.optimizer, resolve=True)
+        target = opt_cfg.pop("_target_")
+        opt_cfg.pop("lr", None)
+        mod, cls = target.rsplit(".", 1)
+        import importlib
+
+        optimizer = getattr(importlib.import_module(mod), cls)(groups, lr=base_lr, **opt_cfg)
+
+        for mult, names in sorted(assigned.items()):
+            n_par = sum(p.numel() for p in buckets[mult])
+            logging.info(
+                f"  lr group x{mult:g} -> {base_lr * mult:.2e}: {len(names)} tensors, {n_par/1e6:.1f}M params "
+                f"(e.g. {names[0]})"
+            )
+
+        ans = {"optimizer": optimizer}
+        if "lr_scheduler" in self.cfg:
+            from nemo.collections.speechlm2.parts.optim_setup import safe_instantiate
+
+            sched = safe_instantiate(self.cfg.lr_scheduler, optimizer)
+            ans["lr_scheduler"] = {"scheduler": sched, "interval": "step", "frequency": 1}
+        return ans
 
 
 __all__ = ["ChatSTTModel", "ChatSTTModelConfig"]
