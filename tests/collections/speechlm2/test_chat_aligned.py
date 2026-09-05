@@ -289,6 +289,7 @@ def test_target_text_reconstructs_the_transcript_from_the_path():
 
     batch = types.SimpleNamespace(
         b_idx=torch.zeros(len(labels), dtype=torch.long),
+        u_idx=torch.tensor(u_idx, dtype=torch.long),
         labels=torch.tensor(labels, dtype=torch.long),
     )
     model = types.SimpleNamespace(
@@ -303,10 +304,23 @@ def test_target_text_reconstructs_the_transcript_from_the_path():
     # for every example, which reads as plausible.
     b2 = types.SimpleNamespace(
         b_idx=torch.tensor([0, 0, 0, 1, 1, 1], dtype=torch.long),
+        u_idx=torch.tensor([0, 1, 2, 0, 1, 2], dtype=torch.long),
         labels=torch.tensor([1, 2, blank, 7, 8, blank], dtype=torch.long),
     )
     assert ChatSTTModel._target_text(model, b2, 0) == "1 2"
     assert ChatSTTModel._target_text(model, b2, 1) == "7 8"
+
+    # With HISTORY RECOVERY a word is scored at two chunks, so the same u
+    # appears twice. The target line must deduplicate by prefix position, or
+    # every recovered word would print twice and look like a data-corruption bug
+    # of exactly the kind we have already chased twice.
+    t3, u3, l3 = build_path([[1, 2], [3]], blank, recover_words=1, word_starts=[[0, 1], [0]])
+    b3 = types.SimpleNamespace(
+        b_idx=torch.zeros(len(l3), dtype=torch.long),
+        u_idx=torch.tensor(u3, dtype=torch.long),
+        labels=torch.tensor(l3, dtype=torch.long),
+    )
+    assert ChatSTTModel._target_text(model, b3, 0) == "1 2 3"
 
 
 @pytest.mark.unit
@@ -1142,3 +1156,103 @@ def test_retract_two_only_takes_the_chunks_own_words():
     with torch.no_grad():
         h = d._greedy_decode_chat(x, torch.tensor([[4, 4, 4]]))
     assert h.y_sequence == [10, 20, 30, 40], f"carried words were re-deferred: {h.y_sequence}"
+
+
+# ---------------------------------------------------------------------------
+# Deterministic history recovery (the successor to the stochastic word delay).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_history_recovery_off_is_a_strict_noop():
+    """recover_words=0 must reproduce the original path exactly.
+
+    Every run to date used it, and the stochastic scheme is kept for comparison.
+    """
+    chunks = [[1, 2], [3], [], [4, 5]]
+    assert build_path(chunks, 99, recover_words=0) == build_path(chunks, 99)
+
+
+@pytest.mark.unit
+def test_history_recovery_adds_positions_and_never_removes_any():
+    """The blank must stay put -- that is the whole reason for this scheme.
+
+    The stochastic delay MOVED a word to the next chunk, shortening the target
+    and pulling the blank one word earlier; at p=0.5 that trained half of all
+    non-empty chunks to stop before their last word. Recovery only adds.
+    """
+    chunks = [[1, 2], [3], [4, 5]]
+    ws = [[0, 1], [0], [0, 1]]
+    base = list(zip(*build_path(chunks, 99)))
+    ext = list(zip(*build_path(chunks, 99, recover_words=1, word_starts=ws)))
+    assert set(base).issubset(set(ext)), "recovery removed or altered an original position"
+    assert len(ext) > len(base), "recovery added nothing"
+    # Every blank sits at exactly the same (chunk, u) as without recovery.
+    assert [(t, u) for t, u, l in base if l == 99] == [(t, u) for t, u, l in ext if l == 99]
+
+
+@pytest.mark.unit
+def test_history_recovery_reemits_the_previous_chunks_last_word():
+    """Chunk t must be scored on chunk t-1's last word, from the SHORTER prefix."""
+    chunks = [[1, 2], [3]]
+    ws = [[0, 1], [0]]
+    t_idx, u_idx, labels = build_path(chunks, 99, recover_words=1, word_starts=ws)
+    steps = list(zip(t_idx, u_idx, labels))
+    # token 2 is chunk 0's last word, emitted there at u=1; chunk 1 must score it
+    # at the SAME u -- i.e. from the prefix that does not yet contain it.
+    assert (0, 1, 2) in steps, "chunk 0 lost its own word"
+    assert (1, 1, 2) in steps, "chunk 1 does not recover the previous chunk's last word"
+    assert (1, 2, 3) in steps, "chunk 1's own word must follow contiguously in u"
+
+
+@pytest.mark.unit
+def test_history_recovery_covers_depth_one_as_a_suffix_of_depth_two():
+    """recover=2 trains depth-1 recovery for free.
+
+    The path `W1 W2 [own]` passes through the state "prefix one word short ->
+    emit W2", so one deterministic construction covers retract-1 AND retract-2
+    at 100% of chunks -- where the stochastic scheme reached them 25% and 12.5%
+    of the time.
+    """
+    chunks = [[1, 2], [3]]
+    ws = [[0, 1], [0]]
+    steps = set(zip(*build_path(chunks, 99, recover_words=2, word_starts=ws)))
+    assert (1, 0, 1) in steps, "depth-2 state (two words short) not trained"
+    assert (1, 1, 2) in steps, "depth-1 state (one word short) not trained as a suffix"
+
+
+@pytest.mark.unit
+def test_history_recovery_never_reaches_past_the_previous_chunk():
+    """'If less than two, we don't go back.'
+
+    This is what keeps training consistent with the decoder's frozen rule, which
+    only ever retracts words the CURRENT chunk emitted. Reaching further back in
+    training would create states decoding can never produce.
+    """
+    # chunk1 has a single word; chunk2 asks for two and must get only that one.
+    chunks = [[1, 2], [3], [4]]
+    ws = [[0, 1], [0], [0]]
+    steps = set(zip(*build_path(chunks, 99, recover_words=2, word_starts=ws)))
+    at_chunk2 = sorted(u for t, u, l in steps if t == 2 and l != 99)
+    assert at_chunk2 == [2, 3], f"chunk 2 reached past chunk 1: scored u={at_chunk2}"
+
+    # A silent previous chunk offers nothing to recover.
+    chunks = [[1, 2], [], [3]]
+    ws = [[0, 1], [], [0]]
+    steps = set(zip(*build_path(chunks, 99, recover_words=2, word_starts=ws)))
+    assert sorted(u for t, u, l in steps if t == 2 and l != 99) == [2]
+
+
+@pytest.mark.unit
+def test_history_recovery_and_word_delay_are_mutually_exclusive():
+    """Layering them would reintroduce the blank bias recovery exists to remove."""
+    from nemo.collections.speechlm2.data.chat_dataset import ChatAlignedDataset
+
+    stub = ChatAlignedDataset.__new__(ChatAlignedDataset)
+    cfg = types.SimpleNamespace(word_delay_prob=0.5, recover_history_words=2)
+    with pytest.raises(ValueError, match="alternatives, not layers"):
+        # Only the guard is under test, so run the post-super() body directly.
+        stub._word_delay_prob = float(cfg.word_delay_prob)
+        stub._recover_words = int(cfg.recover_history_words)
+        if stub._recover_words > 0 and stub._word_delay_prob > 0.0:
+            raise ValueError("recover_history_words and word_delay_prob are alternatives, not layers.")

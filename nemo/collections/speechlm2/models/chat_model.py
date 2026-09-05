@@ -592,8 +592,18 @@ class ChatSTTModel(LightningModule):
         sel = batch.b_idx == i
         if not bool(sel.any()):
             return ""
-        labels = batch.labels[sel]
-        toks = [int(t) for t in labels[labels != self.blank_id].tolist()]
+        labels, us = batch.labels[sel], batch.u_idx[sel]
+        keep = labels != self.blank_id
+        labels, us = labels[keep], us[keep]
+        # Deduplicate by PREFIX POSITION. With history recovery a word is scored
+        # at two chunks -- its own and the next one -- so a plain concatenation
+        # would print every recovered word twice and look like a data bug. Each
+        # u carries the same token wherever it appears, so keeping one per u and
+        # ordering by u reconstructs the transcript exactly.
+        by_u = {}
+        for u, tok in zip(us.tolist(), labels.tolist()):
+            by_u.setdefault(int(u), int(tok))
+        toks = [by_u[u] for u in sorted(by_u)]
         return self._detokenize(toks)
 
     # ------------------------------------------------------------------

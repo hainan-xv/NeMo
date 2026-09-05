@@ -101,17 +101,71 @@ class ChatAlignedBatch:
         )
 
 
-def build_path(chunk_tokens: List[List[int]], blank_id: int):
+def build_path(chunk_tokens: List[List[int]], blank_id: int, recover_words: int = 0, word_starts=None):
     """(t_idx, u_idx, labels) for one utterance's forced path.
 
     ``u`` counts EMITTED LABELS, so it does not advance on a blank -- the
     prediction network only ever sees real tokens. Every chunk contributes
     exactly one blank, silent ones included; that is the signal for "nothing to
     emit here", and dropping it would leave the model no way to learn silence.
+
+    HISTORY RECOVERY (``recover_words`` > 0). Each chunk's path is additionally
+    extended BACKWARD over the previous chunk's last ``recover_words`` words, so
+    chunk t is scored on::
+
+        [last <=k words of chunk t-1]  [chunk t's own words]  BLANK
+
+    starting from the prefix position before those words. Chunk t-1 keeps its
+    own full path, blank included -- nothing is removed anywhere.
+
+    WHY THIS AND NOT THE STOCHASTIC DELAY. Moving a word from chunk t-1 to chunk
+    t shortens chunk t-1's target, which moves its BLANK one word earlier. At
+    word_delay_prob=0.5 that trains half of all non-empty chunks to stop before
+    their last word -- a systematic bias toward premature blank, i.e. deletions.
+    Extending backward instead only ADDS scored positions, so every blank stays
+    exactly where the acoustics put it.
+
+    It is also strictly more thorough. The path ``W1 W2 [own]`` passes through
+    the state "prefix one word short -> emit W2", so a single deterministic
+    construction trains recovery at depth 1 AND 2 at 100% of chunks, where the
+    stochastic scheme reached them only 25% and 12.5% of the time.
+
+    The re-emitted positions reuse prefix states the single decoder pass has
+    already computed: the prediction network sees only word tokens, with no
+    blanks, no chunk identity and no position, so the state at a given prefix is
+    the same tensor whichever chunk is paired with it.
+
+    Args:
+        chunk_tokens: per chunk, the flat token ids it reveals.
+        blank_id: the transducer blank.
+        recover_words: how many of the previous chunk's words each chunk should
+            additionally be able to recover. 0 reproduces the original path
+            exactly.
+        word_starts: per chunk, the indices WITHIN that chunk at which words
+            begin. Required when recover_words > 0.
     """
     t_idx, u_idx, labels = [], [], []
     u = 0
+    chunk_u_start: List[int] = []
     for t, toks in enumerate(chunk_tokens):
+        chunk_u_start.append(u)
+
+        # Recovery prefix: re-emit the previous chunk's last words HERE, from the
+        # prefix that precedes them. Its u values run contiguously up to this
+        # chunk's own start, so the two segments join without a gap.
+        if recover_words > 0 and t > 0:
+            prev, starts = chunk_tokens[t - 1], (word_starts[t - 1] if word_starts else [])
+            if starts:
+                # "If less than two, we don't go back": take what the previous
+                # chunk has and never reach further back than it.
+                take_from = starts[-recover_words] if len(starts) >= recover_words else starts[0]
+                uu = chunk_u_start[t - 1] + take_from
+                for tok in prev[take_from:]:
+                    t_idx.append(t)
+                    u_idx.append(uu)
+                    labels.append(int(tok))
+                    uu += 1
+
         for tok in toks:
             t_idx.append(t)
             u_idx.append(u)
@@ -136,9 +190,64 @@ class ChatAlignedDataset(ScriptSTTDataset):
         # Stochastic WORD-level emission delay. 0 disables it.
         self._word_delay_prob = float(getattr(cfg, "word_delay_prob", 0.0) or 0.0)
         self._word_delay_rngs: dict = {}
+        # Deterministic history recovery: each chunk is additionally scored on the
+        # previous chunk's last N words, from the prefix preceding them.
+        self._recover_words = int(getattr(cfg, "recover_history_words", 0) or 0)
+        self._ws_ids = None
+        if self._recover_words > 0 and self._word_delay_prob > 0.0:
+            raise ValueError(
+                "recover_history_words and word_delay_prob are alternatives, not layers. The stochastic "
+                "delay MOVES words between chunks, which shortens a chunk's target and pulls its blank one "
+                "word earlier; history recovery only ADDS scored positions and leaves every blank in place. "
+                "Running both would reintroduce exactly the blank bias recovery exists to remove."
+            )
         # The transducer's blank is an extra class at the END of the vocabulary,
         # the standard NeMo convention (num_classes == vocab_size, blank == V).
         self.blank_id = int(len(self.tokenizer) if blank_id is None else blank_id)
+
+    def _word_start_ids(self) -> frozenset:
+        """Token ids that begin a word, for splitting a chunk into words.
+
+        Uses the same word-boundary markers the DECODER uses to find retraction
+        points (U+2581 SentencePiece, U+0120 byte-level BPE). They must agree:
+        training extends a chunk backward over whole words, and decoding rolls
+        back over whole words, so a different notion of "word" on either side
+        would have the model recovering from states it was never trained on.
+        """
+        if self._ws_ids is None:
+            tok = self.tokenizer
+            hf = getattr(tok, "tokenizer", None)
+            ids = set()
+            n = len(tok) if hasattr(tok, "__len__") else len(hf)
+            for i in range(n):
+                piece = None
+                try:
+                    if hf is not None and hasattr(hf, "convert_ids_to_tokens"):
+                        piece = hf.convert_ids_to_tokens(i)
+                    elif hasattr(tok, "ids_to_tokens"):
+                        got = tok.ids_to_tokens([i])
+                        piece = got[0] if got else None
+                except Exception:  # noqa: BLE001
+                    piece = None
+                if isinstance(piece, str) and (piece.startswith("\u2581") or piece.startswith("\u0120")):
+                    ids.add(i)
+            if not ids:
+                raise RuntimeError(
+                    "no word-start token ids found: this tokenizer marks word boundaries some other way, so "
+                    "history recovery would extend a chunk backward to a mid-word position."
+                )
+            self._ws_ids = frozenset(ids)
+        return self._ws_ids
+
+    def _split_word_starts(self, toks: List[int]) -> List[int]:
+        """Indices within a chunk's token list at which words begin.
+
+        Position 0 always counts: the first chunk's text has no leading space, so
+        its opening token carries no boundary marker, and a chunk whose text was
+        sliced mid-word must still start a group somewhere.
+        """
+        ws = self._word_start_ids()
+        return [i for i, t in enumerate(toks) if i == 0 or t in ws]
 
     def _get_word_delay_rng(self) -> random.Random:
         """RNG for the word-delay draw, seeded per dataloader worker.
@@ -186,7 +295,10 @@ class ChatAlignedDataset(ScriptSTTDataset):
         for bi, messages in enumerate(batch_messages):
             chunks = self._messages_to_chunks(messages)
             chunk_tokens = [list(c.target_ids) for c in chunks]
-            t_idx, u_idx, labels = build_path(chunk_tokens, self.blank_id)
+            word_starts = [self._split_word_starts(c) for c in chunk_tokens] if self._recover_words > 0 else None
+            t_idx, u_idx, labels = build_path(
+                chunk_tokens, self.blank_id, recover_words=self._recover_words, word_starts=word_starts
+            )
 
             all_b.extend([bi] * len(t_idx))
             all_t.extend(t_idx)
