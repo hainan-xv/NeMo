@@ -134,18 +134,49 @@ def build_chat_tokenizer(cfg: dict):
     return AutoTokenizer(cfg["pretrained_llm"], use_fast=True)
 
 
+# The Open ASR Leaderboard is a FIXED set of seven splits. Taking "everything
+# cached" instead silently changes what the macro average means: the grid cache
+# also holds ami, gigaspeech, tedlium, voxpopuli (uncleaned variants) and
+# speech_commands, which would give a 12-dataset average that is not comparable
+# to any published number or to our own SCRIPT column. Kept identical to
+# _DEFAULT_DATASETS in launch/eval_leaderboard.sh.
+LEADERBOARD_SPLITS: List[Tuple[str, str]] = [
+    ("librispeech", "test.clean"),
+    ("librispeech", "test.other"),
+    ("ami_cleaned", "test"),
+    ("earnings22", "test"),
+    ("gigaspeech_cleaned", "test"),
+    ("spgispeech", "test"),
+    ("voxpopuli_cleaned_aa", "test"),
+]
+
+
 def find_splits(cache_dir: str) -> List[Tuple[str, str]]:
-    """Every ``<dataset>/<split>`` under the cache that has a manifest."""
+    """The seven leaderboard splits that are actually staged under ``cache_dir``."""
     out = []
-    for m in sorted(glob.glob(os.path.join(cache_dir, "*", "*", "_cache_manifest.jsonl"))):
-        rel = os.path.relpath(os.path.dirname(m), cache_dir)
-        ds, split = rel.split(os.sep, 1)
-        out.append((ds, split))
+    for ds, split in LEADERBOARD_SPLITS:
+        if os.path.isfile(os.path.join(cache_dir, ds, split, "_cache_manifest.jsonl")):
+            out.append((ds, split))
+    missing = [f"{d}:{s}" for d, s in LEADERBOARD_SPLITS if (d, s) not in out]
+    if missing:
+        print(f"  WARNING: leaderboard splits not staged and therefore EXCLUDED: {', '.join(missing)}")
     return out
 
 
 def read_manifest(path: str, max_samples: Optional[int] = None, max_duration: Optional[float] = None) -> List[dict]:
-    rows = []
+    """Read a staged split, resolving audio paths against the manifest's own dir.
+
+    Manifests record the ABSOLUTE path the cache was built under, which is not
+    where it now lives -- on the grid they still point at a long-gone
+    /home/.../leaderboard_run/cache. The files are beside the manifest, so retry
+    by basename there, exactly as scripts/leaderboard_common.py does.
+
+    A record whose audio cannot be found either way is DROPPED, and the count is
+    reported: silently evaluating on a subset would understate or overstate WER
+    with nothing in the output to show it happened.
+    """
+    ds_dir = os.path.dirname(path)
+    rows, dropped = [], 0
     with open(path) as f:
         for line in f:
             line = line.strip()
@@ -154,9 +185,18 @@ def read_manifest(path: str, max_samples: Optional[int] = None, max_duration: Op
             r = json.loads(line)
             if max_duration and r.get("duration", 0) > max_duration:
                 continue
+            fp = r["audio_filepath"]
+            if not os.path.exists(fp):
+                fp = os.path.join(ds_dir, os.path.basename(fp))
+                if not os.path.exists(fp):
+                    dropped += 1
+                    continue
+                r["audio_filepath"] = fp
             rows.append(r)
             if max_samples and len(rows) >= max_samples:
                 break
+    if dropped:
+        print(f"  WARNING: {dropped} records in {path} have no audio and were skipped")
     return rows
 
 
