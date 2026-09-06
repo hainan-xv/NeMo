@@ -124,8 +124,13 @@ if [[ "$RUN_AVERAGING" == "1" ]]; then
         && mv -f '${AVG_TMP}' '${CKPT}'; else echo '==> reusing cached ${CKPT}'; fi && "
 fi
 
-# The cache lives on the llmservice portfolio; results on nemotron. Mount both.
-MOUNTS="--container-mounts=${CODE_DIR}:/code,${OUTPUT_PREFIX}:${OUTPUT_PREFIX},${CACHE_DIR}:${CACHE_DIR}"
+# Mount every portfolio the job touches. The checkpoint records an ABSOLUTE path
+# for its pretrained encoder on the llmservice portfolio; without that mount the
+# path does not exist inside the container and the model is built from whatever
+# else happens to be in the HF cache. Job 13127090 built its encoder from
+# canary-1b-flash that way and died on a shape mismatch.
+PRETRAINED_DIR="${PRETRAINED_DIR:-/lustre/fsw/portfolios/llmservice/users/heh}"
+MOUNTS="--container-mounts=${CODE_DIR}:/code,${OUTPUT_PREFIX}:${OUTPUT_PREFIX},${CACHE_DIR}:${CACHE_DIR},${PRETRAINED_DIR}:${PRETRAINED_DIR}"
 
 read -r -d '' CMD <<EOF || true
 cd /code && export PYTHONPATH=/code:\${PYTHONPATH:-} && export HF_HOME=${OUTPUT_PREFIX}/hf_cache \

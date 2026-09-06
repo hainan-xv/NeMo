@@ -48,18 +48,26 @@ def _resolve_asr(recorded: str, override: Optional[str] = None) -> str:
     for cand in (override, recorded):
         if cand and os.path.exists(cand):
             return cand
-    hits = sorted(
-        glob.glob(os.path.expanduser("~/.cache/huggingface/hub/models--nvidia--*/**/*.nemo"), recursive=True)
-    )
-    if recorded:
-        want = os.path.basename(recorded)
-        exact = [h for h in hits if os.path.basename(h) == want]
-        if exact:
-            return exact[0]
-    if hits:
-        return hits[0]
+    # Search caches by EXACT FILENAME only. Returning "some other nvidia .nemo"
+    # is not a fallback, it is a different model: a leaderboard job silently
+    # built its encoder from canary-1b-flash instead of the nemotron streaming
+    # model this checkpoint was trained on, and only failed later on a shape
+    # mismatch (1024x4352 vs 1024x4096). Had the shapes happened to agree it
+    # would have produced numbers.
+    want = os.path.basename(recorded) if recorded else None
+    roots = [
+        os.path.expanduser("~/.cache/huggingface/hub"),
+        os.environ.get("HF_HOME", ""),
+        "/root/.cache/huggingface/hub",
+    ]
+    if want:
+        for root in [r for r in roots if r and os.path.isdir(r)]:
+            for h in sorted(glob.glob(os.path.join(root, "**", want), recursive=True)):
+                return h
     raise FileNotFoundError(
-        f"cannot find the pretrained ASR model locally (checkpoint recorded {recorded!r}); pass an override."
+        f"cannot find the pretrained ASR model this checkpoint was built on: {recorded!r}.\n"
+        "On the grid this usually means the portfolio holding it is not mounted into the container.\n"
+        "Pass an explicit local path rather than letting a different model be substituted."
     )
 
 
