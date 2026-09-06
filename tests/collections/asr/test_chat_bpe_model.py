@@ -91,6 +91,33 @@ def _cuts(texts_and_times, duration=3.0):
     return CutSet.from_cuts(cuts)
 
 
+def _train_ds_cfg(tmp_path):
+    """A minimal Lhotse training config backed by real audio on disk."""
+    from lhotse.testing.dummies import DummyManifest
+
+    cuts = DummyManifest(CutSet, begin_id=0, end_id=4, with_data=True)
+    cuts = cuts.save_audios(str(tmp_path / "audio"))
+    for i, cut in enumerate(cuts):
+        cut.supervisions[0].text = "hello world"
+        cut.custom = {
+            "alignments": [
+                {"text": "hello", "start_time": 0.0, "end_time": 0.3},
+                {"text": "world", "start_time": 0.4, "end_time": 0.8},
+            ]
+        }
+    path = str(tmp_path / "cuts.jsonl.gz")
+    cuts.to_file(path)
+    return {
+        'use_lhotse': True,
+        'cuts_path': path,
+        'sample_rate': 16000,
+        'shuffle': False,
+        'num_workers': 0,
+        'batch_size': 2,
+        'use_bucketing': False,
+    }
+
+
 @pytest.fixture(autouse=True)
 def _cpu_default_device():
     """Pin these CPU tests to CPU regardless of what ran before them.
@@ -245,3 +272,48 @@ class TestForcedAlignmentLoss:
         ids = forced_model.tokenizer.text_to_ids("hello world")
         # "world" is preceded by a space, so its first piece must be a word start.
         assert any(i in ws for i in ids)
+
+
+class TestConstructionWithATrainingDataloader:
+    """Building the train loader happens INSIDE ModelPT.__init__.
+
+    The unit tests above build a model with no ``train_ds`` at all, so they
+    cannot see ordering bugs in ``__init__`` -- and one of those (attributes
+    assigned after ``super().__init__()``, which calls ``setup_training_data()``
+    from inside it) reached the grid and killed job 13179581 at construction.
+    These tests pay the cost of a real dataloader to close that gap.
+    """
+
+    @pytest.mark.unit
+    def test_forced_arm_constructs_and_requests_cuts(self, test_data_dir, tmp_path):
+        cfg = _cfg(test_data_dir, 'forced_alignment')
+        cfg.train_ds = _train_ds_cfg(tmp_path)
+        model = EncDecCHATBPEModel(cfg=cfg)
+        assert model.loss_type == 'forced_alignment'
+        # The forced loss reads cut.custom["alignments"], so the batch must carry
+        # the cuts; without them the path could not be built at all.
+        batch = next(iter(model._train_dl))
+        assert len(batch) == 5, "forced-alignment training batches must include cuts"
+        assert all(c.custom.get("alignments") for c in batch[4])
+
+    @pytest.mark.unit
+    def test_rnnt_arm_constructs_without_cuts(self, test_data_dir, tmp_path):
+        cfg = _cfg(test_data_dir, 'rnnt')
+        cfg.train_ds = _train_ds_cfg(tmp_path)
+        model = EncDecCHATBPEModel(cfg=cfg)
+        batch = next(iter(model._train_dl))
+        assert len(batch) == 4, "the marginalised arm must keep the parent's 4-tuple batch"
+
+    @pytest.mark.unit
+    def test_a_real_batch_produces_a_finite_forced_loss(self, test_data_dir, tmp_path):
+        """End to end on real audio: dataloader -> encoder -> forced path -> loss."""
+        cfg = _cfg(test_data_dir, 'forced_alignment', recover=2)
+        cfg.train_ds = _train_ds_cfg(tmp_path)
+        model = EncDecCHATBPEModel(cfg=cfg)
+        model.train()
+        signal, signal_len, _, _, cuts = next(iter(model._train_dl))
+        enc, enc_len = model.forward(input_signal=signal, input_signal_length=signal_len)
+        loss = model._forced_alignment_loss(enc, enc_len, cuts)
+        assert torch.isfinite(loss)
+        loss.backward()
+        assert any(p.grad is not None for p in model.parameters())

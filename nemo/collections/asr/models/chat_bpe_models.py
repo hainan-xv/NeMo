@@ -63,8 +63,10 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
     """CHAT transducer trainable with either the marginalised or a forced loss."""
 
     def __init__(self, cfg: DictConfig, trainer=None):
-        super().__init__(cfg=cfg, trainer=trainer)
-
+        # EVERY attribute the data-setup path reads must be assigned BEFORE
+        # super().__init__(): ModelPT.__init__ calls setup_training_data() from
+        # inside it, so anything set afterwards does not exist yet and the model
+        # dies with AttributeError at construction.
         self.loss_type = str(cfg.get("loss_type", "rnnt"))
         if self.loss_type not in LOSS_TYPES:
             raise ValueError(f"model.loss_type must be one of {LOSS_TYPES}, got {self.loss_type!r}")
@@ -85,6 +87,8 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
         # needs the cuts (for their alignments), validation does not and is
         # scored by the ordinary WER path.
         self._want_cuts = False
+
+        super().__init__(cfg=cfg, trainer=trainer)
 
         if self.loss_type == "forced_alignment":
             logging.info(
