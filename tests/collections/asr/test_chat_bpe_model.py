@@ -118,6 +118,18 @@ def _train_ds_cfg(tmp_path):
     }
 
 
+def _with_stub_trainer(model):
+    """Attach the minimum trainer surface training_step reads.
+
+    ``self.trainer.global_step`` and ``log_every_n_steps`` are all it needs; a
+    real pl.Trainer would drag in a full fit loop for no extra coverage.
+    """
+    from types import SimpleNamespace
+
+    model._trainer = SimpleNamespace(global_step=0, log_every_n_steps=1)
+    return model
+
+
 @pytest.fixture(autouse=True)
 def _cpu_default_device():
     """Pin these CPU tests to CPU regardless of what ran before them.
@@ -317,3 +329,50 @@ class TestConstructionWithATrainingDataloader:
         assert torch.isfinite(loss)
         loss.backward()
         assert any(p.grad is not None for p in model.parameters())
+
+
+class TestBothArmsLogTheSameMetrics:
+    """training_batch_wer went missing from the forced arm for a whole run.
+
+    The forced ``training_step`` is a separate implementation from the parent's,
+    so "they share the training code except the loss" is only true if something
+    checks it. These tests are that check.
+    """
+
+    @staticmethod
+    def _run_step(model, monkeypatch):
+        """Drive one training_step, capturing what it logs."""
+        logged = {}
+        monkeypatch.setattr(type(model), 'log', lambda self, k, v, **kw: logged.__setitem__(k, v), raising=False)
+        monkeypatch.setattr(type(model), 'log_dict', lambda self, d, **kw: logged.update(d), raising=False)
+        # log_every_n_steps=1 and global_step=0 make the WER branch fire on the
+        # very first step, which is what we want to observe.
+        model._optimizer = torch.optim.SGD(model.parameters(), lr=1e-3)
+        model.trainer.log_every_n_steps = 1
+        batch = next(iter(model._train_dl))
+        out = model.training_step(batch, 0)
+        return logged, out
+
+    @pytest.mark.unit
+    def test_forced_arm_logs_training_batch_wer(self, test_data_dir, tmp_path, monkeypatch):
+        cfg = _cfg(test_data_dir, 'forced_alignment')
+        cfg.train_ds = _train_ds_cfg(tmp_path)
+        model = _with_stub_trainer(EncDecCHATBPEModel(cfg=cfg))
+        logged, out = self._run_step(model, monkeypatch)
+        assert 'training_batch_wer' in logged, f"forced arm logged only {sorted(logged)}"
+        assert 'train_loss' in logged and 'learning_rate' in logged
+        assert torch.isfinite(torch.as_tensor(logged['training_batch_wer']))
+        assert torch.isfinite(out['loss'])
+
+    @pytest.mark.unit
+    def test_both_arms_log_the_same_metric_names(self, test_data_dir, tmp_path, monkeypatch):
+        names = {}
+        for arm in ('rnnt', 'forced_alignment'):
+            cfg = _cfg(test_data_dir, arm)
+            cfg.train_ds = _train_ds_cfg(tmp_path)
+            model = _with_stub_trainer(EncDecCHATBPEModel(cfg=cfg))
+            names[arm] = set(self._run_step(model, monkeypatch)[0])
+        assert names['rnnt'] == names['forced_alignment'], (
+            f"only in rnnt: {names['rnnt'] - names['forced_alignment']}; "
+            f"only in forced: {names['forced_alignment'] - names['rnnt']}"
+        )

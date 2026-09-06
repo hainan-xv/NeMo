@@ -52,6 +52,7 @@ from nemo.collections.asr.models.rnnt_bpe_models import EncDecRNNTBPEModel
 from nemo.collections.asr.parts.utils.chat_alignment import assign_words_to_chunks, build_forced_path
 from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
 from nemo.core.classes.common import PretrainedModelInfo
+from nemo.core.classes.mixins import AccessMixin
 from nemo.utils import logging
 
 __all__ = ["EncDecCHATBPEModel"]
@@ -217,25 +218,62 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
     # ------------------------------------------------------------- training
 
     def training_step(self, batch, batch_nb):
+        """Only the LOSS differs between the arms; everything logged is shared.
+
+        The rnnt arm defers to the parent untouched. The forced arm mirrors the
+        parent step for step -- same access-registry handling, same metric names,
+        same logging cadence, and in particular the SAME ``training_batch_wer``,
+        computed by the same greedy decode against the same reference tokens.
+        The two curves therefore mean the same thing and can be read on one plot;
+        a WER that appeared for one arm and not the other would make exactly the
+        comparison this model exists to support impossible.
+        """
         if self.loss_type != "forced_alignment":
             return super().training_step(batch, batch_nb)
 
+        if AccessMixin.is_access_enabled(self.model_guid):
+            AccessMixin.reset_registry(self)
+
         signal, signal_len, transcript, transcript_len, cuts = batch
         encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
+        del signal
+
         loss_value = self.add_auxiliary_losses(self._forced_alignment_loss(encoded, encoded_len, cuts))
 
-        # train_loss on the progress bar, not just in wandb: a forced-alignment
-        # loss that collapses to ~0 in the first few steps means the targets are
-        # empty, and that has happened here before. It should be visible in the
-        # job's own log without opening a browser.
+        if AccessMixin.is_access_enabled(self.model_guid):
+            AccessMixin.reset_registry(self)
+
+        if hasattr(self, '_trainer') and self._trainer is not None:
+            log_every_n_steps = self._trainer.log_every_n_steps
+            sample_id = self._trainer.global_step
+        else:
+            log_every_n_steps = 1
+            sample_id = batch_nb
+
+        # Logged every step and on the progress bar, unlike the rest: a forced
+        # loss that collapses to ~0 within a few steps means the targets came
+        # through empty, and that should be visible in the job's own log rather
+        # than only in wandb.
         self.log('train_loss', loss_value, prog_bar=True)
-        self.log_dict(
-            {
-                'learning_rate': self._optimizer.param_groups[0]['lr'],
-                'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
-            }
-        )
-        return loss_value
+
+        if (sample_id + 1) % log_every_n_steps == 0:
+            self.wer.update(
+                predictions=encoded,
+                predictions_lengths=encoded_len,
+                targets=transcript,
+                targets_lengths=transcript_len,
+            )
+            _, scores, words = self.wer.compute()
+            self.wer.reset()
+            self.log_dict(
+                {
+                    'learning_rate': self._optimizer.param_groups[0]['lr'],
+                    'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
+                    'training_batch_wer': scores.float() / words,
+                }
+            )
+
+        return {'loss': loss_value}
 
     @classmethod
     def list_available_models(cls) -> List[PretrainedModelInfo]:
