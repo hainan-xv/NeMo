@@ -51,7 +51,14 @@ model:
     bucket_batch_size: [38, 29, 25, 22, 20, 18, 17, 15, 14, 13, 12, 11, 10, 8, 7, 6, 5, 4]
     max_duration: 54
     min_duration: 0.1
-    text_field: answer
+    # text_field deliberately UNSET, matching the speechlm2 recipes that read
+    # this same input_cfg. Setting it to "answer" made every TRAINING target
+    # empty: the granary cuts carry their transcript in the default field, so
+    # the lookup found nothing, the RNN-T loss was trivially satisfied by
+    # emitting blanks (loss -> 0 within a few steps) and training WER was NaN
+    # from dividing by zero reference words. Validation was unaffected because
+    # its JSON manifest happens to have BOTH "text" and "answer" keys, which is
+    # exactly what made the bug asymmetric and easy to miss.
 
   validation_ds:
     use_lhotse: true
@@ -63,7 +70,6 @@ model:
     shuffle: false
     num_workers: 4
     pin_memory: true
-    text_field: answer
 
   test_ds:
     manifest_filepath: null
