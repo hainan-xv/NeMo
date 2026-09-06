@@ -224,9 +224,13 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
         encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
         loss_value = self.add_auxiliary_losses(self._forced_alignment_loss(encoded, encoded_len, cuts))
 
+        # train_loss on the progress bar, not just in wandb: a forced-alignment
+        # loss that collapses to ~0 in the first few steps means the targets are
+        # empty, and that has happened here before. It should be visible in the
+        # job's own log without opening a browser.
+        self.log('train_loss', loss_value, prog_bar=True)
         self.log_dict(
             {
-                'train_loss': loss_value,
                 'learning_rate': self._optimizer.param_groups[0]['lr'],
                 'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
             }
