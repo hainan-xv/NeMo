@@ -1,0 +1,232 @@
+# Standard CHAT transducer on Granary 2.0 -- the MARGINALISED-loss control.
+#
+# This is the PR's model trained the ordinary way: EncDecRNNTBPEModel with
+# RNNTAttJoint and the full RNN-T loss summing over every alignment. Our
+# ChatSTTModel uses the same joint and decoder but conditions on ONE forced
+# alignment, so the difference between this run and that one is exactly the cost
+# (or benefit) of fixing the alignment. Nothing else is meant to differ: same
+# Granary 2.0 data, same nemotron encoder init, same 1,024-piece tokenizer, same
+# 14-frame chunk grid.
+#
+# The encoder block is copied verbatim from the donor's own model_config so
+# init_from_nemo_model can load its weights -- any mismatch in d_model, n_layers,
+# subsampling or conv settings silently drops those tensors and leaves a
+# randomly initialised encoder.
+#
+# Chunk size is auto-inferred by rnnt_models.py from att_context_size as
+# right_context + 1 = 14, matching the forced-alignment runs.
+
+name: "Nemotron-CHAT-Transducer-Granary2"
+
+model:
+  sample_rate: 16000
+  compute_eval_loss: false
+  log_prediction: true
+  skip_nan_grad: false
+
+  model_defaults:
+    enc_hidden: 1024
+    pred_hidden: 640
+    joint_hidden: 640
+
+  train_ds:
+    use_lhotse: true
+    # The same filtered Granary 2.0 the forced-alignment arms train on. Those
+    # need the word alignments this manifest carries; the standard RNN-T loss
+    # does not, but pointing at the same data is what makes the comparison a
+    # comparison.
+    input_cfg: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/users/dongjig/aligned_amos/granary_v2_en_pnc_qwen_aligned_filtered/granary_v2_en_pnc_qwen_aligned_filtered_safe_iad_s3_audio.yaml
+    manifest_filepath: null
+    skip_missing_manifest_entries: true
+    sample_rate: ${model.sample_rate}
+    shuffle: true
+    shard_seed: "randomized"
+    num_workers: 8
+    pin_memory: true
+    force_iterable_dataset: true
+    # Same bucketing as the forced-alignment arms, so a step covers a comparable
+    # amount of audio and the two runs are step-for-step meaningful.
+    use_bucketing: true
+    bucket_duration_bins: [4.32, 6.0, 7.04, 7.92, 8.8, 9.6, 10.4, 11.12, 11.89, 12.66, 13.47, 14.8, 16.92, 20.0, 22.4, 29.44, 35.0, 39.6]
+    bucket_batch_size: [38, 29, 25, 22, 20, 18, 17, 15, 14, 13, 12, 11, 10, 8, 7, 6, 5, 4]
+    max_duration: 54
+    min_duration: 0.1
+    text_field: answer
+
+  validation_ds:
+    use_lhotse: true
+    # The identical validation set the SCRIPT and forced-alignment CHAT runs use,
+    # so val_wer is comparable across all three.
+    manifest_filepath: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/users/dongjig/aligned_amos/steve_val_mmlpc_mcv11_2k/mcv11_dev_clean_pcstrip_en_2k_qwen_aligned.json
+    sample_rate: ${model.sample_rate}
+    batch_size: 8
+    shuffle: false
+    num_workers: 4
+    pin_memory: true
+    text_field: answer
+
+  test_ds:
+    manifest_filepath: null
+    sample_rate: ${model.sample_rate}
+    batch_size: 8
+    shuffle: false
+    num_workers: 4
+
+  tokenizer:
+    # The donor's own 1,024-piece SentencePiece model, extracted from the .nemo.
+    # Must be the SAME vocabulary the 1k forced-alignment arm uses or the two are
+    # not comparable.
+    dir: ???
+    type: bpe
+
+  preprocessor:
+    _target_: nemo.collections.asr.modules.AudioToMelSpectrogramPreprocessor
+    sample_rate: ${model.sample_rate}
+    normalize: "per_feature"
+    window_size: 0.025
+    window_stride: 0.01
+    window: "hann"
+    features: 128
+    n_fft: 512
+    log: true
+    frame_splicing: 1
+    dither: 0.00001
+    pad_to: 0
+    pad_value: 0.0
+
+  spec_augment:
+    _target_: nemo.collections.asr.modules.SpectrogramAugmentation
+    freq_masks: 2
+    time_masks: 10
+    freq_width: 27
+    time_width: 0.05
+
+  # --- copied verbatim from the donor's model_config so its weights load ---
+  encoder:
+    _target_: nemo.collections.asr.modules.ConformerEncoder
+    feat_in: ${model.preprocessor.features}
+    feat_out: -1
+    n_layers: 24
+    d_model: 1024
+    subsampling: dw_striding
+    subsampling_factor: 8
+    subsampling_conv_channels: 256
+    causal_downsampling: true
+    ff_expansion_factor: 4
+    self_attention_model: rel_pos
+    n_heads: 8
+    # Single context, not the donor's four: the forced-alignment arms are pinned
+    # to [70, 13] and the joint infers chunk_size = right + 1 = 14 from it. A
+    # list would make chunk_size ambiguous and rnnt_models.py rejects it.
+    att_context_size: [70, 13]
+    att_context_style: chunked_limited
+    xscaling: true
+    untie_biases: true
+    pos_emb_max_len: 5000
+    conv_kernel_size: 9
+    conv_norm_type: layer_norm
+    conv_context_size: causal
+    use_bias: false
+    dropout: 0.1
+    dropout_pre_encoder: 0.1
+    dropout_emb: 0.0
+    dropout_att: 0.1
+
+  decoder:
+    _target_: nemo.collections.asr.modules.RNNTDecoder
+    normalization_mode: null
+    random_state_sampling: false
+    blank_as_pad: true
+    prednet:
+      pred_hidden: ${model.model_defaults.pred_hidden}
+      pred_rnn_layers: 2
+      t_max: null
+      dropout: 0.2
+
+  joint:
+    _target_: nemo.collections.asr.modules.RNNTAttJoint
+    log_softmax: null
+    preserve_memory: false
+    fuse_loss_wer: false
+    fused_batch_size: null
+    jointnet:
+      # 1024 straight from the encoder -- no projection bottleneck. Our
+      # ChatSTTModel inserts a Linear(1024, 640) because its perception module
+      # targets joint_hidden; here the joint projects the encoder itself, as the
+      # donor did.
+      encoder_hidden: ${model.model_defaults.enc_hidden}
+      pred_hidden: ${model.model_defaults.pred_hidden}
+      joint_hidden: ${model.model_defaults.joint_hidden}
+      activation: "relu"
+      dropout: 0.2
+
+  decoding:
+    strategy: "greedy_batch"
+    greedy:
+      max_symbols: 10
+    beam:
+      beam_size: 2
+      return_best_hypothesis: false
+      score_norm: true
+      tsd_max_sym_exp: 50
+      alsd_max_target_len: 2.0
+
+  loss:
+    loss_name: "default"
+    warprnnt_numba_kwargs:
+      fastemit_lambda: 0.005
+      clamp: -1.0
+
+  optim:
+    name: adamw
+    lr: 1e-3
+    betas: [0.9, 0.98]
+    weight_decay: 1e-3
+    sched:
+      name: CosineAnnealing
+      warmup_steps: 2500
+      warmup_ratio: null
+      min_lr: 1e-6
+
+trainer:
+  devices: -1
+  num_nodes: 1
+  max_epochs: -1
+  max_steps: 300000
+  val_check_interval: 4000
+  limit_train_batches: 4000
+  accelerator: gpu
+  strategy:
+    _target_: lightning.pytorch.strategies.DDPStrategy
+    gradient_as_bucket_view: true
+    find_unused_parameters: false
+  accumulate_grad_batches: 1
+  gradient_clip_val: 1.0
+  # fp32 master weights with bf16 compute. bf16-true kept optimizer state in
+  # bf16 and produced nan in the large-vocabulary forced-alignment arm.
+  precision: bf16-mixed
+  log_every_n_steps: 10
+  enable_progress_bar: true
+  num_sanity_val_steps: 1
+  check_val_every_n_epoch: 1
+  sync_batchnorm: true
+  enable_checkpointing: false
+  logger: false
+  benchmark: false
+
+exp_manager:
+  exp_dir: null
+  name: ${name}
+  create_tensorboard_logger: false
+  create_checkpoint_callback: true
+  checkpoint_callback_params:
+    monitor: "val_wer"
+    mode: "min"
+    save_top_k: 5
+    always_save_nemo: false
+  resume_if_exists: true
+  resume_ignore_no_checkpoint: true
+  create_wandb_logger: true
+  wandb_logger_kwargs:
+    name: null
+    project: null
