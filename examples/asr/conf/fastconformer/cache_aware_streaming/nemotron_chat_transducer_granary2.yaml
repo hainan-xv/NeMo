@@ -24,6 +24,16 @@ model:
   log_prediction: true
   skip_nan_grad: false
 
+  # Sum the losses and divide by the total number of TARGET TOKENS, rather than
+  # by batch size (NeMo's default mean_batch).
+  #
+  # This is what makes the loss comparable to the forced-alignment arm, which
+  # uses F.cross_entropy over path steps -- i.e. already per-token. Under
+  # mean_batch a long utterance contributes the same as a short one, so the two
+  # runs' loss curves would be on different scales and the per-token difficulty
+  # would be hidden behind the batch's length mix.
+  rnnt_reduction: mean_volume
+
   model_defaults:
     enc_hidden: 1024
     pred_hidden: 640
