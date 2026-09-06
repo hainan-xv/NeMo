@@ -34,4 +34,20 @@ export HISTORY_CHUNKS="${HISTORY_CHUNKS:-1}"
 export RECOVER_WORDS="${RECOVER_WORDS:-2}"
 export EXP_NAME="${EXP_NAME:-granary2_chat_forced_asrvocab_win28_recover}"
 
-exec "$(dirname "$0")/chat_train.sh"
+# Under sbatch, $0 is a COPY of this script in Slurm's spool directory, so
+# dirname "$0" has no sibling chat_train.sh and the job dies with exit 127 five
+# seconds in, before it creates a results directory to leave a log in.
+# SLURM_SUBMIT_DIR is where the sbatch was issued, which is the repo root.
+find_launch_dir() {
+    if [[ -n "${SLURM_SUBMIT_DIR:-}" ]]; then
+        [[ -f "${SLURM_SUBMIT_DIR}/chat_train.sh" ]] && { echo "${SLURM_SUBMIT_DIR}"; return; }
+        [[ -f "${SLURM_SUBMIT_DIR}/launch/chat_train.sh" ]] && { echo "${SLURM_SUBMIT_DIR}/launch"; return; }
+    fi
+    local here
+    here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    [[ -f "${here}/chat_train.sh" ]] && { echo "${here}"; return; }
+    echo "ERROR: cannot locate chat_train.sh (SLURM_SUBMIT_DIR=${SLURM_SUBMIT_DIR:-<unset>})" >&2
+    exit 1
+}
+
+exec bash "$(find_launch_dir)/chat_train.sh" "$@"
