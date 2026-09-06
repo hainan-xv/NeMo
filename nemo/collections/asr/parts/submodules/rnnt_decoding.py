@@ -753,13 +753,17 @@ class AbstractRNNTDecoding(ConfidenceMixin):
         if chunk_encoder_fn is not None:
             encoder_output, encoded_lengths, chunk_frame_lengths = chunk_encoder_fn(encoder_output, encoded_lengths)
 
-        # Compute hypotheses
+        # Compute hypotheses. Only the CHAT-aware strategies accept
+        # chunk_frame_lengths, so pass it only when there is something to pass:
+        # sending it unconditionally raises TypeError in every other decoder
+        # (TDT, multi-blank, beam), which have no chunk axis to begin with.
+        extra = {} if chunk_frame_lengths is None else {"chunk_frame_lengths": chunk_frame_lengths}
         with torch.inference_mode():
             hypotheses_list = self.decoding(
                 encoder_output=encoder_output,
                 encoded_lengths=encoded_lengths,
                 partial_hypotheses=partial_hypotheses,
-                chunk_frame_lengths=chunk_frame_lengths,
+                **extra,
             )  # type: [List[Hypothesis]]
 
             # extract the hypotheses

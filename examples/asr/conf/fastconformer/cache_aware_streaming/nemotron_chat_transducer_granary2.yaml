@@ -1,12 +1,10 @@
-# Standard CHAT transducer on Granary 2.0 -- the MARGINALISED-loss control.
+# CHAT transducer on Granary 2.0 -- BOTH training objectives.
 #
-# This is the PR's model trained the ordinary way: EncDecRNNTBPEModel with
-# RNNTAttJoint and the full RNN-T loss summing over every alignment. Our
-# ChatSTTModel uses the same joint and decoder but conditions on ONE forced
-# alignment, so the difference between this run and that one is exactly the cost
-# (or benefit) of fixing the alignment. Nothing else is meant to differ: same
-# Granary 2.0 data, same nemotron encoder init, same 1,024-piece tokenizer, same
-# 14-frame chunk grid.
+# One config, one architecture, one vocabulary; `model.loss_type` selects whether
+# the run marginalises over every alignment (the ordinary RNN-T loss) or
+# conditions on a single forced alignment. Because the two arms differ in that
+# field alone, the gap between them is exactly the cost (or benefit) of fixing
+# the alignment, and a checkpoint from either can initialise the other.
 #
 # The encoder block is copied verbatim from the donor's own model_config so
 # init_from_nemo_model can load its weights -- any mismatch in d_model, n_layers,
@@ -33,6 +31,32 @@ model:
   # runs' loss curves would be on different scales and the per-token difficulty
   # would be hidden behind the batch's length mix.
   rnnt_reduction: mean_volume
+
+  # THE ONE KNOB THAT SEPARATES THE TWO ARMS.
+  #
+  #   rnnt             -- the ordinary transducer loss, marginalising over every
+  #                       alignment. Needs a [B, T, U, V+1] tensor.
+  #   forced_alignment -- cross-entropy along ONE path, taken from the word
+  #                       timings the Granary cuts carry. Scores U+T positions
+  #                       instead of T*U, which is what makes a large vocabulary
+  #                       affordable.
+  #
+  # Everything else -- architecture, vocabulary, data, decoding -- is shared, so
+  # a difference between the two runs is a difference in the objective alone.
+  loss_type: rnnt
+
+  forced_alignment:
+    # Emit a word at the chunk containing its last frame PLUS this delay. A
+    # word's final frames are often what disambiguate it, so emitting at the
+    # chunk where it ends leaves the encoder no right context.
+    num_delay_frames: 0
+    # Additionally score each chunk on the previous chunk's last k words,
+    # starting from the prefix before them. Nothing is removed from the output;
+    # it teaches the model to recover when its history is short, which is what
+    # makes retract-style decoding legal at inference.
+    recover_history_words: 0
+    # Seconds per ENCODER frame; defaults to window_stride * subsampling_factor.
+    frame_length_in_secs: null
 
   model_defaults:
     enc_hidden: 1024
@@ -162,14 +186,17 @@ model:
   joint:
     _target_: nemo.collections.asr.modules.RNNTAttJoint
     log_softmax: null
+    # Widen the joint's cross-attention keys/values to also cover the previous M
+    # chunks ("win28" at M=1). Applied at the CHUNKING step and strictly
+    # backward-looking, so it adds context without adding latency. Independent of
+    # loss_type -- both arms may use it.
+    history_chunks: 0
     preserve_memory: false
     fuse_loss_wer: false
     fused_batch_size: null
     jointnet:
-      # 1024 straight from the encoder -- no projection bottleneck. Our
-      # ChatSTTModel inserts a Linear(1024, 640) because its perception module
-      # targets joint_hidden; here the joint projects the encoder itself, as the
-      # donor did.
+      # 1024 straight from the encoder -- the joint does the projection itself,
+      # as the donor did, with no intermediate bottleneck.
       encoder_hidden: ${model.model_defaults.enc_hidden}
       pred_hidden: ${model.model_defaults.pred_hidden}
       joint_hidden: ${model.model_defaults.joint_hidden}

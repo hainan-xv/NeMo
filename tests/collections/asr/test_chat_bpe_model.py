@@ -1,0 +1,247 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""``EncDecCHATBPEModel``: one architecture, two selectable training losses.
+
+The point of folding the forced-alignment objective into ``EncDecRNNTBPEModel``
+was that the two arms should differ ONLY in the loss. These tests pin that down:
+same vocabulary, same parameters, interchangeable checkpoints, same decoder.
+"""
+
+import os
+
+import pytest
+import torch
+from lhotse import CutSet, MonoCut, SupervisionSegment
+from omegaconf import DictConfig
+
+from nemo.collections.asr.models import EncDecCHATBPEModel
+
+
+def _cfg(test_data_dir, loss_type, recover=0):
+    return DictConfig(
+        {
+            'loss_type': loss_type,
+            'forced_alignment': {'num_delay_frames': 0, 'recover_history_words': recover},
+            'sample_rate': 16000,
+            'compute_eval_loss': False,
+            'skip_nan_grad': False,
+            'model_defaults': {'enc_hidden': 32, 'pred_hidden': 32, 'joint_hidden': 32},
+            'tokenizer': {'dir': os.path.join(test_data_dir, "asr", "tokenizers", "an4_spe_128"), 'type': 'bpe'},
+            'preprocessor': {
+                '_target_': 'nemo.collections.asr.modules.AudioToMelSpectrogramPreprocessor',
+                'features': 64,
+                'window_stride': 0.01,
+            },
+            'encoder': {
+                '_target_': 'nemo.collections.asr.modules.ConformerEncoder',
+                'feat_in': 64,
+                'feat_out': -1,
+                'n_layers': 2,
+                'd_model': 32,
+                'subsampling': 'dw_striding',
+                'subsampling_factor': 8,
+                'subsampling_conv_channels': 16,
+                'causal_downsampling': True,
+                'self_attention_model': 'rel_pos',
+                'n_heads': 2,
+                'att_context_size': [70, 13],  # chunk_size = right + 1 = 14
+                'att_context_style': 'chunked_limited',
+                'conv_kernel_size': 9,
+                'conv_context_size': 'causal',
+            },
+            'decoder': {
+                '_target_': 'nemo.collections.asr.modules.RNNTDecoder',
+                'prednet': {'pred_hidden': 32, 'pred_rnn_layers': 1},
+            },
+            'joint': {
+                '_target_': 'nemo.collections.asr.modules.RNNTAttJoint',
+                'jointnet': {'encoder_hidden': 32, 'pred_hidden': 32, 'joint_hidden': 32, 'activation': 'relu'},
+            },
+            'decoding': {'strategy': 'greedy_batch', 'greedy': {'max_symbols': 10}},
+            'loss': {'loss_name': 'default'},
+            'optim': {'name': 'adamw', 'lr': 1e-3},
+        }
+    )
+
+
+def _cuts(texts_and_times, duration=3.0):
+    """CutSet carrying word alignments the way the Granary manifests do."""
+    cuts = []
+    for i, words in enumerate(texts_and_times):
+        text = " ".join(w[0] for w in words)
+        cut = MonoCut(id=f"c{i}", start=0.0, duration=duration, channel=0, recording=None)
+        cut.supervisions = [
+            SupervisionSegment(id=f"s{i}", recording_id=f"r{i}", start=0.0, duration=duration, text=text)
+        ]
+        cut.custom = {
+            "alignments": [{"text": w, "start_time": s, "end_time": e} for (w, s, e) in words],
+        }
+        cuts.append(cut)
+    return CutSet.from_cuts(cuts)
+
+
+@pytest.fixture(autouse=True)
+def _cpu_default_device():
+    """Pin these CPU tests to CPU regardless of what ran before them.
+
+    Several speechlm2 modules call ``torch.set_default_device('cuda')``, a
+    process-wide mutation that leaks into whatever pytest collects next. Without
+    this the tests here pass alone and fail in a full session, which is the worst
+    possible failure mode to debug.
+    """
+    prev = torch.get_default_device()
+    torch.set_default_device('cpu')
+    try:
+        yield
+    finally:
+        torch.set_default_device(prev)
+
+
+@pytest.fixture()
+def rnnt_model(test_data_dir):
+    return EncDecCHATBPEModel(cfg=_cfg(test_data_dir, 'rnnt'))
+
+
+@pytest.fixture()
+def forced_model(test_data_dir):
+    return EncDecCHATBPEModel(cfg=_cfg(test_data_dir, 'forced_alignment'))
+
+
+class TestOneArchitectureTwoLosses:
+    @pytest.mark.unit
+    def test_the_marginalised_arm_still_trains(self, rnnt_model):
+        """Adding the forced option must not disturb the ordinary RNN-T path.
+
+        ``training_step`` delegates to the parent for ``loss_type: rnnt``, so
+        this walks the same forward/joint/loss the parent would.
+        """
+        rnnt_model.train()
+        audio = torch.randn(2, 16000 * 3) * 0.1
+        enc, enc_len = rnnt_model.forward(input_signal=audio, input_signal_length=torch.tensor([16000 * 3, 16000 * 2]))
+        tr, trl = torch.randint(0, 100, (2, 5)), torch.tensor([5, 3])
+        dec, tl, _ = rnnt_model.decoder(targets=tr, target_length=trl)
+        joint = rnnt_model.joint(encoder_outputs=enc, decoder_outputs=dec, encoder_lengths=enc_len)
+        # The CHAT joint scores CHUNKS, so the loss's input length is the chunk
+        # count, not the frame count -- the parent's training_step does the same.
+        loss = rnnt_model.loss(
+            log_probs=joint,
+            targets=tr,
+            input_lengths=rnnt_model.joint.num_chunks_per_utterance,
+            target_lengths=tl,
+        )
+        assert torch.isfinite(loss)
+        loss.backward()
+        assert any(p.grad is not None for p in rnnt_model.parameters())
+
+    @pytest.mark.unit
+    def test_both_losses_give_the_identical_vocabulary(self, rnnt_model, forced_model):
+        """The old split had 1,027 text classes on one side and 1,024 on the other."""
+        assert rnnt_model.joint.num_classes_with_blank == forced_model.joint.num_classes_with_blank
+        assert rnnt_model.tokenizer.vocab_size == forced_model.tokenizer.vocab_size
+        assert rnnt_model.joint.num_classes_with_blank == rnnt_model.tokenizer.vocab_size + 1
+
+    @pytest.mark.unit
+    def test_checkpoints_are_interchangeable(self, rnnt_model, forced_model):
+        """Either arm must be able to initialise from the other, exactly.
+
+        This is what a separate class made impossible and is the main reason for
+        the merge: a forced-alignment run should be usable as a starting point
+        for a marginalised run and vice versa.
+        """
+        missing, unexpected = forced_model.load_state_dict(rnnt_model.state_dict(), strict=True)
+        assert not missing and not unexpected
+
+    @pytest.mark.unit
+    def test_both_share_one_decoding_path(self, rnnt_model, forced_model):
+        assert type(rnnt_model.decoding.decoding) is type(forced_model.decoding.decoding)
+        assert hasattr(forced_model.joint, "chunk_encoder_for_decoding")
+
+    @pytest.mark.unit
+    def test_rejects_an_unknown_loss_type(self, test_data_dir):
+        with pytest.raises(ValueError, match="loss_type"):
+            EncDecCHATBPEModel(cfg=_cfg(test_data_dir, 'marginal'))
+
+    @pytest.mark.unit
+    def test_frame_length_derives_from_the_preprocessor(self, forced_model):
+        # 10 ms hop x 8x subsampling. A wrong value shifts every word to the
+        # wrong chunk without raising anything.
+        assert forced_model.frame_length_in_secs == pytest.approx(0.08)
+
+
+class TestForcedAlignmentLoss:
+    WORDS = [
+        [("hello", 0.0, 0.5), ("world", 0.6, 1.4), ("again", 1.5, 2.4)],
+        [("one", 0.1, 0.9), ("two", 1.0, 2.0)],
+    ]
+
+    @pytest.mark.unit
+    def test_loss_is_finite_and_backpropagates(self, forced_model):
+        forced_model.train()
+        audio = torch.randn(2, 16000 * 3) * 0.1
+        alen = torch.tensor([16000 * 3, 16000 * 2])
+        enc, enc_len = forced_model.forward(input_signal=audio, input_signal_length=alen)
+        loss = forced_model._forced_alignment_loss(enc, enc_len, _cuts(self.WORDS))
+        assert torch.isfinite(loss)
+        loss.backward()
+        grads = [p.grad for p in forced_model.parameters() if p.grad is not None]
+        assert grads, "no parameter received a gradient"
+        assert all(torch.isfinite(g).all() for g in grads)
+
+    @pytest.mark.unit
+    def test_path_covers_every_chunk_and_scores_u_plus_t_positions(self, forced_model):
+        n_chunks = torch.tensor([5, 3])
+        b, t, u, lab, pred, plens = forced_model._build_batch_path(_cuts(self.WORDS), n_chunks, torch.device('cpu'))
+        for i, n in enumerate(n_chunks.tolist()):
+            # Every chunk contributes at least its blank; none may exceed the
+            # encoder's chunk axis, which would index out of bounds in the joint.
+            assert set(t[b == i].tolist()) == set(range(n))
+        # Path length = emitted labels + one blank per chunk.
+        assert lab.numel() == int(plens.sum()) + int(n_chunks.sum())
+        assert (u <= plens[b]).all()
+
+    @pytest.mark.unit
+    def test_empty_alignments_do_not_produce_nan(self, forced_model):
+        """A batch with no alignable words must not poison the weights.
+
+        cross_entropy over an empty path is nan, and with many ranks drawing
+        batches this happens for real.
+        """
+        forced_model.train()
+        audio = torch.randn(1, 16000 * 2) * 0.1
+        enc, enc_len = forced_model.forward(input_signal=audio, input_signal_length=torch.tensor([16000 * 2]))
+        # No alignments at all -> every chunk still emits a blank, so the path is
+        # non-empty; the loss must simply be finite.
+        loss = forced_model._forced_alignment_loss(enc, enc_len, _cuts([[]]))
+        assert torch.isfinite(loss)
+
+    @pytest.mark.unit
+    def test_recovery_adds_scored_positions_without_changing_the_targets(self, test_data_dir):
+        plain = EncDecCHATBPEModel(cfg=_cfg(test_data_dir, 'forced_alignment', recover=0))
+        rec = EncDecCHATBPEModel(cfg=_cfg(test_data_dir, 'forced_alignment', recover=2))
+        n_chunks = torch.tensor([5, 3])
+        cuts = _cuts(self.WORDS)
+        _, _, _, lab_a, pred_a, _ = plain._build_batch_path(cuts, n_chunks, torch.device('cpu'))
+        _, _, _, lab_b, pred_b, _ = rec._build_batch_path(cuts, n_chunks, torch.device('cpu'))
+        assert lab_b.numel() > lab_a.numel()
+        # The prediction-network input -- the actual transcript -- is untouched;
+        # recovery only changes which positions are scored.
+        assert torch.equal(pred_a, pred_b)
+
+    @pytest.mark.unit
+    def test_word_start_ids_are_found_in_the_sentencepiece_vocab(self, forced_model):
+        ws = forced_model._word_start_ids()
+        assert len(ws) > 0
+        ids = forced_model.tokenizer.text_to_ids("hello world")
+        # "world" is preceded by a space, so its first piece must be a word start.
+        assert any(i in ws for i in ids)

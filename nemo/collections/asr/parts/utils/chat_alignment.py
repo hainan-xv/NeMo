@@ -1,0 +1,116 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Forced-alignment paths for CHAT training.
+
+The RNN-T loss marginalises over every alignment, which costs a [B, T, U, V]
+tensor. Conditioning on ONE alignment instead reduces the scored positions from
+T*U to U+T and makes a large vocabulary trainable. This module turns word
+timings into that single path.
+
+Lives in the ASR collection so ``EncDecCHATBPEModel`` needs nothing from
+speechlm2; the rules are identical to the ones validated there.
+"""
+
+import math
+from typing import List, Optional, Sequence, Tuple
+
+__all__ = ["assign_words_to_chunks", "build_forced_path"]
+
+
+def assign_words_to_chunks(
+    word_end_times: Sequence[float],
+    num_chunks: int,
+    chunk_size: int,
+    frame_length_in_secs: float,
+    num_delay_frames: int = 0,
+) -> List[List[int]]:
+    """Which word indices each chunk is responsible for emitting.
+
+    A word is emitted at the chunk containing its LAST frame, plus a delay. The
+    delay matters because a word's final frames are often what disambiguate it:
+    emitting at the chunk where it ends gives the encoder no right context at
+    all.
+
+    Words whose end time (plus delay) falls past the final chunk -- because the
+    delay pushed them out, or because the alignment runs past the clip -- are
+    folded into the last chunk rather than dropped, which would otherwise show
+    up as deletions at the end of every utterance.
+    """
+    chunks: List[List[int]] = [[] for _ in range(max(num_chunks, 0))]
+    if not chunks:
+        return chunks
+    for i, end in enumerate(word_end_times):
+        ready = math.ceil(end / frame_length_in_secs) + num_delay_frames
+        idx = min(ready // chunk_size, num_chunks - 1)
+        chunks[max(idx, 0)].append(i)
+    return chunks
+
+
+def build_forced_path(
+    chunk_tokens: List[List[int]],
+    blank_id: int,
+    recover_words: int = 0,
+    word_starts: Optional[List[List[int]]] = None,
+) -> Tuple[List[int], List[int], List[int]]:
+    """(t_idx, u_idx, labels) for one utterance.
+
+    Each chunk emits its tokens then exactly one blank -- silent chunks
+    included, since that is the only signal for "emit nothing here". ``u``
+    counts EMITTED LABELS and so does not advance on a blank: the prediction
+    network is conditioned on emitted labels alone.
+
+    HISTORY RECOVERY (``recover_words`` > 0) additionally scores each chunk on
+    the previous chunk's last k words, starting from the prefix that precedes
+    them::
+
+        chunk t-1 :  ... W1 W2 BLANK            <- unchanged, blank stays put
+        chunk t   :  W1 W2 [own words] BLANK    <- begins k words earlier in u
+
+    Nothing is removed, so no chunk is ever trained to stop before its last
+    word. It teaches the model to recover when its history is short, which is
+    what makes retract-style decoding legal. Never reaches further back than the
+    immediately-previous chunk, so the decoder's matching rule can be satisfied
+    exactly.
+    """
+    t_idx: List[int] = []
+    u_idx: List[int] = []
+    labels: List[int] = []
+    u = 0
+    chunk_u_start: List[int] = []
+
+    for t, toks in enumerate(chunk_tokens):
+        chunk_u_start.append(u)
+
+        if recover_words > 0 and t > 0:
+            prev = chunk_tokens[t - 1]
+            starts = word_starts[t - 1] if word_starts else []
+            if starts:
+                take_from = starts[-recover_words] if len(starts) >= recover_words else starts[0]
+                uu = chunk_u_start[t - 1] + take_from
+                for tok in prev[take_from:]:
+                    t_idx.append(t)
+                    u_idx.append(uu)
+                    labels.append(int(tok))
+                    uu += 1
+
+        for tok in toks:
+            t_idx.append(t)
+            u_idx.append(u)
+            labels.append(int(tok))
+            u += 1
+        t_idx.append(t)
+        u_idx.append(u)
+        labels.append(int(blank_id))
+
+    return t_idx, u_idx, labels

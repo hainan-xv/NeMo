@@ -326,6 +326,11 @@ class GreedyBatchedLabelLoopingComputerBase(WithOptionalCudaGraphs, ABC):
             chunk_frame_lengths: Optional tensor of shape [B, T] containing the number of valid
                 frames in each chunk. Required for CHAT models with cross-attention in the joint.
         """
+        # Only the CHAT-aware implementations (RNN-T label looping) declare
+        # chunk_frame_lengths; TDT and multi-blank do not, and passing it to them
+        # is a TypeError. Forward it only when there is a chunk axis to describe.
+        extra = {} if chunk_frame_lengths is None else {"chunk_frame_lengths": chunk_frame_lengths}
+
         if self.cuda_graphs_mode is not None and x.device.type == "cuda":
             if chunk_frame_lengths is not None:
                 if not getattr(self, '_chat_cuda_graphs_warned', False):
@@ -343,7 +348,7 @@ class GreedyBatchedLabelLoopingComputerBase(WithOptionalCudaGraphs, ABC):
                         encoder_output_length=out_len,
                         prev_batched_state=prev_batched_state,
                         multi_biasing_ids=multi_biasing_ids,
-                        chunk_frame_lengths=chunk_frame_lengths,
+                        **extra,
                     )
 
         return self.torch_impl(
@@ -351,5 +356,5 @@ class GreedyBatchedLabelLoopingComputerBase(WithOptionalCudaGraphs, ABC):
             encoder_output_length=out_len,
             prev_batched_state=prev_batched_state,
             multi_biasing_ids=multi_biasing_ids,
-            chunk_frame_lengths=chunk_frame_lengths,
+            **extra,
         )
