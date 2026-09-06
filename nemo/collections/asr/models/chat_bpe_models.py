@@ -49,6 +49,7 @@ from lhotse.dataset.collation import collate_vectors
 from omegaconf import DictConfig
 
 from nemo.collections.asr.data.audio_to_text_lhotse import LhotseSpeechToTextBpeDataset
+from nemo.collections.asr.metrics.chat_wer import ChatWER
 from nemo.collections.asr.models.rnnt_bpe_models import EncDecRNNTBPEModel
 from nemo.collections.asr.parts.utils.chat_alignment import assign_words_to_chunks, build_forced_path
 from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
@@ -91,6 +92,7 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
         self._want_cuts = False
 
         super().__init__(cfg=cfg, trainer=trainer)
+        self._use_normalized_wer()
 
         if self.loss_type == "forced_alignment":
             logging.info(
@@ -118,6 +120,40 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
                 tokenizer=self.tokenizer,
             )
         return super()._setup_dataloader_from_config(config)
+
+    # ------------------------------------------------------------- metrics
+
+    def _use_normalized_wer(self) -> None:
+        """Swap in the metric that also reports a Whisper-normalised WER.
+
+        ``val_wer`` keeps its verbatim meaning -- it is what the checkpoint
+        callback monitors and what every other ASR model reports -- and
+        ``val_wer_norm`` is added beside it, matching how the speechlm2 CHAT runs
+        measured. Without the second number, a curve from this model cannot be
+        read against those runs at all: on a PnC model the normaliser forgives
+        every case and punctuation difference, which is not a small correction.
+        """
+        self.wer = ChatWER(
+            decoding=self.decoding,
+            use_cer=self._cfg.get('use_cer', False),
+            log_prediction=self._cfg.get('log_prediction', True),
+        )
+
+    def validation_pass(self, batch, batch_idx, dataloader_idx=0):
+        logs = super().validation_pass(batch, batch_idx, dataloader_idx)
+        norm = self.wer.normalized() if isinstance(self.wer, ChatWER) else None
+        if norm is not None and 'val_wer' in logs:
+            logs['val_wer_norm_num'], logs['val_wer_norm_denom'] = norm
+        return logs
+
+    def multi_validation_epoch_end(self, outputs, dataloader_idx: int = 0):
+        out = super().multi_validation_epoch_end(outputs, dataloader_idx)
+        if outputs and 'val_wer_norm_num' in outputs[0]:
+            num = torch.stack([x['val_wer_norm_num'] for x in outputs]).sum()
+            denom = torch.stack([x['val_wer_norm_denom'] for x in outputs]).sum()
+            if denom > 0:
+                out.setdefault('log', {})['val_wer_norm'] = num.float() / denom
+        return out
 
     # ------------------------------------------------------------ optimizer
 

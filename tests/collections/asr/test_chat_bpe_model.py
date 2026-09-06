@@ -425,3 +425,65 @@ class TestPerGroupLearningRates:
         names = set(model.state_dict())
         for prefix in ("encoder.", "decoder.", "joint.enc.", "joint.pred."):
             assert any(prefix in n for n in names), f"nothing in the model matches {prefix!r}"
+
+
+class TestNormalizedWER:
+    """val_wer here is verbatim; the speechlm2 runs it is compared against used
+    Whisper's normaliser. Reporting only one makes the two incomparable, which
+    is what made a correctly-training port look stalled."""
+
+    @pytest.mark.unit
+    def test_the_model_uses_the_dual_metric(self, forced_model, rnnt_model):
+        from nemo.collections.asr.metrics.chat_wer import ChatWER
+
+        assert isinstance(forced_model.wer, ChatWER)
+        assert isinstance(rnnt_model.wer, ChatWER), "both arms must measure identically"
+
+    @pytest.mark.unit
+    def test_normalisation_forgives_case_and_punctuation(self, forced_model):
+        """The whole point: 'Alpha Media.' vs 'alpha media' is 2 raw errors, 0 normalised."""
+        from kaldialign import edit_distance
+
+        norm = forced_model.wer._normalizer
+        if norm is None:
+            pytest.skip("whisper_normalizer not installed")
+        ref, hyp = "The station is owned by Alpha Media.", "the station is owned by alpha media"
+        raw = edit_distance(ref.split(), hyp.split())['total']
+        normed = edit_distance(norm(ref).split(), norm(hyp).split())['total']
+        assert raw > 0, "this reference/hypothesis pair should differ verbatim"
+        assert normed == 0, "and should be identical once normalised"
+
+    @pytest.mark.unit
+    def test_raw_counts_match_the_stock_metric_exactly(self, test_data_dir, forced_model):
+        """ChatWER must not perturb val_wer -- the checkpoint callback monitors it."""
+        from nemo.collections.asr.metrics.wer import WER
+
+        stock = WER(decoding=forced_model.decoding, log_prediction=False)
+        torch.manual_seed(0)
+        enc, enc_len = forced_model.forward(
+            input_signal=torch.randn(2, 16000 * 2) * 0.1, input_signal_length=torch.tensor([16000 * 2] * 2)
+        )
+        tgt, tgt_len = torch.randint(1, 100, (2, 6)), torch.tensor([6, 4])
+        kw = dict(predictions=enc, predictions_lengths=enc_len, targets=tgt, targets_lengths=tgt_len)
+        stock.update(**kw)
+        forced_model.wer.update(**kw)
+        assert torch.allclose(stock.compute()[1], forced_model.wer.compute()[1])
+        assert torch.allclose(stock.compute()[2], forced_model.wer.compute()[2])
+
+    @pytest.mark.unit
+    def test_normalised_counts_survive_the_reset_after_compute(self, forced_model):
+        """validation_pass resets right after compute(), so the numbers it needs
+        must not live in metric state."""
+        enc, enc_len = forced_model.forward(
+            input_signal=torch.randn(1, 16000 * 2) * 0.1, input_signal_length=torch.tensor([16000 * 2])
+        )
+        forced_model.wer.update(
+            predictions=enc,
+            predictions_lengths=enc_len,
+            targets=torch.randint(1, 100, (1, 5)),
+            targets_lengths=torch.tensor([5]),
+        )
+        forced_model.wer.compute()
+        forced_model.wer.reset()
+        norm = forced_model.wer.normalized()
+        assert norm is not None and norm[1] > 0, "reference words were lost by reset()"
