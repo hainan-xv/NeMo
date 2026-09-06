@@ -38,6 +38,11 @@
 #   MAX_STEPS, LR, WARMUP_STEPS, EPOCH_STEPS   training schedule
 #   EXP_NAME                 results directory
 #   INIT_NEMO                encoder donor (.nemo)
+#   INIT_EXCLUDE             tensors to leave random; default keeps the donor's
+#                            embedding OUT, matching the speechlm2 CHAT runs.
+#                            Set to '[]' to also inherit the embedding (legal
+#                            here since the vocabulary matches the donor's, but
+#                            it is a deviation from the runs we compare against).
 # ============================================================================
 
 read_required_token() {
@@ -122,7 +127,8 @@ read -r -d '' cmd <<EOF
 echo "*******STARTING********" \
 && echo "*** CHAT transducer (RNNTAttJoint), loss_type=${LOSS_TYPE} ***" \
 && echo "*** forced-alignment knobs: delay=${DELAY_FRAMES} recover=${RECOVER_WORDS} history_chunks=${HISTORY_CHUNKS} ***" \
-&& echo "*** warm start: encoder + prediction LSTM + joint.enc/pred from the donor; Q/K/V and joint_net random ***" \
+&& echo "*** warm start: encoder + prediction LSTM + joint.enc/pred from the donor ***" \
+&& echo "*** left RANDOM: Q/K/V, joint_net, and the embedding (exclude=${INIT_EXCLUDE:-[prediction.embed]}) ***" \
 && echo "*** encoder init: ${INIT_NEMO} ***" \
 && echo "*** schedule: epoch=${EPOCH_STEPS} lr=${LR} warmup=${WARMUP_STEPS} max_steps=${MAX_STEPS} ***" \
 && nvidia-smi \
@@ -169,6 +175,7 @@ print('    tokenizer ->', dst)
     trainer.num_nodes=\${SLURM_JOB_NUM_NODES} \
     +init_from_nemo_model.model0.path=${INIT_NEMO} \
     +init_from_nemo_model.model0.include=["encoder.","decoder.","joint.enc.","joint.pred."] \
+    +init_from_nemo_model.model0.exclude=${INIT_EXCLUDE:-'["prediction.embed"]'} \
     ++exp_manager.exp_dir=/results/ \
     ++exp_manager.name=${EXP_NAME} \
     ++exp_manager.max_time_per_run=00:03:55:00 \
