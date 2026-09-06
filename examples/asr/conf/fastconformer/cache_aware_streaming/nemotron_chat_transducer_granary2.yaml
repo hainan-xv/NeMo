@@ -196,6 +196,12 @@ trainer:
   val_check_interval: 4000
   limit_train_batches: 4000
   accelerator: gpu
+  # Lhotse samplers shard the data themselves and expose no __len__, so Lightning
+  # must not wrap them: with the default (true) it substitutes a
+  # DistributedSamplerWrapper and dies at dataloader setup. This config was
+  # adapted from the ASR-side CHAT recipe, which does not use Lhotse and so never
+  # needed the flag; every speechlm2 recipe reading this manifest sets it.
+  use_distributed_sampler: false
   strategy:
     _target_: lightning.pytorch.strategies.DDPStrategy
     gradient_as_bucket_view: true
