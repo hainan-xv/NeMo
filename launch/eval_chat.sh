@@ -14,136 +14,69 @@
 #SBATCH --output=slurm_out/%x=%j --error=slurm_out/%x=%j
 
 # ============================================================================
-# Open-ASR-Leaderboard eval for a CHAT transducer (ChatSTTModel).
+# Open-ASR-Leaderboard eval for a CHAT transducer.
 #
 #   ./oci_launch.sh launch/eval_chat.sh granary2_chat_asrvocab_win28_recover
-#   RETRACT=1 ./oci_launch.sh launch/eval_chat.sh granary2_chat_asrvocab_win28_recover
+#   RETRACT=1 ./oci_launch.sh launch/eval_chat.sh <exp>
 #   RUN_AVERAGING=0 CKPT=<path> ./oci_launch.sh launch/eval_chat.sh <exp>
 #
-# WHY A SEPARATE SCRIPT FROM eval_leaderboard.sh. That driver calls generate()
-# on a SpeechLM. CHAT decodes through the chunk-synchronous greedy transducer
-# path (transcribe_ids) and has its own decode-time knob (retract_words), so it
-# needs its own driver. Averaging, dataset list and scoring are deliberately
-# identical, so a number here is comparable to the SCRIPT and nemotron columns.
+# A THIN WRAPPER over launch/eval_leaderboard.sh -- it sets the driver and model
+# class and execs it. Everything that decides a NUMBER is therefore shared with
+# the SCRIPT and nemotron evaluations: checkpoint averaging, the dataset list,
+# the manifest reader, the seeded length-balanced shard partition, audio padding,
+# the aggregation and the scoring.
 #
-# CHECKPOINT AVERAGING. Averaging the top-k checkpoints is usually worth a few
-# tenths of WER and costs nothing at inference. ChatSTTModel is a plain
-# LightningModule, not a NeMo ModelPT, so NeMo's checkpoint_averaging/ scripts
-# do not apply -- they construct an EncDec* model and emit a .nemo. What they do
-# mathematically is a mean over state_dict float tensors, which is exactly what
-# scripts/average_script_ckpts.py does, model-agnostically (integer buffers such
-# as step counters are taken from the first checkpoint rather than averaged,
-# which would corrupt them).
+# WHY THAT MATTERS. The first version of this eval was a standalone script, and
+# it drifted in three ways that each silently changed the number: it scored with
+# NeMo's WER class rather than the leaderboard's normaliser (AMI 11.51 vs
+# 11.45); it sharded by DATASET, so spgispeech -- 53% of the corpus -- ran alone
+# on one GPU while seven idled; and it evaluated "everything cached", which on
+# the grid is TWELVE datasets rather than the leaderboard's seven. Reusing the
+# shared launcher makes all three impossible rather than merely fixed.
 #
-# The averaged file is CACHED next to the checkpoints and reused unless
-# FORCE_AVERAGE=1 or a newer input appeared.
-#
-# POSITIONAL
-#   $1  EXP_NAME   experiment to evaluate (REQUIRED)
+# The CHAT-specific parts live in scripts/chat_leaderboard_eval.py, which mirrors
+# speechlm_leaderboard_eval.py and differs only in building a ChatSTTModel and
+# decoding through the chunk-synchronous transducer path.
 #
 # ENV
-#   RETRACT         retract-by-k decoding (default: the checkpoint's own setting)
-#   RUN_AVERAGING   1 (default) average top-k non-last checkpoints
-#   AVG_TOP_K       how many of the best checkpoints to average (default 5)
-#   FORCE_AVERAGE   1 to recompute a cached average
-#   CKPT            explicit checkpoint; disables averaging
-#   DATASETS        comma-separated dataset:split (default: everything cached)
-#   MAX_SAMPLES     cap utterances per dataset (smoke test)
-#   BATCH_SIZE      default 8
+#   RETRACT    retract-by-k decoding (default: the checkpoint's own setting).
+#              Also tags the results directory, so k=0 and k=1 cannot overwrite
+#              each other.
+#   plus every knob eval_leaderboard.sh accepts (RUN_AVERAGING, FORCE_AVERAGE,
+#   CKPT, DATASETS, MAX_EVAL_SAMPLES, BATCH_SIZE, NGPU, PAD_EXTRA_SECONDS, ...)
 # ============================================================================
-set -euo pipefail
-mkdir -p slurm_out
+set -uo pipefail
 
-EXP_NAME="${1:-${EXP_NAME:-}}"
-PROJECT="${PROJECT:-SpeechlmScriptCC}"
-OUTPUT_PREFIX="${OUTPUT_PREFIX:-/lustre/fsw/portfolios/nemotron/users/hainanx}"
-CACHE_DIR="${CACHE_DIR:-/lustre/fsw/portfolios/llmservice/users/hainanx/leaderboard_cache}"
-CODE_DIR="${CODE_DIR:-/lustre/fsw/portfolios/nemotron/users/hainanx/NeMo_SCRIPT_cc}"
-CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/llmservice/users/heh/containers/nemo-26.02-streaming-speechlm.sqsh}"
+export EVAL_DRIVER="${EVAL_DRIVER:-chat_leaderboard_eval.py}"
+export MODEL_CLASS="${MODEL_CLASS:-nemo.collections.speechlm2.models.chat_model.ChatSTTModel}"
 
-if [[ -z "$EXP_NAME" ]]; then
-    echo "ERROR: no experiment name given." >&2
-    echo "usage: sbatch launch/eval_chat.sh <exp_name>" >&2
-    ls -1 "${OUTPUT_PREFIX}/results/${PROJECT}" 2>/dev/null | grep -i chat | sed 's/^/  /' >&2 || true
-    exit 1
-fi
-
+# Retract is a CHAT-only decode knob, so it rides through EXTRA_EVAL_ARGS rather
+# than becoming another flag on the shared launcher.
 RETRACT="${RETRACT:-}"
-RUN_AVERAGING="${RUN_AVERAGING:-1}"
-AVG_TOP_K="${AVG_TOP_K:-5}"
-FORCE_AVERAGE="${FORCE_AVERAGE:-0}"
-CKPT="${CKPT:-}"
-DATASETS="${DATASETS:-}"
-MAX_SAMPLES="${MAX_SAMPLES:-}"
-BATCH_SIZE="${BATCH_SIZE:-8}"
-NUM_GPUS="${NUM_GPUS:-8}"
+if [[ -n "$RETRACT" ]]; then
+    export EXTRA_EVAL_ARGS="${EXTRA_EVAL_ARGS:-} --retract ${RETRACT}"
+    # Distinct results dir per k, or the second run silently overwrites the first.
+    export EVAL_TAG="${EVAL_TAG:-${1:-chat}}_retract${RETRACT}"
+fi
 
-CKPT_DIR="${OUTPUT_PREFIX}/results/${PROJECT}/${EXP_NAME}/${EXP_NAME}/checkpoints"
-RESULTS_DIR="${OUTPUT_PREFIX}/results/${PROJECT}/${EXP_NAME}/leaderboard${RETRACT:+_retract${RETRACT}}"
-mkdir -p "${RESULTS_DIR}"
-
-# An explicit checkpoint always wins over (and disables) averaging.
-if [[ -n "$CKPT" ]]; then
-    RUN_AVERAGING=0
-elif [[ "$RUN_AVERAGING" == "1" ]]; then
-    CKPT="${CKPT_DIR}/${EXP_NAME}-averaged.ckpt"
-    # Best-by-val_wer, not newest: with save_top_k the newest is often not the
-    # best, and -last carries whatever the metric was when training stopped --
-    # which for a job killed before its first validation is 0.0000.
-    mapfile -t _AVG_IN < <(ls -1 "${CKPT_DIR}"/*.ckpt 2>/dev/null \
-        | grep -v -- '-last\.ckpt$' | grep -v -- '-averaged\.ckpt$' \
-        | grep -E 'val_wer=[0-9]+\.[0-9]+' \
-        | sed -E 's/.*val_wer=([0-9.]+)\.ckpt/\1 &/' | sort -g | head -n "${AVG_TOP_K}" | cut -d' ' -f2-)
-    if [[ ${#_AVG_IN[@]} -eq 0 ]]; then
-        echo "ERROR: RUN_AVERAGING=1 but no scored checkpoints under ${CKPT_DIR}" >&2
-        exit 1
+# Under sbatch, Slurm COPIES the submitted script into a spool directory, so
+# BASH_SOURCE points somewhere with no sibling launcher -- prefer SLURM_SUBMIT_DIR.
+resolve_launch_dir() {
+    if [[ -n "${SLURM_SUBMIT_DIR:-}" ]]; then
+        [[ -f "${SLURM_SUBMIT_DIR}/eval_leaderboard.sh" ]] && { echo "${SLURM_SUBMIT_DIR}"; return; }
+        [[ -f "${SLURM_SUBMIT_DIR}/launch/eval_leaderboard.sh" ]] && { echo "${SLURM_SUBMIT_DIR}/launch"; return; }
     fi
-    echo "==> Averaging ${#_AVG_IN[@]} best-val_wer checkpoint(s):"
-    printf '      %s\n' "${_AVG_IN[@]##*/}"
-else
-    CKPT="$(ls -1 "${CKPT_DIR}"/*.ckpt 2>/dev/null | grep -E 'val_wer=[0-9]+\.[0-9]+' \
-            | sed -E 's/.*val_wer=([0-9.]+)\.ckpt/\1 &/' | sort -g | head -1 | cut -d' ' -f2-)"
-    [[ -z "$CKPT" ]] && { echo "ERROR: no checkpoint under ${CKPT_DIR}" >&2; exit 1; }
-fi
+    local here
+    here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    [[ -f "${here}/eval_leaderboard.sh" ]] && { echo "${here}"; return; }
+    echo "ERROR: cannot locate eval_leaderboard.sh (SLURM_SUBMIT_DIR=${SLURM_SUBMIT_DIR:-<unset>})" >&2
+    exit 1
+}
+LAUNCH_DIR="$(resolve_launch_dir)"
 
-echo "==> CHAT leaderboard eval"
-echo "    exp:      ${EXP_NAME}"
-echo "    ckpt:     ${CKPT}"
+echo "==> CHAT leaderboard eval (shared launcher)"
+echo "    driver:   ${EVAL_DRIVER}"
+echo "    class:    ${MODEL_CLASS}"
 echo "    retract:  ${RETRACT:-<checkpoint default>}"
-echo "    results:  ${RESULTS_DIR}"
 
-AVG_CMD=""
-if [[ "$RUN_AVERAGING" == "1" ]]; then
-    AVG_TMP="${CKPT}.tmp.$$"
-    printf '%s\n' "${_AVG_IN[@]}" > "${RESULTS_DIR}/avg_inputs.txt"
-    # Write to a temp file and mv into place: mv is atomic within a filesystem,
-    # so a concurrent eval either sees the old average or the new one, never a
-    # half-written file.
-    AVG_CMD="if [[ '${FORCE_AVERAGE}' == '1' ]] || [[ ! -s '${CKPT}' ]]; then \
-        echo '==> averaging'; python /code/scripts/average_script_ckpts.py --output '${AVG_TMP}' \$(cat '${RESULTS_DIR}/avg_inputs.txt') \
-        && mv -f '${AVG_TMP}' '${CKPT}'; else echo '==> reusing cached ${CKPT}'; fi && "
-fi
-
-# Mount every portfolio the job touches. The checkpoint records an ABSOLUTE path
-# for its pretrained encoder on the llmservice portfolio; without that mount the
-# path does not exist inside the container and the model is built from whatever
-# else happens to be in the HF cache. Job 13127090 built its encoder from
-# canary-1b-flash that way and died on a shape mismatch.
-PRETRAINED_DIR="${PRETRAINED_DIR:-/lustre/fsw/portfolios/llmservice/users/heh}"
-MOUNTS="--container-mounts=${CODE_DIR}:/code,${OUTPUT_PREFIX}:${OUTPUT_PREFIX},${CACHE_DIR}:${CACHE_DIR},${PRETRAINED_DIR}:${PRETRAINED_DIR}"
-
-read -r -d '' CMD <<EOF || true
-cd /code && export PYTHONPATH=/code:\${PYTHONPATH:-} && export HF_HOME=${OUTPUT_PREFIX}/hf_cache \
-&& ${AVG_CMD} \
-for i in \$(seq 0 \$((${NUM_GPUS} - 1))); do \
-    CUDA_VISIBLE_DEVICES=\$i python /code/scripts/speechlm2/chat_leaderboard_eval.py \
-        --ckpt '${CKPT}' --cache-dir '${CACHE_DIR}' --output-dir '${RESULTS_DIR}' \
-        --shard \$i --num-shards ${NUM_GPUS} --batch-size ${BATCH_SIZE} \
-        ${RETRACT:+--retract ${RETRACT}} ${DATASETS:+--datasets ${DATASETS}} ${MAX_SAMPLES:+--max-samples ${MAX_SAMPLES}} \
-        > '${RESULTS_DIR}/shard'\$i.log 2>&1 & \
-done; wait \
-&& python /code/scripts/speechlm2/chat_leaderboard_eval.py --aggregate --output-dir '${RESULTS_DIR}' \
-   2>&1 | tee '${RESULTS_DIR}/summary.txt'
-EOF
-
-srun --container-image="$CONTAINER" $MOUNTS bash -c "${CMD}"
+exec bash "${LAUNCH_DIR}/eval_leaderboard.sh" "$@"
