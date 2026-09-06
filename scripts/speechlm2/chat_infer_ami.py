@@ -56,115 +56,13 @@ def parse_args():
     return ap.parse_args()
 
 
-def _resolve_asr(recorded: str, override: str = None) -> str:
-    """Local path to the pretrained ASR .nemo the checkpoint was built on."""
-    import glob
-
-    for cand in (override, recorded):
-        if cand and os.path.exists(cand):
-            return cand
-    hits = sorted(
-        glob.glob(os.path.expanduser("~/.cache/huggingface/hub/models--nvidia--*/**/*.nemo"), recursive=True)
-    )
-    if recorded:
-        want = os.path.basename(recorded)
-        exact = [h for h in hits if os.path.basename(h) == want]
-        if exact:
-            print(f"  pretrained_asr remapped to local cache: {exact[0]}")
-            return exact[0]
-    if hits:
-        print(f"  pretrained_asr remapped to local cache: {hits[0]}")
-        return hits[0]
-    raise FileNotFoundError(
-        f"cannot find the pretrained ASR model locally (checkpoint recorded {recorded!r}). "
-        "Pass --pretrained-asr with a local .nemo."
-    )
-
-
-def _resolve_llm(recorded: str, override: str = None) -> str:
-    """Local path or hub id for the LLM whose tokenizer the Qwen arm uses."""
-    if override:
-        return override
-    if recorded and os.path.exists(recorded):
-        return recorded
-    # A hub id works if the tokenizer is already cached, which it is if this
-    # machine has ever built the Qwen arm.
-    guess = "Qwen/" + os.path.basename(recorded.rstrip("/")) if recorded else "Qwen/Qwen3-1.7B"
-    print(f"  pretrained_llm remapped to hub id: {guess}")
-    return guess
-
-
-def load_model(ckpt_path, device, retract, asr_override=None, llm_override=None):
-    """Rebuild ChatSTTModel from the checkpoint's own hyper_parameters.
-
-    The config is read from the checkpoint rather than from a YAML on disk: the
-    recipes have changed repeatedly (vocabulary, joint_history_chunks, delay),
-    and pairing a checkpoint with a drifted config silently builds the wrong
-    model -- usually a shape error, but at worst a quiet mismatch.
-    """
-    from omegaconf import OmegaConf
-
-    from nemo.collections.speechlm2.models.chat_model import ChatSTTModel
-
-    print(f"loading {ckpt_path}")
-    ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    hp = ck.get("hyper_parameters", {})
-    cfg = hp.get("cfg", hp)
-    cfg = OmegaConf.to_container(OmegaConf.create(cfg), resolve=True) if not isinstance(cfg, dict) else dict(cfg)
-
-    # Warm-starting from the donor RNN-T is a TRAINING-time convenience; here it
-    # would just be overwritten by the checkpoint's own weights, at the cost of
-    # reading a 2.5 GB .nemo.
-    cfg["init_rnnt_from_asr"] = False
-
-    # The checkpoint records the CLUSTER's paths for the pretrained encoder and
-    # LLM, which do not exist on a desktop. Remap them to local copies rather
-    # than making the caller edit a config: leaving them unresolved fails deep
-    # inside HuggingFace with an unhelpful "Repo id must be in the form ..."
-    # because NeMo falls back to treating the path as a hub name.
-    cfg["pretrained_asr"] = _resolve_asr(cfg.get("pretrained_asr", ""), asr_override)
-    if not cfg.get("text_vocab_from_asr", True):
-        cfg["pretrained_llm"] = _resolve_llm(cfg.get("pretrained_llm", ""), llm_override)
-    if retract is not None:
-        cfg["retract_words"] = int(retract)
-
-    model = ChatSTTModel(cfg)
-    sd = ck["state_dict"]
-    missing, unexpected = model.load_state_dict(sd, strict=False)
-    real_missing = [k for k in missing if not k.startswith("perception.preprocessor")]
-    if real_missing:
-        raise RuntimeError(f"checkpoint is missing {len(real_missing)} parameters, e.g. {real_missing[:5]}")
-    if unexpected:
-        print(f"  ignoring {len(unexpected)} unexpected keys, e.g. {unexpected[:3]}")
-
-    model = model.to(device).eval()
-    print(
-        f"  vocab={cfg.get('vocab_size')}  chunk_size={cfg.get('chunk_size')}  "
-        f"joint_history_chunks={cfg.get('joint_history_chunks', 0)}  retract_words={cfg.get('retract_words', 0)}"
-    )
-    return model, cfg
-
-
-def build_tokenizer(cfg):
-    """The same tokenizer the run trained with -- the arm's defining choice."""
-    import tempfile
-
-    if cfg.get("text_vocab_from_asr", True):
-        from nemo.collections.speechlm2.data.script_dataset import ScriptSTTDataset
-        from nemo.collections.speechlm2.parts.asr_vocab import AsrVocabTokenizer, extract_spm_from_nemo
-
-        spm = extract_spm_from_nemo(cfg["pretrained_asr"], tempfile.mkdtemp(prefix="chat_vocab_"))
-        EOT = "<|im_end|>"
-        specials = [ScriptSTTDataset.audio_open_token, ScriptSTTDataset.audio_close_token, EOT]
-        tok = AsrVocabTokenizer(spm, special_tokens=specials, eos_token=EOT, pad_token=EOT)
-        print(f"  tokenizer: ASR SentencePiece, {len(tok)} pieces")
-        return tok
-
-    from nemo.collections.common.tokenizers.huggingface.auto_tokenizer import AutoTokenizer
-
-    tok = AutoTokenizer(cfg["pretrained_llm"], use_fast=True)
-    print(f"  tokenizer: {cfg['pretrained_llm']}, {len(tok.tokenizer)} pieces")
-    return tok
+from nemo.collections.speechlm2.parts.chat_eval import (
+    build_chat_tokenizer,
+    load_chat_model,
+    read_manifest,
+    score_pairs,
+    transcribe_manifest,
+)
 
 
 def main():
@@ -182,8 +80,12 @@ def main():
         rows = rows[: args.n]
     print(f"{len(rows)} utterances, {sum(r.get('duration', 0) for r in rows)/60:.1f} min of audio")
 
-    model, cfg = load_model(args.ckpt, args.device, args.retract, args.pretrained_asr, args.pretrained_llm)
-    model.tokenizer = build_tokenizer(cfg)
+    model, cfg = load_chat_model(args.ckpt, args.device, args.retract, args.pretrained_asr, args.pretrained_llm)
+    model.tokenizer = build_chat_tokenizer(cfg)
+    print(
+        f"  vocab={cfg.get('vocab_size')}  joint_history_chunks={cfg.get('joint_history_chunks', 0)}  "
+        f"retract_words={cfg.get('retract_words', 0)}"
+    )
 
     import soundfile as sf
 
