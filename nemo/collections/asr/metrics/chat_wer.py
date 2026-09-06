@@ -67,7 +67,7 @@ class ChatWER(WER):
         # Plain attributes, not metric states: they must survive the reset() that
         # validation_pass performs right after compute().
         self.last_norm_scores = torch.tensor(0.0)
-        self.last_norm_words = torch.tensor(0.0)
+        self.last_norm_words = torch.tensor(0.0)  # replaced on the right device by compute()
         self._norm_scores = 0.0
         self._norm_words = 0.0
 
@@ -133,8 +133,15 @@ class ChatWER(WER):
             self.decode = saved
 
     def compute(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        self.last_norm_scores = torch.tensor(float(self._norm_scores))
-        self.last_norm_words = torch.tensor(float(self._norm_words))
+        # On the metric's OWN device, not the default one. These end up in the
+        # dict validation_pass returns, and Lightning all-reduces every logged
+        # value over the process group -- which is NCCL, and NCCL cannot reduce
+        # a CPU tensor ("No backend type associated with device type cpu"). It
+        # costs nothing on one GPU and kills an 8-node run at the first
+        # validation.
+        dev = self.scores.device
+        self.last_norm_scores = torch.tensor(float(self._norm_scores), device=dev)
+        self.last_norm_words = torch.tensor(float(self._norm_words), device=dev)
         return super().compute()
 
     def reset(self):
