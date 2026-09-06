@@ -48,8 +48,15 @@ model:
   forced_alignment:
     # Emit a word at the chunk containing its last frame PLUS this delay. A
     # word's final frames are often what disambiguate it, so emitting at the
-    # chunk where it ends leaves the encoder no right context.
-    num_delay_frames: 0
+    # chunk where it ends leaves the encoder no right context. 3 is what the
+    # speechlm2 recipe this was ported from used; 0 measurably slows convergence.
+    #
+    # Pairs with the 0.5 s tail padding below, which gives a delayed final word
+    # real audio to be emitted against. Without it the delay still resolves --
+    # a word pushed past the last chunk is folded back into it, which measurably
+    # only bites when the encoder length lands on an exact chunk boundary -- but
+    # the tail no longer matches the padded audio used at eval time.
+    num_delay_frames: 3
     # Additionally score each chunk on the previous chunk's last k words,
     # starting from the prefix before them. Nothing is removed from the output;
     # it teaches the model to recover when its history is short, which is what
@@ -85,6 +92,13 @@ model:
     bucket_batch_size: [38, 29, 25, 22, 20, 18, 17, 15, 14, 13, 12, 11, 10, 8, 7, 6, 5, 4]
     max_duration: 54
     min_duration: 0.1
+    seed: 42
+    # Pad 0.5 s of silence onto every clip, as the speechlm2 recipes do and as
+    # the leaderboard eval does (--pad_extra_seconds 0.5). Without it the
+    # emission delay has no frames to land in at the end of an utterance.
+    pad_extra_duration: 0.5
+    pad_extra_duration_prob: 1.0
+
     # text_field deliberately UNSET, matching the speechlm2 recipes that read
     # this same input_cfg. Setting it to "answer" made every TRAINING target
     # empty: the granary cuts carry their transcript in the default field, so
@@ -100,6 +114,10 @@ model:
     # so val_wer is comparable across all three.
     manifest_filepath: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/users/dongjig/aligned_amos/steve_val_mmlpc_mcv11_2k/mcv11_dev_clean_pcstrip_en_2k_qwen_aligned.json
     sample_rate: ${model.sample_rate}
+    # Padded like training and like the leaderboard eval, so val_wer is measured
+    # on the same audio shape the model is trained and evaluated on.
+    pad_extra_duration: 0.5
+    pad_extra_duration_prob: 1.0
     batch_size: 8
     shuffle: false
     num_workers: 4
@@ -181,7 +199,11 @@ model:
       pred_hidden: ${model.model_defaults.pred_hidden}
       pred_rnn_layers: 2
       t_max: null
-      dropout: 0.2
+      # 0.1, as the speechlm2 CHAT model used -- not the 0.2 the standard ASR
+      # transducer recipes carry. The prediction network and joint are trained
+      # from SCRATCH here; doubling their dropout slows convergence for no gain
+      # this early, and this recipe already regularises with SpecAugment.
+      dropout: 0.1
 
   joint:
     _target_: nemo.collections.asr.modules.RNNTAttJoint
@@ -201,7 +223,7 @@ model:
       pred_hidden: ${model.model_defaults.pred_hidden}
       joint_hidden: ${model.model_defaults.joint_hidden}
       activation: "relu"
-      dropout: 0.2
+      dropout: 0.1  # matches the speechlm2 CHAT model; see prednet above
 
   decoding:
     strategy: "greedy_batch"

@@ -32,6 +32,11 @@
 export LOSS_TYPE=forced_alignment
 export HISTORY_CHUNKS="${HISTORY_CHUNKS:-1}"
 export RECOVER_WORDS="${RECOVER_WORDS:-2}"
+# 3 frames of emission delay, as the speechlm2 recipe used. Word-to-chunk
+# assignment is by the word's LAST frame, so with no delay a word must be
+# emitted from the very chunk it ends in, with none of the right context that
+# often disambiguates it.
+export DELAY_FRAMES="${DELAY_FRAMES:-3}"
 export EXP_NAME="${EXP_NAME:-granary2_chat_forced_asrvocab_win28_recover}"
 
 # Under sbatch, $0 is a COPY of this script in Slurm's spool directory, so
