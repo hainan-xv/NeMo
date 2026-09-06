@@ -40,6 +40,7 @@ The forced path is built from the word timings the Granary cuts already carry in
 ``return_cuts=True`` on the ordinary Lhotse BPE dataset.
 """
 
+import re
 from typing import Dict, List, Optional
 
 import torch
@@ -117,6 +118,48 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
                 tokenizer=self.tokenizer,
             )
         return super()._setup_dataloader_from_config(config)
+
+    # ------------------------------------------------------------ optimizer
+
+    def setup_optimizer_param_groups(self):
+        """Per-group learning rates from ``model.lr_multipliers``.
+
+        The 609M encoder is PRETRAINED and only needs fine-tuning; the
+        prediction network, the joint and the joint's Q/K/V are trained from
+        scratch and are starved by any rate low enough for the encoder. A single
+        shared rate has to be wrong for one of them -- and which way it is wrong
+        decides whether the encoder is damaged or the new parts never train.
+
+        For scale: the donor RNN-T this encoder comes from trained with
+        NoamAnnealing(lr=3.0, d_model=1024, warmup=8000), peaking at 1.05e-3. So
+        base 1e-3 for the from-scratch parts with the encoder held at 0.1x is the
+        donor's own peak for the new parts and the rate the encoder has always
+        had.
+
+        Keys are regexes matched against parameter names; a parameter matching
+        none of them keeps the base rate.
+        """
+        mults = self.cfg.get("lr_multipliers", None)
+        if not mults:
+            return super().setup_optimizer_param_groups()
+
+        base_lr = float(self.cfg.optim.lr)
+        groups, claimed = [], set()
+        for pattern, mult in mults.items():
+            params = [p for n, p in self.named_parameters() if n not in claimed and re.search(pattern, n)]
+            if not params:
+                logging.warning(f"lr_multipliers pattern {pattern!r} matched no parameters")
+                continue
+            claimed.update(n for n, _ in self.named_parameters() if re.search(pattern, n))
+            groups.append({'params': params, 'lr': base_lr * float(mult)})
+            logging.info(
+                f"lr_multipliers: {len(params)} tensors matching {pattern!r} -> lr {base_lr * float(mult):.2e}"
+            )
+
+        rest = [p for n, p in self.named_parameters() if n not in claimed]
+        groups.append({'params': rest, 'lr': base_lr})
+        logging.info(f"lr_multipliers: {len(rest)} remaining tensors -> base lr {base_lr:.2e}")
+        self._optimizer_param_groups = groups
 
     # -------------------------------------------------------- forced path
 

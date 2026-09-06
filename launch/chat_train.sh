@@ -122,6 +122,7 @@ read -r -d '' cmd <<EOF
 echo "*******STARTING********" \
 && echo "*** CHAT transducer (RNNTAttJoint), loss_type=${LOSS_TYPE} ***" \
 && echo "*** forced-alignment knobs: delay=${DELAY_FRAMES} recover=${RECOVER_WORDS} history_chunks=${HISTORY_CHUNKS} ***" \
+&& echo "*** warm start: encoder + prediction LSTM + joint.enc/pred from the donor; Q/K/V and joint_net random ***" \
 && echo "*** encoder init: ${INIT_NEMO} ***" \
 && echo "*** schedule: epoch=${EPOCH_STEPS} lr=${LR} warmup=${WARMUP_STEPS} max_steps=${MAX_STEPS} ***" \
 && nvidia-smi \
@@ -167,7 +168,7 @@ print('    tokenizer ->', dst)
     trainer.devices=${GPUS_PER_NODE} \
     trainer.num_nodes=\${SLURM_JOB_NUM_NODES} \
     +init_from_nemo_model.model0.path=${INIT_NEMO} \
-    +init_from_nemo_model.model0.include=["encoder"] \
+    +init_from_nemo_model.model0.include=["encoder.","decoder.","joint.enc.","joint.pred."] \
     ++exp_manager.exp_dir=/results/ \
     ++exp_manager.name=${EXP_NAME} \
     ++exp_manager.max_time_per_run=00:03:55:00 \
