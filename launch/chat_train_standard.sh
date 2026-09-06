@@ -99,7 +99,14 @@ mkdir -p "${RESULTS_DIR}" "${HFCACHE}"
 OUTFILE=${RESULTS_DIR}/slurm-%j-%n.out
 ERRFILE=${RESULTS_DIR}/error-%j-%n.out
 
-MOUNTS="--container-mounts=${DATA_DIR}:${DATA_DIR},${H_DIR}:${H_DIR},$CODE_DIR:/code,$RESULTS_DIR:/results,${HFCACHE}:/hfcache/,$DONGJI_ROOT:$DONGJI_ROOT"
+# Mirrors chat_train.sh's mount list. $DATA_DIR must be mounted at BOTH its real
+# path and /data: the manifests carry absolute paths under /data (the validation
+# set points at /data/ASR/MMLPC/...), so mounting only the real path leaves those
+# unresolvable and Lhotse fails on the first batch. Job 13170777 died exactly
+# that way, having otherwise started correctly.
+HAINAN_DIR=/lustre/fsw/portfolios/llmservice/users/hainanx
+PRETRAINED_MODEL_DIR=${LUSTRE_ACCOUNT_PREFIX}/users/heh/pretrained_models
+MOUNTS="--container-mounts=${DATA_DIR}:${DATA_DIR},${H_DIR}:${H_DIR},${HAINAN_DIR}:${HAINAN_DIR},$CODE_DIR:/code,$RESULTS_DIR:/results,$DATA_DIR:/data,$PRETRAINED_MODEL_DIR:/pretrained,${HFCACHE}:/hfcache/,$DONGJI_ROOT:$DONGJI_ROOT"
 
 read -r -d '' cmd <<EOF
 echo "*******STARTING********" \
