@@ -15,7 +15,12 @@
 
 import pytest
 
-from nemo.collections.asr.parts.utils.chat_alignment import assign_words_to_chunks, build_forced_path
+from nemo.collections.asr.parts.utils.chat_alignment import (
+    assign_words_to_chunks,
+    build_forced_path,
+    chunk_texts,
+    word_spans,
+)
 
 
 class TestAssignWordsToChunks:
@@ -114,3 +119,61 @@ class TestBuildForcedPath:
     def test_first_chunk_never_recovers(self):
         _, _, lab = build_forced_path([[1]], self.BLANK, recover_words=1, word_starts=[[0]])
         assert lab == [1, self.BLANK]
+
+
+class TestChunkTexts:
+    """Targets are sliced from the transcript, not rebuilt from aligner words.
+
+    Two real defects motivated this, both visible in a training decode as
+    `Oh  what a world of  profit and  delight` against a reference of
+    `Oh, what a world of profit and delight,`:
+
+      * aligner word forms have punctuation stripped, so a PnC model trained on
+        them can never emit any, and
+      * prepending a space to each chunk makes SentencePiece emit a standalone
+        word-boundary piece, i.e. a junk token per chunk that decodes as a
+        double space.
+    """
+
+    TRANSCRIPT = "Oh, what a world of profit and delight, of power, of honor."
+    WORDS = [w.strip(",.") for w in TRANSCRIPT.split()]
+
+    def _groups(self, n=4):
+        return [list(range(i, min(i + n, len(self.WORDS)))) for i in range(0, len(self.WORDS), n)]
+
+    @pytest.mark.unit
+    def test_chunks_reconstruct_the_transcript_exactly(self):
+        assert " ".join(chunk_texts(self._groups(), self.WORDS, self.TRANSCRIPT)) == self.TRANSCRIPT
+
+    @pytest.mark.unit
+    def test_no_chunk_carries_leading_or_trailing_whitespace(self):
+        for t in chunk_texts(self._groups(), self.WORDS, self.TRANSCRIPT):
+            assert t == t.strip(), f"{t!r} would tokenize to a standalone word-boundary piece"
+
+    @pytest.mark.unit
+    def test_punctuation_is_preserved(self):
+        joined = " ".join(chunk_texts(self._groups(), self.WORDS, self.TRANSCRIPT))
+        assert joined.count(",") == self.TRANSCRIPT.count(",")
+        assert joined.endswith(".")
+
+    @pytest.mark.unit
+    def test_silent_chunks_stay_empty(self):
+        out = chunk_texts([[0, 1], [], [2]], self.WORDS, self.TRANSCRIPT)
+        assert out[1] == ""
+
+    @pytest.mark.unit
+    def test_falls_back_to_word_forms_without_a_transcript(self):
+        """No transcript is not a reason to emit nothing -- only to lose punctuation."""
+        out = chunk_texts([[0, 1]], ["hello", "world"], "")
+        assert out == ["hello world"]
+
+    @pytest.mark.unit
+    def test_a_repeated_word_maps_to_its_own_occurrence(self):
+        t = "the cat the dog"
+        spans = word_spans(["the", "cat", "the", "dog"], t)
+        assert [t[a:b] for a, b in spans] == ["the", "cat", "the", "dog"]
+        assert spans[0][0] != spans[2][0], "both 'the's resolved to the same position"
+
+    @pytest.mark.unit
+    def test_unlocatable_word_yields_none_not_a_wrong_span(self):
+        assert word_spans(["hello", "absent"], "hello world")[1] is None

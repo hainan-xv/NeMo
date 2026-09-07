@@ -51,7 +51,7 @@ from omegaconf import DictConfig
 from nemo.collections.asr.data.audio_to_text_lhotse import LhotseSpeechToTextBpeDataset
 from nemo.collections.asr.metrics.chat_wer import ChatWER
 from nemo.collections.asr.models.rnnt_bpe_models import EncDecRNNTBPEModel
-from nemo.collections.asr.parts.utils.chat_alignment import assign_words_to_chunks, build_forced_path
+from nemo.collections.asr.parts.utils.chat_alignment import assign_words_to_chunks, build_forced_path, chunk_texts
 from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
 from nemo.core.classes.common import PretrainedModelInfo
 from nemo.core.classes.mixins import AccessMixin
@@ -222,29 +222,27 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
     def _chunk_tokens(self, cut, n_chunks: int) -> List[List[int]]:
         """Tokens each chunk is responsible for, one list per chunk.
 
-        A chunk's words are joined and tokenized TOGETHER rather than one word at
-        a time, so the pieces match what the tokenizer would produce for running
-        text.
+        The text comes from the ORIGINAL transcript, sliced by where each
+        aligned word sits in it -- not from the aligner's word forms, which have
+        punctuation stripped. Building targets from the bare forms trains a PnC
+        model that can never emit punctuation, and inflates a verbatim WER
+        against a punctuated reference on every sentence.
         """
-        words = (cut.custom or {}).get("alignments", []) or []
+        aligned = (cut.custom or {}).get("alignments", []) or []
+        words = [w["text"] for w in aligned]
+        transcript = " ".join(s.text for s in cut.supervisions if s.text) if cut.supervisions else ""
+
         groups = assign_words_to_chunks(
-            [w["end_time"] for w in words],
+            [w["end_time"] for w in aligned],
             n_chunks,
             self.joint.chunk_size,
             self.frame_length_in_secs,
             self.num_delay_frames,
         )
-        out = []
-        for gi, idxs in enumerate(groups):
-            if not idxs:
-                out.append([])
-                continue
-            text = " ".join(words[i]["text"] for i in idxs)
-            # Every chunk but the first continues mid-utterance, so its opening
-            # token must carry the word-boundary marker; without the leading
-            # space SentencePiece would emit a continuation piece instead.
-            out.append(self.tokenizer.text_to_ids(text if gi == 0 else " " + text))
-        return out
+        # Each chunk is tokenized on its own, with NO leading space: the
+        # tokenizer's dummy prefix already marks the word start, while an
+        # explicit space becomes a standalone piece the model then has to emit.
+        return [self.tokenizer.text_to_ids(t) if t else [] for t in chunk_texts(groups, words, transcript)]
 
     def _build_batch_path(self, cuts, n_chunks: torch.Tensor, device):
         """Assemble (b, t, u, labels) and the prediction-network input."""

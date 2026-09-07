@@ -25,7 +25,64 @@ speechlm2; the rules are identical to the ones validated there.
 import math
 from typing import List, Optional, Sequence, Tuple
 
-__all__ = ["assign_words_to_chunks", "build_forced_path"]
+__all__ = ["assign_words_to_chunks", "build_forced_path", "word_spans", "chunk_texts"]
+
+
+def word_spans(words: Sequence[str], transcript: str) -> List[Optional[Tuple[int, int]]]:
+    """Character spans of each aligned word inside the ORIGINAL transcript.
+
+    Forced aligners emit bare word forms -- ``Media``, never ``Media.`` -- so a
+    target built from them has no punctuation at all, and a PnC model trained on
+    it can never produce any. Locating each word in the transcript instead
+    recovers the true surface form: the span is extended through any trailing
+    non-alphanumeric characters, which is what picks up commas, periods and
+    quotes.
+
+    Matching is case-insensitive and advances a cursor, so a repeated word maps
+    to its own occurrence rather than always to the first. A word that cannot be
+    located yields ``None`` rather than a wrong span.
+    """
+    spans: List[Optional[Tuple[int, int]]] = []
+    lower = transcript.lower()
+    pos = 0
+    for w in words:
+        idx = lower.find(w.lower(), pos)
+        if idx == -1:
+            spans.append(None)
+            continue
+        end = idx + len(w)
+        while end < len(transcript) and not transcript[end].isalnum() and not transcript[end].isspace():
+            end += 1
+        spans.append((idx, end))
+        pos = end
+    return spans
+
+
+def chunk_texts(groups: Sequence[Sequence[int]], words: Sequence[str], transcript: str) -> List[str]:
+    """The text each chunk is responsible for, sliced from the transcript.
+
+    Returned WITHOUT leading or trailing whitespace. That matters: SentencePiece
+    turns a leading space into a standalone ``▁`` piece, so prepending one to
+    every chunk trains the model to emit a junk token at each chunk boundary --
+    which decodes as a double space and wastes one emission slot per chunk. The
+    word-boundary marker is already supplied by the tokenizer's own dummy
+    prefix, so the space is not needed for it either.
+
+    Falls back to joining the aligner's word forms when a span cannot be
+    located, which loses that word's punctuation but never loses the word.
+    """
+    spans = word_spans(words, transcript) if transcript else [None] * len(words)
+    out = []
+    for idxs in groups:
+        if not idxs:
+            out.append("")
+            continue
+        found = [spans[i] for i in idxs if spans[i] is not None]
+        if found:
+            out.append(transcript[found[0][0] : found[-1][1]].strip())
+        else:
+            out.append(" ".join(words[i] for i in idxs).strip())
+    return out
 
 
 def assign_words_to_chunks(
