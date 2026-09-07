@@ -114,7 +114,11 @@ OCI_TMP_DIR="${OCI_TMP_DIR:-/results/tmp}"
 # extracted below -- using any other vocabulary would make this incomparable to
 # the 1k forced-alignment arm.
 INIT_NEMO="${INIT_NEMO:-${H_DIR}/pretrained_models/huggingface/nvidia/nemotron-speech-streaming-en-0.6b/nemotron-speech-streaming-en-0.6b.nemo}"
-TOKENIZER_DIR="${RESULTS_DIR}/tokenizer"
+# /results is where RESULTS_DIR is mounted inside the container. Writing to the
+# host path instead puts the tokenizer in the container's ephemeral overlay: the
+# run works, but nothing persists to lustre, so anything later needing the
+# vocabulary (checkpoint averaging, eval) finds an empty directory.
+TOKENIZER_DIR="/results/tokenizer"
 
 mkdir -p "${RESULTS_DIR}" "${HFCACHE}"
 OUTFILE=${RESULTS_DIR}/slurm-%j-%n.out

@@ -26,6 +26,10 @@ CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/llmservice/users/heh/containers/n
 RUN_DIR="${OUTPUT_PREFIX}/results/${PROJECT}/${ARM_EXP_NAME}"
 CKPT_DIR="${RUN_DIR}/${ARM_EXP_NAME}/checkpoints"
 TOKENIZER_DIR="${RUN_DIR}/tokenizer"
+# The donor .nemo IS the tokenizer. Runs before the /results fix left no
+# tokenizer on lustre, so extract it here when it is missing rather than failing
+# -- it is the same 1,024-piece vocabulary either way.
+INIT_NEMO="${INIT_NEMO:-/lustre/fsw/portfolios/llmservice/users/heh/pretrained_models/huggingface/nvidia/nemotron-speech-streaming-en-0.6b/nemotron-speech-streaming-en-0.6b.nemo}"
 AVG_DIR="${RUN_DIR}/averaged"
 AVG_NAME="${AVG_DIR}/top${TOPK}"
 AVG_NEMO="${AVG_NAME}-averaged.nemo"
@@ -35,6 +39,23 @@ if [[ ! -d "$CKPT_DIR" ]]; then
     exit 1
 fi
 mkdir -p "$AVG_DIR"
+
+if [[ ! -f "${TOKENIZER_DIR}/tokenizer.model" ]]; then
+    echo "==> no tokenizer at ${TOKENIZER_DIR}; extracting from the donor"
+    mkdir -p "$TOKENIZER_DIR"
+    python3 - "$INIT_NEMO" "$TOKENIZER_DIR" <<'PYEOF'
+import os, sys, tarfile
+src, dst = sys.argv[1], sys.argv[2]
+with tarfile.open(src, "r:") as tf:
+    for m in tf.getmembers():
+        for want in ("tokenizer.model", "tokenizer.vocab", "vocab.txt"):
+            if m.name.endswith(want):
+                m.name = want
+                tf.extract(m, dst)
+assert os.path.isfile(os.path.join(dst, "tokenizer.model")), "no tokenizer.model in " + src
+print("    tokenizer ->", dst)
+PYEOF
+fi
 
 # Top-K by val_wer, read off the filenames the checkpoint callback writes.
 # `-last` and `-unfinished` are excluded: `-last` duplicates a scored checkpoint
