@@ -293,7 +293,12 @@ trainer:
   # fp32 master weights with bf16 compute. bf16-true kept optimizer state in
   # bf16 and produced nan in the large-vocabulary forced-alignment arm.
   precision: bf16-mixed
-  log_every_n_steps: 10
+  # Gates training_batch_wer, which runs a full greedy decode of the batch --
+  # by far the most expensive thing logged. 100 rather than 10 keeps the curve
+  # readable at a tenth of the cost and a tenth of the log volume.
+  # train_loss is unaffected in the forced-alignment arms: they log it every
+  # step, on the progress bar, so a collapse is still visible immediately.
+  log_every_n_steps: 100
   enable_progress_bar: true
   num_sanity_val_steps: 1
   check_val_every_n_epoch: 1
