@@ -10,7 +10,11 @@
 #
 # Averaging needs the model's architecture, which differs per arm (history
 # chunks, flexible delay), so the arm's own overrides are passed through to the
-# same training config the run used. The averaged .nemo records `target =
+# same training config the run used. Only train_ds is dropped -- it would build
+# the full Granary loader for nothing. validation_ds MUST be kept: transcribe()
+# uses it as the template for its temporary dataloader, and without it every
+# batch fails with "Key 'validation_ds' is not in struct" and the eval reports a
+# clean, complete-looking 100% WER. The averaged .nemo records `target =
 # EncDecCHATBPEModel`, so eval_nemotron.sh restores the right class with no
 # special-casing and every CHAT number stays comparable to the nemotron one.
 # ============================================================================
@@ -88,7 +92,7 @@ else
             +checkpoint_paths=\\\"[${CKPT_CSV}]\\\" \
             model.tokenizer.dir=${TOKENIZER_DIR} \
             ${ARM_MODEL_OVERRIDES:-} \
-            ~model.train_ds ~model.validation_ds ~model.test_ds \
+            ~model.train_ds \
             ~trainer.strategy \
             trainer.devices=1 trainer.accelerator=cpu trainer.precision=32 \
             trainer.num_nodes=1 trainer.logger=false trainer.enable_checkpointing=false
