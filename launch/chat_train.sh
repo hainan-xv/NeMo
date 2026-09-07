@@ -35,6 +35,10 @@
 #   DELAY_FRAMES             forced only: emit a word this many frames late
 #   RECOVER_WORDS            forced only: also score the previous chunk's last k words
 #   HISTORY_CHUNKS           joint attends over this many previous chunks ("win28" = 1)
+#   MAX_DELAY_FRAMES         flexible delay: sample d ~ U{0..MAX} per batch and
+#                            hide the last d frames of each chunk. 0 = off.
+#                            Needs HISTORY_CHUNKS >= 1.
+#   INFER_DELAY_FRAMES       latency to validate/decode at; null = MAX/2
 #   MAX_STEPS, LR, WARMUP_STEPS, EPOCH_STEPS   training schedule
 #   EXP_NAME                 results directory
 #   INIT_NEMO                encoder donor (.nemo)
@@ -76,6 +80,8 @@ LOSS_TYPE="${LOSS_TYPE:-rnnt}"
 DELAY_FRAMES="${DELAY_FRAMES:-0}"
 RECOVER_WORDS="${RECOVER_WORDS:-0}"
 HISTORY_CHUNKS="${HISTORY_CHUNKS:-0}"
+MAX_DELAY_FRAMES="${MAX_DELAY_FRAMES:-0}"
+INFER_DELAY_FRAMES="${INFER_DELAY_FRAMES:-null}"
 # The rnnt default keeps the name the pre-merge "standard CHAT" runs used. The
 # results directory is what exp_manager resumes from, so renaming it would
 # silently start job 13173232 over from step 0 on its next requeue instead of
@@ -127,6 +133,7 @@ read -r -d '' cmd <<EOF
 echo "*******STARTING********" \
 && echo "*** CHAT transducer (RNNTAttJoint), loss_type=${LOSS_TYPE} ***" \
 && echo "*** forced-alignment knobs: delay=${DELAY_FRAMES} recover=${RECOVER_WORDS} history_chunks=${HISTORY_CHUNKS} ***" \
+&& echo "*** flexible delay: max=${MAX_DELAY_FRAMES} (0=off, sampled per batch) inference=${INFER_DELAY_FRAMES} (null=max/2) ***" \
 && echo "*** warm start: encoder + prediction LSTM + joint.enc/pred from the donor ***" \
 && echo "*** left RANDOM: Q/K/V, joint_net, and the embedding (exclude=${INIT_EXCLUDE:-[prediction.embed]}) ***" \
 && echo "*** encoder init: ${INIT_NEMO} ***" \
@@ -164,6 +171,8 @@ print('    tokenizer ->', dst)
     model.tokenizer.dir=${TOKENIZER_DIR} \
     model.loss_type=${LOSS_TYPE} \
     model.forced_alignment.num_delay_frames=${DELAY_FRAMES} \
+    model.forced_alignment.max_delay_frames=${MAX_DELAY_FRAMES} \
+    model.forced_alignment.inference_delay_frames=${INFER_DELAY_FRAMES} \
     model.forced_alignment.recover_history_words=${RECOVER_WORDS} \
     model.joint.history_chunks=${HISTORY_CHUNKS} \
     model.optim.lr=${LR} \
