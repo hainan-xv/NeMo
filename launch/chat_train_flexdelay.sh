@@ -30,6 +30,8 @@
 # history_chunks = 1 is required: frames are being taken away, so the window must
 # reach back a chunk to leave enough to attend to.
 #
+# One learning rate for every parameter (1e-3), encoder included.
+#
 #   sbatch launch/chat_train_flexdelay.sh          <- no arguments, no environment to set
 #
 # Every setting that defines THIS model is written below. chat_train.sh holds
@@ -42,7 +44,11 @@ export DELAY_FRAMES=0
 export RECOVER_WORDS=0
 export HISTORY_CHUNKS=1
 export MAX_DELAY_FRAMES=4
-export EXP_NAME="${EXP_NAME:-granary2_chat_forced_asrvocab_flexdelay4}"
+# A NEW directory, not the flexdelay4 one. Those checkpoints were written with
+# a two-group optimizer (encoder at 0.1x); with a single group now,
+# optimizer.load_state_dict raises "loaded state dict has a different number of
+# parameter groups" and the resume dies on start.
+export EXP_NAME="${EXP_NAME:-granary2_chat_forced_asrvocab_flexdelay4_flatlr}"
 
 # Under sbatch $0 is a copy in Slurm's spool directory, so dirname "$0" has no
 # sibling chat_train.sh; SLURM_SUBMIT_DIR is where the sbatch was issued.
