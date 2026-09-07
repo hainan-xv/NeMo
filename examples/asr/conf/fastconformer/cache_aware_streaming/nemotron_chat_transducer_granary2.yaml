@@ -62,6 +62,18 @@ model:
     # it teaches the model to recover when its history is short, which is what
     # makes retract-style decoding legal at inference.
     recover_history_words: 0
+    # FLEXIBLE DELAY. 0 disables (fixed num_delay_frames above). When > 0, each
+    # batch draws d ~ U{0..max_delay_frames} and the joint additionally hides the
+    # last d frames of every chunk, so the model emits a chunk's words from
+    # exactly the audio that has arrived. d is therefore a LATENCY knob -- at d
+    # the model commits d frames before the chunk completes -- and training over
+    # the range gives one model usable at any latency in it.
+    #
+    # Needs joint.history_chunks >= 1: frames are being taken away, so the window
+    # must reach back a chunk to keep enough to attend to.
+    max_delay_frames: 0
+    # Latency to validate and decode at; defaults to half the range.
+    inference_delay_frames: null
     # Seconds per ENCODER frame; defaults to window_stride * subsampling_factor.
     frame_length_in_secs: null
 

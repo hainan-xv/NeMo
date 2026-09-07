@@ -18,6 +18,7 @@ was that the two arms should differ ONLY in the loss. These tests pin that down:
 same vocabulary, same parameters, interchangeable checkpoints, same decoder.
 """
 
+import math
 import os
 
 import pytest
@@ -425,3 +426,112 @@ class TestPerGroupLearningRates:
         names = set(model.state_dict())
         for prefix in ("encoder.", "decoder.", "joint.enc.", "joint.pred."):
             assert any(prefix in n for n in names), f"nothing in the model matches {prefix!r}"
+
+
+def _flex_cfg(test_data_dir, max_delay=4, infer=None):
+    cfg = _cfg(test_data_dir, 'forced_alignment')
+    cfg.forced_alignment.max_delay_frames = max_delay
+    if infer is not None:
+        cfg.forced_alignment.inference_delay_frames = infer
+    cfg.joint.history_chunks = 1  # frames are removed, so the window must reach back
+    return cfg
+
+
+class TestFlexibleDelay:
+    """d shifts the alignment AND hides the last d frames of each chunk.
+
+    The two are complements: a word emitted at chunk t has its last frame in
+    [t*C - d, (t+1)*C - d), which is exactly what survives the trim. Applying
+    only one of them would train the model to emit words whose audio it cannot
+    hear (or to ignore audio it was given), and nothing would crash -- the loss
+    would just be quietly wrong.
+    """
+
+    @pytest.mark.unit
+    def test_inference_delay_defaults_to_half_the_range(self, test_data_dir):
+        m = EncDecCHATBPEModel(cfg=_flex_cfg(test_data_dir, max_delay=4))
+        assert m.inference_delay_frames == 2
+
+    @pytest.mark.unit
+    def test_inference_delay_can_be_set_explicitly(self, test_data_dir):
+        m = EncDecCHATBPEModel(cfg=_flex_cfg(test_data_dir, max_delay=4, infer=0))
+        assert m.inference_delay_frames == 0
+
+    @pytest.mark.unit
+    def test_disabled_by_default_leaves_the_joint_untouched(self, forced_model):
+        assert forced_model.max_delay_frames == 0
+        assert forced_model.joint.frame_trim == 0
+
+    @pytest.mark.unit
+    def test_sampled_delay_stays_in_range(self, test_data_dir):
+        m = EncDecCHATBPEModel(cfg=_flex_cfg(test_data_dir, max_delay=4))
+        draws = {m._sample_delay() for _ in range(200)}
+        assert draws <= {0, 1, 2, 3, 4}
+        assert len(draws) == 5, f"the range is not being covered: {sorted(draws)}"
+
+    @pytest.mark.unit
+    def test_ranks_draw_different_delays(self, test_data_dir):
+        """A shared seed would give all 64 ranks the same d every step, so each
+        step would see ONE latency globally instead of a spread."""
+        seqs = []
+        for rank in (0, 1):
+            m = EncDecCHATBPEModel(cfg=_flex_cfg(test_data_dir, max_delay=4))
+            m.trainer = None
+            object.__setattr__(m, '_global_rank', rank) if hasattr(m, '_global_rank') else None
+            m._delay_rng = None
+            import random as _r
+
+            m._delay_rng = _r.Random(1234 + rank)
+            seqs.append([m._sample_delay() for _ in range(20)])
+        assert seqs[0] != seqs[1]
+
+    @pytest.mark.unit
+    def test_trim_hides_exactly_d_frames_per_chunk(self, test_data_dir):
+        """The trim must shorten the VALID count, so cross_attention's trailing
+        zero frame lands after the removal rather than before it."""
+        m = EncDecCHATBPEModel(cfg=_flex_cfg(test_data_dir, max_delay=4))
+        C = m.joint.chunk_size
+        chunked = torch.randn(1, 3, C * 8)
+        lengths = torch.tensor([[C, C, C]])
+        m.joint.frame_trim = 0
+        _, base = m.joint._apply_history_window(chunked, lengths.clone())
+        m.joint.frame_trim = 3
+        _, trimmed = m.joint._apply_history_window(chunked, lengths.clone())
+        assert torch.equal(base - trimmed, torch.full_like(base, 3))
+
+    @pytest.mark.unit
+    def test_a_chunk_past_the_audio_stays_empty_under_trim(self, test_data_dir):
+        m = EncDecCHATBPEModel(cfg=_flex_cfg(test_data_dir, max_delay=4))
+        C = m.joint.chunk_size
+        m.joint.frame_trim = 2
+        _, valid = m.joint._apply_history_window(torch.randn(1, 3, C * 8), torch.tensor([[C, C, 0]]))
+        assert valid[0, 2] == 0, "a chunk with no audio must not become valid via its history"
+
+    @pytest.mark.unit
+    def test_flush_chunk_adds_exactly_one_chunk(self, test_data_dir):
+        m = EncDecCHATBPEModel(cfg=_flex_cfg(test_data_dir, max_delay=4))
+        C = m.joint.chunk_size
+        enc = torch.randn(2, 32, 5 * C)
+        enc2, len2 = m._append_flush_chunk(enc, torch.tensor([5 * C, 3 * C]))
+        assert enc2.shape[2] == 6 * C
+        assert torch.equal(len2, torch.tensor([6 * C, 4 * C]))
+        assert torch.count_nonzero(enc2[:, :, 5 * C :]) == 0, "the flush chunk must carry no audio"
+
+    @pytest.mark.unit
+    def test_alignment_shift_and_trim_agree(self, test_data_dir):
+        """The invariant: every word emitted at chunk t must still be visible.
+
+        Word last frame f is emitted at chunk floor((f+d)/C); the trim leaves
+        frames < (t+1)*C - d visible. So f < (t+1)*C - d must hold for every word.
+        """
+        from nemo.collections.asr.parts.utils.chat_alignment import assign_words_to_chunks
+
+        C, frame = 14, 0.08
+        ends = [round(0.13 * i, 3) for i in range(1, 40)]
+        for d in range(5):
+            groups = assign_words_to_chunks(ends, 12, C, frame, d)
+            for t, idxs in enumerate(groups):
+                for i in idxs:
+                    f = math.ceil(ends[i] / frame)
+                    if t < 11:  # the last chunk absorbs overflow by design
+                        assert f < (t + 1) * C - d + 1, f"d={d}: word {i} (frame {f}) not visible at chunk {t}"

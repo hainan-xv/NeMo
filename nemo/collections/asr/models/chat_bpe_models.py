@@ -40,6 +40,7 @@ The forced path is built from the word timings the Granary cuts already carry in
 ``return_cuts=True`` on the ordinary Lhotse BPE dataset.
 """
 
+import random
 import re
 from typing import Dict, List, Optional
 
@@ -83,6 +84,20 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
         self.frame_length_in_secs = float(
             fa.get("frame_length_in_secs", None) or cfg.preprocessor.window_stride * cfg.encoder.subsampling_factor
         )
+
+        # FLEXIBLE DELAY. When > 0, each batch draws d ~ U{0..max_delay_frames}
+        # and (a) shifts the alignment by d, (b) hides the last d frames of every
+        # chunk from the joint. The two are exact complements, so the model emits
+        # a chunk's words using exactly the audio that has arrived -- which makes
+        # d a LATENCY knob: at d frames it commits d frames before the chunk
+        # completes. Training over the range yields one model usable at any
+        # latency in it, instead of one model per latency.
+        self.max_delay_frames = int(fa.get("max_delay_frames", 0) or 0)
+        # Latency to decode at. Half the range by default: the middle of what the
+        # model was trained on rather than either extreme.
+        infer = fa.get("inference_delay_frames", None)
+        self.inference_delay_frames = int(infer) if infer is not None else self.max_delay_frames // 2
+        self._delay_rng: Optional[random.Random] = None
 
         self._ws_ids: Optional[frozenset] = None
         # Set only while the TRAINING loader is being built: the forced loss
@@ -161,6 +176,45 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
         logging.info(f"lr_multipliers: {len(rest)} remaining tensors -> base lr {base_lr:.2e}")
         self._optimizer_param_groups = groups
 
+    def on_validation_epoch_start(self):
+        # Decode at the configured latency, never at whatever d the last training
+        # batch happened to draw -- val_wer must mean one fixed operating point.
+        self.joint.frame_trim = self.inference_delay_frames if self.max_delay_frames > 0 else 0
+        return super().on_validation_epoch_start()
+
+    def on_test_epoch_start(self):
+        self.joint.frame_trim = self.inference_delay_frames if self.max_delay_frames > 0 else 0
+        return super().on_test_epoch_start()
+
+    # ------------------------------------------------------- flexible delay
+
+    def _sample_delay(self) -> int:
+        """One delay for the whole batch, drawn independently per rank.
+
+        Seeding by global rank matters: with a shared seed all 64 ranks would
+        draw the SAME d every step, so each step would see one latency across
+        the entire global batch instead of a spread over the range.
+        """
+        if self.max_delay_frames <= 0:
+            return self.num_delay_frames
+        if self._delay_rng is None:
+            self._delay_rng = random.Random(1234 + int(self.global_rank))
+        return self._delay_rng.randint(0, self.max_delay_frames)
+
+    def _append_flush_chunk(self, encoded, encoded_len):
+        """One all-zero chunk on the end, so trimmed-off words still get emitted.
+
+        With d > 0 the last d frames of the final chunk are hidden, so any word
+        ending in them has no chunk left to be emitted from and would otherwise
+        be folded backwards into a chunk that cannot see it. An extra chunk gives
+        those words somewhere to go; it carries no audio of its own, but with
+        history_chunks >= 1 it still attends to the real frames behind it, which
+        is what it needs to flush them.
+        """
+        b, d_model, _ = encoded.shape
+        pad = encoded.new_zeros(b, d_model, self.joint.chunk_size)
+        return torch.cat([encoded, pad], dim=2), encoded_len + self.joint.chunk_size
+
     # -------------------------------------------------------- forced path
 
     def _word_start_ids(self) -> frozenset:
@@ -183,7 +237,7 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
             self._ws_ids = frozenset(ids)
         return self._ws_ids
 
-    def _chunk_tokens(self, cut, n_chunks: int) -> List[List[int]]:
+    def _chunk_tokens(self, cut, n_chunks: int, delay: Optional[int] = None) -> List[List[int]]:
         """Tokens each chunk is responsible for, one list per chunk.
 
         The text comes from the ORIGINAL transcript, sliced by where each
@@ -201,21 +255,21 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
             n_chunks,
             self.joint.chunk_size,
             self.frame_length_in_secs,
-            self.num_delay_frames,
+            self.num_delay_frames if delay is None else delay,
         )
         # Each chunk is tokenized on its own, with NO leading space: the
         # tokenizer's dummy prefix already marks the word start, while an
         # explicit space becomes a standalone piece the model then has to emit.
         return [self.tokenizer.text_to_ids(t) if t else [] for t in chunk_texts(groups, words, transcript)]
 
-    def _build_batch_path(self, cuts, n_chunks: torch.Tensor, device):
+    def _build_batch_path(self, cuts, n_chunks: torch.Tensor, device, delay: Optional[int] = None):
         """Assemble (b, t, u, labels) and the prediction-network input."""
         blank = self.joint.num_classes_with_blank - 1
         ws = self._word_start_ids() if self.recover_history_words > 0 else None
 
         b_all, t_all, u_all, lab_all, preds = [], [], [], [], []
         for b, cut in enumerate(cuts):
-            chunks = self._chunk_tokens(cut, int(n_chunks[b]))
+            chunks = self._chunk_tokens(cut, int(n_chunks[b]), delay)
             starts = [[i for i, t in enumerate(c) if i == 0 or t in ws] for c in chunks] if ws else None
             t_idx, u_idx, labels = build_forced_path(chunks, blank, self.recover_history_words, starts)
             b_all += [b] * len(t_idx)
@@ -230,13 +284,22 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
         return as_t(b_all), as_t(t_all), as_t(u_all), as_t(lab_all), pred_input, pred_lens.to(device)
 
     def _forced_alignment_loss(self, encoded, encoded_len, cuts) -> torch.Tensor:
+        # ONE delay per batch. It has to reach BOTH the alignment shift and the
+        # joint's window trim: they are complements, and applying either alone
+        # would train the model to emit words it cannot hear, or to ignore audio
+        # it has been given.
+        delay = self._sample_delay()
+        self.joint.frame_trim = delay
+        if delay > 0:
+            encoded, encoded_len = self._append_flush_chunk(encoded, encoded_len)
+
         # Chunk counts come from the ACTUAL encoder output, not from the
         # duration, so the two sides cannot disagree about the tail chunk.
         chunk_size = self.joint.chunk_size
         n_chunks = torch.div(encoded_len + chunk_size - 1, chunk_size, rounding_mode="floor")
 
         b_idx, t_idx, u_idx, labels, pred_input, pred_lens = self._build_batch_path(
-            cuts, n_chunks.cpu(), encoded.device
+            cuts, n_chunks.cpu(), encoded.device, delay
         )
 
         if labels.numel() == 0:

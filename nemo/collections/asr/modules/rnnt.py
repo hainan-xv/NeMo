@@ -1915,6 +1915,9 @@ class RNNTAttJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMix
         # Frames the joint may ATTEND to, beyond the chunk it is emitting for.
         # 0 = standard CHAT. See _apply_history_window.
         self.history_chunks = int(history_chunks)
+        # Frames of the CURRENT chunk to treat as not-yet-arrived. Set per batch
+        # by the flexible-delay recipe; 0 leaves the joint exactly as it was.
+        self.frame_trim = 0
 
         self._vocab_size = num_classes
         self._num_extra_outputs = num_extra_outputs
@@ -2031,6 +2034,21 @@ class RNNTAttJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMix
         The valid frames are kept as a PREFIX of the window, which is what the
         attention mask assumes: it masks positions >= a single per-chunk count.
         """
+        # FLEXIBLE-DELAY TRIM. `frame_trim` frames of each chunk are treated as
+        # NOT YET ARRIVED: dropping them from the valid count is what makes the
+        # model emit before a chunk completes. It is done by shortening `sizes`
+        # rather than by slicing, so cross_attention's trailing zero frame lands
+        # immediately after the surviving frames -- the zero is appended AFTER
+        # the removal, not before it.
+        #
+        # `orig` is kept because a chunk whose own frames are entirely trimmed
+        # still exists and must still be able to attend to its history; only a
+        # chunk past the end of the audio is truly empty.
+        orig_lengths = chunk_lengths
+        d = int(getattr(self, "frame_trim", 0))
+        if d > 0:
+            chunk_lengths = (chunk_lengths - d).clamp(min=0)
+
         M = self.history_chunks
         if M <= 0:
             return chunked, chunk_lengths
@@ -2054,7 +2072,7 @@ class RNNTAttJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMix
         valid = hist.view(1, T) + chunk_lengths
         # A chunk past the end of the audio stays empty -- it has no target and
         # must not become "valid" merely because history sits in front of it.
-        valid = torch.where(chunk_lengths > 0, valid, torch.zeros_like(valid))
+        valid = torch.where(orig_lengths > 0, valid, torch.zeros_like(valid))
         return windowed, valid
 
     def chunk_encoder_for_decoding(
