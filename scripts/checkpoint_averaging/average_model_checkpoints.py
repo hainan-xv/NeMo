@@ -27,12 +27,11 @@
 # limitations under the License.
 
 """
-# Changes to script
-Change the script to import the NeMo model class you would like to load a checkpoint for,
-then update the model constructor to use this model class. This can be found by the line:
-<<< Change model class here ! >>>
-By default, this script imports and creates the `EncDecCTCModelBPE` class but it can be
-changed to any NeMo Model.
+# Choosing the model class
+Pass `+model_class=<full import path>` to build any NeMo model, e.g.
+`+model_class=nemo.collections.asr.models.EncDecRNNTBPEModel`. Defaults to
+`EncDecCTCModelBPE`. Alternatively edit the constructor at the line
+`<<< Change model class here ! >>>`.
 # Run the script
 ## Saving a .nemo model file (loaded with ModelPT.restore_from(...))
 HYDRA_FULL_ERROR=1 python average_model_checkpoints.py \
@@ -60,7 +59,7 @@ from omegaconf import OmegaConf, open_dict
 # Change this import to the model you would like to average
 from nemo.collections.asr.models import EncDecCTCModelBPE
 from nemo.core.config import hydra_runner
-from nemo.utils import logging
+from nemo.utils import logging, model_utils
 
 
 def process_config(cfg: OmegaConf):
@@ -114,10 +113,15 @@ def main(cfg):
     if not save_ckpt_only:
         trainer = pl.Trainer(**cfg.trainer)
 
-        # <<< Change model class here ! >>>
-        # Model architecture which will contain the averaged checkpoints
-        # Change the model constructor to the one you would like (if needed)
-        model = EncDecCTCModelBPE(cfg=cfg.model, trainer=trainer)
+        # Model architecture which will contain the averaged checkpoints.
+        # Either pass `+model_class=<import path>` (preferred -- no edit needed,
+        # and the averaged .nemo then records the right `target` so
+        # ModelPT.restore_from rebuilds the same class), or change the default
+        # below. <<< Change model class here ! >>>
+        model_class = cfg.get('model_class', None)
+        cls = model_utils.import_class_by_path(model_class) if model_class else EncDecCTCModelBPE
+        logging.info(f"Building the averaged model as {cls.__name__}")
+        model = cls(cfg=cfg.model, trainer=trainer)
 
     """ < Checkpoint Averaging Logic > """
     # load state dicts
