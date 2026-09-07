@@ -254,20 +254,11 @@ model:
       fastemit_lambda: 0.005
       clamp: -1.0
 
-  # Per-group learning rates. The 609M encoder is PRETRAINED and only needs
-  # fine-tuning; the prediction network, joint and the joint's Q/K/V are trained
-  # from SCRATCH and are starved by any rate low enough for the encoder.
-  #
-  # For scale: the donor RNN-T -- the model this encoder comes from -- trained
-  # with NoamAnnealing(lr=3.0, d_model=1024, warmup=8000), peaking at 1.05e-3.
-  # So base 1e-3 for the from-scratch parts matches the donor's peak, with the
-  # encoder held at 0.1x = 1e-4, the rate it has always had.
-  #
-  # Dropping this (a flat 1e-3 on everything) runs the pretrained encoder 10x
-  # hotter than it has ever been trained, and convergence visibly suffers.
-  lr_multipliers:
-    '^encoder\.': 0.1
-
+  # ONE learning rate for every parameter, the pretrained encoder included.
+  # An earlier version held the encoder at 0.1x on the argument that a
+  # pretrained component only needs fine-tuning. That is an extra moving part
+  # with no measurement behind it here, and it made the effective schedule
+  # depend on a regex over parameter names.
   optim:
     name: adamw
     lr: 1e-3

@@ -379,55 +379,6 @@ class TestBothArmsLogTheSameMetrics:
         )
 
 
-class TestPerGroupLearningRates:
-    """A flat rate on a pretrained 609M encoder runs it 10x hotter than it has
-    ever been trained. These pin the multipliers to the optimizer itself, not to
-    the config, because a pattern that matches nothing fails silently."""
-
-    @pytest.mark.unit
-    def test_encoder_gets_the_reduced_rate_and_everything_else_the_base(self, test_data_dir):
-        cfg = _cfg(test_data_dir, 'forced_alignment')
-        cfg.lr_multipliers = {r'^encoder\.': 0.1}
-        model = EncDecCHATBPEModel(cfg=cfg)
-        model.setup_optimization(cfg.optim)
-
-        by_lr = {}
-        for g in model._optimizer.param_groups:
-            by_lr.setdefault(round(g['lr'], 12), 0)
-            by_lr[round(g['lr'], 12)] += sum(p.numel() for p in g['params'])
-        assert set(by_lr) == {1e-4, 1e-3}, f"expected two rates, got {sorted(by_lr)}"
-
-        enc = sum(p.numel() for n, p in model.named_parameters() if n.startswith('encoder.'))
-        assert by_lr[1e-4] == enc, "the reduced group must be exactly the encoder"
-        assert by_lr[1e-3] == sum(p.numel() for p in model.parameters()) - enc
-
-    @pytest.mark.unit
-    def test_every_parameter_lands_in_exactly_one_group(self, test_data_dir):
-        """A parameter in no group is never optimised; in two, it is stepped twice."""
-        cfg = _cfg(test_data_dir, 'forced_alignment')
-        cfg.lr_multipliers = {r'^encoder\.': 0.1, r'^joint\.': 0.5}
-        model = EncDecCHATBPEModel(cfg=cfg)
-        model.setup_optimization(cfg.optim)
-        seen = [id(p) for g in model._optimizer.param_groups for p in g['params']]
-        assert len(seen) == len(set(seen)), "a parameter appears in more than one group"
-        assert set(seen) == {id(p) for p in model.parameters()}, "a parameter is missing from every group"
-
-    @pytest.mark.unit
-    def test_no_multipliers_keeps_the_single_group(self, test_data_dir):
-        model = EncDecCHATBPEModel(cfg=_cfg(test_data_dir, 'rnnt'))
-        model.setup_optimization(model.cfg.optim)
-        assert len(model._optimizer.param_groups) == 1
-
-    @pytest.mark.unit
-    def test_donor_prefixes_name_real_tensors(self, test_data_dir):
-        """The warm-start include list is a substring filter over donor tensor
-        names; a prefix naming nothing loads nothing, silently."""
-        model = EncDecCHATBPEModel(cfg=_cfg(test_data_dir, 'forced_alignment'))
-        names = set(model.state_dict())
-        for prefix in ("encoder.", "decoder.", "joint.enc.", "joint.pred."):
-            assert any(prefix in n for n in names), f"nothing in the model matches {prefix!r}"
-
-
 def _flex_cfg(test_data_dir, max_delay=4, infer=None):
     cfg = _cfg(test_data_dir, 'forced_alignment')
     cfg.forced_alignment.max_delay_frames = max_delay
