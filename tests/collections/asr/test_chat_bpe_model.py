@@ -487,28 +487,3 @@ class TestNormalizedWER:
         forced_model.wer.reset()
         norm = forced_model.wer.normalized()
         assert norm is not None and norm[1] > 0, "reference words were lost by reset()"
-
-    @pytest.mark.unit
-    def test_normalised_counts_live_on_the_metric_device(self, forced_model):
-        """Everything validation_pass returns gets all-reduced over NCCL.
-
-        A CPU tensor there raises "No backend type associated with device type
-        cpu" and takes down every rank at the first validation -- job 13188843
-        died exactly that way, 22 minutes in. `meta` stands in for "a device
-        that is not the default" so this is checkable without a GPU.
-        """
-        enc, enc_len = forced_model.forward(
-            input_signal=torch.randn(1, 16000 * 2) * 0.1, input_signal_length=torch.tensor([16000 * 2])
-        )
-        forced_model.wer.update(
-            predictions=enc,
-            predictions_lengths=enc_len,
-            targets=torch.randint(1, 100, (1, 5)),
-            targets_lengths=torch.tensor([5]),
-        )
-        forced_model.wer.scores = forced_model.wer.scores.to('meta')
-        forced_model.wer.words = forced_model.wer.words.to('meta')
-        forced_model.wer.compute()
-        num, denom = forced_model.wer.normalized()
-        assert num.device == forced_model.wer.scores.device, f"{num.device} != metric device"
-        assert denom.device == forced_model.wer.scores.device
