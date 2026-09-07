@@ -131,7 +131,11 @@ def main(cfg):
     logging.info(f"Averaging {n} checkpoints ...")
 
     for ix, path in enumerate(checkpoint_paths):
-        checkpoint = torch.load(path, map_location='cpu')
+        # weights_only=False: PyTorch 2.6 flipped the default to True, which
+        # refuses any Lightning checkpoint (they pickle the hyper-parameters and
+        # callback state alongside the tensors). These are checkpoints this same
+        # training run wrote, so there is no untrusted input here.
+        checkpoint = torch.load(path, map_location='cpu', weights_only=False)
 
         if 'state_dict' in checkpoint:
             checkpoint = checkpoint['state_dict']
