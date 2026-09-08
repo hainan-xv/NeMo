@@ -596,3 +596,69 @@ class TestBandedLossInTheModel:
         c.train_ds = _train_ds_cfg(tmp_path)
         m = EncDecCHATBPEModel(cfg=c)
         assert len(next(iter(m._train_dl))) == 5, "banded needs the cuts for their alignments"
+
+
+class TestNoDeletionsAtTheAudioEnd:
+    """The trim hides the last d frames of EVERY chunk, and the final chunk has
+    no successor to recover them from -- so without a flush chunk the last d
+    frames of an utterance are visible to nothing and whatever was spoken in
+    them cannot be emitted. Padded audio hides this (training and the
+    leaderboard eval both pad 0.5 s); a raw file does not.
+    """
+
+    @staticmethod
+    def _visible_own_frames(model, enc_len):
+        """Real frames of audio reachable by at least one chunk."""
+        enc = torch.randn(1, 32, enc_len)
+        _, n_chunks, cl = model.joint.chunk_encoder_for_decoding(enc, torch.tensor([enc_len]))
+        c = model.joint.chunk_size
+        hist = model.joint.history_chunks
+        # valid = min(t, hist) * C + own-chunk frames, so subtract the history part
+        own = []
+        for t in range(int(n_chunks[0])):
+            own.append(max(int(cl[0, t]) - min(t, hist) * c, 0))
+        return sum(own)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("extra", [0, 1, 3, 9, 13])
+    def test_every_real_frame_stays_reachable(self, test_data_dir, extra):
+        cfg = _flex_cfg(test_data_dir, max_delay=4)
+        cfg.loss_type = 'rnnt'
+        model = EncDecCHATBPEModel(cfg=cfg)
+        model.eval()
+        c = model.joint.chunk_size
+        enc_len = c * 5 + extra
+
+        model.joint.frame_trim = 0
+        baseline = self._visible_own_frames(model, enc_len)
+        model.joint.frame_trim = model.inference_delay_frames
+        trimmed = self._visible_own_frames(model, enc_len)
+
+        assert trimmed >= baseline, (
+            f"enc_len={enc_len}: trimming hid {baseline - trimmed} real frames with no chunk to recover them"
+        )
+
+    @pytest.mark.unit
+    def test_the_flush_chunk_appears_only_when_trimming(self, test_data_dir):
+        cfg = _flex_cfg(test_data_dir, max_delay=4)
+        cfg.loss_type = 'rnnt'
+        model = EncDecCHATBPEModel(cfg=cfg)
+        model.eval()
+        c = model.joint.chunk_size
+        enc = torch.randn(1, 32, c * 5)
+
+        model.joint.frame_trim = 0
+        _, n0, _ = model.joint.chunk_encoder_for_decoding(enc, torch.tensor([c * 5]))
+        model.joint.frame_trim = 2
+        _, n2, _ = model.joint.chunk_encoder_for_decoding(enc, torch.tensor([c * 5]))
+        assert int(n2[0]) == int(n0[0]) + 1, "trimming must add exactly one flush chunk"
+
+    @pytest.mark.unit
+    def test_untrimmed_decoding_is_completely_unchanged(self, forced_model):
+        """A model that never trims must chunk exactly as it did before."""
+        c = forced_model.joint.chunk_size
+        enc = torch.randn(2, 32, c * 4 + 5)
+        lens = torch.tensor([c * 4 + 5, c * 3])
+        assert forced_model.joint.frame_trim == 0
+        chunked, n, cl = forced_model.joint.chunk_encoder_for_decoding(enc, lens)
+        assert int(n[0]) == 5 and int(n[1]) == 3

@@ -2094,6 +2094,24 @@ class RNNTAttJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMix
                 - num_chunks: [B] number of valid chunks per utterance
                 - chunk_frame_lengths: [B, num_chunks] valid frames per chunk
         """
+        # FLUSH CHUNK. With frame_trim > 0 the last d frames of EVERY chunk are
+        # hidden. Mid-utterance that is harmless -- a frame hidden from chunk t
+        # reappears in chunk t+1's window -- but the final chunk has no
+        # successor, so the utterance's last d frames would never be visible to
+        # any chunk and anything spoken in them could not be emitted. That is a
+        # deletion at the end of every utterance, invisible on padded audio
+        # (training and the leaderboard eval both pad 0.5 s) and plainly wrong on
+        # a raw file.
+        #
+        # One extra all-zero chunk gives those frames a successor to be read
+        # from. It carries no audio itself, but with history_chunks >= 1 it
+        # attends to the real frames behind it, which is what it needs to flush
+        # them. Mirrors what the forced-alignment training path already does.
+        if int(getattr(self, "frame_trim", 0)) > 0:
+            pad = encoded.new_zeros(encoded.shape[0], encoded.shape[1], self.chunk_size)
+            encoded = torch.cat([encoded, pad], dim=2)
+            encoded_len = encoded_len + self.chunk_size
+
         chunked, chunk_lengths = chunk_concat_audio(encoded.transpose(1, 2), encoded_len, self.chunk_size)
         num_chunks = (chunk_lengths != 0).sum(dim=1)
         # Widen here so the single chunk the greedy loop slices out already
