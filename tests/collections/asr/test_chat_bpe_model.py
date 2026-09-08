@@ -127,7 +127,7 @@ def _with_stub_trainer(model):
     """
     from types import SimpleNamespace
 
-    model._trainer = SimpleNamespace(global_step=0, log_every_n_steps=1)
+    model._trainer = SimpleNamespace(global_step=0, log_every_n_steps=1, global_rank=0, world_size=1)
     return model
 
 
@@ -486,3 +486,38 @@ class TestFlexibleDelay:
                     f = math.ceil(ends[i] / frame)
                     if t < 11:  # the last chunk absorbs overflow by design
                         assert f < (t + 1) * C - d + 1, f"d={d}: word {i} (frame {f}) not visible at chunk {t}"
+
+    @pytest.mark.unit
+    def test_the_rnnt_arm_also_trims(self, test_data_dir, tmp_path, monkeypatch):
+        """The marginalised arm must sample and apply d too.
+
+        It delegates to the parent's training_step, so the trim has to be set
+        before that call or the flexible-delay setting is silently a no-op for
+        this loss -- the run trains normally and simply is not the model asked
+        for.
+        """
+        cfg = _flex_cfg(test_data_dir, max_delay=4)
+        cfg.loss_type = 'rnnt'
+        cfg.train_ds = _train_ds_cfg(tmp_path)
+        model = _with_stub_trainer(EncDecCHATBPEModel(cfg=cfg))
+        model._optimizer = torch.optim.SGD(model.parameters(), lr=1e-3)
+        monkeypatch.setattr(type(model), 'log', lambda self, k, v, **kw: None, raising=False)
+        monkeypatch.setattr(type(model), 'log_dict', lambda self, d, **kw: None, raising=False)
+
+        seen = set()
+        for _ in range(40):
+            model.training_step(next(iter(model._train_dl)), 0)
+            seen.add(model.joint.frame_trim)
+        assert seen <= {0, 1, 2, 3, 4}
+        assert len(seen) > 1, f"frame_trim never varied: {seen}"
+
+    @pytest.mark.unit
+    def test_the_rnnt_arm_leaves_the_trim_alone_when_disabled(self, test_data_dir, tmp_path, monkeypatch):
+        cfg = _cfg(test_data_dir, 'rnnt')
+        cfg.train_ds = _train_ds_cfg(tmp_path)
+        model = _with_stub_trainer(EncDecCHATBPEModel(cfg=cfg))
+        model._optimizer = torch.optim.SGD(model.parameters(), lr=1e-3)
+        monkeypatch.setattr(type(model), 'log', lambda self, k, v, **kw: None, raising=False)
+        monkeypatch.setattr(type(model), 'log_dict', lambda self, d, **kw: None, raising=False)
+        model.training_step(next(iter(model._train_dl)), 0)
+        assert model.joint.frame_trim == 0

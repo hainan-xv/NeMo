@@ -280,6 +280,17 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
         comparison this model exists to support impossible.
         """
         if self.loss_type != "forced_alignment":
+            # The window trim applies to the marginalised loss too, and means the
+            # same thing: the last d frames of each chunk have not arrived yet.
+            # There is no alignment to shift here -- the RNN-T loss chooses its
+            # own emission points, so hiding the frames is the whole mechanism.
+            #
+            # No flush chunk is needed either. Mid-utterance the trimmed frames
+            # simply reappear in the next chunk's window; only the final chunk's
+            # trailing d frames are never seen, and with pad_extra_duration 0.5 s
+            # (~6 frames) those are silence padding for any d <= 4.
+            if self.max_delay_frames > 0:
+                self.joint.frame_trim = self._sample_delay()
             return super().training_step(batch, batch_nb)
 
         if AccessMixin.is_access_enabled(self.model_guid):
