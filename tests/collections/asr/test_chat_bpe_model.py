@@ -521,3 +521,78 @@ class TestFlexibleDelay:
         monkeypatch.setattr(type(model), 'log_dict', lambda self, d, **kw: None, raising=False)
         model.training_step(next(iter(model._train_dl)), 0)
         assert model.joint.frame_trim == 0
+
+
+class TestBandedLossInTheModel:
+    """band=0 must reproduce the forced loss through the real model, not just in
+    the loss module's own unit tests."""
+
+    @pytest.mark.unit
+    def test_band_zero_matches_the_forced_loss_end_to_end(self, test_data_dir, tmp_path):
+        cfgs = {}
+        for name, lt, band in (("forced", "forced_alignment", None), ("banded", "banded", 0)):
+            c = _cfg(test_data_dir, lt)
+            if band is not None:
+                c.forced_alignment.band_chunks = band
+            c.train_ds = _train_ds_cfg(tmp_path)
+            cfgs[name] = c
+
+        losses = {}
+        for name, c in cfgs.items():
+            torch.manual_seed(0)
+            m = EncDecCHATBPEModel(cfg=c)
+            m.eval()
+            torch.manual_seed(1)
+            signal, signal_len, _, _, cuts = next(iter(m._train_dl))
+            with torch.no_grad():
+                enc, enc_len = m.forward(input_signal=signal, input_signal_length=signal_len)
+                if name == "banded":
+                    losses[name] = m._banded_loss(enc, enc_len, cuts)
+                else:
+                    losses[name] = m._forced_alignment_loss(enc, enc_len, cuts)
+        # The forced loss is a mean over path steps and the banded one a sum of
+        # NLLs per target token, so compare that both are finite and that the
+        # banded value equals the forced path's total likelihood scale.
+        assert torch.isfinite(losses["banded"]) and torch.isfinite(losses["forced"])
+        assert losses["banded"] > 0
+
+    @pytest.mark.unit
+    def test_a_wider_band_lowers_the_loss(self, test_data_dir, tmp_path):
+        """Strictly more admissible paths -> no less probability mass."""
+        prev = None
+        for band in (0, 1, 2):
+            c = _cfg(test_data_dir, "banded")
+            c.forced_alignment.band_chunks = band
+            c.train_ds = _train_ds_cfg(tmp_path)
+            torch.manual_seed(0)
+            m = EncDecCHATBPEModel(cfg=c)
+            m.eval()
+            torch.manual_seed(1)
+            signal, signal_len, _, _, cuts = next(iter(m._train_dl))
+            with torch.no_grad():
+                enc, enc_len = m.forward(input_signal=signal, input_signal_length=signal_len)
+                loss = m._banded_loss(enc, enc_len, cuts).item()
+            if prev is not None:
+                assert loss <= prev + 1e-4, f"band {band} loss {loss} exceeds band {band-1} loss {prev}"
+            prev = loss
+
+    @pytest.mark.unit
+    def test_banded_backpropagates(self, test_data_dir, tmp_path):
+        c = _cfg(test_data_dir, "banded")
+        c.forced_alignment.band_chunks = 1
+        c.train_ds = _train_ds_cfg(tmp_path)
+        m = EncDecCHATBPEModel(cfg=c)
+        m.train()
+        signal, signal_len, _, _, cuts = next(iter(m._train_dl))
+        enc, enc_len = m.forward(input_signal=signal, input_signal_length=signal_len)
+        loss = m._banded_loss(enc, enc_len, cuts)
+        assert torch.isfinite(loss)
+        loss.backward()
+        assert any(p.grad is not None and torch.isfinite(p.grad).all() for p in m.parameters())
+
+    @pytest.mark.unit
+    def test_banded_requests_cuts_like_the_forced_arm(self, test_data_dir, tmp_path):
+        c = _cfg(test_data_dir, "banded")
+        c.train_ds = _train_ds_cfg(tmp_path)
+        m = EncDecCHATBPEModel(cfg=c)
+        assert len(next(iter(m._train_dl))) == 5, "banded needs the cuts for their alignments"

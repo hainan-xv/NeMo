@@ -25,7 +25,7 @@ speechlm2; the rules are identical to the ones validated there.
 import math
 from typing import List, Optional, Sequence, Tuple
 
-__all__ = ["assign_words_to_chunks", "build_forced_path", "word_spans", "chunk_texts"]
+__all__ = ["assign_words_to_chunks", "build_forced_path", "word_spans", "chunk_texts", "band_nodes"]
 
 
 def word_spans(words: Sequence[str], transcript: str) -> List[Optional[Tuple[int, int]]]:
@@ -171,3 +171,40 @@ def build_forced_path(
         labels.append(int(blank_id))
 
     return t_idx, u_idx, labels
+
+
+def band_nodes(tokens_per_chunk: Sequence[int], band: int) -> List[Tuple[int, int]]:
+    """Lattice nodes ``(t, u)`` within ``band`` chunks of the forced path.
+
+    The middle ground between the two losses. Conditioning on ONE alignment
+    scores ``U + T`` positions and trusts the aligner completely; the full RNN-T
+    lattice scores ``T * U`` and ignores it. This keeps the alignment as a PRIOR:
+    a word may be emitted up to ``band`` chunks earlier or later than the aligner
+    placed it, and the loss sums over every valid path in that band.
+
+    ``t`` indexes CHUNKS -- CHAT's loss already uses chunks as its time axis --
+    and ``u`` is the number of labels emitted, so ``u`` runs ``0..U``.
+
+    At chunk ``t`` the forced path occupies ``u`` in ``[S(t), S(t+1)]`` where
+    ``S`` is the cumulative token count. Widening by ``band`` chunks gives
+    ``[S(t-band), S(t+band+1)]``. So ``band=0`` returns exactly the forced path's
+    own nodes (``U + T`` of them) and the cost grows roughly linearly in
+    ``2*band + 1`` -- about 3x at ``band=1``, against ``T*U/(U+T)`` (an order of
+    magnitude more) for the full lattice.
+
+    Returns nodes grouped by ``t`` and ascending in ``u``.
+    """
+    T = len(tokens_per_chunk)
+    if T == 0:
+        return []
+    cum = [0]
+    for n in tokens_per_chunk:
+        cum.append(cum[-1] + int(n))
+
+    nodes: List[Tuple[int, int]] = []
+    for t in range(T):
+        u_lo = cum[max(0, t - band)]
+        u_hi = cum[min(T - 1, t + band) + 1]
+        for u in range(u_lo, u_hi + 1):
+            nodes.append((t, u))
+    return nodes

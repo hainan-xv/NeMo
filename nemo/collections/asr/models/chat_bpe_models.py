@@ -49,6 +49,7 @@ from lhotse.dataset.collation import collate_vectors
 from omegaconf import DictConfig
 
 from nemo.collections.asr.data.audio_to_text_lhotse import LhotseSpeechToTextBpeDataset
+from nemo.collections.asr.losses.banded_rnnt import BandedLattice, banded_rnnt_loss, build_lattices
 from nemo.collections.asr.models.rnnt_bpe_models import EncDecRNNTBPEModel
 from nemo.collections.asr.parts.utils.chat_alignment import assign_words_to_chunks, build_forced_path, chunk_texts
 from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
@@ -58,7 +59,7 @@ from nemo.utils import logging
 
 __all__ = ["EncDecCHATBPEModel"]
 
-LOSS_TYPES = ("rnnt", "forced_alignment")
+LOSS_TYPES = ("rnnt", "forced_alignment", "banded")
 
 
 class EncDecCHATBPEModel(EncDecRNNTBPEModel):
@@ -91,6 +92,9 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
         # d a LATENCY knob: at d frames it commits d frames before the chunk
         # completes. Training over the range yields one model usable at any
         # latency in it, instead of one model per latency.
+        # How many chunks a word may drift from where the aligner put it, when
+        # loss_type is "banded". 0 reproduces the forced loss exactly.
+        self.band_chunks = int(fa.get("band_chunks", 1))
         self.max_delay_frames = int(fa.get("max_delay_frames", 0) or 0)
         # Latency to decode at. Half the range by default: the middle of what the
         # model was trained on rather than either extreme.
@@ -106,9 +110,9 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
 
         super().__init__(cfg=cfg, trainer=trainer)
 
-        if self.loss_type == "forced_alignment":
+        if self.loss_type in ("forced_alignment", "banded"):
             logging.info(
-                f"CHAT forced-alignment loss: delay={self.num_delay_frames} frames, "
+                f"CHAT {self.loss_type} loss (band_chunks={self.band_chunks}): delay={self.num_delay_frames} frames, "
                 f"recover_history_words={self.recover_history_words}, "
                 f"frame_length={self.frame_length_in_secs:.4f}s, chunk_size={self.joint.chunk_size}"
             )
@@ -116,7 +120,7 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
     # ------------------------------------------------------------------ data
 
     def setup_training_data(self, train_data_config):
-        self._want_cuts = self.loss_type == "forced_alignment"
+        self._want_cuts = self.loss_type in ("forced_alignment", "banded")
         try:
             super().setup_training_data(train_data_config)
         finally:
@@ -230,6 +234,49 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
         as_t = lambda x: torch.tensor(x, dtype=torch.long, device=device)  # noqa: E731
         return as_t(b_all), as_t(t_all), as_t(u_all), as_t(lab_all), pred_input, pred_lens.to(device)
 
+    def _banded_loss(self, encoded, encoded_len, cuts) -> torch.Tensor:
+        """RNN-T forward summed over paths within ``band_chunks`` of the alignment.
+
+        Uses the same chunk assignment as the forced loss -- the alignment is the
+        band's centre -- but scores the NODES of a lattice rather than the steps
+        of one path, and sums their paths instead of taking the product along a
+        single one. ``joint_on_path`` already evaluates the joint at arbitrary
+        ``(b, t, u)`` triples, so the expensive part is shared unchanged.
+        """
+        chunk_size = self.joint.chunk_size
+        n_chunks = torch.div(encoded_len + chunk_size - 1, chunk_size, rounding_mode="floor").cpu()
+
+        chunks_per_utt = [self._chunk_tokens(cut, int(n_chunks[b])) for b, cut in enumerate(cuts)]
+        per_utt, num_chunks, target_lens = build_lattices(chunks_per_utt, self.band_chunks)
+        if sum(target_lens) == 0:
+            logging.warning(f"empty banded lattice at step {self.global_step}; contributing zero loss")
+            return encoded.sum() * 0.0
+
+        lattice = BandedLattice(per_utt, num_chunks, target_lens)
+        b_idx, t_idx, u_idx = lattice.index_tensors(encoded.device)
+
+        # Targets, and the prediction network run over them. u indexes emitted
+        # labels, exactly as in the forced path.
+        u_max = max(target_lens)
+        targets = torch.zeros((len(chunks_per_utt), max(u_max, 1)), dtype=torch.long, device=encoded.device)
+        for b, chunks in enumerate(chunks_per_utt):
+            flat = [tok for c in chunks for tok in c]
+            if flat:
+                targets[b, : len(flat)] = torch.tensor(flat, dtype=torch.long, device=encoded.device)
+        pred_lens = torch.tensor(target_lens, dtype=torch.long, device=encoded.device)
+
+        g, _, _ = self.decoder(targets=targets, target_length=pred_lens)
+        g = g.transpose(1, 2)
+
+        logits = self.joint.joint_on_path(encoded.transpose(1, 2), g, b_idx, t_idx, u_idx, encoded_len)
+        log_probs = logits.float().log_softmax(-1)
+
+        blank = self.joint.num_classes_with_blank - 1
+        nll = banded_rnnt_loss(log_probs, lattice, targets, blank)
+        # mean_volume: per target token, matching the rnnt arm's reduction so the
+        # two losses are on the same scale.
+        return nll.sum() / max(int(pred_lens.sum()), 1)
+
     def _forced_alignment_loss(self, encoded, encoded_len, cuts) -> torch.Tensor:
         # ONE delay per batch. It has to reach BOTH the alignment shift and the
         # joint's window trim: they are complements, and applying either alone
@@ -279,7 +326,7 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
         a WER that appeared for one arm and not the other would make exactly the
         comparison this model exists to support impossible.
         """
-        if self.loss_type != "forced_alignment":
+        if self.loss_type == "rnnt":
             # The window trim applies to the marginalised loss too, and means the
             # same thing: the last d frames of each chunk have not arrived yet.
             # There is no alignment to shift here -- the RNN-T loss chooses its
@@ -300,7 +347,10 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
         encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
         del signal
 
-        loss_value = self.add_auxiliary_losses(self._forced_alignment_loss(encoded, encoded_len, cuts))
+        if self.loss_type == "banded":
+            loss_value = self.add_auxiliary_losses(self._banded_loss(encoded, encoded_len, cuts))
+        else:
+            loss_value = self.add_auxiliary_losses(self._forced_alignment_loss(encoded, encoded_len, cuts))
 
         if AccessMixin.is_access_enabled(self.model_guid):
             AccessMixin.reset_registry(self)

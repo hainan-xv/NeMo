@@ -40,6 +40,11 @@ model:
   #                       timings the Granary cuts carry. Scores U+T positions
   #                       instead of T*U, which is what makes a large vocabulary
   #                       affordable.
+  #   banded           -- the middle ground: sum over every path that stays
+  #                       within forced_alignment.band_chunks chunks of the
+  #                       aligner's, so the alignment is a prior rather than a
+  #                       constraint. About 2.2x the forced cost at band 1, and
+  #                       an order of magnitude below full marginalisation.
   #
   # Everything else -- architecture, vocabulary, data, decoding -- is shared, so
   # a difference between the two runs is a difference in the objective alone.
@@ -74,6 +79,11 @@ model:
     max_delay_frames: 0
     # Latency to validate and decode at; defaults to half the range.
     inference_delay_frames: null
+    # Chunks a word may drift from where the aligner put it, for loss_type
+    # "banded". 0 reproduces the forced loss exactly (one surviving path), and a
+    # value >= the chunk count reproduces the full RNN-T loss -- both asserted in
+    # tests/collections/asr/test_banded_rnnt.py.
+    band_chunks: 1
     # Seconds per ENCODER frame; defaults to window_stride * subsampling_factor.
     frame_length_in_secs: null
 

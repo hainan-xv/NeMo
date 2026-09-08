@@ -31,7 +31,8 @@
 # either without a bespoke driver.
 #
 # ENV
-#   LOSS_TYPE                rnnt | forced_alignment
+#   LOSS_TYPE                rnnt | forced_alignment | banded
+#   BAND_CHUNKS              banded only: chunks a word may drift from the aligner
 #   DELAY_FRAMES             forced only: emit a word this many frames late
 #   RECOVER_WORDS            forced only: also score the previous chunk's last k words
 #   HISTORY_CHUNKS           joint attends over this many previous chunks ("win28" = 1)
@@ -81,6 +82,7 @@ DELAY_FRAMES="${DELAY_FRAMES:-0}"
 RECOVER_WORDS="${RECOVER_WORDS:-0}"
 HISTORY_CHUNKS="${HISTORY_CHUNKS:-0}"
 MAX_DELAY_FRAMES="${MAX_DELAY_FRAMES:-0}"
+BAND_CHUNKS="${BAND_CHUNKS:-1}"
 INFER_DELAY_FRAMES="${INFER_DELAY_FRAMES:-null}"
 # The rnnt default keeps the name the pre-merge "standard CHAT" runs used. The
 # results directory is what exp_manager resumes from, so renaming it would
@@ -176,6 +178,7 @@ print('    tokenizer ->', dst)
     model.loss_type=${LOSS_TYPE} \
     model.forced_alignment.num_delay_frames=${DELAY_FRAMES} \
     model.forced_alignment.max_delay_frames=${MAX_DELAY_FRAMES} \
+    model.forced_alignment.band_chunks=${BAND_CHUNKS} \
     model.forced_alignment.inference_delay_frames=${INFER_DELAY_FRAMES} \
     model.forced_alignment.recover_history_words=${RECOVER_WORDS} \
     model.joint.history_chunks=${HISTORY_CHUNKS} \
