@@ -1918,6 +1918,9 @@ class RNNTAttJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMix
         # Frames of the CURRENT chunk to treat as not-yet-arrived. Set per batch
         # by the flexible-delay recipe; 0 leaves the joint exactly as it was.
         self.frame_trim = 0
+        # Extra all-zero chunks appended at decode time so trailing words have
+        # somewhere to be emitted. 0 = current behaviour.
+        self.decode_flush_chunks = 0
 
         self._vocab_size = num_classes
         self._num_extra_outputs = num_extra_outputs
@@ -2107,10 +2110,16 @@ class RNNTAttJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMix
         # from. It carries no audio itself, but with history_chunks >= 1 it
         # attends to the real frames behind it, which is what it needs to flush
         # them. Mirrors what the forced-alignment training path already does.
-        if int(getattr(self, "frame_trim", 0)) > 0:
-            pad = encoded.new_zeros(encoded.shape[0], encoded.shape[1], self.chunk_size)
+        # Trimming always needs at least one flush chunk; `decode_flush_chunks`
+        # lets a model that does NOT trim ask for one anyway. A CHAT model can
+        # learn to emit a word one chunk after the audio that carries it, and
+        # then the last chunk's words have nowhere to go -- the same deletion,
+        # from latency rather than from trimming.
+        flush = max(int(getattr(self, "decode_flush_chunks", 0)), 1 if int(getattr(self, "frame_trim", 0)) > 0 else 0)
+        if flush > 0:
+            pad = encoded.new_zeros(encoded.shape[0], encoded.shape[1], self.chunk_size * flush)
             encoded = torch.cat([encoded, pad], dim=2)
-            encoded_len = encoded_len + self.chunk_size
+            encoded_len = encoded_len + self.chunk_size * flush
 
         chunked, chunk_lengths = chunk_concat_audio(encoded.transpose(1, 2), encoded_len, self.chunk_size)
         num_chunks = (chunk_lengths != 0).sum(dim=1)

@@ -22,6 +22,7 @@ def main():
     p.add_argument("--nemo", required=True)
     p.add_argument("--manifest", required=True)
     p.add_argument("--trims", default="0,1,2")
+    p.add_argument("--flush", type=int, default=0, help="extra all-zero chunks appended at decode")
     p.add_argument("--limit", type=int, default=0)
     p.add_argument(
         "--normalize",
@@ -62,6 +63,8 @@ def main():
     for t in [int(x) for x in args.trims.split(",")]:
         if hasattr(model.joint, "frame_trim"):
             model.joint.frame_trim = t
+        if hasattr(model.joint, "decode_flush_chunks"):
+            model.joint.decode_flush_chunks = args.flush
         with torch.inference_mode():
             hyps = model.transcribe(paths, batch_size=args.batch_size, verbose=False)
         if isinstance(hyps, tuple):
@@ -69,7 +72,7 @@ def main():
         texts = [h if isinstance(h, str) else (getattr(h, "text", "") or "") for h in hyps]
         wer = word_error_rate(hypotheses=[norm(x) for x in texts], references=[norm(r) for r in refs])
         empty = sum(1 for x in texts if not x.strip())
-        print(f"  frame_trim={t}:  val_wer={wer:.4f}   empty_hyps={empty}")
+        print(f"  frame_trim={t} flush={args.flush}:  val_wer={wer:.4f}   empty_hyps={empty}")
 
 
 if __name__ == "__main__":
