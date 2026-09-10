@@ -35,6 +35,12 @@ MOUNTS="--container-mounts=${CODE_DIR}:/code,${OUTPUT_PREFIX}:${OUTPUT_PREFIX},/
 srun --ntasks=1 --container-image="$CONTAINER" $MOUNTS bash -c "
 cd /code && export PYTHONPATH=/code:\$PYTHONPATH
 LS=/lustre/fsw/portfolios/llmservice/users/hainanx/leaderboard_cache/librispeech/test.clean/_cache_manifest.jsonl
+echo '################ librispeech test.clean -- PLAIN model, swept over trim'
+echo '### it was never trained with trimming; if trimming still helps, the last'
+echo '### frame of each chunk is harmful and this is a chunking bug, not a skill'
+python scripts/chat_val_probe.py --nemo ${B}/granary2_chat_rnnt_lr1e4_wu5k/averaged/top5-averaged.nemo \
+    --manifest \$LS --trims 0,1,2,3 --flush 0 --normalize
+echo
 echo '################ librispeech test.clean -- plain RNN-T, no flush'
 python scripts/chat_val_probe.py --nemo ${B}/granary2_chat_rnnt_lr1e4_wu5k/averaged/top5-averaged.nemo \
     --manifest \$LS --trims 0 --flush 0 --normalize
