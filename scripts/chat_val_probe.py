@@ -23,6 +23,12 @@ def main():
     p.add_argument("--manifest", required=True)
     p.add_argument("--trims", default="0,1,2")
     p.add_argument("--limit", type=int, default=0)
+    p.add_argument(
+        "--normalize",
+        action="store_true",
+        help="apply Whisper's EnglishTextNormalizer to both sides, as the leaderboard scorer does; "
+        "required for the staged leaderboard manifests, whose references are lowercased and unpunctuated",
+    )
     p.add_argument("--batch_size", type=int, default=32)
     args = p.parse_args()
 
@@ -40,10 +46,18 @@ def main():
         for line in f:
             d = json.loads(line)
             paths.append(d["audio_filepath"])
-            refs.append(d["text"])
+            # training manifests use "text"; the staged leaderboard cache uses "reference"
+            refs.append(d.get("text", d.get("reference", "")))
     if args.limit:
         paths, refs = paths[: args.limit], refs[: args.limit]
     print(f"{len(paths)} utterances from {args.manifest}\n")
+
+    norm = (lambda x: x)
+    if args.normalize:
+        from whisper_normalizer.english import EnglishTextNormalizer
+
+        norm = EnglishTextNormalizer()
+        print("scoring with Whisper's EnglishTextNormalizer, matching the leaderboard\n")
 
     for t in [int(x) for x in args.trims.split(",")]:
         if hasattr(model.joint, "frame_trim"):
@@ -53,7 +67,7 @@ def main():
         if isinstance(hyps, tuple):
             hyps = hyps[0]
         texts = [h if isinstance(h, str) else (getattr(h, "text", "") or "") for h in hyps]
-        wer = word_error_rate(hypotheses=texts, references=refs)
+        wer = word_error_rate(hypotheses=[norm(x) for x in texts], references=[norm(r) for r in refs])
         empty = sum(1 for x in texts if not x.strip())
         print(f"  frame_trim={t}:  val_wer={wer:.4f}   empty_hyps={empty}")
 
