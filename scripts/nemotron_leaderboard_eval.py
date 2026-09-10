@@ -87,7 +87,7 @@ _FRAME_SECONDS = 0.08
 # ---------------------------------------------------------------------------
 
 
-def load_model(model_path: str, device: torch.device, dtype: torch.dtype):
+def load_model(model_path: str, device: torch.device, dtype: torch.dtype, frame_trim=None):
     """Restore a ``.nemo`` ASR model through its own concrete class.
 
     Mirrors NeMo's ``setup_model``: read the config first to discover
@@ -101,6 +101,16 @@ def load_model(model_path: str, device: torch.device, dtype: torch.dtype):
     cls = model_utils.import_class_by_path(model_cfg.target)
     _log(f"    class: {cls.__name__}")
     model = cls.restore_from(restore_path=model_path, map_location=device)
+
+    # CHAT flexible-delay models hide the last `frame_trim` frames of each chunk,
+    # which is their latency knob. transcribe() never runs the Lightning epoch
+    # hooks that would pin it, so a restored model decodes at the constructor
+    # default of 0 unless it is set HERE -- and 0 is a different operating point
+    # from the one the model was validated at.
+    if frame_trim is not None and hasattr(getattr(model, "joint", None), "frame_trim"):
+        model.joint.frame_trim = int(frame_trim)
+        _log(f"    frame_trim: {int(frame_trim)} frames hidden per chunk")
+
     return model.to(dtype).to(device).eval()
 
 
@@ -362,6 +372,12 @@ def parse_args():
         help="encoder frames per chunk (0.08s each); validated against the model's trained look-aheads",
     )
     p.add_argument(
+        "--frame_trim",
+        type=int,
+        default=None,
+        help="CHAT flexible-delay: hide this many frames at the end of each chunk (the latency knob)",
+    )
+    p.add_argument(
         "--left_context", type=int, default=None, help="left attention context in frames; default = the model's own"
     )
     p.add_argument(
@@ -411,7 +427,7 @@ def main() -> int:
     elif args.mode == "streaming" and args.dtype != "fp32":
         _log("==> streaming mode is fp32-only in NeMo; ignoring --dtype bf16")
 
-    model = load_model(args.model_path, device, dtype)
+    model = load_model(args.model_path, device, dtype, frame_trim=args.frame_trim)
 
     try:
         att = resolve_att_context(model, args.chunk_size, args.left_context)

@@ -77,6 +77,12 @@ WANDB_TOKEN="$(read_optional_token "$HOME/.wandb_token")"
 mkdir -p slurm_out
 
 CHUNK_SIZE="${1:-${CHUNK_SIZE:-14}}"
+# CHAT flexible-delay latency knob: frames hidden at the end of each chunk.
+# Empty leaves the model at whatever it restores with (0), which is a valid
+# operating point but not necessarily the one it was validated at.
+FRAME_TRIM="${FRAME_TRIM:-}"
+FRAME_TRIM_ARG=""
+[[ -n "${FRAME_TRIM}" ]] && FRAME_TRIM_ARG="--frame_trim ${FRAME_TRIM}"
 MODE="${MODE:-offline}"                     # offline | streaming
 EXP_NAME="${EXP_NAME:-nemotron_streaming_0.6b}"
 PROJECT="${PROJECT:-SpeechlmScriptCC}"
@@ -123,6 +129,7 @@ else
     CKPT_TS="unknown"
 fi
 DECODE_LABEL="chunk${CHUNK_SIZE:-default}_${MODE}"
+[[ -n "${FRAME_TRIM}" ]] && DECODE_LABEL="${DECODE_LABEL}_trim${FRAME_TRIM}"
 
 # <exp>/eval_<checkpoint timestamp>/<decode config>/ -- the model name is not repeated
 # (this is already under the experiment dir) and the timestamp is the MODEL's,
@@ -220,6 +227,7 @@ echo "*******STARTING NEMOTRON LEADERBOARD EVAL********" \
         --max_eval_samples ${MAX_EVAL_SAMPLES} \
         --mode ${MODE} \
         --chunk_size ${CHUNK_SIZE} \
+        ${FRAME_TRIM_ARG} \
         --dtype ${DTYPE} \
         > "\${log}" 2>&1 & \
       pids+=(\$!); \

@@ -634,9 +634,9 @@ class TestNoDeletionsAtTheAudioEnd:
         model.joint.frame_trim = model.inference_delay_frames
         trimmed = self._visible_own_frames(model, enc_len)
 
-        assert trimmed >= baseline, (
-            f"enc_len={enc_len}: trimming hid {baseline - trimmed} real frames with no chunk to recover them"
-        )
+        assert (
+            trimmed >= baseline
+        ), f"enc_len={enc_len}: trimming hid {baseline - trimmed} real frames with no chunk to recover them"
 
     @pytest.mark.unit
     def test_the_flush_chunk_appears_only_when_trimming(self, test_data_dir):
@@ -662,3 +662,22 @@ class TestNoDeletionsAtTheAudioEnd:
         assert forced_model.joint.frame_trim == 0
         chunked, n, cl = forced_model.joint.chunk_encoder_for_decoding(enc, lens)
         assert int(n[0]) == 5 and int(n[1]) == 3
+
+    @pytest.mark.unit
+    def test_validation_pins_the_inference_delay(self, test_data_dir):
+        """Without this the joint keeps whatever d the last TRAINING batch drew,
+        so val_wer describes a random latency rather than one operating point.
+        The hooks were silently deleted once already, by an over-greedy edit."""
+        cfg = _flex_cfg(test_data_dir, max_delay=4)
+        cfg.loss_type = 'rnnt'
+        m = _with_stub_trainer(EncDecCHATBPEModel(cfg=cfg))
+        m.joint.frame_trim = 4  # as if a training batch had just drawn d=4
+        m.on_validation_epoch_start()
+        assert m.joint.frame_trim == m.inference_delay_frames == 2
+
+    @pytest.mark.unit
+    def test_disabled_models_are_not_pinned(self, test_data_dir):
+        cfg = _cfg(test_data_dir, 'rnnt')
+        m = _with_stub_trainer(EncDecCHATBPEModel(cfg=cfg))
+        m.on_validation_epoch_start()
+        assert m.joint.frame_trim == 0

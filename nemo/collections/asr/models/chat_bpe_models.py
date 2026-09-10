@@ -137,6 +137,28 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
             )
         return super()._setup_dataloader_from_config(config)
 
+    # ------------------------------------------------------- inference delay
+
+    def _pin_inference_delay(self) -> None:
+        """Fix the trim for a decode pass.
+
+        Without this the joint keeps whatever d the LAST TRAINING BATCH drew, so
+        val_wer would be measured at a random latency each time and would not
+        describe any single operating point. Outside training the attribute
+        defaults to 0, which is a different operating point again -- so both
+        paths have to be pinned explicitly.
+        """
+        if self.max_delay_frames > 0:
+            self.joint.frame_trim = self.inference_delay_frames
+
+    def on_validation_epoch_start(self):
+        self._pin_inference_delay()
+        return super().on_validation_epoch_start()
+
+    def on_test_epoch_start(self):
+        self._pin_inference_delay()
+        return super().on_test_epoch_start()
+
     # ------------------------------------------------------- flexible delay
 
     def _sample_delay(self) -> int:
