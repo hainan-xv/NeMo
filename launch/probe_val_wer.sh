@@ -34,6 +34,15 @@ MOUNTS="--container-mounts=${CODE_DIR}:/code,${OUTPUT_PREFIX}:${OUTPUT_PREFIX},/
 
 srun --ntasks=1 --container-image="$CONTAINER" $MOUNTS bash -c "
 cd /code && export PYTHONPATH=/code:\$PYTHONPATH
+LS=/lustre/fsw/portfolios/llmservice/users/hainanx/leaderboard_cache/librispeech/test.clean/_cache_manifest.jsonl
+echo '################ librispeech test.clean -- plain RNN-T'
+python scripts/chat_val_probe.py --nemo ${B}/granary2_chat_rnnt_lr1e4_wu5k/averaged/top5-averaged.nemo \
+    --manifest \$LS --trims 0 --normalize
+echo
+echo '################ librispeech test.clean -- flexible delay'
+python scripts/chat_val_probe.py --nemo ${B}/granary2_chat_rnnt_flexdelay4_lr1e4/averaged/top5-averaged.nemo \
+    --manifest \$LS --trims 0,1 --normalize
+echo
 echo '################ plain RNN-T (history_chunks=0, never trims)'
 python scripts/chat_val_probe.py \
     --nemo ${B}/granary2_chat_rnnt_lr1e4_wu5k/averaged/top5-averaged.nemo \
