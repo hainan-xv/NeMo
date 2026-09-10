@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -A nemotron_speechprod_asr
+#SBATCH -A nemotron_speech_asr
 #SBATCH -J nemotron_speechprod_asr:flex-spike
 #SBATCH -p interactive,batch_block1,batch_block3,batch_block4
 #SBATCH -N 1
