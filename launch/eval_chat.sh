@@ -79,9 +79,19 @@ CKPT_CSV="$(IFS=,; echo "${BEST[*]}")"
 
 MOUNTS="--container-mounts=${CODE_DIR}:/code,${OUTPUT_PREFIX}:${OUTPUT_PREFIX},/lustre/fsw/portfolios/llmservice:/lustre/fsw/portfolios/llmservice"
 
-if [[ -f "$AVG_NEMO" && "${FORCE_AVERAGE:-0}" != "1" ]]; then
-    echo "==> reusing existing ${AVG_NEMO} (FORCE_AVERAGE=1 to rebuild)"
+# Reuse only if the averaged model is NEWER than every checkpoint it could be
+# built from. Reusing on existence alone silently evaluates stale weights after
+# a run has trained further, and the result looks completely normal -- there is
+# nothing in the output to say the .nemo predates the checkpoints.
+STALE=0
+if [[ -f "$AVG_NEMO" ]]; then
+    NEWEST_CKPT="$(ls -t "${CKPT_DIR}"/*.ckpt 2>/dev/null | head -1)"
+    [[ -n "$NEWEST_CKPT" && "$NEWEST_CKPT" -nt "$AVG_NEMO" ]] && STALE=1
+fi
+if [[ -f "$AVG_NEMO" && "$STALE" == "0" && "${FORCE_AVERAGE:-0}" != "1" ]]; then
+    echo "==> reusing ${AVG_NEMO} (newer than every checkpoint; FORCE_AVERAGE=1 to rebuild)"
 else
+    [[ "$STALE" == "1" ]] && echo "==> checkpoints are newer than the averaged model; rebuilding"
     srun --ntasks=1 --nodes=1 --container-image="$CONTAINER" $MOUNTS bash -c "
         cd /code && export PYTHONPATH=/code:\$PYTHONPATH HYDRA_FULL_ERROR=1 &&
         python scripts/checkpoint_averaging/average_model_checkpoints.py \

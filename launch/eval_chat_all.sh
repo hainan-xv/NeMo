@@ -29,8 +29,9 @@
 # Averaging uses NeMo's own scripts/checkpoint_averaging/average_model_checkpoints.py
 # via launch/eval_chat.sh; nothing here reimplements it.
 #
-# Re-running is cheap: an arm whose averaged .nemo already exists is not
-# re-averaged unless FORCE_AVERAGE=1.
+# Re-running is cheap and safe after more training: the averaged .nemo is reused
+# only when it is NEWER than every checkpoint, so a run that has trained further
+# is re-averaged automatically rather than silently evaluated at stale weights.
 #
 # ENV
 #   ARMS            override the list of "exp_name|overrides" entries
@@ -47,10 +48,14 @@ TOPK="${TOPK:-5}"
 # a wrong value here is a shape error at best and a silently different model at
 # worst.
 FA=model.forced_alignment
+# Third field is the inference frame_trim. It must be set PER ARM: the trim
+# model is wrong at d=0 (that is the only setting with no end-of-audio flush
+# chunk, worth 0.70 macro WER), while a model that never trims must stay at 0 or
+# it starts hiding frames it was never trained to lose.
 DEFAULT_ARMS=(
-  "granary2_chat_rnnt_lr1e4_wu5k|model.loss_type=rnnt ${FA}.num_delay_frames=0 ${FA}.recover_history_words=0 ${FA}.max_delay_frames=0 model.joint.history_chunks=0"
-  "granary2_chat_rnnt_flexdelay4_lr1e4|model.loss_type=rnnt ${FA}.num_delay_frames=0 ${FA}.recover_history_words=0 ${FA}.max_delay_frames=4 model.joint.history_chunks=1"
-  "granary2_chat_banded1_delay3_lr1e4|model.loss_type=banded ${FA}.num_delay_frames=3 ${FA}.recover_history_words=0 ${FA}.band_chunks=1 ${FA}.max_delay_frames=0 model.joint.history_chunks=0"
+  "granary2_chat_rnnt_lr1e4_wu5k|model.loss_type=rnnt ${FA}.num_delay_frames=0 ${FA}.recover_history_words=0 ${FA}.max_delay_frames=0 model.joint.history_chunks=0|"
+  "granary2_chat_rnnt_flexdelay4_lr1e4|model.loss_type=rnnt ${FA}.num_delay_frames=0 ${FA}.recover_history_words=0 ${FA}.max_delay_frames=4 model.joint.history_chunks=1|1"
+  "granary2_chat_banded1_delay3_lr1e4|model.loss_type=banded ${FA}.num_delay_frames=3 ${FA}.recover_history_words=0 ${FA}.band_chunks=1 ${FA}.max_delay_frames=0 model.joint.history_chunks=0|"
 )
 if [[ -n "${ARMS:-}" ]]; then
     read -r -a ARM_LIST <<< "${ARMS}"
@@ -83,7 +88,9 @@ echo
 declare -a STATUS=()
 for entry in "${ARM_LIST[@]}"; do
     exp="${entry%%|*}"
-    overrides="${entry#*|}"
+    rest="${entry#*|}"
+    overrides="${rest%|*}"
+    trim="${rest##*|}"
 
     echo "############################################################"
     echo "### ${exp}"
@@ -97,8 +104,9 @@ for entry in "${ARM_LIST[@]}"; do
 
     # A failure in one arm must not abandon the other two -- the whole point of
     # batching them is to come back to a full table.
+    [[ -n "$trim" ]] && echo "    decoding at frame_trim=${trim}"
     ARM_EXP_NAME="${exp}" ARM_MODEL_OVERRIDES="${overrides}" TOPK="${TOPK}" \
-        FORCE_AVERAGE="${FORCE_AVERAGE:-0}" EVAL_TAG="avg${TOPK}" \
+        FORCE_AVERAGE="${FORCE_AVERAGE:-0}" EVAL_TAG="avg${TOPK}" FRAME_TRIM="${trim}" \
         bash "${LAUNCH_DIR}/eval_chat.sh"
     rc=$?
     if [[ $rc -eq 0 ]]; then
@@ -120,9 +128,14 @@ echo
 echo "  WER tables:"
 for entry in "${ARM_LIST[@]}"; do
     exp="${entry%%|*}"
-    for agg in "${OUTPUT_PREFIX}/results/${PROJECT}/${exp}"/eval_*/chunk14_offline/aggregate.log; do
-        [[ -f "$agg" ]] || continue
-        printf '\n  === %s\n' "${exp}"
-        grep -E '^RESULT' "$agg" | sed 's/^/    /'
-    done
+    rest="${entry#*|}"
+    trim="${rest##*|}"
+    # Only THIS run's directory. eval_nemotron.sh tags the leaf with the trim, so
+    # a bare glob would also print the stale d=0 tables from earlier sweeps.
+    leaf="chunk14_offline"
+    [[ -n "$trim" ]] && leaf="chunk14_offline_trim${trim}"
+    newest="$(ls -t "${OUTPUT_PREFIX}/results/${PROJECT}/${exp}"/eval_*/"${leaf}"/aggregate.log 2>/dev/null | head -1)"
+    [[ -n "$newest" ]] || continue
+    printf '\n  === %s%s\n' "${exp}" "${trim:+  (frame_trim=${trim})}"
+    grep -E '^RESULT' "$newest" | sed 's/^/    /'
 done
