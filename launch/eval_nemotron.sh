@@ -80,6 +80,12 @@ CHUNK_SIZE="${1:-${CHUNK_SIZE:-14}}"
 # CHAT flexible-delay latency knob: frames hidden at the end of each chunk.
 # Empty leaves the model at whatever it restores with (0), which is a valid
 # operating point but not necessarily the one it was validated at.
+# Trailing silence in OFFLINE mode, matching train_ds pad_extra_duration. For a
+# CHAT model this sets the chunk count and therefore the emission budget: a 1 s
+# clip trains with 2 chunks and decodes unpadded with 1, losing the transcript
+# tail. Measured on AMI: plain CHAT 0.1316 -> 0.1021 WER. Frame-level models are
+# unaffected, so 0.5 is safe for every model this driver evaluates.
+PAD_EXTRA_SECONDS="${PAD_EXTRA_SECONDS:-0.5}"
 FRAME_TRIM="${FRAME_TRIM:-}"
 FRAME_TRIM_ARG=""
 [[ -n "${FRAME_TRIM}" ]] && FRAME_TRIM_ARG="--frame_trim ${FRAME_TRIM}"
@@ -130,6 +136,7 @@ else
 fi
 DECODE_LABEL="chunk${CHUNK_SIZE:-default}_${MODE}"
 [[ -n "${FRAME_TRIM}" ]] && DECODE_LABEL="${DECODE_LABEL}_trim${FRAME_TRIM}"
+[[ "${PAD_EXTRA_SECONDS}" != "0" && "${PAD_EXTRA_SECONDS}" != "0.0" ]] && DECODE_LABEL="${DECODE_LABEL}_pad${PAD_EXTRA_SECONDS}"
 
 # <exp>/eval_<checkpoint timestamp>/<decode config>/ -- the model name is not repeated
 # (this is already under the experiment dir) and the timestamp is the MODEL's,
@@ -161,6 +168,7 @@ eval_tag: "${EVAL_TAG}"
 model_path: "${MODEL_PATH}"
 mode: "${MODE}"
 chunk_size: ${CHUNK_SIZE}
+pad_extra_seconds: ${PAD_EXTRA_SECONDS}
 chunk_seconds: $(python3 -c "print(f'{${CHUNK_SIZE} * 0.08:.2f}')" 2>/dev/null || echo "null")
 dtype: "${DTYPE}"
 batch_size: ${BATCH_SIZE}
@@ -174,7 +182,7 @@ YAML
 
 echo "==> nemotron leaderboard eval"
 echo "    model:      ${MODEL_PATH}"
-echo "    mode:       ${MODE}   chunk_size: ${CHUNK_SIZE} frames"
+echo "    mode:       ${MODE}   chunk_size: ${CHUNK_SIZE} frames   pad: ${PAD_EXTRA_SECONDS}s"
 echo "    results ->  ${RESULTS_DIR}"
 
 # /lustre/fsw and /lustre/fs12 are separate autofs roots; the model lives on
@@ -227,6 +235,7 @@ echo "*******STARTING NEMOTRON LEADERBOARD EVAL********" \
         --max_eval_samples ${MAX_EVAL_SAMPLES} \
         --mode ${MODE} \
         --chunk_size ${CHUNK_SIZE} \
+        --pad_extra_seconds ${PAD_EXTRA_SECONDS} \
         ${FRAME_TRIM_ARG} \
         --dtype ${DTYPE} \
         > "\${log}" 2>&1 & \

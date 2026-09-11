@@ -116,10 +116,78 @@ def cmd_summary(args):
         print()
 
 
+def cmd_deletions(args):
+    """Where in the reference do deletions fall?
+
+    A model that truncates the tail of an utterance produces deletions bunched
+    in the last decile; one that misses onsets bunches them in the first. A
+    model that simply recognises badly spreads them evenly. The duration trend
+    alone cannot tell these apart, so align and look.
+    """
+    from kaldialign import align
+
+    EPS = "*"
+    for path in [args.a] + ([args.b] if args.b else []):
+        recs = load(path)
+        bins = [0] * 10
+        first_word = last_word = 0
+        total_del = 0
+        # Deletions in runs at the very edges, which is what truncation looks like.
+        tail_run = head_run = 0
+        for r in recs.values():
+            ref, hyp = r["ref"].split(), r["hyp"].split()
+            if not ref:
+                continue
+            pairs = align(ref, hyp, EPS)
+            ref_pos = 0
+            dele_positions = []
+            for a, b in pairs:
+                if a != EPS:
+                    if b == EPS:
+                        dele_positions.append(ref_pos)
+                    ref_pos += 1
+            if not dele_positions:
+                continue
+            n = len(ref)
+            total_del += len(dele_positions)
+            for d in dele_positions:
+                bins[min(int(d / n * 10), 9)] += 1
+            if 0 in dele_positions:
+                first_word += 1
+            if n - 1 in dele_positions:
+                last_word += 1
+            # trailing run: deletions covering the final k words contiguously
+            k = 0
+            while n - 1 - k in dele_positions:
+                k += 1
+            tail_run += k
+            k = 0
+            while k in dele_positions:
+                k += 1
+            head_run += k
+
+        print(f"=== {path}")
+        print(f"    {total_del} deletions over {len(recs)} utterances")
+        print("    position in reference (decile):")
+        for i, c in enumerate(bins):
+            bar = "#" * int(60 * c / max(max(bins), 1))
+            print(f"      {i*10:>3}-{i*10+10:<3}%  {c:>6}  {bar}")
+        print(f"    utterances missing the FIRST word: {first_word}")
+        print(f"    utterances missing the LAST  word: {last_word}")
+        print(f"    words lost in a contiguous HEAD run: {head_run}")
+        print(f"    words lost in a contiguous TAIL run: {tail_run}")
+        print()
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
-    for name, fn in (("worst", cmd_worst), ("diff", cmd_diff), ("summary", cmd_summary)):
+    for name, fn in (
+        ("worst", cmd_worst),
+        ("diff", cmd_diff),
+        ("summary", cmd_summary),
+        ("deletions", cmd_deletions),
+    ):
         q = sub.add_parser(name)
         q.add_argument("a")
         q.add_argument("b", nargs="?" if name != "diff" else None)

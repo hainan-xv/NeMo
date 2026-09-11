@@ -21,36 +21,41 @@ import torch
 
 
 def _transcribe_padded(model, paths, batch_size, pad_seconds):
-    """Transcribe with trailing silence appended, matching the leaderboard driver.
+    """Transcribe with real trailing silence appended.
 
-    It pads to keep a chunked model from having to commit at the exact end of
-    speech; scoring without it measures a different thing, which is why a local
-    number and a leaderboard number for the SAME model do not match.
+    Writes padded copies and transcribes those by PATH rather than handing
+    transcribe() a pre-batched tensor, which it would re-batch into the wrong
+    shape. Slower, but it is exactly "the same audio with silence on the end",
+    with no ambiguity about lengths or batching.
+
+    This matters because train_ds sets pad_extra_duration 0.5 while transcribe()
+    pads nothing: for a CHAT model the pad changes the CHUNK COUNT, so a 1 s
+    clip trains with 2 chunks and decodes with 1.
     """
+    import shutil
+    import tempfile
+
     import numpy as np
     import soundfile as sf
-    import torch as _torch
 
     sr = 16000
-    out = []
-    for i in range(0, len(paths), batch_size):
-        batch = paths[i : i + batch_size]
-        sigs = []
-        for p_ in batch:
+    tmp = tempfile.mkdtemp(prefix="padded_")
+    try:
+        padded_paths = []
+        for i, p_ in enumerate(paths):
             a, file_sr = sf.read(p_, dtype="float32")
+            if a.ndim > 1:
+                a = a.mean(axis=1)
             assert file_sr == sr, f"expected {sr} Hz, got {file_sr} in {p_}"
-            sigs.append(np.concatenate([a, np.zeros(int(round(pad_seconds * sr)), dtype="float32")]))
-        lens = _torch.tensor([len(x) for x in sigs])
-        mx = int(lens.max())
-        padded = _torch.zeros(len(sigs), mx)
-        for j, x in enumerate(sigs):
-            padded[j, : len(x)] = _torch.from_numpy(x)
-        dev = next(model.parameters()).device
-        hyp = model.transcribe(padded.to(dev), batch_size=len(batch), verbose=False)
-        if isinstance(hyp, tuple):
-            hyp = hyp[0]
-        out.extend(hyp)
-    return out
+            out = os.path.join(tmp, f"{i:06d}.wav")
+            sf.write(out, np.concatenate([a, np.zeros(int(round(pad_seconds * sr)), dtype="float32")]), sr)
+            padded_paths.append(out)
+        hyps = model.transcribe(padded_paths, batch_size=batch_size, verbose=False)
+        if isinstance(hyps, tuple):
+            hyps = hyps[0]
+        return hyps
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def main():

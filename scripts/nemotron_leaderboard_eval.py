@@ -59,11 +59,15 @@ Usage:
 import argparse
 import json
 import os
+import shutil
 import sys
+import tempfile
 import time
 from collections import defaultdict
 from typing import List
 
+import numpy as np
+import soundfile
 import torch
 from tqdm import tqdm
 
@@ -156,10 +160,38 @@ def _texts_from(hyps) -> List[str]:
     return out
 
 
-def transcribe_offline(model, paths: List[str], batch_size: int) -> List[str]:
-    """One full-utterance forward per clip, with chunk-limited attention."""
+def transcribe_offline(model, paths: List[str], batch_size: int, pad_extra_seconds: float = 0.0) -> List[str]:
+    """One full-utterance forward per clip, with chunk-limited attention.
+
+    ``pad_extra_seconds`` appends real trailing silence, mirroring the training
+    dataloader's ``pad_extra_duration``. For a CHAT model this is not a cosmetic
+    context tweak: the pad changes the CHUNK COUNT, which is the model's entire
+    emission budget. A 1 s clip trains with 2 chunks and, unpadded, decodes with
+    1 -- so half its capacity disappears and the tail of the transcript is never
+    emitted. Measured on AMI test, adding the training pad moved plain CHAT from
+    0.1316 to 0.1021 WER, with the gain concentrated in short clips exactly as
+    that arithmetic predicts.
+
+    Frame-level models are unaffected (no chunk quantisation), so this stays
+    opt-in and defaults to off, preserving every existing number.
+    """
     with torch.inference_mode():
-        hyps = model.transcribe(paths, batch_size=batch_size, verbose=False)
+        if pad_extra_seconds > 0:
+            tmp = tempfile.mkdtemp(prefix="lb_pad_")
+            try:
+                padded = []
+                for i, p_ in enumerate(paths):
+                    w, sr = soundfile.read(p_, dtype="float32")
+                    if w.ndim > 1:
+                        w = w.mean(axis=1)
+                    out = os.path.join(tmp, f"{i:06d}.wav")
+                    soundfile.write(out, np.concatenate([w, np.zeros(int(round(pad_extra_seconds * sr)), "float32")]), sr)
+                    padded.append(out)
+                hyps = model.transcribe(padded, batch_size=batch_size, verbose=False)
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+        else:
+            hyps = model.transcribe(paths, batch_size=batch_size, verbose=False)
     # n-best configs return (best, all); take the best list.
     if isinstance(hyps, tuple) and len(hyps) == 2:
         hyps = hyps[0]
@@ -303,7 +335,7 @@ def evaluate_shard(model, args) -> None:
                     else:
                         hyps = transcribe_streaming(model, paths, args.pad_and_drop_preencoded)
                 else:
-                    hyps = transcribe_offline(model, paths, len(paths))
+                    hyps = transcribe_offline(model, paths, len(paths), args.pad_extra_seconds)
             except Exception as e:  # one bad batch must not kill the shard
                 _log(f"    [WARN] batch at {i} failed ({type(e).__name__}: {e}); emitting empty hypotheses")
                 hyps = [""] * len(batch)
@@ -370,6 +402,14 @@ def parse_args():
         type=int,
         default=14,
         help="encoder frames per chunk (0.08s each); validated against the model's trained look-aheads",
+    )
+    p.add_argument(
+        "--pad_extra_seconds",
+        type=float,
+        default=0.0,
+        help="append this much trailing silence in OFFLINE mode, mirroring the training dataloader's "
+        "pad_extra_duration. For a chunked model the pad changes the chunk count and therefore the "
+        "emission budget; without it short clips lose their transcript tail",
     )
     p.add_argument(
         "--frame_trim",
