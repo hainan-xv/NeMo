@@ -557,6 +557,40 @@ class TestBandedLossInTheModel:
         assert losses["banded"] > 0
 
     @pytest.mark.unit
+    def test_a_nonfinite_loss_is_contained_rather_than_propagated(self, test_data_dir, tmp_path):
+        """One bad batch must cost one update, not the whole run.
+
+        A NaN loss yields NaN gradients, and gradient clipping does not repair a
+        NaN -- it reaches every weight on the next step and the job emits NaN
+        forever. The first Qwen-vocabulary banded run lost 5,143 consecutive
+        steps to exactly this. The guard must return a FINITE zero that still
+        carries a gradient to the joint, so DDP does not then abort on a
+        parameter that received none.
+        """
+        c = _cfg(test_data_dir, "banded")
+        c.train_ds = _train_ds_cfg(tmp_path)
+        torch.manual_seed(0)
+        m = EncDecCHATBPEModel(cfg=c)
+        m.train()
+        torch.manual_seed(1)
+        signal, signal_len, _, _, cuts = next(iter(m._train_dl))
+        enc, enc_len = m.forward(input_signal=signal, input_signal_length=signal_len)
+
+        # Poison the joint so its logits go non-finite, which is what a real bad
+        # batch does, rather than patching the loss value after the fact.
+        with torch.no_grad():
+            m.joint.joint_net[-1].bias.fill_(float("nan"))
+
+        loss = m._banded_loss(enc, enc_len, cuts)
+        assert torch.isfinite(loss), "the guard must not pass a NaN through"
+        assert float(loss) == 0.0
+
+        loss.backward()
+        grad = m.joint.joint_net[-1].weight.grad
+        assert grad is not None, "the joint must still receive a gradient, or DDP aborts"
+        assert torch.isfinite(grad).all() and float(grad.abs().sum()) == 0.0
+
+    @pytest.mark.unit
     def test_a_wider_band_lowers_the_loss(self, test_data_dir, tmp_path):
         """Strictly more admissible paths -> no less probability mass."""
         prev = None

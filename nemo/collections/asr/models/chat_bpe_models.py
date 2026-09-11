@@ -381,6 +381,16 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
         if sum(target_lens) == 0:
             logging.warning(f"empty banded lattice at step {self.global_step}; contributing zero loss")
             return encoded.sum() * 0.0
+        if min(num_chunks) == 0:
+            # BandedLattice reads index[(b, num_chunks[b] - 1, ...)] for its final
+            # node, so a zero-chunk utterance looks up chunk -1 and raises
+            # KeyError rather than producing a loss. Reachable whenever an
+            # utterance encodes to no frames at all.
+            logging.warning(
+                f"banded batch at step {self.global_step} has an utterance with no chunks "
+                f"(num_chunks={num_chunks}); contributing zero loss"
+            )
+            return encoded.sum() * 0.0
 
         lattice = BandedLattice(per_utt, num_chunks, target_lens)
         b_idx, t_idx, u_idx = lattice.index_tensors(encoded.device)
@@ -405,7 +415,68 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
         nll = banded_rnnt_loss(log_probs, lattice, targets, blank)
         # mean_volume: per target token, matching the rnnt arm's reduction so the
         # two losses are on the same scale.
-        return nll.sum() / max(int(pred_lens.sum()), 1)
+        loss = nll.sum() / max(int(pred_lens.sum()), 1)
+
+        if not torch.isfinite(loss):
+            return self._skip_nonfinite_batch(loss, encoded, g, logits, nll, encoded_len, lattice, target_lens)
+        return loss
+
+    def _skip_nonfinite_batch(self, loss, encoded, g, logits, nll, encoded_len, lattice, target_lens):
+        """Drop a batch whose loss is not finite, and say where it went wrong.
+
+        WHY THIS EXISTS. A single non-finite loss produces NaN gradients, and
+        gradient clipping does not repair a NaN -- it propagates into every
+        weight on the next step and the run emits NaN forever. That is not a
+        hypothetical: the first Qwen-vocabulary banded run trained cleanly for
+        ~400 steps (loss 15.5 -> 12.8), hit one bad batch, and then logged NaN
+        for 5,143 consecutive steps before anyone noticed. Skipping the batch
+        costs one update; not skipping it costs the entire job.
+
+        The stage report matters because the failure is otherwise SILENT: the
+        loss arithmetic is well conditioned (random-structure sweeps stay finite,
+        and log_softmax in float32 cannot underflow to -inf), so the interesting
+        question is whether `encoded`, the prediction network, or the joint went
+        bad first -- which only the batch that fails can answer.
+        """
+        stage = "loss reduction (all inputs finite)"
+        for name, tensor in (("encoder output", encoded), ("prediction network", g), ("joint logits", logits)):
+            if not torch.isfinite(tensor).all():
+                stage = name
+                break
+        bad = (~torch.isfinite(nll)).nonzero().flatten().tolist()
+        logging.error(
+            "non-finite banded loss at step %s: first non-finite stage = %s; "
+            "batch=%d utts, encoded_len min/max=%d/%d, lattice nodes=%d, "
+            "target_lens=%s, non-finite utterances=%s. Skipping this batch.",
+            self.global_step,
+            stage,
+            encoded.shape[0],
+            int(encoded_len.min()),
+            int(encoded_len.max()),
+            lattice.num_nodes,
+            target_lens,
+            bad,
+        )
+        # Zero loss that still TOUCHES every parameter, so DDP sees a gradient
+        # for each one and does not abort on an unused parameter.
+        #
+        # Built from the PARAMETERS, not from the poisoned activations. Routing
+        # it through `logits` instead looks equivalent -- nan_to_num(logits) is
+        # finite, and multiplying by zero should zero the gradient -- but the
+        # backward of the ops FEEDING logits still multiplies by their saved
+        # non-finite activations, so 0 * inf = NaN reaches the weights. The loss
+        # then looks contained while the gradients are exactly as poisonous as
+        # before.
+        #
+        # Each parameter is reduced to a SCALAR and made finite before anything
+        # multiplies it. Multiplying by zero last does not work on its own --
+        # NaN * 0 is NaN -- and whatever went wrong upstream may well have
+        # reached the weights already, so the guard cannot assume they are clean.
+        # nan_to_num on a scalar per parameter costs nothing next to a copy of
+        # all 812M of them, and its derivative is zero exactly where the value
+        # was not finite.
+        zero = sum(torch.nan_to_num(p.sum()) for p in self.parameters() if p.requires_grad)
+        return zero * 0.0
 
     def _forced_alignment_loss(self, encoded, encoded_len, cuts) -> torch.Tensor:
         # ONE delay per batch. It has to reach BOTH the alignment shift and the
