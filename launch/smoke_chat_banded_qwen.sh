@@ -28,12 +28,12 @@
 # of a configuration nobody is going to train, which is worth very little --
 # whatever this job hits, the 8-node job hits too.
 #
-# The one unavoidable difference is EXP_NAME. exp_manager RESUMES from a
-# matching directory, so sharing the name would let this copy write its
-# checkpoints into the 8-node run's checkpoint directory. The _n1 suffix is the
-# same one chat_train.sh appends by itself when an allocation does not match the
-# script's own -N; it is spelled out here because this script's -N IS 1, so that
-# automatic rename does not fire.
+# EXP_NAME is the real run's, deliberately. chat_train.sh appends _n<N> by
+# itself whenever the allocation does not match the -N it declares, so this job
+# lands in ..._n1 and cannot resume from or overwrite the 8-node run. That guard
+# reads the -N of chat_train.sh (which is exec'd, so $0 is chat_train.sh, not
+# this wrapper), so it fires here even though this script also says -N 1 --
+# hardcoding a _n1 suffix would only get doubled into _n1_n1.
 # ============================================================================
 
 export LOSS_TYPE=banded
@@ -49,7 +49,7 @@ export MAX_STEPS=500000
 export CONFIG_NAME=nemotron_chat_transducer_granary2_qwen
 export TOKENIZER_DIR=/lustre/fsw/portfolios/llmservice/users/heh/pretrained_models/huggingface/Qwen/Qwen3-1.7B
 export INIT_EXCLUDE='["prediction.embed","joint_net"]'
-export EXP_NAME=granary2_chat_banded1_qwenvocab_lr1e4_n1
+export EXP_NAME=granary2_chat_banded1_qwenvocab_lr1e4
 
 # Under sbatch $0 is a copy in Slurm's spool directory, so dirname "$0" has no
 # sibling chat_train.sh; SLURM_SUBMIT_DIR is where the sbatch was issued.
