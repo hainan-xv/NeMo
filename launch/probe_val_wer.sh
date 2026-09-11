@@ -1,7 +1,10 @@
 #!/bin/bash
 #SBATCH -A nemotron_speech_asr
 #SBATCH -J nemotron_speechprod_asr:probe-val
-#SBATCH -p batch_block1,batch_block3,batch_block4
+# Eval jobs go to the INTERACTIVE partition: they are single-node and short,
+# and the batch blocks queue behind 8-node training for hours. The admin limit
+# is ONE interactive job per user at a time, so do not launch two evals at once.
+#SBATCH -p interactive
 #SBATCH -N 1
 #SBATCH --gpus-per-node=8
 #SBATCH -t 01:00:00
