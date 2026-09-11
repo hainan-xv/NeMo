@@ -26,7 +26,19 @@ model:
   sample_rate: 16000
   compute_eval_loss: false
   log_prediction: true
-  skip_nan_grad: false
+  # ON for this arm. A non-finite GRADIENT here is fatal in a way that is easy
+  # to miss: `gradient_clip_val: 1.0` scales by max_norm/total_norm, which for an
+  # infinite total_norm is zero, and inf * 0 = NaN -- so clipping CONVERTS one
+  # overflowing gradient into NaN weights instead of containing it. Both lr 1e-4
+  # runs and the lr 3e-5 run died exactly this way: a smooth loss up to the last
+  # step (7.0-8.1 at 3e-5), then every encoder output non-finite from the next
+  # step on, with no warning in between.
+  #
+  # on_after_backward runs BEFORE clipping and all-reduces the verdict, so every
+  # rank drops the same step and DDP stays in sync. Lowering the LR only delayed
+  # the collapse (step ~360 -> ~1793), which is what identified the gradient
+  # rather than the step size as the thing to guard.
+  skip_nan_grad: true
 
   # Sum the losses and divide by the total number of TARGET TOKENS, rather than
   # by batch size (NeMo's default mean_batch).

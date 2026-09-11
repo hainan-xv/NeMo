@@ -444,6 +444,13 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
                 stage = name
                 break
         bad = (~torch.isfinite(nll)).nonzero().flatten().tolist()
+        # Surface the skip as a METRIC, not only as a log line. The guard returns
+        # a loss of exactly 0.0, which on a progress bar is indistinguishable
+        # from a model that has learned the task perfectly -- and that is how the
+        # first skipped run was read. A train_batches_skipped that climbs with
+        # every step says plainly that nothing is being learned.
+        self._batches_skipped = getattr(self, "_batches_skipped", 0) + 1
+        self.log("train_batches_skipped", float(self._batches_skipped), prog_bar=True)
         logging.error(
             "non-finite banded loss at step %s: first non-finite stage = %s; "
             "batch=%d utts, encoded_len min/max=%d/%d, lattice nodes=%d, "
