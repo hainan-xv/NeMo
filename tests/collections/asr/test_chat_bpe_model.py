@@ -749,6 +749,13 @@ class TestHuggingFaceVocabulary:
         assert m.decoding.decode_ids_to_str(ids) == "hello world"
         assert m.decoding.decode_ids_to_str(ids + [blank]) == "hello world"
         assert m.decoding.decode_ids_to_str([]) == ""
+        # The blank may land ANYWHERE, and a hypothesis that opens with one is
+        # ordinary early in training. Deciding ids-vs-strings from the first
+        # element before dropping None sends a decoded [None, 'hello', ...] down
+        # the id branch, which is the exact crash this guard exists to prevent.
+        assert m.decoding.decode_ids_to_str([blank] + ids) == "hello world"
+        assert m.decoding.decode_ids_to_str([ids[0], blank, ids[1]]) == "hello world"
+        assert m.decoding.decode_ids_to_str([blank, blank]) == ""
 
     @pytest.mark.unit
     def test_greedy_decode_runs_on_the_large_vocabulary(self, test_data_dir, tmp_path):

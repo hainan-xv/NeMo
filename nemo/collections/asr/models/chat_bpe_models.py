@@ -81,14 +81,19 @@ class _RNNTAutoTokenizer(AutoTokenizer):
     """
 
     def tokens_to_text(self, tokens, remove_special_tokens=False):
-        items = list(tokens)
-        if items and not isinstance(items[0], str):
-            n = self.vocab_size
-            ids = [int(t) for t in items]
-            items = self.tokenizer.convert_ids_to_tokens([i for i in ids if 0 <= i < n])
-        items = [t for t in items if t is not None]
+        # Drop None FIRST. This is reached two ways: with raw ids, and with the
+        # output of decode_ids_to_tokens, which already maps an out-of-vocabulary
+        # id (the blank) to None. Deciding ids-vs-strings from items[0] before
+        # filtering crashes whenever a hypothesis BEGINS with a blank.
+        items = [t for t in list(tokens) if t is not None]
         if not items:
             return ""
+        if not isinstance(items[0], str):
+            n = self.vocab_size
+            items = self.tokenizer.convert_ids_to_tokens([int(t) for t in items if 0 <= int(t) < n])
+            items = [t for t in items if t is not None]
+            if not items:
+                return ""
         return super().tokens_to_text(items, remove_special_tokens=remove_special_tokens)
 
 
