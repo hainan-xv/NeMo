@@ -25,7 +25,7 @@
 # d sees more audio; high d answers sooner. The interesting question is how much
 # accuracy the last 0.32 s of look-ahead is actually worth.
 #
-# Each d writes its own results directory (chunk14_offline_trim<d>), so the runs
+# Each d writes its own results directory (chunk14_offline_trim<d>_pad<p>), so runs
 # do not overwrite one another and the sweep can be resumed.
 #
 # The averaged .nemo is built once and reused across all five decodes.
@@ -69,7 +69,10 @@ echo "### macro WER by inference delay -- ${EXP}"
 echo "############################################################"
 printf '  %-6s %-10s %s\n' "d" "latency" "macro WER"
 for d in ${DELAYS}; do
-    agg="${OUTPUT_PREFIX}/results/${PROJECT}/${EXP}"/eval_*/chunk14_offline_trim${d}/aggregate.log
-    macro="$(grep -hE '^RESULT[[:space:]]+Average' $agg 2>/dev/null | awk '{print $3}' | tail -1)"
+    # eval_nemotron.sh now tags the leaf with the pad as well as the trim. Match
+    # the padded leaf specifically: a bare chunk14_offline_trim<d> glob would
+    # silently pick up the older UNPADDED results sitting beside it.
+    agg="$(ls -t "${OUTPUT_PREFIX}/results/${PROJECT}/${EXP}"/eval_*/chunk14_offline_trim${d}_pad*/aggregate.log 2>/dev/null | head -1)"
+    macro="$(grep -hE '^RESULT[[:space:]]+Average' "$agg" 2>/dev/null | awk '{print $3}' | tail -1)"
     printf '  %-6s %-10s %s\n' "${d}" "$(awk "BEGIN{printf \"-%.2fs\", ${d}*0.08}")" "${macro:-(missing)}"
 done
