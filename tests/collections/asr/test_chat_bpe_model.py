@@ -732,3 +732,35 @@ class TestHuggingFaceVocabulary:
         assert torch.isfinite(loss)
         loss.backward()
         assert any(p.grad is not None and torch.isfinite(p.grad).all() for p in m.parameters())
+
+    @pytest.mark.unit
+    def test_decoding_tolerates_ids_and_the_blank(self, test_data_dir, tmp_path):
+        """RNNTBPEDecoding passes token IDS to tokens_to_text, and the blank sits
+        outside the vocabulary. SentencePiece accepts ids; AutoTokenizer does not,
+        and an out-of-range id becomes None, which the HF decoder rejects with
+        "'NoneType' object cannot be converted to 'PyString'" -- during
+        validation, after the model has already trained for a while."""
+        if not os.path.isdir(self.QWEN):
+            pytest.skip("Qwen tokenizer not staged locally")
+        m = EncDecCHATBPEModel(cfg=self._cfg_qwen(test_data_dir, tmp_path))
+        m.eval()
+        blank = m.joint.num_classes_with_blank - 1
+        ids = m.tokenizer.text_to_ids("hello world")
+        assert m.decoding.decode_ids_to_str(ids) == "hello world"
+        assert m.decoding.decode_ids_to_str(ids + [blank]) == "hello world"
+        assert m.decoding.decode_ids_to_str([]) == ""
+
+    @pytest.mark.unit
+    def test_greedy_decode_runs_on_the_large_vocabulary(self, test_data_dir, tmp_path):
+        if not os.path.isdir(self.QWEN):
+            pytest.skip("Qwen tokenizer not staged locally")
+        m = EncDecCHATBPEModel(cfg=self._cfg_qwen(test_data_dir, tmp_path))
+        m.eval()
+        enc, enclen = m.forward(
+            input_signal=torch.randn(2, 16000 * 2) * 0.1, input_signal_length=torch.tensor([32000, 32000])
+        )
+        with torch.no_grad():
+            hyp = m.decoding.rnnt_decoder_predictions_tensor(encoder_output=enc, encoded_lengths=enclen)
+        if isinstance(hyp, tuple):
+            hyp = hyp[0]
+        assert len(hyp) == 2 and all(isinstance(h.text, str) for h in hyp)

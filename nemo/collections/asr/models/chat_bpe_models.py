@@ -54,6 +54,7 @@ from nemo.collections.asr.losses.banded_rnnt import BandedLattice, banded_rnnt_l
 from nemo.collections.asr.models.rnnt_bpe_models import EncDecRNNTBPEModel
 from nemo.collections.asr.parts.utils.chat_alignment import assign_words_to_chunks, build_forced_path, chunk_texts
 from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
+from nemo.collections.common.tokenizers import AutoTokenizer
 from nemo.core.classes.common import PretrainedModelInfo
 from nemo.core.classes.mixins import AccessMixin
 from nemo.utils import logging
@@ -61,6 +62,34 @@ from nemo.utils import logging
 __all__ = ["EncDecCHATBPEModel"]
 
 LOSS_TYPES = ("rnnt", "forced_alignment", "banded")
+
+
+class _RNNTAutoTokenizer(AutoTokenizer):
+    """AutoTokenizer with the leniency the RNN-T decoding path assumes.
+
+    ``RNNTBPEDecoding.decode_tokens_to_str`` passes token IDS to
+    ``tokens_to_text``. ``SentencePieceTokenizer`` accepts ids or strings, so
+    that works for a SentencePiece vocabulary; ``AutoTokenizer`` accepts only
+    strings. Worse, the transducer's BLANK sits at ``vocab_size`` -- outside the
+    vocabulary -- so converting it yields ``None`` and the HuggingFace decoder
+    fails with:
+
+        TypeError: argument 'tokens': 'NoneType' object cannot be converted to 'PyString'
+
+    Accepting ids and dropping out-of-vocabulary ones restores the contract the
+    decoding path relies on, without touching shared ASR code.
+    """
+
+    def tokens_to_text(self, tokens, remove_special_tokens=False):
+        items = list(tokens)
+        if items and not isinstance(items[0], str):
+            n = self.vocab_size
+            ids = [int(t) for t in items]
+            items = self.tokenizer.convert_ids_to_tokens([i for i in ids if 0 <= i < n])
+        items = [t for t in items if t is not None]
+        if not items:
+            return ""
+        return super().tokens_to_text(items, remove_special_tokens=remove_special_tokens)
 
 
 class EncDecCHATBPEModel(EncDecRNNTBPEModel):
@@ -141,15 +170,13 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
         if str(tokenizer_cfg.get("type", "")).lower() not in ("huggingface", "hf"):
             return super()._setup_tokenizer(tokenizer_cfg)
 
-        from nemo.collections.common.tokenizers import AutoTokenizer
-
         tok_dir = tokenizer_cfg["dir"]
         # Downstream branches test tokenizer_type against 'agg'; a subword
         # tokenizer behaves like the bpe path everywhere else.
         self.tokenizer_type = "bpe"
         self.tokenizer_dir = tok_dir
         self.tokenizer_cfg = OmegaConf.to_container(tokenizer_cfg) if hasattr(tokenizer_cfg, "keys") else {}
-        self.tokenizer = AutoTokenizer(pretrained_model_name=tok_dir)
+        self.tokenizer = _RNNTAutoTokenizer(pretrained_model_name=tok_dir)
 
         # EncDecRNNTBPEModel copies the vocabulary into cfg.labels and then into
         # cfg.joint.vocabulary. OmegaConf gives several strings special meaning,
