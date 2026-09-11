@@ -40,13 +40,14 @@ The forced path is built from the word timings the Granary cuts already carry in
 ``return_cuts=True`` on the ordinary Lhotse BPE dataset.
 """
 
+import os
 import random
 from typing import Dict, List, Optional
 
 import torch
 import torch.nn.functional as F
 from lhotse.dataset.collation import collate_vectors
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 from nemo.collections.asr.data.audio_to_text_lhotse import LhotseSpeechToTextBpeDataset
 from nemo.collections.asr.losses.banded_rnnt import BandedLattice, banded_rnnt_loss, build_lattices
@@ -110,12 +111,87 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
 
         super().__init__(cfg=cfg, trainer=trainer)
 
+        # Restore the real get_vocab now that the config is built (see
+        # _setup_tokenizer); leaving the placeholder would corrupt anything that
+        # later asks the tokenizer for its vocabulary.
+        _patch = getattr(self, "_hf_vocab_patch", None)
+        if _patch is not None:
+            _patch[0].get_vocab = _patch[1]
+            self._hf_vocab_patch = None
+
         if self.loss_type in ("forced_alignment", "banded"):
             logging.info(
                 f"CHAT {self.loss_type} loss (band_chunks={self.band_chunks}): delay={self.num_delay_frames} frames, "
                 f"recover_history_words={self.recover_history_words}, "
                 f"frame_length={self.frame_length_in_secs:.4f}s, chunk_size={self.joint.chunk_size}"
             )
+
+    # ----------------------------------------------------------- tokenizer
+
+    def _setup_tokenizer(self, tokenizer_cfg):
+        """Accept ``type: huggingface`` in addition to the ASR collection's bpe/wpe.
+
+        The forced-alignment and banded losses exist because a large vocabulary
+        makes the full RNN-T lattice unaffordable, so being able to attach one is
+        the point. NeMo's own ``AutoTokenizer`` already satisfies everything the
+        RNN-T BPE model asks of a tokenizer -- including ``.tokenizer.get_vocab()``,
+        which is how the joint sizes itself -- so this only has to construct it
+        and register the files so ``save_to`` produces a self-contained .nemo.
+        """
+        if str(tokenizer_cfg.get("type", "")).lower() not in ("huggingface", "hf"):
+            return super()._setup_tokenizer(tokenizer_cfg)
+
+        from nemo.collections.common.tokenizers import AutoTokenizer
+
+        tok_dir = tokenizer_cfg["dir"]
+        # Downstream branches test tokenizer_type against 'agg'; a subword
+        # tokenizer behaves like the bpe path everywhere else.
+        self.tokenizer_type = "bpe"
+        self.tokenizer_dir = tok_dir
+        self.tokenizer_cfg = OmegaConf.to_container(tokenizer_cfg) if hasattr(tokenizer_cfg, "keys") else {}
+        self.tokenizer = AutoTokenizer(pretrained_model_name=tok_dir)
+
+        # EncDecRNNTBPEModel copies the vocabulary into cfg.labels and then into
+        # cfg.joint.vocabulary. OmegaConf gives several strings special meaning,
+        # and an LLM vocabulary contains them as ordinary pieces:
+        #     "${..."  -> parsed as an interpolation   (36 Qwen pieces)
+        #     "???"    -> parsed as MISSING            (1 Qwen piece)
+        # Each one aborts model construction, and escaping does not survive the
+        # second copy. Rather than chase OmegaConf's special values one at a
+        # time, do not put the strings in the config at all.
+        #
+        # Nothing needs them. cfg.labels is used ONLY for its length, to size the
+        # decoder embedding and the joint output layer, and joint.vocabulary is
+        # stored but never read -- decode_ids_to_str goes through the tokenizer.
+        # So the config gets a placeholder list of the right length while the
+        # tokenizer keeps the real vocabulary.
+        #
+        # The patch is reverted as soon as the parent constructor has run, so
+        # nothing else ever sees the placeholder.
+        _hf = self.tokenizer.tokenizer
+        _raw_get_vocab = _hf.get_vocab
+        _n = len(_raw_get_vocab())
+
+        def _placeholder_vocab():
+            return {f"<piece_{i}>": i for i in range(_n)}
+
+        _hf.get_vocab = _placeholder_vocab
+        self._hf_vocab_patch = (_hf, _raw_get_vocab)
+
+        # Bundle the vocabulary into the .nemo. Without this, restore_from would
+        # need the original lustre path to still exist, which it will not on
+        # another machine.
+        for fname in (
+            "tokenizer.json",
+            "vocab.json",
+            "merges.txt",
+            "tokenizer_config.json",
+            "special_tokens_map.json",
+        ):
+            path = os.path.join(tok_dir, fname)
+            if os.path.isfile(path):
+                self.register_artifact(f"tokenizer.{fname}", path)
+        logging.info(f"HuggingFace tokenizer from {tok_dir}: {self.tokenizer.vocab_size} pieces")
 
     # ------------------------------------------------------------------ data
 

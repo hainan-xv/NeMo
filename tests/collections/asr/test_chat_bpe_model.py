@@ -681,3 +681,54 @@ class TestNoDeletionsAtTheAudioEnd:
         m = _with_stub_trainer(EncDecCHATBPEModel(cfg=cfg))
         m.on_validation_epoch_start()
         assert m.joint.frame_trim == 0
+
+
+class TestHuggingFaceVocabulary:
+    """An LLM vocabulary is the case the banded and forced losses exist for, so
+    the model has to be able to attach one. It is also full of strings OmegaConf
+    treats as syntax, which breaks model construction in non-obvious ways."""
+
+    QWEN = "/home/hainanx/Workplace/chat_diag/qwen_tokenizer"
+
+    def _cfg_qwen(self, test_data_dir, tmp_path, loss="banded"):
+        cfg = _cfg(test_data_dir, loss)
+        cfg.tokenizer.dir = self.QWEN
+        cfg.tokenizer.type = "huggingface"
+        cfg.train_ds = _train_ds_cfg(tmp_path)
+        return cfg
+
+    @pytest.mark.unit
+    def test_builds_and_sizes_the_joint_from_the_hf_vocabulary(self, test_data_dir, tmp_path):
+        if not os.path.isdir(self.QWEN):
+            pytest.skip("Qwen tokenizer not staged locally")
+        m = EncDecCHATBPEModel(cfg=self._cfg_qwen(test_data_dir, tmp_path))
+        assert m.tokenizer.vocab_size > 100000
+        assert m.joint.num_classes_with_blank == m.tokenizer.vocab_size + 1
+        assert m.decoder.prediction.embed.weight.shape[0] == m.tokenizer.vocab_size + 1
+
+    @pytest.mark.unit
+    def test_the_real_vocabulary_survives_construction(self, test_data_dir, tmp_path):
+        """cfg.labels gets a placeholder list so OmegaConf can store it; the
+        tokenizer must be left holding the real pieces, including the ones that
+        look like OmegaConf syntax."""
+        if not os.path.isdir(self.QWEN):
+            pytest.skip("Qwen tokenizer not staged locally")
+        m = EncDecCHATBPEModel(cfg=self._cfg_qwen(test_data_dir, tmp_path))
+        vocab = m.tokenizer.tokenizer.get_vocab()
+        assert not any(k.startswith("<piece_") for k in list(vocab)[:50]), "placeholder vocabulary leaked"
+        assert "${" in vocab, "the interpolation-looking piece was lost"
+        for text in ("cost ${5} today", "answer is ???", "plain words"):
+            assert m.tokenizer.ids_to_text(m.tokenizer.text_to_ids(text)) == text
+
+    @pytest.mark.unit
+    def test_banded_loss_runs_on_the_large_vocabulary(self, test_data_dir, tmp_path):
+        if not os.path.isdir(self.QWEN):
+            pytest.skip("Qwen tokenizer not staged locally")
+        m = EncDecCHATBPEModel(cfg=self._cfg_qwen(test_data_dir, tmp_path))
+        m.train()
+        sig, siglen, _, _, cuts = next(iter(m._train_dl))
+        enc, enclen = m.forward(input_signal=sig, input_signal_length=siglen)
+        loss = m._banded_loss(enc, enclen, cuts)
+        assert torch.isfinite(loss)
+        loss.backward()
+        assert any(p.grad is not None and torch.isfinite(p.grad).all() for p in m.parameters())

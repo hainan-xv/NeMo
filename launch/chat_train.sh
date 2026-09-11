@@ -43,6 +43,10 @@
 #   MAX_STEPS, LR, WARMUP_STEPS, EPOCH_STEPS   training schedule
 #   EXP_NAME                 results directory
 #   INIT_NEMO                encoder donor (.nemo)
+#   TOKENIZER_DIR            vocabulary to train with; default extracts the
+#                            donor's SentencePiece model into /results/tokenizer.
+#                            Point it at a HuggingFace directory to use an LLM
+#                            vocabulary (set model.tokenizer.type accordingly).
 #   INIT_EXCLUDE             tensors to leave random; default keeps the donor's
 #                            embedding OUT, matching the speechlm2 CHAT runs.
 #                            Set to '[]' to also inherit the embedding (legal
@@ -120,7 +124,10 @@ INIT_NEMO="${INIT_NEMO:-${H_DIR}/pretrained_models/huggingface/nvidia/nemotron-s
 # host path instead puts the tokenizer in the container's ephemeral overlay: the
 # run works, but nothing persists to lustre, so anything later needing the
 # vocabulary (checkpoint averaging, eval) finds an empty directory.
-TOKENIZER_DIR="/results/tokenizer"
+# Default: extract the donor's SentencePiece model into the mounted results dir.
+# An arm with its own vocabulary (e.g. Qwen) overrides this to point at a
+# directory that already holds one, and the extraction below is skipped.
+TOKENIZER_DIR="${TOKENIZER_DIR:-/results/tokenizer}"
 
 mkdir -p "${RESULTS_DIR}" "${HFCACHE}"
 OUTFILE=${RESULTS_DIR}/slurm-%j-%n.out
@@ -153,7 +160,7 @@ echo "*******STARTING********" \
 && export TMPDIR=${OCI_TMP_DIR} && mkdir -p ${OCI_TMP_DIR} \
 && export AIS_ENDPOINT=http://asr.iad.oci.aistore.nvidia.com:51080 AIS_AUTHN_TOKEN="${AIS_AUTHN_TOKEN}" \
 && export NEMO_DATA_STORE_CACHE_DIR=${H_DIR}/nemo_cache \
-&& if [ ! -f '${TOKENIZER_DIR}/tokenizer.model' ]; then \
+&& if [ ! -f '${TOKENIZER_DIR}/tokenizer.model' ] && [ ! -f '${TOKENIZER_DIR}/tokenizer.json' ]; then \
      echo '==> extracting the donor SentencePiece vocabulary'; \
      python -c "
 import os, tarfile, shutil, sys
