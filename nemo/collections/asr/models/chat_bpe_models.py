@@ -80,6 +80,48 @@ class _RNNTAutoTokenizer(AutoTokenizer):
     decoding path relies on, without touching shared ASR code.
     """
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._align_inner_vocab_size()
+
+    def _align_inner_vocab_size(self):
+        """Make the UNDERLYING tokenizer report the full vocabulary size.
+
+        ``RNNTBPEDecoding`` derives the blank from
+        ``tokenizer.tokenizer.vocab_size`` -- the underlying object, not this
+        wrapper. For a HuggingFace tokenizer that property counts only the BASE
+        vocabulary and excludes added special tokens, while the joint is sized
+        from ``len(vocab)``. Qwen has 26 added tokens, so the decoder looked for
+        the blank at 151643 while the joint emitted it at 151669.
+
+        The consequences are severe and silent. The real blank is treated as an
+        ordinary label, so it is APPENDED to the hypothesis instead of ending the
+        step, and the step only terminates on id 151643 -- a token the model
+        almost never predicts -- so decoding runs to max_symbols every chunk.
+        That is the runaway repetition observed:
+
+            REF  'The formation is now in a small park overlooking the St ...'
+            HYP  ' in a in a park over the Saint the Saint the Saint Mar.. River'
+
+        SentencePiece has no added tokens, so the two agree and the 1,024-piece
+        arm is unaffected -- which is why this survived every test at 1k.
+
+        Fixed here, at the single point all three RNNTBPEDecoding construction
+        sites read from, so change_decoding_strategy cannot reintroduce it.
+        """
+        inner = self.tokenizer
+        full = len(inner.get_vocab())
+        if getattr(inner, "vocab_size", full) == full:
+            return
+        # vocab_size is a read-only property on the class, so give this INSTANCE
+        # a subclass that overrides it rather than mutating shared state.
+        patched = type(
+            type(inner).__name__ + "WithAddedTokens",
+            (type(inner),),
+            {"vocab_size": property(lambda _self, _n=full: _n)},
+        )
+        inner.__class__ = patched
+
     def tokens_to_text(self, tokens, remove_special_tokens=False):
         # Drop None FIRST. This is reached two ways: with raw ids, and with the
         # output of decode_ids_to_tokens, which already maps an out-of-vocabulary

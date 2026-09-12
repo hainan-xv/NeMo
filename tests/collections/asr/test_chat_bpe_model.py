@@ -717,6 +717,62 @@ class TestNoDeletionsAtTheAudioEnd:
         assert m.joint.frame_trim == 0
 
 
+class TestDecoderAndJointAgreeOnTheBlank:
+    """The decoder's blank must be the id the joint actually emits.
+
+    RNNTBPEDecoding derives it from ``tokenizer.tokenizer.vocab_size`` -- the
+    UNDERLYING tokenizer. For HuggingFace that counts only the base vocabulary
+    and excludes added special tokens, while the joint is sized from
+    ``len(vocab)``. Qwen has 26 added tokens, so the decoder hunted for the blank
+    at 151643 while the joint emitted it at 151669.
+
+    The failure is silent and severe: the real blank becomes an ordinary label
+    and is APPENDED to the hypothesis rather than ending the step, and the step
+    only terminates on a token the model never predicts, so decoding runs to
+    max_symbols on every chunk:
+
+        REF  'The formation is now in a small park overlooking the St Maurice'
+        HYP  ' in a in a park over the Saint the Saint the Saint Mar.. River'
+
+    SentencePiece has no added tokens, so both numbers agree and the 1,024-piece
+    arm never showed it.
+    """
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("tok_kind", ["sentencepiece", "huggingface"])
+    def test_blank_index_matches_the_joint(self, test_data_dir, tmp_path, tok_kind):
+        qwen = "/home/hainanx/Workplace/chat_diag/qwen_tokenizer"
+        c = _cfg(test_data_dir, "banded")
+        if tok_kind == "huggingface":
+            if not os.path.isdir(qwen):
+                pytest.skip("Qwen tokenizer not staged locally")
+            c.tokenizer.dir, c.tokenizer.type = qwen, "huggingface"
+        c.train_ds = _train_ds_cfg(tmp_path)
+        m = EncDecCHATBPEModel(cfg=c)
+        joint_blank = m.joint.num_classes_with_blank - 1
+        assert m.decoding.blank_id == joint_blank
+        assert m.decoding.decoding._blank_index == joint_blank
+        # change_decoding_strategy rebuilds decoding from the tokenizer, so the
+        # fix has to live where that rereads it, not in a one-off assignment.
+        m.change_decoding_strategy(m.cfg.decoding)
+        assert m.decoding.blank_id == joint_blank
+
+    @pytest.mark.unit
+    def test_every_real_token_id_is_inside_the_joint(self, test_data_dir, tmp_path):
+        """Added special tokens sit ABOVE the base vocab_size. They must still be
+        addressable by the joint, or a rare token would index out of bounds."""
+        qwen = "/home/hainanx/Workplace/chat_diag/qwen_tokenizer"
+        if not os.path.isdir(qwen):
+            pytest.skip("Qwen tokenizer not staged locally")
+        c = _cfg(test_data_dir, "banded")
+        c.tokenizer.dir, c.tokenizer.type = qwen, "huggingface"
+        c.train_ds = _train_ds_cfg(tmp_path)
+        m = EncDecCHATBPEModel(cfg=c)
+        highest = max(m.tokenizer.tokenizer.get_vocab().values())
+        blank = m.joint.num_classes_with_blank - 1
+        assert highest < blank, "a real token collides with or exceeds the blank"
+
+
 class TestChunkTargetsMatchWholeTranscript:
     """The concatenated per-chunk targets must tokenize to the SAME ids as the
     whole transcript.
