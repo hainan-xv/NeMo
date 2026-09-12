@@ -9,6 +9,7 @@
 # rejects a whole-node memory request against a single GPU as stranding the
 # other seven. One GPU is plenty to decode eight utterances.
 #SBATCH --mem=200G
+#SBATCH --cpus-per-task=16
 #SBATCH --ntasks-per-node=1
 #SBATCH --output=slurm_out/%x=%j --error=slurm_out/%x=%j
 
@@ -60,6 +61,12 @@ DATA_DIR=/lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/dat
 MOUNTS="--container-mounts=${CODE_DIR}:/code,/lustre/fsw/portfolios/llmservice:/lustre/fsw/portfolios/llmservice,/lustre/fsw/portfolios/nemotron:/lustre/fsw/portfolios/nemotron,${DATA_DIR}:/data"
 
 srun --ntasks=1 --nodes=1 --container-image="$CONTAINER" $MOUNTS bash -c "
-    cd /code && export PYTHONPATH=/code:\$PYTHONPATH HYDRA_FULL_ERROR=1 &&
+    cd /code &&
+    # Pin the MKL/OMP thread count. On this 1-GPU allocation MKL's vector-math
+    # threader computes a per-thread chunk size from the visible core count and
+    # divides by zero (SIGFPE in mkl_vml_serv_GetMinN, reached via vmsCos while
+    # building positional encodings) before any model code runs.
+    export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 &&
+    export PYTHONPATH=/code:\$PYTHONPATH HYDRA_FULL_ERROR=1 &&
     python scripts/qwen_decode_probe.py --ckpt '${CKPT}' --n 8
 "
