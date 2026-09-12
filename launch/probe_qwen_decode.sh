@@ -34,9 +34,11 @@ PROJECT="${PROJECT:-SpeechlmScriptCC}"
 CODE_DIR="${CODE_DIR:-${OUTPUT_PREFIX}/NeMo_SCRIPT_cc}"
 CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/llmservice/users/heh/containers/nemo-26.02-streaming-speechlm.sqsh}"
 
-# The lr 1e-4 arm is the clearest case: its best val_wer (0.8683) is epoch 0, so
-# every later epoch made the metric worse while the loss fell.
-EXP="${EXP:-granary2_chat_banded1_qwenvocab_lr1e4_gradguard}"
+# The 1-node lr 3e-5 arm, which is simply the furthest along. Since the chunk
+# spacing fix its val_wer falls instead of rising -- 1.0000, 0.9605, 0.8713,
+# 0.8768, 0.8716, 0.8673, 0.8624 -- but it has plateaued near 86% while the
+# 1,024-piece arm sits at 0.1139, so the targets were not the only fault.
+EXP="${EXP:-granary2_chat_banded1_qwenvocab_lr3e5_n1}"
 CKPT_DIR="${OUTPUT_PREFIX}/results/${PROJECT}/${EXP}/${EXP}/checkpoints"
 
 # Newest, not best: the question is what the TRAINED model emits, and the "best"
