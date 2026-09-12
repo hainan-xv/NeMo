@@ -338,10 +338,56 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
             self.frame_length_in_secs,
             self.num_delay_frames if delay is None else delay,
         )
-        # Each chunk is tokenized on its own, with NO leading space: the
-        # tokenizer's dummy prefix already marks the word start, while an
-        # explicit space becomes a standalone piece the model then has to emit.
-        return [self.tokenizer.text_to_ids(t) if t else [] for t in chunk_texts(groups, words, transcript)]
+        texts = self._chunk_texts_for_tokenizer(groups, words, transcript)
+        return [self.tokenizer.text_to_ids(t) if t else [] for t in texts]
+
+    @property
+    def _tokenizer_supplies_word_prefix(self) -> bool:
+        """Does this tokenizer mark a word start without being given a space?
+
+        SentencePiece does: its dummy prefix makes ``text_to_ids("word")`` begin
+        with ``▁word``, so a chunk tokenized on its own still says "word start".
+        A byte-level BPE like Qwen's does NOT -- ``"word"`` encodes as ``word``
+        and only ``" word"`` encodes as ``Ġword``, a DIFFERENT id.
+        """
+        cached = getattr(self, "_tok_word_prefix", None)
+        if cached is None:
+            ids = self.tokenizer.text_to_ids("word")
+            pieces = self.tokenizer.ids_to_tokens(list(ids)) if ids else []
+            cached = bool(pieces) and str(pieces[0]).startswith(("▁", "Ġ"))
+            self._tok_word_prefix = cached
+        return cached
+
+    def _chunk_texts_for_tokenizer(self, groups, words, transcript) -> List[str]:
+        """Chunk texts, spaced so that tokenizing them SEPARATELY gives the same
+        ids as tokenizing the whole transcript at once.
+
+        This is the difference between the 1,024-piece arm working and the
+        151.7k Qwen arm producing 'the bestselling singleby a Germanartist'.
+        chunk_texts strips whitespace and leaves the word-boundary marker to the
+        tokenizer's dummy prefix, which SentencePiece supplies and a byte-level
+        BPE does not. Without it every chunk after the first trains the model on
+        the NO-SPACE variant of its opening word, so the words are individually
+        right and run together when decoded -- and no amount of training fixes
+        it, because the targets themselves are wrong.
+
+        The first chunk carrying text keeps its bare form: it opens the
+        utterance, where the full-sentence tokenization has no preceding space
+        either. For SentencePiece nothing changes, which is what keeps the
+        explicit space from becoming the junk standalone piece chunk_texts warns
+        about.
+        """
+        texts = chunk_texts(groups, words, transcript)
+        if self._tokenizer_supplies_word_prefix:
+            return texts
+        out, started = [], False
+        for t in texts:
+            if not t:
+                out.append(t)
+                continue
+            out.append(" " + t if started else t)
+            started = True
+        return out
 
     def _build_batch_path(self, cuts, n_chunks: torch.Tensor, device, delay: Optional[int] = None):
         """Assemble (b, t, u, labels) and the prediction-network input."""

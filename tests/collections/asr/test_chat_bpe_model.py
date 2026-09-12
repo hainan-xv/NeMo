@@ -717,6 +717,67 @@ class TestNoDeletionsAtTheAudioEnd:
         assert m.joint.frame_trim == 0
 
 
+class TestChunkTargetsMatchWholeTranscript:
+    """The concatenated per-chunk targets must tokenize to the SAME ids as the
+    whole transcript.
+
+    This is the invariant the Qwen arm violated. chunk_texts strips whitespace
+    and leaves the word-boundary marker to the tokenizer's dummy prefix --
+    SentencePiece supplies one, a byte-level BPE does not. So every chunk after
+    the first was trained on the NO-SPACE variant of its opening word, and the
+    model learned to emit words that run together:
+
+        trained target : 'the bestselling singleby a Germanartist'
+        wanted         : 'the best selling single by a German artist'
+
+    The words were individually correct, so the loss fell happily (15.5 -> 1.2)
+    while val_wer never beat its epoch-0 value. No amount of training could fix
+    it; the targets themselves were wrong. A WER test would not have caught this
+    at 1k, because SentencePiece makes it invisible.
+    """
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("tok_kind", ["sentencepiece", "huggingface"])
+    def test_chunkwise_tokenization_equals_whole_transcript(self, test_data_dir, tmp_path, tok_kind):
+        qwen = "/home/hainanx/Workplace/chat_diag/qwen_tokenizer"
+        c = _cfg(test_data_dir, "banded")
+        if tok_kind == "huggingface":
+            if not os.path.isdir(qwen):
+                pytest.skip("Qwen tokenizer not staged locally")
+            c.tokenizer.dir, c.tokenizer.type = qwen, "huggingface"
+        c.train_ds = _train_ds_cfg(tmp_path)
+        m = EncDecCHATBPEModel(cfg=c)
+
+        transcript = "the best selling single by a German artist"
+        words = transcript.split()
+        groups = [[0, 1], [2, 3], [4, 5, 6], [7]]   # four chunks, as the aligner would give
+        texts = m._chunk_texts_for_tokenizer(groups, words, transcript)
+        chunkwise = [i for t in texts for i in (m.tokenizer.text_to_ids(t) if t else [])]
+        whole = m.tokenizer.text_to_ids(transcript)
+        assert chunkwise == whole, (
+            f"{tok_kind}: chunk-wise ids differ from whole-transcript ids\n"
+            f"  chunkwise -> {m.tokenizer.ids_to_text(chunkwise)!r}\n"
+            f"  whole     -> {m.tokenizer.ids_to_text(whole)!r}"
+        )
+
+    @pytest.mark.unit
+    def test_sentencepiece_gets_no_explicit_space(self, test_data_dir, tmp_path):
+        """The fix must not regress the vocabulary that already works.
+
+        chunk_texts warns that an explicit leading space becomes a standalone
+        SentencePiece piece, wasting one emission slot per chunk. So for a
+        tokenizer that supplies its own prefix the texts must come back
+        untouched.
+        """
+        c = _cfg(test_data_dir, "banded")
+        c.train_ds = _train_ds_cfg(tmp_path)
+        m = EncDecCHATBPEModel(cfg=c)
+        assert m._tokenizer_supplies_word_prefix is True
+        transcript = "the best selling single"
+        texts = m._chunk_texts_for_tokenizer([[0, 1], [2, 3]], transcript.split(), transcript)
+        assert not any(t.startswith(" ") for t in texts), texts
+
+
 class TestHuggingFaceVocabulary:
     """An LLM vocabulary is the case the banded and forced losses exist for, so
     the model has to be able to attach one. It is also full of strings OmegaConf
