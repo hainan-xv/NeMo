@@ -5,8 +5,10 @@
 #SBATCH -N 1
 #SBATCH --gpus-per-node=1
 #SBATCH -t 00:30:00
-#SBATCH --exclusive
-#SBATCH --mem=0
+# No --exclusive / --mem=0 here. This asks for ONE GPU, and the scheduler
+# rejects a whole-node memory request against a single GPU as stranding the
+# other seven. One GPU is plenty to decode eight utterances.
+#SBATCH --mem=200G
 #SBATCH --ntasks-per-node=1
 #SBATCH --output=slurm_out/%x=%j --error=slurm_out/%x=%j
 
