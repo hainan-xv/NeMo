@@ -48,7 +48,13 @@ if [[ -z "$CKPT" ]]; then
 fi
 echo "==> probing ${CKPT##*/}"
 
-MOUNTS="--container-mounts=${CODE_DIR}:/code,${OUTPUT_PREFIX}:${OUTPUT_PREFIX},/lustre/fsw/portfolios/llmservice:/lustre/fsw/portfolios/llmservice"
+# The validation manifests reference audio by its IN-CONTAINER path
+# (/data/ASR/...), so the probe needs the same DATA_DIR:/data mount the training
+# job uses. Without it the checkpoint loads and the tokenizer works, then the
+# dataloader dies on the first cut.
+DATA_DIR=/lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data
+H_DIR=/lustre/fsw/portfolios/llmservice/users/heh
+MOUNTS="--container-mounts=${CODE_DIR}:/code,${OUTPUT_PREFIX}:${OUTPUT_PREFIX},${DATA_DIR}:/data,${DATA_DIR}:${DATA_DIR},${H_DIR}:${H_DIR}"
 
 srun --ntasks=1 --nodes=1 --container-image="$CONTAINER" $MOUNTS bash -c "
     cd /code && export PYTHONPATH=/code:\$PYTHONPATH HYDRA_FULL_ERROR=1 &&
