@@ -227,8 +227,9 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
             )
         # How often to report aligner/transcript spelling mismatches. 0 disables.
         self.log_target_mismatch_every_n_steps = int(fa.get("log_target_mismatch_every_n_steps", 500))
-        self._mismatch_stats = {"utts": 0, "words": 0, "respelled": 0, "dropped": 0, "missing": 0}
+        self._mismatch_stats = {"utts": 0, "words": 0, "respelled": 0, "dropped": 0, "missing": 0, "fallback": 0}
         self._mismatch_examples: List[str] = []
+        self._fallback_examples: List[str] = []
         self._mismatch_last_logged = -1
 
         self._ws_ids: Optional[frozenset] = None
@@ -432,14 +433,25 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
             self.frame_length_in_secs,
             self.num_delay_frames if delay is None else delay,
         )
-        if self.target_construction != "partition" or not transcript or not words:
-            texts = self._chunk_texts_for_tokenizer(groups, words, transcript)
+        partition = self.target_construction == "partition"
+        if not partition or not transcript or not words:
+            texts = self._chunk_texts_for_tokenizer(groups, words, transcript, respell=partition)
             return [self.tokenizer.text_to_ids(t) if t else [] for t in texts]
 
         offsets = self._tokenize_with_offsets(transcript)
         if offsets is None:
+            # The offsets could not be verified against the transcript, so the
+            # token-space split is unsafe here. Degrade to the text path but KEEP
+            # the respelling retry: we lose the partition and the punctuation
+            # delay for this utterance, not the word. Counted and sampled,
+            # because a high rate would mean this arm is quietly running the
+            # control's objective -- which the mismatch counters alone cannot
+            # show, since an utterance with no mismatch reports nothing either way.
+            self._mismatch_stats["fallback"] += 1
+            if len(self._fallback_examples) < 3:
+                self._fallback_examples.append(repr(transcript[:100]))
             # Tokenizer cannot report character offsets; keep the text-space path.
-            texts = self._chunk_texts_for_tokenizer(groups, words, transcript)
+            texts = self._chunk_texts_for_tokenizer(groups, words, transcript, respell=True)
             return [self.tokenizer.text_to_ids(t) if t else [] for t in texts]
 
         char_chunk = self._char_to_chunk(transcript, words, groups)
@@ -596,7 +608,7 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
         logging.info(
             "CHAT targets @ step %d (%s): %d utts / %d aligner words | "
             "respelled+recovered %d (%.3f%%) | respelled+DROPPED %d (%.3f%%) | "
-            "absent from transcript %d (%.3f%%) | examples: %s",
+            "absent from transcript %d (%.3f%%) | offset-fallback %d/%d utts (%.2f%%)%s | examples: %s",
             step,
             self.target_construction,
             s["utts"],
@@ -607,9 +619,14 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
             pct("dropped"),
             s["missing"],
             pct("missing"),
+            s["fallback"],
+            s["utts"],
+            100.0 * s["fallback"] / max(s["utts"], 1),
+            (" e.g. " + "; ".join(self._fallback_examples)) if self._fallback_examples else "",
             "; ".join(self._mismatch_examples) or "(none)",
         )
         self._mismatch_examples.clear()
+        self._fallback_examples.clear()
 
     @property
     def _tokenizer_supplies_word_prefix(self) -> bool:
@@ -628,7 +645,7 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
             self._tok_word_prefix = cached
         return cached
 
-    def _chunk_texts_for_tokenizer(self, groups, words, transcript) -> List[str]:
+    def _chunk_texts_for_tokenizer(self, groups, words, transcript, respell: bool = False) -> List[str]:
         """Chunk texts, spaced so that tokenizing them SEPARATELY gives the same
         ids as tokenizing the whole transcript at once.
 
