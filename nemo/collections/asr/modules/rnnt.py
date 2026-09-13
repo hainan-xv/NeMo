@@ -1907,6 +1907,7 @@ class RNNTAttJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMix
         masking_prob: float = -1.0,
         chunk_size: int = -1,
         history_chunks: int = 0,
+        window_frames: int = 0,
     ):
         super().__init__()
 
@@ -1915,6 +1916,20 @@ class RNNTAttJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMix
         # Frames the joint may ATTEND to, beyond the chunk it is emitting for.
         # 0 = standard CHAT. See _apply_history_window.
         self.history_chunks = int(history_chunks)
+        # FIXED-FRAME WINDOW ("win28"). A CONSTANT number of encoder frames the
+        # joint may attend to, ending at the chunk boundary -- unlike
+        # history_chunks, which gives (M+1)*chunk_size and therefore SCALES with
+        # the emission grid: at chunk_size 2, history_chunks=1 is 4 frames, while
+        # window_frames=28 is 28 at every chunk size. That decoupling of acoustic
+        # context from emission granularity is the whole point of the knob, so
+        # the two are mutually exclusive rather than one silently winning.
+        self.window_frames = int(window_frames)
+        if self.window_frames > 0 and self.history_chunks > 0:
+            raise ValueError(
+                f"RNNTAttJoint: window_frames={self.window_frames} and history_chunks={self.history_chunks} "
+                f"are both set. They size the SAME attention window in incompatible units -- window_frames is a "
+                f"constant count of encoder frames, history_chunks is a multiple of chunk_size. Set exactly one."
+            )
         # Frames of the CURRENT chunk to treat as not-yet-arrived. Set per batch
         # by the flexible-delay recipe; 0 leaves the joint exactly as it was.
         self.frame_trim = 0
@@ -2008,6 +2023,19 @@ class RNNTAttJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMix
         self.num_chunks_per_utterance = None
         return self.joint_after_projection(self.project_encoder(f), self.project_prednet(g), f_len)
 
+    def window_width(self, chunk_size: Optional[int] = None) -> int:
+        """Frames the joint may attend to per chunk.
+
+        ``window_frames`` is a FLOOR, not a cap: a chunk longer than the window
+        keeps all of its own frames, because a chunk must be able to see the
+        audio of the words it is asked to emit. Same rule as SCRIPT's
+        ``_audio_window_start`` (speechlm2/parts/script.py).
+
+        Read at CALL time, so a per-batch chunk size needs no extra wiring.
+        """
+        c = int(self.chunk_size if chunk_size is None else chunk_size)
+        return max(int(self.window_frames), (int(self.history_chunks) + 1) * c)
+
     def _apply_history_window(self, chunked: torch.Tensor, chunk_lengths: torch.Tensor):
         """Widen each chunk's ATTENDABLE frames to include the previous M chunks.
 
@@ -2052,26 +2080,27 @@ class RNNTAttJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMix
         if d > 0:
             chunk_lengths = (chunk_lengths - d).clamp(min=0)
 
-        M = self.history_chunks
-        if M <= 0:
+        C = self.chunk_size
+        W = self.window_width()
+        if W <= C:
             return chunked, chunk_lengths
 
         B, T, CD = chunked.shape
-        C = self.chunk_size
         D = CD // C
-        W = (M + 1) * C
         dev = chunked.device
 
         flat = chunked.reshape(B, T * C, D)
         t_ar = torch.arange(T, device=dev)
-        start = (t_ar - M).clamp(min=0) * C  # [T]
+        # First frame of the window. Equals (t-M)*C clamped when W=(M+1)*C, so
+        # the chunk-based mode is unchanged; for a fixed W it slides per frame.
+        start = ((t_ar + 1) * C - W).clamp(min=0)  # [T]
         idx = start.view(1, T, 1) + torch.arange(W, device=dev).view(1, 1, W)  # [1, T, W]
         idx = idx.clamp(max=T * C - 1).expand(B, T, W)
         gathered = flat.gather(1, idx.reshape(B, T * W, 1).expand(B, T * W, D))
         windowed = gathered.reshape(B, T, W * D)
 
-        # Frames of real history in front of this chunk: min(t, M) * C.
-        hist = t_ar.clamp(max=M) * C  # [T]
+        # Frames of real history in front of this chunk == min(t*C, W - C).
+        hist = t_ar * C - start  # [T]
         valid = hist.view(1, T) + chunk_lengths
         # A chunk past the end of the audio stays empty -- it has no target and
         # must not become "valid" merely because history sits in front of it.

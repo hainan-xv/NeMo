@@ -100,6 +100,63 @@ def process_config(cfg: OmegaConf):
     return name_prefix, checkpoint_paths, save_ckpt_only
 
 
+# Architecture keys that change what the model COMPUTES without changing a single
+# tensor shape. The CHAT joint's attention window is the motivating case: a model
+# built with window_frames=28 and one built with window_frames=0 have identical
+# state_dicts (measured: 111 tensors, same shapes), so `load_state_dict(strict=True)`
+# accepts either into the other and the averaged .nemo then decodes with a window it
+# was never trained with. No error, no shape mismatch, just a worse number that
+# belongs to no trained model.
+_ARCH_KEYS = (
+    "joint.window_frames",
+    "joint.history_chunks",
+    "joint.chunk_size",
+    "loss_type",
+)
+
+
+def _get_nested(cfg, dotted):
+    cur = cfg
+    for part in dotted.split("."):
+        if cur is None:
+            return None
+        try:
+            cur = cur.get(part) if hasattr(cur, "get") else getattr(cur, part, None)
+        except Exception:  # noqa: BLE001 -- an absent key is not an error here
+            return None
+    return cur
+
+
+def _check_architecture_matches(checkpoint, model_cfg, path):
+    """Fail loudly when the config being rebuilt disagrees with the checkpoint.
+
+    Only compares keys present on BOTH sides, so checkpoints written before a key
+    existed are unaffected.
+    """
+    if model_cfg is None or not isinstance(checkpoint, dict):
+        return
+    ckpt_cfg = (checkpoint.get("hyper_parameters") or {}).get("cfg")
+    if ckpt_cfg is None:
+        return
+    bad = []
+    for key in _ARCH_KEYS:
+        want = _get_nested(ckpt_cfg, key)
+        have = _get_nested(model_cfg, key)
+        if want is None or have is None:
+            continue
+        if str(want) != str(have):
+            bad.append(f"  {key}: checkpoint={want!r} but this config builds {have!r}")
+    if bad:
+        raise ValueError(
+            "Refusing to average: the model being constructed does not match the checkpoint.\n"
+            + "\n".join(bad)
+            + f"\ncheckpoint: {path}\n"
+            "These keys change what the model computes WITHOUT changing any tensor shape, so "
+            "load_state_dict would accept the weights silently. Point --config-name at the arm's "
+            "own config, or pass the matching override."
+        )
+
+
 @hydra_runner(config_path=None, config_name=None)
 def main(cfg):
     """
@@ -136,6 +193,9 @@ def main(cfg):
         # callback state alongside the tensors). These are checkpoints this same
         # training run wrote, so there is no untrusted input here.
         checkpoint = torch.load(path, map_location='cpu', weights_only=False)
+
+        if ix == 0:
+            _check_architecture_matches(checkpoint, model_cfg=getattr(cfg, 'model', None), path=path)
 
         if 'state_dict' in checkpoint:
             checkpoint = checkpoint['state_dict']

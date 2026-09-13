@@ -1055,3 +1055,114 @@ class TestTargetsArePartitionOfOneTokenization:
         # ... and it still REPORTS what it is dropping, so the rate is visible
         assert legacy._mismatch_stats["dropped"] == 1, legacy._mismatch_stats
         assert legacy._mismatch_stats["respelled"] == 0
+
+
+class TestFixedFrameJointWindow:
+    """`window_frames` gives the joint a CONSTANT number of encoder frames.
+
+    `history_chunks=M` gives (M+1)*chunk_size, which scales with the emission
+    grid: 4 frames at chunk_size 2 but 28 at chunk_size 14. Holding the acoustic
+    context constant while the grid varies is the point of the knob, so the two
+    are mutually exclusive rather than one silently winning.
+    """
+
+    @staticmethod
+    def _joint(C, M=0, F=0, trim=0):
+        from nemo.collections.asr.modules.rnnt import RNNTAttJoint
+
+        j = RNNTAttJoint.__new__(RNNTAttJoint)
+        j.chunk_size, j.history_chunks, j.window_frames, j.frame_trim = C, M, F, trim
+        return j
+
+    @staticmethod
+    def _old_window(chunked, chunk_lengths, C, M, trim):
+        """The pre-change implementation, inlined so the old semantics are frozen
+        in the test file rather than only in git history."""
+        orig = chunk_lengths
+        if trim > 0:
+            chunk_lengths = (chunk_lengths - trim).clamp(min=0)
+        if M <= 0:
+            return chunked, chunk_lengths
+        B, T, CD = chunked.shape
+        D, W = CD // C, (M + 1) * C
+        flat = chunked.reshape(B, T * C, D)
+        t_ar = torch.arange(T)
+        start = (t_ar - M).clamp(min=0) * C
+        idx = (start.view(1, T, 1) + torch.arange(W).view(1, 1, W)).clamp(max=T * C - 1).expand(B, T, W)
+        g = flat.gather(1, idx.reshape(B, T * W, 1).expand(B, T * W, D))
+        valid = (t_ar.clamp(max=M) * C).view(1, T) + chunk_lengths
+        return g.reshape(B, T, W * D), torch.where(orig > 0, valid, torch.zeros_like(valid))
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("C", [2, 7, 10, 14])
+    @pytest.mark.parametrize("M", [0, 1, 2])
+    @pytest.mark.parametrize("trim", [0, 3])
+    def test_default_is_byte_identical_to_the_chunk_window(self, C, M, trim):
+        """Back-compat proof: with window_frames unset, every existing arm must
+        get exactly the tensors it got before."""
+        from nemo.collections.asr.modules.rnnt import RNNTAttJoint
+
+        torch.manual_seed(0)
+        B, T, D = 2, 6, 5
+        x = torch.randn(B, T, C * D)
+        lens = torch.tensor([[C, C, C, max(1, C // 2), 0, 0], [C, C, C, C, C, 1]])
+        new_w, new_v = RNNTAttJoint._apply_history_window(self._joint(C, M, 0, trim), x, lens)
+        old_w, old_v = self._old_window(x, lens, C, M, trim)
+        assert torch.equal(new_w, old_w)
+        assert torch.equal(new_v, old_v)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("C", [2, 7, 10, 14])
+    def test_the_window_is_constant_across_chunk_sizes(self, C):
+        from nemo.collections.asr.modules.rnnt import RNNTAttJoint
+
+        j = self._joint(C, M=0, F=28)
+        assert j.window_width() == 28
+        T, B, D = 40, 1, 3
+        x = torch.randn(B, T, C * D)
+        _, valid = RNNTAttJoint._apply_history_window(j, x, torch.full((B, T), C))
+        assert int(valid[0, 30]) == 28, "a saturated chunk must see exactly window_frames frames"
+
+    @pytest.mark.unit
+    def test_window_frames_is_a_floor_not_a_cap(self):
+        """A chunk longer than the window keeps all of its own frames -- it must
+        see the audio of the words it is asked to emit."""
+        assert self._joint(C=32, M=0, F=28).window_width() == 32
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("C", [2, 7, 14])
+    def test_the_window_never_looks_ahead(self, C):
+        """Causality comes from the `valid` mask, not the gather: for early chunks
+        the gather deliberately reads past the boundary and is then masked."""
+        from nemo.collections.asr.modules.rnnt import RNNTAttJoint
+
+        T, B, D, F = 20, 1, 1, 28
+        # frame-id features, so a visible slot identifies the global frame it came from
+        x = torch.arange(T * C, dtype=torch.float32).reshape(1, T, C * D)
+        w, valid = RNNTAttJoint._apply_history_window(self._joint(C, M=0, F=F), x, torch.full((B, T), C))
+        W = F
+        for t in range(T):
+            visible = w[0, t].reshape(W, D)[: int(valid[0, t]), 0]
+            assert visible.numel() == 0 or int(visible.max()) < (t + 1) * C, f"chunk {t} saw a future frame"
+
+    @pytest.mark.unit
+    def test_window_frames_and_history_chunks_cannot_both_be_set(self, test_data_dir, tmp_path):
+        c = _cfg(test_data_dir, "banded")
+        c.joint.window_frames = 28
+        c.joint.history_chunks = 1
+        c.train_ds = _train_ds_cfg(tmp_path)
+        # Hydra instantiates the joint, so its InstantiationException wraps the
+        # ValueError; assert on the message rather than the wrapper's type.
+        with pytest.raises(Exception) as excinfo:
+            EncDecCHATBPEModel(cfg=c)
+        assert "both set" in str(excinfo.value) or "both set" in str(excinfo.value.__cause__)
+
+    @pytest.mark.unit
+    def test_a_window_smaller_than_the_chunk_is_rejected(self, test_data_dir, tmp_path):
+        """Silently it would just keep the chunk's own frames and the
+        constant-context premise would be gone with no error."""
+        c = _cfg(test_data_dir, "banded")
+        c.joint.window_frames = 8  # chunk_size is 14 in this fixture
+        c.train_ds = _train_ds_cfg(tmp_path)
+        with pytest.raises(ValueError, match="smaller than chunk_size"):
+            EncDecCHATBPEModel(cfg=c)

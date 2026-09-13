@@ -248,11 +248,29 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
             _patch[0].get_vocab = _patch[1]
             self._hf_vocab_patch = None
 
+        # GUARDS THE JOINT CANNOT EXPRESS. The joint sees one chunk size and knows
+        # nothing about the delay; both failures below are silent.
+        _F = int(getattr(self.joint, "window_frames", 0))
+        _C = int(self.joint.chunk_size)
+        if _F > 0 and _F < _C:
+            raise ValueError(
+                f"model.joint.window_frames={_F} is smaller than chunk_size={_C}. The window is a FLOOR, so "
+                f"every chunk would simply keep its own {_C} frames and the constant-context premise is gone "
+                f"with no error. Raise window_frames to >= {_C}, or drop the knob."
+            )
+        if _F > 0 and self.max_delay_frames > _C:
+            raise ValueError(
+                f"forced_alignment.max_delay_frames={self.max_delay_frames} exceeds chunk_size={_C}; the "
+                f"per-chunk trim clamps at 0, so frames the delay is meant to hide stay visible and the model "
+                f"trains at a latency the config does not deliver."
+            )
+
         if self.loss_type in ("forced_alignment", "banded"):
             logging.info(
                 f"CHAT {self.loss_type} loss (band_chunks={self.band_chunks}): delay={self.num_delay_frames} frames, "
                 f"recover_history_words={self.recover_history_words}, "
-                f"frame_length={self.frame_length_in_secs:.4f}s, chunk_size={self.joint.chunk_size}"
+                f"frame_length={self.frame_length_in_secs:.4f}s, chunk_size={self.joint.chunk_size}, "
+                f"joint_window={self.joint.window_width()} frames ({self.joint.window_width() * self.frame_length_in_secs:.2f}s)"
             )
 
     # ----------------------------------------------------------- tokenizer
@@ -632,7 +650,7 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
         if transcript and words:
             self._mismatch_stats["utts"] += 1
             self._mismatch_stats["words"] += len(words)
-        texts = chunk_texts(groups, words, transcript, report=self._report_target_mismatch, respell=False)
+        texts = chunk_texts(groups, words, transcript, report=self._report_target_mismatch, respell=respell)
         if self._tokenizer_supplies_word_prefix:
             return texts
         out, started = [], False

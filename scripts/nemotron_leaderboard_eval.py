@@ -185,7 +185,9 @@ def transcribe_offline(model, paths: List[str], batch_size: int, pad_extra_secon
                     if w.ndim > 1:
                         w = w.mean(axis=1)
                     out = os.path.join(tmp, f"{i:06d}.wav")
-                    soundfile.write(out, np.concatenate([w, np.zeros(int(round(pad_extra_seconds * sr)), "float32")]), sr)
+                    soundfile.write(
+                        out, np.concatenate([w, np.zeros(int(round(pad_extra_seconds * sr)), "float32")]), sr
+                    )
                     padded.append(out)
                 hyps = model.transcribe(padded, batch_size=batch_size, verbose=False)
             finally:
@@ -476,6 +478,22 @@ def main() -> int:
         return 1
     # Also recomputes encoder.streaming_cfg, which the streaming buffer reads.
     model.encoder.set_default_att_context_size(att)
+
+    # A CHAT model chunks the ENCODER OUTPUT a second time, inside the joint, and
+    # that chunk size is fixed at construction (rnnt_models.py reads it from the
+    # config or infers it from att_context_size) -- it does NOT follow the
+    # encoder. Setting only the encoder leaves the joint grouping frames at
+    # whatever the checkpoint was built with, so `--chunk_size 7` would give a
+    # 7-frame-look-ahead encoder feeding a joint that still emits on a 14-frame
+    # grid: no error, no shape mismatch, just a model that is not the one being
+    # asked for. Harmless while every CHAT eval ran at the trained chunk size of
+    # 14; wrong the moment a chunk-size sweep is attempted.
+    joint = getattr(model, "joint", None)
+    if joint is not None and int(getattr(joint, "chunk_size", 0)) > 0:
+        if int(joint.chunk_size) != int(args.chunk_size):
+            _log(f"==> joint.chunk_size {int(joint.chunk_size)} -> {int(args.chunk_size)} (following the encoder)")
+        joint.chunk_size = int(args.chunk_size)
+
     _log(
         f"==> mode={args.mode} chunk_size={args.chunk_size} frames "
         f"({args.chunk_size * _FRAME_SECONDS:.2f}s) att_context_size={att} dtype={dtype}"
