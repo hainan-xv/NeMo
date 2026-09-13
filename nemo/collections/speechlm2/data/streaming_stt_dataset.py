@@ -205,11 +205,47 @@ def decode_with_blank(
     return text
 
 
+def _at_word_boundary(transcript: str, start: int, end: int) -> bool:
+    """Is transcript[start:end] a whole word rather than a slice of a longer one?
+
+    Without this, ``find()`` matches a respelled word INSIDE another word: the
+    aligner's ``US`` (from ``U.S.``) matches the ``us`` in ``business``, the
+    search cursor jumps forward past text that has not been spoken yet, and the
+    chunk boundary lands mid-word.
+    """
+    before = start == 0 or not transcript[start - 1].isalnum()
+    after = end >= len(transcript) or not transcript[end].isalnum()
+    return before and after
+
+
+def _find_anchored(haystack: str, needle: str, start: int, transcript: str, back=None):
+    """First whole-word occurrence of *needle* at or after *start*, or None.
+
+    ``back`` maps positions in an alphanumeric-only view of the transcript back
+    to original offsets; pass it when searching that view.
+    """
+    if not needle:
+        return None
+    pos = start
+    while True:
+        i = haystack.find(needle, pos)
+        if i == -1:
+            return None
+        if back is None:
+            s, e = i, i + len(needle)
+        else:
+            s, e = back[i], back[i + len(needle) - 1] + 1
+        if _at_word_boundary(transcript, s, e):
+            return s, e
+        pos = i + 1
+
+
 def compute_word_spans(
     alignments: List[WordAlignment],
     transcript: str,
     preserve_trailing_whitespace: bool = False,
     preserve_leading_whitespace: bool = False,
+    respell: bool = False,
 ) -> List[tuple[int, int]]:
     """Find (start, end) character positions for each alignment word in the transcript.
 
@@ -232,6 +268,30 @@ def compute_word_spans(
             ``"world"``).  For ``"hello world"`` this yields
             ``[(0,5), (5,11)]`` = ``"hello"``, ``" world"``.
 
+        respell: When True, a word that is not a literal substring is retried with
+            punctuation ignored on both sides, and BOTH searches are constrained to
+            whole-word boundaries. Default False, because this function is shared
+            with the interleaved StreamingSTTModel, whose targets (and whose
+            teacher-forced validation metrics) would otherwise change too.
+
+    WHY respell EXISTS. The forced aligner ran on NORMALISED text, so punctuation
+    INSIDE a word is gone: the transcript's ``forty-eight`` reaches us as
+    ``fortyeight``, ``U.S.`` as ``US``, ``4,723,000,000`` as ``4723000000``. The
+    plain literal search then fails on 0.46% of aligner words (0% on LibriSpeech,
+    which has no PnC), and it fails in two ways, both harmful:
+
+      * it returns -1, the word gets no span, and script_messages.py holds its
+        cursor -- so the chunk is supervised as SILENCE while the word is being
+        spoken, and the text is dumped into a later chunk (measured: 41.5% of
+        such words land at least one chunk late at chunk_size 14, up to 7.84 s);
+      * or worse, it matches the respelled letters INSIDE a later word, the
+        cursor jumps FORWARD over text not yet spoken, and the chunk boundary
+        tears mid-word -- yielding targets that decode as ``HMO bus iness``.
+
+    With respell=True both searches are whole-word anchored and the EARLIER hit
+    wins, which locates 100.000% of aligner words on the eval manifests, removes
+    every mid-word tear, and leaves LibriSpeech spans byte-identical.
+
     Returns a list parallel to *alignments*.  If a word cannot be located, its
     span is ``None``.
     """
@@ -242,18 +302,45 @@ def compute_word_spans(
         )
     spans: List[tuple[int, int] | None] = []
     search_pos = 0
+    lowered = transcript.lower()
+    norm = back = alnum_before = None
+    if respell:
+        norm_chars: List[str] = []
+        back = []
+        alnum_before = [0] * (len(transcript) + 1)
+        for i, ch in enumerate(transcript):
+            alnum_before[i + 1] = alnum_before[i] + (1 if ch.isalnum() else 0)
+            if ch.isalnum():
+                norm_chars.append(ch.lower())
+                back.append(i)
+        norm = "".join(norm_chars)
+
     for word in alignments:
-        idx = transcript.lower().find(word.text.lower(), search_pos)
-        if idx == -1:
-            spans.append(None)
-            continue
+        if not respell:
+            idx = lowered.find(word.text.lower(), search_pos)
+            if idx == -1:
+                spans.append(None)
+                continue
+            end0 = idx + len(word.text)
+        else:
+            literal = _find_anchored(lowered, word.text.lower(), search_pos, transcript)
+            w_norm = "".join(c.lower() for c in word.text if c.isalnum())
+            respelled = _find_anchored(norm, w_norm, alnum_before[search_pos], transcript, back)
+            # The EARLIER hit wins. Taking the literal one unconditionally lets a
+            # short respelled word match far downstream and drag the cursor past
+            # text that has not been spoken yet.
+            hit = min([h for h in (literal, respelled) if h is not None], key=lambda h: h[0], default=None)
+            if hit is None:
+                spans.append(None)
+                continue
+            idx, end0 = hit
         start = idx
         # Optionally extend start backward through leading whitespace,
         # clamped at the previous word's span end.
         if preserve_leading_whitespace:
             while start > search_pos and transcript[start - 1].isspace():
                 start -= 1
-        end = idx + len(word.text)
+        end = end0
         # Include trailing punctuation (e.g., comma, period, quotes)
         while end < len(transcript) and not transcript[end].isalnum() and not transcript[end].isspace():
             end += 1

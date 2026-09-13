@@ -111,6 +111,13 @@ class ScriptSTTDataConfig(StreamingSTTDataConfig):
         punctuation_prob: probability an example keeps its punctuation.
         control_seed: base seed for the per-example control draw. Kept separate
             from ``chunk_size_seed`` so changing one does not reshuffle the other.
+        respell_targets: locate an aligner word that is not a literal substring of
+            the transcript by retrying with punctuation ignored, and anchor both
+            searches to whole-word boundaries. The aligner ran on normalised text,
+            so ``forty-eight`` arrives as ``fortyeight`` and ``U.S.`` as ``US``;
+            without this 0.37% of words are either supervised several chunks late
+            or mislocated inside a later word. Default False so an existing run
+            that requeues keeps the objective it was launched with.
     """
 
     audio_history_chunks: int = 0
@@ -130,6 +137,7 @@ class ScriptSTTDataConfig(StreamingSTTDataConfig):
     capitalization_prob: float = 0.5
     punctuation_prob: float = 0.5
     control_seed: int = 5678
+    respell_targets: bool = False
 
 
 @dataclass
@@ -457,6 +465,7 @@ class ScriptSTTDataset(StreamingSTTDataset):
             delays, caps, puncts = self.cfg.num_delay_frames, True, True
 
         batch_messages = get_llm_messages_for_batch(
+            respell=self.cfg.respell_targets,
             system_role=self.cfg.system_role,
             system_prompt=system_prompts,
             audio_tag=self.cfg.audio_tag,

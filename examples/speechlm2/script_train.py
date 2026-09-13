@@ -62,6 +62,7 @@ def train(cfg):
         "read_write",
         "gate_in_history",
         "full_context",
+        "respell_targets",
     ):
         model_val = int(cfg.model.get(key, 0) or 0)
         data_val = int(dataset_cfg.get(key, 0) or 0)

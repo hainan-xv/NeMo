@@ -170,6 +170,12 @@ class ScriptSTTModelConfig(StreamingSTTModelConfig):
     gate_in_history: bool = False
     position_scheme: str = "branch"
     full_context: bool = False
+    # Provenance only -- the target construction is a pure DATASET concern, but
+    # save_hyperparameters() stamps cfg.model into every checkpoint and nothing
+    # in cfg.data.dataset is recorded there. Without this, a .nemo cannot be told
+    # apart from one trained on the old targets. script_train.py's paired assert
+    # keeps the two sides from drifting.
+    respell_targets: bool = False
     val_position_scheme: str = "continuous"
     val_chunk_size: Optional[int] = None
     val_max_new_tokens_per_chunk: Optional[int] = None

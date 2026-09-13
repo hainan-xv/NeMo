@@ -73,6 +73,7 @@ def get_llm_messages_for_sample(
     punctuation: bool = True,
     word_delay_prob: float = 0.0,
     rng: Optional[random.Random] = None,
+    respell: bool = False,
 ) -> List[dict]:
     """Build the alternating user/assistant turns for one utterance.
 
@@ -133,7 +134,11 @@ def get_llm_messages_for_sample(
         alignments = []
 
     # Character spans let us reproduce the transcript's own punctuation/spacing.
-    word_spans = compute_word_spans(alignments, transcript, preserve_leading_whitespace=True) if transcript else None
+    word_spans = (
+        compute_word_spans(alignments, transcript, preserve_leading_whitespace=True, respell=respell)
+        if transcript
+        else None
+    )
 
     # Chunk texts must TILE the transcript, not be sliced from it independently.
     #
@@ -312,6 +317,7 @@ def get_llm_messages_for_batch(
     frame_length_in_secs: float,
     alignments: Optional[List[List[WordAlignment]]] = None,
     transcripts: Optional[List[str]] = None,
+    respell: bool = False,
     capitalization: Union[bool, Sequence[bool]] = True,
     punctuation: Union[bool, Sequence[bool]] = True,
     word_delay_prob: float = 0.0,
@@ -349,6 +355,7 @@ def get_llm_messages_for_batch(
             punctuation=puncts[i],
             word_delay_prob=word_delay_prob,
             rng=rng,
+            respell=respell,
         )
         for i in range(n)
     ]

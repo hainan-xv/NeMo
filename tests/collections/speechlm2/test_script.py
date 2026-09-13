@@ -3570,3 +3570,70 @@ def test_word_delay_last_chunk_never_pushes():
     for seed in range(50):
         chunks = _wd_chunks(_WD_TEXT, prob=0.9, seed=seed)
         assert chunks[-1] != "<b>" or all(c == "<b>" for c in chunks), f"seed {seed}: tail lost"
+
+
+class TestRespellTargets:
+    """The aligner ran on NORMALISED text, so punctuation INSIDE a word is gone:
+    the transcript's ``forty-eight`` arrives as ``fortyeight``, ``U.S.`` as ``US``.
+
+    ``compute_word_spans``' literal ``find()`` then fails two ways, and the tests
+    below pin BOTH branches on the same input so the default cannot be flipped
+    without a test edit. The existing target tests only assert losslessness, which
+    holds either way.
+    """
+
+    @pytest.mark.unit
+    def test_the_default_is_off(self):
+        import inspect
+
+        from nemo.collections.speechlm2.data.script_dataset import ScriptSTTDataConfig
+        from nemo.collections.speechlm2.data.streaming_stt_dataset import compute_word_spans
+
+        assert inspect.signature(compute_word_spans).parameters["respell"].default is False
+        assert (
+            ScriptSTTDataConfig(sample_rate=16000, frame_length_in_secs=0.08, chunk_size=14).respell_targets is False
+        )
+
+    @pytest.mark.unit
+    def test_a_respelled_word_is_located_only_when_asked(self):
+        from nemo.collections.speechlm2.data.streaming_stt_dataset import WordAlignment, compute_word_spans
+
+        transcript = "his wait of forty-eight hours tonight"
+        words = [WordAlignment(w, 0.0, 0.0) for w in ["his", "wait", "of", "fortyeight", "hours", "tonight"]]
+
+        off = compute_word_spans(words, transcript, preserve_leading_whitespace=True)
+        assert off[3] is None, "literal find() should not locate the respelled word"
+
+        on = compute_word_spans(words, transcript, preserve_leading_whitespace=True, respell=True)
+        assert on[3] is not None
+        assert transcript[on[3][0] : on[3][1]].strip() == "forty-eight"
+
+    @pytest.mark.unit
+    def test_a_respelled_word_does_not_match_inside_a_later_word(self):
+        """The worse failure: 'US' finds the 'us' in 'business', so the cursor
+        jumps forward over audio not yet heard and every word in between loses
+        its span."""
+        from nemo.collections.speechlm2.data.streaming_stt_dataset import WordAlignment, compute_word_spans
+
+        transcript = "the U.S. dollar exchange rate hurt the business"
+        words = [WordAlignment(w, 0.0, 0.0) for w in ["the", "US", "dollar", "exchange", "rate"]]
+
+        off = compute_word_spans(words, transcript, preserve_leading_whitespace=True)
+        assert transcript[off[1][0] : off[1][1]] == "us", "expected the mislocation this guards against"
+        assert off[2] is None and off[3] is None, "and the cascade of lost spans after it"
+
+        on = compute_word_spans(words, transcript, preserve_leading_whitespace=True, respell=True)
+        assert [transcript[s[0] : s[1]].strip() for s in on] == ["the", "U.S.", "dollar", "exchange", "rate"]
+
+    @pytest.mark.unit
+    def test_librispeech_style_text_is_byte_identical(self):
+        """No punctuation inside words means nothing to respell, so the fix must
+        be a strict no-op there -- which is what makes LibriSpeech the built-in
+        control dataset inside the leaderboard."""
+        from nemo.collections.speechlm2.data.streaming_stt_dataset import WordAlignment, compute_word_spans
+
+        transcript = "and fought beneath the cross of god now strange to my eyes"
+        words = [WordAlignment(w, 0.0, 0.0) for w in transcript.split()]
+        assert compute_word_spans(words, transcript, preserve_leading_whitespace=True) == compute_word_spans(
+            words, transcript, preserve_leading_whitespace=True, respell=True
+        )
