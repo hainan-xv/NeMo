@@ -27,9 +27,14 @@ PROJECT="${PROJECT:-SpeechlmScriptCC}"
 CODE_DIR="${CODE_DIR:-/lustre/fsw/portfolios/nemotron/users/hainanx/NeMo_SCRIPT_cc}"
 CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/llmservice/users/heh/containers/nemo-26.02-streaming-speechlm.sqsh}"
 
+# The training config and vocabulary differ per arm. The 1,024-piece arms use
+# the donor SentencePiece model extracted into the run dir; the Qwen arms use a
+# HuggingFace directory and their own config. Defaulting to the 1k case keeps
+# every existing wrapper working unchanged.
+ARM_CONFIG_NAME="${ARM_CONFIG_NAME:-nemotron_chat_transducer_granary2}"
 RUN_DIR="${OUTPUT_PREFIX}/results/${PROJECT}/${ARM_EXP_NAME}"
 CKPT_DIR="${RUN_DIR}/${ARM_EXP_NAME}/checkpoints"
-TOKENIZER_DIR="${RUN_DIR}/tokenizer"
+TOKENIZER_DIR="${ARM_TOKENIZER_DIR:-${RUN_DIR}/tokenizer}"
 # The donor .nemo IS the tokenizer. Runs before the /results fix left no
 # tokenizer on lustre, so extract it here when it is missing rather than failing
 # -- it is the same 1,024-piece vocabulary either way.
@@ -43,8 +48,15 @@ if [[ ! -d "$CKPT_DIR" ]]; then
     exit 1
 fi
 mkdir -p "$AVG_DIR"
+if [[ -n "${ARM_TOKENIZER_DIR:-}" ]]; then
+    if [[ ! -f "${TOKENIZER_DIR}/tokenizer.model" && ! -f "${TOKENIZER_DIR}/tokenizer.json" ]]; then
+        echo "ERROR: ARM_TOKENIZER_DIR=${TOKENIZER_DIR} holds no tokenizer.model or tokenizer.json" >&2
+        exit 1
+    fi
+    echo "==> using the arm's own tokenizer: ${TOKENIZER_DIR}"
+fi
 
-if [[ ! -f "${TOKENIZER_DIR}/tokenizer.model" ]]; then
+if [[ -z "${ARM_TOKENIZER_DIR:-}" && ! -f "${TOKENIZER_DIR}/tokenizer.model" ]]; then
     echo "==> no tokenizer at ${TOKENIZER_DIR}; extracting from the donor"
     mkdir -p "$TOKENIZER_DIR"
     python3 - "$INIT_NEMO" "$TOKENIZER_DIR" <<'PYEOF'
@@ -96,7 +108,7 @@ else
         cd /code && export PYTHONPATH=/code:\$PYTHONPATH HYDRA_FULL_ERROR=1 &&
         python scripts/checkpoint_averaging/average_model_checkpoints.py \
             --config-path=/code/examples/asr/conf/fastconformer/cache_aware_streaming \
-            --config-name=nemotron_chat_transducer_granary2 \
+            --config-name=${ARM_CONFIG_NAME} \
             name=${AVG_NAME} \
             +model_class=nemo.collections.asr.models.EncDecCHATBPEModel \
             +checkpoint_paths=\\\"[${CKPT_CSV}]\\\" \
