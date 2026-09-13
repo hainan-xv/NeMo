@@ -438,142 +438,107 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
             texts = self._chunk_texts_for_tokenizer(groups, words, transcript, respell=partition)
             return [self.tokenizer.text_to_ids(t) if t else [] for t in texts]
 
-        offsets = self._tokenize_with_offsets(transcript)
-        if offsets is None:
-            # The offsets could not be verified against the transcript, so the
-            # token-space split is unsafe here. Degrade to the text path but KEEP
-            # the respelling retry: we lose the partition and the punctuation
-            # delay for this utterance, not the word. Counted and sampled,
-            # because a high rate would mean this arm is quietly running the
-            # control's objective -- which the mismatch counters alone cannot
+        bounds = self._chunk_bounds(transcript, words, groups)
+        counts = self._token_split_points(transcript, bounds)
+        if counts is None:
+            # A boundary did not split the tokenization cleanly. Degrade to the
+            # text path but KEEP the respelling retry: we lose the partition and
+            # the punctuation delay for this utterance, not the word. Counted and
+            # sampled, because a high rate would mean this arm is quietly running
+            # the control's objective -- which the mismatch counters alone cannot
             # show, since an utterance with no mismatch reports nothing either way.
             self._mismatch_stats["fallback"] += 1
             if len(self._fallback_examples) < 3:
                 self._fallback_examples.append(repr(transcript[:100]))
-            # Tokenizer cannot report character offsets; keep the text-space path.
             texts = self._chunk_texts_for_tokenizer(groups, words, transcript, respell=True)
             return [self.tokenizer.text_to_ids(t) if t else [] for t in texts]
 
-        char_chunk = self._char_to_chunk(transcript, words, groups)
-        out: List[List[int]] = [[] for _ in range(len(groups))]
-        for tok_id, begin, end in offsets:
-            c = char_chunk[begin] if begin < len(char_chunk) else -1
-            if c < 0:  # every character is assigned below, so this is belt-and-braces
-                continue
-            out[c].append(int(tok_id))
+        full = self.tokenizer.text_to_ids(transcript)
+        out: List[List[int]] = []
+        prev = 0
+        for n in counts:
+            out.append([int(i) for i in full[prev:n]])
+            prev = n
         return out
 
-    def _tokenize_with_offsets(self, text: str):
-        """``[(id, char_begin, char_end)]`` for the WHOLE transcript, or None.
+    def _token_split_points(self, transcript: str, bounds: List[int]) -> Optional[List[int]]:
+        """Token counts at each chunk BOUNDARY, or None if the split is not exact.
 
-        The chunk targets are a PARTITION of one tokenization rather than a
-        tokenization of each chunk's text. Tokenizing the slices separately is
-        what produced the two target bugs this model has already had: a leading
-        space becomes a standalone ``U+2581`` piece under SentencePiece, and a
-        missing one drops the word-boundary marker under byte-level BPE. Splitting
-        a single id sequence by character offset cannot do either -- the
-        concatenated per-chunk ids equal the whole-transcript ids by
-        construction, for any tokenizer family -- and it is also what makes
-        moving an individual punctuation token to another chunk expressible at
-        all.
+        The chunk targets have to be a split of ONE tokenization of the whole
+        transcript -- tokenizing each chunk's text separately is what produced
+        both of this model's target bugs (a standalone U+2581 piece under
+        SentencePiece, a missing word-boundary marker under byte-level BPE).
+
+        An earlier version got the split from per-token character offsets
+        (SentencePiece's ``encode(out_type='proto')``). That worked locally and
+        failed for 100% of utterances in the training container, whose
+        sentencepiece does not populate those fields -- so every utterance
+        silently took the text-space fallback and the arm quietly trained the
+        control's objective. This uses only ``text_to_ids``, which every NeMo
+        tokenizer has, and VERIFIES the result instead of trusting it: the ids of
+        each prefix must be a prefix of the ids of the whole. When a boundary
+        does not split cleanly (a token spanning it), the caller falls back.
         """
-        inner = getattr(self.tokenizer, "tokenizer", None)
-        if inner is None:
-            return None
-
-        # SentencePiece reports BYTE offsets into its NORMALISED text, not
-        # character offsets into what we passed in. The two coincide only for
-        # pure-ASCII input that the normaliser left alone: 'Café naïve' encodes to 22
-        # bytes for 18 characters, and some models strip leading whitespace. Using
-        # them unchecked would attribute tokens to the wrong chunk on exactly the
-        # utterances nobody inspects. So convert to character offsets and VERIFY
-        # each piece against the transcript; on any disagreement return None and
-        # let the caller fall back rather than guess.
-        proto = None
-        try:
-            proto = inner.encode(text, out_type="proto")
-        except (AttributeError, TypeError, ValueError):
-            proto = None
-        # A HuggingFace tokenizer also has .encode(), and it accepts and IGNORES
-        # out_type, handing back a plain list of ids -- so the call succeeding is
-        # not evidence that this is SentencePiece. Check for the payload instead.
-        if not hasattr(proto, "pieces"):
-            proto = None
-        if proto is not None:
-            byte_to_char: Dict[int, int] = {}
-            b = 0
-            for ci, ch in enumerate(text):
-                for _ in ch.encode("utf-8"):
-                    byte_to_char[b] = ci
-                    b += 1
-            byte_to_char[b] = len(text)
-            out = []
-            for p in proto.pieces:
-                cb, ce = byte_to_char.get(p.begin), byte_to_char.get(p.end)
-                if cb is None or ce is None or text[cb:ce] != p.surface:
-                    return None
-                out.append((p.id, cb, ce))
-            return out
-
-        # HuggingFace: only the FAST tokenizers can report offsets, and theirs are
-        # already character offsets into the raw string.
-        try:
-            if not getattr(inner, "is_fast", False):
+        full = self.tokenizer.text_to_ids(transcript)
+        counts: List[int] = []
+        for b in bounds:
+            if b <= 0:
+                counts.append(0)
+                continue
+            if b >= len(transcript):
+                counts.append(len(full))
+                continue
+            prefix = self.tokenizer.text_to_ids(transcript[:b])
+            n = len(prefix)
+            if n > len(full) or list(full[:n]) != list(prefix):
                 return None
-            enc = inner(text, return_offsets_mapping=True, add_special_tokens=False)
-            pairs = list(zip(enc["input_ids"], enc["offset_mapping"]))
-        except (AttributeError, TypeError, ValueError, KeyError):
+            counts.append(n)
+        if counts != sorted(counts):
             return None
-        if any(b is None or e is None or not (0 <= b <= e <= len(text)) for _, (b, e) in pairs):
-            return None
-        return [(i, b, e) for i, (b, e) in pairs]
+        return counts
 
-    def _char_to_chunk(self, transcript: str, words, groups) -> List[int]:
-        """Which chunk each CHARACTER of the transcript belongs to.
+    def _chunk_bounds(self, transcript: str, words, groups) -> List[int]:
+        """Character position each chunk's target text ENDS at.
 
-        Built from the word spans so that every character lands in exactly one
-        chunk -- a partition, not a union of per-chunk spans. The union is what
-        the old path used, and text falling between one chunk's last located word
-        and the next chunk's first located word belonged to neither, so it was
-        dropped from the target outright.
+        Cumulative and non-decreasing, so the chunks TILE the transcript: every
+        character lands in exactly one chunk. The old path instead sliced each
+        chunk between its own first and last located word, which left the text
+        between two chunks' spans in neither -- and a word the aligner respelled
+        has no span at all, so it fell into such a gap and vanished.
+
+        With ``delay_word_final_punctuation`` the boundary is placed BEFORE a
+        word's trailing punctuation instead of after it, which is what moves that
+        punctuation into the following word's chunk. The last chunk always runs
+        to the end of the transcript, so utterance-final punctuation stays put --
+        it has no following word to be decided by.
         """
         spans = word_spans(words, transcript, report=self._report_target_mismatch)
         self._mismatch_stats["utts"] += 1
         self._mismatch_stats["words"] += len(words)
 
-        chunk_of_word = {i: t for t, idxs in enumerate(groups) for i in idxs}
-        char_chunk = [-1] * (len(transcript) + 1)
-        for i, span in enumerate(spans):
-            if span is None or i not in chunk_of_word:
-                continue
-            here = chunk_of_word[i]
-            core = word_core_end(transcript, span)
-            for p in range(span[0], core):
-                char_chunk[p] = here
-            # The trailing punctuation, charged to whichever chunk the config says.
-            punct_chunk = here
-            if self.delay_word_final_punctuation:
-                nxt = next((chunk_of_word[j] for j in range(i + 1, len(spans)) if j in chunk_of_word), None)
-                if nxt is not None:
-                    punct_chunk = max(nxt, here)  # never move punctuation EARLIER
-            for p in range(core, span[1]):
-                char_chunk[p] = punct_chunk
+        # The LAST located word of the utterance keeps its trailing punctuation:
+        # the rule is "emit it at the FOLLOWING word's chunk", and it has no
+        # following word. Without this the closing period slides into whatever
+        # chunk comes after -- often a trailing silent one -- and the model is
+        # trained to hold the sentence open across it.
+        final_word = max((i for i in range(len(words)) if i < len(spans) and spans[i] is not None), default=None)
 
-        # Fill the gaps -- inter-word whitespace, and any word that could not be
-        # located -- with the chunk of the next assigned character, so leading
-        # space travels with the word it precedes (matching SentencePiece's own
-        # convention) and nothing is left unattributed.
-        nxt = -1
-        for p in range(len(char_chunk) - 1, -1, -1):
-            if char_chunk[p] >= 0:
-                nxt = char_chunk[p]
-            elif nxt >= 0:
-                char_chunk[p] = nxt
-        last = max((c for c in char_chunk if c >= 0), default=len(groups) - 1)
-        for p in range(len(char_chunk)):
-            if char_chunk[p] < 0:
-                char_chunk[p] = last
-        return char_chunk
+        bounds: List[int] = []
+        last = 0
+        for idxs in groups:
+            located = [i for i in idxs if i < len(spans) and spans[i] is not None]
+            if located:
+                i = located[-1]
+                span = spans[i]
+                if self.delay_word_final_punctuation and i != final_word:
+                    end = word_core_end(transcript, span)
+                else:
+                    end = span[1]
+                last = max(last, end)
+            bounds.append(last)
+        if bounds:
+            bounds[-1] = len(transcript)
+        return bounds
 
     def _report_target_mismatch(self, kind: str, aligner_word: str, transcript_form: str) -> None:
         """Record an aligner/transcript spelling mismatch for periodic logging."""
