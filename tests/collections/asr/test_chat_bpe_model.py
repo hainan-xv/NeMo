@@ -806,7 +806,7 @@ class TestChunkTargetsMatchWholeTranscript:
 
         transcript = "the best selling single by a German artist"
         words = transcript.split()
-        groups = [[0, 1], [2, 3], [4, 5, 6], [7]]   # four chunks, as the aligner would give
+        groups = [[0, 1], [2, 3], [4, 5, 6], [7]]  # four chunks, as the aligner would give
         texts = m._chunk_texts_for_tokenizer(groups, words, transcript)
         chunkwise = [i for t in texts for i in (m.tokenizer.text_to_ids(t) if t else [])]
         whole = m.tokenizer.text_to_ids(transcript)
@@ -922,3 +922,136 @@ class TestHuggingFaceVocabulary:
         if isinstance(hyp, tuple):
             hyp = hyp[0]
         assert len(hyp) == 2 and all(isinstance(h.text, str) for h in hyp)
+
+
+def _cut_with_transcript(transcript, words_and_times, duration=6.0):
+    """A cut whose supervision text is NOT built from the aligner's word forms.
+
+    Every other fixture in this file does ``text = " ".join(aligner words)``,
+    which makes the aligner and the transcript agree by construction -- the one
+    case that cannot fail. Real manifests disagree: the aligner normalises
+    punctuation away inside words, so ``forward-looking`` arrives as
+    ``forwardlooking``.
+    """
+    cut = MonoCut(id="c0", start=0.0, duration=duration, channel=0, recording=None)
+    cut.supervisions = [SupervisionSegment(id="s0", recording_id="r0", start=0.0, duration=duration, text=transcript)]
+    cut.custom = {
+        "alignments": [{"text": w, "start_time": max(0.0, e - 0.3), "end_time": e} for w, e in words_and_times]
+    }
+    return cut
+
+
+class TestTargetsArePartitionOfOneTokenization:
+    """Chunk targets are a SPLIT of the whole-transcript ids, not a tokenization
+    of each chunk's text.
+
+    Tokenizing the slices separately caused both target bugs this model has had:
+    a leading space becomes a standalone U+2581 piece under SentencePiece, and a
+    missing one drops the word-boundary marker under byte-level BPE. Splitting a
+    single id sequence by character offset cannot do either, for any tokenizer.
+    """
+
+    TRANSCRIPT = "Thank you, operator. Our forward-looking guidance is strong."
+    ALIGNED = [
+        ("Thank", 0.5),
+        ("you", 0.9),
+        ("operator", 1.6),
+        ("Our", 2.4),
+        ("forwardlooking", 3.3),
+        ("guidance", 4.0),
+        ("is", 4.5),
+        ("strong", 5.0),
+    ]
+
+    def _model(self, test_data_dir, tmp_path, delay_punct):
+        c = _cfg(test_data_dir, "banded")
+        c.forced_alignment.num_delay_frames = 3
+        c.forced_alignment.target_construction = "partition"
+        c.forced_alignment.delay_word_final_punctuation = delay_punct
+        c.train_ds = _train_ds_cfg(tmp_path)
+        return EncDecCHATBPEModel(cfg=c)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("delay_punct", [False, True])
+    def test_concatenated_chunk_ids_equal_the_whole_transcript(self, test_data_dir, tmp_path, delay_punct):
+        m = self._model(test_data_dir, tmp_path, delay_punct)
+        cut = _cut_with_transcript(self.TRANSCRIPT, self.ALIGNED)
+        chunks = m._chunk_tokens(cut, n_chunks=6)
+        assert [i for c in chunks for i in c] == m.tokenizer.text_to_ids(self.TRANSCRIPT)
+
+    @pytest.mark.unit
+    def test_a_respelled_word_reaches_the_target(self, test_data_dir, tmp_path):
+        """'forwardlooking' is not a substring of 'forward-looking'; before the
+        punctuation-insensitive retry the word was dropped from the target."""
+        m = self._model(test_data_dir, tmp_path, False)
+        cut = _cut_with_transcript(self.TRANSCRIPT, self.ALIGNED)
+        chunks = m._chunk_tokens(cut, n_chunks=6)
+        text = m.tokenizer.ids_to_text([i for c in chunks for i in c])
+        assert "forward" in text and "looking" in text, text
+
+    @pytest.mark.unit
+    def test_word_final_punctuation_moves_to_the_following_words_chunk(self, test_data_dir, tmp_path):
+        """Whether a period follows 'operator' is not decidable from the audio of
+        'operator' -- it needs the next word -- so it is emitted at that word's
+        chunk instead. Exactly one token moves, one chunk later, and the id is
+        unchanged."""
+        cut = _cut_with_transcript(self.TRANSCRIPT, self.ALIGNED)
+        off = self._model(test_data_dir, tmp_path, False)._chunk_tokens(cut, n_chunks=6)
+        on = self._model(test_data_dir, tmp_path, True)._chunk_tokens(cut, n_chunks=6)
+
+        assert off != on, "delay_word_final_punctuation had no effect"
+        # nothing is created or destroyed, only reattributed
+        assert [i for c in off for i in c] == [i for c in on for i in c]
+
+        moved = [t for t in range(len(off)) if off[t] != on[t]]
+        assert len(moved) == 2 and moved[1] == moved[0] + 1, f"expected one hand-off, got chunks {moved}"
+        src, dst = moved
+        assert len(on[src]) == len(off[src]) - 1, "the source chunk did not give up exactly one token"
+        assert len(on[dst]) == len(off[dst]) + 1, "the next chunk did not receive exactly one token"
+        assert on[dst][0] == off[src][-1], "a different token moved than the trailing punctuation"
+
+    @pytest.mark.unit
+    def test_utterance_final_punctuation_has_nowhere_to_go_and_stays(self, test_data_dir, tmp_path):
+        """The closing '.' has no following word, so it must not move."""
+        cut = _cut_with_transcript(self.TRANSCRIPT, self.ALIGNED)
+        off = self._model(test_data_dir, tmp_path, False)._chunk_tokens(cut, n_chunks=6)
+        on = self._model(test_data_dir, tmp_path, True)._chunk_tokens(cut, n_chunks=6)
+        last = max(t for t in range(len(off)) if off[t])
+        assert on[last] == off[last], "the closing period left the final chunk"
+        whole = self._model(test_data_dir, tmp_path, True).tokenizer.text_to_ids(self.TRANSCRIPT)
+        assert on[last][-1] == whole[-1]
+
+    @pytest.mark.unit
+    def test_both_knobs_are_off_by_default(self, test_data_dir, tmp_path):
+        """They change the targets, so a requeue under an existing EXP_NAME must
+        not silently switch objective."""
+        c = _cfg(test_data_dir, "banded")
+        c.train_ds = _train_ds_cfg(tmp_path)
+        m = EncDecCHATBPEModel(cfg=c)
+        assert m.delay_word_final_punctuation is False
+        assert m.target_construction == "legacy"
+
+    @pytest.mark.unit
+    def test_punctuation_delay_requires_the_partition_targets(self, test_data_dir, tmp_path):
+        """The legacy path tokenizes each chunk separately and cannot express
+        moving one punctuation token, so asking for it must fail loudly."""
+        c = _cfg(test_data_dir, "banded")
+        c.forced_alignment.delay_word_final_punctuation = True
+        c.train_ds = _train_ds_cfg(tmp_path)
+        with pytest.raises(ValueError, match="requires target_construction"):
+            EncDecCHATBPEModel(cfg=c)
+
+    @pytest.mark.unit
+    def test_legacy_still_drops_the_respelled_word(self, test_data_dir, tmp_path):
+        """The gate has to be real: an arm launched on 'legacy' must keep the
+        objective it was launched with, retry available or not."""
+        c = _cfg(test_data_dir, "banded")
+        c.forced_alignment.num_delay_frames = 3
+        c.train_ds = _train_ds_cfg(tmp_path)
+        legacy = EncDecCHATBPEModel(cfg=c)
+        cut = _cut_with_transcript(self.TRANSCRIPT, self.ALIGNED)
+        ids = [i for chunk in legacy._chunk_tokens(cut, n_chunks=6) for i in chunk]
+        assert ids != legacy.tokenizer.text_to_ids(self.TRANSCRIPT)
+        # ... and it still REPORTS what it is dropping, so the rate is visible
+        assert legacy._mismatch_stats["dropped"] == 1, legacy._mismatch_stats
+        assert legacy._mismatch_stats["respelled"] == 0

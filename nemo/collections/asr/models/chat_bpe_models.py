@@ -52,7 +52,13 @@ from omegaconf import DictConfig, OmegaConf
 from nemo.collections.asr.data.audio_to_text_lhotse import LhotseSpeechToTextBpeDataset
 from nemo.collections.asr.losses.banded_rnnt import BandedLattice, banded_rnnt_loss, build_lattices
 from nemo.collections.asr.models.rnnt_bpe_models import EncDecRNNTBPEModel
-from nemo.collections.asr.parts.utils.chat_alignment import assign_words_to_chunks, build_forced_path, chunk_texts
+from nemo.collections.asr.parts.utils.chat_alignment import (
+    assign_words_to_chunks,
+    build_forced_path,
+    chunk_texts,
+    word_core_end,
+    word_spans,
+)
 from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
 from nemo.collections.common.tokenizers import AutoTokenizer
 from nemo.core.classes.common import PretrainedModelInfo
@@ -178,6 +184,52 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
         infer = fa.get("inference_delay_frames", None)
         self.inference_delay_frames = int(infer) if infer is not None else self.max_delay_frames // 2
         self._delay_rng: Optional[random.Random] = None
+
+        # WORD-FINAL PUNCTUATION. Whether a comma or period belongs after a word
+        # usually cannot be decided until the NEXT word has been heard ("Media"
+        # vs "Media, Inc."), so charging it to the chunk that emits the word it
+        # trails asks the model to predict it from audio that does not determine
+        # it. When true, a token that is pure punctuation is emitted at the chunk
+        # of the FOLLOWING word instead. Utterance-final punctuation has no
+        # following word and stays where it is.
+        #
+        # Default OFF: turning it on changes the training targets, so a run that
+        # requeues under an existing EXP_NAME would silently switch objective
+        # mid-flight. New arms opt in explicitly in their launch script.
+        # HOW THE PER-CHUNK TARGETS ARE BUILT.
+        #   "legacy"    -- each chunk's text is sliced from the transcript between
+        #                  its first and last LOCATED word and tokenized on its
+        #                  own. Text between two chunks' spans belongs to neither
+        #                  and is dropped, and a word the aligner respelled
+        #                  ("forward-looking" -> "forwardlooking") cannot be
+        #                  located at all, so it vanishes from the target.
+        #   "partition" -- the whole transcript is tokenized ONCE and the id
+        #                  sequence is split by character offset, so the
+        #                  concatenated per-chunk ids equal the whole-transcript
+        #                  ids by construction; and a respelled word is located by
+        #                  retrying the match with punctuation ignored.
+        # Default "legacy" so a run that requeues under an existing EXP_NAME keeps
+        # the objective it was launched with. Either way the mismatch RATE is
+        # logged, so a legacy arm still reports what it is losing.
+        self.target_construction = str(fa.get("target_construction", "legacy"))
+        if self.target_construction not in ("legacy", "partition"):
+            raise ValueError(
+                f"model.forced_alignment.target_construction must be 'legacy' or 'partition', "
+                f"got {self.target_construction!r}"
+            )
+        self.delay_word_final_punctuation = bool(fa.get("delay_word_final_punctuation", False))
+        if self.delay_word_final_punctuation and self.target_construction != "partition":
+            # Moving one punctuation token to another chunk is only expressible
+            # when the targets are a split of a single tokenization; the legacy
+            # path tokenizes each chunk's text separately and cannot represent it.
+            raise ValueError(
+                "model.forced_alignment.delay_word_final_punctuation requires target_construction='partition'"
+            )
+        # How often to report aligner/transcript spelling mismatches. 0 disables.
+        self.log_target_mismatch_every_n_steps = int(fa.get("log_target_mismatch_every_n_steps", 500))
+        self._mismatch_stats = {"utts": 0, "words": 0, "respelled": 0, "dropped": 0, "missing": 0}
+        self._mismatch_examples: List[str] = []
+        self._mismatch_last_logged = -1
 
         self._ws_ids: Optional[frozenset] = None
         # Set only while the TRAINING loader is being built: the forced loss
@@ -380,8 +432,184 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
             self.frame_length_in_secs,
             self.num_delay_frames if delay is None else delay,
         )
-        texts = self._chunk_texts_for_tokenizer(groups, words, transcript)
-        return [self.tokenizer.text_to_ids(t) if t else [] for t in texts]
+        if self.target_construction != "partition" or not transcript or not words:
+            texts = self._chunk_texts_for_tokenizer(groups, words, transcript)
+            return [self.tokenizer.text_to_ids(t) if t else [] for t in texts]
+
+        offsets = self._tokenize_with_offsets(transcript)
+        if offsets is None:
+            # Tokenizer cannot report character offsets; keep the text-space path.
+            texts = self._chunk_texts_for_tokenizer(groups, words, transcript)
+            return [self.tokenizer.text_to_ids(t) if t else [] for t in texts]
+
+        char_chunk = self._char_to_chunk(transcript, words, groups)
+        out: List[List[int]] = [[] for _ in range(len(groups))]
+        for tok_id, begin, end in offsets:
+            c = char_chunk[begin] if begin < len(char_chunk) else -1
+            if c < 0:  # every character is assigned below, so this is belt-and-braces
+                continue
+            out[c].append(int(tok_id))
+        return out
+
+    def _tokenize_with_offsets(self, text: str):
+        """``[(id, char_begin, char_end)]`` for the WHOLE transcript, or None.
+
+        The chunk targets are a PARTITION of one tokenization rather than a
+        tokenization of each chunk's text. Tokenizing the slices separately is
+        what produced the two target bugs this model has already had: a leading
+        space becomes a standalone ``U+2581`` piece under SentencePiece, and a
+        missing one drops the word-boundary marker under byte-level BPE. Splitting
+        a single id sequence by character offset cannot do either -- the
+        concatenated per-chunk ids equal the whole-transcript ids by
+        construction, for any tokenizer family -- and it is also what makes
+        moving an individual punctuation token to another chunk expressible at
+        all.
+        """
+        inner = getattr(self.tokenizer, "tokenizer", None)
+        if inner is None:
+            return None
+
+        # SentencePiece reports BYTE offsets into its NORMALISED text, not
+        # character offsets into what we passed in. The two coincide only for
+        # pure-ASCII input that the normaliser left alone: 'Café naïve' encodes to 22
+        # bytes for 18 characters, and some models strip leading whitespace. Using
+        # them unchecked would attribute tokens to the wrong chunk on exactly the
+        # utterances nobody inspects. So convert to character offsets and VERIFY
+        # each piece against the transcript; on any disagreement return None and
+        # let the caller fall back rather than guess.
+        proto = None
+        try:
+            proto = inner.encode(text, out_type="proto")
+        except (AttributeError, TypeError, ValueError):
+            proto = None
+        # A HuggingFace tokenizer also has .encode(), and it accepts and IGNORES
+        # out_type, handing back a plain list of ids -- so the call succeeding is
+        # not evidence that this is SentencePiece. Check for the payload instead.
+        if not hasattr(proto, "pieces"):
+            proto = None
+        if proto is not None:
+            byte_to_char: Dict[int, int] = {}
+            b = 0
+            for ci, ch in enumerate(text):
+                for _ in ch.encode("utf-8"):
+                    byte_to_char[b] = ci
+                    b += 1
+            byte_to_char[b] = len(text)
+            out = []
+            for p in proto.pieces:
+                cb, ce = byte_to_char.get(p.begin), byte_to_char.get(p.end)
+                if cb is None or ce is None or text[cb:ce] != p.surface:
+                    return None
+                out.append((p.id, cb, ce))
+            return out
+
+        # HuggingFace: only the FAST tokenizers can report offsets, and theirs are
+        # already character offsets into the raw string.
+        try:
+            if not getattr(inner, "is_fast", False):
+                return None
+            enc = inner(text, return_offsets_mapping=True, add_special_tokens=False)
+            pairs = list(zip(enc["input_ids"], enc["offset_mapping"]))
+        except (AttributeError, TypeError, ValueError, KeyError):
+            return None
+        if any(b is None or e is None or not (0 <= b <= e <= len(text)) for _, (b, e) in pairs):
+            return None
+        return [(i, b, e) for i, (b, e) in pairs]
+
+    def _char_to_chunk(self, transcript: str, words, groups) -> List[int]:
+        """Which chunk each CHARACTER of the transcript belongs to.
+
+        Built from the word spans so that every character lands in exactly one
+        chunk -- a partition, not a union of per-chunk spans. The union is what
+        the old path used, and text falling between one chunk's last located word
+        and the next chunk's first located word belonged to neither, so it was
+        dropped from the target outright.
+        """
+        spans = word_spans(words, transcript, report=self._report_target_mismatch)
+        self._mismatch_stats["utts"] += 1
+        self._mismatch_stats["words"] += len(words)
+
+        chunk_of_word = {i: t for t, idxs in enumerate(groups) for i in idxs}
+        char_chunk = [-1] * (len(transcript) + 1)
+        for i, span in enumerate(spans):
+            if span is None or i not in chunk_of_word:
+                continue
+            here = chunk_of_word[i]
+            core = word_core_end(transcript, span)
+            for p in range(span[0], core):
+                char_chunk[p] = here
+            # The trailing punctuation, charged to whichever chunk the config says.
+            punct_chunk = here
+            if self.delay_word_final_punctuation:
+                nxt = next((chunk_of_word[j] for j in range(i + 1, len(spans)) if j in chunk_of_word), None)
+                if nxt is not None:
+                    punct_chunk = max(nxt, here)  # never move punctuation EARLIER
+            for p in range(core, span[1]):
+                char_chunk[p] = punct_chunk
+
+        # Fill the gaps -- inter-word whitespace, and any word that could not be
+        # located -- with the chunk of the next assigned character, so leading
+        # space travels with the word it precedes (matching SentencePiece's own
+        # convention) and nothing is left unattributed.
+        nxt = -1
+        for p in range(len(char_chunk) - 1, -1, -1):
+            if char_chunk[p] >= 0:
+                nxt = char_chunk[p]
+            elif nxt >= 0:
+                char_chunk[p] = nxt
+        last = max((c for c in char_chunk if c >= 0), default=len(groups) - 1)
+        for p in range(len(char_chunk)):
+            if char_chunk[p] < 0:
+                char_chunk[p] = last
+        return char_chunk
+
+    def _report_target_mismatch(self, kind: str, aligner_word: str, transcript_form: str) -> None:
+        """Record an aligner/transcript spelling mismatch for periodic logging."""
+        self._mismatch_stats[kind] = self._mismatch_stats.get(kind, 0) + 1
+        if len(self._mismatch_examples) < 8:
+            if kind == "respelled":
+                self._mismatch_examples.append(f"{aligner_word!r} -> {transcript_form!r}")
+            elif kind == "dropped":
+                self._mismatch_examples.append(f"{aligner_word!r} -> {transcript_form!r} (DROPPED)")
+            else:
+                self._mismatch_examples.append(f"{aligner_word!r} -> NOT FOUND")
+
+    def _log_target_mismatches(self) -> None:
+        """Print how often the aligner's spelling differed from the transcript.
+
+        This is the rate that decides whether the targets the forced/banded arms
+        train on are the same token sequence the rnnt arm trains on. It was
+        measured offline at 0.46% of aligner words, but the training manifest is
+        not the manifest that was measured, so the run reports its own number.
+        """
+        n = self.log_target_mismatch_every_n_steps
+        if n <= 0 or self.global_rank != 0:
+            return
+        step = int(self.global_step)
+        if step == self._mismatch_last_logged or step % n != 0:
+            return
+        self._mismatch_last_logged = step
+        s = self._mismatch_stats
+        if not s["words"]:
+            return
+        pct = lambda k: 100.0 * s[k] / max(s["words"], 1)  # noqa: E731
+        logging.info(
+            "CHAT targets @ step %d (%s): %d utts / %d aligner words | "
+            "respelled+recovered %d (%.3f%%) | respelled+DROPPED %d (%.3f%%) | "
+            "absent from transcript %d (%.3f%%) | examples: %s",
+            step,
+            self.target_construction,
+            s["utts"],
+            s["words"],
+            s["respelled"],
+            pct("respelled"),
+            s["dropped"],
+            pct("dropped"),
+            s["missing"],
+            pct("missing"),
+            "; ".join(self._mismatch_examples) or "(none)",
+        )
+        self._mismatch_examples.clear()
 
     @property
     def _tokenizer_supplies_word_prefix(self) -> bool:
@@ -419,7 +647,10 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
         explicit space from becoming the junk standalone piece chunk_texts warns
         about.
         """
-        texts = chunk_texts(groups, words, transcript)
+        if transcript and words:
+            self._mismatch_stats["utts"] += 1
+            self._mismatch_stats["words"] += len(words)
+        texts = chunk_texts(groups, words, transcript, report=self._report_target_mismatch, respell=False)
         if self._tokenizer_supplies_word_prefix:
             return texts
         out, started = [], False
@@ -647,6 +878,10 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
             loss_value = self.add_auxiliary_losses(self._banded_loss(encoded, encoded_len, cuts))
         else:
             loss_value = self.add_auxiliary_losses(self._forced_alignment_loss(encoded, encoded_len, cuts))
+
+        # After the targets for this batch have been built, so the counters
+        # include it rather than lagging a step behind.
+        self._log_target_mismatches()
 
         if AccessMixin.is_access_enabled(self.model_guid):
             AccessMixin.reset_registry(self)

@@ -23,12 +23,24 @@ speechlm2; the rules are identical to the ones validated there.
 """
 
 import math
-from typing import List, Optional, Sequence, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple
 
-__all__ = ["assign_words_to_chunks", "build_forced_path", "word_spans", "chunk_texts", "band_nodes"]
+__all__ = [
+    "assign_words_to_chunks",
+    "build_forced_path",
+    "word_spans",
+    "word_core_end",
+    "chunk_texts",
+    "band_nodes",
+]
 
 
-def word_spans(words: Sequence[str], transcript: str) -> List[Optional[Tuple[int, int]]]:
+def word_spans(
+    words: Sequence[str],
+    transcript: str,
+    report: Optional[Callable[[str, str, str], None]] = None,
+    respell: bool = True,
+) -> List[Optional[Tuple[int, int]]]:
     """Character spans of each aligned word inside the ORIGINAL transcript.
 
     Forced aligners emit bare word forms -- ``Media``, never ``Media.`` -- so a
@@ -39,18 +51,73 @@ def word_spans(words: Sequence[str], transcript: str) -> List[Optional[Tuple[int
     quotes.
 
     Matching is case-insensitive and advances a cursor, so a repeated word maps
-    to its own occurrence rather than always to the first. A word that cannot be
-    located yields ``None`` rather than a wrong span.
+    to its own occurrence rather than always to the first.
+
+    THE RESPELLING RETRY. The aligner ran on NORMALISED text, so it strips
+    punctuation that sits INSIDE a word: the transcript's ``forward-looking``
+    reaches us as ``forwardlooking``, ``3-year`` as ``3year``, ``e-commerce`` as
+    ``ecommerce``. Those are not a literal substring of the transcript, so the
+    plain search above returns -1 and the word ends up with no span -- and a word
+    with no span cannot be sliced into its chunk, so it silently vanishes from
+    the training target. Measured over the aligned manifests that was 0.462% of
+    all aligner words (0.528% on spgispeech), and 0% on LibriSpeech, which has no
+    punctuation to strip.
+
+    So when the literal search fails the word is retried with punctuation ignored
+    on BOTH sides, by matching against an alphanumeric-only view of the
+    transcript and mapping the hit back to original offsets. That recovers 93.8%
+    of the failures. Anything still unfound (a word genuinely absent from the
+    transcript, e.g. a verbalised number) yields ``None`` rather than a wrong
+    span, exactly as before.
+
+    ``respell=False`` restores the pre-fix behaviour exactly -- the retry is
+    still RUN, so the rate is still reported, but its answer is discarded and the
+    word yields ``None`` as before. That keeps an already-launched control arm on
+    the objective it was launched with while still telling us what it is losing.
+
+    ``report(kind, aligner_word, transcript_form)`` is called for each mismatch:
+    ``"respelled"`` (found by the retry and used), ``"dropped"`` (found by the
+    retry but discarded because ``respell=False``), or ``"missing"`` (not in the
+    transcript at all). So callers can log how often this fires on real data
+    instead of inferring it.
     """
+    # Alphanumeric-only view plus a map back to original character offsets, and a
+    # prefix count so the cursor can be carried across without rescanning.
+    norm_chars: List[str] = []
+    back: List[int] = []
+    alnum_before: List[int] = [0] * (len(transcript) + 1)
+    for i, ch in enumerate(transcript):
+        alnum_before[i + 1] = alnum_before[i]
+        if ch.isalnum():
+            norm_chars.append(ch.lower())
+            back.append(i)
+            alnum_before[i + 1] += 1
+    norm = "".join(norm_chars)
+
     spans: List[Optional[Tuple[int, int]]] = []
     lower = transcript.lower()
     pos = 0
     for w in words:
         idx = lower.find(w.lower(), pos)
-        if idx == -1:
-            spans.append(None)
-            continue
-        end = idx + len(w)
+        if idx != -1:
+            end = idx + len(w)
+        else:
+            w_norm = "".join(c.lower() for c in w if c.isalnum())
+            j = norm.find(w_norm, alnum_before[pos]) if w_norm else -1
+            if j == -1:
+                spans.append(None)
+                if report is not None:
+                    report("missing", w, "")
+                continue
+            hit_start, hit_end = back[j], back[j + len(w_norm) - 1] + 1
+            if not respell:
+                spans.append(None)
+                if report is not None:
+                    report("dropped", w, transcript[hit_start:hit_end])
+                continue
+            idx, end = hit_start, hit_end
+            if report is not None:
+                report("respelled", w, transcript[idx:end])
         while end < len(transcript) and not transcript[end].isalnum() and not transcript[end].isspace():
             end += 1
         spans.append((idx, end))
@@ -58,7 +125,29 @@ def word_spans(words: Sequence[str], transcript: str) -> List[Optional[Tuple[int
     return spans
 
 
-def chunk_texts(groups: Sequence[Sequence[int]], words: Sequence[str], transcript: str) -> List[str]:
+def word_core_end(transcript: str, span: Tuple[int, int]) -> int:
+    """End of a span's ALPHANUMERIC content, i.e. the span minus trailing punctuation.
+
+    ``word_spans`` deliberately extends each span through trailing punctuation so
+    the surface form carries it. Deciding WHEN that punctuation is emitted needs
+    the two parts separated, which is what this returns: for ``'Media.'`` at
+    (0, 6) it returns 5, so ``[0, 5)`` is the word and ``[5, 6)`` is the period.
+    """
+    start, end = span
+    core = start
+    for i in range(start, end):
+        if transcript[i].isalnum():
+            core = i + 1
+    return core
+
+
+def chunk_texts(
+    groups: Sequence[Sequence[int]],
+    words: Sequence[str],
+    transcript: str,
+    report: Optional[Callable[[str, str, str], None]] = None,
+    respell: bool = True,
+) -> List[str]:
     """The text each chunk is responsible for, sliced from the transcript.
 
     Returned WITHOUT leading or trailing whitespace. That matters: SentencePiece
@@ -71,7 +160,7 @@ def chunk_texts(groups: Sequence[Sequence[int]], words: Sequence[str], transcrip
     Falls back to joining the aligner's word forms when a span cannot be
     located, which loses that word's punctuation but never loses the word.
     """
-    spans = word_spans(words, transcript) if transcript else [None] * len(words)
+    spans = word_spans(words, transcript, report=report, respell=respell) if transcript else [None] * len(words)
     out = []
     for idxs in groups:
         if not idxs:

@@ -33,6 +33,9 @@
 # ENV
 #   LOSS_TYPE                rnnt | forced_alignment | banded
 #   BAND_CHUNKS              banded only: chunks a word may drift from the aligner
+#   TARGET_CONSTRUCTION      legacy | partition -- how per-chunk targets are built
+#   DELAY_PUNCT              true = word-final punctuation is emitted at the
+#                            NEXT word's chunk (it needs that word to be decided)
 #   DELAY_FRAMES             forced only: emit a word this many frames late
 #   RECOVER_WORDS            forced only: also score the previous chunk's last k words
 #   HISTORY_CHUNKS           joint attends over this many previous chunks ("win28" = 1)
@@ -87,6 +90,10 @@ RECOVER_WORDS="${RECOVER_WORDS:-0}"
 HISTORY_CHUNKS="${HISTORY_CHUNKS:-0}"
 MAX_DELAY_FRAMES="${MAX_DELAY_FRAMES:-0}"
 BAND_CHUNKS="${BAND_CHUNKS:-1}"
+# Emit word-final punctuation at the FOLLOWING word's chunk (see the config).
+DELAY_PUNCT="${DELAY_PUNCT:-false}"
+# legacy | partition -- how the per-chunk targets are built (see the config).
+TARGET_CONSTRUCTION="${TARGET_CONSTRUCTION:-legacy}"
 INFER_DELAY_FRAMES="${INFER_DELAY_FRAMES:-null}"
 # The rnnt default keeps the name the pre-merge "standard CHAT" runs used. The
 # results directory is what exp_manager resumes from, so renaming it would
@@ -145,7 +152,7 @@ MOUNTS="--container-mounts=${DATA_DIR}:${DATA_DIR},${H_DIR}:${H_DIR},${HAINAN_DI
 read -r -d '' cmd <<EOF
 echo "*******STARTING********" \
 && echo "*** CHAT transducer (RNNTAttJoint), loss_type=${LOSS_TYPE} ***" \
-&& echo "*** forced-alignment knobs: delay=${DELAY_FRAMES} recover=${RECOVER_WORDS} history_chunks=${HISTORY_CHUNKS} ***" \
+&& echo "*** forced-alignment knobs: delay=${DELAY_FRAMES} recover=${RECOVER_WORDS} history_chunks=${HISTORY_CHUNKS} punct_delay=${DELAY_PUNCT} targets=${TARGET_CONSTRUCTION} ***" \
 && echo "*** flexible delay: max=${MAX_DELAY_FRAMES} (0=off, sampled per batch) inference=${INFER_DELAY_FRAMES} (null=max/2) ***" \
 && echo "*** warm start: encoder + prediction LSTM + joint.enc/pred from the donor ***" \
 && echo "*** left RANDOM: Q/K/V, joint_net, and the embedding (exclude=${INIT_EXCLUDE:-[prediction.embed]}) ***" \
@@ -186,6 +193,8 @@ print('    tokenizer ->', dst)
     model.forced_alignment.num_delay_frames=${DELAY_FRAMES} \
     model.forced_alignment.max_delay_frames=${MAX_DELAY_FRAMES} \
     model.forced_alignment.band_chunks=${BAND_CHUNKS} \
+    model.forced_alignment.delay_word_final_punctuation=${DELAY_PUNCT} \
+    model.forced_alignment.target_construction=${TARGET_CONSTRUCTION} \
     model.forced_alignment.inference_delay_frames=${INFER_DELAY_FRAMES} \
     model.forced_alignment.recover_history_words=${RECOVER_WORDS} \
     model.joint.history_chunks=${HISTORY_CHUNKS} \

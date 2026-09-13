@@ -19,6 +19,7 @@ from nemo.collections.asr.parts.utils.chat_alignment import (
     assign_words_to_chunks,
     build_forced_path,
     chunk_texts,
+    word_core_end,
     word_spans,
 )
 
@@ -177,3 +178,74 @@ class TestChunkTexts:
     @pytest.mark.unit
     def test_unlocatable_word_yields_none_not_a_wrong_span(self):
         assert word_spans(["hello", "absent"], "hello world")[1] is None
+
+
+class TestAlignerRespellsWordsTheTranscriptPunctuates:
+    """The aligner runs on NORMALISED text, so punctuation INSIDE a word is gone.
+
+    ``forward-looking`` reaches us as ``forwardlooking``, which is not a literal
+    substring of the transcript. Before the retry those words got no span, and a
+    word with no span cannot be sliced into its chunk -- so it vanished from the
+    training target entirely. Measured at 0.46% of all aligner words on the
+    aligned manifests, and 0% on LibriSpeech, which has no punctuation to strip.
+    """
+
+    TRANSCRIPT = "Our forward-looking guidance for the day-to-day e-commerce business is strong."
+    WORDS = ["Our", "forwardlooking", "guidance", "for", "the", "daytoday", "ecommerce", "business", "is", "strong"]
+
+    @pytest.mark.unit
+    def test_a_respelled_word_is_located_not_dropped(self):
+        spans = word_spans(self.WORDS, self.TRANSCRIPT)
+        assert all(s is not None for s in spans), "a respelled word still has no span"
+        assert self.TRANSCRIPT[spans[1][0] : spans[1][1]] == "forward-looking"
+        assert self.TRANSCRIPT[spans[6][0] : spans[6][1]] == "e-commerce"
+
+    @pytest.mark.unit
+    def test_every_word_survives_into_some_chunk(self):
+        """The failure this guards: a respelled word at a chunk EDGE is deleted.
+
+        chunk_texts slices from the first to the last LOCATED word of a group, so
+        an unlocated word interior to a group survives by accident while one at
+        an edge falls outside every slice.
+        """
+        groups = [[0, 1], [2, 3, 4], [5, 6, 7], [8, 9]]
+        joined = " ".join(t for t in chunk_texts(groups, self.WORDS, self.TRANSCRIPT) if t)
+        for surface in ("forward-looking", "day-to-day", "e-commerce"):
+            assert surface in joined, f"{surface!r} was dropped from the target"
+
+    @pytest.mark.unit
+    def test_the_report_hook_names_each_mismatch(self):
+        seen = []
+        word_spans(self.WORDS, self.TRANSCRIPT, report=lambda k, w, f: seen.append((k, w, f)))
+        assert ("respelled", "forwardlooking", "forward-looking") in seen
+        assert all(k == "respelled" for k, _, _ in seen), seen
+
+    @pytest.mark.unit
+    def test_a_genuinely_absent_word_is_still_reported_missing(self):
+        seen = []
+        spans = word_spans(["hello", "absent"], "hello world", report=lambda k, w, f: seen.append((k, w, f)))
+        assert spans[1] is None
+        assert seen == [("missing", "absent", "")]
+
+    @pytest.mark.unit
+    def test_literally_matching_words_are_untouched(self):
+        """The retry must not perturb the path that already worked."""
+        t = "the cat sat on the mat."
+        words = ["the", "cat", "sat", "on", "the", "mat"]
+        assert word_spans(words, t) == [(0, 3), (4, 7), (8, 11), (12, 14), (15, 18), (19, 23)]
+
+
+class TestWordCoreEnd:
+    @pytest.mark.unit
+    def test_it_splits_a_span_into_word_and_trailing_punctuation(self):
+        t = "Media. Inc"
+        span = word_spans(["Media"], t)[0]
+        core = word_core_end(t, span)
+        assert t[span[0] : core] == "Media"
+        assert t[core : span[1]] == "."
+
+    @pytest.mark.unit
+    def test_a_span_without_punctuation_is_unchanged(self):
+        t = "Media Inc"
+        span = word_spans(["Media"], t)[0]
+        assert word_core_end(t, span) == span[1]
