@@ -640,8 +640,12 @@ class ScriptSTTModel(StreamingSTTModel):
             use_cache=False,
             return_dict=True,
         )
-        logits = out["logits"].float()  # (n, b, V)
-        lse = torch.logsumexp(logits, dim=-1)  # (n, b)
+        # NOT upcast to fp32. The vocabulary is ~152k, so .float() here allocates
+        # and copies a (n, b, 151936) tensor -- about a gigabyte at n=32 -- and the
+        # checkpointed backward pays for it twice. torch.logsumexp accumulates in
+        # fp32 internally for a bf16 input, so only its (n, b) RESULT is upcast.
+        logits = out["logits"]  # (n, b, V)
+        lse = torch.logsumexp(logits, dim=-1).float()  # (n, b)
 
         # <ve> predicts the first emitted token, so the K + 1 positions starting
         # there carry every score this branch provides. Its index is read PER ROW:
@@ -655,14 +659,15 @@ class ScriptSTTModel(StreamingSTTModel):
         idx = idx.clamp(max=b_w - 1)
 
         lse_sel = lse.gather(1, idx)  # (n, k1)
-        stop_lp = logits[..., self._eot_id].gather(1, idx) - lse_sel
+        stop_lp = logits[..., self._eot_id].float().gather(1, idx) - lse_sel
 
+        # Index by ROW AND COLUMN together, so the result is (n * k1,) directly.
+        # Selecting the rows first and then gathering the column would build a
+        # (n, k1, 151936) intermediate to read one value out of each row of it.
+        tgt = two.branch_targets[i, lo:hi].gather(1, idx)  # (n, k1)
         flat = logits.reshape(-1, logits.shape[-1])
         row = (torch.arange(n, device=logits.device).unsqueeze(1) * b_w + idx).reshape(-1)
-        sel = flat[row].view(n, k1, -1)  # (n, k1, V)
-
-        tgt = two.branch_targets[i, lo:hi].gather(1, idx)  # (n, k1)
-        tok_lp = sel.gather(-1, tgt.clamp(min=0).unsqueeze(-1)).squeeze(-1) - lse_sel
+        tok_lp = flat[row, tgt.clamp(min=0).reshape(-1)].view(n, k1).float() - lse_sel
         tok_lp = torch.where(tgt == IGNORE_INDEX, torch.zeros_like(tok_lp), tok_lp)
 
         return span_scores(

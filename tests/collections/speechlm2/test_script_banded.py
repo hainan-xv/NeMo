@@ -486,3 +486,49 @@ def test_the_shipped_banded_recipe_mirrors_every_paired_key():
     resolved = OmegaConf.load(path)
     for key in ("target_construction", "loss_type", "band_words", "twod_layout"):
         assert resolved.data.dataset[key] == resolved.model[key]
+
+
+@pytest.mark.unit
+def test_row_and_column_indexing_equals_the_naive_slice():
+    """The memory-lean gather in _branch_span_logprobs must be exact.
+
+    It indexes rows and columns together so the result is (n*k1,). The obvious
+    alternative -- select the rows, then gather the column -- builds an
+    (n, k1, vocab) intermediate to read one value out of each row. At vocab
+    151936 that intermediate is hundreds of megabytes per micro-batch, recomputed
+    in the checkpointed backward. This pins the two as numerically identical, so
+    the optimisation cannot silently change the loss.
+    """
+    from nemo.collections.speechlm2.data.streaming_stt_dataset import IGNORE_INDEX
+
+    torch.manual_seed(0)
+    n, b_w, v, k1 = 3, 11, 17, 4
+    logits = torch.randn(n, b_w, v, dtype=torch.float64)
+    ve = torch.tensor([1, 4, 2])
+    idx = (ve.unsqueeze(1) + torch.arange(k1).unsqueeze(0)).clamp(max=b_w - 1)
+    tgt = torch.randint(0, v, (n, k1))
+    tgt[0, 2] = IGNORE_INDEX
+
+    flat = logits.reshape(-1, v)
+    row = (torch.arange(n).unsqueeze(1) * b_w + idx).reshape(-1)
+
+    lean = flat[row, tgt.clamp(min=0).reshape(-1)].view(n, k1)
+    naive = flat[row].view(n, k1, v).gather(-1, tgt.clamp(min=0).unsqueeze(-1)).squeeze(-1)
+
+    assert torch.equal(lean, naive)
+
+
+@pytest.mark.unit
+def test_logsumexp_result_upcast_matches_a_fully_upcast_tensor():
+    """Upcasting only the (n, b) logsumexp result, not the (n, b, vocab) logits.
+
+    torch.logsumexp accumulates in fp32 for a bf16 input, so the cheap form has to
+    agree with the expensive one to bf16's own resolution.
+    """
+    torch.manual_seed(1)
+    logits = torch.randn(2, 5, 512).to(torch.bfloat16)
+
+    cheap = torch.logsumexp(logits, dim=-1).float()
+    expensive = torch.logsumexp(logits.float(), dim=-1)
+
+    torch.testing.assert_close(cheap, expensive, atol=5e-2, rtol=5e-2)
