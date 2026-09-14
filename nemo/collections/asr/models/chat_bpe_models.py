@@ -250,15 +250,22 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
 
         # GUARDS THE JOINT CANNOT EXPRESS. The joint sees one chunk size and knows
         # nothing about the delay; both failures below are silent.
-        _F = int(getattr(self.joint, "window_frames", 0))
-        _C = int(self.joint.chunk_size)
-        if _F > 0 and _F < _C:
+        #
+        # Read both attributes DEFENSIVELY. `init_from_nemo_model` restores the
+        # warm-start donor through `self.__class__` -- so this same __init__ runs
+        # against the DONOR's config, whose joint is a plain RNNTJoint with no
+        # chunk_size and no window_frames. Touching them directly raises
+        # AttributeError before a single step, which is how job 13383115 died.
+        # A joint with neither is not a CHAT joint, so there is nothing to check.
+        _F = int(getattr(self.joint, "window_frames", 0) or 0)
+        _C = int(getattr(self.joint, "chunk_size", 0) or 0)
+        if _F > 0 and _C > 0 and _F < _C:
             raise ValueError(
                 f"model.joint.window_frames={_F} is smaller than chunk_size={_C}. The window is a FLOOR, so "
                 f"every chunk would simply keep its own {_C} frames and the constant-context premise is gone "
                 f"with no error. Raise window_frames to >= {_C}, or drop the knob."
             )
-        if _F > 0 and self.max_delay_frames > _C:
+        if _F > 0 and _C > 0 and self.max_delay_frames > _C:
             raise ValueError(
                 f"forced_alignment.max_delay_frames={self.max_delay_frames} exceeds chunk_size={_C}; the "
                 f"per-chunk trim clamps at 0, so frames the delay is meant to hide stay visible and the model "
@@ -269,7 +276,7 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
             logging.info(
                 f"CHAT {self.loss_type} loss (band_chunks={self.band_chunks}): delay={self.num_delay_frames} frames, "
                 f"recover_history_words={self.recover_history_words}, "
-                f"frame_length={self.frame_length_in_secs:.4f}s, chunk_size={self.joint.chunk_size}, "
+                f"frame_length={self.frame_length_in_secs:.4f}s, chunk_size={_C}, "
                 f"joint_window={self.joint.window_width()} frames ({self.joint.window_width() * self.frame_length_in_secs:.2f}s)"
             )
 

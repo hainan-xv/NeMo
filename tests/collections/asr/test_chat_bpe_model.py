@@ -1166,3 +1166,25 @@ class TestFixedFrameJointWindow:
         c.train_ds = _train_ds_cfg(tmp_path)
         with pytest.raises(ValueError, match="smaller than chunk_size"):
             EncDecCHATBPEModel(cfg=c)
+
+    @pytest.mark.unit
+    def test_construction_survives_a_plain_rnnt_joint(self, test_data_dir, tmp_path):
+        """`init_from_nemo_model` restores the warm-start DONOR through
+        `self.__class__`, so this same __init__ runs against the donor's config --
+        whose joint is a plain RNNTJoint with no chunk_size and no window_frames.
+
+        Reading either attribute directly raises AttributeError before a single
+        training step; that is how job 13383115 died 3 minutes in on 8 nodes. A
+        joint with neither is not a CHAT joint, so the guards must simply skip.
+        """
+        c = _cfg(test_data_dir, "rnnt")
+        # the donor's shape: standard RNNTJoint, no CHAT keys at all
+        c.joint = DictConfig(
+            {
+                '_target_': 'nemo.collections.asr.modules.RNNTJoint',
+                'jointnet': {'encoder_hidden': 32, 'pred_hidden': 32, 'joint_hidden': 32, 'activation': 'relu'},
+            }
+        )
+        c.train_ds = _train_ds_cfg(tmp_path)
+        m = EncDecCHATBPEModel(cfg=c)  # must not raise
+        assert not hasattr(m.joint, "chunk_size") or int(getattr(m.joint, "chunk_size", 0) or 0) == 0
