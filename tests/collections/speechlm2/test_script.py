@@ -3637,3 +3637,91 @@ class TestRespellTargets:
         assert compute_word_spans(words, transcript, preserve_leading_whitespace=True) == compute_word_spans(
             words, transcript, preserve_leading_whitespace=True, respell=True
         )
+
+
+class TestOomSkip:
+    """A CUDA OOM on one rank must drop the batch on ALL ranks, not hang.
+
+    Under DDP every rank must reach the same collectives in the same order. A
+    plain try/except that returns early on one rank leaves the gradient
+    all-reduce waiting forever -- no traceback, no checkpoint, the whole block
+    burned. That is strictly worse than the crash it replaces, so the verdict is
+    all-reduced and every rank takes the same branch.
+    """
+
+    @staticmethod
+    def _model():
+        import types
+
+        from nemo.collections.speechlm2.models.script_model import ScriptSTTModel
+
+        m = ScriptSTTModel.__new__(ScriptSTTModel)
+        m.core_cfg = types.SimpleNamespace(oom_skip_limit=25)
+        m._params = [torch.nn.Parameter(torch.ones(2)), torch.nn.Parameter(torch.ones(3))]
+        m.parameters = lambda: iter(m._params)
+        m.log = lambda *a, **k: None
+        return m
+
+    @pytest.mark.unit
+    def test_the_skip_loss_is_zero_but_touches_every_parameter(self):
+        """DDP aborts on parameters that receive no gradient, so the dummy loss
+        must still reach all of them."""
+        from nemo.collections.speechlm2.models.script_model import ScriptSTTModel
+
+        m = self._model()
+        out = ScriptSTTModel._skip_oom_batch(m, batch_idx=7)
+        loss = out["loss"]
+        assert float(loss) == 0.0
+        loss.backward()
+        for p in m._params:
+            assert p.grad is not None, "a parameter received no gradient; DDP would abort"
+            assert torch.equal(p.grad, torch.zeros_like(p.grad))
+
+    @pytest.mark.unit
+    def test_consecutive_skips_eventually_abort(self):
+        """A rising skip count means the batch simply does not fit; limping on
+        would train on a quietly easier distribution forever."""
+        from nemo.collections.speechlm2.models.script_model import ScriptSTTModel
+
+        m = self._model()
+        m.core_cfg.oom_skip_limit = 3
+        for _ in range(2):
+            ScriptSTTModel._skip_oom_batch(m, batch_idx=0)
+        with pytest.raises(RuntimeError, match="consecutive OOM batches"):
+            ScriptSTTModel._skip_oom_batch(m, batch_idx=0)
+
+    @pytest.mark.unit
+    def test_verdict_is_local_when_not_distributed(self):
+        from nemo.collections.speechlm2.models.script_model import ScriptSTTModel
+
+        m = self._model()
+        assert ScriptSTTModel._any_rank_oom(m, True) is True
+        assert ScriptSTTModel._any_rank_oom(m, False) is False
+
+    @pytest.mark.unit
+    def test_a_peer_oom_makes_a_healthy_rank_drop_its_batch_too(self):
+        """The case that would hang: this rank's forward SUCCEEDED, but a peer's
+        did not, so it must discard its own loss and emit the dummy zero."""
+        import types
+
+        from nemo.collections.speechlm2.models.script_model import ScriptSTTModel
+
+        m = self._model()
+        real = {"loss": torch.tensor(3.0, requires_grad=True)}
+        m._training_step_inner = lambda batch, idx: real
+        m._any_rank_oom = lambda local: True  # a peer OOM'd; this rank did not
+        out = ScriptSTTModel.training_step(m, batch=types.SimpleNamespace(), batch_idx=0)
+        assert float(out["loss"]) == 0.0, "the healthy rank kept its real loss; ranks would disagree"
+
+    @pytest.mark.unit
+    def test_a_healthy_step_is_returned_unchanged(self):
+        import types
+
+        from nemo.collections.speechlm2.models.script_model import ScriptSTTModel
+
+        m = self._model()
+        real = {"loss": torch.tensor(3.0, requires_grad=True)}
+        m._training_step_inner = lambda batch, idx: real
+        m._any_rank_oom = lambda local: False
+        out = ScriptSTTModel.training_step(m, batch=types.SimpleNamespace(), batch_idx=0)
+        assert out is real

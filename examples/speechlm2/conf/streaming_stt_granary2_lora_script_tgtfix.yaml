@@ -60,6 +60,11 @@ model:
   # 100.000% of aligner words located on the eval manifests, versus 99.63% off.
   # Must match data.dataset.respell_targets (script_train.py asserts this).
   respell_targets: true
+  # A CUDA OOM in the forward pass drops that batch on EVERY rank (the
+  # verdict is all-reduced, so DDP stays in lockstep) instead of killing the
+  # job. Job 13380534 lost an 8-node block this way at 3h50m. Skips are
+  # counted as train_batches_skipped_oom; this many IN A ROW re-raises.
+  oom_skip_limit: 25
 
   # Decode-only validation. val_chunk_size pins one well-supported chunk size
   # instead of the largest candidate (whose look-ahead can be slow to stream).

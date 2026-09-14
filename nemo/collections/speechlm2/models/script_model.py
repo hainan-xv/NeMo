@@ -176,6 +176,12 @@ class ScriptSTTModelConfig(StreamingSTTModelConfig):
     # apart from one trained on the old targets. script_train.py's paired assert
     # keeps the two sides from drifting.
     respell_targets: bool = False
+    # Consecutive OOM batches tolerated before training_step re-raises. A few
+    # skips are a rare bad draw (chunk_size is sampled per batch while
+    # bucket_batch_size is keyed on duration only); a streak means the batch
+    # simply does not fit, and limping on would train on a quietly easier
+    # distribution -- the batches that OOM are the long-audio, small-chunk ones.
+    oom_skip_limit: int = 25
     val_position_scheme: str = "continuous"
     val_chunk_size: Optional[int] = None
     val_max_new_tokens_per_chunk: Optional[int] = None
@@ -611,6 +617,101 @@ class ScriptSTTModel(StreamingSTTModel):
     # ------------------------------------------------------------------
 
     def training_step(self, batch: ScriptBatch, batch_idx: int):
+        """OOM-tolerant wrapper around :meth:`_training_step_inner`.
+
+        WHY THIS EXISTS. SCRIPT draws ``chunk_size`` per batch from
+        ``[2, 4, 7, 10, 14, 28]`` while ``bucket_batch_size`` is keyed on DURATION
+        only, so a batch sized to fit at chunk 14 can be ~7x more branches at
+        chunk 2. Job 13380534 died in Qwen3's ``lm_head`` after 3h50m and 32k
+        steps when that draw finally coincided with a long-audio bucket -- a tail
+        event that costs a whole 8-node block each time it lands.
+
+        WHY A PLAIN try/except WOULD HANG. Under DDP every rank must reach the
+        same collectives in the same order. One rank returning early while the
+        other 63 run backward leaves the gradient all-reduce waiting forever --
+        no traceback, no checkpoint, the entire block burned. Strictly worse than
+        crashing. Lightning also rejects the obvious shortcut: returning ``None``
+        from ``training_step`` raises "Skipping the training_step by returning
+        None in distributed training is not supported".
+
+        So the verdict is ALL-REDUCED and every rank then takes the same branch,
+        returning a graph-connected zero built from the PARAMETERS -- which keeps
+        DDP seeing a gradient for each one instead of aborting on unused
+        parameters. Same shape as the CHAT non-finite guard in
+        ``nemo/collections/asr/models/chat_bpe_models.py``.
+
+        FORWARD ONLY. An OOM during backward is not recovered: DDP overlaps
+        all-reduce with gradient computation, so NCCL collectives are already in
+        flight and the process group may be inconsistent. Those still crash, by
+        design. The observed failure is in the forward pass.
+
+        Skips are COUNTED and logged, because a zero loss is indistinguishable
+        from a model that has learned the task perfectly -- and because the
+        batches that OOM are systematically the long-audio, small-chunk ones, so
+        a rising count means training on a quietly easier distribution. After
+        ``oom_skip_limit`` consecutive skips it re-raises rather than limping on.
+        """
+        oom = False
+        result = None
+        try:
+            result = self._training_step_inner(batch, batch_idx)
+        except torch.cuda.OutOfMemoryError as e:
+            oom = True
+            self._last_oom = repr(e)[:200]
+
+        # UNCONDITIONAL, on every rank and every step: a rank that succeeded has
+        # no other way to learn that a peer did not, and if it proceeds to
+        # backward alone the collective waits forever. The cost is one 4-byte
+        # all-reduce per step, which is a sync point DDP would reach at backward
+        # anyway.
+        if self._any_rank_oom(oom):
+            # EVERY rank drops the batch, including ranks whose forward
+            # succeeded -- their loss is discarded so the whole batch is dropped
+            # coherently rather than leaving one rank contributing zeros into an
+            # otherwise real gradient average.
+            del result
+            return self._skip_oom_batch(batch_idx)
+        return result
+
+    def _any_rank_oom(self, local: bool) -> bool:
+        """All-reduce the OOM verdict so every rank takes the same branch."""
+        if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+            return local
+        flag = torch.tensor([1 if local else 0], device=self.device, dtype=torch.int32)
+        torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MAX)
+        return bool(flag.item())
+
+    def _skip_oom_batch(self, batch_idx: int):
+        """Drop the batch on EVERY rank, keeping DDP in lockstep."""
+        # Release whatever the failed forward left behind before the next batch.
+        torch.cuda.empty_cache()
+
+        self._oom_skips = getattr(self, "_oom_skips", 0) + 1
+        self._oom_streak = getattr(self, "_oom_streak", 0) + 1
+        limit = int(getattr(self.core_cfg, "oom_skip_limit", 25) or 25)
+        if self._oom_streak >= limit:
+            raise RuntimeError(
+                f"{self._oom_streak} consecutive OOM batches (limit {limit}). This is no longer a rare "
+                f"draw -- the batch size does not fit this configuration. Scale bucket_batch_size for "
+                f"this recipe, or drop the smallest chunk size. Last error: {getattr(self, '_last_oom', '')}"
+            )
+        logging.error(
+            "CUDA OOM on batch %d (chunk_size=%s); skipping on all ranks. "
+            "total skipped=%d, consecutive=%d. Last: %s",
+            batch_idx,
+            getattr(self, "_last_chunk_size", "?"),
+            self._oom_skips,
+            self._oom_streak,
+            getattr(self, "_last_oom", ""),
+        )
+        self.log("train_batches_skipped_oom", float(self._oom_skips), prog_bar=True, on_step=True)
+
+        # Graph-connected zero that TOUCHES every trainable parameter, so DDP
+        # still receives a gradient for each and does not abort on unused ones.
+        zero = sum(p.sum() for p in self.parameters() if p.requires_grad)
+        return {"loss": zero * 0.0}
+
+    def _training_step_inner(self, batch: ScriptBatch, batch_idx: int):
         # Keep frozen modules in eval mode (disables dropout / BN updates).
         for m in (self.perception.preprocessor, self.perception.encoder, self.llm):
             if is_frozen(m):
@@ -619,6 +720,7 @@ class ScriptSTTModel(StreamingSTTModel):
         # Pin the encoder look-ahead to this batch's chunk size so a frame's
         # receptive field never crosses its chunk boundary.
         self._set_encoder_att_context(batch.chunk_size)
+        self._last_chunk_size = batch.chunk_size
 
         if self._twod_layout:
             return self._twod_training_step(batch, batch_idx)
@@ -678,6 +780,7 @@ class ScriptSTTModel(StreamingSTTModel):
                     "target_to_input_ratio": num_targets / (B * T),
                 }
             )
+        self._oom_streak = 0
         self.log_dict(metrics, on_step=True)
         return {"loss": loss}
 
