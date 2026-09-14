@@ -180,7 +180,16 @@ ATTN_BACKEND="${ATTN_BACKEND:-dense}"
 # 0 reproduces the forced loss EXACTLY and is the control for isolating what the
 # band itself costs, since it runs the identical 2-D banded machinery at C=1.
 BAND_WORDS="${BAND_WORDS:-1}"
-ACT_CKPT="${ACT_CKPT:-false}"
+# ON for this arm, unlike the forced arms. The band triples the packed sequence,
+# and job 13398712 died with a CUDA OOM of 1.71 GiB *inside loss.backward()* at
+# 77.99/79.33 GiB used. That OOM is NOT recoverable by the training_step guard:
+# the guard wraps the forward, and Lightning calls backward() afterwards, so a
+# backward OOM escapes it and takes the rank -- and with it the DDP job -- down.
+# Activation checkpointing roughly halves activation memory for ~30% more compute,
+# which is the difference between "rare skipped batch" and "dead job".
+# (The local Qwen3-1.7B benchmark that reported 8-11 GiB peak had this ON; the
+# grid default was off, which is why those figures did not transfer.)
+ACT_CKPT="${ACT_CKPT:-true}"
 AUDIO_HISTORY_CHUNKS="${AUDIO_HISTORY_CHUNKS:-0}"
 # SINGLE chunk size, unlike every other SCRIPT arm. Benchmarked on Qwen3-1.7B,
 # the band's cost tracks the SEGMENT count, which is the chunk count times the
