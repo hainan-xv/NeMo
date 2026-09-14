@@ -63,6 +63,7 @@ def train(cfg):
         "gate_in_history",
         "full_context",
         "respell_targets",
+        "band_words",
     ):
         model_val = int(cfg.model.get(key, 0) or 0)
         data_val = int(dataset_cfg.get(key, 0) or 0)
@@ -82,6 +83,20 @@ def train(cfg):
         )
     if ps_model not in ("branch", "continuous", "sampled"):
         raise ValueError(f"position_scheme must be 'branch', 'continuous' or 'sampled', got {ps_model!r}")
+
+    # loss_type and target_construction are strings too, and they are the pair the
+    # banded loss stands on: the dataset decides how the spine is tokenized and
+    # which candidate cuts exist, the model runs the dynamic program over them. If
+    # only one side is banded, the batch and the loss disagree about what a branch
+    # even is.
+    for key, default in (("loss_type", "forced"), ("target_construction", "legacy")):
+        m_val = str(cfg.model.get(key, default) or default).lower()
+        d_val = str(dataset_cfg.get(key, default) or default).lower()
+        if m_val != d_val:
+            raise ValueError(
+                f"model.{key} ({m_val}) != data.dataset.{key} ({d_val}); they must match. "
+                f"Set data.dataset.{key}: ${{model.{key}}} in the config."
+            )
 
     # Validation dataset config = training config with val_dataset_overrides on
     # top (e.g. pinning a single chunk_size for the decode-only WER pass).

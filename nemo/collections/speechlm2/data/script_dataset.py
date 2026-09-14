@@ -15,7 +15,7 @@
 
 import math
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -28,8 +28,10 @@ from nemo.collections.speechlm2.parts.alignments import WordAlignment
 from nemo.collections.speechlm2.parts.script import (
     ChunkSpec,
     build_packed_chunk_example,
+    build_twod_banded_example,
     build_twod_chunk_example,
     collate_packed_chunk_examples,
+    collate_twod_banded_examples,
     collate_twod_chunk_examples,
 )
 from nemo.collections.speechlm2.parts.script_messages import get_llm_messages_for_batch
@@ -40,6 +42,13 @@ from nemo.collections.speechlm2.parts.script_prompt import (
 )
 from nemo.collections.speechlm2.parts.utils import to_dataclass
 from nemo.utils import logging
+
+
+# How often (in utterances, per dataloader worker) to report the rate at which
+# target_construction='partition' fell back to per-chunk tokenization. A rate
+# that climbs means the run is quietly training the legacy objective, which no
+# other signal in the log would show.
+_PARTITION_LOG_EVERY = 2000
 
 
 @dataclass
@@ -118,6 +127,26 @@ class ScriptSTTDataConfig(StreamingSTTDataConfig):
             without this 0.37% of words are either supervised several chunks late
             or mislocated inside a later word. Default False so an existing run
             that requeues keeps the objective it was launched with.
+        target_construction: how each chunk's target ids are produced.
+            ``legacy`` tokenizes every chunk's text on its own. The chunk TEXTS
+            already tile the transcript, but their separate tokenizations need
+            not concatenate to the tokenization of the whole: a cut inside a
+            hyphen or apostrophe word makes ``forty-`` + ``eight`` differ from
+            ``forty-eight``, and SentencePiece additionally emits a bare U+2581
+            for the leading space (which ``_tokenize_target`` then has to strip).
+            ``partition`` tokenizes the joined text ONCE and splits the id
+            sequence at each chunk's character boundary, so the concatenated
+            per-chunk ids equal the whole-text ids BY CONSTRUCTION. Verified per
+            utterance, with a per-chunk fallback when a boundary does not split
+            cleanly.
+            This is also the precondition for a banded loss: a band moves the cut
+            between adjacent chunks, and only under ``partition`` is the spine id
+            sequence independent of where the cut falls -- under ``legacy``
+            moving a word re-tokenizes both neighbours, so two paths reaching the
+            same (chunk, cut) state do NOT share a spine prefix and the dynamic
+            program is invalid.
+            Default legacy so an existing run that requeues keeps the objective
+            it was launched with.
     """
 
     audio_history_chunks: int = 0
@@ -138,6 +167,9 @@ class ScriptSTTDataConfig(StreamingSTTDataConfig):
     punctuation_prob: float = 0.5
     control_seed: int = 5678
     respell_targets: bool = False
+    target_construction: str = "legacy"
+    loss_type: str = "forced"
+    band_words: int = 1
 
 
 @dataclass
@@ -180,6 +212,8 @@ class ScriptBatch:
     chunk_size: Optional[int] = None
     # 2-D layout only (twod_layout=True); the flat fields above are then unset.
     twod: Optional[object] = None
+    # Banded loss only (loss_type='banded'); `twod` is then unset.
+    banded: Optional[object] = None
 
 
 class ScriptSTTDataset(StreamingSTTDataset):
@@ -247,6 +281,25 @@ class ScriptSTTDataset(StreamingSTTDataset):
         # from a plain SCRIPT checkpoint).
         self._read_write = bool(self.cfg.read_write)
         self._gate_in_history = bool(self.cfg.gate_in_history)
+        target_construction = str(self.cfg.target_construction or "legacy").lower()
+        if target_construction not in ("legacy", "partition"):
+            raise ValueError(
+                f"target_construction must be 'legacy' or 'partition', got {self.cfg.target_construction!r}"
+            )
+        self._target_partition = target_construction == "partition"
+        self._loss_type = str(self.cfg.loss_type or "forced").lower()
+        if self._loss_type not in ("forced", "banded"):
+            raise ValueError(f"loss_type must be 'forced' or 'banded', got {self.cfg.loss_type!r}")
+        self._band_words = max(int(self.cfg.band_words), 0)
+        self._banded = self._loss_type == "banded"
+        if self._banded and not (self._twod_layout and self._target_partition):
+            raise ValueError(
+                "loss_type='banded' requires twod_layout=true and target_construction='partition'; "
+                f"got twod_layout={self._twod_layout}, target_construction={target_construction!r}"
+            )
+        self._word_start_ids = None
+        self._partition_utts = 0
+        self._partition_fallbacks = 0
         if self._gate_in_history and not self._read_write:
             raise ValueError(
                 "gate_in_history=True requires read_write=True: without the gate there is no "
@@ -381,6 +434,98 @@ class ScriptSTTDataset(StreamingSTTDataset):
             text = text[1:]
         return self.tokenizer.text_to_ids(text)
 
+    def _word_start_id_set(self) -> frozenset:
+        """Token ids whose surface form begins a word, scanned once from the vocab.
+
+        Both the byte-level BPE marker (``\u0120``) and the SentencePiece one
+        (``\u2581``) are recognised, so this works across tokenizer families. A
+        one-time vocabulary scan makes the per-token test O(1); asking the
+        tokenizer to convert ids for every token of every utterance instead would
+        dominate the collate.
+        """
+        if self._word_start_ids is None:
+            hf_tok = self.tokenizer.tokenizer
+            vocab = hf_tok.get_vocab()
+            self._word_start_ids = frozenset(
+                tid for piece, tid in vocab.items() if isinstance(piece, str) and piece[:1] in ("\u0120", "\u2581")
+            )
+        return self._word_start_ids
+
+    def _word_start_positions(self, ids: List[int]) -> List[int]:
+        """Positions in ``ids`` that begin a word. Position 0 always does."""
+        ws = self._word_start_id_set()
+        out = [0] if ids else []
+        out.extend(i for i, t in enumerate(ids) if i > 0 and int(t) in ws)
+        return out
+
+    def _partition_target_ids(self, texts: List[str]) -> Optional[List[List[int]]]:
+        """Split ONE tokenization of the joined chunk texts at the chunk bounds.
+
+        Returns one id list per chunk, or ``None`` when the split is not exact --
+        in which case the caller falls back to per-chunk tokenization for this
+        utterance only.
+
+        Two conditions are checked, and BOTH have bitten this project before:
+
+        1. No boundary may fall mid-word. The chunk texts tile the transcript, so
+           a boundary normally lands on the space that starts the next chunk. It
+           does not when a whitespace-only chunk was blanked out upstream -- its
+           characters leave the joined text, and the two neighbours fuse into
+           ``wordAwordB``, which tokenizes as one word and trains the model to
+           run them together. This is the byte-BPE form of the bug that produced
+           'the bestselling singleby a Germanartist' on the CHAT side.
+        2. Each prefix's ids must be a prefix of the whole's ids. This is
+           VERIFIED rather than trusted: an earlier CHAT implementation took the
+           split from SentencePiece's per-token character offsets, which worked
+           locally and returned nothing in the training container, so every
+           utterance silently took the fallback and the arm quietly trained the
+           control objective. Only ``text_to_ids`` is used here, which every NeMo
+           tokenizer has.
+
+        Condition 1 additionally gives the banded loss a property CHAT's band
+        lacks: CHAT's ``band_nodes`` sees only token counts, so its band permits
+        cuts inside a word. Here a cut is always at a word boundary.
+        """
+        full = "".join(texts)
+        if not full:
+            return [[] for _ in texts]
+
+        bounds: List[int] = []
+        run = 0
+        for t in texts:
+            run += len(t)
+            bounds.append(run)
+
+        for b in bounds[:-1]:
+            if b <= 0 or b >= len(full):
+                continue
+            if not (full[b - 1].isspace() or full[b].isspace()):
+                return None  # a cut inside a word
+
+        full_ids = self.tokenizer.text_to_ids(full)
+        counts: List[int] = []
+        for b in bounds:
+            if b <= 0:
+                counts.append(0)
+                continue
+            if b >= len(full):
+                counts.append(len(full_ids))
+                continue
+            prefix = self.tokenizer.text_to_ids(full[:b])
+            n = len(prefix)
+            if n > len(full_ids) or list(full_ids[:n]) != list(prefix):
+                return None
+            counts.append(n)
+        if counts != sorted(counts):
+            return None
+
+        out: List[List[int]] = []
+        prev = 0
+        for n in counts:
+            out.append([int(i) for i in full_ids[prev:n]])
+            prev = n
+        return out
+
     def _messages_to_chunks(self, messages: List[dict]) -> List[ChunkSpec]:
         """Parse alternating user(audio)/assistant(words) turns into ChunkSpecs.
 
@@ -389,8 +534,8 @@ class ScriptSTTDataset(StreamingSTTDataset):
         frame; the assistant turn that follows holds the words that chunk
         reveals, or the blank sentinel for a silent chunk.
         """
-        chunks: List[ChunkSpec] = []
         audio_tag = self.cfg.audio_tag
+        parsed: List[Tuple[int, str]] = []
         i, n = 1, len(messages)  # skip the system turn
         while i < n:
             m = messages[i]
@@ -407,7 +552,27 @@ class ScriptSTTDataset(StreamingSTTDataset):
             # The blank sentinel (including "" in no-blank mode) means a silent chunk.
             if words == self.cfg.blank_token:
                 words = ""
-            target_ids = self._tokenize_target(words) if words.strip() else []
+            parsed.append((audio_len, words))
+
+        texts = [w for _, w in parsed]
+        per_chunk_ids: Optional[List[List[int]]] = None
+        if self._target_partition:
+            per_chunk_ids = self._partition_target_ids(texts)
+            self._partition_utts += 1
+            if per_chunk_ids is None:
+                self._partition_fallbacks += 1
+            if self._partition_utts % _PARTITION_LOG_EVERY == 0:
+                logging.info(
+                    "SCRIPT target partition: %d/%d utterances fell back to per-chunk " "tokenization (%.2f%%)",
+                    self._partition_fallbacks,
+                    self._partition_utts,
+                    100.0 * self._partition_fallbacks / max(self._partition_utts, 1),
+                )
+        if per_chunk_ids is None:
+            per_chunk_ids = [self._tokenize_target(w) if w.strip() else [] for w in texts]
+
+        chunks: List[ChunkSpec] = []
+        for (audio_len, _words), target_ids in zip(parsed, per_chunk_ids):
             # The gate goes on the BRANCH only; target_ids (which also feeds the
             # spine) stays the plain word sequence.
             gate = None
@@ -500,6 +665,23 @@ class ScriptSTTDataset(StreamingSTTDataset):
                 ]
             else:
                 chunks = self._messages_to_chunks(messages)
+            if self._banded:
+                transcript_ids = [t for ch in chunks for t in ch.target_ids]
+                examples.append(
+                    build_twod_banded_example(
+                        instruction_ids=instruction_ids,
+                        chunks=chunks,
+                        word_starts=self._word_start_positions(transcript_ids),
+                        band_words=self._band_words,
+                        vision_start_id=self.vision_start_id,
+                        vision_end_id=self.vision_end_id,
+                        eot_id=self.eot_id,
+                        audio_history_chunks=self._audio_history_chunks,
+                        audio_window_frames=self._audio_window_frames,
+                        position_scheme=position_scheme,
+                    )
+                )
+                continue
             examples.append(
                 builder(
                     instruction_ids=instruction_ids,
@@ -512,6 +694,16 @@ class ScriptSTTDataset(StreamingSTTDataset):
                     gate_in_history=self._gate_in_history,
                     position_scheme=position_scheme,
                 )
+            )
+
+        if self._banded:
+            return ScriptBatch(
+                audios=audios,
+                audio_lens=audio_lens,
+                banded=collate_twod_banded_examples(examples, pad_id=self.tokenizer.pad_id),
+                text=text,
+                cuts=cuts,
+                chunk_size=chunk_size,
             )
 
         if self._twod_layout:

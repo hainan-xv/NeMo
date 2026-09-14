@@ -37,6 +37,7 @@ from nemo.collections.speechlm2.parts.script import (
     build_twod_branch_mask,
 )
 from nemo.collections.speechlm2.parts.script_attention import script_attention_plan
+from nemo.collections.speechlm2.parts.script_banded import NEG_INF, banded_forward, span_scores
 from nemo.collections.speechlm2.parts.script_fsm import fsm_stream_decode_script, streaming_encode_frames
 from nemo.collections.speechlm2.parts.script_prompt import (
     ScriptControls,
@@ -176,6 +177,14 @@ class ScriptSTTModelConfig(StreamingSTTModelConfig):
     # apart from one trained on the old targets. script_train.py's paired assert
     # keeps the two sides from drifting.
     respell_targets: bool = False
+    target_construction: str = "legacy"
+    # BANDED LOSS. "forced" (default) trains cross-entropy over the single
+    # word-to-chunk assignment the aligner chose. "banded" marginalises over every
+    # assignment whose chunk boundaries sit within band_words words of it, the way
+    # CHAT's banded RNN-T does -- so a word the aligner placed a chunk early is no
+    # longer scored as an error the model must reproduce.
+    loss_type: str = "forced"
+    band_words: int = 1
     # Consecutive OOM batches tolerated before training_step re-raises. A few
     # skips are a rare bad draw (chunk_size is sampled per batch while
     # bucket_batch_size is keyed on duration only); a streak means the batch
@@ -245,6 +254,38 @@ class ScriptSTTModel(StreamingSTTModel):
         self._audio_history_chunks = max(int(self.core_cfg.audio_history_chunks), 0)
         self._audio_window_frames = max(int(self.core_cfg.audio_window_frames), 0)
         self._twod_layout = bool(self.core_cfg.twod_layout)
+        self._loss_type = str(self.core_cfg.loss_type or "forced").lower()
+        if self._loss_type not in ("forced", "banded"):
+            raise ValueError(f"loss_type must be 'forced' or 'banded', got {self.core_cfg.loss_type!r}")
+        self._band_words = max(int(self.core_cfg.band_words), 0)
+        if self._loss_type == "banded":
+            # Each of these makes the (chunk, cut) dynamic program invalid rather
+            # than merely different, so they are refused instead of worked around.
+            if not self._twod_layout:
+                raise ValueError(
+                    "loss_type='banded' requires twod_layout=true. The band adds one branch per "
+                    "candidate cut; in the flat layout branches are a single inseparable sequence, "
+                    "so they cannot be added without rebuilding the packed mask."
+                )
+            if str(self.core_cfg.target_construction or "legacy").lower() != "partition":
+                raise ValueError(
+                    "loss_type='banded' requires target_construction='partition'. Under the legacy "
+                    "per-chunk tokenization the spine ids change with where the cut falls, so two "
+                    "paths reaching the same (chunk, cut) do not share a history prefix and the "
+                    "dynamic program is not valid."
+                )
+            if bool(self.core_cfg.gate_in_history):
+                raise ValueError(
+                    "loss_type='banded' is incompatible with gate_in_history=true: the gate written "
+                    "into the spine is 'write if the chunk emitted anything else read', so it flips "
+                    "exactly when the band empties a chunk -- which would make it part of the DP state."
+                )
+            if bool(self.core_cfg.read_write):
+                raise ValueError(
+                    "loss_type='banded' is incompatible with read_write=true: the branch gate's "
+                    "identity depends on whether the chunk is empty, which varies across the span "
+                    "lengths a single branch scores."
+                )
 
         self._bidirectional_audio = bool(self.core_cfg.bidirectional_audio)
         self._attn_backend = str(self.core_cfg.attn_backend or "dense").lower()
@@ -566,6 +607,140 @@ class ScriptSTTModel(StreamingSTTModel):
                 ignore_index=IGNORE_INDEX,
             )
 
+    def _branch_span_logprobs(self, two, audio_embs, cache, dtype, i: int, lo: int, hi: int) -> Tensor:
+        """Per-token and stop log-probs for branches ``[lo, hi)`` of utterance ``i``.
+
+        Returns ``(hi - lo, K + 1)``: the score of emitting exactly ``k`` tokens
+        from this branch's cut and then stopping, for every ``k``.
+
+        ONE forward per candidate cut yields every span length, because the score
+        of emitting ``spine[u:u+k]`` shares its first ``k-1`` factors with
+        ``spine[u:u+k-1]``. That is what keeps a band of width ``C`` at ``C``
+        branch forwards rather than ``C`` times the number of span lengths.
+
+        The log-softmax is taken as ``logit - logsumexp`` at the two indices that
+        matter instead of materialising a second ``(n, b, 151936)`` tensor; that
+        tensor is already the largest term in the step.
+        """
+        n = hi - lo
+        spine_len = int(two.spine_lens[i])
+        valid = two.branch_valid[i, lo:hi]
+        embeds = self._twod_branch_embeds(two.branch_ids[i, lo:hi], two.branch_frame_index[i, lo:hi], audio_embs[i])
+        out = self._llm_forward(
+            inputs_embeds=embeds,
+            attention_mask=build_twod_branch_mask(
+                two.branch_prefix[i, lo:hi],
+                valid,
+                spine_len,
+                dtype,
+                branch_is_audio=((two.branch_ids[i, lo:hi] == AUDIO_TOKEN_IDX) if self._bidirectional_audio else None),
+            ),
+            position_ids=two.branch_positions[i, lo:hi],
+            past_key_values=broadcast_spine_cache(cache, i, n, spine_len),
+            use_cache=False,
+            return_dict=True,
+        )
+        logits = out["logits"].float()  # (n, b, V)
+        lse = torch.logsumexp(logits, dim=-1)  # (n, b)
+
+        # <ve> predicts the first emitted token, so the K + 1 positions starting
+        # there carry every score this branch provides. Its index is read PER ROW:
+        # with audio_window_frames the early chunks get a narrower window, so
+        # deriving it from the padded row width would read the scores off by that
+        # difference -- silently, and only for the chunks near the start.
+        k1 = two.span_len + 1
+        b_w = logits.shape[1]
+        ve = two.branch_ve[i, lo:hi]  # (n,)
+        idx = ve.unsqueeze(1) + torch.arange(k1, device=logits.device).unsqueeze(0)  # (n, k1)
+        idx = idx.clamp(max=b_w - 1)
+
+        lse_sel = lse.gather(1, idx)  # (n, k1)
+        stop_lp = logits[..., self._eot_id].gather(1, idx) - lse_sel
+
+        flat = logits.reshape(-1, logits.shape[-1])
+        row = (torch.arange(n, device=logits.device).unsqueeze(1) * b_w + idx).reshape(-1)
+        sel = flat[row].view(n, k1, -1)  # (n, k1, V)
+
+        tgt = two.branch_targets[i, lo:hi].gather(1, idx)  # (n, k1)
+        tok_lp = sel.gather(-1, tgt.clamp(min=0).unsqueeze(-1)).squeeze(-1) - lse_sel
+        tok_lp = torch.where(tgt == IGNORE_INDEX, torch.zeros_like(tok_lp), tok_lp)
+
+        return span_scores(
+            tok_lp[:, :-1].unsqueeze(0).unsqueeze(0),
+            stop_lp.unsqueeze(0).unsqueeze(0),
+        )[0, 0]
+
+    def _banded_training_step(self, batch: ScriptBatch, batch_idx: int):
+        """Marginalise the loss over every in-band word-to-chunk assignment.
+
+        The arrangement mirrors :meth:`_twod_training_step` exactly -- one spine
+        forward, branches in micro-batches under ``torch.utils.checkpoint``, and a
+        single batch-wide denominator so splitting the branch axis is numerically
+        invisible. Only the reduction differs: instead of summing per-token
+        cross-entropies, each branch contributes span scores to a dynamic program
+        whose result is the utterance NLL.
+        """
+        two = batch.banded
+        audio_embs, _ = self.perception(input_signal=batch.audios, input_signal_length=batch.audio_lens)
+        dtype = audio_embs.dtype
+        cache = self._twod_spine_cache(two, dtype)
+
+        b_size = int(two.spine_ids.shape[0])
+        t_max, c = int(two.cut.shape[1]), int(two.n_cand)
+        mb = max(int(self.core_cfg.twod_branch_micro_batch), 0)
+        use_ckpt = mb > 0 and torch.is_grad_enabled()
+
+        rows = []
+        for i in range(b_size):
+            n = int(two.branch_counts[i])
+            step = mb if mb > 0 else n
+            parts = []
+            for lo in range(0, n, step):
+                hi = min(lo + step, n)
+                if use_ckpt:
+                    parts.append(
+                        torch.utils.checkpoint.checkpoint(
+                            self._branch_span_logprobs, two, audio_embs, cache, dtype, i, lo, hi, use_reentrant=False
+                        )
+                    )
+                else:
+                    parts.append(self._branch_span_logprobs(two, audio_embs, cache, dtype, i, lo, hi))
+            rows.append(torch.cat(parts, dim=0))
+
+        span_logprob = torch.stack(rows, dim=0).view(b_size, t_max, c, -1)
+        span_logprob = torch.where(two.span_valid, span_logprob, span_logprob.new_full((), NEG_INF))
+
+        nll = banded_forward(span_logprob, two.cut, two.cut_valid, two.n_chunks, two.n_tokens)
+
+        # An utterance no in-band path can complete would otherwise contribute
+        # -NEG_INF and swamp the batch. Drop it, loudly, rather than let one
+        # malformed example decide the gradient.
+        finite = nll < (-NEG_INF / 2)
+        n_targets = int(two.n_tokens[finite].sum()) if bool(finite.any()) else 0
+        if n_targets == 0:
+            logging.warning("Batch %d has no reachable in-band path — skipping (zero loss).", batch_idx)
+            zero = sum(p.sum() for p in self.parameters() if p.requires_grad)
+            return {"loss": zero * 0.0}
+        if not bool(finite.all()):
+            logging.warning(
+                "Batch %d: %d/%d utterances had no reachable in-band path and were dropped.",
+                batch_idx,
+                int((~finite).sum()),
+                b_size,
+            )
+
+        loss = nll[finite].sum() / n_targets
+        self.log_dict(
+            {
+                "loss": loss,
+                "learning_rate": torch.as_tensor(
+                    self.trainer.optimizers[0].param_groups[0]["lr"] if self._trainer is not None else 0.0
+                ),
+            },
+            on_step=True,
+        )
+        return {"loss": loss}
+
     def _twod_training_step(self, batch: ScriptBatch, batch_idx: int):
         two = batch.twod
         audio_embs, _ = self.perception(input_signal=batch.audios, input_signal_length=batch.audio_lens)
@@ -722,6 +897,8 @@ class ScriptSTTModel(StreamingSTTModel):
         self._set_encoder_att_context(batch.chunk_size)
         self._last_chunk_size = batch.chunk_size
 
+        if self._loss_type == "banded":
+            return self._banded_training_step(batch, batch_idx)
         if self._twod_layout:
             return self._twod_training_step(batch, batch_idx)
 

@@ -3725,3 +3725,247 @@ class TestOomSkip:
         m._any_rank_oom = lambda local: False
         out = ScriptSTTModel.training_step(m, batch=types.SimpleNamespace(), batch_idx=0)
         assert out is real
+
+
+class _WordTok:
+    """Toy tokenizer modelling byte-level BPE's word-boundary behaviour.
+
+    One id per ``\\s*\\S+`` run, so the leading space is folded INTO the token and
+    ``" station"`` and ``"station"`` are different single tokens. That is the
+    property that makes concatenating separately-tokenized chunks equal to
+    tokenizing the whole exactly when the cuts land on whitespace, and unequal
+    when they land inside a word -- which is what the partition split has to
+    police.
+    """
+
+    def __init__(self):
+        self._v = {}
+
+    def _id(self, piece: str) -> int:
+        return self._v.setdefault(piece, len(self._v) + 1)
+
+    def text_to_ids(self, text: str):
+        return [self._id(m) for m in re.findall(r"\s*\S+", text)]
+
+
+class _PrefixHostileTok(_WordTok):
+    """A tokenizer whose prefixes are NOT prefixes of the whole.
+
+    Pathological on purpose: it merges the final two words of whatever it is
+    handed, so tokenizing a prefix produces a different merge than tokenizing the
+    full text even at a clean whitespace cut. This is the case the prefix-is-prefix
+    verification exists for; without that check the split would silently hand each
+    chunk ids that decode to the wrong text.
+    """
+
+    def text_to_ids(self, text: str):
+        pieces = re.findall(r"\s*\S+", text)
+        if len(pieces) >= 2:
+            pieces = pieces[:-2] + ["".join(pieces[-2:])]
+        return [self._id(p) for p in pieces]
+
+
+def _partition(tok, texts):
+    """Call the real method with a stub carrying only what it uses."""
+    import types
+
+    from nemo.collections.speechlm2.data.script_dataset import ScriptSTTDataset
+
+    stub = types.SimpleNamespace(tokenizer=tok)
+    return ScriptSTTDataset._partition_target_ids(stub, texts)
+
+
+@pytest.mark.unit
+def test_partition_ids_concatenate_to_the_whole_text():
+    """The defining property: the split IS one tokenization of the joined text.
+
+    This is what makes the spine independent of where the chunk cut falls, which
+    is the precondition for a banded loss -- two paths reaching the same
+    (chunk, cut) state must share a spine prefix or the DP is invalid.
+    """
+    tok = _WordTok()
+    texts = ["The", " station is owned by Alpha", " Media."]
+    out = _partition(tok, texts)
+
+    assert out is not None
+    assert [i for c in out for i in c] == tok.text_to_ids("".join(texts))
+    # and each chunk got exactly its own words
+    assert out == [tok.text_to_ids("The"), tok.text_to_ids(" station is owned by Alpha"), tok.text_to_ids(" Media.")]
+
+
+@pytest.mark.unit
+def test_partition_rejects_a_cut_inside_a_word():
+    """A boundary with no whitespace on either side fuses two words.
+
+    This happens for real when a whitespace-only chunk is blanked upstream: its
+    characters leave the joined text and the neighbours run together. Tokenized
+    that way 'Alpha' + 'Media' becomes one word and the model is trained to emit
+    it fused -- the byte-BPE form of 'the bestselling singleby a Germanartist'.
+    Returning None makes the caller fall back instead of corrupting the target.
+    """
+    assert _partition(_WordTok(), ["Alpha", "Media."]) is None
+    # the same words WITH the space are fine
+    assert _partition(_WordTok(), ["Alpha", " Media."]) is not None
+
+
+@pytest.mark.unit
+def test_partition_rejects_a_split_the_tokenizer_does_not_honour():
+    """Prefix-is-prefix is verified, not assumed."""
+    assert _partition(_PrefixHostileTok(), ["one two", " three four"]) is None
+
+
+@pytest.mark.unit
+def test_partition_gives_silent_chunks_no_tokens_and_shifts_nothing():
+    """Silent chunks are '' and must consume zero ids without moving the others."""
+    tok = _WordTok()
+    texts = ["Hello", "", " world", "", " again."]
+    out = _partition(tok, texts)
+
+    assert out is not None
+    assert out[1] == [] and out[3] == []
+    assert [i for c in out for i in c] == tok.text_to_ids("Hello world again.")
+    assert len(out) == len(texts)
+
+
+@pytest.mark.unit
+def test_partition_handles_an_all_silent_utterance():
+    tok = _WordTok()
+    assert _partition(tok, ["", "", ""]) == [[], [], []]
+
+
+@pytest.mark.unit
+def test_target_construction_defaults_to_legacy():
+    """Default off, so a requeue under an existing EXP_NAME keeps its objective."""
+    from nemo.collections.speechlm2.data.script_dataset import ScriptSTTDataConfig
+
+    cfg = ScriptSTTDataConfig(sample_rate=16000, frame_length_in_secs=0.08, chunk_size=14)
+    assert cfg.target_construction == "legacy"
+
+
+@pytest.mark.unit
+def test_partition_removes_the_spurious_sentencepiece_separator(tmp_path):
+    """Under SentencePiece, partition subsumes the leading-space hack.
+
+    ``_tokenize_target`` strips one leading space because SentencePiece turns it
+    into a bare U+2581. The partition path never tokenizes a chunk on its own, so
+    that token cannot arise -- and unlike the hack, the result is equal to the
+    whole-text tokenization by construction rather than by repair.
+    """
+    from nemo.collections.speechlm2.parts.asr_vocab import AsrVocabTokenizer
+
+    tok = AsrVocabTokenizer(_asr_spm_path(tmp_path), special_tokens=["<|im_end|>"], eos_token="<|im_end|>")
+    mark = chr(0x2581)
+    texts = ["The", " station is owned by Alpha", " Media."]
+
+    out = _partition(tok, texts)
+    assert out is not None
+    flat = [i for c in out for i in c]
+    assert flat == tok.text_to_ids("".join(texts))
+    assert tok.ids_to_text(flat) == "The station is owned by Alpha Media."
+
+    # The naive per-chunk tokenization is what partition replaces.
+    naive = [i for c in texts for i in tok.text_to_ids(c)]
+    assert len(flat) < len(naive)
+    for chunk_ids in out:
+        if chunk_ids:
+            assert tok.convert_ids_to_tokens(chunk_ids[0]) != mark
+
+
+@pytest.mark.unit
+def test_banded_band_zero_equals_the_forced_loss_end_to_end():
+    """THE GATE for the banded loss: at band=0 it must BE the forced loss.
+
+    Not "both are finite" -- the same number, from the same weights, through the
+    whole path: banded layout -> branch forwards against the shared spine cache ->
+    span scores -> dynamic program. CHAT's identically-named test asserts only
+    finiteness, so the equivalence it is named for is pinned nowhere; this asserts
+    the equality itself, which is what makes a band-0 run a valid control.
+
+    With one candidate cut per chunk the lattice admits exactly one partition, so
+    the marginal collapses to that path's joint log-probability -- and that is the
+    sum of the per-chunk cross-entropies (words plus the end-of-chunk token) the
+    forced objective already computes.
+    """
+    import torch.nn.functional as F
+
+    from nemo.collections.speechlm2.parts.script import build_twod_banded_example
+    from nemo.collections.speechlm2.parts.script_banded import banded_forward, span_scores
+
+    model = _tiny_qwen3()
+    H = model.config.hidden_size
+    instruction = [5, 6, 7]
+    chunks = [
+        ChunkSpec(audio_len=2, target_ids=[20, 21]),
+        ChunkSpec(audio_len=3, target_ids=[30]),
+        ChunkSpec(audio_len=2, target_ids=[]),  # silent chunk
+        ChunkSpec(audio_len=2, target_ids=[40, 41, 42]),
+    ]
+    torch.manual_seed(3)
+    frames = torch.randn(sum(c.audio_len for c in chunks), H)
+
+    def _branch_logits(ex):
+        P, N = ex.spine_len, ex.branch_ids.shape[0]
+        spine_emb = model.get_input_embeddings()(ex.spine_ids[None])
+        cache = model(inputs_embeds=spine_emb, position_ids=ex.spine_positions[None], use_cache=True).past_key_values
+        for layer in cache.layers:
+            layer.keys = layer.keys.expand(N, -1, -1, -1)
+            layer.values = layer.values.expand(N, -1, -1, -1)
+        aud = ex.branch_frame_index >= 0
+        emb = _embed_with_audio(model, ex.branch_ids, aud, frames[ex.branch_frame_index[aud]])
+        return model(
+            inputs_embeds=emb,
+            attention_mask=build_twod_branch_mask(ex.branch_prefix, ex.branch_valid, P, emb.dtype),
+            position_ids=ex.branch_positions,
+            past_key_values=cache,
+            use_cache=False,
+        ).logits.float()
+
+    # --- reference: the forced layout's summed cross-entropy ---
+    forced = build_twod_chunk_example(instruction, chunks, VS, VE, EOT)
+    f_logits = _branch_logits(forced)
+    ref = F.cross_entropy(
+        f_logits.flatten(0, 1),
+        forced.branch_targets.flatten(0, 1),
+        reduction="sum",
+        ignore_index=IGNORE_INDEX,
+    )
+
+    # --- candidate: the banded layout at band=0 ---
+    banded = build_twod_banded_example(
+        instruction_ids=instruction,
+        chunks=chunks,
+        word_starts=[0, 1, 2, 3, 4, 5],
+        band_words=0,
+        vision_start_id=VS,
+        vision_end_id=VE,
+        eot_id=EOT,
+    )
+    b_logits = _branch_logits(banded)
+    lse = torch.logsumexp(b_logits, dim=-1)
+
+    k1 = banded.span_valid.shape[-1]
+    n, b_w = b_logits.shape[0], b_logits.shape[1]
+    idx = (banded.branch_ve.unsqueeze(1) + torch.arange(k1).unsqueeze(0)).clamp(max=b_w - 1)
+
+    lse_sel = lse.gather(1, idx)
+    stop_lp = b_logits[..., EOT].gather(1, idx) - lse_sel
+    sel = b_logits.reshape(-1, b_logits.shape[-1])[(torch.arange(n).unsqueeze(1) * b_w + idx).reshape(-1)].view(
+        n, k1, -1
+    )
+    tgt = banded.branch_targets.gather(1, idx)
+    tok_lp = sel.gather(-1, tgt.clamp(min=0).unsqueeze(-1)).squeeze(-1) - lse_sel
+    tok_lp = torch.where(tgt == IGNORE_INDEX, torch.zeros_like(tok_lp), tok_lp)
+
+    T, C = banded.cut.shape
+    span = span_scores(tok_lp[:, :-1].view(1, T, C, -1), stop_lp.view(1, T, C, -1))
+    span = torch.where(banded.span_valid[None], span, torch.full_like(span, -1e30))
+
+    got = banded_forward(
+        span,
+        banded.cut[None],
+        banded.cut_valid[None],
+        torch.tensor([banded.n_chunks]),
+        torch.tensor([banded.n_tokens]),
+    )
+
+    torch.testing.assert_close(got[0], ref, atol=1e-3, rtol=1e-3)
