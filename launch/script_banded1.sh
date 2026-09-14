@@ -161,7 +161,15 @@ PROJECT_NAME=SpeechlmScriptCC
 
 # --- Training parameters ---
 MAX_STEPS="${MAX_STEPS:-300000}"
-VAL_CHECK_INTERVAL="${VAL_CHECK_INTERVAL:-4000}"
+# 2000, not the 4000 the forced arms use. Benchmarked locally on Qwen3-1.7B, the
+# band costs ~3.4x the forced step averaged over the chunk_size draw (1.5x at
+# chunk_size 14, 5.4x at chunk_size 2). The forced arm runs ~1.48 s/step on 8
+# nodes, so banded lands near 5 s/step: 4000 steps would be ~5.6 h against a
+# 3h55m max_time_per_run, and the run would be killed before it ever wrote a
+# checkpoint -- restarting from scratch on every requeue, forever. 2000 steps is
+# ~2.8 h and fits. Checkpoints stay step-indexed, so they remain directly
+# comparable to the forced arm's, just twice as dense.
+VAL_CHECK_INTERVAL="${VAL_CHECK_INTERVAL:-2000}"
 LR="${LR:-0.0001}"
 WARMUP_STEPS="${WARMUP_STEPS:-10000}"
 
