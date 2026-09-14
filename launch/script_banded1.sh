@@ -169,11 +169,6 @@ WARMUP_STEPS="${WARMUP_STEPS:-10000}"
 DELAY="${DELAY:-3}"
 # dense | flex | script -- all mathematically identical; flex is fastest.
 ATTN_BACKEND="${ATTN_BACKEND:-dense}"
-# Branches processed per forward. The band multiplies the branch count, and each
-# forward re-materialises the broadcast spine cache (transformers' DynamicLayer
-# cat), so this trades per-call overhead against activation memory. 32 matches
-# streaming_stt_granary2_lora_script_twod.yaml.
-TWOD_MICRO_BATCH="${TWOD_MICRO_BATCH:-32}"
 # 0 reproduces the forced loss EXACTLY and is the control for isolating what the
 # band itself costs, since it runs the identical 2-D banded machinery at C=1.
 BAND_WORDS="${BAND_WORDS:-1}"
@@ -319,7 +314,6 @@ echo "*******STARTING********" \
     model.audio_history_chunks=${AUDIO_HISTORY_CHUNKS} \
     data.dataset.num_delay_frames=${DELAY} \
     ++model.attn_backend=${ATTN_BACKEND} \
-    ++model.twod_branch_micro_batch=${TWOD_MICRO_BATCH} \
     ++model.band_words=${BAND_WORDS} \
     ++model.activation_checkpointing=${ACT_CKPT} \
     data.dataset.system_prompt="'${SYSTEM_PROMPT}'" \

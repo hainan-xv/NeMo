@@ -91,14 +91,18 @@ model:
   loss_type: banded
   band_words: 1
 
-  # The band adds one branch per candidate cut, so the (branches, width, 151936)
-  # logits grow with the band. The 2-D layout is what makes that affordable --
-  # branches are a batch axis, so twod_branch_micro_batch bounds activation memory
-  # by the micro-batch instead of the utterance length, recomputing in backward.
-  # REQUIRED by loss_type=banded: in the flat layout branches are one inseparable
-  # sequence and cannot be added without rebuilding the packed mask.
-  twod_layout: true
-  twod_branch_micro_batch: 32
+  # LAYOUT. The band emits one branch SEGMENT per candidate cut in the FLAT
+  # packed layout. That needs no mask change: build_script_mask already gives each
+  # segment its own history through `kp < prefix_len[q]`, and the candidates of a
+  # chunk differ ONLY in prefix_len.
+  #
+  # twod_layout MUST be false, and the model refuses it otherwise. Measured on one
+  # node, the 2-D path costs 5.11 s/step against flat's 0.55 s/step for the SAME
+  # objective (band_words=0 is exactly the forced loss) -- because the 2-D premise
+  # that the spine K/V is broadcast and never copied is defeated by transformers'
+  # DynamicLayer.update, which concatenates the stride-0 expansion once per branch
+  # and so pays O(branches x spine) memory traffic.
+  twod_layout: false
   # A CUDA OOM in the forward pass drops that batch on EVERY rank (the
   # verdict is all-reduced, so DDP stays in lockstep) instead of killing the
   # job. Job 13380534 lost an 8-node block this way at 3h50m. Skips are

@@ -3876,19 +3876,19 @@ def test_banded_band_zero_equals_the_forced_loss_end_to_end():
     """THE GATE for the banded loss: at band=0 it must BE the forced loss.
 
     Not "both are finite" -- the same number, from the same weights, through the
-    whole path: banded layout -> branch forwards against the shared spine cache ->
-    span scores -> dynamic program. CHAT's identically-named test asserts only
-    finiteness, so the equivalence it is named for is pinned nowhere; this asserts
-    the equality itself, which is what makes a band-0 run a valid control.
+    whole path: flat banded layout -> one fused masked forward -> span scores ->
+    dynamic program. CHAT's identically-named test asserts only finiteness, so the
+    equivalence it is named for is pinned nowhere; this asserts the equality
+    itself, which is what makes a band-0 run a valid control.
 
     With one candidate cut per chunk the lattice admits exactly one partition, so
-    the marginal collapses to that path's joint log-probability -- and that is the
-    sum of the per-chunk cross-entropies (words plus the end-of-chunk token) the
-    forced objective already computes.
+    the marginal collapses to that path's joint log-probability -- the sum of the
+    per-chunk cross-entropies (words plus end-of-chunk) the forced objective
+    already computes.
     """
     import torch.nn.functional as F
 
-    from nemo.collections.speechlm2.parts.script import build_twod_banded_example
+    from nemo.collections.speechlm2.parts.script import build_packed_banded_example
     from nemo.collections.speechlm2.parts.script_banded import banded_forward, span_scores
 
     model = _tiny_qwen3()
@@ -3903,35 +3903,29 @@ def test_banded_band_zero_equals_the_forced_loss_end_to_end():
     torch.manual_seed(3)
     frames = torch.randn(sum(c.audio_len for c in chunks), H)
 
-    def _branch_logits(ex):
-        P, N = ex.spine_len, ex.branch_ids.shape[0]
-        spine_emb = model.get_input_embeddings()(ex.spine_ids[None])
-        cache = model(inputs_embeds=spine_emb, position_ids=ex.spine_positions[None], use_cache=True).past_key_values
-        for layer in cache.layers:
-            layer.keys = layer.keys.expand(N, -1, -1, -1)
-            layer.values = layer.values.expand(N, -1, -1, -1)
-        aud = ex.branch_frame_index >= 0
-        emb = _embed_with_audio(model, ex.branch_ids, aud, frames[ex.branch_frame_index[aud]])
-        return model(
-            inputs_embeds=emb,
-            attention_mask=build_twod_branch_mask(ex.branch_prefix, ex.branch_valid, P, emb.dtype),
-            position_ids=ex.branch_positions,
-            past_key_values=cache,
-            use_cache=False,
-        ).logits.float()
+    def _logits(ex):
+        emb = _embed_with_audio(model, ex.input_ids, ex.is_audio, frames[ex.audio_frame_index[ex.is_audio]])
+        return (
+            model(
+                inputs_embeds=emb[None],
+                attention_mask=_mask_of(ex)[None, None],
+                position_ids=ex.position_ids[None],
+            )
+            .logits[0]
+            .float()
+        )
 
     # --- reference: the forced layout's summed cross-entropy ---
-    forced = build_twod_chunk_example(instruction, chunks, VS, VE, EOT)
-    f_logits = _branch_logits(forced)
+    forced = build_packed_chunk_example(instruction, chunks, VS, VE, EOT)
     ref = F.cross_entropy(
-        f_logits.flatten(0, 1),
-        forced.branch_targets.flatten(0, 1),
+        _logits(forced),
+        forced.target_ids,
         reduction="sum",
         ignore_index=IGNORE_INDEX,
     )
 
-    # --- candidate: the banded layout at band=0 ---
-    banded = build_twod_banded_example(
+    # --- candidate: the flat banded layout at band=0 ---
+    banded = build_packed_banded_example(
         instruction_ids=instruction,
         chunks=chunks,
         word_starts=[0, 1, 2, 3, 4, 5],
@@ -3940,21 +3934,18 @@ def test_banded_band_zero_equals_the_forced_loss_end_to_end():
         vision_end_id=VE,
         eot_id=EOT,
     )
-    b_logits = _branch_logits(banded)
-    lse = torch.logsumexp(b_logits, dim=-1)
+    lg = _logits(banded)
+    lse = torch.logsumexp(lg, dim=-1)
 
     k1 = banded.span_valid.shape[-1]
-    n, b_w = b_logits.shape[0], b_logits.shape[1]
-    idx = (banded.branch_ve.unsqueeze(1) + torch.arange(k1).unsqueeze(0)).clamp(max=b_w - 1)
+    idx = (banded.branch_ve_abs.unsqueeze(1) + torch.arange(k1).unsqueeze(0)).clamp(max=lg.shape[0] - 1)
+    flat = idx.reshape(-1)
 
-    lse_sel = lse.gather(1, idx)
-    stop_lp = b_logits[..., EOT].gather(1, idx) - lse_sel
-    sel = b_logits.reshape(-1, b_logits.shape[-1])[(torch.arange(n).unsqueeze(1) * b_w + idx).reshape(-1)].view(
-        n, k1, -1
-    )
-    tgt = banded.branch_targets.gather(1, idx)
-    tok_lp = sel.gather(-1, tgt.clamp(min=0).unsqueeze(-1)).squeeze(-1) - lse_sel
-    tok_lp = torch.where(tgt == IGNORE_INDEX, torch.zeros_like(tok_lp), tok_lp)
+    lse_sel = lse[flat]
+    stop_lp = (lg[flat, EOT] - lse_sel).view(-1, k1)
+    tgt = banded.target_ids[flat]
+    tok_lp = lg[flat, tgt.clamp(min=0)] - lse_sel
+    tok_lp = torch.where(tgt == IGNORE_INDEX, torch.zeros_like(tok_lp), tok_lp).view(-1, k1)
 
     T, C = banded.cut.shape
     span = span_scores(tok_lp[:, :-1].view(1, T, C, -1), stop_lp.view(1, T, C, -1))

@@ -274,9 +274,9 @@ def _chunks():
 
 
 def _build(band, word_starts=(0, 1, 2, 3, 4, 5), instruction=(7, 8)):
-    from nemo.collections.speechlm2.parts.script import build_twod_banded_example
+    from nemo.collections.speechlm2.parts.script import build_packed_banded_example
 
-    return build_twod_banded_example(
+    return build_packed_banded_example(
         instruction_ids=list(instruction),
         chunks=_chunks(),
         word_starts=list(word_starts),
@@ -284,7 +284,6 @@ def _build(band, word_starts=(0, 1, 2, 3, 4, 5), instruction=(7, 8)):
         vision_start_id=_VS,
         vision_end_id=_VE,
         eot_id=_EOT,
-        pad_id=_PAD,
     )
 
 
@@ -292,25 +291,30 @@ def _build(band, word_starts=(0, 1, 2, 3, 4, 5), instruction=(7, 8)):
 def test_band_zero_layout_matches_the_forced_builder():
     """band=0 must lay out exactly what the existing forced builder lays out.
 
-    The spine and the per-chunk history prefixes are the contract between the two
-    losses; if they drift, a band-0 run is not the control it claims to be.
+    The spine and the per-segment history prefixes are the contract between the
+    two losses; if they drift, a band-0 run is not the control it claims to be.
     """
-    from nemo.collections.speechlm2.parts.script import build_twod_chunk_example
+    from nemo.collections.speechlm2.parts.script import build_packed_chunk_example
 
     banded = _build(band=0)
-    forced = build_twod_chunk_example(
+    forced = build_packed_chunk_example(
         instruction_ids=[7, 8],
         chunks=_chunks(),
         vision_start_id=_VS,
         vision_end_id=_VE,
         eot_id=_EOT,
-        pad_id=_PAD,
     )
 
-    assert torch.equal(banded.spine_ids, forced.spine_ids)
+    P = banded.spine_len
+    assert P == forced.spine_len
+    assert torch.equal(banded.input_ids[:P], forced.input_ids[:P])
     assert banded.n_cand == 1
-    assert torch.equal(banded.branch_prefix, forced.branch_prefix)
     assert banded.n_chunks == 4 and banded.n_tokens == 6
+    # One segment per chunk, each with the aligner's own history prefix.
+    for t in range(4):
+        seg = (banded.seg_ids == t + 1).nonzero(as_tuple=True)[0]
+        f_seg = (forced.seg_ids == t + 1).nonzero(as_tuple=True)[0]
+        assert int(banded.prefix_len[seg[0]]) == int(forced.prefix_len[f_seg[0]])
 
 
 @pytest.mark.unit
@@ -364,25 +368,40 @@ def test_the_aligner_cut_survives_even_when_it_is_not_a_word_start():
 
 
 @pytest.mark.unit
-def test_branch_prefix_tracks_the_candidate_cut():
-    """branch_prefix is the ONLY thing that distinguishes candidates of a chunk."""
+def test_prefix_len_tracks_the_candidate_cut():
+    """prefix_len is the ONLY thing that distinguishes candidates of a chunk.
+
+    That is exactly why the flat layout needs no mask change: build_script_mask
+    already reads each segment's history as ``kp < prefix_len[q]``.
+    """
     b = _build(band=1)
     m = 2  # len(instruction)
-    flat = b.branch_prefix.view(b.n_chunks, b.n_cand)
-    assert torch.equal(flat, b.cut + m)
+    for t in range(b.n_chunks):
+        for j in range(b.n_cand):
+            seg = t * b.n_cand + j + 1
+            pos = (b.seg_ids == seg).nonzero(as_tuple=True)[0]
+            assert int(b.prefix_len[pos[0]]) == int(b.cut[t, j]) + m
 
 
 @pytest.mark.unit
-def test_every_branch_row_is_well_formed_including_padding_candidates():
-    """Padding candidates still need a valid row; cut_valid keeps them out of the DP."""
+def test_every_segment_is_well_formed_including_padding_candidates():
+    """Padding candidates still need a valid segment; cut_valid keeps them out."""
     b = _build(band=1)
-    n_rows = b.branch_ids.shape[0]
-    assert n_rows == b.n_chunks * b.n_cand
-    for r in range(n_rows):
-        row = b.branch_ids[r]
-        assert int(row[0]) == _VS
-        assert _VE in row.tolist()
-        assert bool(b.branch_valid[r].any())
+    n_seg = int(b.seg_ids.max())
+    assert n_seg == b.n_chunks * b.n_cand
+    for seg in range(1, n_seg + 1):
+        pos = (b.seg_ids == seg).nonzero(as_tuple=True)[0]
+        assert pos.numel() > 0
+        assert int(b.input_ids[pos[0]]) == _VS
+        assert _VE in b.input_ids[pos].tolist()
+
+
+@pytest.mark.unit
+def test_branch_ve_abs_points_at_the_vision_end_token():
+    """The loss reads K+1 scores from here; a wrong index is silent and fatal."""
+    b = _build(band=1)
+    for n, a in enumerate(b.branch_ve_abs.tolist()):
+        assert int(b.input_ids[a]) == _VE, f"segment {n} ve_abs={a} is not <ve>"
 
 
 @pytest.mark.unit
@@ -404,13 +423,15 @@ def test_branch_targets_are_the_transcript_read_from_the_cut():
     b = _build(band=1)
     from nemo.collections.speechlm2.data.streaming_stt_dataset import IGNORE_INDEX
 
-    transcript = b.spine_ids[2:].tolist()
+    transcript = b.input_ids[2 : b.spine_len].tolist()
     for t in range(b.n_chunks):
         for j in range(b.n_cand):
             if not bool(b.cut_valid[t, j]):
                 continue
             u = int(b.cut[t, j])
-            row = b.branch_targets[t * b.n_cand + j].tolist()
+            seg = t * b.n_cand + j + 1
+            pos = (b.seg_ids == seg).nonzero(as_tuple=True)[0]
+            row = b.target_ids[pos].tolist()
             supervised = [x for x in row if x != IGNORE_INDEX]
             assert supervised == transcript[u : u + len(supervised)]
 
@@ -453,12 +474,12 @@ def test_the_shipped_banded_recipe_satisfies_every_guard():
 
     assert cfg.model.loss_type == "banded"
     assert cfg.model.target_construction == "partition"
-    assert cfg.model.twod_layout is True
+    # FLAT, not 2-D: the 2-D path measured 5.11 s/step against flat's 0.55 s/step
+    # for the identical objective, and the model refuses twod_layout=true.
+    assert cfg.model.twod_layout is False
     assert int(cfg.model.band_words) >= 1
     assert not cfg.model.get("gate_in_history", False)
     assert not cfg.model.get("read_write", False)
-    # The band multiplies the branch count, so the memory bound must be engaged.
-    assert int(cfg.model.twod_branch_micro_batch) > 0
 
 
 @pytest.mark.unit

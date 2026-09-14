@@ -27,11 +27,11 @@ from nemo.collections.speechlm2.data.streaming_stt_dataset import (
 from nemo.collections.speechlm2.parts.alignments import WordAlignment
 from nemo.collections.speechlm2.parts.script import (
     ChunkSpec,
+    build_packed_banded_example,
     build_packed_chunk_example,
-    build_twod_banded_example,
     build_twod_chunk_example,
+    collate_packed_banded_examples,
     collate_packed_chunk_examples,
-    collate_twod_banded_examples,
     collate_twod_chunk_examples,
 )
 from nemo.collections.speechlm2.parts.script_messages import get_llm_messages_for_batch
@@ -42,7 +42,6 @@ from nemo.collections.speechlm2.parts.script_prompt import (
 )
 from nemo.collections.speechlm2.parts.utils import to_dataclass
 from nemo.utils import logging
-
 
 # How often (in utterances, per dataloader worker) to report the rate at which
 # target_construction='partition' fell back to per-chunk tokenization. A rate
@@ -292,9 +291,9 @@ class ScriptSTTDataset(StreamingSTTDataset):
             raise ValueError(f"loss_type must be 'forced' or 'banded', got {self.cfg.loss_type!r}")
         self._band_words = max(int(self.cfg.band_words), 0)
         self._banded = self._loss_type == "banded"
-        if self._banded and not (self._twod_layout and self._target_partition):
+        if self._banded and (self._twod_layout or not self._target_partition):
             raise ValueError(
-                "loss_type='banded' requires twod_layout=true and target_construction='partition'; "
+                "loss_type='banded' requires twod_layout=false and target_construction='partition'; "
                 f"got twod_layout={self._twod_layout}, target_construction={target_construction!r}"
             )
         self._word_start_ids = None
@@ -668,7 +667,7 @@ class ScriptSTTDataset(StreamingSTTDataset):
             if self._banded:
                 transcript_ids = [t for ch in chunks for t in ch.target_ids]
                 examples.append(
-                    build_twod_banded_example(
+                    build_packed_banded_example(
                         instruction_ids=instruction_ids,
                         chunks=chunks,
                         word_starts=self._word_start_positions(transcript_ids),
@@ -697,10 +696,23 @@ class ScriptSTTDataset(StreamingSTTDataset):
             )
 
         if self._banded:
+            # The banded batch fills the ORDINARY flat fields, so the model reuses
+            # _script_input_embeds and _training_attention untouched; `banded`
+            # carries only the lattice the loss needs on top.
+            bnd = collate_packed_banded_examples(examples, pad_id=self.tokenizer.pad_id)
             return ScriptBatch(
                 audios=audios,
                 audio_lens=audio_lens,
-                banded=collate_twod_banded_examples(examples, pad_id=self.tokenizer.pad_id),
+                input_tokens=bnd.input_ids,
+                position_ids=bnd.position_ids,
+                order_ids=bnd.order_ids,
+                seg_ids=bnd.seg_ids,
+                prefix_len=bnd.prefix_len,
+                target_tokens=bnd.target_ids,
+                is_audio=bnd.is_audio,
+                audio_frame_index=bnd.audio_frame_index,
+                valid=bnd.valid,
+                banded=bnd,
                 text=text,
                 cuts=cuts,
                 chunk_size=chunk_size,

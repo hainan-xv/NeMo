@@ -375,6 +375,263 @@ def build_packed_chunk_example(
     )
 
 
+@dataclass
+class PackedBandedExample:
+    """One utterance in the FLAT packed layout, with one segment per candidate cut.
+
+    Identical in kind to :class:`PackedChunkExample` -- same fields, same mask
+    rule, same single fused forward -- except a chunk contributes ``C`` branch
+    segments instead of one. That works with no mask change at all, because
+    ``build_script_mask`` already gives each segment its own history through
+    ``kp < prefix_len[q]``, and the candidates of a chunk differ ONLY in
+    ``prefix_len``.
+
+    Attributes:
+        branch_ve_abs: (T * C,) ABSOLUTE index of each segment's ``<ve>`` in the
+            packed sequence. The loss reads ``K + 1`` scores starting there, and
+            segments have different widths (the audio window is narrower for early
+            chunks under ``audio_window_frames``), so the offset cannot be derived.
+        cut / cut_valid / span_valid: the lattice, as in :class:`TwoDBandedExample`.
+    """
+
+    input_ids: Tensor
+    position_ids: Tensor
+    order_ids: Tensor
+    seg_ids: Tensor
+    prefix_len: Tensor
+    target_ids: Tensor
+    is_audio: Tensor
+    audio_frame_index: Tensor
+    spine_len: int
+    cut: Tensor
+    cut_valid: Tensor
+    span_valid: Tensor
+    branch_ve_abs: Tensor
+    n_chunks: int
+    n_tokens: int
+    n_cand: int
+
+
+def build_packed_banded_example(
+    instruction_ids: List[int],
+    chunks: List["ChunkSpec"],
+    word_starts: List[int],
+    band_words: int,
+    vision_start_id: int,
+    vision_end_id: int,
+    eot_id: int,
+    audio_history_chunks: int = 0,
+    audio_window_frames: int = 0,
+    position_scheme: str = BRANCH_SCHEME,
+) -> PackedBandedExample:
+    """Flat packed layout carrying one branch segment per (chunk, candidate cut).
+
+    Preconditions, enforced by the caller: the spine must be the PARTITION
+    tokenization (otherwise the spine ids move with the cut and the dynamic
+    program is invalid), and ``gate_in_history`` / ``read_write`` must be off
+    (the gate's identity flips when the band empties a chunk).
+
+    Why flat rather than the 2-D layout this was first written for: measured on
+    one node, the 2-D path costs 5.11 s/step against the flat path's 0.55 s/step
+    for the SAME objective (``band_words=0``, which is exactly the forced loss).
+    The 2-D layout's premise is that the spine K/V is broadcast and never copied,
+    but transformers' ``DynamicLayer.update`` concatenates the stride-0 expansion
+    and materialises it per branch, so it pays O(branches x spine) memory traffic.
+    The flat layout has no spine cache at all -- one fused forward.
+    """
+    m = len(instruction_ids)
+
+    spine_ids: List[int] = list(instruction_ids)
+    aligner_cuts: List[int] = []
+    frame_starts: List[int] = []
+    running_frames = 0
+    for ch in chunks:
+        aligner_cuts.append(len(spine_ids) - m)
+        frame_starts.append(running_frames)
+        spine_ids.extend(ch.target_ids)
+        running_frames += ch.audio_len
+    transcript_ids = spine_ids[m:]
+    n_tokens = len(transcript_ids)
+    P = len(spine_ids)
+    T = len(chunks)
+
+    cands = band_candidate_cuts(aligner_cuts, word_starts, n_tokens, band_words)
+    C = max((len(c) for c in cands), default=1)
+    reach = [max(cands[t + 1]) if t + 1 < T else n_tokens for t in range(T)]
+    K = max(max((reach[t] - min(cands[t]) for t in range(T)), default=0), 0)
+
+    input_ids: List[int] = list(spine_ids)
+    position_ids: List[int] = list(range(P))
+    order_ids: List[int] = list(range(P))
+    seg_ids: List[int] = [SPINE_SEG_ID] * P
+    prefix_len: List[int] = [0] * P
+    target_ids: List[int] = [IGNORE_INDEX] * P
+    is_audio: List[bool] = [False] * P
+    audio_frame_index: List[int] = [-1] * P
+
+    cut = torch.zeros((T, C), dtype=torch.long)
+    cut_valid = torch.zeros((T, C), dtype=torch.bool)
+    span_valid = torch.zeros((T, C, K + 1), dtype=torch.bool)
+    ve_abs: List[int] = []
+
+    seg = 0
+    for t, ch in enumerate(chunks):
+        win_end = frame_starts[t] + ch.audio_len
+        win_start = audio_window_start(t, frame_starts, audio_history_chunks, win_end, audio_window_frames)
+        window_frames = list(range(win_start, win_end))
+        w = len(window_frames)
+        for j in range(C):
+            if j < len(cands[t]):
+                u = cands[t][j]
+                cut[t, j] = u
+                cut_valid[t, j] = True
+                for k in range(K + 1):
+                    span_valid[t, j, k] = (u + k) <= reach[t]
+            else:
+                # Padding candidate: a well-formed segment that cut_valid keeps out
+                # of the lattice. It still has to exist, because the segments are
+                # one packed axis and C is shared across the batch. `cut` is written
+                # too, so it never disagrees with the segment actually emitted --
+                # the DP ignores it either way, but a silent disagreement between
+                # the two is exactly the kind of thing that survives until it does
+                # matter.
+                u = cands[t][-1]
+                cut[t, j] = u
+
+            seg += 1
+            span = list(transcript_ids[u : u + K])
+            span = span + [eot_id] * (K - len(span))
+            pref = m + u
+
+            toks = [vision_start_id] + [AUDIO_TOKEN_IDX] * w + [vision_end_id] + span + [eot_id]
+            aud = [False] + [True] * w + [False] * (K + 2)
+            fidx = [-1] + window_frames + [-1] * (K + 2)
+
+            ve = 1 + w
+            tgt = [IGNORE_INDEX] * len(toks)
+            for k in range(K):
+                if u + k < n_tokens:
+                    tgt[ve + k] = transcript_ids[u + k]
+
+            ve_abs.append(len(input_ids) + ve)
+            input_ids.extend(toks)
+            position_ids.extend(_branch_positions(branch_position_start(pref, w, position_scheme), w, K))
+            order_ids.extend(range(len(toks)))
+            seg_ids.extend([seg] * len(toks))
+            prefix_len.extend([pref] * len(toks))
+            target_ids.extend(tgt)
+            is_audio.extend(aud)
+            audio_frame_index.extend(fidx)
+
+    shift = -min(position_ids) if position_ids and min(position_ids) < 0 else 0
+    if shift:
+        position_ids = [q + shift for q in position_ids]
+
+    return PackedBandedExample(
+        input_ids=torch.tensor(input_ids, dtype=torch.long),
+        position_ids=torch.tensor(position_ids, dtype=torch.long),
+        order_ids=torch.tensor(order_ids, dtype=torch.long),
+        seg_ids=torch.tensor(seg_ids, dtype=torch.long),
+        prefix_len=torch.tensor(prefix_len, dtype=torch.long),
+        target_ids=torch.tensor(target_ids, dtype=torch.long),
+        is_audio=torch.tensor(is_audio, dtype=torch.bool),
+        audio_frame_index=torch.tensor(audio_frame_index, dtype=torch.long),
+        spine_len=P,
+        cut=cut,
+        cut_valid=cut_valid,
+        span_valid=span_valid,
+        branch_ve_abs=torch.tensor(ve_abs, dtype=torch.long),
+        n_chunks=T,
+        n_tokens=n_tokens,
+        n_cand=C,
+    )
+
+
+@dataclass
+class BatchedPackedBanded:
+    """A batch of :class:`PackedBandedExample`."""
+
+    input_ids: Tensor
+    position_ids: Tensor
+    order_ids: Tensor
+    seg_ids: Tensor
+    prefix_len: Tensor
+    target_ids: Tensor
+    is_audio: Tensor
+    audio_frame_index: Tensor
+    valid: Tensor
+    spine_lens: Tensor
+    cut: Tensor  # (B, T, C)
+    cut_valid: Tensor  # (B, T, C)
+    span_valid: Tensor  # (B, T, C, K + 1)
+    branch_ve_abs: Tensor  # (B, T * C)
+    n_chunks: Tensor  # (B,)
+    n_tokens: Tensor  # (B,)
+    n_cand: int
+    span_len: int
+
+
+def collate_packed_banded_examples(examples: List[PackedBandedExample], pad_id: int) -> BatchedPackedBanded:
+    """Right-pad a list of flat banded examples into a batch.
+
+    ``C`` and ``K`` are padded to the batch maximum and marked by ``cut_valid`` /
+    ``span_valid``. ``branch_ve_abs`` is re-blocked the same way the lattice is:
+    the segments are flattened (chunk, candidate), so widening ``C`` moves every
+    chunk's block and a straight copy would point the loss at the wrong tokens.
+    """
+    B = len(examples)
+    L = max(int(e.input_ids.numel()) for e in examples)
+    T = max(int(e.cut.shape[0]) for e in examples)
+    C = max(int(e.n_cand) for e in examples)
+    Kp1 = max(int(e.span_valid.shape[2]) for e in examples)
+    N = T * C
+
+    def _pad(attr, fill, dtype):
+        out = torch.full((B, L), fill, dtype=dtype)
+        for i, e in enumerate(examples):
+            v = getattr(e, attr)
+            out[i, : v.numel()] = v.to(dtype)
+        return out
+
+    valid = torch.zeros((B, L), dtype=torch.bool)
+    cut = torch.zeros((B, T, C), dtype=torch.long)
+    cut_valid = torch.zeros((B, T, C), dtype=torch.bool)
+    span_valid = torch.zeros((B, T, C, Kp1), dtype=torch.bool)
+    # 0 is a safe filler: it points at the spine, and span_valid/cut_valid keep
+    # every padded entry out of the lattice.
+    ve_abs = torch.zeros((B, N), dtype=torch.long)
+
+    for i, e in enumerate(examples):
+        valid[i, : e.input_ids.numel()] = True
+        t_i, c_i = int(e.cut.shape[0]), int(e.n_cand)
+        cut[i, :t_i, :c_i] = e.cut
+        cut_valid[i, :t_i, :c_i] = e.cut_valid
+        span_valid[i, :t_i, :c_i, : e.span_valid.shape[2]] = e.span_valid
+        for t in range(t_i):
+            ve_abs[i, t * C : t * C + c_i] = e.branch_ve_abs[t * c_i : (t + 1) * c_i]
+
+    return BatchedPackedBanded(
+        input_ids=_pad("input_ids", pad_id, torch.long),
+        position_ids=_pad("position_ids", 0, torch.long),
+        order_ids=_pad("order_ids", 0, torch.long),
+        seg_ids=_pad("seg_ids", PAD_SEG_ID, torch.long),
+        prefix_len=_pad("prefix_len", 0, torch.long),
+        target_ids=_pad("target_ids", IGNORE_INDEX, torch.long),
+        is_audio=_pad("is_audio", False, torch.bool),
+        audio_frame_index=_pad("audio_frame_index", -1, torch.long),
+        valid=valid,
+        spine_lens=torch.tensor([e.spine_len for e in examples], dtype=torch.long),
+        cut=cut,
+        cut_valid=cut_valid,
+        span_valid=span_valid,
+        branch_ve_abs=ve_abs,
+        n_chunks=torch.tensor([e.n_chunks for e in examples], dtype=torch.long),
+        n_tokens=torch.tensor([e.n_tokens for e in examples], dtype=torch.long),
+        n_cand=C,
+        span_len=Kp1 - 1,
+    )
+
+
 def build_script_mask(
     seg_ids: Tensor,
     order_ids: Tensor,
@@ -644,46 +901,6 @@ def build_twod_chunk_example(
     )
 
 
-@dataclass
-class TwoDBandedExample:
-    """One utterance laid out for the BANDED loss.
-
-    Same spine and same branch construction as :class:`TwoDChunkExample`, but a
-    chunk contributes one branch PER CANDIDATE CUT instead of one branch. Rows are
-    flattened ``(T * C, b)`` in ``(chunk, candidate)`` order so every existing
-    consumer -- ``_twod_branch_embeds``, ``build_twod_branch_mask``,
-    ``broadcast_spine_cache`` -- works on them unchanged. That reuse is the whole
-    reason the band is affordable: ``branch_prefix`` enters the model only through
-    the branch mask's ``spine_idx < branch_prefix``, so ONE spine forward serves
-    branches at arbitrarily different cuts.
-
-    Attributes:
-        cut: (T, C) candidate start cut per chunk, in TRANSCRIPT-token space
-            (0-based, i.e. spine index minus the instruction length).
-        cut_valid: (T, C) False where a chunk has fewer than ``C`` candidates.
-        span_valid: (T, C, K + 1) False where emitting ``k`` tokens from that cut
-            would run past the end of the transcript.
-        n_chunks / n_tokens: the DP's final state ``(T, U)``.
-    """
-
-    spine_ids: Tensor
-    spine_positions: Tensor
-    branch_ids: Tensor
-    branch_positions: Tensor
-    branch_frame_index: Tensor
-    branch_targets: Tensor
-    branch_valid: Tensor
-    branch_prefix: Tensor
-    spine_len: int
-    cut: Tensor
-    cut_valid: Tensor
-    span_valid: Tensor
-    branch_ve: Tensor
-    n_chunks: int
-    n_tokens: int
-    n_cand: int
-
-
 def band_candidate_cuts(aligner_cuts: List[int], word_starts: List[int], n_tokens: int, band: int) -> List[List[int]]:
     """Candidate cuts for each chunk: word starts within ``band`` words of the aligner's.
 
@@ -707,141 +924,6 @@ def band_candidate_cuts(aligner_cuts: List[int], word_starts: List[int], n_token
         cands = sorted(set(starts[lo:hi]) | {u})
         out.append([c for c in cands if 0 <= c <= n_tokens])
     return out
-
-
-def build_twod_banded_example(
-    instruction_ids: List[int],
-    chunks: List["ChunkSpec"],
-    word_starts: List[int],
-    band_words: int,
-    vision_start_id: int,
-    vision_end_id: int,
-    eot_id: int,
-    audio_history_chunks: int = 0,
-    audio_window_frames: int = 0,
-    position_scheme: str = BRANCH_SCHEME,
-    pad_id: int = 0,
-) -> TwoDBandedExample:
-    """Build the banded 2-D layout: one branch per (chunk, candidate cut).
-
-    ``word_starts`` are transcript-token positions that begin a word, and the
-    spine must be the PARTITION tokenization -- one tokenization of the whole
-    transcript, split at the chunk bounds. Under the legacy per-chunk
-    tokenization the spine ids change with the cut, two paths reaching the same
-    (chunk, cut) no longer share a prefix, and the dynamic program this feeds is
-    invalid. The caller enforces that; it cannot be detected from here.
-
-    ``gate_in_history`` and ``read_write`` are deliberately absent: the gate's
-    identity is ``write_id if target_ids else read_id``, so it flips exactly when
-    the band empties a chunk, which would make it part of the DP state.
-    """
-    m = len(instruction_ids)
-
-    spine_ids: List[int] = list(instruction_ids)
-    aligner_cuts: List[int] = []
-    frame_starts: List[int] = []
-    running_frames = 0
-    for ch in chunks:
-        aligner_cuts.append(len(spine_ids) - m)
-        frame_starts.append(running_frames)
-        spine_ids.extend(ch.target_ids)
-        running_frames += ch.audio_len
-    transcript_ids = spine_ids[m:]
-    n_tokens = len(transcript_ids)
-    P = len(spine_ids)
-    T = len(chunks)
-
-    cands = band_candidate_cuts(aligner_cuts, word_starts, n_tokens, band_words)
-    C = max((len(c) for c in cands), default=1)
-
-    # The longest span any path could need FROM a given cut is the distance to the
-    # furthest cut the next chunk admits (the end of the transcript for the last
-    # chunk). Bounding it this way rather than by the transcript length keeps the
-    # branch rows -- and therefore the (N, b, vocab) logits -- as narrow as the
-    # band actually requires.
-    reach = [max(cands[t + 1]) if t + 1 < T else n_tokens for t in range(T)]
-    K = max((reach[t] - min(cands[t]) for t in range(T)), default=0)
-    K = max(int(K), 0)
-
-    rows_ids, rows_pos, rows_fidx, rows_tgt, rows_ve = [], [], [], [], []
-    cut = torch.zeros((T, C), dtype=torch.long)
-    cut_valid = torch.zeros((T, C), dtype=torch.bool)
-    span_valid = torch.zeros((T, C, K + 1), dtype=torch.bool)
-
-    for t, ch in enumerate(chunks):
-        win_end = frame_starts[t] + ch.audio_len
-        win_start = audio_window_start(t, frame_starts, audio_history_chunks, win_end, audio_window_frames)
-        window = list(range(win_start, win_end))
-        w = len(window)
-        for j in range(C):
-            if j < len(cands[t]):
-                u = cands[t][j]
-                cut[t, j] = u
-                cut_valid[t, j] = True
-                for k in range(K + 1):
-                    span_valid[t, j, k] = (u + k) <= reach[t]
-            else:
-                # A padding candidate. It still needs a well-formed row, because the
-                # rows are one batch axis; cut_valid keeps it out of the DP.
-                u = cands[t][-1]
-
-            span = transcript_ids[u : u + K]
-            span = list(span) + [pad_id] * (K - len(span))
-            pref = m + u
-
-            ids = [vision_start_id] + [AUDIO_TOKEN_IDX] * w + [vision_end_id] + span + [eot_id]
-            fidx = [-1] + window + [-1] + [-1] * (K + 1)
-            tgt = [IGNORE_INDEX] * len(ids)
-            ve = 1 + w
-            for k in range(K):
-                if u + k < n_tokens:
-                    tgt[ve + k] = transcript_ids[u + k]
-
-            rows_ids.append(ids)
-            rows_pos.append(_branch_positions(branch_position_start(pref, w, position_scheme), w, K))
-            rows_fidx.append(fidx)
-            rows_tgt.append(tgt)
-            rows_ve.append(ve)
-
-    N = len(rows_ids)
-    b = max((len(r) for r in rows_ids), default=0)
-
-    def _pad(rows, fill, dtype):
-        out = torch.full((N, b), fill, dtype=dtype)
-        for i, r in enumerate(rows):
-            out[i, : len(r)] = torch.tensor(r, dtype=dtype)
-        return out
-
-    valid = torch.zeros((N, b), dtype=torch.bool)
-    for i, r in enumerate(rows_ids):
-        valid[i, : len(r)] = True
-
-    prefix = torch.tensor(
-        [m + int(cut[t, j]) for t in range(T) for j in range(C)],
-        dtype=torch.long,
-    )
-
-    return TwoDBandedExample(
-        spine_ids=torch.tensor(spine_ids, dtype=torch.long),
-        spine_positions=torch.arange(P, dtype=torch.long),
-        branch_ids=_pad(rows_ids, pad_id, torch.long),
-        branch_positions=_pad(rows_pos, 0, torch.long),
-        branch_frame_index=_pad(rows_fidx, -1, torch.long),
-        branch_targets=_pad(rows_tgt, IGNORE_INDEX, torch.long),
-        branch_valid=valid,
-        branch_prefix=prefix,
-        spine_len=P,
-        cut=cut,
-        cut_valid=cut_valid,
-        span_valid=span_valid,
-        # Per ROW, because the audio window is not the same width everywhere: with
-        # audio_window_frames the early chunks get a short window, so deriving <ve>
-        # from the padded row width would read the scores off by that difference.
-        branch_ve=torch.tensor(rows_ve, dtype=torch.long),
-        n_chunks=T,
-        n_tokens=n_tokens,
-        n_cand=C,
-    )
 
 
 def build_twod_branch_mask(
@@ -962,119 +1044,6 @@ def collate_twod_chunk_examples(examples: List[TwoDChunkExample], pad_id: int) -
         branch_prefix=prefix,
         branch_counts=torch.tensor([e.branch_ids.shape[0] for e in examples], dtype=torch.long),
         spine_lens=torch.tensor([e.spine_len for e in examples], dtype=torch.long),
-    )
-
-
-@dataclass
-class BatchedTwoDBanded:
-    """A batch of :class:`TwoDBandedExample`.
-
-    The branch fields are laid out exactly like :class:`BatchedTwoDChunk`, so the
-    branch pass is unchanged; the extra fields are the DP's lattice description.
-    ``N == T * C``, flattened in ``(chunk, candidate)`` order.
-    """
-
-    spine_ids: Tensor  # (B, P)
-    spine_positions: Tensor  # (B, P)
-    spine_valid: Tensor  # (B, P)
-    branch_ids: Tensor  # (B, N, b)
-    branch_positions: Tensor  # (B, N, b)
-    branch_frame_index: Tensor  # (B, N, b)
-    branch_targets: Tensor  # (B, N, b)
-    branch_valid: Tensor  # (B, N, b)
-    branch_prefix: Tensor  # (B, N)
-    branch_counts: Tensor  # (B,)
-    spine_lens: Tensor  # (B,)
-    cut: Tensor  # (B, T, C)
-    cut_valid: Tensor  # (B, T, C)
-    span_valid: Tensor  # (B, T, C, K + 1)
-    branch_ve: Tensor  # (B, N) index of <ve> in each row
-    n_chunks: Tensor  # (B,)
-    n_tokens: Tensor  # (B,)
-    n_cand: int
-    span_len: int  # K -- teacher-forced tokens per branch row
-
-
-def collate_twod_banded_examples(examples: List[TwoDBandedExample], pad_id: int) -> BatchedTwoDBanded:
-    """Pad a list of :class:`TwoDBandedExample` into a batch.
-
-    Every utterance in a batch shares one candidate count ``C`` and one span
-    length ``K``: they are padded up to the batch maximum, and ``cut_valid`` /
-    ``span_valid`` mark what is real. Ragged ``C`` across utterances would make
-    the ``(B, T, C)`` lattice impossible to index without a second level of
-    padding for no benefit.
-    """
-    B = len(examples)
-    P = max(int(e.spine_ids.numel()) for e in examples)
-    T = max(int(e.cut.shape[0]) for e in examples)
-    C = max(int(e.n_cand) for e in examples)
-    Kp1 = max(int(e.span_valid.shape[2]) for e in examples)
-    b = max(int(e.branch_ids.shape[1]) for e in examples)
-    N = T * C
-
-    def _spine(attr, fill, dtype):
-        out = torch.full((B, P), fill, dtype=dtype)
-        for i, e in enumerate(examples):
-            v = getattr(e, attr)
-            out[i, : v.numel()] = v.to(dtype)
-        return out
-
-    def _branch(attr, fill, dtype):
-        """Re-block (T_i * C_i, b) rows into the padded (T * C, b) grid.
-
-        A straight copy would be wrong: the rows are flattened (chunk, candidate),
-        so widening C shifts every chunk's block. Each chunk's rows are placed at
-        their new stride instead.
-        """
-        out = torch.full((B, N, b), fill, dtype=dtype)
-        for i, e in enumerate(examples):
-            v = getattr(e, attr)
-            t_i, c_i = int(e.cut.shape[0]), int(e.n_cand)
-            for t in range(t_i):
-                src = v[t * c_i : (t + 1) * c_i]
-                out[i, t * C : t * C + c_i, : src.shape[1]] = src.to(dtype)
-        return out
-
-    spine_valid = torch.zeros((B, P), dtype=torch.bool)
-    branch_valid = torch.zeros((B, N, b), dtype=torch.bool)
-    prefix = torch.zeros((B, N), dtype=torch.long)
-    cut = torch.zeros((B, T, C), dtype=torch.long)
-    cut_valid = torch.zeros((B, T, C), dtype=torch.bool)
-    span_valid = torch.zeros((B, T, C, Kp1), dtype=torch.bool)
-    branch_ve = torch.zeros((B, N), dtype=torch.long)
-
-    for i, e in enumerate(examples):
-        spine_valid[i, : e.spine_ids.numel()] = True
-        t_i, c_i = int(e.cut.shape[0]), int(e.n_cand)
-        cut[i, :t_i, :c_i] = e.cut
-        cut_valid[i, :t_i, :c_i] = e.cut_valid
-        span_valid[i, :t_i, :c_i, : e.span_valid.shape[2]] = e.span_valid
-        for t in range(t_i):
-            src_v = e.branch_valid[t * c_i : (t + 1) * c_i]
-            branch_valid[i, t * C : t * C + c_i, : src_v.shape[1]] = src_v
-            prefix[i, t * C : t * C + c_i] = e.branch_prefix[t * c_i : (t + 1) * c_i]
-            branch_ve[i, t * C : t * C + c_i] = e.branch_ve[t * c_i : (t + 1) * c_i]
-
-    return BatchedTwoDBanded(
-        spine_ids=_spine("spine_ids", pad_id, torch.long),
-        spine_positions=_spine("spine_positions", 0, torch.long),
-        spine_valid=spine_valid,
-        branch_ids=_branch("branch_ids", pad_id, torch.long),
-        branch_positions=_branch("branch_positions", 0, torch.long),
-        branch_frame_index=_branch("branch_frame_index", -1, torch.long),
-        branch_targets=_branch("branch_targets", IGNORE_INDEX, torch.long),
-        branch_valid=branch_valid,
-        branch_prefix=prefix,
-        branch_counts=torch.tensor([N] * B, dtype=torch.long),
-        spine_lens=torch.tensor([e.spine_len for e in examples], dtype=torch.long),
-        cut=cut,
-        cut_valid=cut_valid,
-        span_valid=span_valid,
-        branch_ve=branch_ve,
-        n_chunks=torch.tensor([e.n_chunks for e in examples], dtype=torch.long),
-        n_tokens=torch.tensor([e.n_tokens for e in examples], dtype=torch.long),
-        n_cand=C,
-        span_len=Kp1 - 1,
     )
 
 

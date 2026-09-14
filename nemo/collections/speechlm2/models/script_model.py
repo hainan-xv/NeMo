@@ -261,11 +261,14 @@ class ScriptSTTModel(StreamingSTTModel):
         if self._loss_type == "banded":
             # Each of these makes the (chunk, cut) dynamic program invalid rather
             # than merely different, so they are refused instead of worked around.
-            if not self._twod_layout:
+            if self._twod_layout:
                 raise ValueError(
-                    "loss_type='banded' requires twod_layout=true. The band adds one branch per "
-                    "candidate cut; in the flat layout branches are a single inseparable sequence, "
-                    "so they cannot be added without rebuilding the packed mask."
+                    "loss_type='banded' requires twod_layout=false. The band emits one branch "
+                    "SEGMENT per candidate cut in the flat packed layout, which needs no mask "
+                    "change because build_script_mask already gives each segment its own history "
+                    "via prefix_len. Measured on one node, the 2-D path costs 5.11 s/step against "
+                    "flat's 0.55 s/step for the same objective, because transformers' "
+                    "DynamicLayer.update materialises the broadcast spine cache per branch."
                 )
             if str(self.core_cfg.target_construction or "legacy").lower() != "partition":
                 raise ValueError(
@@ -607,121 +610,77 @@ class ScriptSTTModel(StreamingSTTModel):
                 ignore_index=IGNORE_INDEX,
             )
 
-    def _branch_span_logprobs(self, two, audio_embs, cache, dtype, i: int, lo: int, hi: int) -> Tensor:
-        """Per-token and stop log-probs for branches ``[lo, hi)`` of utterance ``i``.
-
-        Returns ``(hi - lo, K + 1)``: the score of emitting exactly ``k`` tokens
-        from this branch's cut and then stopping, for every ``k``.
-
-        ONE forward per candidate cut yields every span length, because the score
-        of emitting ``spine[u:u+k]`` shares its first ``k-1`` factors with
-        ``spine[u:u+k-1]``. That is what keeps a band of width ``C`` at ``C``
-        branch forwards rather than ``C`` times the number of span lengths.
-
-        The log-softmax is taken as ``logit - logsumexp`` at the two indices that
-        matter instead of materialising a second ``(n, b, 151936)`` tensor; that
-        tensor is already the largest term in the step.
-        """
-        n = hi - lo
-        spine_len = int(two.spine_lens[i])
-        valid = two.branch_valid[i, lo:hi]
-        embeds = self._twod_branch_embeds(two.branch_ids[i, lo:hi], two.branch_frame_index[i, lo:hi], audio_embs[i])
-        out = self._llm_forward(
-            inputs_embeds=embeds,
-            attention_mask=build_twod_branch_mask(
-                two.branch_prefix[i, lo:hi],
-                valid,
-                spine_len,
-                dtype,
-                branch_is_audio=((two.branch_ids[i, lo:hi] == AUDIO_TOKEN_IDX) if self._bidirectional_audio else None),
-            ),
-            position_ids=two.branch_positions[i, lo:hi],
-            past_key_values=broadcast_spine_cache(cache, i, n, spine_len),
-            use_cache=False,
-            return_dict=True,
-        )
-        # NOT upcast to fp32. The vocabulary is ~152k, so .float() here allocates
-        # and copies a (n, b, 151936) tensor -- about a gigabyte at n=32 -- and the
-        # checkpointed backward pays for it twice. torch.logsumexp accumulates in
-        # fp32 internally for a bf16 input, so only its (n, b) RESULT is upcast.
-        logits = out["logits"]  # (n, b, V)
-        lse = torch.logsumexp(logits, dim=-1).float()  # (n, b)
-
-        # <ve> predicts the first emitted token, so the K + 1 positions starting
-        # there carry every score this branch provides. Its index is read PER ROW:
-        # with audio_window_frames the early chunks get a narrower window, so
-        # deriving it from the padded row width would read the scores off by that
-        # difference -- silently, and only for the chunks near the start.
-        k1 = two.span_len + 1
-        b_w = logits.shape[1]
-        ve = two.branch_ve[i, lo:hi]  # (n,)
-        idx = ve.unsqueeze(1) + torch.arange(k1, device=logits.device).unsqueeze(0)  # (n, k1)
-        idx = idx.clamp(max=b_w - 1)
-
-        lse_sel = lse.gather(1, idx)  # (n, k1)
-        stop_lp = logits[..., self._eot_id].float().gather(1, idx) - lse_sel
-
-        # Index by ROW AND COLUMN together, so the result is (n * k1,) directly.
-        # Selecting the rows first and then gathering the column would build a
-        # (n, k1, 151936) intermediate to read one value out of each row of it.
-        tgt = two.branch_targets[i, lo:hi].gather(1, idx)  # (n, k1)
-        flat = logits.reshape(-1, logits.shape[-1])
-        row = (torch.arange(n, device=logits.device).unsqueeze(1) * b_w + idx).reshape(-1)
-        tok_lp = flat[row, tgt.clamp(min=0).reshape(-1)].view(n, k1).float() - lse_sel
-        tok_lp = torch.where(tgt == IGNORE_INDEX, torch.zeros_like(tok_lp), tok_lp)
-
-        return span_scores(
-            tok_lp[:, :-1].unsqueeze(0).unsqueeze(0),
-            stop_lp.unsqueeze(0).unsqueeze(0),
-        )[0, 0]
-
     def _banded_training_step(self, batch: ScriptBatch, batch_idx: int):
         """Marginalise the loss over every in-band word-to-chunk assignment.
 
-        The arrangement mirrors :meth:`_twod_training_step` exactly -- one spine
-        forward, branches in micro-batches under ``torch.utils.checkpoint``, and a
-        single batch-wide denominator so splitting the branch axis is numerically
-        invisible. Only the reduction differs: instead of summing per-token
-        cross-entropies, each branch contributes span scores to a dynamic program
-        whose result is the utterance NLL.
+        Runs the ORDINARY flat packed forward -- same embeds, same SCRIPT mask,
+        one fused call -- and differs only in the reduction. The batch carries
+        ``C`` branch segments per chunk instead of one; the mask needs no change,
+        because it already gives each segment its own history through
+        ``kp < prefix_len[q]`` and the candidates differ only in ``prefix_len``.
+
+        The flat layout rather than the 2-D one is a measured choice. At one node
+        the 2-D path cost 5.11 s/step against flat's 0.55 s/step for the SAME
+        objective (``band_words=0`` is exactly the forced loss), because the 2-D
+        premise that the spine K/V is broadcast and never copied is defeated by
+        transformers' ``DynamicLayer.update``, which concatenates the stride-0
+        expansion once per branch. Flat has no spine cache at all.
         """
-        two = batch.banded
-        audio_embs, _ = self.perception(input_signal=batch.audios, input_signal_length=batch.audio_lens)
-        dtype = audio_embs.dtype
-        cache = self._twod_spine_cache(two, dtype)
+        lat = batch.banded
 
-        b_size = int(two.spine_ids.shape[0])
-        t_max, c = int(two.cut.shape[1]), int(two.n_cand)
-        mb = max(int(self.core_cfg.twod_branch_micro_batch), 0)
-        use_ckpt = mb > 0 and torch.is_grad_enabled()
+        input_embeds = self._script_input_embeds(batch)
+        impl, mask = self._training_attention(batch, input_embeds.dtype)
+        plan = getattr(batch, "attn_plan", None)
+        if self._attn_backend == "script" and plan is None:
+            raise ValueError(
+                "attn_backend='script' but the batch carries no attn_plan, so the structured "
+                "kernel would fall back to unmasked SDPA -- branches would attend each other."
+            )
+        if plan is not None and self._bidirectional_audio:
+            plan = replace(plan, bidirectional_audio=True)
+        with self._attn_implementation(impl), _maybe_plan(plan if self._attn_backend == "script" else None):
+            out = self._llm_forward(
+                inputs_embeds=input_embeds,
+                attention_mask=mask,
+                position_ids=batch.position_ids,
+                use_cache=False,
+                return_dict=True,
+            )
 
-        rows = []
-        for i in range(b_size):
-            n = int(two.branch_counts[i])
-            step = mb if mb > 0 else n
-            parts = []
-            for lo in range(0, n, step):
-                hi = min(lo + step, n)
-                if use_ckpt:
-                    parts.append(
-                        torch.utils.checkpoint.checkpoint(
-                            self._branch_span_logprobs, two, audio_embs, cache, dtype, i, lo, hi, use_reentrant=False
-                        )
-                    )
-                else:
-                    parts.append(self._branch_span_logprobs(two, audio_embs, cache, dtype, i, lo, hi))
-            rows.append(torch.cat(parts, dim=0))
+        logits = out["logits"]  # (B, L, V) -- left in bf16 on purpose
+        b_size, seq_len, vocab = logits.shape
+        k1 = int(lat.span_len) + 1
 
-        span_logprob = torch.stack(rows, dim=0).view(b_size, t_max, c, -1)
-        span_logprob = torch.where(two.span_valid, span_logprob, span_logprob.new_full((), NEG_INF))
+        # Absolute <ve> index per segment; segments differ in width because the
+        # audio window narrows for early chunks, so this cannot be derived.
+        idx = lat.branch_ve_abs.unsqueeze(-1) + torch.arange(k1, device=logits.device)
+        idx = idx.clamp(max=seq_len - 1).reshape(b_size, -1)  # (B, N * k1)
 
-        nll = banded_forward(span_logprob, two.cut, two.cut_valid, two.n_chunks, two.n_tokens)
+        # Only the (B, L) logsumexp is upcast; .float() on (B, L, 151936) would
+        # allocate gigabytes and be recomputed under activation checkpointing.
+        lse = torch.logsumexp(logits, dim=-1).float()
+        lse_sel = lse.gather(1, idx)
+        stop_lp = logits[..., self._eot_id].float().gather(1, idx) - lse_sel
+
+        # Row and column together, so no (B, N * k1, vocab) intermediate exists.
+        tgt = batch.target_tokens.gather(1, idx)
+        rows = (torch.arange(b_size, device=logits.device).unsqueeze(1) * seq_len + idx).reshape(-1)
+        tok_lp = logits.reshape(-1, vocab)[rows, tgt.clamp(min=0).reshape(-1)].view(b_size, -1).float() - lse_sel
+        tok_lp = torch.where(tgt == IGNORE_INDEX, torch.zeros_like(tok_lp), tok_lp)
+
+        t_max, n_cand = int(lat.cut.shape[1]), int(lat.n_cand)
+        tok_lp = tok_lp.view(b_size, t_max, n_cand, k1)
+        stop_lp = stop_lp.view(b_size, t_max, n_cand, k1)
+
+        span_logprob = span_scores(tok_lp[..., :-1], stop_lp)
+        span_logprob = torch.where(lat.span_valid, span_logprob, span_logprob.new_full((), NEG_INF))
+
+        nll = banded_forward(span_logprob, lat.cut, lat.cut_valid, lat.n_chunks, lat.n_tokens)
 
         # An utterance no in-band path can complete would otherwise contribute
-        # -NEG_INF and swamp the batch. Drop it, loudly, rather than let one
-        # malformed example decide the gradient.
+        # -NEG_INF and swamp the batch. Drop it, loudly.
         finite = nll < (-NEG_INF / 2)
-        n_targets = int(two.n_tokens[finite].sum()) if bool(finite.any()) else 0
+        n_targets = int(lat.n_tokens[finite].sum()) if bool(finite.any()) else 0
         if n_targets == 0:
             logging.warning("Batch %d has no reachable in-band path — skipping (zero loss).", batch_idx)
             zero = sum(p.sum() for p in self.parameters() if p.requires_grad)
