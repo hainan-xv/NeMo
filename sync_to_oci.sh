@@ -52,6 +52,17 @@ SCRIPT_PATHS=(
     nemo/collections/speechlm2/models/__init__.py
     examples/speechlm2/script_train.py
     'examples/speechlm2/conf/streaming_stt_granary2_lora_script*.yaml'
+    # CHAT recipes live under the ASR collection, not speechlm2. Without this
+    # a NEW chat config is untracked, silently skipped, and the job dies at
+    # startup with Hydra's MissingConfigException -- which is exactly how
+    # granary2_chat_banded1_qwenvocab_win28_lr1e4 (job 13381311) failed in 45 s
+    # on 8 nodes. The existing chat YAMLs only reach the grid because they are
+    # tracked in git.
+    'examples/asr/conf/fastconformer/cache_aware_streaming/*.yaml'
+    examples/asr/asr_transducer/speech_to_text_chat_bpe.py
+    'nemo/collections/asr/models/chat_bpe_models.py'
+    'nemo/collections/asr/parts/utils/chat_alignment.py'
+    'nemo/collections/asr/losses/banded_rnnt.py'
     tests/collections/speechlm2/test_script.py
     scripts/script_leaderboard_eval.py
     scripts/nemotron_leaderboard_eval.py
