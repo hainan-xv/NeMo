@@ -215,7 +215,17 @@ data:
     #
     #   forced : [38,29,25,22,20,18,17,15,14,13,12,11,10,8,7,6,5,4]
     #   flat/3 : [12, 9, 8, 7, 6, 6, 5, 5, 4, 4, 4, 3, 3,2,2,2,1,1]  <- too big at 12.7s/13.5s/29.4s
-    bucket_batch_size: [13, 9, 8, 7, 6, 5, 5, 4, 4, 3, 3, 3, 3, 2, 2, 1, 1, 1]
+    # x0.6 AGAIN after job 13399611 still OOMed in backward at 78.93/79.33 GiB
+    # with activation_checkpointing on. Measured locally at the sizes below this
+    # line, the LLM forward+backward peaks at a FLAT 8-12 GiB across every bin --
+    # and banded at 13x332 tokens/step is FEWER LLM tokens than forced at 38x141.
+    # So the band is not what fills the GPU; the forced arm already runs near the
+    # limit (job 13380534 died of OOM before the guard existed) once the encoder
+    # and optimizer state are counted, which a local LLM-only benchmark cannot
+    # see. Rather than keep iterating on the grid at ~30 min per attempt, buy
+    # margin. Throughput is the price; a dead 8-node job costs far more.
+    #   previous: [13, 9, 8, 7, 6, 5, 5, 4, 4, 3, 3, 3, 3, 2, 2, 1, 1, 1]
+    bucket_batch_size: [7, 5, 4, 4, 3, 3, 3, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1]
     max_duration: 54
     pad_extra_duration: 0.5
     pad_extra_duration_prob: 1.0

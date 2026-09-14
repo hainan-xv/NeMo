@@ -190,6 +190,13 @@ BAND_WORDS="${BAND_WORDS:-1}"
 # (The local Qwen3-1.7B benchmark that reported 8-11 GiB peak had this ON; the
 # grid default was off, which is why those figures did not transfer.)
 ACT_CKPT="${ACT_CKPT:-true}"
+# The band makes the packed length vary widely across buckets (332 -> 2791 tokens
+# at chunk 14), so the caching allocator sees a wide spread of block sizes and
+# fragments. The failing OOM reported 358 MiB reserved-but-unallocated while
+# asking for 1.30 GiB. expandable_segments lets the allocator grow a segment
+# instead of needing one contiguous free block, which is exactly this shape of
+# failure; PyTorch's own OOM message recommends it.
+export PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True}"
 AUDIO_HISTORY_CHUNKS="${AUDIO_HISTORY_CHUNKS:-0}"
 # SINGLE chunk size, unlike every other SCRIPT arm. Benchmarked on Qwen3-1.7B,
 # the band's cost tracks the SEGMENT count, which is the chunk count times the
