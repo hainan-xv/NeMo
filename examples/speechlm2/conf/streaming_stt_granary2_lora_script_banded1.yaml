@@ -195,15 +195,27 @@ data:
     force_iterable_dataset: true
     use_bucketing: true
     bucket_duration_bins: [4.32,6.0,7.04,7.92,8.8,9.6,10.4,11.12,11.89,12.66,13.47,14.8,16.92,20.0,22.4,29.44,35.0,39.6]
-    # DIVIDED BY 3 versus the forced arm's [38,29,25,...,5,4]. The band emits one
-    # branch segment per candidate cut, so the packed sequence is ~3x longer
-    # (measured on Qwen3-1.7B at chunk_size 14: 975 -> 2793 tokens for 40 s audio).
-    # The dominant memory term is the logits tensor (B, L, 151936) plus its
-    # gradient, which is LINEAR in L -- so 3x the length needs 1/3 the batch.
-    # Without this every single batch OOMs: job 13397556 skipped 25 in a row and
-    # the oom_skip_limit re-raised, which is the correct behaviour and exactly how
-    # this was found.
-    bucket_batch_size: [12, 9, 8, 7, 6, 6, 5, 5, 4, 4, 4, 3, 3, 2, 2, 2, 1, 1]
+    # SIZED BY PACKED LENGTH, not by duration alone. Lhotse keys the batch on
+    # audio duration, but what actually fills the GPU is the LLM's logits tensor
+    # (B, L, 151936) plus its gradient -- linear in the PACKED sequence length L,
+    # which the band inflates by emitting one branch segment per candidate cut.
+    #
+    # That inflation is NOT uniform: measured with the real builders at
+    # chunk_size 14 / band_words 1, L grows 2.35x at the 4.3 s bin but 2.87x at
+    # 39.6 s, because longer audio means more chunks and each chunk multiplies.
+    # A flat divisor therefore over-allocates exactly where it hurts -- the long
+    # bins -- which is where job 13398712 died (OOM of 1.71 GiB in backward).
+    #
+    # These hold batch x L constant at the FORCED arm's own token budget
+    # (B_forced x L_forced), times 0.85 for headroom, since the forced sizing was
+    # tuned against forward peak and the band's backward peak is what broke.
+    # Regenerate after changing band_words or chunk_size: build both
+    # build_packed_chunk_example and build_packed_banded_example per duration bin,
+    # take input_ids.numel(), and rescale.
+    #
+    #   forced : [38,29,25,22,20,18,17,15,14,13,12,11,10,8,7,6,5,4]
+    #   flat/3 : [12, 9, 8, 7, 6, 6, 5, 5, 4, 4, 4, 3, 3,2,2,2,1,1]  <- too big at 12.7s/13.5s/29.4s
+    bucket_batch_size: [13, 9, 8, 7, 6, 5, 5, 4, 4, 3, 3, 3, 3, 2, 2, 1, 1, 1]
     max_duration: 54
     pad_extra_duration: 0.5
     pad_extra_duration_prob: 1.0
