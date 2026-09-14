@@ -77,12 +77,43 @@ fi
 # `-last` and `-unfinished` are excluded: `-last` duplicates a scored checkpoint
 # (averaging it would silently double its weight) and `-unfinished` may be a
 # partial write.
-mapfile -t BEST < <(ls "${CKPT_DIR}"/*.ckpt 2>/dev/null \
+mapfile -t SCORED < <(ls "${CKPT_DIR}"/*.ckpt 2>/dev/null \
     | grep -v -- '-last' | grep -v -- 'unfinished' \
-    | sed -E 's/.*val_wer=([0-9.]+).*/\1 &/' | sort -g -k1,1 | head -n "$TOPK" | cut -d' ' -f2-)
+    | sed -E 's/.*val_wer=([0-9.]+).*/\1 &/' | sort -g -k1,1)
 
-if [[ ${#BEST[@]} -eq 0 ]]; then
+if [[ ${#SCORED[@]} -eq 0 ]]; then
     echo "ERROR: no scored checkpoints in ${CKPT_DIR}" >&2
+    exit 1
+fi
+
+# DROP OUTLIERS BEFORE TAKING THE TOP K. Early in a run there are fewer than K
+# scored checkpoints, so top-K silently reaches back to epoch 0 -- which on these
+# arms sits at val_wer 0.63-0.82 against 0.15-0.18 for a trained epoch. Averaging
+# that in produces a model that never existed, and the output looks completely
+# normal: the banner lists K checkpoints and the leaderboard prints a number.
+# Anything worse than MAX_WER_RATIO x the best is excluded and SAID SO, so a
+# short arm reports an honest average over 2 checkpoints instead of a quiet
+# fiction over 5. Set MAX_WER_RATIO=0 to disable.
+MAX_WER_RATIO="${MAX_WER_RATIO:-2.0}"
+BEST_WER="${SCORED[0]%% *}"
+declare -a KEPT=() DROPPED=()
+for row in "${SCORED[@]}"; do
+    wer="${row%% *}"; path="${row#* }"
+    if [[ "$MAX_WER_RATIO" != "0" ]] \
+       && awk -v w="$wer" -v b="$BEST_WER" -v r="$MAX_WER_RATIO" 'BEGIN{exit !(b>0 && w>b*r)}'; then
+        DROPPED+=("${path##*/}")
+    else
+        KEPT+=("$path")
+    fi
+done
+if [[ ${#DROPPED[@]} -gt 0 ]]; then
+    echo "==> excluding ${#DROPPED[@]} checkpoint(s) worse than ${MAX_WER_RATIO}x the best val_wer (${BEST_WER}):"
+    printf '      %s\n' "${DROPPED[@]}"
+fi
+
+BEST=("${KEPT[@]:0:$TOPK}")
+if [[ ${#BEST[@]} -eq 0 ]]; then
+    echo "ERROR: every checkpoint in ${CKPT_DIR} was excluded as an outlier" >&2
     exit 1
 fi
 echo "==> averaging ${#BEST[@]} checkpoints for ${ARM_EXP_NAME}:"
