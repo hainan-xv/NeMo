@@ -182,7 +182,15 @@ ATTN_BACKEND="${ATTN_BACKEND:-dense}"
 BAND_WORDS="${BAND_WORDS:-1}"
 ACT_CKPT="${ACT_CKPT:-false}"
 AUDIO_HISTORY_CHUNKS="${AUDIO_HISTORY_CHUNKS:-0}"
-CHUNK_SIZES="${CHUNK_SIZES:-[2,4,7,10,14,28]}"
+# SINGLE chunk size, unlike every other SCRIPT arm. Benchmarked on Qwen3-1.7B,
+# the band's cost tracks the SEGMENT count, which is the chunk count times the
+# candidates per chunk -- so it is worst exactly where chunks are smallest:
+# 5.4x forced at chunk_size 2 (20 s audio -> 375 segments, 3120 tokens) against
+# 1.5-2.7x at chunk_size 14. Drawing uniformly from the six sizes would spend a
+# sixth of every epoch in the 5.4x case for a latency setting we are not yet
+# trying to answer questions about. Pinning 14 buys a fast first read; widen it
+# once the band is known to help.
+CHUNK_SIZES="${CHUNK_SIZES:-14}"
 # Apostrophe-free by construction: the Hydra override wraps it in single quotes.
 SYSTEM_PROMPT="${SYSTEM_PROMPT:-You are doing streaming speech recognition. Given the transcript so far and the representation of the next audio chunk, output the words spoken in that chunk.}"
 

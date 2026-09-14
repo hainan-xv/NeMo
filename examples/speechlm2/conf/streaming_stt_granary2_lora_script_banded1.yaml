@@ -41,7 +41,11 @@ model:
   sample_rate: 16000
   blank_token: ""            # no-blank: silent chunks emit <|im_end|>
   frame_length_in_secs: 0.08
-  chunk_size: [2, 4, 7, 10, 14, 28]   # multi chunk-size: one drawn per batch
+  # SINGLE chunk size for this arm (every other SCRIPT recipe draws from the six).
+  # The band's cost tracks the SEGMENT count = chunks x candidates, so it is worst
+  # where chunks are smallest: measured 5.4x forced at chunk_size 2 versus 1.5-2.7x
+  # at 14. A fixed 14 gives a fast first read on whether the band helps at all.
+  chunk_size: 14
   att_context_size: [70, 1]  # left 70; right (look-ahead) set per batch to chunk-1
   audio_pad_to: 0
 
@@ -191,7 +195,15 @@ data:
     force_iterable_dataset: true
     use_bucketing: true
     bucket_duration_bins: [4.32,6.0,7.04,7.92,8.8,9.6,10.4,11.12,11.89,12.66,13.47,14.8,16.92,20.0,22.4,29.44,35.0,39.6]
-    bucket_batch_size: [38,29,25,22,20,18,17,15,14,13,12,11,10,8,7,6,5,4]
+    # DIVIDED BY 3 versus the forced arm's [38,29,25,...,5,4]. The band emits one
+    # branch segment per candidate cut, so the packed sequence is ~3x longer
+    # (measured on Qwen3-1.7B at chunk_size 14: 975 -> 2793 tokens for 40 s audio).
+    # The dominant memory term is the logits tensor (B, L, 151936) plus its
+    # gradient, which is LINEAR in L -- so 3x the length needs 1/3 the batch.
+    # Without this every single batch OOMs: job 13397556 skipped 25 in a row and
+    # the oom_skip_limit re-raised, which is the correct behaviour and exactly how
+    # this was found.
+    bucket_batch_size: [12, 9, 8, 7, 6, 6, 5, 5, 4, 4, 4, 3, 3, 2, 2, 2, 1, 1]
     max_duration: 54
     pad_extra_duration: 0.5
     pad_extra_duration_prob: 1.0
