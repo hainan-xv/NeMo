@@ -98,7 +98,7 @@ model:
   # REQUIRED by loss_type=banded: in the flat layout branches are one inseparable
   # sequence and cannot be added without rebuilding the packed mask.
   twod_layout: true
-  twod_branch_micro_batch: 8
+  twod_branch_micro_batch: 32
   # A CUDA OOM in the forward pass drops that batch on EVERY rank (the
   # verdict is all-reduced, so DDP stays in lockstep) instead of killing the
   # job. Job 13380534 lost an 8-node block this way at 3h50m. Skips are
