@@ -7,7 +7,10 @@
 #SBATCH -p interactive
 #SBATCH -N 1
 #SBATCH --gpus-per-node=8
-#SBATCH -t 04:00:00
+# 2h30 for three arms. Measured: one Qwen arm (average top-5 + the full 74,838
+# utterances) took 12m30s, the 1k-vocab arms ~8m each. 50m expected, so this is
+# ~3x margin -- and a shorter wall backfills onto interactive sooner than 4h.
+#SBATCH -t 02:30:00
 #SBATCH --exclusive
 #SBATCH --mem=0
 #SBATCH --ntasks-per-node=1
