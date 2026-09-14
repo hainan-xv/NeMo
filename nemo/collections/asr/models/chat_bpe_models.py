@@ -248,6 +248,25 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
             _patch[0].get_vocab = _patch[1]
             self._hf_vocab_patch = None
 
+        # HISTORY RECOVERY IS FORCED-PATH ONLY. `recover_history_words` is
+        # implemented in build_forced_path, which only _forced_alignment_loss
+        # reaches; _banded_loss goes _chunk_tokens -> build_lattices -> band_nodes,
+        # and build_lattices reads only the per-chunk token COUNTS. So the knob
+        # would be accepted, logged, and have ZERO effect on the loss.
+        #
+        # It is not merely unplumbed. Recovery re-emits the previous chunk's last
+        # k words, i.e. the same u twice; a banded path is a monotone RNN-T
+        # forward that visits each u exactly once, so no band width can express
+        # it. The band says WHERE a word may go (an alternative); recovery says
+        # resume from a truncated history (a repetition). Different objectives.
+        if self.loss_type == "banded" and self.recover_history_words > 0:
+            raise ValueError(
+                f"forced_alignment.recover_history_words={self.recover_history_words} has no effect with "
+                f"loss_type='banded': recovery is built in build_forced_path, which the banded loss never "
+                f"calls, and a monotone lattice path cannot emit the same token twice. Use "
+                f"loss_type='forced_alignment' (band_chunks is then irrelevant), or set recover_history_words=0."
+            )
+
         # GUARDS THE JOINT CANNOT EXPRESS. The joint sees one chunk size and knows
         # nothing about the delay; both failures below are silent.
         #
