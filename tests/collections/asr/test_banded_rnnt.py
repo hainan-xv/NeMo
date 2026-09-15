@@ -252,3 +252,61 @@ def test_band_side_is_validated():
 
     with pytest.raises(ValueError, match="side must be"):
         band_nodes([1, 1], 1, "rightwards")
+
+
+def test_padding_does_not_create_label_transitions_for_short_utterances():
+    """A short utterance's loss must not depend on how long its BATCHMATES are.
+
+    ``has_label`` masks on ``targets.shape[1]`` -- the BATCH-PADDED width, not
+    each utterance's own target length -- so nodes at ``u == U_b`` for a short
+    utterance are scored as if a label followed, gathering the PAD id. That
+    looks like a latent correctness bug and is worth pinning, but it is benign
+    for a specific structural reason: ``band_nodes`` never emits a node beyond
+    ``u == U_b``, so nothing exists at ``u + 1`` to consume that transition, and
+    the gathered value is discarded. Measured on this batch: 6 nodes sit at or
+    past their own end and 0 of them feed a label transition.
+
+    Two independent pins, because the cheap one alone would not catch a
+    regression that made the mask matter:
+      1. the same utterance batched against a long vs. a short neighbour must
+         score identically;
+      2. the loss must be invariant to the PAD VALUE itself -- the direct test
+         that the gathered padding is never consumed.
+    """
+    torch.manual_seed(0)
+    V, blank = 10, 10
+    short = [[7], [8], [], []]
+
+    losses = []
+    for neighbour in ([[1, 2], [3], [4, 5], [6]], [[1], [2], [], []]):
+        chunks = [short, neighbour]
+        per_utt, num_chunks, target_lens = build_lattices(chunks, 1, "both")
+        lat = BandedLattice(per_utt, num_chunks, target_lens)
+        targets = torch.zeros((2, max(max(target_lens), 1)), dtype=torch.long)
+        for b, cs in enumerate(chunks):
+            flat = [t for c in cs for t in c]
+            if flat:
+                targets[b, : len(flat)] = torch.tensor(flat)
+        # Score every node identically so the only possible difference is which
+        # transitions the mask admits.
+        lp = torch.full((lat.num_nodes, V + 1), -1.0).log_softmax(-1)
+        losses.append(banded_rnnt_loss(lp, lat, targets, blank)[0].item())
+
+    assert losses[0] == pytest.approx(
+        losses[1], abs=1e-5
+    ), f"short utterance's loss changed with its batchmate's length: {losses}"
+
+    # Pin 2: the pad value must not reach the loss at all.
+    chunks = [short, [[1, 2], [3], [4, 5], [6]]]
+    per_utt, num_chunks, target_lens = build_lattices(chunks, 1, "both")
+    lat = BandedLattice(per_utt, num_chunks, target_lens)
+    lp = torch.randn(lat.num_nodes, V + 1).log_softmax(-1)
+    by_pad = []
+    for pad in (0, 3, V):
+        targets = torch.full((2, max(target_lens)), pad, dtype=torch.long)
+        for b, cs in enumerate(chunks):
+            flat = [t for c in cs for t in c]
+            if flat:
+                targets[b, : len(flat)] = torch.tensor(flat)
+        by_pad.append(banded_rnnt_loss(lp, lat, targets, blank).tolist())
+    assert by_pad[0] == by_pad[1] == by_pad[2], f"loss depends on the pad value: {by_pad}"
