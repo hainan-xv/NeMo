@@ -128,7 +128,7 @@ MOUNTS="--container-mounts=${CODE_DIR}:/code,${RESULTS_DIR}:/results,${HFCACHE}:
 read -r -d '' cmd <<EOF
 echo "*******STARTING********" \
 && echo "*** DFW CHAT transducer (RNNTAttJoint), loss_type=${LOSS_TYPE} ***" \
-&& echo "*** knobs: delay=${DELAY_FRAMES} recover=${RECOVER_WORDS} history_chunks=${HISTORY_CHUNKS} band=${BAND_CHUNKS} targets=${TARGET_CONSTRUCTION} punct_delay=${DELAY_PUNCT} ***" \
+&& echo "*** knobs: delay=${DELAY_FRAMES} recover=${RECOVER_WORDS} history_chunks=${HISTORY_CHUNKS} band=${BAND_CHUNKS} band_side=${BAND_SIDE} targets=${TARGET_CONSTRUCTION} punct_delay=${DELAY_PUNCT} ***" \
 && echo "*** schedule: epoch=${EPOCH_STEPS} lr=${LR} warmup=${WARMUP_STEPS} max_steps=${MAX_STEPS} ***" \
 && nvidia-smi \
 && export WANDB_API_KEY=${WANDB} \
