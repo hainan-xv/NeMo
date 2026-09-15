@@ -113,7 +113,10 @@ CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/llmservice/users/heh/containers/n
 OUTPUT_PREFIX="${OUTPUT_PREFIX:-/lustre/fsw/portfolios/nemotron/users/hainanx}"
 CODE_DIR="${CODE_DIR:-/lustre/fsw/portfolios/nemotron/users/hainanx/NeMo_SCRIPT_cc}"
 CACHE_DIR="${CACHE_DIR:-/lustre/fsw/portfolios/llmservice/users/hainanx/leaderboard_cache}"
-H_DIR=/lustre/fsw/portfolios/llmservice/users/heh
+# Overridable: this is an OCI path (llmservice/users/heh) and does not exist on
+# every cluster. Mounting a path that is not there fails the container outright,
+# so a DFW wrapper points this at its own equivalent.
+H_DIR="${H_DIR:-/lustre/fsw/portfolios/llmservice/users/heh}"
 HFCACHE="${OUTPUT_PREFIX}/hf_cache"
 OCI_TMP_DIR="${OCI_TMP_DIR:-/tmp/nemotron_eval_${SLURM_JOB_ID:-$$}}"
 
