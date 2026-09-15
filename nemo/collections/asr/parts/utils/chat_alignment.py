@@ -262,7 +262,7 @@ def build_forced_path(
     return t_idx, u_idx, labels
 
 
-def band_nodes(tokens_per_chunk: Sequence[int], band: int) -> List[Tuple[int, int]]:
+def band_nodes(tokens_per_chunk: Sequence[int], band: int, side: str = "both") -> List[Tuple[int, int]]:
     """Lattice nodes ``(t, u)`` within ``band`` chunks of the forced path.
 
     The middle ground between the two losses. Conditioning on ONE alignment
@@ -290,10 +290,20 @@ def band_nodes(tokens_per_chunk: Sequence[int], band: int) -> List[Tuple[int, in
     for n in tokens_per_chunk:
         cum.append(cum[-1] + int(n))
 
+    if side not in ("both", "later", "earlier"):
+        raise ValueError(f"side must be 'both', 'later' or 'earlier', got {side!r}")
+
     nodes: List[Tuple[int, int]] = []
     for t in range(T):
-        u_lo = cum[max(0, t - band)]
-        u_hi = cum[min(T - 1, t + band) + 1]
+        # u is the number of labels emitted BY chunk t, so the two directions are:
+        #   lower u  -> fewer labels emitted so far -> a word DEFERRED ("later")
+        #   higher u -> more labels emitted already -> a word PULLED FORWARD
+        # "later" is the half aligner error can justify: a word whose audio ends
+        # just after a chunk boundary cannot honestly be emitted before that audio
+        # arrives, which is the same thing num_delay_frames guards. It also costs
+        # about half of the two-sided band.
+        u_lo = cum[max(0, t - band)] if side in ("both", "later") else cum[t]
+        u_hi = cum[min(T - 1, t + band) + 1] if side in ("both", "earlier") else cum[t + 1]
         for u in range(u_lo, u_hi + 1):
             nodes.append((t, u))
     return nodes

@@ -146,15 +146,21 @@ def banded_rnnt_loss(
 
 
 def build_lattices(
-    chunk_tokens_per_utt: Sequence[Sequence[Sequence[int]]], band: int
+    chunk_tokens_per_utt: Sequence[Sequence[Sequence[int]]], band: int, band_side: str = "both"
 ) -> Tuple[List[List[Tuple[int, int]]], List[int], List[int]]:
-    """Nodes, chunk counts and label counts for a batch of forced alignments."""
+    """Nodes, chunk counts and label counts for a batch of forced alignments.
+
+    ``band_side`` restricts which half of the band is kept -- see
+    :func:`~nemo.collections.asr.parts.utils.chat_alignment.band_nodes`.
+    ``"later"`` allows only deferral, which is the direction aligner error can
+    justify and roughly halves the node count against a two-sided band.
+    """
     from nemo.collections.asr.parts.utils.chat_alignment import band_nodes
 
     per_utt, num_chunks, target_lens = [], [], []
     for chunks in chunk_tokens_per_utt:
         counts = [len(c) for c in chunks]
-        per_utt.append(band_nodes(counts, band))
+        per_utt.append(band_nodes(counts, band, band_side))
         num_chunks.append(len(counts))
         target_lens.append(sum(counts))
     return per_utt, num_chunks, target_lens

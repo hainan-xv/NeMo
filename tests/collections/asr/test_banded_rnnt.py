@@ -188,3 +188,67 @@ class TestBandedRNNT:
             offset = 0 if i == 0 else lat.b_idx.index(1)
             alone = banded_rnnt_loss(lp[offset : offset + lat1.num_nodes], lat1, targets[i : i + 1], 5)
             assert torch.allclose(both[i], alone[0], atol=1e-5), f"utterance {i} depends on its neighbour"
+
+
+@pytest.mark.unit
+def test_band_side_later_only_allows_deferral():
+    """'later' must widen the band DOWNWARD in u, never upward.
+
+    u is the number of labels emitted BY chunk t, so a LOWER u means fewer labels
+    emitted so far -- a word deferred to a later chunk. A HIGHER u means a word
+    pulled forward, i.e. emitted before its audio has fully arrived, which is the
+    thing num_delay_frames exists to prevent.
+
+    Reads backwards, so it is pinned here: a sign flip would be invisible in
+    training and would just look like slightly worse WER.
+    """
+    from nemo.collections.asr.parts.utils.chat_alignment import band_nodes
+
+    counts = [2, 2, 2]  # forced path: chunk t owns u in [2t, 2t+2]
+
+    forced = {t: (u, u) for t, u in []}  # placeholder, computed below
+    by_t = {}
+    for side in ("both", "later", "earlier"):
+        nodes = band_nodes(counts, 1, side)
+        by_t[side] = {
+            t: (min(u for tt, u in nodes if tt == t), max(u for tt, u in nodes if tt == t)) for t in range(3)
+        }
+
+    for t in range(3):
+        lo_b, hi_b = by_t["both"][t]
+        lo_l, hi_l = by_t["later"][t]
+        lo_e, hi_e = by_t["earlier"][t]
+        # 'later' keeps the forced upper edge and widens below.
+        assert hi_l == 2 * t + 2, f"'later' widened UPWARD at t={t}: {hi_l}"
+        assert lo_l == lo_b, f"'later' should widen down as far as 'both' at t={t}"
+        # 'earlier' is the mirror image.
+        assert lo_e == 2 * t, f"'earlier' widened DOWNWARD at t={t}: {lo_e}"
+        assert hi_e == hi_b, f"'earlier' should widen up as far as 'both' at t={t}"
+
+
+@pytest.mark.unit
+def test_one_sided_band_has_fewer_nodes_than_two_sided():
+    """The point of the one-sided band: roughly half the lattice."""
+    from nemo.collections.asr.parts.utils.chat_alignment import band_nodes
+
+    counts = [3] * 8
+    both = len(band_nodes(counts, 1, "both"))
+    later = len(band_nodes(counts, 1, "later"))
+    forced = len(band_nodes(counts, 0, "later"))
+    assert forced < later < both, f"forced={forced} later={later} both={both}"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("side", ["both", "later", "earlier"])
+def test_band_zero_is_the_forced_path_whatever_the_side(side):
+    from nemo.collections.asr.parts.utils.chat_alignment import band_nodes
+
+    assert band_nodes([2, 2, 2], 0, side) == band_nodes([2, 2, 2], 0, "both")
+
+
+@pytest.mark.unit
+def test_band_side_is_validated():
+    from nemo.collections.asr.parts.utils.chat_alignment import band_nodes
+
+    with pytest.raises(ValueError, match="side must be"):
+        band_nodes([1, 1], 1, "rightwards")

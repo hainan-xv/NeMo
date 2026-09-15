@@ -68,6 +68,7 @@ RECOVER_WORDS="${RECOVER_WORDS:-0}"
 HISTORY_CHUNKS="${HISTORY_CHUNKS:-0}"
 MAX_DELAY_FRAMES="${MAX_DELAY_FRAMES:-0}"
 BAND_CHUNKS="${BAND_CHUNKS:-1}"
+BAND_SIDE="${BAND_SIDE:-later}"
 DELAY_PUNCT="${DELAY_PUNCT:-true}"
 TARGET_CONSTRUCTION="${TARGET_CONSTRUCTION:-partition}"
 INFER_DELAY_FRAMES="${INFER_DELAY_FRAMES:-null}"
@@ -165,6 +166,7 @@ print('    tokenizer ->', dst)
     model.forced_alignment.num_delay_frames=${DELAY_FRAMES} \
     model.forced_alignment.max_delay_frames=${MAX_DELAY_FRAMES} \
     model.forced_alignment.band_chunks=${BAND_CHUNKS} \
+    ++model.forced_alignment.band_side=${BAND_SIDE} \
     model.forced_alignment.delay_word_final_punctuation=${DELAY_PUNCT} \
     model.forced_alignment.target_construction=${TARGET_CONSTRUCTION} \
     model.forced_alignment.inference_delay_frames=${INFER_DELAY_FRAMES} \

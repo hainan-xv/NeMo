@@ -280,6 +280,16 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
         # Costs one extra validation decode, so it is a config switch rather than
         # unconditional; default ON because an incomparable metric has repeatedly
         # cost more than the decode does.
+        # Which half of the band to keep. "later" allows only DEFERRAL -- a word may
+        # be emitted a chunk later than the aligner placed it, never earlier --
+        # which is the direction aligner error can justify, since a word whose
+        # audio ends just after a boundary cannot honestly be emitted before that
+        # audio arrives. It also roughly halves the lattice against a two-sided
+        # band. Matches the SCRIPT models' band_side so the two families' banded
+        # arms mean the same thing.
+        self.band_side = str(fa.get("band_side", "later")).lower()
+        if self.band_side not in ("both", "later", "earlier"):
+            raise ValueError(f"forced_alignment.band_side must be both|later|earlier, got {self.band_side!r}")
         self._log_normalised_wer = bool(fa.get("log_normalised_wer", True))
         self._text_normalizer = None
 
@@ -729,7 +739,7 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
         n_chunks = torch.div(encoded_len + chunk_size - 1, chunk_size, rounding_mode="floor").cpu()
 
         chunks_per_utt = [self._chunk_tokens(cut, int(n_chunks[b])) for b, cut in enumerate(cuts)]
-        per_utt, num_chunks, target_lens = build_lattices(chunks_per_utt, self.band_chunks)
+        per_utt, num_chunks, target_lens = build_lattices(chunks_per_utt, self.band_chunks, self.band_side)
         if sum(target_lens) == 0:
             logging.warning(f"empty banded lattice at step {self.global_step}; contributing zero loss")
             return encoded.sum() * 0.0
