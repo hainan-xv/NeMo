@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH -A nemotron_speechprod_asr
-#SBATCH -J nemotron_speechprod_asr:dfw-script-banded1
+#SBATCH -J nemotron_speechprod_asr:dfw-script-banded1-both
 # DFW's default GPU partition. Unlike OCI there is ONE pool of 1850 nodes rather
 # than batch_block1/3/4, so no comma-list is needed.
 #SBATCH -p batch
@@ -18,45 +18,34 @@
 #SBATCH --exclude=pool0-00407
 
 # ============================================================================
-# SCRIPT with the BANDED loss, on the CW DFW cluster.
+# SCRIPT with a TWO-SIDED banded loss (band_side=both).
 #
-#   sbatch launch/dfw_script_banded1.sh          <- no arguments
+#   sbatch launch/dfw_script_banded1_both.sh          <- no arguments
 #
-# The DFW port of launch/script_banded1.sh. The MODEL is identical -- same
-# config, same loss_type=banded, same band_words=1, same target_construction=
-# partition -- so a result here is comparable with the OCI arm. Only the cluster
-# differs, and every difference is listed below.
+# The A/B partner of dfw_script_banded1.sh, which uses band_side=later. Identical
+# in every other respect, so a delta between them is the band's DIRECTION and
+# nothing else.
 #
-# WHAT DIFFERS FROM THE OCI SCRIPT, and why
-#   account      nemotron_speechprod_asr (OCI: nemotron_speech_asr)
-#   partition    batch, one pool of 1850 nodes (OCI: batch_block1,3,4)
-#   lustre       /lustre/fsw/portfolios/nemotron/projects/nemotron_speechprod_asr
-#                DFW does NOT share a filesystem with OCI -- verified, the
-#                reference paths under users/heh are unreadable from the OCI
-#                login node -- so every path here is DFW's own.
-#   scratch      .../nemotron_speechprod_asr/hainanx, because users/ under that
-#                project is not writable by me and users/hainanx cannot be
-#                created. Same project as the container and data, so the job
-#                bills where it reads.
-#   models       Qwen3-1.7B and the nemotron ASR .nemo come from users/heh's
-#                pretrained_models; they are NOT at the OCI paths.
-#   data         the DFW-side Granary input_cfg, and the mcv11 validation
-#                manifest, both under users/heh.
-#   num_workers  4, down from 8 (flagged by the reference recipe).
-#   NCCL/threads the env block below, copied from the reference recipe.
+# WHAT THE TWO SIDES MEAN. The band moves the CUT between chunks, and cut index
+# runs opposite to emission time:
+#   later  -- a word may be emitted a chunk LATER than the aligner placed it.
+#             The half aligner error can justify: a word whose audio ends just
+#             after a boundary cannot honestly be emitted before that audio has
+#             arrived, which is what num_delay_frames=3 already guards.
+#   both   -- also allows the reverse, emitting a word EARLIER than placed, which
+#             asks the model to commit from audio that may not have arrived.
 #
-# TOKENS ARE READ FROM FILES, never inlined. The reference DFW script hardcodes
-# a live WANDB key and HF token in plaintext on shared lustre; this repo is
-# pushed to GitHub, so inlining them would publish them.
+# COST. `both` offers 3 candidate cuts per chunk against 2, so roughly 50% more
+# branch segments and a correspondingly longer packed sequence -- which is the
+# term that dominates memory here. The one-sided arm measured 0.203 s/step against
+# the baseline's 0.164; expect this one to land nearer the 0.28-0.47 the two-sided
+# band cost before the per-chunk span fix.
 #
-# BATCH SIZES ARE NOT SCALED UP, and should not be. The reference recipe uses
-# int(x*1.9) versus the OCI list, which looks like it implies bigger cards -- it
-# does not. Measured from nvidia-smi in job 18615569: these are H100 80GB HBM3,
-# the SAME memory as the OCI A100s. The 1.9x is presumably because that recipe's
-# readwrite_collapse variant collapses silent audio and so runs shorter
-# sequences. Our banded bucket_batch_size was derived by direct measurement
-# against 80 GB, so it ports here unchanged; adopting the 1.9x would over-commit
-# by almost double. Guessing at memory is what cost three OOM cycles on OCI.
+# MEMORY. This is the configuration that OOMed repeatedly before that fix, so it
+# is the real test of whether per-chunk span sizing removed the tail or merely
+# made it rarer. bucket_batch_size is left at the one-sided arm's conservative
+# values deliberately -- changing two things at once would make a failure
+# unattributable.
 # ============================================================================
 set -uo pipefail
 
@@ -78,7 +67,7 @@ PROJECT_NAME="${PROJECT_NAME:-SpeechlmDFW}"
 # --- the banded recipe, identical to the OCI arm ---
 CONFIG_PATH=/code/examples/speechlm2/conf
 CONFIG_NAME="${CONFIG_NAME:-streaming_stt_granary2_lora_script_banded1}"
-EXP_NAME="${EXP_NAME:-dfw_granary2_script_banded1}"
+EXP_NAME="${EXP_NAME:-dfw_granary2_script_banded1_both}"
 
 MAX_STEPS="${MAX_STEPS:-500000}"
 VAL_CHECK_INTERVAL="${VAL_CHECK_INTERVAL:-2000}"
@@ -87,7 +76,7 @@ LR="${LR:-1e-4}"
 WARMUP_STEPS="${WARMUP_STEPS:-5000}"
 CHUNK_SIZES="${CHUNK_SIZES:-14}"
 BAND_WORDS="${BAND_WORDS:-1}"
-BAND_SIDE="${BAND_SIDE:-later}"
+BAND_SIDE="${BAND_SIDE:-both}"
 ACT_CKPT="${ACT_CKPT:-true}"
 ATTN_BACKEND="${ATTN_BACKEND:-dense}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
