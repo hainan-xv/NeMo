@@ -909,6 +909,26 @@ class ScriptSTTModel(StreamingSTTModel):
 
     def _skip_oom_batch(self, batch_idx: int):
         """Drop the batch on EVERY rank, keeping DDP in lockstep."""
+        # ONE memory summary, on the FIRST OOM only, before empty_cache() erases
+        # the evidence.
+        #
+        # The OOM message says how much was in use but never WHAT was holding it,
+        # which left the banded arm's repeated failures to be answered by guessing
+        # at bucket_batch_size -- four cuts, four more failures. This prints the
+        # allocator's own breakdown (params vs activations vs fragmentation) so the
+        # next decision is made on evidence. Rank 0 only and once per process, so
+        # it cannot flood the log.
+        if not getattr(self, "_oom_summary_logged", False):
+            self._oom_summary_logged = True
+            try:
+                if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+                    logging.error(
+                        "FIRST CUDA OOM -- allocator state before empty_cache():\n%s",
+                        torch.cuda.memory_summary(abbreviated=True),
+                    )
+            except Exception:  # pragma: no cover - diagnostics must never add a failure
+                pass
+
         # Release whatever the failed forward left behind before the next batch.
         torch.cuda.empty_cache()
 
