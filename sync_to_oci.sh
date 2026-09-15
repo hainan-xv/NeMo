@@ -107,6 +107,17 @@ echo "==> Pushing HEAD to $BRANCH"
 git push "$GITHUB_URL" "HEAD:$BRANCH"
 
 # --- Update the grid checkout over SSH ---
+# SKIP_OCI_CHECKOUT=1 stages, commits and pushes but leaves the OCI grid checkout
+# where it is. sync_to_dfw.sh sets this: the two clusters share a branch, but a
+# queued OCI job reads its config from the checkout at RUN time, so advancing it
+# silently changes what an already-submitted OCI run will do. That is wanted when
+# fixing an OCI arm and unwanted when the change is for DFW only.
+if [[ "${SKIP_OCI_CHECKOUT:-0}" == "1" ]]; then
+    echo "==> SKIP_OCI_CHECKOUT=1; leaving the OCI checkout untouched"
+    echo "==> Push complete."
+    exit 0
+fi
+
 # Quoted heredoc: nothing expands locally; the three args carry everything.
 oci_ssh bash -s -- "$GITHUB_URL" "$BRANCH" "$OCI_REPO" <<'REMOTE'
 set -euo pipefail

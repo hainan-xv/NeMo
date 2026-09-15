@@ -665,3 +665,34 @@ def test_training_wer_is_bounded_and_disableable():
     src = inspect.getsource(ScriptSTTModel._maybe_log_training_wer)
     assert "except Exception" in src, "a metric failure must never take down training"
     assert "no_grad" in src, "the decode must not build a graph"
+    # Exact per-module restore, not a bare self.train(): _training_step_inner puts
+    # frozen submodules back into eval, and clobbering that would silently
+    # re-enable dropout in a frozen encoder for every subsequent step.
+    assert "was_training" in src and "m.train(was_training" in src
+
+
+@pytest.mark.unit
+def test_training_wer_runs_outside_the_training_step():
+    """It must run in on_train_batch_end, never inside training_step.
+
+    Extra forward passes and train/eval toggling BETWEEN a checkpointed forward
+    and its recomputation corrupt activation checkpointing:
+
+        torch.utils.checkpoint: Recomputed values for the following tensors have
+        different metadata than during the forward pass.
+
+    Both DFW SCRIPT arms died exactly that way at step 500 -- the first step where
+    train_wer_every_n_steps fired. By on_train_batch_end the backward and optimizer
+    step are complete, so the decode cannot perturb them.
+    """
+    import inspect
+
+    from nemo.collections.speechlm2.models.script_model import ScriptSTTModel
+
+    assert hasattr(ScriptSTTModel, "on_train_batch_end")
+    assert "_maybe_log_training_wer" in inspect.getsource(ScriptSTTModel.on_train_batch_end)
+
+    for step_fn in (ScriptSTTModel._training_step_inner, ScriptSTTModel._banded_training_step):
+        assert "_maybe_log_training_wer" not in inspect.getsource(
+            step_fn
+        ), f"{step_fn.__name__} must not decode mid-step; it breaks activation checkpointing"

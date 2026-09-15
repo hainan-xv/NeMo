@@ -622,23 +622,42 @@ class ScriptSTTModel(StreamingSTTModel):
                 ignore_index=IGNORE_INDEX,
             )
 
+    def on_train_batch_end(self, outputs, batch, batch_idx: int) -> None:
+        """Drive the training-WER decode AFTER the step is completely finished.
+
+        It must not live inside training_step. Doing so ran extra forward passes
+        and toggled module train/eval state between the forward and its
+        recomputation, which corrupts activation checkpointing:
+
+            torch.utils.checkpoint: Recomputed values for the following tensors
+            have different metadata than during the forward pass.
+
+        Both DFW SCRIPT arms died that way at exactly step 500 -- the first step
+        where train_wer_every_n_steps fired. By on_train_batch_end the backward
+        and optimizer step are done, so nothing this does can perturb them.
+        """
+        super().on_train_batch_end(outputs, batch, batch_idx)
+        self._maybe_log_training_wer(batch)
+
     def _maybe_log_training_wer(self, batch: ScriptBatch) -> None:
         """Log ``training_batch_wer`` on a bounded sample of the training batch.
 
-        Named to match the ASR collection, so CHAT and SCRIPT land on one wandb
-        panel. Like CHAT's, it is a real decode rather than a teacher-forced
+        Named to match the ASR collection so CHAT and SCRIPT land on one wandb
+        panel, and like CHAT's it is a real decode rather than a teacher-forced
         score, so the two measure the same thing.
 
         Deliberately cheap and deliberately noisy: a handful of utterances every
         few hundred steps is enough to see a training curve diverge from
         validation, and not enough to slow the run. It is NOT a substitute for
-        val_wer -- it is measured on whatever chunk size this batch drew, which
-        for a multi chunk-size arm varies from step to step.
+        val_wer -- it is measured on whatever chunk size this batch drew, which for
+        a multi chunk-size arm varies step to step.
 
-        Any failure here is swallowed: a metric must never be able to kill a
-        training run. The decode path is shared with validation and can raise on
-        a degenerate batch (no audio, empty reference), which would otherwise take
-        down every rank at once.
+        Module train/eval flags are saved and restored EXACTLY, per module. A bare
+        self.train() afterwards would be wrong: _training_step_inner deliberately
+        puts frozen submodules back into eval, and clobbering that would silently
+        re-enable dropout in a frozen encoder for every later step.
+
+        Any failure is swallowed: a metric must never be able to kill a run.
         """
         every = int(getattr(self.core_cfg, "train_wer_every_n_steps", 0) or 0)
         if every <= 0 or self._trainer is None:
@@ -649,11 +668,11 @@ class ScriptSTTModel(StreamingSTTModel):
 
         n = max(int(getattr(self.core_cfg, "train_wer_max_utts", 4) or 4), 1)
         refs = [t for t in (batch.text or [])][:n]
-        if not refs:
+        if not refs or batch.audios is None:
             return
 
+        was_training = {name: m.training for name, m in self.named_modules()}
         try:
-            was_training = self.training
             self.eval()
             with torch.no_grad():
                 hyps = self.generate(
@@ -663,9 +682,6 @@ class ScriptSTTModel(StreamingSTTModel):
                     max_new_tokens=self.val_max_new_tokens_per_chunk,
                     chunk_size_override=batch.chunk_size,
                 )
-            if was_training:
-                self.train()
-
             metric = WER(normalize=False, verbose=False)
             metric.update("train", refs=refs, hyps=[str(h) for h in hyps])
             for name, value in metric.compute().items():
@@ -673,8 +689,13 @@ class ScriptSTTModel(StreamingSTTModel):
                     self.log("training_batch_wer", value.to(self.device), on_step=True)
         except Exception as e:  # pragma: no cover - never let a metric kill training
             logging.warning("training_batch_wer skipped: %r", e)
-            if self.training is False:
-                self.train()
+        finally:
+            for name, m in self.named_modules():
+                if name in was_training:
+                    m.train(was_training[name])
+            # generate() may have retuned the encoder's look-ahead; put it back.
+            if getattr(self, "_last_chunk_size", None) is not None:
+                self._set_encoder_att_context(self._last_chunk_size)
 
     def _banded_training_step(self, batch: ScriptBatch, batch_idx: int):
         """Marginalise the loss over every in-band word-to-chunk assignment.
@@ -926,8 +947,6 @@ class ScriptSTTModel(StreamingSTTModel):
         # receptive field never crosses its chunk boundary.
         self._set_encoder_att_context(batch.chunk_size)
         self._last_chunk_size = batch.chunk_size
-
-        self._maybe_log_training_wer(batch)
 
         if self._loss_type == "banded":
             return self._banded_training_step(batch, batch_idx)

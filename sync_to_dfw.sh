@@ -21,9 +21,10 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 source ./dfw_env.sh
 
 # --- Stage, commit and push via the OCI script (shared allowlist + branch) ---
-# It also updates the OCI checkout, which is harmless and keeps the two clusters
-# on the same commit.
-./sync_to_oci.sh "${1:-Sync code $(date +%Y%m%d_%H%M%S)}"
+# SKIP_OCI_CHECKOUT: publish the branch, but do NOT advance the OCI grid
+# checkout. OCI has long-running arms whose queued jobs read the checkout at
+# run time; a DFW-only change must not alter what they do.
+SKIP_OCI_CHECKOUT=1 ./sync_to_oci.sh "${1:-Sync code $(date +%Y%m%d_%H%M%S)}"
 
 # --- Update the DFW checkout over SSH ---
 # Quoted heredoc: nothing expands locally; the three args carry everything.
