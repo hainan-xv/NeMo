@@ -747,8 +747,18 @@ class ScriptSTTModel(StreamingSTTModel):
 
         # Absolute <ve> index per segment; segments differ in width because the
         # audio window narrows for early chunks, so this cannot be derived.
+        # Segments are NOT uniform width any more: each is sized to its own chunk's
+        # span length, which is what stopped one dense chunk from inflating the
+        # whole utterance. So clamp each segment's reads to its OWN last position
+        # rather than to the sequence end -- otherwise a short segment would read
+        # forward into the next one and silently score the wrong tokens.
+        #
+        # The over-read positions are harmless: span_valid marks every k beyond the
+        # segment's real length invalid, and span_scores' cumsum is prefix-only, so
+        # a valid k never depends on a garbage k' > k.
+        last = (lat.branch_ve_abs + lat.branch_span_len).unsqueeze(-1)  # (B, N, 1)
         idx = lat.branch_ve_abs.unsqueeze(-1) + torch.arange(k1, device=logits.device)
-        idx = idx.clamp(max=seq_len - 1).reshape(b_size, -1)  # (B, N * k1)
+        idx = torch.minimum(idx, last).clamp(max=seq_len - 1).reshape(b_size, -1)  # (B, N * k1)
 
         # Only the (B, L) logsumexp is upcast; .float() on (B, L, 151936) would
         # allocate gigabytes and be recomputed under activation checkpointing.

@@ -774,3 +774,123 @@ def test_shipped_recipe_uses_the_one_sided_band():
     cfg = OmegaConf.load(path)
     assert cfg.model.band_side == "later"
     assert cfg.data.dataset.band_side == cfg.model.band_side
+
+
+# ---------------------------------------------------------------------------
+# Per-chunk span sizing
+# ---------------------------------------------------------------------------
+
+
+def _uneven_chunks():
+    """One word-dense chunk among sparse ones -- the shape that caused the OOMs."""
+    from nemo.collections.speechlm2.parts.script import ChunkSpec
+
+    return [
+        ChunkSpec(audio_len=2, target_ids=[10]),
+        ChunkSpec(audio_len=2, target_ids=list(range(20, 40))),  # the dense one
+        ChunkSpec(audio_len=2, target_ids=[50]),
+        ChunkSpec(audio_len=2, target_ids=[60]),
+    ]
+
+
+@pytest.mark.unit
+def test_one_dense_chunk_does_not_inflate_the_other_segments():
+    """THE FIX: segments are sized per chunk, not to the utterance-wide maximum.
+
+    Sizing every segment to max(K_t) meant a single dense chunk widened ALL of
+    them, so the packed sequence -- and the (B, L, 151936) logits that dominate
+    memory -- scaled with the worst chunk. That is why the banded arm's OOMs were
+    a tail event: rank 0 sat at 33 GiB while the rank drawing a dense utterance
+    hit 78, and four global bucket_batch_size cuts never touched it.
+    """
+    from nemo.collections.speechlm2.parts.script import build_packed_banded_example
+
+    ex = build_packed_banded_example(
+        instruction_ids=[7, 8],
+        chunks=_uneven_chunks(),
+        word_starts=list(range(23)),
+        band_words=1,
+        vision_start_id=_VS,
+        vision_end_id=_VE,
+        eot_id=_EOT,
+    )
+    lens = ex.branch_span_len.view(ex.n_chunks, ex.n_cand)[:, 0].tolist()
+    assert max(lens) > min(lens), f"all segments still uniform: {lens}"
+    # The sparse chunks must stay far narrower than the dense one.
+    assert min(lens) * 3 < max(lens), f"sparse chunks not narrow enough: {lens}"
+
+
+@pytest.mark.unit
+def test_per_chunk_sizing_shortens_the_packed_sequence():
+    """The saving has to show up where memory is actually spent: sequence length."""
+    from nemo.collections.speechlm2.parts.script import build_packed_banded_example
+
+    ex = build_packed_banded_example(
+        instruction_ids=[7, 8],
+        chunks=_uneven_chunks(),
+        word_starts=list(range(23)),
+        band_words=1,
+        vision_start_id=_VS,
+        vision_end_id=_VE,
+        eot_id=_EOT,
+    )
+    n_seg = int(ex.seg_ids.max())
+    k_max = int(ex.branch_span_len.max())
+    # What a global-K build would have cost: every segment padded to k_max.
+    uniform = ex.spine_len + n_seg * (2 + 2 + k_max + 1)  # <vs> + audio(2) + <ve> + span + <eot>
+    assert int(ex.input_ids.numel()) < uniform, "per-chunk sizing saved nothing"
+
+
+@pytest.mark.unit
+def test_every_segment_reads_only_its_own_tokens():
+    """branch_ve_abs + branch_span_len must stay inside the segment.
+
+    With uneven widths a short segment could read forward into the next one and
+    silently score the wrong tokens -- the loss would still look finite.
+    """
+    from nemo.collections.speechlm2.parts.script import build_packed_banded_example
+
+    ex = build_packed_banded_example(
+        instruction_ids=[7, 8],
+        chunks=_uneven_chunks(),
+        word_starts=list(range(23)),
+        band_words=1,
+        vision_start_id=_VS,
+        vision_end_id=_VE,
+        eot_id=_EOT,
+    )
+    for n, (ve, kt) in enumerate(zip(ex.branch_ve_abs.tolist(), ex.branch_span_len.tolist())):
+        seg_id = int(ex.seg_ids[ve])
+        assert int(ex.input_ids[ve]) == _VE, f"segment {n}: ve_abs does not point at <ve>"
+        # The last position the loss reads must still belong to THIS segment.
+        assert int(ex.seg_ids[ve + kt]) == seg_id, f"segment {n} reads into segment {int(ex.seg_ids[ve + kt])}"
+
+
+@pytest.mark.unit
+def test_collated_batch_carries_per_segment_lengths():
+    """Exercises the COLLATOR, which no test touched before.
+
+    A missing field here parses and passes every builder test, then fails at
+    runtime on the grid -- which is exactly how it nearly shipped.
+    """
+    from nemo.collections.speechlm2.parts.script import (
+        build_packed_banded_example,
+        collate_packed_banded_examples,
+    )
+
+    exs = [
+        build_packed_banded_example(
+            instruction_ids=[7, 8],
+            chunks=_uneven_chunks(),
+            word_starts=list(range(23)),
+            band_words=1,
+            vision_start_id=_VS,
+            vision_end_id=_VE,
+            eot_id=_EOT,
+        )
+        for _ in range(2)
+    ]
+    batch = collate_packed_banded_examples(exs, pad_id=_PAD)
+    assert hasattr(batch, "branch_span_len"), "collator dropped branch_span_len"
+    assert batch.branch_span_len.shape == batch.branch_ve_abs.shape
+    assert int(batch.branch_span_len.max()) == int(exs[0].branch_span_len.max())

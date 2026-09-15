@@ -407,6 +407,7 @@ class PackedBandedExample:
     cut_valid: Tensor
     span_valid: Tensor
     branch_ve_abs: Tensor
+    branch_span_len: Tensor
     n_chunks: int
     n_tokens: int
     n_cand: int
@@ -459,7 +460,25 @@ def build_packed_banded_example(
     cands = band_candidate_cuts(aligner_cuts, word_starts, n_tokens, band_words, band_side)
     C = max((len(c) for c in cands), default=1)
     reach = [max(cands[t + 1]) if t + 1 < T else n_tokens for t in range(T)]
-    K = max(max((reach[t] - min(cands[t]) for t in range(T)), default=0), 0)
+
+    # PER-CHUNK span length, not one global maximum.
+    #
+    # K_t is how many tokens chunk t's segments are teacher-forced on: the furthest
+    # any of its candidates could reach. Sizing every segment to max(K_t) instead
+    # meant a single word-dense chunk inflated EVERY segment of the utterance, and
+    # the packed sequence -- and with it the (B, L, 151936) logits that dominate
+    # memory -- scales directly with that width.
+    #
+    # That is what made the banded arm's OOMs a TAIL event rather than a steady
+    # overflow: the allocator dump showed rank 0 peaking at 33 GiB while the rank
+    # that drew a dense utterance hit 78. Cutting bucket_batch_size globally (four
+    # times) only shrank the ranks that were never in trouble.
+    #
+    # The LATTICE stays rectangular at K_max -- it is a few KiB and the DP wants a
+    # dense (B, T, C, K+1) tensor -- but span_valid already marks k > K_t invalid,
+    # so the extra columns cost nothing and score nothing.
+    k_per_chunk = [max(reach[t] - min(cands[t]), 0) for t in range(T)]
+    K = max(k_per_chunk, default=0)
 
     input_ids: List[int] = list(spine_ids)
     position_ids: List[int] = list(range(P))
@@ -474,6 +493,7 @@ def build_packed_banded_example(
     cut_valid = torch.zeros((T, C), dtype=torch.bool)
     span_valid = torch.zeros((T, C, K + 1), dtype=torch.bool)
     ve_abs: List[int] = []
+    span_len: List[int] = []
 
     seg = 0
     for t, ch in enumerate(chunks):
@@ -500,23 +520,25 @@ def build_packed_banded_example(
                 cut[t, j] = u
 
             seg += 1
-            span = list(transcript_ids[u : u + K])
-            span = span + [eot_id] * (K - len(span))
+            kt = k_per_chunk[t]
+            span = list(transcript_ids[u : u + kt])
+            span = span + [eot_id] * (kt - len(span))
             pref = m + u
 
             toks = [vision_start_id] + [AUDIO_TOKEN_IDX] * w + [vision_end_id] + span + [eot_id]
-            aud = [False] + [True] * w + [False] * (K + 2)
-            fidx = [-1] + window_frames + [-1] * (K + 2)
+            aud = [False] + [True] * w + [False] * (kt + 2)
+            fidx = [-1] + window_frames + [-1] * (kt + 2)
 
             ve = 1 + w
             tgt = [IGNORE_INDEX] * len(toks)
-            for k in range(K):
+            for k in range(kt):
                 if u + k < n_tokens:
                     tgt[ve + k] = transcript_ids[u + k]
 
             ve_abs.append(len(input_ids) + ve)
+            span_len.append(kt)
             input_ids.extend(toks)
-            position_ids.extend(_branch_positions(branch_position_start(pref, w, position_scheme), w, K))
+            position_ids.extend(_branch_positions(branch_position_start(pref, w, position_scheme), w, kt))
             order_ids.extend(range(len(toks)))
             seg_ids.extend([seg] * len(toks))
             prefix_len.extend([pref] * len(toks))
@@ -542,6 +564,7 @@ def build_packed_banded_example(
         cut_valid=cut_valid,
         span_valid=span_valid,
         branch_ve_abs=torch.tensor(ve_abs, dtype=torch.long),
+        branch_span_len=torch.tensor(span_len, dtype=torch.long),
         n_chunks=T,
         n_tokens=n_tokens,
         n_cand=C,
@@ -566,6 +589,7 @@ class BatchedPackedBanded:
     cut_valid: Tensor  # (B, T, C)
     span_valid: Tensor  # (B, T, C, K + 1)
     branch_ve_abs: Tensor  # (B, T * C)
+    branch_span_len: Tensor  # (B, T * C) teacher-forced tokens per segment
     n_chunks: Tensor  # (B,)
     n_tokens: Tensor  # (B,)
     n_cand: int
@@ -601,6 +625,7 @@ def collate_packed_banded_examples(examples: List[PackedBandedExample], pad_id: 
     # 0 is a safe filler: it points at the spine, and span_valid/cut_valid keep
     # every padded entry out of the lattice.
     ve_abs = torch.zeros((B, N), dtype=torch.long)
+    span_len = torch.zeros((B, N), dtype=torch.long)
 
     for i, e in enumerate(examples):
         valid[i, : e.input_ids.numel()] = True
@@ -610,6 +635,7 @@ def collate_packed_banded_examples(examples: List[PackedBandedExample], pad_id: 
         span_valid[i, :t_i, :c_i, : e.span_valid.shape[2]] = e.span_valid
         for t in range(t_i):
             ve_abs[i, t * C : t * C + c_i] = e.branch_ve_abs[t * c_i : (t + 1) * c_i]
+            span_len[i, t * C : t * C + c_i] = e.branch_span_len[t * c_i : (t + 1) * c_i]
 
     return BatchedPackedBanded(
         input_ids=_pad("input_ids", pad_id, torch.long),
@@ -626,6 +652,7 @@ def collate_packed_banded_examples(examples: List[PackedBandedExample], pad_id: 
         cut_valid=cut_valid,
         span_valid=span_valid,
         branch_ve_abs=ve_abs,
+        branch_span_len=span_len,
         n_chunks=torch.tensor([e.n_chunks for e in examples], dtype=torch.long),
         n_tokens=torch.tensor([e.n_tokens for e in examples], dtype=torch.long),
         n_cand=C,
