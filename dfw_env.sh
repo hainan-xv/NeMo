@@ -26,7 +26,11 @@ DFW_ALIAS="${DFW_ALIAS:-dfw}"
 # The grid checkout. Filled in once the cluster's scratch layout is confirmed --
 # DFW does NOT share a filesystem with OCI (verified: the example paths under
 # .../users/heh/ are not readable from the OCI login node).
-DFW_REPO="${DFW_REPO:-/lustre/fsw/portfolios/nemotron/projects/nemotron_speechprod_asr/users/hainanx/NeMo_SCRIPT_cc}"
+# NOTE: users/ under this project is NOT writable by me, and users/hainanx
+# cannot be created -- verified, mkdir returns EACCES. The project ROOT is
+# writable, so scratch lives directly under it. Must match MYDIR in
+# launch/dfw_script_banded1.sh.
+DFW_REPO="${DFW_REPO:-/lustre/fsw/portfolios/nemotron/projects/nemotron_speechprod_asr/hainanx/NeMo_SCRIPT_cc}"
 
 # Standard ssh invocation, mirroring oci_ssh. BatchMode is NOT forced here so an
 # interactive first connection can still accept a host key; the callers that poll
