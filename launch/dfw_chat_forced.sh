@@ -59,7 +59,15 @@ find_launch_dir() {
     fi
     local here; here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     [[ -f "${here}/dfw_chat_train.sh" ]] && { echo "${here}"; return; }
-    echo "ERROR: cannot locate dfw_chat_train.sh (SLURM_SUBMIT_DIR=${SLURM_SUBMIT_DIR:-<unset>})" >&2
+    # ABSOLUTE fallback, and it is not belt-and-braces -- it is the only thing that
+    # works on a REQUEUE. Slurm hands the requeued job SLURM_SUBMIT_DIR pointing at
+    # the scratch ROOT rather than the directory the job was submitted from, and $0
+    # is the spool copy, so both of the lookups above miss. Both CHAT arms died this
+    # way every 17 minutes for three hours (exit 127) after their first 4h wall,
+    # while the self-contained SCRIPT arms requeued fine.
+    local repo="${DFW_CODE_DIR:-/lustre/fsw/portfolios/nemotron/projects/nemotron_speechprod_asr/hainanx/NeMo_SCRIPT_cc}"
+    [[ -f "${repo}/launch/dfw_chat_train.sh" ]] && { echo "${repo}/launch"; return; }
+    echo "ERROR: cannot locate dfw_chat_train.sh (SLURM_SUBMIT_DIR=${SLURM_SUBMIT_DIR:-<unset>}, repo=${repo})" >&2
     exit 1
 }
 exec bash "$(find_launch_dir)/dfw_chat_train.sh" "$@"
