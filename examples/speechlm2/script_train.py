@@ -30,10 +30,58 @@ from omegaconf import DictConfig, OmegaConf, open_dict
 
 from nemo.collections.speechlm2 import DataModule, ScriptSTTDataset, ScriptSTTModel
 from nemo.core.config import hydra_runner
+from nemo.utils import logging
 from nemo.utils.exp_manager import exp_manager
 from nemo.utils.trainer_utils import resolve_trainer_cfg
 
 torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+
+
+def _init_from_ckpt(model, path: str) -> None:
+    """Load WEIGHTS ONLY from a training checkpoint, discarding optimizer state.
+
+    This is an INITIALISATION, not a resume: the step counter, LR schedule and
+    optimizer moments are all left at their fresh values, so the new arm starts
+    its own schedule from step 0 with the donor arm's parameters. Use
+    exp_manager's resume_if_exists when you actually want to continue a run.
+
+    Shapes are checked per tensor and mismatches are skipped rather than fatal,
+    so a checkpoint from a sibling arm with a different head can still seed the
+    shared trunk. But a checkpoint that matches NOTHING raises: a silent no-op
+    here would look exactly like a successful warm start while actually training
+    from scratch, and that failure mode has already cost this project a run.
+    """
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    src = ckpt.get("state_dict", ckpt)
+    tgt = model.state_dict()
+
+    loaded, skipped, missing = {}, [], []
+    for k, v in src.items():
+        if k in tgt and tgt[k].shape == v.shape:
+            loaded[k] = v
+        elif k in tgt:
+            skipped.append(f"{k} {tuple(v.shape)} != {tuple(tgt[k].shape)}")
+        else:
+            missing.append(k)
+
+    if not loaded:
+        raise ValueError(
+            f"init_from_ckpt matched ZERO parameters from {path}. "
+            f"{len(skipped)} shape mismatches, {len(missing)} keys absent from the model. "
+            "Refusing to train from scratch under the guise of a warm start."
+        )
+
+    model.load_state_dict(loaded, strict=False)
+    logging.info(
+        "init_from_ckpt: loaded %d/%d tensors from %s (%d shape-mismatched, %d unknown keys)",
+        len(loaded),
+        len(tgt),
+        path,
+        len(skipped),
+        len(missing),
+    )
+    for line in skipped[:10]:
+        logging.warning("init_from_ckpt: shape mismatch, left at init: %s", line)
 
 
 @hydra_runner(config_path="conf", config_name="streaming_stt_granary2_lora_script")
@@ -123,6 +171,10 @@ def train(cfg):
         ScriptSTTDataset(cfg=val_dataset_cfg, tokenizer=model.tokenizer) if val_dataset_cfg is not None else None
     )
     datamodule = DataModule(cfg.data, tokenizer=model.tokenizer, dataset=dataset, val_dataset=val_dataset)
+
+    init_ckpt = cfg.get("init_from_ckpt", None)
+    if init_ckpt:
+        _init_from_ckpt(model, str(init_ckpt))
 
     trainer.fit(model, datamodule)
 
