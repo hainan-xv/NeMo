@@ -89,6 +89,16 @@ EXP_NAME="${EXP_NAME:-dfw_granary2_chat_${LOSS_TYPE}}"
 # DFW data and model paths.
 QWEN_TOK=${HEH}/pretrained_models/huggingface/Qwen/Qwen3-1.7B
 INIT_NEMO="${INIT_NEMO:-${HEH}/pretrained_models/huggingface/nvidia/nemotron-speech-streaming-en-0.6b/nemotron-speech-streaming-en-0.6b.nemo}"
+# WHICH tensors the warm start transfers. The defaults are sized for the DONOR
+# nemotron ASR, whose vocabulary differs from ours: joint.joint_net is omitted
+# from the include list and the vocab-shaped tensors are excluded, because they
+# cannot be loaded across a vocabulary change.
+#
+# An arm warm-starting from a SIBLING arm with the SAME vocabulary should widen
+# both -- the 151k embedding and the 151k output projection are the largest and
+# slowest-to-learn tensors in the model, and leaving them at init discards most
+# of the benefit of warm starting at all.
+INIT_INCLUDE="${INIT_INCLUDE:-[\"encoder.\",\"decoder.\",\"joint.enc.\",\"joint.pred.\"]}"
 TRAIN_INPUT_CFG="${TRAIN_INPUT_CFG:-${HEH}/data_configs/granary_v2_en_full_d0.5_b0.5_dfw_qwen_aligned.yaml}"
 VAL_MANIFEST="${VAL_MANIFEST:-${HEH}/data/mcv11_en_dev_aligned/mcv11_dev_clean_pcstrip_en_2k_qwen_aligned.json}"
 TOKENIZER_DIR="${TOKENIZER_DIR:-${QWEN_TOK}}"
@@ -183,7 +193,7 @@ print('    tokenizer ->', dst)
     trainer.devices=${GPUS_PER_NODE} \
     trainer.num_nodes=\${SLURM_JOB_NUM_NODES} \
     +init_from_nemo_model.model0.path=${INIT_NEMO} \
-    +init_from_nemo_model.model0.include=["encoder.","decoder.","joint.enc.","joint.pred."] \
+    +init_from_nemo_model.model0.include=${INIT_INCLUDE} \
     +init_from_nemo_model.model0.exclude=${INIT_EXCLUDE:-'["prediction.embed"]'} \
     ++exp_manager.exp_dir=/results/ \
     ++exp_manager.name=${EXP_NAME} \

@@ -74,7 +74,14 @@ export EXP_NAME="${EXP_NAME:-dfw_granary2_chat_banded1_nodelay}"
 # exec'd from this wrapper). Left unset, a 2-node allocation would be treated as
 # an undersized smoke test and silently renamed to ..._n2.
 export DESIGN_NODES=2
-export INIT_EXCLUDE='["prediction.embed","joint_net"]'
+# FULL transfer, unlike the donor-seeded arms. The seed is dfw_granary2_chat_forced
+# -- the same nemotron_chat_transducer_granary2_qwen config, so the same 151k
+# vocabulary and the same tensor shapes throughout. The usual exclusions exist
+# only to survive a vocabulary change and would here discard the 151k embedding
+# and the 151k joint output projection, which is most of what we are warm
+# starting FOR.
+export INIT_INCLUDE='["encoder.","decoder.","joint."]'
+export INIT_EXCLUDE='[]'
 
 # The standard CHAT arm's top-5 average, produced by its own leaderboard eval.
 # A .nemo (not a .ckpt) because init_from_nemo_model is what the CHAT trainer
