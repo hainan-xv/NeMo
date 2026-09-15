@@ -76,6 +76,12 @@ LR="${LR:-1e-4}"
 WARMUP_STEPS="${WARMUP_STEPS:-5000}"
 MAX_STEPS="${MAX_STEPS:-500000}"
 EPOCH_STEPS="${EPOCH_STEPS:-2000}"
+# 4, NOT the config's 8. The reference DFW recipe flags this explicitly ("note the
+# reduction in num_workers to 4"), and it is not cosmetic: with 8 the CHAT arms
+# pass validation and then hang FOREVER entering the training dataloader --
+# jobs 18617256 and 18620418 both sat at step 0/2000 for 20 minutes, while the
+# SCRIPT arms, which were already passing 4, trained normally on the same data.
+NUM_WORKERS="${NUM_WORKERS:-4}"
 
 EXP_NAME="${EXP_NAME:-dfw_granary2_chat_${LOSS_TYPE}}"
 
@@ -165,6 +171,7 @@ print('    tokenizer ->', dst)
     model.forced_alignment.recover_history_words=${RECOVER_WORDS} \
     model.joint.history_chunks=${HISTORY_CHUNKS} \
     model.train_ds.input_cfg=${TRAIN_INPUT_CFG} \
+    model.train_ds.num_workers=${NUM_WORKERS} \
     model.validation_ds.manifest_filepath=${VAL_MANIFEST} \
     model.optim.lr=${LR} \
     model.optim.sched.warmup_steps=${WARMUP_STEPS} \
