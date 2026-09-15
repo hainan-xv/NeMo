@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH -A nemotron_speechprod_asr
-#SBATCH -J nemotron_speechprod_asr:dfw-script-banded1
+#SBATCH -J nemotron_speechprod_asr:dfw-script-baseline
 # DFW's default GPU partition. Unlike OCI there is ONE pool of 1850 nodes rather
 # than batch_block1/3/4, so no comma-list is needed.
 #SBATCH -p batch
@@ -18,45 +18,30 @@
 #SBATCH --exclude=pool0-00407
 
 # ============================================================================
-# SCRIPT with the BANDED loss, on the CW DFW cluster.
+# BASELINE 3 of 3 on DFW: STANDARD SCRIPT.
 #
-#   sbatch launch/dfw_script_banded1.sh          <- no arguments
+#   sbatch launch/dfw_script_baseline.sh          <- no arguments
 #
-# The DFW port of launch/script_banded1.sh. The MODEL is identical -- same
-# config, same loss_type=banded, same band_words=1, same target_construction=
-# partition -- so a result here is comparable with the OCI arm. Only the cluster
-# differs, and every difference is listed below.
+# Plain cross-entropy over the ONE word-to-chunk assignment the aligner chose --
+# the SCRIPT analogue of dfw_chat_forced.sh, and the control the banded arm
+# (dfw_script_banded1.sh) has to beat. Identical to that arm in every respect
+# except loss_type, so a delta between them is the band and nothing else.
 #
-# WHAT DIFFERS FROM THE OCI SCRIPT, and why
-#   account      nemotron_speechprod_asr (OCI: nemotron_speech_asr)
-#   partition    batch, one pool of 1850 nodes (OCI: batch_block1,3,4)
-#   lustre       /lustre/fsw/portfolios/nemotron/projects/nemotron_speechprod_asr
-#                DFW does NOT share a filesystem with OCI -- verified, the
-#                reference paths under users/heh are unreadable from the OCI
-#                login node -- so every path here is DFW's own.
-#   scratch      .../nemotron_speechprod_asr/hainanx, because users/ under that
-#                project is not writable by me and users/hainanx cannot be
-#                created. Same project as the container and data, so the job
-#                bills where it reads.
-#   models       Qwen3-1.7B and the nemotron ASR .nemo come from users/heh's
-#                pretrained_models; they are NOT at the OCI paths.
-#   data         the DFW-side Granary input_cfg, and the mcv11 validation
-#                manifest, both under users/heh.
-#   num_workers  4, down from 8 (flagged by the reference recipe).
-#   NCCL/threads the env block below, copied from the reference recipe.
+# MULTI CHUNK-SIZE: [2, 7, 10, 14], one drawn per batch, giving ONE model usable
+# at four latencies from 0.16 s to 1.12 s. The banded arm is pinned to 14
+# instead, because the band emits one branch segment per candidate cut and its
+# cost therefore tracks the CHUNK COUNT -- measured 5.4x forced at chunk_size 2
+# against 1.5x at 14. That restriction is a property of the band, not of SCRIPT,
+# so the baseline keeps the full set.
 #
-# TOKENS ARE READ FROM FILES, never inlined. The reference DFW script hardcodes
-# a live WANDB key and HF token in plaintext on shared lustre; this repo is
-# pushed to GitHub, so inlining them would publish them.
+# BATCH SIZES ARE THE BANDED ARM'S, which are ~3x smaller than a forced arm
+# needs, because they are set in the shared config. That makes this baseline
+# slower per unit of data than it has to be, but it makes the two arms see the
+# SAME number of utterances per step -- which is what keeps a step-for-step
+# comparison honest. Widen them only if you also widen the banded arm's.
 #
-# BATCH SIZES ARE NOT SCALED UP, and should not be. The reference recipe uses
-# int(x*1.9) versus the OCI list, which looks like it implies bigger cards -- it
-# does not. Measured from nvidia-smi in job 18615569: these are H100 80GB HBM3,
-# the SAME memory as the OCI A100s. The 1.9x is presumably because that recipe's
-# readwrite_collapse variant collapses silent audio and so runs shorter
-# sequences. Our banded bucket_batch_size was derived by direct measurement
-# against 80 GB, so it ports here unchanged; adopting the 1.9x would over-commit
-# by almost double. Guessing at memory is what cost three OOM cycles on OCI.
+# Carries the target fixes (respell + partition tokenization), so this is the
+# fixed-target baseline rather than the legacy one.
 # ============================================================================
 set -uo pipefail
 
@@ -78,15 +63,15 @@ PROJECT_NAME="${PROJECT_NAME:-SpeechlmDFW}"
 # --- the banded recipe, identical to the OCI arm ---
 CONFIG_PATH=/code/examples/speechlm2/conf
 CONFIG_NAME="${CONFIG_NAME:-streaming_stt_granary2_lora_script_banded1}"
-EXP_NAME="${EXP_NAME:-dfw_granary2_script_banded1}"
+EXP_NAME="${EXP_NAME:-dfw_granary2_script_baseline}"
 
 MAX_STEPS="${MAX_STEPS:-500000}"
 VAL_CHECK_INTERVAL="${VAL_CHECK_INTERVAL:-2000}"
 DELAY="${DELAY:-3}"
 LR="${LR:-1e-4}"
 WARMUP_STEPS="${WARMUP_STEPS:-5000}"
-CHUNK_SIZES="${CHUNK_SIZES:-14}"
-BAND_WORDS="${BAND_WORDS:-1}"
+CHUNK_SIZES="${CHUNK_SIZES:-[2,7,10,14]}"
+LOSS_TYPE="${LOSS_TYPE:-forced}"
 ACT_CKPT="${ACT_CKPT:-true}"
 ATTN_BACKEND="${ATTN_BACKEND:-dense}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
@@ -147,7 +132,7 @@ MOUNTS="--container-mounts=${CODE_DIR}:/code,${RESULTS_DIR}:/results,${HFCACHE}:
 read -r -d '' cmd <<EOF
 echo "*******STARTING********" \
 && nvidia-smi \
-&& echo "*** RECIPE: ${CONFIG_NAME} (DFW, SCRIPT banded | band_words=${BAND_WORDS} | chunk ${CHUNK_SIZES} | delay ${DELAY}) ***" \
+&& echo "*** RECIPE: ${CONFIG_NAME} (DFW, SCRIPT baseline | loss_type=${LOSS_TYPE} | chunks ${CHUNK_SIZES} | delay ${DELAY}) ***" \
 && export WANDB_API_KEY=${WANDB} \
 && export HF_HOME="/hfcache/" \
 && export HF_TOKEN=${HF_TOKEN} \
@@ -174,7 +159,7 @@ echo "*******STARTING********" \
     model.optimizer.lr=${LR} \
     model.lr_scheduler.warmup_steps=${WARMUP_STEPS} \
     model.chunk_size="${CHUNK_SIZES}" \
-    ++model.band_words=${BAND_WORDS} \
+    ++model.loss_type=${LOSS_TYPE} \
     ++model.activation_checkpointing=${ACT_CKPT} \
     ++model.attn_backend=${ATTN_BACKEND} \
     data.dataset.num_delay_frames=${DELAY} \
