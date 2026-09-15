@@ -89,7 +89,7 @@ def train(cfg):
     # which candidate cuts exist, the model runs the dynamic program over them. If
     # only one side is banded, the batch and the loss disagree about what a branch
     # even is.
-    for key, default in (("loss_type", "forced"), ("target_construction", "legacy")):
+    for key, default in (("loss_type", "forced"), ("target_construction", "legacy"), ("band_side", "later")):
         m_val = str(cfg.model.get(key, default) or default).lower()
         d_val = str(dataset_cfg.get(key, default) or default).lower()
         if m_val != d_val:

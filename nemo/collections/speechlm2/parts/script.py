@@ -420,6 +420,7 @@ def build_packed_banded_example(
     vision_start_id: int,
     vision_end_id: int,
     eot_id: int,
+    band_side: str = "both",
     audio_history_chunks: int = 0,
     audio_window_frames: int = 0,
     position_scheme: str = BRANCH_SCHEME,
@@ -455,7 +456,7 @@ def build_packed_banded_example(
     P = len(spine_ids)
     T = len(chunks)
 
-    cands = band_candidate_cuts(aligner_cuts, word_starts, n_tokens, band_words)
+    cands = band_candidate_cuts(aligner_cuts, word_starts, n_tokens, band_words, band_side)
     C = max((len(c) for c in cands), default=1)
     reach = [max(cands[t + 1]) if t + 1 < T else n_tokens for t in range(T)]
     K = max(max((reach[t] - min(cands[t]) for t in range(T)), default=0), 0)
@@ -901,7 +902,13 @@ def build_twod_chunk_example(
     )
 
 
-def band_candidate_cuts(aligner_cuts: List[int], word_starts: List[int], n_tokens: int, band: int) -> List[List[int]]:
+def band_candidate_cuts(
+    aligner_cuts: List[int],
+    word_starts: List[int],
+    n_tokens: int,
+    band: int,
+    side: str = "both",
+) -> List[List[int]]:
     """Candidate cuts for each chunk: word starts within ``band`` words of the aligner's.
 
     ``band=0`` returns the aligner's own cut alone, which makes the banded loss
@@ -914,13 +921,25 @@ def band_candidate_cuts(aligner_cuts: List[int], word_starts: List[int], n_token
     the only kind of move the aligner's error can actually justify.
     """
     starts = sorted(set(word_starts) | {0, n_tokens})
+    if side not in ("both", "later", "earlier"):
+        raise ValueError(f"side must be 'both', 'later' or 'earlier', got {side!r}")
+
     out: List[List[int]] = []
     for u in aligner_cuts:
         if band <= 0:
             out.append([u])
             continue
         i = bisect.bisect_left(starts, u)
-        lo, hi = max(0, i - band), min(len(starts), i + band + 1)
+        if side == "both":
+            lo, hi = max(0, i - band), min(len(starts), i + band + 1)
+        elif side == "later":
+            # A word may be emitted LATER than the aligner placed it, never
+            # earlier. The cut INDEX therefore moves DOWN: pulling cut[t] back
+            # makes chunk t start sooner, which is the same thing as the previous
+            # chunk giving up its trailing word.
+            lo, hi = max(0, i - band), min(len(starts), i + 1)
+        else:  # "earlier"
+            lo, hi = i, min(len(starts), i + band + 1)
         cands = sorted(set(starts[lo:hi]) | {u})
         out.append([c for c in cands if 0 <= c <= n_tokens])
     return out

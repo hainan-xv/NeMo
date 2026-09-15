@@ -185,6 +185,13 @@ class ScriptSTTModelConfig(StreamingSTTModelConfig):
     # longer scored as an error the model must reproduce.
     loss_type: str = "forced"
     band_words: int = 1
+    # ONE-SIDED by default. "later" lets a word the aligner placed in chunk t be
+    # emitted in t+1 instead, never earlier -- which is the direction aligner error
+    # actually needs, since a word whose audio finishes just after a boundary
+    # cannot legitimately be emitted before that audio arrives. It also costs a
+    # THIRD less than a two-sided band: candidates per chunk drop 3 -> 2, and the
+    # packed sequence scales with that count.
+    band_side: str = "later"
     # Consecutive OOM batches tolerated before training_step re-raises. A few
     # skips are a rare bad draw (chunk_size is sampled per batch while
     # bucket_batch_size is keyed on duration only); a streak means the batch

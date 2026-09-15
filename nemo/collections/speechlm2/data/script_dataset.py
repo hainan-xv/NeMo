@@ -169,6 +169,7 @@ class ScriptSTTDataConfig(StreamingSTTDataConfig):
     target_construction: str = "legacy"
     loss_type: str = "forced"
     band_words: int = 1
+    band_side: str = "later"
 
 
 @dataclass
@@ -290,6 +291,9 @@ class ScriptSTTDataset(StreamingSTTDataset):
         if self._loss_type not in ("forced", "banded"):
             raise ValueError(f"loss_type must be 'forced' or 'banded', got {self.cfg.loss_type!r}")
         self._band_words = max(int(self.cfg.band_words), 0)
+        self._band_side = str(self.cfg.band_side or "later").lower()
+        if self._band_side not in ("both", "later", "earlier"):
+            raise ValueError(f"band_side must be 'both', 'later' or 'earlier', got {self.cfg.band_side!r}")
         self._banded = self._loss_type == "banded"
         if self._banded and (self._twod_layout or not self._target_partition):
             raise ValueError(
@@ -672,6 +676,7 @@ class ScriptSTTDataset(StreamingSTTDataset):
                         chunks=chunks,
                         word_starts=self._word_start_positions(transcript_ids),
                         band_words=self._band_words,
+                        band_side=self._band_side,
                         vision_start_id=self.vision_start_id,
                         vision_end_id=self.vision_end_id,
                         eot_id=self.eot_id,

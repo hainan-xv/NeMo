@@ -94,6 +94,14 @@ model:
   # Must match data.dataset.loss_type / band_words.
   loss_type: banded
   band_words: 1
+  # ONE-SIDED: a word the aligner placed in chunk t may be emitted in t+1, never
+  # earlier. That is the direction aligner error needs -- a word whose audio ends
+  # just after a boundary cannot honestly be emitted before that audio arrives,
+  # which is also what num_delay_frames=3 guards. And it costs a third less than a
+  # two-sided band: candidates per chunk drop from 3 to 2, and the packed sequence
+  # (and so the logits tensor that dominates memory) scales with that count.
+  # Must match data.dataset.band_side.
+  band_side: later
 
   # LAYOUT. The band emits one branch SEGMENT per candidate cut in the FLAT
   # packed layout. That needs no mask change: build_script_mask already gives each
@@ -171,6 +179,7 @@ data:
     target_construction: ${model.target_construction}
     loss_type: ${model.loss_type}
     band_words: ${model.band_words}
+    band_side: ${model.band_side}
     twod_layout: ${model.twod_layout}
     num_delay_frames: 3
     audio_tag: "<audio>"

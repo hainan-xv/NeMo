@@ -696,3 +696,81 @@ def test_training_wer_runs_outside_the_training_step():
         assert "_maybe_log_training_wer" not in inspect.getsource(
             step_fn
         ), f"{step_fn.__name__} must not decode mid-step; it breaks activation checkpointing"
+
+
+# ---------------------------------------------------------------------------
+# One-sided band
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_band_side_later_only_defers_words():
+    """'later' must let a word move to a LATER chunk, never an earlier one.
+
+    The band moves the CUT, and cut index runs opposite to emission time: letting
+    chunk t give up its trailing word means chunk t+1 starts SOONER, i.e. a LOWER
+    cut index. So 'later' offers cuts below the aligner's, which reads backwards
+    and is exactly the kind of thing that gets silently inverted in a refactor.
+    """
+    from nemo.collections.speechlm2.parts.script import band_candidate_cuts
+
+    starts = [0, 1, 2, 3, 4, 5]
+    aligner = [0, 2, 3]
+
+    later = band_candidate_cuts(aligner, starts, 6, 1, "later")
+    for u, cands in zip(aligner, later):
+        assert max(cands) == u, f"'later' offered a cut ABOVE the aligner's: {cands} vs {u}"
+        assert u in cands, "the aligner's own path must stay in the band"
+
+    earlier = band_candidate_cuts(aligner, starts, 6, 1, "earlier")
+    for u, cands in zip(aligner, earlier):
+        assert min(cands) == u, f"'earlier' offered a cut BELOW the aligner's: {cands} vs {u}"
+        assert u in cands
+
+
+@pytest.mark.unit
+def test_one_sided_band_is_cheaper_than_two_sided():
+    """The whole point: a third fewer segments, so a third shorter sequence."""
+    from nemo.collections.speechlm2.parts.script import band_candidate_cuts
+
+    starts = list(range(8))
+    aligner = [1, 3, 5]
+    widths = {
+        side: max(len(c) for c in band_candidate_cuts(aligner, starts, 8, 1, side))
+        for side in ("both", "later", "earlier")
+    }
+    assert widths["both"] == 3
+    assert widths["later"] == widths["earlier"] == 2
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("side", ["both", "later", "earlier"])
+def test_band_zero_ignores_the_side(side):
+    """band_words=0 is the forced loss whichever side is configured."""
+    from nemo.collections.speechlm2.parts.script import band_candidate_cuts
+
+    cands = band_candidate_cuts([0, 2, 3], list(range(6)), 6, 0, side)
+    assert cands == [[0], [2], [3]]
+
+
+@pytest.mark.unit
+def test_band_side_is_validated():
+    from nemo.collections.speechlm2.parts.script import band_candidate_cuts
+
+    with pytest.raises(ValueError, match="side must be"):
+        band_candidate_cuts([0], [0, 1], 2, 1, "rightwards")
+
+
+@pytest.mark.unit
+def test_shipped_recipe_uses_the_one_sided_band():
+    import os
+
+    from omegaconf import OmegaConf
+
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+    path = os.path.join(root, _BANDED_YAML)
+    if not os.path.isfile(path):
+        pytest.skip(f"{_BANDED_YAML} not present")
+    cfg = OmegaConf.load(path)
+    assert cfg.model.band_side == "later"
+    assert cfg.data.dataset.band_side == cfg.model.band_side
