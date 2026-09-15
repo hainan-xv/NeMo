@@ -88,8 +88,10 @@ TOKENIZER_DIR="${TOKENIZER_DIR:-${QWEN_TOK}}"
 
 # A 1-node allocation writes to a DIFFERENT EXP_NAME so a smoke test can never
 # resume from, or overwrite, the real 8-node run's checkpoints.
-DESIGN_NODES="$(grep -m1 -E '^#SBATCH[[:space:]]+-N[[:space:]]+[0-9]+' "${SLURM_JOB_NAME:+$0}" 2>/dev/null | grep -oE '[0-9]+$' || true)"
-DESIGN_NODES="${DESIGN_NODES:-8}"
+# Set explicitly, NOT grepped from $0: this body is exec'd from a wrapper, so $0
+# is this file, which carries no #SBATCH lines -- the grep would always miss and
+# fall back, wrongly suffixing every full-size run. Wrappers may override.
+DESIGN_NODES="${DESIGN_NODES:-4}"
 ACTUAL_NODES="${SLURM_JOB_NUM_NODES:-$DESIGN_NODES}"
 if [[ "${SKIP_NODE_SUFFIX:-0}" != "1" && "$ACTUAL_NODES" -ne "$DESIGN_NODES" ]]; then
     EXP_NAME="${EXP_NAME}_n${ACTUAL_NODES}"

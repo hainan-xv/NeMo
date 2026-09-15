@@ -4,7 +4,7 @@
 # DFW's default GPU partition. Unlike OCI there is ONE pool of 1850 nodes rather
 # than batch_block1/3/4, so no comma-list is needed.
 #SBATCH -p batch
-#SBATCH -N 8
+#SBATCH -N 4
 #SBATCH --gpus-per-node=8
 #SBATCH -t 04:00:00
 #SBATCH --time-min 04:00:00

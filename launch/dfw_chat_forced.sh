@@ -2,7 +2,7 @@
 #SBATCH -A nemotron_speechprod_asr
 #SBATCH -J nemotron_speechprod_asr:dfw-chat-forced
 #SBATCH -p batch
-#SBATCH -N 8
+#SBATCH -N 4
 #SBATCH --gpus-per-node=8
 #SBATCH -t 04:00:00
 #SBATCH --time-min 04:00:00
