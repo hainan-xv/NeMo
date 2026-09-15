@@ -124,4 +124,37 @@ CMD_BASENAME="stage_cache_cmd_${SLURM_JOB_ID:-local$$}.sh"
 printf '%s\n' "$cmd" > "${CODE_DIR}/slurm_out/${CMD_BASENAME}"
 chmod +x "${CODE_DIR}/slurm_out/${CMD_BASENAME}"
 
-srun -o "$OUTFILE" -e "$ERRFILE" --container-image="$CONTAINER" $MOUNTS bash "/code/slurm_out/${CMD_BASENAME}"
+srun -o "$OUTFILE" -e "$ERRFILE" --container-image="$CONTAINER" $MOUNTS bash "/code/slurm_out/${CMD_BASENAME}" || true
+srun_rc=$?
+
+# VERIFY THE OUTPUT, DO NOT TRUST THE EXIT CODE.
+#
+# stage_leaderboard_cache.py finishes its work, prints "Done", and then aborts
+# during interpreter SHUTDOWN:
+#
+#   Fatal Python error: PyGILState_Release: thread state ... must be current
+#   Python runtime state: finalizing
+#
+# -- a GIL/thread teardown fault in a C extension (a `datasets` streaming worker
+# outliving the interpreter). Every file is on disk by then, but srun reports
+# SIGABRT, so the job shows FAILED while having fully succeeded. Job 18671487
+# staged 7/7 splits and still exited 6:0.
+#
+# Checking for a manifest per requested split distinguishes "crashed at exit"
+# (fine) from "crashed partway" (not fine), which the exit code cannot.
+missing=0
+for spec in ${DATASETS}; do
+    name="${spec%%:*}"; split="${spec##*:}"
+    if [[ ! -s "${CACHE_DIR}/${name}/${split}/_cache_manifest.jsonl" ]]; then
+        echo "MISSING: ${CACHE_DIR}/${name}/${split}/_cache_manifest.jsonl" >&2
+        missing=$((missing + 1))
+    fi
+done
+
+if [[ "$missing" -gt 0 ]]; then
+    echo "==> staging INCOMPLETE: ${missing} split(s) missing a manifest (srun rc=${srun_rc})" >&2
+    exit 1
+fi
+echo "==> staging complete: every requested split has a manifest"
+[[ "$srun_rc" -ne 0 ]] && echo "    (srun returned ${srun_rc}; that is the known shutdown abort, data verified above)"
+exit 0
