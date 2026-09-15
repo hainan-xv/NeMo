@@ -61,6 +61,11 @@ export CONTAINER="${CONTAINER:-${DFW}/users/heh/containers/nemo-26.02-streaming-
 export CACHE_DIR="${CACHE_DIR:-${OUTPUT_PREFIX}/leaderboard_cache}"
 export H_DIR="${H_DIR:-${DFW}/users/heh}"
 export PROJECT="${PROJECT:-SpeechlmDFW}"
+# The averaging step mounts this to reach the tokenizer and the donor .nemo.
+# Defaults to an OCI path in eval_chat.sh, which on DFW leaves the tokenizer
+# directory invisible inside the container -- transformers then treats it as a
+# hub repo id and fails with "Repo id must be in the form 'repo_name'".
+export EXTRA_MOUNTS="${EXTRA_MOUNTS:-${DFW}:${DFW}}"
 
 TOPK="${TOPK:-5}"
 QWEN_TOK="${DFW}/users/heh/pretrained_models/huggingface/Qwen/Qwen3-1.7B"

@@ -120,7 +120,15 @@ echo "==> averaging ${#BEST[@]} checkpoints for ${ARM_EXP_NAME}:"
 printf '      %s\n' "${BEST[@]##*/}"
 CKPT_CSV="$(IFS=,; echo "${BEST[*]}")"
 
-MOUNTS="--container-mounts=${CODE_DIR}:/code,${OUTPUT_PREFIX}:${OUTPUT_PREFIX},/lustre/fsw/portfolios/llmservice:/lustre/fsw/portfolios/llmservice"
+# The third mount carries the TOKENIZER and the donor .nemo, and it is
+# cluster-specific: OCI keeps them under llmservice, DFW under the
+# nemotron_speechprod_asr project. Averaging CONSTRUCTS the model, so an
+# unmounted tokenizer directory is not a missing-file error -- transformers falls
+# back to treating the path as a hub repo id and fails with "Repo id must be in
+# the form 'repo_name'", which reads nothing like a mount problem. That is
+# exactly how the first DFW CHAT eval failed.
+EXTRA_MOUNTS="${EXTRA_MOUNTS:-/lustre/fsw/portfolios/llmservice:/lustre/fsw/portfolios/llmservice}"
+MOUNTS="--container-mounts=${CODE_DIR}:/code,${OUTPUT_PREFIX}:${OUTPUT_PREFIX},${EXTRA_MOUNTS}"
 
 # Reuse only if the averaged model is NEWER than every checkpoint it could be
 # built from. Reusing on existence alone silently evaluates stale weights after
