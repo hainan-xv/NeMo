@@ -136,6 +136,21 @@ echo "*******STARTING********" \
 && export TORCH_NCCL_ENABLE_MONITORING=0 \
 && export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=240 \
 && export NCCL_IB_TIMEOUT=22 NCCL_IB_RETRY_CNT=10 \
+&& if [ ! -f '${TOKENIZER_DIR}/tokenizer.model' ] && [ ! -f '${TOKENIZER_DIR}/tokenizer.json' ]; then \
+     echo '==> extracting the donor SentencePiece vocabulary'; \
+     python -c "
+import os, tarfile
+src, dst = '${INIT_NEMO}', '${TOKENIZER_DIR}'
+os.makedirs(dst, exist_ok=True)
+with tarfile.open(src, 'r:') as tf:
+    for m in tf.getmembers():
+        for want in ('tokenizer.model', 'tokenizer.vocab', 'vocab.txt'):
+            if m.name.endswith(want):
+                m.name = want; tf.extract(m, dst)
+assert os.path.isfile(os.path.join(dst,'tokenizer.model')), 'no tokenizer.model in ' + src
+print('    tokenizer ->', dst)
+"; \
+   else echo '==> reusing existing tokenizer'; fi \
 && python /code/examples/asr/asr_transducer/speech_to_text_chat_bpe.py \
     --config-path=${CONFIG_PATH} \
     --config-name=${CONFIG_NAME} \

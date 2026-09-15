@@ -39,9 +39,29 @@ export WARMUP_STEPS=5000
 export MAX_STEPS=500000
 export EPOCH_STEPS=2000
 
-export CONFIG_NAME=nemotron_chat_transducer_granary2_qwen
-export EXP_NAME="${EXP_NAME:-dfw_granary2_chat_rnnt}"
-export INIT_EXCLUDE='["prediction.embed","joint_net"]'
+# 1,024-piece vocabulary, NOT the Qwen 151,669 one the other arms use.
+#
+# This is forced, not a preference. The full RNN-T loss marginalises over the
+# whole lattice and needs a [B, T, U+1, V+1] joint tensor; at V=151,670 that is
+# ~2 GB per sample for the joint output alone. Job 18617613 proved it: the model
+# built fine (812M params), passed the sanity check, then sat at step 0/2000 for
+# ten minutes without completing ONE step -- no OOM, just intractable. The banded
+# loss exists precisely because of this, scoring ~3U+T nodes instead of T*U*V.
+#
+# CONSEQUENCE FOR THE COMPARISON: this arm differs from dfw_chat_forced.sh in
+# BOTH vocabulary and objective, so the gap between them is not attributable to
+# either alone. Treat it as a loose reference for what marginalising buys, not as
+# a controlled A/B. A clean rnnt-vs-forced pair would need forced re-run at 1k.
+#
+# The tokenizer is EXTRACTED from the donor .nemo into /results/tokenizer by the
+# body, since the 1k SentencePiece ships inside that checkpoint rather than as a
+# standalone directory.
+export CONFIG_NAME=nemotron_chat_transducer_granary2
+export TOKENIZER_DIR=/results/tokenizer
+export EXP_NAME="${EXP_NAME:-dfw_granary2_chat_rnnt_1k}"
+# Default exclude: at 1k the donor's prediction embedding and joint output DO
+# have counterparts (same vocabulary), so only the embedding is left random --
+# unlike the Qwen arms where both are 148x larger and cannot be warm-started.
 
 find_launch_dir() {
     if [[ -n "${SLURM_SUBMIT_DIR:-}" ]]; then
