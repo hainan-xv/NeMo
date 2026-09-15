@@ -553,3 +553,110 @@ def test_logsumexp_result_upcast_matches_a_fully_upcast_tensor():
     expensive = torch.logsumexp(logits.float(), dim=-1)
 
     torch.testing.assert_close(cheap, expensive, atol=5e-2, rtol=5e-2)
+
+
+# ---------------------------------------------------------------------------
+# Cross-family metric comparability
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_script_logs_train_loss_not_bare_loss():
+    """The LOGGED key is train_loss, matching the ASR collection.
+
+    CHAT logs 'train_loss'; SCRIPT used to log a bare 'loss', so a wandb panel
+    could not carry both families. The key RETURNED from training_step must stay
+    'loss' -- Lightning reads it to drive the optimizer -- so this pins the two
+    apart, which is exactly the distinction easy to get wrong when renaming.
+    """
+    import inspect
+
+    from nemo.collections.speechlm2.models import script_model
+
+    src = inspect.getsource(script_model)
+    assert '"train_loss": loss' in src, "the logged key should be train_loss"
+    assert 'return {"loss": loss}' in src, "the RETURNED key must remain 'loss' for Lightning"
+    assert '"loss": loss,\n' not in src, "a bare logged 'loss' key has come back"
+
+
+@pytest.mark.unit
+def test_script_and_chat_agree_on_metric_names():
+    """One wandb panel has to carry both families, so the names must match.
+
+    Pins the shared vocabulary rather than each model's full set: CHAT logs extra
+    ASR-specific keys and SCRIPT logs extra streaming ones, but these four have to
+    mean the same thing on both sides.
+    """
+    import inspect
+
+    from nemo.collections.asr.models import chat_bpe_models
+    from nemo.collections.speechlm2.models import script_model
+
+    chat = inspect.getsource(chat_bpe_models)
+    script = inspect.getsource(script_model)
+
+    for name in ("train_loss", "training_batch_wer", "learning_rate"):
+        assert name in chat, f"CHAT no longer logs {name}"
+        assert name in script, f"SCRIPT no longer logs {name}"
+
+
+@pytest.mark.unit
+def test_both_families_expose_a_comparable_val_wer():
+    """val_wer alone is NOT comparable across families, so both extras must exist.
+
+    CHAT's val_wer is verbatim (ASR convention); SCRIPT's is Whisper-normalised
+    (speechlm2 convention). On the same manifest that gap read ~0.15 vs ~0.087 and
+    was mistaken for a quality difference. Neither native metric may change -- both
+    are checkpoint monitors -- so each family gains the OTHER normalisation:
+    val_wer_norm on CHAT, val_wer_verbatim on SCRIPT.
+    """
+    import inspect
+
+    from nemo.collections.asr.models import chat_bpe_models
+    from nemo.collections.speechlm2.models import script_model
+
+    assert "val_wer_norm" in inspect.getsource(chat_bpe_models), "CHAT lost its normalised val WER"
+    assert "val_wer_verbatim" in inspect.getsource(script_model), "SCRIPT lost its verbatim val WER"
+
+
+@pytest.mark.unit
+def test_normalised_wer_uses_the_shared_edit_distance():
+    """Both sides must use nemo's word_error_rate, or the numbers diverge anyway.
+
+    Computing the same metric with a different edit-distance implementation would
+    reintroduce the incomparability it exists to remove -- a subtle version of the
+    original bug rather than a fix for it.
+    """
+    import inspect
+
+    from nemo.collections.asr.models import chat_bpe_models
+
+    chat = inspect.getsource(chat_bpe_models)
+    assert "word_error_rate_detail" in chat
+    assert "editdistance" not in chat, "editdistance is not a dependency of this repo"
+
+    from nemo.collections.speechlm2.parts.metrics import wer as speechlm_wer
+
+    assert "word_error_rate" in inspect.getsource(speechlm_wer)
+
+
+@pytest.mark.unit
+def test_training_wer_is_bounded_and_disableable():
+    """A metric must not be able to dominate or kill a run."""
+    import dataclasses
+
+    from nemo.collections.speechlm2.models.script_model import ScriptSTTModelConfig
+
+    # Read the DECLARED defaults: the config has required fields, so it cannot be
+    # instantiated bare.
+    defaults = {f.name: f.default for f in dataclasses.fields(ScriptSTTModelConfig)}
+    assert defaults["train_wer_every_n_steps"] >= 100, "too frequent: this is a real decode, not a cheap score"
+    assert 1 <= defaults["train_wer_max_utts"] <= 16, "unbounded sample would make the cost batch-dependent"
+
+    import inspect
+
+    from nemo.collections.speechlm2.models.script_model import ScriptSTTModel
+
+    src = inspect.getsource(ScriptSTTModel._maybe_log_training_wer)
+    assert "except Exception" in src, "a metric failure must never take down training"
+    assert "no_grad" in src, "the decode must not build a graph"

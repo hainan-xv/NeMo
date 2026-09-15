@@ -276,6 +276,13 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
         # chunk_size and no window_frames. Touching them directly raises
         # AttributeError before a single step, which is how job 13383115 died.
         # A joint with neither is not a CHAT joint, so there is nothing to check.
+        # Whisper-normalised val WER, for comparability with the SCRIPT models.
+        # Costs one extra validation decode, so it is a config switch rather than
+        # unconditional; default ON because an incomparable metric has repeatedly
+        # cost more than the decode does.
+        self._log_normalised_wer = bool(fa.get("log_normalised_wer", True))
+        self._text_normalizer = None
+
         _F = int(getattr(self.joint, "window_frames", 0) or 0)
         _C = int(getattr(self.joint, "chunk_size", 0) or 0)
         if _F > 0 and _C > 0 and _F < _C:
@@ -943,6 +950,101 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
             )
 
         return {'loss': loss_value}
+
+    def validation_pass(self, batch, batch_idx, dataloader_idx=0):
+        """The RNN-T validation pass plus a WHISPER-NORMALISED WER.
+
+        The base pass reports ``val_wer`` computed verbatim -- raw text, no
+        normalisation -- which is the ASR collection's convention. speechlm2 (and
+        so every SCRIPT model) instead reports a Whisper-normalised ``val_wer``.
+        The two numbers are therefore NOT comparable, and the gap is large: on the
+        same manifest CHAT reads ~0.15 where SCRIPT reads ~0.087, most of which is
+        the normaliser rather than the model. That has been misread as a quality
+        difference more than once.
+
+        So this adds ``val_wer_norm`` alongside, computed the way speechlm2 does,
+        and leaves ``val_wer`` untouched -- it is the checkpoint monitor, and every
+        existing run's save_top_k was selected against its current meaning.
+
+        COST: one extra decode of the validation batch. Validation runs every
+        val_check_interval steps (2000 here), so this is not on the hot path, but
+        it is not free either -- it is a second RNN-T greedy decode, not a
+        re-scoring of strings the base pass already produced. The base pass
+        decodes inside ``self.wer.update`` and does not hand the hypotheses back.
+        """
+        logs = super().validation_pass(batch, batch_idx, dataloader_idx=dataloader_idx)
+
+        if not self._log_normalised_wer:
+            return logs
+
+        try:
+            from whisper_normalizer.english import EnglishTextNormalizer
+        except ImportError:  # pragma: no cover - normaliser is optional
+            logging.warning("whisper_normalizer is unavailable; val_wer_norm will not be logged.")
+            self._log_normalised_wer = False
+            return logs
+
+        if self._text_normalizer is None:
+            self._text_normalizer = EnglishTextNormalizer()
+
+        signal, signal_len, transcript, transcript_len = batch
+        with torch.no_grad():
+            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
+            hyps = self.wer.decoding.rnnt_decoder_predictions_tensor(
+                encoder_output=encoded, encoded_lengths=encoded_len, return_hypotheses=False
+            )
+        if isinstance(hyps, tuple):
+            hyps = hyps[0]
+        hyp_texts = [h.text if hasattr(h, "text") else str(h) for h in hyps]
+
+        ref_texts = []
+        for i in range(transcript.shape[0]):
+            n = int(transcript_len[i])
+            ref_texts.append(self.wer.decoding.decode_tokens_to_str(transcript[i][:n].cpu().tolist()))
+
+        # Corpus WER, not a mean of per-utterance rates: accumulate edits and
+        # reference words separately so short utterances cannot dominate, and so
+        # the number aggregates the same way the base val_wer does.
+        #
+        # word_error_rate_detail is the SAME helper speechlm2's WER wraps, so the
+        # edit distance is computed identically on both sides -- using a different
+        # implementation here would reintroduce exactly the incomparability this
+        # metric exists to remove.
+        from nemo.collections.asr.metrics.wer import word_error_rate_detail
+
+        refs = [self._text_normalizer(r) for r in ref_texts]
+        hyps = [self._text_normalizer(h) for h in hyp_texts]
+        # Drop pairs whose reference normalises to nothing: they contribute zero
+        # denominator but a full insertion penalty, which silently inflates WER.
+        pairs = [(r, h) for r, h in zip(refs, hyps) if r.strip()]
+        if pairs:
+            rate, words, *_ = word_error_rate_detail(
+                hypotheses=[h for _, h in pairs], references=[r for r, _ in pairs]
+            )
+            rate = 0.0 if rate != rate else rate  # NaN guard
+            num = float(rate) * float(words)
+        else:
+            num, words = 0.0, 0
+
+        dev = encoded.device
+        logs['val_wer_norm_num'] = torch.tensor(num, device=dev, dtype=torch.float32)
+        logs['val_wer_norm_denom'] = torch.tensor(float(words), device=dev, dtype=torch.float32)
+        return logs
+
+    def multi_validation_epoch_end(self, outputs, dataloader_idx: int = 0):
+        """Base aggregation plus the corpus-level normalised WER.
+
+        Summing num and denom across batches, rather than averaging per-batch
+        rates, is what makes this comparable to SCRIPT's -- speechlm2 gathers every
+        decoded string and computes one corpus WER, so a batch-mean here would be a
+        different statistic wearing the same name.
+        """
+        result = super().multi_validation_epoch_end(outputs, dataloader_idx=dataloader_idx)
+        if outputs and 'val_wer_norm_num' in outputs[0]:
+            num = torch.stack([x['val_wer_norm_num'] for x in outputs]).sum()
+            denom = torch.stack([x['val_wer_norm_denom'] for x in outputs]).sum()
+            result.setdefault('log', {})['val_wer_norm'] = num / denom.clamp(min=1.0)
+        return result
 
     @classmethod
     def list_available_models(cls) -> List[PretrainedModelInfo]:

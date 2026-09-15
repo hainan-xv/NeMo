@@ -203,6 +203,18 @@ class ScriptSTTModelConfig(StreamingSTTModelConfig):
     encode_batch_size: int = 8
     force_word_start: bool = True
     log_detailed_train_metrics: bool = False
+    # TRAINING WER, under the ASR collection's name so one wandb panel carries both
+    # families. It is a REAL autoregressive decode, matching what CHAT's
+    # training_batch_wer measures -- a teacher-forced argmax would be cheaper but
+    # would not be the same statistic, and logging it under the same name is the
+    # kind of false comparability this exists to remove.
+    #
+    # Decoding is expensive for an LLM, so it is bounded on both axes: every
+    # train_wer_every_n_steps steps, over at most train_wer_max_utts utterances.
+    # At the defaults that is ~4 short decodes per 500 steps, well under 1% of
+    # step time. 0 disables.
+    train_wer_every_n_steps: int = 500
+    train_wer_max_utts: int = 4
 
 
 class ScriptSTTModel(StreamingSTTModel):
@@ -610,6 +622,60 @@ class ScriptSTTModel(StreamingSTTModel):
                 ignore_index=IGNORE_INDEX,
             )
 
+    def _maybe_log_training_wer(self, batch: ScriptBatch) -> None:
+        """Log ``training_batch_wer`` on a bounded sample of the training batch.
+
+        Named to match the ASR collection, so CHAT and SCRIPT land on one wandb
+        panel. Like CHAT's, it is a real decode rather than a teacher-forced
+        score, so the two measure the same thing.
+
+        Deliberately cheap and deliberately noisy: a handful of utterances every
+        few hundred steps is enough to see a training curve diverge from
+        validation, and not enough to slow the run. It is NOT a substitute for
+        val_wer -- it is measured on whatever chunk size this batch drew, which
+        for a multi chunk-size arm varies from step to step.
+
+        Any failure here is swallowed: a metric must never be able to kill a
+        training run. The decode path is shared with validation and can raise on
+        a degenerate batch (no audio, empty reference), which would otherwise take
+        down every rank at once.
+        """
+        every = int(getattr(self.core_cfg, "train_wer_every_n_steps", 0) or 0)
+        if every <= 0 or self._trainer is None:
+            return
+        step = int(self.trainer.global_step)
+        if step == 0 or step % every != 0:
+            return
+
+        n = max(int(getattr(self.core_cfg, "train_wer_max_utts", 4) or 4), 1)
+        refs = [t for t in (batch.text or [])][:n]
+        if not refs:
+            return
+
+        try:
+            was_training = self.training
+            self.eval()
+            with torch.no_grad():
+                hyps = self.generate(
+                    audios=batch.audios[: len(refs)],
+                    audio_lens=batch.audio_lens[: len(refs)],
+                    system_prompt=self._val_system_prompt,
+                    max_new_tokens=self.val_max_new_tokens_per_chunk,
+                    chunk_size_override=batch.chunk_size,
+                )
+            if was_training:
+                self.train()
+
+            metric = WER(normalize=False, verbose=False)
+            metric.update("train", refs=refs, hyps=[str(h) for h in hyps])
+            for name, value in metric.compute().items():
+                if name == "wer":
+                    self.log("training_batch_wer", value.to(self.device), on_step=True)
+        except Exception as e:  # pragma: no cover - never let a metric kill training
+            logging.warning("training_batch_wer skipped: %r", e)
+            if self.training is False:
+                self.train()
+
     def _banded_training_step(self, batch: ScriptBatch, batch_idx: int):
         """Marginalise the loss over every in-band word-to-chunk assignment.
 
@@ -696,7 +762,7 @@ class ScriptSTTModel(StreamingSTTModel):
         loss = nll[finite].sum() / n_targets
         self.log_dict(
             {
-                "loss": loss,
+                "train_loss": loss,
                 "learning_rate": torch.as_tensor(
                     self.trainer.optimizers[0].param_groups[0]["lr"] if self._trainer is not None else 0.0
                 ),
@@ -742,7 +808,7 @@ class ScriptSTTModel(StreamingSTTModel):
         loss = total / n_targets
         self.log_dict(
             {
-                "loss": loss,
+                "train_loss": loss,
                 "learning_rate": torch.as_tensor(
                     self.trainer.optimizers[0].param_groups[0]["lr"] if self._trainer is not None else 0.0
                 ),
@@ -861,6 +927,8 @@ class ScriptSTTModel(StreamingSTTModel):
         self._set_encoder_att_context(batch.chunk_size)
         self._last_chunk_size = batch.chunk_size
 
+        self._maybe_log_training_wer(batch)
+
         if self._loss_type == "banded":
             return self._banded_training_step(batch, batch_idx)
         if self._twod_layout:
@@ -907,7 +975,7 @@ class ScriptSTTModel(StreamingSTTModel):
             )
 
         metrics = {
-            "loss": loss,
+            "train_loss": loss,
             "learning_rate": torch.as_tensor(
                 self.trainer.optimizers[0].param_groups[0]["lr"] if self._trainer is not None else 0.0
             ),
@@ -976,15 +1044,38 @@ class ScriptSTTModel(StreamingSTTModel):
         else:
             gathered = [local]
 
+        # TWO normalizations over the SAME decoded strings, because one number
+        # cannot serve both purposes.
+        #
+        #   val_wer          Whisper-normalised. speechlm2's historical default and
+        #                    this model's checkpoint monitor, so its meaning must
+        #                    not change -- every existing run's save_top_k was
+        #                    selected against it.
+        #   val_wer_verbatim raw text, no normalisation. This is what the ASR
+        #                    collection (and therefore the CHAT models) reports as
+        #                    its val_wer.
+        #
+        # Logging both makes the families comparable on a like-for-like axis. They
+        # were NOT before: CHAT reading ~0.15 and SCRIPT ~0.087 on the same
+        # manifest was mostly the normaliser, not the model, and that gap was read
+        # as a real quality difference more than once.
+        #
+        # The second metric is nearly free -- it re-scores strings that are already
+        # decoded and gathered, with no extra forward pass.
         wer = WER(normalize=True, verbose=False)
+        wer_verbatim = WER(normalize=False, verbose=False)
         has_data = False
         for rank_data in gathered:
             for name, values in rank_data.items():
                 has_data = has_data or bool(values["refs"])
                 wer.update(name, refs=values["refs"], hyps=values["hyps"])
+                wer_verbatim.update(name, refs=values["refs"], hyps=values["hyps"])
         if has_data:
             for metric_name, metric_value in wer.compute().items():
                 log_name = "val_wer" if metric_name == "wer" else f"val_{metric_name}"
+                self.log(log_name, metric_value.to(self.device), on_epoch=True, sync_dist=False)
+            for metric_name, metric_value in wer_verbatim.compute().items():
+                log_name = "val_wer_verbatim" if metric_name == "wer" else f"val_{metric_name}_verbatim"
                 self.log(log_name, metric_value.to(self.device), on_epoch=True, sync_dist=False)
 
         self._partial_wer_refs.clear()
