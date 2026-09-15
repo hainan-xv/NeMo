@@ -49,12 +49,14 @@
 # a live WANDB key and HF token in plaintext on shared lustre; this repo is
 # pushed to GitHub, so inlining them would publish them.
 #
-# BATCH SIZES ARE DELIBERATELY NOT SCALED UP. The reference recipe uses
-# int(x*1.9) versus the OCI list, implying these GPUs hold roughly 1.9x what an
-# 80 GB card does. Our banded bucket_batch_size was derived by measurement
-# against 80 GB and is therefore conservative here -- it will fit. Establish
-# that the arm RUNS first, read the real GPU from nvidia-smi in the job log,
-# then re-derive. Guessing at memory is what cost three OOM cycles on OCI today.
+# BATCH SIZES ARE NOT SCALED UP, and should not be. The reference recipe uses
+# int(x*1.9) versus the OCI list, which looks like it implies bigger cards -- it
+# does not. Measured from nvidia-smi in job 18615569: these are H100 80GB HBM3,
+# the SAME memory as the OCI A100s. The 1.9x is presumably because that recipe's
+# readwrite_collapse variant collapses silent audio and so runs shorter
+# sequences. Our banded bucket_batch_size was derived by direct measurement
+# against 80 GB, so it ports here unchanged; adopting the 1.9x would over-commit
+# by almost double. Guessing at memory is what cost three OOM cycles on OCI.
 # ============================================================================
 set -uo pipefail
 
@@ -124,7 +126,19 @@ HF_TOKEN="$(read_required_token "$HOME/.hf_token")"
 
 LHOTSE_RND_SEED="${1:-42}"
 
-MOUNTS="--container-mounts=${CODE_DIR}:/code,${RESULTS_DIR}:/results,${HEH}:${HEH},${MYDIR}:${MYDIR},${HFCACHE}:/hfcache"
+# IDENTITY mounts of both project roots the data config references, because the
+# manifests and tar paths inside it are ABSOLUTE lustre paths -- they have to
+# resolve to the same string inside the container as outside.
+#
+# There are exactly two roots, confirmed by scanning the input_cfg rather than
+# assumed: the manifests live under nemotron_speechprod_asr/users/heh, and the
+# AUDIO TARS live under llmservice_nemo_speechlm. Mounting only the first is what
+# failed job 18615569 -- it sailed through the sanity check (which uses the mcv11
+# val manifest, a plain .json under the mounted root) and then died on the first
+# TRAINING batch with FileNotFoundError on .../ASR/YTC/en12/audio_52.tar.
+DATA_ROOT=/lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm
+
+MOUNTS="--container-mounts=${CODE_DIR}:/code,${RESULTS_DIR}:/results,${HFCACHE}:/hfcache,${LUSTRE}:${LUSTRE},${DATA_ROOT}:${DATA_ROOT}"
 
 # Do NOT enable xtrace: the command below contains expanded token values.
 read -r -d '' cmd <<EOF
