@@ -604,19 +604,24 @@ def test_script_and_chat_agree_on_metric_names():
 def test_both_families_expose_a_comparable_val_wer():
     """val_wer alone is NOT comparable across families, so both extras must exist.
 
-    CHAT's val_wer is verbatim (ASR convention); SCRIPT's is Whisper-normalised
-    (speechlm2 convention). On the same manifest that gap read ~0.15 vs ~0.087 and
-    was mistaken for a quality difference. Neither native metric may change -- both
-    are checkpoint monitors -- so each family gains the OTHER normalisation:
-    val_wer_norm on CHAT, val_wer_verbatim on SCRIPT.
+    val_wer is Whisper-normalised on BOTH families now. CHAT's used to be verbatim
+    (the ASR convention), which is why the same manifest read ~0.15 there against
+    ~0.087 on SCRIPT and got mistaken for a quality difference. The verbatim number
+    is still available on both, under val_wer_verbatim.
     """
     import inspect
 
     from nemo.collections.asr.models import chat_bpe_models
     from nemo.collections.speechlm2.models import script_model
 
-    assert "val_wer_norm" in inspect.getsource(chat_bpe_models), "CHAT lost its normalised val WER"
-    assert "val_wer_verbatim" in inspect.getsource(script_model), "SCRIPT lost its verbatim val WER"
+    chat = inspect.getsource(chat_bpe_models)
+    script = inspect.getsource(script_model)
+
+    # CHAT must MOVE its verbatim number aside rather than drop it, and the
+    # primary val_wer must be the normalised one.
+    assert "val_wer_verbatim" in chat, "CHAT lost its verbatim val WER"
+    assert "EnglishTextNormalizer" in chat, "CHAT's val_wer is no longer normalised"
+    assert "val_wer_verbatim" in script, "SCRIPT lost its verbatim val WER"
 
 
 @pytest.mark.unit

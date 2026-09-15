@@ -1026,9 +1026,25 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
         else:
             num, words = 0.0, 0
 
+        # SWAP WHICH NORMALISATION OWNS THE NAME `val_wer`.
+        #
+        # The base pass computed val_wer verbatim (the ASR collection's
+        # convention). That is moved aside to val_wer_verbatim, and the
+        # Whisper-normalised number takes the primary name -- matching speechlm2,
+        # so CHAT and SCRIPT `val_wer` finally mean the same thing and one wandb
+        # panel carries both.
+        #
+        # This CHANGES CHECKPOINT SELECTION: exp_manager monitors val_wer, so
+        # save_top_k now ranks on the normalised metric. Checkpoints selected
+        # under the old meaning are not comparable to ones selected under the new
+        # one, which is why this landed together with wiping the run directories.
         dev = encoded.device
-        logs['val_wer_norm_num'] = torch.tensor(num, device=dev, dtype=torch.float32)
-        logs['val_wer_norm_denom'] = torch.tensor(float(words), device=dev, dtype=torch.float32)
+        for key in ('val_wer', 'val_wer_num', 'val_wer_denom'):
+            if key in logs:
+                logs[key.replace('val_wer', 'val_wer_verbatim')] = logs[key]
+        logs['val_wer_num'] = torch.tensor(num, device=dev, dtype=torch.float32)
+        logs['val_wer_denom'] = torch.tensor(float(words), device=dev, dtype=torch.float32)
+        logs['val_wer'] = torch.tensor(num / max(float(words), 1.0), device=dev, dtype=torch.float32)
         return logs
 
     def multi_validation_epoch_end(self, outputs, dataloader_idx: int = 0):
@@ -1039,11 +1055,15 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
         decoded string and computes one corpus WER, so a batch-mean here would be a
         different statistic wearing the same name.
         """
+        # The base sums val_wer_num / val_wer_denom, which this pass has already
+        # replaced with the normalised counts -- so its val_wer comes out
+        # normalised with no further work. Only the verbatim companion needs
+        # aggregating here, and corpus-style for the same reason.
         result = super().multi_validation_epoch_end(outputs, dataloader_idx=dataloader_idx)
-        if outputs and 'val_wer_norm_num' in outputs[0]:
-            num = torch.stack([x['val_wer_norm_num'] for x in outputs]).sum()
-            denom = torch.stack([x['val_wer_norm_denom'] for x in outputs]).sum()
-            result.setdefault('log', {})['val_wer_norm'] = num / denom.clamp(min=1.0)
+        if outputs and 'val_wer_verbatim_num' in outputs[0]:
+            num = torch.stack([x['val_wer_verbatim_num'] for x in outputs]).sum()
+            denom = torch.stack([x['val_wer_verbatim_denom'] for x in outputs]).sum()
+            result.setdefault('log', {})['val_wer_verbatim'] = num / denom.clamp(min=1.0)
         return result
 
     @classmethod
