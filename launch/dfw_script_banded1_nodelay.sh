@@ -15,7 +15,10 @@
 #SBATCH --ntasks-per-node=8
 #SBATCH --output=slurm_out/%x=%j --error=slurm_out/%x=%j
 # Known-bad node, excluded by the reference DFW recipe.
-#SBATCH --exclude=pool0-00407
+# pool0-01815 carries an old NVIDIA driver (12020) and fails torch's CUDA init
+# outright; it killed job 18686485 in 103s. pool0-00407 is the reference recipe's
+# known-bad node.
+#SBATCH --exclude=pool0-00407,pool0-01815
 
 # ============================================================================
 # SCRIPT, right-band=1, on the UNMODIFIED alignment, warm-started.

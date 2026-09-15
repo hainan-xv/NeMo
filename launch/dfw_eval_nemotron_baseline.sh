@@ -10,7 +10,10 @@
 #SBATCH --mem=0
 #SBATCH --ntasks-per-node=1
 #SBATCH --output=slurm_out/%x=%j --error=slurm_out/%x=%j
-#SBATCH --exclude=pool0-00407
+# pool0-01815 carries an old NVIDIA driver (12020) and fails torch's CUDA init
+# outright; it killed job 18686485 in 103s. pool0-00407 is the reference recipe's
+# known-bad node.
+#SBATCH --exclude=pool0-00407,pool0-01815
 
 # ============================================================================
 # Leaderboard eval of the DONOR nemotron streaming RNN-T, on the CW DFW cluster.
