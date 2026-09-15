@@ -39,6 +39,8 @@ SCRIPT_PATHS=(
     oci_env.sh
     oci_launch.sh
     oci_launch_interactive.sh
+    dfw_env.sh
+    sync_to_dfw.sh
     eval_sweep.sh
     eval_all.sh
     eval_promptctl_sweep.sh
