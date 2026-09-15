@@ -215,18 +215,27 @@ data:
     #
     #   forced : [38,29,25,22,20,18,17,15,14,13,12,11,10,8,7,6,5,4]
     #   flat/3 : [12, 9, 8, 7, 6, 6, 5, 5, 4, 4, 4, 3, 3,2,2,2,1,1]  <- too big at 12.7s/13.5s/29.4s
-    # x0.6 AGAIN after job 13399611 still OOMed in backward at 78.93/79.33 GiB
-    # with activation_checkpointing on. Measured locally at the sizes below this
-    # line, the LLM forward+backward peaks at a FLAT 8-12 GiB across every bin --
-    # and banded at 13x332 tokens/step is FEWER LLM tokens than forced at 38x141.
-    # So the band is not what fills the GPU; the forced arm already runs near the
-    # limit (job 13380534 died of OOM before the guard existed) once the encoder
-    # and optimizer state are counted, which a local LLM-only benchmark cannot
-    # see. Rather than keep iterating on the grid at ~30 min per attempt, buy
-    # margin. Throughput is the price; a dead 8-node job costs far more.
-    #   previous: [13, 9, 8, 7, 6, 5, 5, 4, 4, 3, 3, 3, 3, 2, 2, 1, 1, 1]
-    bucket_batch_size: [7, 5, 4, 4, 3, 3, 3, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1]
-    max_duration: 54
+    # CUT AGAIN after DFW job 18615921 died the same way at step 1709/2000: four
+    # forward OOMs skipped cleanly, then one in backward, which the guard cannot
+    # recover (NCCL collectives are already in flight) -- the watchdog reported
+    # "Invalid access of peer GPU memory over nvlink" and aborted. Same failure on
+    # H100 80GB as on A100 80GB, so it is memory, not the card.
+    #
+    # NOTE bins 10-18 are ALREADY at batch 1 and cannot go lower, so this only
+    # moves the short/mid bins. The long tail's remaining lever is max_duration,
+    # cut below from 54 to 40 -- the last duration bin ends at 39.6, so anything
+    # past it was landing in the final bucket with a ~3800-token packed sequence.
+    #
+    # Honest limitation: local measurement accounts for only ~10 GiB of the ~78
+    # GiB the grid reports, the rest being the encoder and optimizer state a
+    # LLM-only benchmark cannot see. This buys margin rather than demonstrating a
+    # fix, and it is deliberately generous because each grid iteration costs a
+    # run that dies near its first checkpoint.
+    #   previous: [7, 5, 4, 4, 3, 3, 3, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+    bucket_batch_size: [4, 3, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+    # 40, not 54: the last duration bin ends at 39.6, so longer clips fell into
+    # the final bucket and produced the longest packed sequences of all.
+    max_duration: 40
     pad_extra_duration: 0.5
     pad_extra_duration_prob: 1.0
 
