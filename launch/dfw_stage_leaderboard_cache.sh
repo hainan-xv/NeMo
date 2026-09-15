@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH -A nemotron_speechprod_asr
 #SBATCH -J nemotron_speechprod_asr:dfw-stage-leaderboard-cache
-#SBATCH -p cpu,interactive
+#SBATCH -p cpu_datamover,cpu
 #SBATCH -N 1
 #SBATCH -t 04:00:00
 #SBATCH --time-min 01:00:00
@@ -24,8 +24,11 @@
 #
 # DFW differs from the OCI script only in:
 #   account    nemotron_speechprod_asr
-#   partition  cpu,interactive -- staging is CPU/network bound and wants no GPU,
-#              and DFW has real CPU partitions where OCI did not
+#   partition  cpu_datamover,cpu -- staging is CPU/network bound and wants no
+#              GPU at all. Slurm REJECTS a GPU-less job submitted to a GPU
+#              partition, and it validates the whole -p list, so mixing in
+#              `interactive` fails outright. cpu_datamover has no time limit,
+#              which suits a 43 GB download.
 #   paths      cache, code and container all under the DFW project
 #
 # Confirmed before writing this: DFW login can reach huggingface.co (HTTP 200),
