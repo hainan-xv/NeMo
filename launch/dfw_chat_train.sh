@@ -75,6 +75,11 @@ INFER_DELAY_FRAMES="${INFER_DELAY_FRAMES:-null}"
 
 LR="${LR:-1e-4}"
 WARMUP_STEPS="${WARMUP_STEPS:-5000}"
+# Per-bucket batch sizes. Empty means "use whatever the YAML says", which is what
+# every arm did until we dropped to 2 nodes. An arm that sets this overrides the
+# YAML wholesale -- an ABSOLUTE list, not a multiplier, so it stays a valid
+# specification even if the YAML's own list is later retuned.
+BUCKET_BATCH_SIZE="${BUCKET_BATCH_SIZE:-}"
 MAX_STEPS="${MAX_STEPS:-500000}"
 EPOCH_STEPS="${EPOCH_STEPS:-2000}"
 # 4, NOT the config's 8. The reference DFW recipe flags this explicitly ("note the
@@ -135,6 +140,11 @@ HF_TOKEN="$(read_required_token "$HOME/.hf_token")"
 MOUNTS="--container-mounts=${CODE_DIR}:/code,${RESULTS_DIR}:/results,${HFCACHE}:/hfcache,${LUSTRE}:${LUSTRE},${DATA_ROOT}:${DATA_ROOT}"
 
 # Do NOT enable xtrace: the command below contains expanded token values.
+BUCKET_BATCH_CLAUSE=""
+if [[ -n "$BUCKET_BATCH_SIZE" ]]; then
+    BUCKET_BATCH_CLAUSE="model.train_ds.bucket_batch_size=${BUCKET_BATCH_SIZE}"
+fi
+
 read -r -d '' cmd <<EOF
 echo "*******STARTING********" \
 && echo "*** DFW CHAT transducer (RNNTAttJoint), loss_type=${LOSS_TYPE} ***" \
@@ -184,6 +194,7 @@ print('    tokenizer ->', dst)
     model.joint.history_chunks=${HISTORY_CHUNKS} \
     model.train_ds.input_cfg=${TRAIN_INPUT_CFG} \
     model.train_ds.num_workers=${NUM_WORKERS} \
+    ${BUCKET_BATCH_CLAUSE} \
     model.validation_ds.manifest_filepath=${VAL_MANIFEST} \
     model.optim.lr=${LR} \
     model.optim.sched.warmup_steps=${WARMUP_STEPS} \
