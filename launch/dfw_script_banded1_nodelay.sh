@@ -109,6 +109,20 @@ if [[ "${SKIP_NODE_SUFFIX:-0}" != "1" && "$ACTUAL_NODES" -ne "$DESIGN_NODES" ]];
     echo "==> Allocation is ${ACTUAL_NODES} node(s), not the designed ${DESIGN_NODES}; EXP_NAME -> ${EXP_NAME}"
 fi
 
+# Hydra's override grammar cannot parse a VALUE containing "=", and every
+# checkpoint this project writes is named "step=NNNN-val_wer=N.NNNN-last.ckpt".
+# Passing the path directly dies with "mismatched input '=' expecting <EOF>"
+# before the model is even built. A symlink under a clean name is the simplest
+# thing that cannot be broken by a future filename scheme.
+INIT_LINK=${MYDIR}/init_ckpts/${EXP_NAME}_init.ckpt
+mkdir -p "$(dirname "$INIT_LINK")"
+if [[ ! -e "$INIT_CKPT" ]]; then
+    echo "ERROR: warm-start checkpoint not found: ${INIT_CKPT}" >&2
+    exit 1
+fi
+ln -sfn "$INIT_CKPT" "$INIT_LINK"
+echo "==> warm start: ${INIT_LINK} -> ${INIT_CKPT}"
+
 RESULTS_DIR=${MYDIR}/results/${PROJECT_NAME}/${EXP_NAME}
 HFCACHE=${MYDIR}/hf_cache
 mkdir -p "$RESULTS_DIR" "$HFCACHE"
@@ -178,7 +192,7 @@ echo "*******STARTING********" \
     ++model.activation_checkpointing=${ACT_CKPT} \
     ++model.attn_backend=${ATTN_BACKEND} \
     data.dataset.num_delay_frames=${DELAY} \
-    ++init_from_ckpt=${INIT_CKPT} \
+    ++init_from_ckpt=${INIT_LINK} \
     data.train_ds.input_cfg=${TRAIN_INPUT_CFG} \
     data.train_ds.num_workers=${NUM_WORKERS} \
     data.train_ds.seed=${LHOTSE_RND_SEED} \
