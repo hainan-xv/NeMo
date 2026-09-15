@@ -191,10 +191,18 @@ echo "    model:      ${MODEL_PATH}"
 echo "    mode:       ${MODE}   chunk_size: ${CHUNK_SIZE} frames   pad: ${PAD_EXTRA_SECONDS}s"
 echo "    results ->  ${RESULTS_DIR}"
 
-# /lustre/fsw and /lustre/fs12 are separate autofs roots; the model lives on
-# fs12 while the code/cache/results live on fsw, so BOTH must be bound. The
-# broad catch-alls come first so ancestor binds do not shadow the leaves.
-MOUNTS="--container-mounts=/lustre/fsw:/lustre/fsw,/lustre/fs12:/lustre/fs12,${CODE_DIR}:/code,${OUTPUT_PREFIX}:${OUTPUT_PREFIX},${CACHE_DIR}:${CACHE_DIR},${H_DIR}:${H_DIR},${HFCACHE}:/hfcache/"
+# /lustre/fsw and /lustre/fs12 are separate autofs roots; on OCI the donor .nemo
+# lives on fs12 while the code/cache/results live on fsw, so BOTH must be bound.
+# The broad catch-alls come first so ancestor binds do not shadow the leaves.
+#
+# fs12 is bound ONLY IF IT EXISTS. DFW has no fs12, and enroot refuses to start a
+# container when a bind source is missing rather than skipping it -- which failed
+# all three CHAT arms of job 18676634 with "enroot-mount: failed to mount:
+# /lustre/fs12 ... No such file or directory", after averaging had already
+# succeeded. On OCI the directory is present, so this is a no-op there.
+FS12_MOUNT=""
+[[ -d /lustre/fs12 ]] && FS12_MOUNT="/lustre/fs12:/lustre/fs12,"
+MOUNTS="--container-mounts=/lustre/fsw:/lustre/fsw,${FS12_MOUNT}${CODE_DIR}:/code,${OUTPUT_PREFIX}:${OUTPUT_PREFIX},${CACHE_DIR}:${CACHE_DIR},${H_DIR}:${H_DIR},${HFCACHE}:/hfcache/"
 
 WANDB_CLAUSE=""
 if [[ "$REPORT_WANDB" == "1" ]]; then
