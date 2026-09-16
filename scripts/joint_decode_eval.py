@@ -92,13 +92,13 @@ def load_chat(path: str, device: torch.device, tokenizer_dir: str = ""):
 
     cfg = EncDecCHATBPEModel.restore_from(restore_path=path, return_config=True)
     old_dir = str(cfg.tokenizer.get("dir", "") or "")
-        # Hubify ONLY when the recorded path is gone. On the cluster that trained
-        # the model the lustre path is REAL and resolvable; rewriting it to a hub
-        # id there breaks it, because the container runs with HF_HUB_OFFLINE and
-        # has no hub cache -- which is exactly how both fusion runs of job
-        # 18751303 died ("couldn't connect to huggingface.co"). Locally the path
-        # is absent and the hub id is what works. So the test is existence, not
-        # the machine.
+    # Hubify ONLY when the recorded path is gone. On the cluster that trained
+    # the model the lustre path is REAL and resolvable; rewriting it to a hub
+    # id there breaks it, because the container runs with HF_HUB_OFFLINE and
+    # has no hub cache -- which is exactly how both fusion runs of job
+    # 18751303 died ("couldn't connect to huggingface.co"). Locally the path
+    # is absent and the hub id is what works. So the test is existence, not
+    # the machine.
     if tokenizer_dir:
         new_dir = tokenizer_dir
     elif old_dir and not os.path.isdir(old_dir):
@@ -124,7 +124,9 @@ def load_script(ckpt: str, device: torch.device, dtype: torch.dtype):
 
 
 @torch.no_grad()
-def decode_batch(chat_m, script_m, wav, wav_len, chunk_size, lams, prompt, max_new_tokens):
+def decode_batch(
+    chat_m, script_m, wav, wav_len, chunk_size, lams, prompt, max_new_tokens, taus=(float("inf"),), stats=None
+):
     """Decode a BATCH at every lam, through SCRIPT's production decode loop.
 
     The fusion lives inside ``batched_stream_decode_script``, so this inherits its
@@ -145,15 +147,18 @@ def decode_batch(chat_m, script_m, wav, wav_len, chunk_size, lams, prompt, max_n
 
     out = {}
     for lam in lams:
-        out[lam] = script_m.generate(
-            wav,
-            wav_len,
-            system_prompt=prompt,
-            max_new_tokens=max_new_tokens,
-            chunk_size_override=chunk_size,
-            chat_fusion=None if lam == 0.0 else scorer,
-            fusion_lam=lam,
-        )
+        for tau in taus:
+            out[(lam, tau)] = script_m.generate(
+                wav,
+                wav_len,
+                system_prompt=prompt,
+                max_new_tokens=max_new_tokens,
+                chunk_size_override=chunk_size,
+                chat_fusion=None if lam == 0.0 else scorer,
+                fusion_lam=lam,
+                fusion_margin_threshold=tau,
+                fusion_stats=stats.get((lam, tau)) if stats else None,
+            )
     return out
 
 
@@ -176,6 +181,14 @@ def main() -> int:
     ap.add_argument("--chunk_size", type=int, default=14)
     ap.add_argument("--pad_extra_seconds", type=float, default=0.5)
     ap.add_argument("--batch_size", type=int, default=16)
+    ap.add_argument(
+        "--margin_threshold",
+        default="inf",
+        help="comma-separated CHAT-confidence thresholds (nats). A step whose CHAT top1-top2 "
+        "margin is at least tau is handed to CHAT outright instead of fused. Monotonic: "
+        "0 = CHAT alone, inf = full fusion. Sweeping tau shows WHERE the ensemble earns its gain.",
+    )
+    ap.add_argument("--fusion_stats", action="store_true", help="report override rate by CHAT confidence")
     ap.add_argument("--max_new_tokens", type=int, default=64)
     ap.add_argument("--device", type=int, default=0)
     ap.add_argument("--dtype", choices=["bf16", "fp32"], default="bf16")
@@ -189,6 +202,7 @@ def main() -> int:
     args = ap.parse_args()
 
     lams = [float(x) for x in args.lam.split(",") if x.strip()]
+    taus = [float(x) for x in args.margin_threshold.split(",") if x.strip()]
     device = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float32
 
@@ -218,17 +232,32 @@ def main() -> int:
             flush=True,
         )
 
-        hyps = {lam: [] for lam in lams}
+        keys = [(l, t) for l in lams for t in taus]
+        stats = None
+        if args.fusion_stats:
+            from nemo.collections.speechlm2.parts.chat_fusion import FusionStats
+
+            stats = {k: FusionStats() for k in keys}
+        hyps = {k: [] for k in keys}
         t0 = time.time()
         for st in range(0, len(paths), args.batch_size):
             chunk_paths = paths[st : st + args.batch_size]
             wav, wav_len = load_audio_batch(chunk_paths, args.pad_extra_seconds)
             wav, wav_len = wav.to(device), wav_len.to(device)
             got = decode_batch(
-                chat_m, script_m, wav, wav_len, args.chunk_size, lams, args.system_prompt, args.max_new_tokens
+                chat_m,
+                script_m,
+                wav,
+                wav_len,
+                args.chunk_size,
+                lams,
+                args.system_prompt,
+                args.max_new_tokens,
+                taus,
+                stats,
             )
-            for lam in lams:
-                hyps[lam].extend(got[lam])
+            for k in keys:
+                hyps[k].extend(got[k])
             done = min(st + args.batch_size, len(paths))
             el = time.time() - t0
             print(
@@ -238,20 +267,24 @@ def main() -> int:
             if args.verbose and st == 0:
                 for j in range(min(2, len(chunk_paths))):
                     print(f"   ref: {refs[j]}")
-                    for lam in lams:
-                        print(f"   lam={lam}: {got[lam][j]}")
+                    for k in keys:
+                        print(f"   lam={k[0]} tau={k[1]}: {got[k][j]}")
 
-        print(f"\n  {'lam':>6}  {'WER%':>7}")
-        print(f"  {'-'*16}")
-        for lam in lams:
+        print(f"\n  {'lam':>6}  {'tau':>6}  {'WER%':>7}")
+        print(f"  {'-'*24}")
+        for lam, tau in keys:
             # A FRESH scorer per lam: LeaderboardWER accumulates across update()
             # calls, so reusing one would pool every lam's hypotheses together
             # and report the same blended number for all of them.
             sc = LeaderboardWER()
-            sc.update(f"{ds}/{split}", refs, hyps[lam])
+            sc.update(f"{ds}/{split}", refs, hyps[(lam, tau)])
             wer = sc.compute()["wer"] * 100.0
-            tag = "  <- CHAT alone" if lam == 1.0 else ("  <- SCRIPT alone" if lam == 0.0 else "")
-            print(f"  {lam:>6}  {wer:>7.2f}{tag}")
+            tag = "  <- CHAT alone" if (lam == 1.0 or tau == 0.0) else ("  <- SCRIPT alone" if lam == 0.0 else "")
+            print(f"  {lam:>6}  {tau:>6}  {wer:>7.2f}{tag}")
+        if stats:
+            for k in keys:
+                if stats[k].steps:
+                    print(f"\n  lam={k[0]} tau={k[1]}\n  " + stats[k].report().replace("\n", "\n  "))
     return 0
 
 

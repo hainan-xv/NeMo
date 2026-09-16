@@ -44,9 +44,67 @@ from typing import List, Sequence
 
 import torch
 
-__all__ = ["ChatFusionScorer", "fuse_into_script_logits"]
+__all__ = ["ChatFusionScorer", "FusionStats", "fuse_into_script_logits"]
 
 NEG_INF = -1e30
+
+
+class FusionStats:
+    """Where does the ensemble actually earn its gain?
+
+    The motivating hypothesis is that CHAT is usually right on its own and SCRIPT
+    only helps where CHAT is unsure. If true, fusion could be GATED on CHAT's
+    confidence -- cheaper, and possibly better, since a confident CHAT would stop
+    being outvoted. If false -- if overrides are spread evenly across confidence
+    -- a gate would just discard gains.
+
+    Confidence here is the MARGIN: CHAT's top-1 minus top-2 log-prob at that
+    step. Margin rather than top-1 probability because the decision at each step
+    is between the leading candidates; a step can have low top-1 mass spread over
+    many unlikely tokens and still be an easy call.
+
+    Records, per margin bucket, how often the fused argmax DIFFERED from CHAT's.
+    That is the override rate: the only steps at which fusion can change the
+    transcript at all.
+    """
+
+    # Bucket edges in nats of margin. Dense near 0 because that is where the
+    # interesting steps are; a margin above ~5 is effectively a certainty.
+    EDGES = (0.0, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, float("inf"))
+
+    def __init__(self):
+        self.steps = 0
+        self.overrides = 0
+        self.bucket_steps = [0] * (len(self.EDGES) - 1)
+        self.bucket_overrides = [0] * (len(self.EDGES) - 1)
+
+    def _bucket(self, m: float) -> int:
+        for i in range(len(self.EDGES) - 1):
+            if m < self.EDGES[i + 1]:
+                return i
+        return len(self.EDGES) - 2
+
+    def update(self, margins: torch.Tensor, overridden: torch.Tensor) -> None:
+        for m, o in zip(margins.tolist(), overridden.tolist()):
+            b = self._bucket(float(m))
+            self.steps += 1
+            self.bucket_steps[b] += 1
+            if o:
+                self.overrides += 1
+                self.bucket_overrides[b] += 1
+
+    def report(self) -> str:
+        out = [
+            f"fusion steps={self.steps} overrides={self.overrides} "
+            f"({100.0 * self.overrides / max(1, self.steps):.2f}%)",
+            f"  {'CHAT margin':>16}  {'steps':>9}  {'overrides':>9}  {'rate':>7}",
+        ]
+        for i in range(len(self.EDGES) - 1):
+            lo, hi = self.EDGES[i], self.EDGES[i + 1]
+            n, o = self.bucket_steps[i], self.bucket_overrides[i]
+            label = f"[{lo:g}, {hi:g})" if hi != float("inf") else f"[{lo:g}, inf)"
+            out.append(f"  {label:>16}  {n:>9}  {o:>9}  {100.0*o/max(1,n):>6.2f}%")
+        return "\n".join(out)
 
 
 class ChatFusionScorer:
@@ -117,6 +175,8 @@ def fuse_into_script_logits(
     lam: float,
     eot_id: int,
     veto_ids: Sequence[int] = (),
+    margin_threshold: float = float("inf"),
+    stats: "FusionStats | None" = None,
 ) -> torch.Tensor:
     """Combine in SCRIPT's index space, returning a drop-in replacement for ``logits``.
 
@@ -148,4 +208,38 @@ def fuse_into_script_logits(
     for vid in veto_ids:
         if 0 <= vid < vocab_llm:
             out[:, vid] = NEG_INF
+
+    # ``margin_threshold`` is "how confident CHAT must be before we hand it the
+    # step outright", so the sweep is MONOTONIC:
+    #     tau = 0    every step gated  -> CHAT alone
+    #     tau = inf  no step gated     -> full fusion   (the default)
+    # An earlier version treated 0 as "off", which made tau=0 mean full fusion
+    # and tau=epsilon mean nearly-CHAT-alone -- the curve doubled back on itself
+    # and a sweep over it could not be read.
+    gating = margin_threshold != float("inf")
+    if gating or stats is not None:
+        # CHAT's own view, in the same index space, so "what CHAT would have
+        # done" is comparable to the fused choice row by row.
+        chat_only = torch.full_like(out, NEG_INF)
+        chat_only[:, :V] = chat_lp[:, :V]
+        chat_only[:, eot_id] = chat_lp[:, V]
+        for vid in veto_ids:
+            if 0 <= vid < vocab_llm:
+                chat_only[:, vid] = NEG_INF
+
+        top2 = chat_only.topk(2, dim=-1)
+        margins = top2.values[:, 0] - top2.values[:, 1]
+        chat_choice = top2.indices[:, 0]
+
+        if stats is not None:
+            stats.update(margins.detach().cpu(), (out.argmax(-1) != chat_choice).detach().cpu())
+
+        if gating:
+            # Where CHAT is confident, hand the step to CHAT outright. Replacing
+            # the ROW (rather than nudging weights) keeps the decision identical
+            # to CHAT-alone decoding at those steps, which is what makes a
+            # threshold sweep interpretable: tau -> inf must reproduce lam=1.
+            confident = margins >= margin_threshold
+            if bool(confident.any()):
+                out = torch.where(confident.unsqueeze(1), chat_only, out)
     return out

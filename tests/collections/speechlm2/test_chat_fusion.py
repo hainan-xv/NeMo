@@ -125,3 +125,125 @@ def test_batched_streams_are_fused_independently():
     out = fuse_into_script_logits(logits, chat_lp, 1.0, EOT, ())
     assert out[0].argmax().item() == 1
     assert out[1].argmax().item() == 3
+
+
+# --------------------------------------------------------------------------
+# Confidence gating: hand a step to CHAT outright when it is sure.
+# --------------------------------------------------------------------------
+
+
+SCRIPT_FAVOURITE = 3  # the token SCRIPT is made to want in these tests
+
+
+def _chat_dist(top_tok, margin, floor=-6.0, runner_up=1):
+    """CHAT log-probs: ``top_tok`` on top, beating the runner-up by ``margin``.
+
+    ``floor`` is deliberately MILD (-6, not -30). A very negative floor makes
+    CHAT veto every token it did not pick, so SCRIPT can never pull a step at
+    lam=0.5 no matter how unsure CHAT is -- which made an earlier version of
+    these tests assert an outcome the arithmetic could not produce.
+    """
+    assert runner_up not in (top_tok, SCRIPT_FAVOURITE)
+    lp = torch.full((1, V + 1), floor)
+    lp[0, top_tok] = 0.0
+    lp[0, runner_up] = -margin
+    return lp
+
+
+def _script_prefers(tok, strength=20.0, n=1):
+    lg = torch.zeros(n, LLM)
+    lg[:, tok] = strength
+    return lg
+
+
+def test_threshold_zero_reproduces_chat_alone():
+    """tau=0 gates EVERY step, so it must equal lam=1 decoding exactly.
+
+    This is one end of the sweep; without it a threshold curve cannot be
+    anchored.
+    """
+    logits = _script_prefers(SCRIPT_FAVOURITE)
+    chat_lp = _chat_dist(2, 3.0)
+    gated = fuse_into_script_logits(logits, chat_lp, 0.5, EOT, (), margin_threshold=0.0)
+    chat_only = fuse_into_script_logits(logits, chat_lp, 1.0, EOT, ())
+    assert gated[0].argmax().item() == chat_only[0].argmax().item() == 2
+
+
+def test_threshold_infinity_is_plain_fusion():
+    """The other end: no step gated, identical to ungated fusion."""
+    torch.manual_seed(3)
+    logits = torch.randn(1, LLM)
+    chat_lp = torch.randn(1, V + 1).log_softmax(-1)
+    a = fuse_into_script_logits(logits, chat_lp, 0.5, EOT, ())
+    b = fuse_into_script_logits(logits, chat_lp, 0.5, EOT, (), margin_threshold=float("inf"))
+    assert torch.allclose(a, b, atol=1e-6)
+
+
+def test_gate_hands_confident_steps_to_chat():
+    """With the gate on, a confident CHAT keeps the step it would otherwise lose.
+
+    Ungated the step goes to SCRIPT: fused[tok3] = .5*(-6) + .5*(0) = -3 beats
+    fused[tok2] = .5*(0) + .5*(-20) = -10. Gating on a margin above tau replaces
+    the row with CHAT's own, so token 2 wins instead.
+    """
+    logits = _script_prefers(SCRIPT_FAVOURITE)
+    sure = _chat_dist(2, 5.0)
+    assert fuse_into_script_logits(logits, sure, 0.5, EOT, ())[0].argmax().item() == SCRIPT_FAVOURITE
+    gated = fuse_into_script_logits(logits, sure, 0.5, EOT, (), margin_threshold=1.0)
+    assert gated[0].argmax().item() == 2, "confident CHAT must keep the step"
+
+
+def test_gate_leaves_unsure_steps_to_the_ensemble():
+    logits = _script_prefers(SCRIPT_FAVOURITE)
+    unsure = _chat_dist(2, 0.1)
+    out = fuse_into_script_logits(logits, unsure, 0.5, EOT, (), margin_threshold=1.0)
+    assert out[0].argmax().item() == SCRIPT_FAVOURITE, "unsure CHAT must let SCRIPT pull"
+
+
+def test_gate_is_per_row_not_per_batch():
+    """Streams decode together; one confident row must not gate another."""
+    logits = _script_prefers(SCRIPT_FAVOURITE, n=2)
+    chat_lp = torch.cat([_chat_dist(2, 5.0), _chat_dist(2, 0.1)], dim=0)
+    out = fuse_into_script_logits(logits, chat_lp, 0.5, EOT, (), margin_threshold=1.0)
+    assert out[0].argmax().item() == 2, "row 0 confident -> CHAT"
+    assert out[1].argmax().item() == SCRIPT_FAVOURITE, "row 1 unsure -> fused"
+
+
+def test_stats_count_overrides_by_confidence_bucket():
+    """Row 0 disagrees with SCRIPT (override); row 1 AGREES with it (no override).
+
+    Agreement is used for the no-override row rather than a large margin,
+    because margin alone does not prevent an override -- a very confident SCRIPT
+    can outvote a confident CHAT. That is a real property of the method, not
+    something the test should paper over.
+    """
+    from nemo.collections.speechlm2.parts.chat_fusion import FusionStats
+
+    st = FusionStats()
+    logits = _script_prefers(SCRIPT_FAVOURITE, n=2)
+    chat_lp = torch.cat(
+        [
+            _chat_dist(2, 0.1),                  # unsure, disagrees -> overridden
+            _chat_dist(SCRIPT_FAVOURITE, 9.0),   # certain, AGREES   -> not overridden
+        ],
+        dim=0,
+    )
+    fuse_into_script_logits(logits, chat_lp, 0.5, EOT, (), stats=st)
+
+    assert st.steps == 2
+    assert st.overrides == 1, "only the disagreeing row counts as an override"
+    assert st.bucket_overrides[st._bucket(0.1)] == 1
+    assert st.bucket_overrides[st._bucket(9.0)] == 0
+    assert "CHAT margin" in st.report()
+
+
+def test_stats_do_not_change_the_decision():
+    """Instrumentation must be observation only."""
+    from nemo.collections.speechlm2.parts.chat_fusion import FusionStats
+
+    torch.manual_seed(2)
+    logits = torch.randn(3, LLM)
+    chat_lp = torch.randn(3, V + 1).log_softmax(-1)
+    a = fuse_into_script_logits(logits, chat_lp, 0.5, EOT, ())
+    b = fuse_into_script_logits(logits, chat_lp, 0.5, EOT, (), stats=FusionStats())
+    assert torch.allclose(a, b, atol=1e-6)

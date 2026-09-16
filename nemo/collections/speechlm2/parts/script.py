@@ -1293,6 +1293,8 @@ def batched_stream_decode_script(
     position_scheme: str = BRANCH_SCHEME,
     chat_fusion=None,
     fusion_lam: float = 0.5,
+    fusion_margin_threshold: float = float("inf"),
+    fusion_stats=None,
 ):
     """Batched greedy SCRIPT decode for ``B`` utterances at once.
 
@@ -1489,6 +1491,8 @@ def batched_stream_decode_script(
                     fusion_lam,
                     eot_id,
                     veto_ids=(vision_start_id, vision_end_id),
+                    margin_threshold=fusion_margin_threshold,
+                    stats=fusion_stats,
                 )
             if emission_penalty or emission_penalty_lambda:
                 # Bias <eot> rather than suppressing every word token: the choice

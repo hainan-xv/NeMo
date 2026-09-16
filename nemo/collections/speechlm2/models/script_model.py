@@ -1323,6 +1323,8 @@ class ScriptSTTModel(StreamingSTTModel):
         # scorer is supplied, so the production decode path is unchanged.
         chat_fusion = generation_kwargs.pop("chat_fusion", None)
         fusion_lam = float(generation_kwargs.pop("fusion_lam", 0.5))
+        fusion_margin_threshold = float(generation_kwargs.pop("fusion_margin_threshold", float("inf")))
+        fusion_stats = generation_kwargs.pop("fusion_stats", None)
         # Guarantee that each chunk's first emitted token starts a new word. On by
         # default: without it a chunk whose first token is a continuation merges
         # onto the previous chunk's last word.
@@ -1386,6 +1388,8 @@ class ScriptSTTModel(StreamingSTTModel):
             max_history_tokens=max_history_tokens,
             chat_fusion=chat_fusion,
             fusion_lam=fusion_lam,
+            fusion_margin_threshold=fusion_margin_threshold,
+            fusion_stats=fusion_stats,
             is_word_start=self._is_word_start if insert_word_start_id is not None else None,
             insert_word_start_id=insert_word_start_id,
             **({"bidirectional_audio": True} if self._bidirectional_audio else {}),
