@@ -125,7 +125,18 @@ def load_script(ckpt: str, device: torch.device, dtype: torch.dtype):
 
 @torch.no_grad()
 def decode_batch(
-    chat_m, script_m, wav, wav_len, chunk_size, lams, prompt, max_new_tokens, taus=(float("inf"),), stats=None
+    chat_m,
+    script_m,
+    wav,
+    wav_len,
+    chunk_size,
+    lams,
+    prompt,
+    max_new_tokens,
+    taus=(float("inf"),),
+    stats=None,
+    skips=(float("inf"),),
+    skipped=None,
 ):
     """Decode a BATCH at every lam, through SCRIPT's production decode loop.
 
@@ -268,6 +279,8 @@ def main() -> int:
                 args.max_new_tokens,
                 taus,
                 stats,
+                skips,
+                skipped,
             )
             for k in keys:
                 hyps[k].extend(got[k])

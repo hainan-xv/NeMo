@@ -133,7 +133,16 @@ def load_model(ckpt_path: str, model_class_path: str, device: torch.device, dtyp
 # ---------------------------------------------------------------------------
 
 
-def _generate(model, audios, audio_lens, gen_kwargs, min_batch_size: int, chat_model=None, fusion_lam: float = 0.5):
+def _generate(
+    model,
+    audios,
+    audio_lens,
+    gen_kwargs,
+    min_batch_size: int,
+    chat_model=None,
+    fusion_lam: float = 0.5,
+    fusion_skip: float = float("inf"),
+):
     """Decode one batch, halving on CUDA OOM down to ``min_batch_size``.
 
     When ``chat_model`` is given, each batch is also encoded by the CHAT
@@ -155,6 +164,7 @@ def _generate(model, audios, audio_lens, gen_kwargs, min_batch_size: int, chat_m
             **gen_kwargs,
             "chat_fusion": ChatFusionScorer(chat_model, enc.transpose(1, 2), enc_len),
             "fusion_lam": fusion_lam,
+            "fusion_skip_threshold": fusion_skip,
         }
     try:
         with torch.inference_mode():
@@ -165,7 +175,7 @@ def _generate(model, audios, audio_lens, gen_kwargs, min_batch_size: int, chat_m
     # Retry OUTSIDE the except block, so the failed batch's traceback -- and the
     # tensors it still references -- are released before we allocate again.
     torch.cuda.empty_cache()
-    gen_kwargs = {k: v for k, v in gen_kwargs.items() if k not in ("chat_fusion", "fusion_lam")}
+    gen_kwargs = {k: v for k, v in gen_kwargs.items() if k not in ("chat_fusion", "fusion_lam", "fusion_skip_threshold")}
     half = max(min_batch_size, n // 2)
     _log(f"    [oom] retrying {n} utts as sub-batches of {half}")
     # generate() returns a plain list of texts, or (texts, per_chunk) when
@@ -180,7 +190,7 @@ def _generate(model, audios, audio_lens, gen_kwargs, min_batch_size: int, chat_m
         # Trim to the sub-batch's own longest clip; keeping the parent batch's
         # padding width would defeat the point of splitting.
         sub_audios = audios[sl, : int(sub_lens.max().item())]
-        res = _generate(model, sub_audios, sub_lens, gen_kwargs, min_batch_size, chat_model, fusion_lam)
+        res = _generate(model, sub_audios, sub_lens, gen_kwargs, min_batch_size, chat_model, fusion_lam, fusion_skip)
         if tupled:
             texts, chunks = res
             out.extend(texts)
@@ -262,6 +272,7 @@ def evaluate_shard(model, args, device) -> None:
                     args.min_batch_size,
                     getattr(args, "_chat_model", None),
                     float(getattr(args, "fusion_lam", 0.5)),
+                    float(getattr(args, "fusion_skip_threshold", float("inf"))),
                 )
                 # generate() returns (texts, per_chunk) under --emit_chunk_ids and
                 # a bare list otherwise. Unpack explicitly: zipping the tuple
@@ -420,6 +431,14 @@ def parse_args():
         help="CHAT .nemo to fuse with (chunk-synchronous joint decoding). Empty = SCRIPT alone.",
     )
     p.add_argument("--fusion_lam", type=float, default=0.5, help="weight on CHAT; 0 = SCRIPT alone, 1 = CHAT alone")
+    p.add_argument(
+        "--fusion_skip_threshold",
+        type=float,
+        default=float("inf"),
+        help="ON-DEMAND fusion: decode each chunk with CHAT alone first and invoke SCRIPT only for "
+        "streams whose weakest step fell below this CHAT margin (nats). inf = always fuse. Saves real "
+        "compute: a skipped chunk never builds a SCRIPT prompt.",
+    )
     p.add_argument("--aggregate", action="store_true", help="reduce shard JSONLs; no GPU or model needed")
     p.add_argument("--progress_interval", type=float, default=5.0, help="tqdm mininterval (log-friendly)")
     p.add_argument("--verbose", action="store_true", help="print sample normalized ref/hyp pairs")

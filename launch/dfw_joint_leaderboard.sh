@@ -57,6 +57,10 @@ export PROJECT="${PROJECT:-SpeechlmDFW}"
 CHAT_ARM="${CHAT_ARM:-dfw_granary2_chat_banded1_nodelay_v2}"
 SCRIPT_ARM="${SCRIPT_ARM:-dfw_granary2_script_banded1_nodelay_v2}"
 LAM_LIST="${LAM_LIST:-0.0 0.5 1.0}"
+# ON-DEMAND fusion: a chunk whose weakest CHAT margin clears this never invokes
+# SCRIPT at all. inf = always fuse. Measured on 200 utts of test.other: 2.0
+# skipped 46.5% of chunk-decodes for a 0.01 WER cost.
+SKIP_THRESHOLD="${SKIP_THRESHOLD:-inf}"
 
 CHAT_NEMO="${OUTPUT_PREFIX}/results/${PROJECT}/${CHAT_ARM}/averaged/top5-averaged.nemo"
 if [[ ! -s "$CHAT_NEMO" ]]; then
@@ -105,13 +109,14 @@ for lam in ${LAM_LIST}; do
     if [[ "$lam" == "0.0" ]]; then
         EXTRA=""
     else
-        EXTRA="--chat_nemo ${CHAT_NEMO} --fusion_lam ${lam}"
+        EXTRA="--chat_nemo ${CHAT_NEMO} --fusion_lam ${lam} --fusion_skip_threshold ${SKIP_THRESHOLD:-inf}"
     fi
     # RESULTS_SUFFIX, not EVAL_TAG: the results path is keyed on the checkpoint
     # mtime and the decode label, neither of which varies across weights, so
     # without a suffix all three runs land in one directory and overwrite each
     # other's logs.
-    EVAL_TAG="joint_lam${lam}" RESULTS_SUFFIX="lam${lam}" EXTRA_EVAL_ARGS="${EXTRA}" \
+    _sfx="lam${lam}"; [[ "${SKIP_THRESHOLD}" != "inf" ]] && _sfx="${_sfx}_skip${SKIP_THRESHOLD}"
+    EVAL_TAG="joint_${_sfx}" RESULTS_SUFFIX="${_sfx}" EXTRA_EVAL_ARGS="${EXTRA}" \
         bash "${LAUNCH_DIR}/eval_leaderboard.sh"
     rc=$?
     if [[ $rc -eq 0 ]]; then STATUS+=("lam=${lam}|ok"); else
@@ -129,7 +134,8 @@ for s in "${STATUS[@]}"; do printf '  %-14s %s\n' "${s%%|*}" "${s#*|}"; done
 echo
 echo "### macro WER per weight"
 for lam in ${LAM_LIST}; do
-    L="$(ls -t "${OUTPUT_PREFIX}/results/${PROJECT}/${EXP_NAME}"/eval_*/*_lam${lam}/aggregate.log 2>/dev/null | head -1)"
+    _sfx="lam${lam}"; [[ "${SKIP_THRESHOLD}" != "inf" ]] && _sfx="${_sfx}_skip${SKIP_THRESHOLD}"
+    L="$(ls -t "${OUTPUT_PREFIX}/results/${PROJECT}/${EXP_NAME}"/eval_*/*_${_sfx}/aggregate.log 2>/dev/null | head -1)"
     if [[ -n "$L" ]]; then
         printf '  lam=%-6s %s\n' "$lam" "$(awk -F'\t' '$1=="RESULT" && $2=="Average"{v=$3} END{print v}' "$L")"
     else
