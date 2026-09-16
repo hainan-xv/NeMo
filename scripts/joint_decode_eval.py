@@ -92,7 +92,19 @@ def load_chat(path: str, device: torch.device, tokenizer_dir: str = ""):
 
     cfg = EncDecCHATBPEModel.restore_from(restore_path=path, return_config=True)
     old_dir = str(cfg.tokenizer.get("dir", "") or "")
-    new_dir = tokenizer_dir or _hubify(old_dir)
+        # Hubify ONLY when the recorded path is gone. On the cluster that trained
+        # the model the lustre path is REAL and resolvable; rewriting it to a hub
+        # id there breaks it, because the container runs with HF_HUB_OFFLINE and
+        # has no hub cache -- which is exactly how both fusion runs of job
+        # 18751303 died ("couldn't connect to huggingface.co"). Locally the path
+        # is absent and the hub id is what works. So the test is existence, not
+        # the machine.
+    if tokenizer_dir:
+        new_dir = tokenizer_dir
+    elif old_dir and not os.path.isdir(old_dir):
+        new_dir = _hubify(old_dir)
+    else:
+        new_dir = old_dir
     if new_dir != old_dir:
         with open_dict(cfg):
             cfg.tokenizer.dir = new_dir

@@ -459,10 +459,18 @@ def main() -> int:
 
         _log(f"==> joint decoding with CHAT {args.chat_nemo} (lam={args.fusion_lam})")
         ccfg = EncDecCHATBPEModel.restore_from(restore_path=args.chat_nemo, return_config=True)
-        # A .nemo records the tokenizer path of the machine that TRAINED it; off
-        # that filesystem transformers reads it as a hub id and fails.
-        with open_dict(ccfg):
-            ccfg.tokenizer.dir = _hubify(str(ccfg.tokenizer.get("dir", "") or ""))
+        _tok = str(ccfg.tokenizer.get("dir", "") or "")
+        # Hubify ONLY when the recorded path is gone. On the cluster that trained
+        # the model the lustre path is REAL and resolvable; rewriting it to a hub
+        # id there breaks it, because the container runs with HF_HUB_OFFLINE and
+        # has no hub cache -- which is exactly how both fusion runs of job
+        # 18751303 died ("couldn't connect to huggingface.co"). Locally the path
+        # is absent and the hub id is what works. So the test is existence, not
+        # the machine.
+        if _tok and not os.path.isdir(_tok):
+            with open_dict(ccfg):
+                ccfg.tokenizer.dir = _hubify(_tok)
+            _log(f"    tokenizer {_tok} is absent here -> {ccfg.tokenizer.dir}")
         cm = EncDecCHATBPEModel.restore_from(
             restore_path=args.chat_nemo, map_location=device, override_config_path=ccfg
         )
