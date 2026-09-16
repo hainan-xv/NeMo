@@ -27,8 +27,8 @@ import math
 import pytest
 import torch
 
-from nemo.collections.speechlm2.parts.joint_decode import NEG_INF
 from nemo.collections.speechlm2.parts.joint_decode_adapters import (
+    NEG_INF,
     ScriptChunkScorer,
     remap_script_logprobs,
 )

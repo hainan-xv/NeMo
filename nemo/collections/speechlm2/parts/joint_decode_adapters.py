@@ -40,9 +40,11 @@ from typing import Any, Callable, List, Optional, Sequence, Tuple
 
 import torch
 
-from nemo.collections.speechlm2.parts.joint_decode import NEG_INF
+__all__ = ["NEG_INF", "ChatChunkScorer", "ScriptChunkScorer", "remap_script_logprobs"]
 
-__all__ = ["ChatChunkScorer", "ScriptChunkScorer", "remap_script_logprobs"]
+# Veto value for slots that must never be emitted. Finite rather than -inf so a
+# weighted sum can never produce nan from 0 * -inf.
+NEG_INF = -1e30
 
 
 def remap_script_logprobs(

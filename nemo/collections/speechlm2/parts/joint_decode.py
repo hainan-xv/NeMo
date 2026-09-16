@@ -13,147 +13,66 @@
 # limitations under the License.
 """Chunk-synchronous joint decoding of a CHAT transducer and a SCRIPT SpeechLM.
 
-The two model families are trained on the SAME aligner output, the SAME Qwen3
-vocabulary and the SAME 14-frame chunk grid, which makes a token-level ensemble
-possible in a way it normally is not: at every step both models are predicting
-the next piece of the same tokenization of the same words, so their log-probs
-can simply be added. Nothing here resamples, re-tokenizes or re-aligns.
+CHAT drives the loop -- it is the faster model and its transducer already steps
+along exactly the axes we need. At every step it is at chunk ``t`` with history
+``h`` and produces ``p_chat(token | t, h)``. SCRIPT is asked for
+``p_script(token | t, h)`` at the SAME ``(t, h)``, and the two are combined
+log-linearly::
 
-WHAT IS ACTUALLY SHARED, verified rather than assumed:
-  * vocabulary -- both load Qwen3-1.7B, 151,669 pieces, so text token INDICES
-    are identical and no mapping table is needed.
-  * terminator -- CHAT's transducer blank sits at ``vocab_size`` (outside the
-    tokenizer), SCRIPT closes a chunk with ``<|im_end|>``. Different indices for
-    the same event, so each scorer reports it in a canonical slot (``END``) and
-    the fusion never sees the raw ids.
+    score(token) = lam * log p_chat(token | t, h) + (1 - lam) * log p_script(token | t, h)
 
-WHAT IS NOT SHARED, and why this file is more than a weighted sum:
-  The two chunk-assignment rules disagree on exact chunk boundaries --
+over the shared vocabulary AND over the end-of-chunk symbol, so the two models
+vote on when the chunk ends just as they vote on what is in it.
 
-      CHAT    t = (ceil(end/frame_len) + delay) // chunk_size
-      SCRIPT  t = first chunk with ready <= (t+1)*chunk_size  ==  (ready-1) // chunk_size
+WHY THIS IS LEGITIMATE, and it is the whole reason the idea works: the two
+families are trained on the same aligner output, the same Qwen3 vocabulary and
+the same 14-frame chunk grid. At any ``(t, h)`` they are predicting the next
+piece of the same tokenization of the same words, so their log-probs are
+commensurable and can simply be added. Nothing here resamples, re-tokenizes or
+re-aligns.
 
-  which differ precisely when ``ready`` is a multiple of ``chunk_size``. That is
-  1/chunk_size of positions -- ~7% at chunk 14 -- and always in the same
-  direction: CHAT places a boundary word ONE CHUNK LATER than SCRIPT. The offset
-  is systematic, not noise, so a naive per-chunk sum would penalise the correct
-  hypothesis at every boundary rather than average two opinions of it. Neither
-  model is trained to tolerate it either: SCRIPT's stochastic word-delay
-  augmentation (``word_delay_prob``) defaults to 0 and is off in the v2 recipe.
+THE ONE THING THAT IS NOT SHARED, and why it needs no machinery. The two
+chunk-assignment rules disagree when ``ready`` is an exact multiple of
+``chunk_size`` (~7% of word positions at chunk 14): CHAT places such a word one
+chunk LATER than SCRIPT. That is a training-target convention, and at inference
+neither model emits one-hot -- a boundary word still draws probability from both
+models, just split slightly differently across two adjacent chunks. So it shows
+up as a mild disagreement in the sum, which is exactly what an ensemble is for,
+not as a structural conflict. An earlier draft of this file modelled the offset
+explicitly with per-hypothesis skew state; it was solving a problem that only
+exists for one-hot distributions.
 
-  So a beam carries an explicit SKEW in {0, -1}: CHAT is scored at chunk ``t``
-  while SCRIPT is scored at chunk ``t + skew``. The sign follows the direction of
-  the mismatch -- CHAT places a boundary word LATER, so to agree with it SCRIPT
-  must be read one chunk BEHIND. (Reading SCRIPT ahead, the intuitive-looking
-  ``+1``, moves the two further apart and deadlocks chunk 0.)
-
-  Both values are seeded from the START rather than forked at a later boundary:
-  the offset is a property of the alignment convention, so it is already in
-  effect at chunk 0, and a beam that cannot get past chunk 0 can never reach a
-  boundary at which to fork. A skewed beam necessarily runs off one end of the
-  utterance -- SCRIPT has no chunk -1, and CHAT finishes a chunk early -- and a
-  model whose chunk is out of range contributes ``_neutral``, i.e. abstains and
-  lets the other decide. Set ``allow_skew=False`` for the naive behaviour, which
-  is the ablation the equivalence tests pin.
+The END slot is the only translation, and each scorer owns it (see
+``joint_decode_adapters``): CHAT's blank already sits at index ``V``, SCRIPT's
+``<|im_end|>`` is moved there. The fusion below therefore never sees a raw id.
 """
 
 from __future__ import annotations
 
-import math
-from dataclasses import dataclass, field
-from typing import Any, List, Optional, Protocol, Sequence, Tuple
+from typing import Any, List, Protocol, Sequence
 
-__all__ = ["END", "ChunkScorer", "Beam", "chunk_sync_joint_decode"]
-
-# Canonical slot for "this chunk is finished", in the scorers' output vectors.
-# The raw ids differ per model (CHAT blank at vocab_size, SCRIPT <|im_end|>), and
-# keeping the translation inside each scorer is what lets the fusion below be a
-# plain elementwise add.
-END = -1
-
-NEG_INF = -1e30
+__all__ = ["ChunkScorer", "chunk_sync_joint_decode"]
 
 
 class ChunkScorer(Protocol):
     """One model's view of decoding, reduced to what fusion needs.
 
-    Implementations wrap EncDecCHATBPEModel and ScriptSTTModel respectively. The
-    protocol exists so the search can be tested against stubs -- the fusion
-    arithmetic and the skew bookkeeping are where the bugs live, and neither
-    needs a GPU or a 2.4B-parameter model to exercise.
+    Implemented by ChatChunkScorer and ScriptChunkScorer. The protocol exists so
+    the fusion can be tested with stubs: the arithmetic and the END handling are
+    where bugs live, and neither needs a GPU to exercise.
     """
 
     def init_state(self) -> Any:
-        """Opaque per-hypothesis state (caches, step index, token history)."""
+        """Opaque per-utterance state (caches, token history)."""
 
     def logprobs(self, state: Any, chunk_idx: int) -> Sequence[float]:
-        """Next-token log-probs for this chunk.
-
-        Length ``V + 1``; index ``V`` is the END slot. Must be normalised, since
-        the fusion weights assume comparable scales between the two models.
-        """
+        """Next-token log-probs at this chunk: length ``V + 1``, END at index ``V``."""
 
     def advance(self, state: Any, token: int) -> Any:
-        """State after emitting ``token`` (never END) within the current chunk."""
+        """State after emitting ``token`` (never END) inside the current chunk."""
 
     def close_chunk(self, state: Any, chunk_idx: int) -> Any:
-        """State after finishing ``chunk_idx``; the next call uses ``chunk_idx+1``."""
-
-
-@dataclass
-class Beam:
-    """One hypothesis: the tokens, both models' states, and the skew."""
-
-    tokens: List[int] = field(default_factory=list)
-    chat_state: Any = None
-    script_state: Any = None
-    # +1 means SCRIPT is one chunk AHEAD of CHAT, which is the direction the
-    # rule mismatch predicts. 0 means the two agree.
-    skew: int = 0
-    score: float = 0.0
-    # Per-chunk token count, to enforce max_tokens_per_chunk.
-    emitted_this_chunk: int = 0
-
-    def key(self) -> Tuple:
-        """Identity for recombination: same tokens AND same skew are the same path."""
-        return (tuple(self.tokens), self.skew)
-
-
-def _fuse(chat_lp: Sequence[float], script_lp: Sequence[float], lam: float) -> List[float]:
-    """Log-linear interpolation, the standard shallow-fusion form.
-
-    Deliberately NOT renormalised. Beam search compares hypotheses of equal
-    length at equal depth, so a shared per-step constant cancels; paying a
-    logsumexp over 151k entries per step per beam would dominate the runtime for
-    no change in the argmax.
-    """
-    n = len(chat_lp)
-    if len(script_lp) != n:
-        raise ValueError(f"scorer vocab mismatch: chat={n} script={len(script_lp)}")
-    # A -inf vetoes the token, because a symbol one model has structurally
-    # excluded must not be reachable just because the other scores it finitely.
-    # But ONLY from a model that carries weight: at lam=1 the ensemble has to
-    # reduce to CHAT exactly, and a veto from the zero-weight side would leave it
-    # silently unable to emit CHAT's own argmax.
-    chat_votes = lam > 0.0
-    script_votes = lam < 1.0
-    out = [0.0] * n
-    for i in range(n):
-        a, b = chat_lp[i], script_lp[i]
-        if (chat_votes and a <= NEG_INF) or (script_votes and b <= NEG_INF):
-            out[i] = NEG_INF
-        else:
-            out[i] = (lam * a if chat_votes else 0.0) + ((1.0 - lam) * b if script_votes else 0.0)
-    return out
-
-
-def _neutral(vocab_size: int) -> List[float]:
-    """ "No opinion": log 1 everywhere, so the other model decides alone.
-
-    Used when a model's chunk index falls outside the utterance, which a skewed
-    beam necessarily produces at one end or the other.
-    """
-    return [0.0] * (vocab_size + 1)
+        """State after finishing ``chunk_idx``."""
 
 
 def chunk_sync_joint_decode(
@@ -162,126 +81,50 @@ def chunk_sync_joint_decode(
     num_chunks: int,
     vocab_size: int,
     lam: float = 0.5,
-    beam_size: int = 4,
     max_tokens_per_chunk: int = 32,
-    allow_skew: bool = True,
-    skew_penalty: float = 0.0,
 ) -> List[int]:
-    """Decode one utterance, synchronising the two models at every chunk boundary.
+    """Greedy decode of one utterance, both models scoring every step.
 
     Args:
-        chat, script: the two scorers.
-        num_chunks: chunks in this utterance (both models see the same grid).
-        vocab_size: ``V``; scorer vectors are ``V + 1`` long with END last.
-        lam: weight on CHAT. 1.0 is CHAT alone, 0.0 is SCRIPT alone -- both are
-            exercised by the tests as the degenerate cases.
-        beam_size: hypotheses kept across a chunk boundary.
-        max_tokens_per_chunk: guard against a model that never emits END. A chunk
-            is 14 frames (~1.12 s) of audio, so a real chunk holds a handful of
-            tokens; this only fires on a degenerate hypothesis.
-        allow_skew: explore SCRIPT running one chunk ahead (see module docstring).
-        skew_penalty: log-domain cost for adopting skew=+1. 0.0 lets the models
-            decide purely on likelihood; a small positive value biases toward the
-            aligned reading when the evidence is a wash.
+        chat, script: the two scorers, each returning ``V + 1`` log-probs.
+        num_chunks: chunks in this utterance; both models see the same grid.
+        vocab_size: ``V``. Index ``V`` in a scorer's output is END.
+        lam: weight on CHAT. ``1.0`` is CHAT alone and ``0.0`` is SCRIPT alone --
+            both are pinned by tests, since a fusion that does not reduce
+            correctly at the endpoints is not doing what it claims in between.
+        max_tokens_per_chunk: guard against a chunk that never ends. A chunk is
+            ~1.12 s of audio, so this only fires on a degenerate hypothesis.
 
     Returns:
-        The best hypothesis' token ids, END excluded.
+        The emitted token ids, END excluded.
     """
     if not 0.0 <= lam <= 1.0:
         raise ValueError(f"lam must be in [0, 1], got {lam}")
-    if num_chunks <= 0:
-        return []
 
-    beams = [Beam(chat_state=chat.init_state(), script_state=script.init_state(), skew=0)]
-    if allow_skew:
-        beams.append(
-            Beam(
-                chat_state=chat.init_state(),
-                script_state=script.init_state(),
-                skew=-1,
-                score=-skew_penalty,
-            )
-        )
+    chat_state = chat.init_state()
+    script_state = script.init_state()
+    tokens: List[int] = []
 
-    # One extra pass: a skew=-1 beam is a chunk behind on the SCRIPT side, so its
-    # final chunk of audio is still unread when CHAT has finished. CHAT abstains
-    # there via _neutral.
-    total_passes = num_chunks + (1 if allow_skew else 0)
+    for t in range(num_chunks):
+        for _ in range(max_tokens_per_chunk):
+            c_lp = chat.logprobs(chat_state, t)
+            s_lp = script.logprobs(script_state, t)
+            if len(c_lp) != len(s_lp):
+                raise ValueError(f"scorer vocab mismatch: chat={len(c_lp)} script={len(s_lp)}")
 
-    for t in range(total_passes):
-        for b in beams:
-            b.emitted_this_chunk = 0
+            best_i, best_v = 0, None
+            for i in range(len(c_lp)):
+                v = lam * c_lp[i] + (1.0 - lam) * s_lp[i]
+                if best_v is None or v > best_v:
+                    best_i, best_v = i, v
 
-        # --- expand within the chunk until every beam has emitted END ---
-        active, finished = beams, []
-        while active:
-            nxt: List[Beam] = []
-            for b in active:
-                if b.emitted_this_chunk >= max_tokens_per_chunk:
-                    finished.append(b)
-                    continue
+            if best_i == vocab_size:  # END: this chunk is finished
+                break
+            tokens.append(best_i)
+            chat_state = chat.advance(chat_state, best_i)
+            script_state = script.advance(script_state, best_i)
 
-                # Either model may be outside the utterance on a skewed beam;
-                # whoever is out of range abstains rather than being clamped onto
-                # a chunk it has already consumed.
-                s_chunk = t + b.skew
-                c_lp = chat.logprobs(b.chat_state, t) if t < num_chunks else _neutral(vocab_size)
-                s_lp = script.logprobs(b.script_state, s_chunk) if 0 <= s_chunk < num_chunks else _neutral(vocab_size)
-                if t >= num_chunks and not (0 <= s_chunk < num_chunks):
-                    # Both abstain: nothing left to decode on this beam.
-                    finished.append(b)
-                    continue
-                fused = _fuse(c_lp, s_lp, lam)
+        chat_state = chat.close_chunk(chat_state, t)
+        script_state = script.close_chunk(script_state, t)
 
-                # Top (beam_size + 1) candidates: END plus enough tokens that a
-                # full beam can still be filled if END wins.
-                order = sorted(range(len(fused)), key=lambda i: fused[i], reverse=True)
-                for idx in order[: beam_size + 1]:
-                    sc = fused[idx]
-                    if sc <= NEG_INF:
-                        continue
-                    if idx == vocab_size:  # END
-                        nb = Beam(
-                            tokens=list(b.tokens),
-                            chat_state=b.chat_state,
-                            script_state=b.script_state,
-                            skew=b.skew,
-                            score=b.score + sc,
-                            emitted_this_chunk=b.emitted_this_chunk,
-                        )
-                        finished.append(nb)
-                    else:
-                        nxt.append(
-                            Beam(
-                                tokens=b.tokens + [idx],
-                                chat_state=chat.advance(b.chat_state, idx),
-                                script_state=script.advance(b.script_state, idx),
-                                skew=b.skew,
-                                score=b.score + sc,
-                                emitted_this_chunk=b.emitted_this_chunk + 1,
-                            )
-                        )
-            active = sorted(nxt, key=lambda x: x.score, reverse=True)[:beam_size]
-
-        # --- chunk boundary: close both models, then consider the skew flip ---
-        closed: List[Beam] = []
-        for b in finished:
-            if t < num_chunks:
-                b.chat_state = chat.close_chunk(b.chat_state, t)
-            s_chunk = t + b.skew
-            if 0 <= s_chunk < num_chunks:
-                b.script_state = script.close_chunk(b.script_state, s_chunk)
-            closed.append(b)
-
-        # Recombine identical (tokens, skew) paths, keeping the best score, then
-        # prune. Without this the skew fork doubles the beam every chunk.
-        best: dict = {}
-        for b in closed:
-            k = b.key()
-            if k not in best or b.score > best[k].score:
-                best[k] = b
-        beams = sorted(best.values(), key=lambda x: x.score, reverse=True)[:beam_size]
-        if not beams:  # every path vetoed; nothing sensible to continue from
-            return []
-
-    return beams[0].tokens
+    return tokens
