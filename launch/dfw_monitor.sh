@@ -46,16 +46,16 @@ EVAL_AT_START="${EVAL_AT_START:-0}"
 STALL_TICKS="${STALL_TICKS:-2}"
 MAX_HOURS="${MAX_HOURS:-168}"
 
-# "exp_name|slurm job-name fragment". The two are NOT derivable from each other:
-# experiment names use underscores and the granary2 prefix, Slurm job names use
-# dashes and drop it. Deriving one from the other silently matched nothing.
-# Note "script-banded1-nodelay-v2" is not a substring of
-# "script-banded1-both-nodelay-v2", so these fragments stay unambiguous.
+# "exp_name|launcher filename". Keyed on the sbatch COMMAND PATH (squeue %o),
+# NOT the job name. Job names drift from experiment names -- the SCRIPT v2
+# launchers shipped carrying the v1 -J line, so a name-based match reported two
+# live arms as ABSENT while they were training normally. The command path is
+# what actually produced the job and cannot disagree with itself.
 ARMS=(
-  "dfw_granary2_chat_banded1_nodelay_v2|dfw-chat-banded1-nodelay-v2"
-  "dfw_granary2_chat_banded1_both_nodelay_v2|dfw-chat-banded1-both-nodelay-v2"
-  "dfw_granary2_script_banded1_nodelay_v2|dfw-script-banded1-nodelay-v2"
-  "dfw_granary2_script_banded1_both_nodelay_v2|dfw-script-banded1-both-nodelay-v2"
+  "dfw_granary2_chat_banded1_nodelay_v2|dfw_chat_banded1_nodelay_v2.sh"
+  "dfw_granary2_chat_banded1_both_nodelay_v2|dfw_chat_banded1_both_nodelay_v2.sh"
+  "dfw_granary2_script_banded1_nodelay_v2|dfw_script_banded1_nodelay_v2.sh"
+  "dfw_granary2_script_banded1_both_nodelay_v2|dfw_script_banded1_both_nodelay_v2.sh"
 )
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
@@ -78,18 +78,19 @@ best_val_wer() {
 # Is an eval already queued or running? Submitting a second one would contend
 # for the single interactive slot and average a moving checkpoint set twice.
 eval_in_flight() {
-    squeue -u "$USER" -h -o '%j' 2>/dev/null | grep -q 'eval-v2-all'
+    squeue -u "$USER" -h -o '%o' 2>/dev/null | sed 's#^.*/##' | grep -qx 'dfw_eval_v2_all.sh'
 }
 
 health_check() {
     local unhealthy=0
     local snapshot
-    snapshot=$(squeue -u "$USER" -h -o '%j %T' 2>/dev/null)
+    # %o is the launcher path; basename it so the match is exact-filename.
+    snapshot=$(squeue -u "$USER" -h -o '%o %T' 2>/dev/null | sed 's#^.*/##')
     for entry in "${ARMS[@]}"; do
-        local arm="${entry%%|*}" jobpat="${entry#*|}"
+        local arm="${entry%%|*}" launcher="${entry#*|}"
         local short="${arm#dfw_granary2_}"
         local state ckpt prev best oom stall_file stalls
-        state=$(echo "$snapshot" | grep -F "$jobpat" | head -1 | awk '{print $2}')
+        state=$(echo "$snapshot" | awk -v f="$launcher" '$1==f{print $2; exit}')
         ckpt=$(newest_ckpt "$arm")
         best=$(best_val_wer "$arm")
         oom=$(grep -lic 'out of memory' "${RESULTS}/${arm}"/error-*.out 2>/dev/null | wc -l)

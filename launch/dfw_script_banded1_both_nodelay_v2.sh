@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH -A nemotron_speechprod_asr
-#SBATCH -J nemotron_speechprod_asr:dfw-script-banded1-both-nodelay
+#SBATCH -J nemotron_speechprod_asr:dfw-script-banded1-both-nodelay-v2
 # DFW's default GPU partition. Unlike OCI there is ONE pool of 1850 nodes rather
 # than batch_block1/3/4, so no comma-list is needed.
 #SBATCH -p batch
