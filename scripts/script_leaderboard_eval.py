@@ -133,9 +133,29 @@ def load_model(ckpt_path: str, model_class_path: str, device: torch.device, dtyp
 # ---------------------------------------------------------------------------
 
 
-def _generate(model, audios, audio_lens, gen_kwargs, min_batch_size: int):
-    """Decode one batch, halving on CUDA OOM down to ``min_batch_size``."""
+def _generate(model, audios, audio_lens, gen_kwargs, min_batch_size: int, chat_model=None, fusion_lam: float = 0.5):
+    """Decode one batch, halving on CUDA OOM down to ``min_batch_size``.
+
+    When ``chat_model`` is given, each batch is also encoded by the CHAT
+    transducer and the two models are fused inside SCRIPT's decode loop
+    (chunk-synchronous joint decoding). The scorer is built HERE rather than
+    passed in because it holds that batch's encoder output -- and because the
+    OOM path below re-enters with sub-batches, which must each get a scorer
+    matching their own audio. A scorer built once outside would index the parent
+    batch's rows and silently score the wrong utterance.
+    """
     n = int(audios.shape[0])
+    if chat_model is not None:
+        from nemo.collections.speechlm2.parts.chat_fusion import ChatFusionScorer
+
+        with torch.inference_mode():
+            proc, proc_len = chat_model.preprocessor(input_signal=audios, length=audio_lens)
+            enc, enc_len = chat_model.encoder(audio_signal=proc, length=proc_len)
+        gen_kwargs = {
+            **gen_kwargs,
+            "chat_fusion": ChatFusionScorer(chat_model, enc.transpose(1, 2), enc_len),
+            "fusion_lam": fusion_lam,
+        }
     try:
         with torch.inference_mode():
             return model.generate(audios=audios, audio_lens=audio_lens, **gen_kwargs)
@@ -145,6 +165,7 @@ def _generate(model, audios, audio_lens, gen_kwargs, min_batch_size: int):
     # Retry OUTSIDE the except block, so the failed batch's traceback -- and the
     # tensors it still references -- are released before we allocate again.
     torch.cuda.empty_cache()
+    gen_kwargs = {k: v for k, v in gen_kwargs.items() if k not in ("chat_fusion", "fusion_lam")}
     half = max(min_batch_size, n // 2)
     _log(f"    [oom] retrying {n} utts as sub-batches of {half}")
     # generate() returns a plain list of texts, or (texts, per_chunk) when
@@ -159,7 +180,7 @@ def _generate(model, audios, audio_lens, gen_kwargs, min_batch_size: int):
         # Trim to the sub-batch's own longest clip; keeping the parent batch's
         # padding width would defeat the point of splitting.
         sub_audios = audios[sl, : int(sub_lens.max().item())]
-        res = _generate(model, sub_audios, sub_lens, gen_kwargs, min_batch_size)
+        res = _generate(model, sub_audios, sub_lens, gen_kwargs, min_batch_size, chat_model, fusion_lam)
         if tupled:
             texts, chunks = res
             out.extend(texts)
@@ -233,7 +254,15 @@ def evaluate_shard(model, args, device) -> None:
             paths = [b["path"] for b in batch]
             try:
                 audios, audio_lens = load_audio_batch(paths, args.pad_extra_seconds)
-                out = _generate(model, audios.to(device), audio_lens.to(device), gen_kwargs, args.min_batch_size)
+                out = _generate(
+                    model,
+                    audios.to(device),
+                    audio_lens.to(device),
+                    gen_kwargs,
+                    args.min_batch_size,
+                    getattr(args, "_chat_model", None),
+                    float(getattr(args, "fusion_lam", 0.5)),
+                )
                 # generate() returns (texts, per_chunk) under --emit_chunk_ids and
                 # a bare list otherwise. Unpack explicitly: zipping the tuple
                 # itself writes the whole batch's texts as ONE record.
@@ -384,6 +413,13 @@ def parse_args():
     )
     p.add_argument("--no_punctuation", dest="punctuation", action="store_false")
 
+    p.add_argument(
+        "--chat_nemo",
+        type=str,
+        default="",
+        help="CHAT .nemo to fuse with (chunk-synchronous joint decoding). Empty = SCRIPT alone.",
+    )
+    p.add_argument("--fusion_lam", type=float, default=0.5, help="weight on CHAT; 0 = SCRIPT alone, 1 = CHAT alone")
     p.add_argument("--aggregate", action="store_true", help="reduce shard JSONLs; no GPU or model needed")
     p.add_argument("--progress_interval", type=float, default=5.0, help="tqdm mininterval (log-friendly)")
     p.add_argument("--verbose", action="store_true", help="print sample normalized ref/hyp pairs")
@@ -415,6 +451,22 @@ def main() -> int:
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float32
 
     model = load_model(args.ckpt_path, args.model_class, device, dtype)
+    args._chat_model = None
+    if getattr(args, "chat_nemo", ""):
+        from omegaconf import open_dict
+
+        from nemo.collections.asr.models.chat_bpe_models import EncDecCHATBPEModel
+
+        _log(f"==> joint decoding with CHAT {args.chat_nemo} (lam={args.fusion_lam})")
+        ccfg = EncDecCHATBPEModel.restore_from(restore_path=args.chat_nemo, return_config=True)
+        # A .nemo records the tokenizer path of the machine that TRAINED it; off
+        # that filesystem transformers reads it as a hub id and fails.
+        with open_dict(ccfg):
+            ccfg.tokenizer.dir = _hubify(str(ccfg.tokenizer.get("dir", "") or ""))
+        cm = EncDecCHATBPEModel.restore_from(
+            restore_path=args.chat_nemo, map_location=device, override_config_path=ccfg
+        )
+        args._chat_model = cm.eval().to(device)
     _log(f"==> system_prompt: {args.system_prompt!r}")
     _log(
         f"==> chunk_size={args.chunk_size} force_word_start={args.force_word_start} "

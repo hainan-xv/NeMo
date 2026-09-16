@@ -1319,6 +1319,10 @@ class ScriptSTTModel(StreamingSTTModel):
         streaming_encode = bool(generation_kwargs.pop("streaming_encode", False))
         state_machine = bool(generation_kwargs.pop("use_state_machine_inference", False))
         max_history_tokens = int(generation_kwargs.pop("max_history_tokens", self.core_cfg.max_history_tokens))
+        # Chunk-synchronous joint decoding with a CHAT transducer. Off unless a
+        # scorer is supplied, so the production decode path is unchanged.
+        chat_fusion = generation_kwargs.pop("chat_fusion", None)
+        fusion_lam = float(generation_kwargs.pop("fusion_lam", 0.5))
         # Guarantee that each chunk's first emitted token starts a new word. On by
         # default: without it a chunk whose first token is a continuation merges
         # onto the previous chunk's last word.
@@ -1346,6 +1350,14 @@ class ScriptSTTModel(StreamingSTTModel):
             )
         self._reject_fsm_with_bidirectional_audio(state_machine)
         decode_fn = fsm_stream_decode_script if state_machine else batched_stream_decode_script
+        if chat_fusion is not None and state_machine:
+            # The FSM decoder has its own emission logic and no fusion hook, so it
+            # would silently IGNORE chat_fusion and report a SCRIPT-only number as
+            # if it were a joint one.
+            raise ValueError(
+                "chat_fusion is not supported with use_state_machine_inference=True; "
+                "the FSM decoder has no fusion hook and would silently ignore it."
+            )
         # full_context: keep the ENCODER at chunk size `cs` (already applied by
         # encode_frames) but hand the decoder a chunk large enough that every
         # utterance is a single branch -- the LLM then sees all the audio at once.
@@ -1372,6 +1384,8 @@ class ScriptSTTModel(StreamingSTTModel):
             audio_history_chunks=self._audio_history_chunks,
             audio_window_frames=self._audio_window_frames,
             max_history_tokens=max_history_tokens,
+            chat_fusion=chat_fusion,
+            fusion_lam=fusion_lam,
             is_word_start=self._is_word_start if insert_word_start_id is not None else None,
             insert_word_start_id=insert_word_start_id,
             **({"bidirectional_audio": True} if self._bidirectional_audio else {}),
