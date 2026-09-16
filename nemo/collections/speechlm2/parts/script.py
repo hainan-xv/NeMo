@@ -1295,6 +1295,8 @@ def batched_stream_decode_script(
     fusion_lam: float = 0.5,
     fusion_margin_threshold: float = float("inf"),
     fusion_stats=None,
+    fusion_skip_threshold: float = float("inf"),
+    fusion_skipped=None,
 ):
     """Batched greedy SCRIPT decode for ``B`` utterances at once.
 
@@ -1363,6 +1365,38 @@ def batched_stream_decode_script(
 
     for k in range(max_chunks):
         active = [b for b in range(B) if k < num_chunks[b]]
+
+        # ---- ON-DEMAND FUSION -------------------------------------------
+        # Decode the chunk with CHAT alone first. Streams whose weakest step
+        # cleared the threshold keep those tokens and never build a SCRIPT
+        # prompt at all; only the unsure ones fall through to the fused path
+        # below. Safe per chunk because SCRIPT holds no state across chunk
+        # boundaries -- its prompt is rebuilt from text history each time.
+        if chat_fusion is not None and fusion_skip_threshold != float("inf") and active:
+            from nemo.collections.speechlm2.parts.chat_fusion import chat_only_chunk
+
+            pre_toks, pre_worst = chat_only_chunk(
+                chat_fusion,
+                active,
+                k,
+                [list(emitted[b]) for b in active],
+                max_new_tokens=max_new_tokens,
+                margin_threshold=fusion_skip_threshold,
+            )
+            kept, unsure = [], []
+            for i, b in enumerate(active):
+                if pre_worst[i] >= fusion_skip_threshold:
+                    emitted[b].extend(pre_toks[i])
+                    kept.append(b)
+                else:
+                    unsure.append(b)
+            if fusion_skipped is not None:
+                fusion_skipped["skipped"] = fusion_skipped.get("skipped", 0) + len(kept)
+                fusion_skipped["total"] = fusion_skipped.get("total", 0) + len(active)
+            active = unsure
+            if not active:
+                continue
+        # -----------------------------------------------------------------
         if not active:
             break
         na = len(active)

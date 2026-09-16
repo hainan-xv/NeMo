@@ -44,7 +44,7 @@ from typing import List, Sequence
 
 import torch
 
-__all__ = ["ChatFusionScorer", "FusionStats", "fuse_into_script_logits"]
+__all__ = ["ChatFusionScorer", "FusionStats", "chat_only_chunk", "fuse_into_script_logits"]
 
 NEG_INF = -1e30
 
@@ -243,3 +243,65 @@ def fuse_into_script_logits(
             if bool(confident.any()):
                 out = torch.where(confident.unsqueeze(1), chat_only, out)
     return out
+
+
+@torch.no_grad()
+def chat_only_chunk(
+    scorer: "ChatFusionScorer",
+    b_idx: Sequence[int],
+    chunk_idx: int,
+    prefixes: Sequence[Sequence[int]],
+    eot_slot_is_last: bool = True,
+    max_new_tokens: int = 32,
+    margin_threshold: float = 2.0,
+):
+    """Decode one chunk with CHAT ALONE, reporting each stream's weakest step.
+
+    The basis of on-demand fusion. Measured on test.other: 83.8% of decoding
+    steps have a CHAT margin of at least 2 nats, and across those SCRIPT changes
+    the chosen token 0.60% of the time -- above margin 8, across 51,662 steps, it
+    never disagreed once. So the ensemble earns its entire gain in the ~16% of
+    steps where CHAT is unsure, and running the 1.7B LLM at the other 84% is
+    wasted work.
+
+    WHY THIS IS SAFE TO DO PER CHUNK. SCRIPT keeps NO state across chunk
+    boundaries: its conditioning is instruction + plain-text history + this
+    chunk's audio, rebuilt every chunk. So a chunk that never calls SCRIPT costs
+    nothing later -- there is no KV cache to keep warm and no drift to repair.
+    The same skip WITHIN a chunk would require reconstructing the cache.
+
+    Returns ``(tokens_per_stream, min_margin_per_stream)``. A caller accepts the
+    tokens for streams whose minimum margin cleared ``margin_threshold`` and
+    re-decodes only the rest with fusion -- so the threshold is applied to the
+    WEAKEST step in the chunk, not the average. One unsure step is enough to
+    want a second opinion on the whole chunk, because an early wrong token
+    changes every token after it.
+    """
+    n = len(b_idx)
+    toks: List[List[int]] = [[] for _ in range(n)]
+    worst = [float("inf")] * n
+    done = [False] * n
+    live = list(range(n))
+
+    for _ in range(max_new_tokens):
+        if not live:
+            break
+        rows = [b_idx[i] for i in live]
+        pref = [list(prefixes[i]) + toks[i] for i in live]
+        lp = scorer.logprobs(rows, chunk_idx, pref)  # [len(live), V+1]
+        top2 = lp.topk(2, dim=-1)
+        choice = top2.indices[:, 0]
+        margin = top2.values[:, 0] - top2.values[:, 1]
+
+        still: List[int] = []
+        for j, i in enumerate(live):
+            worst[i] = min(worst[i], float(margin[j].item()))
+            tid = int(choice[j].item())
+            if tid == scorer.vocab_size:  # END slot -> chunk finished
+                done[i] = True
+                continue
+            toks[i].append(tid)
+            still.append(i)
+        live = still
+
+    return toks, worst

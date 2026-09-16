@@ -247,3 +247,91 @@ def test_stats_do_not_change_the_decision():
     a = fuse_into_script_logits(logits, chat_lp, 0.5, EOT, ())
     b = fuse_into_script_logits(logits, chat_lp, 0.5, EOT, (), stats=FusionStats())
     assert torch.allclose(a, b, atol=1e-6)
+
+
+# --------------------------------------------------------------------------
+# On-demand fusion: decode a chunk with CHAT alone, escalate only if unsure.
+# --------------------------------------------------------------------------
+
+
+class _StubScorer:
+    """Scripted CHAT: table[chunk][position] -> (top_token, margin)."""
+
+    def __init__(self, table, vocab_size=V):
+        self.table = table
+        self.vocab_size = vocab_size
+        self.calls = 0
+
+    def logprobs(self, b_idx, chunk_idx, prefixes):
+        self.calls += 1
+        rows = []
+        for p in prefixes:
+            tok, margin = self.table[chunk_idx][len(p)]
+            lp = torch.full((self.vocab_size + 1,), -20.0)
+            lp[tok] = 0.0
+            # runner-up sits `margin` below the top
+            lp[(tok + 1) % self.vocab_size if tok != (tok + 1) % self.vocab_size else 0] = -margin
+            rows.append(lp)
+        return torch.stack(rows)
+
+
+def test_chat_only_chunk_returns_tokens_and_the_weakest_margin():
+    from nemo.collections.speechlm2.parts.chat_fusion import chat_only_chunk
+
+    END = V
+    # two tokens then END; margins 5.0 then 0.3 -> weakest is 0.3
+    tbl = {0: {0: (2, 5.0), 1: (3, 0.3), 2: (END, 9.0)}}
+    sc = _StubScorer(tbl)
+    toks, worst = chat_only_chunk(sc, [0], 0, [[]], margin_threshold=2.0)
+    assert toks == [[2, 3]]
+    assert worst[0] == pytest.approx(0.3, abs=1e-6), "must report the MINIMUM margin, not the last or mean"
+
+
+def test_one_unsure_step_taints_the_whole_chunk():
+    """An early uncertain token changes every token after it, so the chunk is
+    escalated as a unit rather than per position."""
+    from nemo.collections.speechlm2.parts.chat_fusion import chat_only_chunk
+
+    END = V
+    tbl = {0: {0: (2, 0.1), 1: (3, 9.0), 2: (END, 9.0)}}  # only the FIRST step is unsure
+    toks, worst = chat_only_chunk(_StubScorer(tbl), [0], 0, [[]], margin_threshold=2.0)
+    assert worst[0] < 2.0, "the chunk must be flagged even though later steps were certain"
+
+
+def test_chunk_ends_at_the_end_slot_without_emitting_it():
+    from nemo.collections.speechlm2.parts.chat_fusion import chat_only_chunk
+
+    END = V
+    tbl = {0: {0: (END, 9.0)}}
+    toks, worst = chat_only_chunk(_StubScorer(tbl), [0], 0, [[]], margin_threshold=2.0)
+    assert toks == [[]] and V not in toks[0]
+
+
+def test_streams_are_tracked_independently():
+    """Batched decoding: one stream ending must not truncate another."""
+    from nemo.collections.speechlm2.parts.chat_fusion import chat_only_chunk
+
+    END = V
+
+    class _TwoStream(_StubScorer):
+        def logprobs(self, b_idx, chunk_idx, prefixes):
+            rows = []
+            for bi, p in zip(b_idx, prefixes):
+                # stream 0 stops immediately; stream 1 emits two tokens
+                tok, margin = (END, 9.0) if bi == 0 else ([4, 5, END][len(p)], 9.0)
+                lp = torch.full((V + 1,), -20.0)
+                lp[tok] = 0.0
+                lp[0 if tok != 0 else 1] = -margin
+                rows.append(lp)
+            return torch.stack(rows)
+
+    toks, worst = chat_only_chunk(_TwoStream({}), [0, 1], 0, [[], []], margin_threshold=2.0)
+    assert toks[0] == [] and toks[1] == [4, 5]
+
+
+def test_max_new_tokens_bounds_a_chunk_that_never_ends():
+    from nemo.collections.speechlm2.parts.chat_fusion import chat_only_chunk
+
+    tbl = {0: {i: (2, 9.0) for i in range(50)}}
+    toks, _ = chat_only_chunk(_StubScorer(tbl), [0], 0, [[]], max_new_tokens=4, margin_threshold=2.0)
+    assert toks == [[2, 2, 2, 2]]

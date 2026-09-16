@@ -1325,6 +1325,8 @@ class ScriptSTTModel(StreamingSTTModel):
         fusion_lam = float(generation_kwargs.pop("fusion_lam", 0.5))
         fusion_margin_threshold = float(generation_kwargs.pop("fusion_margin_threshold", float("inf")))
         fusion_stats = generation_kwargs.pop("fusion_stats", None)
+        fusion_skip_threshold = float(generation_kwargs.pop("fusion_skip_threshold", float("inf")))
+        fusion_skipped = generation_kwargs.pop("fusion_skipped", None)
         # Guarantee that each chunk's first emitted token starts a new word. On by
         # default: without it a chunk whose first token is a continuation merges
         # onto the previous chunk's last word.
@@ -1390,6 +1392,8 @@ class ScriptSTTModel(StreamingSTTModel):
             fusion_lam=fusion_lam,
             fusion_margin_threshold=fusion_margin_threshold,
             fusion_stats=fusion_stats,
+            fusion_skip_threshold=fusion_skip_threshold,
+            fusion_skipped=fusion_skipped,
             is_word_start=self._is_word_start if insert_word_start_id is not None else None,
             insert_word_start_id=insert_word_start_id,
             **({"bidirectional_audio": True} if self._bidirectional_audio else {}),

@@ -148,17 +148,20 @@ def decode_batch(
     out = {}
     for lam in lams:
         for tau in taus:
-            out[(lam, tau)] = script_m.generate(
-                wav,
-                wav_len,
-                system_prompt=prompt,
-                max_new_tokens=max_new_tokens,
-                chunk_size_override=chunk_size,
-                chat_fusion=None if lam == 0.0 else scorer,
-                fusion_lam=lam,
-                fusion_margin_threshold=tau,
-                fusion_stats=stats.get((lam, tau)) if stats else None,
-            )
+            for sk in skips:
+                out[(lam, tau, sk)] = script_m.generate(
+                    wav,
+                    wav_len,
+                    system_prompt=prompt,
+                    max_new_tokens=max_new_tokens,
+                    chunk_size_override=chunk_size,
+                    chat_fusion=None if lam == 0.0 else scorer,
+                    fusion_lam=lam,
+                    fusion_margin_threshold=tau,
+                    fusion_stats=stats.get((lam, tau, sk)) if stats else None,
+                    fusion_skip_threshold=sk,
+                    fusion_skipped=skipped.get((lam, tau, sk)) if skipped else None,
+                )
     return out
 
 
@@ -189,6 +192,14 @@ def main() -> int:
         "0 = CHAT alone, inf = full fusion. Sweeping tau shows WHERE the ensemble earns its gain.",
     )
     ap.add_argument("--fusion_stats", action="store_true", help="report override rate by CHAT confidence")
+    ap.add_argument(
+        "--skip_threshold",
+        default="inf",
+        help="ON-DEMAND fusion: decode each chunk with CHAT alone first and only invoke SCRIPT "
+        "for streams whose weakest step fell below this margin. inf = never skip (always fuse). "
+        "Unlike --margin_threshold this saves real compute, because a skipped chunk never builds "
+        "a SCRIPT prompt.",
+    )
     ap.add_argument("--max_new_tokens", type=int, default=64)
     ap.add_argument("--device", type=int, default=0)
     ap.add_argument("--dtype", choices=["bf16", "fp32"], default="bf16")
@@ -203,6 +214,7 @@ def main() -> int:
 
     lams = [float(x) for x in args.lam.split(",") if x.strip()]
     taus = [float(x) for x in args.margin_threshold.split(",") if x.strip()]
+    skips = [float(x) for x in args.skip_threshold.split(",") if x.strip()]
     device = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float32
 
@@ -232,7 +244,8 @@ def main() -> int:
             flush=True,
         )
 
-        keys = [(l, t) for l in lams for t in taus]
+        keys = [(l, t, s_) for l in lams for t in taus for s_ in skips]
+        skipped = {k: {} for k in keys}
         stats = None
         if args.fusion_stats:
             from nemo.collections.speechlm2.parts.chat_fusion import FusionStats
@@ -268,23 +281,24 @@ def main() -> int:
                 for j in range(min(2, len(chunk_paths))):
                     print(f"   ref: {refs[j]}")
                     for k in keys:
-                        print(f"   lam={k[0]} tau={k[1]}: {got[k][j]}")
+                        print(f"   lam={k[0]} tau={k[1]} skip={k[2]}: {got[k][j]}")
 
-        print(f"\n  {'lam':>6}  {'tau':>6}  {'WER%':>7}")
-        print(f"  {'-'*24}")
-        for lam, tau in keys:
+        print(f"\n  {'lam':>6}  {'tau':>6}  {'skip':>6}  {'WER%':>7}  {'SCRIPT skipped':>15}")
+        print(f"  {'-'*50}")
+        for lam, tau, sk in keys:
             # A FRESH scorer per lam: LeaderboardWER accumulates across update()
             # calls, so reusing one would pool every lam's hypotheses together
             # and report the same blended number for all of them.
             sc = LeaderboardWER()
-            sc.update(f"{ds}/{split}", refs, hyps[(lam, tau)])
+            sc.update(f"{ds}/{split}", refs, hyps[(lam, tau, sk)])
             wer = sc.compute()["wer"] * 100.0
-            tag = "  <- CHAT alone" if (lam == 1.0 or tau == 0.0) else ("  <- SCRIPT alone" if lam == 0.0 else "")
-            print(f"  {lam:>6}  {tau:>6}  {wer:>7.2f}{tag}")
+            d = skipped.get((lam, tau, sk), {})
+            frac = (100.0 * d.get("skipped", 0) / d["total"]) if d.get("total") else 0.0
+            print(f"  {lam:>6}  {tau:>6}  {sk:>6}  {wer:>7.2f}  {frac:>14.1f}%")
         if stats:
             for k in keys:
                 if stats[k].steps:
-                    print(f"\n  lam={k[0]} tau={k[1]}\n  " + stats[k].report().replace("\n", "\n  "))
+                    print(f"\n  lam={k[0]} tau={k[1]} skip={k[2]}\n  " + stats[k].report().replace("\n", "\n  "))
     return 0
 
 
