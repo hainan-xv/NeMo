@@ -264,6 +264,13 @@ fi
 # ---------------------------------------------------------------------------
 RESULTS_SUBDIR="${DECODE_LABEL}"
 [[ "${KEEP_HISTORY:-0}" == "1" ]] && RESULTS_SUBDIR="${DECODE_LABEL}_${JOB_TAG}"
+# RESULTS_SUFFIX distinguishes runs that share a checkpoint AND a decode label
+# but differ in some other axis -- a joint-decoding mixing weight, say. Without
+# it those runs all resolve to the SAME directory: eval_<ckpt-mtime>/<label> has
+# no term that varies, so the second run overwrites the first's shard logs and
+# aggregate. That already destroyed the evidence for one failed run. Empty by
+# default, so every existing path is unchanged.
+[[ -n "${RESULTS_SUFFIX:-}" ]] && RESULTS_SUBDIR="${RESULTS_SUBDIR}_${RESULTS_SUFFIX}"
 RESULTS_DIR="${OUTPUT_PREFIX}/results/${PROJECT}/${EXP_NAME}/eval_${CKPT_TS}/${RESULTS_SUBDIR}"
 SHARD_DIR="${RESULTS_DIR}/shards"
 mkdir -p "$SHARD_DIR"

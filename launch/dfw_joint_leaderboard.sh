@@ -107,7 +107,11 @@ for lam in ${LAM_LIST}; do
     else
         EXTRA="--chat_nemo ${CHAT_NEMO} --fusion_lam ${lam}"
     fi
-    EVAL_TAG="joint_lam${lam}" EXTRA_EVAL_ARGS="${EXTRA}" \
+    # RESULTS_SUFFIX, not EVAL_TAG: the results path is keyed on the checkpoint
+    # mtime and the decode label, neither of which varies across weights, so
+    # without a suffix all three runs land in one directory and overwrite each
+    # other's logs.
+    EVAL_TAG="joint_lam${lam}" RESULTS_SUFFIX="lam${lam}" EXTRA_EVAL_ARGS="${EXTRA}" \
         bash "${LAUNCH_DIR}/eval_leaderboard.sh"
     rc=$?
     if [[ $rc -eq 0 ]]; then STATUS+=("lam=${lam}|ok"); else
@@ -125,8 +129,7 @@ for s in "${STATUS[@]}"; do printf '  %-14s %s\n' "${s%%|*}" "${s#*|}"; done
 echo
 echo "### macro WER per weight"
 for lam in ${LAM_LIST}; do
-    L="$(ls -t "${OUTPUT_PREFIX}/results/${PROJECT}/${EXP_NAME}"/eval_*/*joint_lam${lam}*/aggregate.log 2>/dev/null | head -1)"
-    [[ -z "$L" ]] && L="$(ls -t "${OUTPUT_PREFIX}/results/${PROJECT}/${EXP_NAME}"/eval_*/*/aggregate.log 2>/dev/null | head -1)"
+    L="$(ls -t "${OUTPUT_PREFIX}/results/${PROJECT}/${EXP_NAME}"/eval_*/*_lam${lam}/aggregate.log 2>/dev/null | head -1)"
     if [[ -n "$L" ]]; then
         printf '  lam=%-6s %s\n' "$lam" "$(awk -F'\t' '$1=="RESULT" && $2=="Average"{v=$3} END{print v}' "$L")"
     else
