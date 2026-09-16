@@ -1291,6 +1291,8 @@ def batched_stream_decode_script(
     emission_penalty_lambda: float = 0.0,
     emission_penalty: Optional[Sequence[float]] = None,
     position_scheme: str = BRANCH_SCHEME,
+    chat_fusion=None,
+    fusion_lam: float = 0.5,
 ):
     """Batched greedy SCRIPT decode for ``B`` utterances at once.
 
@@ -1467,6 +1469,27 @@ def batched_stream_decode_script(
         # position-dependent penalty is keyed on.
         n_emitted = [0] * na
         for _ in range(max_new_tokens):
+            if chat_fusion is not None:
+                # CHUNK-SYNCHRONOUS JOINT DECODING. Both models are standing on
+                # the same (chunk, history) here -- chunk k, and each stream's
+                # own emitted prefix -- which is the whole reason their
+                # log-probs can be added: they are predicting the next piece of
+                # the same tokenization of the same words.
+                #
+                # Placed BEFORE the emission penalty so the penalty biases the
+                # COMBINED distribution. After it, fusion would overwrite the
+                # eot column the penalty had just adjusted.
+                from nemo.collections.speechlm2.parts.chat_fusion import fuse_into_script_logits
+
+                prefixes = [list(emitted[b]) + list(words[i]) for i, b in enumerate(active)]
+                chat_lp = chat_fusion.logprobs(active, k, prefixes)
+                logits = fuse_into_script_logits(
+                    logits,
+                    chat_lp,
+                    fusion_lam,
+                    eot_id,
+                    veto_ids=(vision_start_id, vision_end_id),
+                )
             if emission_penalty or emission_penalty_lambda:
                 # Bias <eot> rather than suppressing every word token: the choice
                 # at each step is "another word or stop", so a bonus on stop is
