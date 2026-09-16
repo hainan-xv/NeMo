@@ -113,6 +113,14 @@ echo "###   topk=${TOPK}  chunk_size=${CHUNK_SIZE}  cache=${CACHE_DIR}"
 date
 echo "############################################################"
 
+# Marker file stamped at job start. The summary below only accepts an
+# aggregate.log NEWER than this, because eval_*/ directories accumulate: an arm
+# that FAILS this run still has last run's aggregate.log on disk, and reading
+# "the newest aggregate.log" then reports STALE numbers under a fresh timestamp.
+# That happened -- a failed arm was reported with a full result table identical
+# to the previous run's.
+JOB_START_MARKER="$(mktemp)"
+
 declare -a STATUS=()
 
 for entry in "${ALL_ARMS[@]}"; do
@@ -181,10 +189,14 @@ for entry in "${ALL_ARMS[@]}"; do
     IFS='|' read -r key family exp side <<< "$entry"
     [[ -n "$WANTED" ]] && [[ " $WANTED " != *" $key "* ]] && continue
     L="$(ls -t "${OUTPUT_PREFIX}/results/${PROJECT}/${exp}"/eval_*/*/aggregate.log 2>/dev/null | head -1)"
-    if [[ -n "$L" ]]; then
+    if [[ -z "$L" ]]; then
+        printf '  %-16s %s\n' "$key" "(never evaluated)"
+    elif [[ ! "$L" -nt "$JOB_START_MARKER" ]]; then
+        # Older than this job => it is the PREVIOUS run's result, not ours.
+        printf '  %-16s %s\n' "$key" "NO RESULT THIS RUN (stale log from $(date -r "$L" '+%m-%d %H:%M') ignored)"
+    else
         # awk, not grep -E: \t is not portable in an ERE pattern.
         printf '  %-16s %s\n' "$key" "$(awk -F'\t' '$1=="RESULT" && $2=="Average"{v=$3} END{print v}' "$L")"
-    else
-        printf '  %-16s %s\n' "$key" "(no aggregate.log)"
     fi
 done
+rm -f "$JOB_START_MARKER"
