@@ -43,7 +43,22 @@ from __future__ import annotations
 
 from typing import List, Sequence, Tuple
 
-__all__ = ["align_words", "label_chunks"]
+__all__ = ["align_words", "label_chunks", "simple_normalize"]
+
+
+def simple_normalize(word: str) -> str:
+    """Casefold and strip surrounding punctuation, for the LABEL DECISION only.
+
+    The ASR emits cased, punctuated text; the aligner's reference words are raw.
+    Compared literally, almost every chunk looks wrong -- measured, that inflated
+    the wrong-chunk rate from 7% to 75%, which is the difference between a
+    usable corpus and nonsense.
+
+    This is used ONLY to decide whether a chunk needs correcting. The correction
+    TARGET stays the true reference text, because that is what the model should
+    learn to emit -- casing and punctuation included.
+    """
+    return word.strip(".,!?;:\"'()[]").casefold()
 
 
 def align_words(hyp: Sequence[str], ref: Sequence[str]) -> List[Tuple[str, int, int]]:
@@ -79,7 +94,7 @@ def align_words(hyp: Sequence[str], ref: Sequence[str]) -> List[Tuple[str, int, 
     return out
 
 
-def label_chunks(hyp_words: Sequence[str], ref_chunks: Sequence[Sequence[str]]):
+def label_chunks(hyp_words: Sequence[str], ref_chunks: Sequence[Sequence[str]], normalize=None):
     """``(labels, n_wrong)`` where ``labels[t]`` is None for ACCEPT else the target.
 
     Args:
@@ -87,9 +102,12 @@ def label_chunks(hyp_words: Sequence[str], ref_chunks: Sequence[Sequence[str]]):
             HYPOTHESIS are deliberately not an input -- see the module docstring.
         ref_chunks: reference words grouped by chunk.
     """
-    ref_words: List[str] = [w for c in ref_chunks for w in c]
+    norm = normalize or (lambda w: w)
+    hyp_words = [norm(w) for w in hyp_words]
+    ref_chunks_cmp = [[norm(w) for w in c] for c in ref_chunks]
+    ref_words: List[str] = [w for c in ref_chunks_cmp for w in c]
     # Which reference chunk each reference word belongs to.
-    owner: List[int] = [t for t, c in enumerate(ref_chunks) for _ in c]
+    owner: List[int] = [t for t, c in enumerate(ref_chunks_cmp) for _ in c]
 
     # Rule 1: the transcript is right, so nothing is wrong anywhere.
     if list(hyp_words) == ref_words:

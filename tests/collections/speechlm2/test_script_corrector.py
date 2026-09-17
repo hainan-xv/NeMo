@@ -241,3 +241,54 @@ def test_accept_flags_survive_collation():
         PAD,
     )
     assert b.is_accept == [True, False]
+
+
+# --------------------------------------------------------------------------
+# Metrics.
+# --------------------------------------------------------------------------
+
+from nemo.collections.speechlm2.parts.script_corrector import (  # noqa: E402
+    decision_stats,
+    word_errors,
+)
+
+
+def test_always_accept_scores_zero_reject_recall():
+    """The collapse this 93%-ACCEPT corpus invites. Plain accuracy would call it
+    93% correct; reject_recall correctly calls it useless."""
+    labels = [True] * 9 + [False]
+    st = decision_stats([True] * 10, labels)
+    assert st["pred_accept_frac"] == 1.0
+    assert st["reject_recall"] == 0.0, "it never caught the one real error"
+
+
+def test_perfect_decisions_score_one():
+    labels = [True, False, True, False]
+    st = decision_stats(labels, labels)
+    assert st["reject_recall"] == 1.0 and st["reject_precision"] == 1.0
+
+
+def test_over_rejecting_shows_up_as_low_precision():
+    st = decision_stats([False] * 4, [True, True, True, False])
+    assert st["reject_recall"] == 1.0
+    assert st["reject_precision"] == 0.25
+
+
+def test_decision_stats_rejects_mismatched_lengths():
+    with pytest.raises(ValueError, match="length mismatch"):
+        decision_stats([True], [True, False])
+
+
+def test_word_errors_returns_edits_and_reference_length():
+    assert word_errors(["a", "b"], ["a", "b"]) == (0, 2)
+    assert word_errors(["a", "X"], ["a", "b"]) == (1, 2)
+    assert word_errors(["a"], ["a", "b"]) == (1, 2)
+    assert word_errors(["a", "b", "c"], ["a", "b"]) == (1, 2)
+
+
+def test_wer_accumulates_additively_not_as_a_mean_of_rates():
+    """A 1-word utterance fully wrong and a 9-word utterance fully right is 10%
+    corpus WER, not the 50% a mean of per-utterance rates would give."""
+    e1, n1 = word_errors(["X"], ["a"])
+    e2, n2 = word_errors(list("bcdefghij"), list("bcdefghij"))
+    assert (e1 + e2) / (n1 + n2) == pytest.approx(0.1)

@@ -48,10 +48,13 @@ import torch
 from omegaconf import open_dict
 
 from nemo.collections.speechlm2.models.script_model import ScriptSTTModel
+from nemo.collections.asr.parts.utils.chunk_error_labels import simple_normalize
 from nemo.collections.speechlm2.parts.script_corrector import (
     CorrectorIds,
     collate_corrector_examples,
     corrector_examples_for_utterance,
+    decision_stats,
+    word_errors,
 )
 from nemo.utils import logging
 
@@ -193,7 +196,16 @@ class ScriptCorrectorModel(ScriptSTTModel):
         for b in range(len(n_chunks)):
             hyp_w = [self.tokenizer.ids_to_text(t).split() if t else [] for t in hyp_i[b]]
             lens = [min(cs, max(0, int(enc_len[b]) - k * cs)) for k in range(n_chunks[b])]
-            exs = corrector_examples_for_utterance(instr, ref_w[b], ref_i[b], hyp_i[b], hyp_w, lens, ids=self.ids)
+            exs = corrector_examples_for_utterance(
+                instr,
+                ref_w[b],
+                ref_i[b],
+                hyp_i[b],
+                hyp_w,
+                lens,
+                ids=self.ids,
+                normalize=simple_normalize,
+            )
             for k, e in enumerate(exs):
                 examples.append(e)
                 frame_src.append((b, k * cs))
@@ -221,8 +233,92 @@ class ScriptCorrectorModel(ScriptSTTModel):
 
         out = self.llm(inputs_embeds=embeds, attention_mask=attn, labels=labels)
         loss = out.loss
-        acc = float(sum(cb.is_accept)) / max(1, len(cb.is_accept))
+
+        with torch.no_grad():
+            # The DECISION is the argmax at prompt_len - 1: logits at position i
+            # predict token i+1, so that column is the first target token.
+            first = torch.tensor([e.prompt_len - 1 for e in examples], device=dev)
+            rows = torch.arange(len(examples), device=dev)
+            pred_accept = (out.logits[rows, first].argmax(-1) == self.ids.accept).tolist()
+            st = decision_stats(pred_accept, cb.is_accept)
+
+            # CHAT's WER on this batch, TEACHER-FORCED: every chunk was decoded
+            # given the REFERENCE prefix, so it is optimistic versus deployment
+            # where CHAT conditions on its own output. It is the right baseline
+            # for the corrector -- it is exactly what the corrector saw -- but it
+            # must not be quoted as CHAT's WER, hence the _tf suffix.
+            e_tot = n_tot = 0
+            for b in range(len(n_chunks)):
+                hw = [w for t in hyp_i[b] for w in self.tokenizer.ids_to_text(t).split()]
+                rw = [w for c in ref_w[b] for w in c]
+                e, n = word_errors([simple_normalize(w) for w in hw], [simple_normalize(w) for w in rw])
+                e_tot += e
+                n_tot += n
+
         self.log("train_loss", loss, prog_bar=True, sync_dist=True)
-        self.log("accept_frac", acc, prog_bar=True, sync_dist=True)
         self.log("chunks_per_batch", float(len(examples)), sync_dist=True)
+        for k, v in st.items():
+            self.log(f"train_{k}", float(v), prog_bar=(k == "reject_recall"), sync_dist=True)
+        if n_tot:
+            self.log("train_chat_wer_tf", e_tot / n_tot, prog_bar=True, sync_dist=True)
+
+        # Handed to on_train_batch_end, which computes corrected_wer. Generating
+        # inside training_step corrupts activation checkpointing -- that killed
+        # both SCRIPT arms at step 500 ("Recomputed values ... different
+        # metadata"), so generation stays out of the graph-building step.
+        self._last = {
+            "enc_len": enc_len,
+            "n_chunks": n_chunks,
+            "ref_w": ref_w,
+            "ref_i": ref_i,
+            "hyp_i": hyp_i,
+            "instr": instr,
+            "device": dev,
+        }
         return loss
+
+    @torch.no_grad()
+    def _corrected_wer(self, st) -> Optional[float]:
+        """WER after applying the corrector's own accept/reject decisions.
+
+        Accept keeps CHAT's chunk; reject substitutes the reference. That makes
+        this an ORACLE-CORRECTION number: it measures the DECISION quality only,
+        not the generated text, so it is the ceiling the accept/reject head can
+        reach. Reported beside train_chat_wer_tf on the same batch, the pair is an
+        A/B on identical audio -- any gap is the decision doing work. Generating
+        the corrections instead would fold two skills into one number and make a
+        regression impossible to attribute.
+        """
+        cs = self.chat.joint.chunk_size
+        dev = st["device"]
+        e_tot = n_tot = 0
+        for b in range(len(st["n_chunks"])):
+            out_words: List[str] = []
+            history: List[int] = []
+            for k in range(st["n_chunks"][b]):
+                hyp = st["hyp_i"][b][k]
+                alen = min(cs, max(0, int(st["enc_len"][b]) - k * cs))
+                ex = corrector_examples_for_utterance(st["instr"], [[]], [[]], [hyp], [[]], [alen], ids=self.ids)[0]
+                tail = ex.input_ids[len(st["instr"]) : ex.prompt_len]
+                ids_t = torch.tensor([list(st["instr"]) + history + tail], dtype=torch.long, device=dev)
+                logits = self.llm(inputs_embeds=self._embed_tokens(ids_t)).logits[0, -1]
+                toks = hyp if int(logits.argmax()) == self.ids.accept else st["ref_i"][b][k]
+                out_words += self.tokenizer.ids_to_text(toks).split() if toks else []
+                history = history + list(st["ref_i"][b][k])
+            rw = [w for c in st["ref_w"][b] for w in c]
+            e, n = word_errors([simple_normalize(w) for w in out_words], [simple_normalize(w) for w in rw])
+            e_tot += e
+            n_tot += n
+        return (e_tot / n_tot) if n_tot else None
+
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        every = int(getattr(self.core_cfg, "corrected_wer_every_n_steps", 0) or 200)
+        last = getattr(self, "_last", None)
+        if every and self.global_step and self.global_step % every == 0 and last:
+            try:
+                w = self._corrected_wer(last)
+                if w is not None:
+                    self.log("train_corrected_wer", w, prog_bar=True, sync_dist=True)
+            except Exception as e:  # a metric must never kill a training run
+                logging.warning("corrected_wer failed at step %s: %s", self.global_step, e)
+        self._last = None

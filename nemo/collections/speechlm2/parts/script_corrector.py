@@ -50,6 +50,8 @@ __all__ = [
     "corrector_examples_for_utterance",
     "CorrectorBatch",
     "collate_corrector_examples",
+    "decision_stats",
+    "word_errors",
 ]
 
 
@@ -145,6 +147,7 @@ def corrector_examples_for_utterance(
     audio_lens: Sequence[int],
     ids: CorrectorIds = CorrectorIds(),
     ignore_index: int = -100,
+    normalize=None,
 ) -> List[CorrectorExample]:
     """One utterance -> one example per chunk, labelled ACCEPT or corrected.
 
@@ -171,7 +174,7 @@ def corrector_examples_for_utterance(
         )
 
     flat_hyp = [w for c in hyp_chunk_words for w in c]
-    labels, _ = label_chunks(flat_hyp, ref_chunk_words)
+    labels, _ = label_chunks(flat_hyp, ref_chunk_words, normalize=normalize)
 
     out: List[CorrectorExample] = []
     history: List[int] = []
@@ -250,3 +253,45 @@ def collate_corrector_examples(
         audio_slots=slots,
         is_accept=[e.is_accept for e in examples],
     )
+
+
+def decision_stats(pred_accept: Sequence[bool], label_accept: Sequence[bool]) -> dict:
+    """Accept/reject quality, reported from the REJECT side.
+
+    With ~93% of chunks needing no change, a model that always accepts scores
+    93% accuracy and is worthless -- it never corrects anything. So the numbers
+    that matter are recall and precision on REJECT: of the chunks that really
+    were wrong, how many did it catch, and of those it flagged, how many really
+    were wrong. ``pred_accept_frac`` is the collapse detector: it drifting to
+    1.00 while the loss still falls is exactly the failure this imbalance
+    invites.
+    """
+    if len(pred_accept) != len(label_accept):
+        raise ValueError(f"length mismatch: {len(pred_accept)} vs {len(label_accept)}")
+    n = len(label_accept)
+    if n == 0:
+        return {}
+    tp = sum(1 for p, l in zip(pred_accept, label_accept) if not p and not l)  # correctly rejected
+    fp = sum(1 for p, l in zip(pred_accept, label_accept) if not p and l)  # wrongly rejected
+    fn = sum(1 for p, l in zip(pred_accept, label_accept) if p and not l)  # missed a real error
+    return {
+        "pred_accept_frac": sum(pred_accept) / n,
+        "label_accept_frac": sum(label_accept) / n,
+        "reject_precision": tp / (tp + fp) if (tp + fp) else 0.0,
+        "reject_recall": tp / (tp + fn) if (tp + fn) else 0.0,
+    }
+
+
+def word_errors(hyp_words: Sequence[str], ref_words: Sequence[str]) -> tuple:
+    """``(edits, ref_len)`` so WER can be accumulated ADDITIVELY across a batch.
+
+    Returning the pair rather than a rate matters: corpus WER is total edits over
+    total reference words, and averaging per-utterance rates instead over-weights
+    short utterances. That is the same additive rule the leaderboard scorer uses,
+    so these numbers stay comparable to the ones in the results table.
+    """
+    from nemo.collections.asr.parts.utils.chunk_error_labels import align_words
+
+    ops = align_words(list(hyp_words), list(ref_words))
+    edits = sum(1 for op, _, _ in ops if op != "equal")
+    return edits, len(ref_words)

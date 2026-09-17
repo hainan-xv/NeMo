@@ -100,7 +100,9 @@ echo "*** CORRECTOR SMOKE: verifying ${CHAT_ARM}, warm start ${SCRIPT_ARM} ***" 
     trainer.num_nodes=\${SLURM_JOB_NUM_NODES} \
     trainer.log_every_n_steps=5 \
     ++exp_manager.exp_dir=/results/ \
-    ++exp_manager.create_wandb_logger=false \
+    ++exp_manager.create_wandb_logger=true \
+    ++exp_manager.wandb_logger_kwargs.project=${PROJECT_NAME} \
+    ++exp_manager.wandb_logger_kwargs.name=${EXP_NAME} \
     ++exp_manager.create_tensorboard_logger=false \
     ++exp_manager.name=${EXP_NAME}
 EOCMD

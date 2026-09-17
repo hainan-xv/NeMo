@@ -82,3 +82,46 @@ def test_alignment_ops_are_what_they_claim():
     assert ops == ["equal", "del", "equal"]
     ops = [o for o, _, _ in align_words(["a", "b", "c"], ["a", "c"])]
     assert ops == ["equal", "ins", "equal"]
+
+
+# --------------------------------------------------------------------------
+# Normalisation for the label decision.
+# --------------------------------------------------------------------------
+
+from nemo.collections.asr.parts.utils.chunk_error_labels import simple_normalize  # noqa: E402
+
+
+def test_casing_and_punctuation_alone_do_not_mark_a_chunk_wrong():
+    """The ASR writes 'Hello, world.'; the aligner has 'hello world'. Compared
+    literally that is two errors -- measured, this inflated the wrong-chunk rate
+    from 7% to 75%."""
+    labels, n = label_chunks(
+        ["Hello,", "world."], [["hello"], ["world"]], normalize=simple_normalize
+    )
+    assert n == 0 and labels == [None, None]
+
+
+def test_without_a_normalizer_the_same_input_looks_entirely_wrong():
+    """Pins the default as exact-match, so the normalisation is a visible choice."""
+    _, n = label_chunks(["Hello,", "world."], [["hello"], ["world"]])
+    assert n == 2
+
+
+def test_a_real_error_still_shows_through_normalisation():
+    labels, n = label_chunks(
+        ["Hello,", "word."], [["hello"], ["world"]], normalize=simple_normalize
+    )
+    assert n == 1 and labels[1] == "world"
+
+
+def test_correction_target_keeps_the_original_reference_text():
+    """Normalisation decides IF a chunk is wrong; the target must stay the true
+    reference, casing and punctuation included, since that is what to emit."""
+    labels, _ = label_chunks(["X"], [["Hello,"]], normalize=simple_normalize)
+    assert labels[0] == "Hello,", "target must not be normalised"
+
+
+def test_simple_normalize_strips_edge_punctuation_only():
+    assert simple_normalize("Hello,") == "hello"
+    assert simple_normalize('"world."') == "world"
+    assert simple_normalize("don't") == "don't", "internal apostrophes must survive"
