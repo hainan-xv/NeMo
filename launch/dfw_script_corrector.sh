@@ -18,10 +18,14 @@
 #
 #   sbatch launch/dfw_script_corrector.sh
 #
-# v2, not v1: v1 reached step 7242 on corrupted targets -- teacher-forced CHAT
-# hypotheses (0.40 WER) and the pre-punctuation-fix labeller (accept_frac 0.77).
-# Those steps are not worth resuming, and resume_if_exists would have silently
-# picked them up. v1's artifacts are left on disk untouched for comparison.
+# v3, not v2: v2 trained on labels indexed by REFERENCE chunk while the decision
+# is made on the HYPOTHESIS chunk. With emission lagging the aligner by about a
+# word the two hold different words, so <incorrect> landed on the neighbouring
+# chunk and its target deleted late-emitted words and duplicated early ones. It
+# showed: val_corrected_wer went 0.0891 -> 0.0916 -> 0.1090 while chat_wer_tf sat
+# at 0.0876, i.e. correcting made the transcript WORSE, monotonically.
+# resume_if_exists would have reloaded those weights, so the run needs a new name.
+# v1 and v2 artifacts are left on disk untouched for comparison.
 #
 # Short runs are not useful here: 200 steps on a 93%-ACCEPT corpus is long
 # enough to learn "always accept" and nothing else. This runs to the wall clock.
@@ -63,7 +67,7 @@ CODE_DIR="${CODE_DIR:-${MYDIR}/NeMo_SCRIPT_cc}"
 PROJECT_NAME="${PROJECT_NAME:-SpeechlmDFW}"
 CONFIG_PATH=/code/examples/speechlm2/conf
 CONFIG_NAME="${CONFIG_NAME:-streaming_stt_granary2_lora_script_corrector}"
-EXP_NAME="${EXP_NAME:-dfw_corrector_v2}"
+EXP_NAME="${EXP_NAME:-dfw_corrector_v3}"
 
 # The model being verified, and the SCRIPT checkpoint we warm-start from.
 CHAT_ARM="${CHAT_ARM:-dfw_granary2_chat_banded1_nodelay_v2}"

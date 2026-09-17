@@ -198,3 +198,86 @@ def test_standalone_punctuation_in_the_reference_is_not_an_error():
 def test_alignment_ops_are_the_expected_four():
     ops = {op for op, _, _ in align_words(["a", "X", "c"], ["a", "b", "c"])}
     assert ops <= {"equal", "sub", "ins", "del"}
+
+
+# --------------------------------------------------------------------------
+# The reconstruction invariant: errors AND a different chunking, together.
+# --------------------------------------------------------------------------
+
+
+def _chunk(words, sizes):
+    """Group a flat word list into chunks of the given sizes (last one takes the rest)."""
+    out, i = [], 0
+    for n in sizes:
+        out.append(words[i : i + n])
+        i += n
+    out.append(words[i:])
+    return out
+
+
+@pytest.mark.unit
+def test_owned_spans_reconstruct_the_reference_exactly():
+    """Whatever the alignment does, the per-chunk reference spans must partition
+    the reference: every word once, in order, nothing invented."""
+    ref_words = ["the", "quick", "brown", "fox", "jumps", "over", "the", "lazy", "dog"]
+    # Substitution, insertion and deletion at once, on boundaries that line up
+    # with nothing in the reference.
+    hyp_words = ["the", "quick", "BROWN", "fox", "XX", "over", "the", "dog"]
+    ref_chunks = _chunk(ref_words, [2, 3, 2])
+    hyp_chunks = _chunk(hyp_words, [4, 1, 1])
+
+    labels, n_wrong, owned = label_chunks(hyp_chunks, ref_chunks)
+    assert n_wrong > 0, "this hypothesis really is wrong; the test would be vacuous otherwise"
+    assert [w for c in owned for w in c] == ref_words
+
+
+@pytest.mark.unit
+def test_corrected_chunks_concatenate_to_the_reference():
+    """THE property the whole design rests on: emit the hypothesis where a chunk
+    is accepted and its reference span where it is not, and the result is the
+    reference -- no word dropped, none duplicated."""
+    ref_words = ["a", "b", "c", "d", "e", "f", "g", "h"]
+    hyp_words = ["a", "b", "ZZ", "d", "e", "g", "h"]  # sub at c, deletion of f
+    ref_chunks = _chunk(ref_words, [3, 2, 2])
+    hyp_chunks = _chunk(hyp_words, [1, 4, 1])
+
+    labels, _, owned = label_chunks(hyp_chunks, ref_chunks)
+    assert _stitch(hyp_chunks, labels, owned) == ref_words
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("seed", range(40))
+def test_reconstruction_holds_over_random_errors_and_chunkings(seed):
+    """Fuzz it. Independent chunkings for reference and hypothesis, plus a mix of
+    substitutions, insertions and deletions -- the case the old reference-indexed
+    labels got wrong, and the one a single hand-picked example can hide."""
+    import random
+
+    rnd = random.Random(seed)
+    ref_words = [f"w{i}" for i in range(rnd.randint(4, 14))]
+
+    hyp_words = []
+    for w in ref_words:
+        r = rnd.random()
+        if r < 0.15:
+            continue  # deletion
+        hyp_words.append(f"S{w}" if r < 0.30 else w)  # substitution, else correct
+        if r > 0.92:
+            hyp_words.append("INS")  # insertion
+
+    def _rand_chunks(words):
+        if not words:
+            return [[]]
+        cuts = sorted(rnd.sample(range(1, len(words) + 1), k=min(3, len(words))))
+        out, prev = [], 0
+        for c in cuts:
+            out.append(words[prev:c])
+            prev = c
+        out.append(words[prev:])
+        return out
+
+    ref_chunks, hyp_chunks = _rand_chunks(ref_words), _rand_chunks(hyp_words)
+    labels, _, owned = label_chunks(hyp_chunks, ref_chunks)
+
+    assert [w for c in owned for w in c] == ref_words, "the reference spans must partition the reference"
+    assert _stitch(hyp_chunks, labels, owned) == ref_words, "accept-or-correct must rebuild the reference"

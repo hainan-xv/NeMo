@@ -461,3 +461,51 @@ def test_module_still_defines_every_public_symbol():
         "format_sample",
     }
     assert expected <= top, f"missing from the module: {sorted(expected - top)}"
+
+
+# --------------------------------------------------------------------------
+# Token-level reconstruction: what actually gets spliced back together.
+# --------------------------------------------------------------------------
+
+
+def test_corrected_token_spans_concatenate_to_the_reference_ids():
+    """The word-level invariant is pinned in the labeller's tests; this is the
+    same property one layer down, on the IDS the model emits and the decoder
+    stitches. Errors AND a chunking that lines up with nothing.
+    """
+    vocab = {w: 50 + i for i, w in enumerate(["a", "b", "c", "d", "e", "f"])}
+    vocab["ZZ"] = 99
+
+    def tok(text):
+        return [vocab[w] for w in text.split()]
+
+    ref_chunks = [["a", "b", "c"], ["d", "e"], ["f"]]
+    hyp_chunks = [["a"], ["b", "ZZ", "d"], ["e", "f"]]  # sub at c, boundaries elsewhere
+
+    _, labels, target_ids = corrector_examples_for_utterance(
+        INSTR, ref_chunks, hyp_chunks, [[1], [2], [3]], [14, 14, 14], tok
+    )
+    assert any(l is not None for l in labels), "the hypothesis must really be wrong here"
+
+    flat_ref_ids = tok(" ".join(w for c in ref_chunks for w in c))
+    assert [t for span in target_ids for t in span] == flat_ref_ids
+
+
+def test_stitching_accepts_and_corrections_reproduces_the_reference_ids():
+    """Accept -> CHAT's ids; reject -> the chunk's reference span. Concatenated,
+    the transcript is the reference."""
+    vocab = {w: 50 + i for i, w in enumerate(["a", "b", "c", "d"])}
+    vocab["ZZ"] = 99
+
+    def tok(text):
+        return [vocab[w] for w in text.split()]
+
+    ref_chunks = [["a", "b"], ["c", "d"]]
+    hyp_chunks = [["a"], ["b", "ZZ", "d"]]
+    hyp_ids = [[vocab["a"]], [vocab["b"], vocab["ZZ"], vocab["d"]]]
+
+    exs, labels, target_ids = corrector_examples_for_utterance(INSTR, ref_chunks, hyp_chunks, hyp_ids, [14, 14], tok)
+    out = []
+    for k, e in enumerate(exs):
+        out += hyp_ids[k] if e.is_accept else target_ids[k]
+    assert out == tok("a b c d")
