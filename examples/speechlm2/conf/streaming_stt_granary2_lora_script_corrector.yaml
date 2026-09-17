@@ -326,7 +326,11 @@ exp_manager:
     resume: true
 
   checkpoint_callback_params:
-    filename: "{step}-{val_wer:.4f}"
+    # Lightning substitutes 0 for a key missing from the metrics dict, so a
+    # template naming val_wer produced five checkpoints all called
+    # "val_wer=0.0000" -- indistinguishable, and unsortable by the top-K
+    # averaging step that parses the WER back out of the filename.
+    filename: "{step}-{val_corrected_wer:.4f}"
     # The corrector never logs val_wer -- it logs val_corrected_wer, the WER
     # AFTER its decisions. Monitoring the inherited key raises
     # MisconfigurationException at the first checkpoint, after validation has

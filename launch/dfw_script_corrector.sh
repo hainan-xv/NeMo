@@ -14,13 +14,17 @@
 #SBATCH --exclude=pool0-00407,pool0-01815
 
 # ============================================================================
-# LONG interactive run for the verifier/corrector: does it actually LEARN?
+# FULL run for the verifier/corrector: does it actually LEARN?
 #
-#   sbatch launch/dfw_script_corrector_long.sh
+#   sbatch launch/dfw_script_corrector.sh
 #
-# The smoke test answered "does it build and step". It could not answer whether
-# the thing works, because 200 steps on a 93%-ACCEPT corpus is long enough to
-# learn "always accept" and nothing else. This runs to the wall clock instead.
+# v2, not v1: v1 reached step 7242 on corrupted targets -- teacher-forced CHAT
+# hypotheses (0.40 WER) and the pre-punctuation-fix labeller (accept_frac 0.77).
+# Those steps are not worth resuming, and resume_if_exists would have silently
+# picked them up. v1's artifacts are left on disk untouched for comparison.
+#
+# Short runs are not useful here: 200 steps on a 93%-ACCEPT corpus is long
+# enough to learn "always accept" and nothing else. This runs to the wall clock.
 #
 # WHAT TO WATCH, and it is NOT the loss. With this imbalance the loss falls
 # steadily for a model that has simply collapsed to accepting everything:
@@ -59,7 +63,7 @@ CODE_DIR="${CODE_DIR:-${MYDIR}/NeMo_SCRIPT_cc}"
 PROJECT_NAME="${PROJECT_NAME:-SpeechlmDFW}"
 CONFIG_PATH=/code/examples/speechlm2/conf
 CONFIG_NAME="${CONFIG_NAME:-streaming_stt_granary2_lora_script_corrector}"
-EXP_NAME="${EXP_NAME:-dfw_corrector_v1}"
+EXP_NAME="${EXP_NAME:-dfw_corrector_v2}"
 
 # The model being verified, and the SCRIPT checkpoint we warm-start from.
 CHAT_ARM="${CHAT_ARM:-dfw_granary2_chat_banded1_nodelay_v2}"
@@ -102,7 +106,7 @@ DATA_ROOT=/lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm
 MOUNTS="--container-mounts=${CODE_DIR}:/code,${RESULTS_DIR}:/results,${HFCACHE}:/hfcache,${LUSTRE}:${LUSTRE},${DATA_ROOT}:${DATA_ROOT}"
 
 read -r -d '' cmd <<EOCMD
-echo "*** CORRECTOR SMOKE: verifying ${CHAT_ARM}, warm start ${SCRIPT_ARM} ***" \
+echo "*** CORRECTOR: verifying ${CHAT_ARM}, warm start ${SCRIPT_ARM} ***" \
 && nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | head -1 \
 && export WANDB_API_KEY=${WANDB} HF_HOME=/hfcache/ HF_TOKEN=${HF_TOKEN} HF_HUB_OFFLINE=1 \
 && export HYDRA_FULL_ERROR=1 PYTORCH_ALLOC_CONF=expandable_segments:True \
