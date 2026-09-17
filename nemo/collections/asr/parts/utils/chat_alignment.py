@@ -26,6 +26,7 @@ import math
 from typing import Callable, List, Optional, Sequence, Tuple
 
 __all__ = [
+    "assert_clean_transcript",
     "assign_words_to_chunks",
     "build_forced_path",
     "word_spans",
@@ -172,6 +173,53 @@ def chunk_texts(
         else:
             out.append(" ".join(words[i] for i in idxs).strip())
     return out
+
+
+def assert_clean_transcript(transcript: str, source: str = "") -> None:
+    """Raise if the transcript would tokenize to an ORPHAN word-start token.
+
+    Qwen's byte-level BPE marks word starts with a leading space. Text that runs
+    two spaces together, or ends in one, therefore produces a piece that is a
+    word marker with NO WORD ATTACHED, followed by another word-marked piece::
+
+        'a  b'  -> ['a', 'G', 'Gb']     <- orphan
+        'a b '  -> ['a', 'Gb', 'G']     <- orphan
+        'a b'   -> ['a', 'Gb']          <- fine
+
+    (``G`` stands for the byte-level space marker.) Measured on Qwen3-1.7B. A
+    single space, a leading space, a tab or a newline all merge into the
+    following piece and are harmless -- only repeated spaces and a trailing one
+    orphan a token.
+
+    This matters because the chunk targets are a SPLIT of one tokenization of the
+    whole transcript. An orphan marker consumes an emission slot in whichever
+    chunk it lands in, so the model is trained to emit a token that carries no
+    word, and the chunk's token count no longer matches its word count. This is
+    the same family as the standalone U+2581 piece that _token_split_points
+    already guards against.
+
+    Observed in mcv11_dev_clean_pcstrip_en_2k_qwen_aligned.json, where 25% of
+    utterances have a double space after a comma -- the text was rebuilt with the
+    comma merged onto the previous word and an empty placeholder left behind. A
+    1.32M-utterance sample of the granary training manifests found ZERO, so this
+    should never fire on training data; if it does, the data changed.
+    """
+    if not transcript:
+        return
+    if "  " in transcript:
+        i = transcript.index("  ")
+        raise ValueError(
+            f"transcript has consecutive spaces at offset {i}"
+            f"{f' in {source}' if source else ''}: {transcript[max(0, i - 30):i + 30]!r}. "
+            "This tokenizes to an orphan word-start piece and corrupts the chunk targets. "
+            "Fix the manifest (re.sub(r'  +', ' ', text)) rather than relaxing this check."
+        )
+    if transcript != transcript.rstrip():
+        raise ValueError(
+            f"transcript has trailing whitespace"
+            f"{f' in {source}' if source else ''}: {transcript[-40:]!r}. "
+            "This tokenizes to an orphan word-start piece at the end of the targets."
+        )
 
 
 def assign_words_to_chunks(

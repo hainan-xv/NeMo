@@ -53,6 +53,7 @@ from nemo.collections.asr.data.audio_to_text_lhotse import LhotseSpeechToTextBpe
 from nemo.collections.asr.losses.banded_rnnt import BandedLattice, banded_rnnt_loss, build_lattices
 from nemo.collections.asr.models.rnnt_bpe_models import EncDecRNNTBPEModel
 from nemo.collections.asr.parts.utils.chat_alignment import (
+    assert_clean_transcript,
     assign_words_to_chunks,
     build_forced_path,
     chunk_texts,
@@ -486,6 +487,11 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
         aligned = (cut.custom or {}).get("alignments", []) or []
         words = [w["text"] for w in aligned]
         transcript = " ".join(s.text for s in cut.supervisions if s.text) if cut.supervisions else ""
+        # Fail loudly on text that would tokenize to an orphan word-start piece.
+        # The chunk targets below are a SPLIT of one tokenization of this string,
+        # so a marker with no word attached silently consumes an emission slot
+        # and desynchronises a chunk's token count from its word count.
+        assert_clean_transcript(transcript, source=str(getattr(cut, "id", "")))
 
         groups = assign_words_to_chunks(
             [w["end_time"] for w in aligned],
