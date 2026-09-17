@@ -45,6 +45,24 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from nemo.collections.asr.parts.utils.chunk_error_labels import label_chunks  # noqa: E402
 
 
+def _make_normalizer():
+    """The SAME normalizer the leaderboard WER uses.
+
+    CHAT emits cased, punctuated text; the aligner's reference words are raw. A
+    raw string comparison therefore marks almost every utterance wrong -- the
+    first run of this probe reported 0.00% exact matches over 640 utterances at
+    ~8% WER, which is the signature of exactly that. Every chunk-wrong figure it
+    produced was measuring punctuation.
+    """
+    from leaderboard_wer import LeaderboardWER
+
+    return LeaderboardWER().normalizer
+
+
+def _norm_words(normalizer, text: str):
+    return normalizer(text).split()
+
+
 def _ref_chunks_for(model, cut, n_chunks):
     """Reference words grouped by chunk, using the model's OWN assignment rule.
 
@@ -71,11 +89,14 @@ def main() -> int:
     ap.add_argument("--nemo", required=True)
     ap.add_argument("--source", choices=["train", "manifest"], default="train")
     ap.add_argument("--manifest", default="")
+    ap.add_argument("--train_input_cfg", default="", help="Granary input_cfg YAML (.nemo does not store train_ds)")
     ap.add_argument("--batches", type=int, default=40)
     ap.add_argument("--batch_size", type=int, default=16)
     ap.add_argument("--device", type=int, default=0)
     ap.add_argument("--dump", default="", help="write per-utterance records here (jsonl)")
     args = ap.parse_args()
+
+    from omegaconf import open_dict
 
     dev = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
     from nemo.collections.asr.models.chat_bpe_models import EncDecCHATBPEModel
@@ -83,9 +104,20 @@ def main() -> int:
     print(f"==> restoring {args.nemo}", flush=True)
     model = EncDecCHATBPEModel.restore_from(restore_path=args.nemo, map_location=dev).eval().to(dev)
 
-    cfg = model.cfg.train_ds if args.source == "train" else model.cfg.validation_ds
-    from omegaconf import open_dict
+    # A saved .nemo keeps validation_ds but STRIPS train_ds, so the training
+    # source has to be reconstructed: take validation_ds as the template (it
+    # already carries sample_rate, lhotse settings and the 0.5 s pad that changes
+    # a CHAT model's chunk count) and point it at the training input_cfg.
+    import copy as _copy
 
+    cfg = _copy.deepcopy(model.cfg.validation_ds)
+    if args.source == "train":
+        if not args.train_input_cfg:
+            print("ERROR: --train_input_cfg is required (.nemo does not store train_ds)", file=sys.stderr)
+            return 2
+        with open_dict(cfg):
+            cfg.input_cfg = args.train_input_cfg
+            cfg.manifest_filepath = None
     with open_dict(cfg):
         cfg.batch_size = args.batch_size
         cfg.num_workers = 2
@@ -109,6 +141,7 @@ def main() -> int:
     finally:
         model._want_cuts = False
 
+    normalizer = _make_normalizer()
     n_utt = n_exact = n_chunk = n_bad = 0
     dump = open(args.dump, "w") if args.dump else None
 
@@ -143,11 +176,16 @@ def main() -> int:
                 ref_chunks, ref_words = _ref_chunks_for(model, cuts[u], n_ch)
                 if not ref_words:
                     continue
-                labels, bad = label_chunks(text.split(), ref_chunks)
+                hyp_w = _norm_words(normalizer, text)
+                ref_chunks = [_norm_words(normalizer, " ".join(c)) for c in ref_chunks]
+                ref_words = [w for c in ref_chunks for w in c]
+                if not ref_words:
+                    continue
+                labels, bad = label_chunks(hyp_w, ref_chunks)
                 n_utt += 1
                 n_chunk += len(ref_chunks)
                 n_bad += bad
-                if text.split() == ref_words:
+                if hyp_w == ref_words:
                     n_exact += 1
                 if dump:
                     dump.write(

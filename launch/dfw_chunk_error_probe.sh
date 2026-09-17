@@ -34,6 +34,7 @@ HEH="${DFW}/users/heh"
 ARM="${ARM:-dfw_granary2_chat_banded1_nodelay_v2}"
 NEMO="${OUT}/results/SpeechlmDFW/${ARM}/averaged/top5-averaged.nemo"
 BATCHES="${BATCHES:-40}"
+TRAIN_INPUT_CFG="${TRAIN_INPUT_CFG:-${HEH}/data_configs/granary_v2_en_full_d0.5_b0.5_dfw_qwen_aligned.yaml}"
 VAL_MANIFEST="${VAL_MANIFEST:-${HEH}/data/mcv11_en_dev_aligned/mcv11_dev_clean_pcstrip_en_2k_qwen_aligned.json}"
 
 if [[ ! -s "$NEMO" ]]; then
@@ -47,7 +48,7 @@ read -r -d '' cmd <<CMD
 export PYTHONPATH="/code:/code/scripts:\${PYTHONPATH}" HF_HUB_OFFLINE=1 HYDRA_FULL_ERROR=1 \
 && cd /code \
 && echo "################ TRAIN ################" \
-&& python /code/scripts/chat_chunk_error_probe.py --nemo "${NEMO}" --source train --batches ${BATCHES} \
+&& python /code/scripts/chat_chunk_error_probe.py --nemo "${NEMO}" --source train --batches ${BATCHES} --train_input_cfg "${TRAIN_INPUT_CFG}" \
      --dump /code/slurm_out/chunk_err_train.jsonl ; \
 echo "################ HELD-OUT ################" ; \
 python /code/scripts/chat_chunk_error_probe.py --nemo "${NEMO}" --source manifest --manifest "${VAL_MANIFEST}" \
