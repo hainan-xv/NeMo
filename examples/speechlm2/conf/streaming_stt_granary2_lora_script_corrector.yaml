@@ -51,6 +51,10 @@ model:
   # The frozen CHAT .nemo this model verifies. No default: a corrector without
   # something to correct is a silently different (and useless) experiment.
   chat_nemo: ???
+  # Instruction for the VERIFY task. Intentionally different from the generation
+  # prompt the warm start was trained with -- the model is being asked a
+  # different question and must be told so.
+  system_prompt: "You are verifying a streaming speech recognizer. Given the transcript so far, the representation of the next audio chunk, and the recognizer's hypothesis for that chunk, reply with the accept token if the hypothesis is correct, otherwise output the corrected words."
   pretrained_llm: /lustre/fsw/portfolios/llmservice/users/heh/pretrained_models/huggingface/Qwen/Qwen3-1.7B
   pretrained_asr: /lustre/fsw/portfolios/llmservice/users/heh/pretrained_models/huggingface/nvidia/nemotron-speech-streaming-en-0.6b/nemotron-speech-streaming-en-0.6b.nemo
   load_llm_weights: true

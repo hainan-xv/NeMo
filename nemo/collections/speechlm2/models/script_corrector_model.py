@@ -55,7 +55,13 @@ from nemo.collections.speechlm2.parts.script_corrector import (
 )
 from nemo.utils import logging
 
-__all__ = ["ScriptCorrectorModel"]
+__all__ = ["ScriptCorrectorModel", "DEFAULT_CORRECTOR_PROMPT"]
+
+DEFAULT_CORRECTOR_PROMPT = (
+    "You are verifying a streaming speech recognizer. Given the transcript so far, the "
+    "representation of the next audio chunk, and the recognizer's hypothesis for that chunk, "
+    "reply with the accept token if the hypothesis is correct, otherwise output the corrected words."
+)
 
 
 class ScriptCorrectorModel(ScriptSTTModel):
@@ -65,6 +71,15 @@ class ScriptCorrectorModel(ScriptSTTModel):
         super().__init__(cfg, **kw)
         self.ids = CorrectorIds()
         self.ids.validate(vocab_size=int(self.text_pad_id) + 10**6)
+
+        # The corrector's instruction is DELIBERATELY not SCRIPT's. It describes a
+        # different task -- judge a hypothesis, do not produce one -- and the
+        # warm-started weights have to be told that. Read from the model config
+        # rather than core_cfg: system_prompt is a DATASET field there, which is
+        # what the first smoke run tripped over.
+        self.system_prompt = (
+            cfg.get("system_prompt") or getattr(self.core_cfg, "val_system_prompt", None) or DEFAULT_CORRECTOR_PROMPT
+        )
 
         path = chat_nemo or cfg.get("chat_nemo", "")
         if not path:
@@ -173,7 +188,7 @@ class ScriptCorrectorModel(ScriptSTTModel):
 
         hyp_i = self._chat_hypotheses(enc, enc_len, ref_i, n_chunks)
 
-        instr = self.tokenizer.text_to_ids(self.core_cfg.system_prompt + "\n")
+        instr = self.tokenizer.text_to_ids(self.system_prompt + "\n")
         examples, frame_src = [], []
         for b in range(len(n_chunks)):
             hyp_w = [self.tokenizer.ids_to_text(t).split() if t else [] for t in hyp_i[b]]
