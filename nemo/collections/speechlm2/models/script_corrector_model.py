@@ -88,11 +88,21 @@ _METRIC_KEYS = (
 # applies there -- every rank logs every key, every epoch.
 _VAL_METRIC_KEYS = (
     "val_chat_wer_tf",
-    "val_corrected_wer",
+    # ORACLE: a rejected chunk is handed the REFERENCE span. Since those spans
+    # partition the reference, this can only move towards it -- so
+    # val_oracle_wer <= val_chat_wer_tf and val_oracle_gain <= 0 are identities.
+    # Useful as a ceiling and as a recall proxy; NEVER as evidence the corrector
+    # improves WER. It read 0.049 while real decoding lost 0.18 WER on AMI.
+    "val_oracle_wer",
+    "val_oracle_gain",
+    # REAL: the model writes the correction and conditions on what it EMITTED.
+    # This is the only one that can go the wrong way, and it is what the
+    # checkpoint monitor selects on.
+    "val_gen_wer",
+    "val_gen_delta",
     # corrected MINUS chat, so NEGATIVE is the corrector winning. Logged as its
     # own series because the effect is a couple of WER points on top of numbers
     # around 0.05 -- a size that two overlaid curves hide and a difference shows.
-    "val_wer_delta",
     "val_reject_precision",
     "val_reject_recall",
     "val_pred_accept_frac",
@@ -440,14 +450,43 @@ class ScriptCorrectorModel(ScriptSTTModel):
         v["chat_e"] += st["chat_e"]
         v["chat_n"] += st["chat_n"]
         try:
-            e, n = self._corrected_wer(st["carry"], return_counts=True)
+            e, n = self._corrected_wer(st["carry"], return_counts=True, mode="oracle")
             v["corr_e"] += e
             v["corr_n"] += n
         except Exception as exc:
-            logging.warning("val corrected_wer failed: %s", exc)
+            logging.warning("val oracle_wer failed: %s", exc)
+
+        # The REAL metric, on a capped number of utterances: it generates, so it
+        # costs autoregressive decoding per rejected chunk. Capped rather than
+        # skipped, because a ceiling nobody can fail is what let a regression run
+        # unnoticed. Corpus WER over a fixed subset is still a corpus WER.
+        cap = int(getattr(self.core_cfg, "val_gen_max_utts", 0) or 200)
+        if v["gen_utts"] < cap:
+            try:
+                e, n = self._corrected_wer(
+                    st["carry"],
+                    return_counts=True,
+                    mode="generate",
+                    max_new_tokens=int(getattr(self.core_cfg, "val_gen_max_tokens", 0) or 24),
+                )
+                v["gen_e"] += e
+                v["gen_n"] += n
+                v["gen_utts"] += len(st["carry"]["n_chunks"])
+            except Exception as exc:
+                logging.warning("val gen_wer failed: %s", exc)
 
     def on_validation_epoch_start(self):
-        self._val = {"pred": [], "label": [], "chat_e": 0, "chat_n": 0, "corr_e": 0, "corr_n": 0}
+        self._val = {
+            "pred": [],
+            "label": [],
+            "chat_e": 0,
+            "chat_n": 0,
+            "corr_e": 0,
+            "corr_n": 0,
+            "gen_e": 0,
+            "gen_n": 0,
+            "gen_utts": 0,
+        }
 
     def on_validation_epoch_end(self):
         v = getattr(self, "_val", None) or {
@@ -457,16 +496,26 @@ class ScriptCorrectorModel(ScriptSTTModel):
             "chat_n": 0,
             "corr_e": 0,
             "corr_n": 0,
+            "gen_e": 0,
+            "gen_n": 0,
+            "gen_utts": 0,
         }
         stats = decision_stats(v["pred"], v["label"]) if v["pred"] else {}
         vals = {
             "val_chat_wer_tf": (v["chat_e"] / v["chat_n"]) if v["chat_n"] else 0.0,
-            "val_corrected_wer": (v["corr_e"] / v["corr_n"]) if v["corr_n"] else 0.0,
+            "val_oracle_wer": (v["corr_e"] / v["corr_n"]) if v["corr_n"] else 0.0,
+            "val_gen_wer": (v["gen_e"] / v["gen_n"]) if v["gen_n"] else 0.0,
             # Differenced from the ACCUMULATED counts, not averaged over batches:
             # corpus WER is total edits over total reference words, so a mean of
             # per-batch deltas would weight a short utterance like a long one.
-            "val_wer_delta": (
+            "val_oracle_gain": (
                 ((v["corr_e"] / v["corr_n"]) if v["corr_n"] else 0.0)
+                - ((v["chat_e"] / v["chat_n"]) if v["chat_n"] else 0.0)
+            ),
+            # THE number that decides whether this method works. Positive means
+            # the corrector is making the transcript worse.
+            "val_gen_delta": (
+                ((v["gen_e"] / v["gen_n"]) if v["gen_n"] else 0.0)
                 - ((v["chat_e"] / v["chat_n"]) if v["chat_n"] else 0.0)
             ),
             **{f"val_{k}": float(x) for k, x in stats.items()},
@@ -476,7 +525,7 @@ class ScriptCorrectorModel(ScriptSTTModel):
             self.log(
                 k,
                 float(vals.get(k, 0.0)),
-                prog_bar=k in ("val_corrected_wer", "val_chat_wer_tf"),
+                prog_bar=k in ("val_gen_wer", "val_gen_delta", "val_chat_wer_tf"),
                 sync_dist=True,
             )
         self._val = None
@@ -578,7 +627,23 @@ class ScriptCorrectorModel(ScriptSTTModel):
         return gens
 
     @torch.no_grad()
-    def _corrected_wer(self, st, return_counts: bool = False):
+    def _generate_correction(self, prompt_emb, first_logits, max_new_tokens: int, dev):
+        """Greedily write one chunk's replacement text. Capped, so an undertrained
+        model cannot run to the context limit inside a validation loop."""
+        nxt = int(first_logits.argmax())
+        if nxt == self.ids.eot:
+            return []
+        toks = [nxt]
+        cur = torch.cat([prompt_emb, self._embed_tokens(torch.tensor([[nxt]], device=dev))], dim=1)
+        for _ in range(max(1, max_new_tokens) - 1):
+            nxt = int(self.llm(inputs_embeds=cur).logits[0, -1].argmax())
+            if nxt == self.ids.eot:
+                break
+            toks.append(nxt)
+            cur = torch.cat([cur, self._embed_tokens(torch.tensor([[nxt]], device=dev))], dim=1)
+        return toks
+
+    def _corrected_wer(self, st, return_counts: bool = False, mode: str = "oracle", max_new_tokens: int = 24):
         """WER after applying the corrector's own accept/reject decisions.
 
         Accept keeps CHAT's chunk; reject substitutes the reference. That makes
@@ -588,6 +653,14 @@ class ScriptCorrectorModel(ScriptSTTModel):
         A/B on identical audio -- any gap is the decision doing work. Generating
         the corrections instead would fold two skills into one number and make a
         regression impossible to attribute.
+
+        ``mode="oracle"`` substitutes the REFERENCE span for a rejected chunk;
+        ``mode="generate"`` substitutes what the model actually writes. Because
+        the spans partition the reference exactly, the oracle output is CHAT's
+        hypothesis with some chunks replaced by ground truth -- so it can only
+        move TOWARDS the reference, and oracle_wer <= chat_wer_tf is an identity,
+        not a result. Only the generate mode can report a regression, and it did:
+        on AMI the oracle read 0.049 while real decoding LOST 0.18 WER.
 
         READ IT WITH pred_accept_frac. Being an oracle, this metric is MINIMISED
         by rejecting everything: a model that rejects every chunk is handed the
@@ -626,10 +699,20 @@ class ScriptCorrectorModel(ScriptSTTModel):
                     emb[0, pos] = self.perception.proj(enc_b[frm].to(emb.dtype))
 
                 logits = self.llm(inputs_embeds=emb).logits[0, -1]
+                accepted = int(logits.argmax()) == self.ids.accept
                 tgt = st["tgt_i"][b][k]
-                toks = hyp if int(logits.argmax()) == self.ids.accept else tgt
-                out_ids += list(toks)
-                history = history + list(tgt)
+                if accepted:
+                    chunk = list(hyp)
+                elif mode == "oracle":
+                    chunk = list(tgt)
+                else:
+                    chunk = self._generate_correction(emb, logits, max_new_tokens, dev)
+                out_ids += chunk
+                # ORACLE conditions on the reference, matching how the model was
+                # trained. GENERATE conditions on what was actually emitted,
+                # which is all inference can ever see -- and is where an early
+                # error starts poisoning later chunks.
+                history = history + (list(tgt) if mode == "oracle" else chunk)
             # One detokenization of the whole output, for the same reason as above:
             # per-chunk detokenization splits words that straddle a boundary.
             out_words = self.tokenizer.ids_to_text(out_ids).split() if out_ids else []
@@ -683,7 +766,7 @@ class ScriptCorrectorModel(ScriptSTTModel):
                     ok = True
                 except Exception as e:  # a metric must never kill a training run
                     logging.warning("corrected_wer failed at step %s: %s", self.global_step, e)
-            self.log("train_corrected_wer", float(w), prog_bar=True, sync_dist=True)
+            self.log("train_oracle_wer", float(w), prog_bar=True, sync_dist=True)
             # Both logs sit INSIDE the rank-uniform branch and are unconditional
             # within it -- a rank that skipped either one would desync the
             # sync_dist collective, which is how an earlier version hung.
@@ -691,6 +774,6 @@ class ScriptCorrectorModel(ScriptSTTModel):
             # failed computation would otherwise post a large spurious GAIN.
             chat = getattr(self, "_last_chat_wer", None)
             delta = (w - chat) if (ok and chat is not None) else 0.0
-            self.log("train_wer_delta", float(delta), prog_bar=True, sync_dist=True)
+            self.log("train_oracle_gain", float(delta), prog_bar=True, sync_dist=True)
         self._last = None
         self._last_chat_wer = None

@@ -330,12 +330,15 @@ exp_manager:
     # template naming val_wer produced five checkpoints all called
     # "val_wer=0.0000" -- indistinguishable, and unsortable by the top-K
     # averaging step that parses the WER back out of the filename.
-    filename: "{step}-{val_corrected_wer:.4f}"
-    # The corrector never logs val_wer -- it logs val_corrected_wer, the WER
-    # AFTER its decisions. Monitoring the inherited key raises
-    # MisconfigurationException at the first checkpoint, after validation has
-    # already run and the metric it wanted was sitting right there.
-    monitor: val_corrected_wer
+    filename: "{step}-{val_gen_wer:.4f}"
+    # val_gen_wer, NOT the oracle. A rejected chunk in the oracle metric is
+    # handed the REFERENCE span, and those spans partition the reference, so the
+    # oracle can only move towards it -- oracle <= chat is an identity and
+    # selecting on it would rank every checkpoint by a number that cannot express
+    # failure. It read 0.049 while real decoding LOST 0.18 WER on AMI.
+    # val_gen_wer makes the model write the correction and condition on what it
+    # emitted, which is what inference does.
+    monitor: val_gen_wer
     mode: min
     every_n_train_steps: null
     every_n_epochs: 1
