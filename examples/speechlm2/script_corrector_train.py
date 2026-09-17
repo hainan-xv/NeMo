@@ -80,6 +80,17 @@ def train(cfg):
         with open_dict(vc):
             vc.use_lhotse = True
             vc.shuffle = False
+            # SCRIPT's validation_ds is NESTED -- validation_ds.datasets.<name>.
+            # manifest_filepath -- because that model validates on several named
+            # sets. The lhotse loader wants a FLAT manifest_filepath and fails
+            # with "You must specify either: manifest_filepath, cuts_path, or
+            # shar_path", which the try/except below then turns into a silent
+            # training-only run. Flatten to the first entry.
+            if "datasets" in vc and vc.get("manifest_filepath") is None:
+                first = next(iter(vc.datasets.values()))
+                vc.manifest_filepath = first.manifest_filepath
+                logging.info("validation: flattened datasets -> %s", vc.manifest_filepath)
+                del vc["datasets"]
         try:
             val_loader = get_lhotse_dataloader_from_config(
                 vc,
@@ -89,7 +100,12 @@ def train(cfg):
                 tokenizer=model.tokenizer,
             )
         except Exception as e:
-            logging.warning("no validation loader (%s); training without val_* metrics", e)
+            # Loud, and on stdout: the previous run degraded to training-only with
+            # this warning buried in stderr, so val_* was simply absent from wandb
+            # with no visible reason.
+            msg = f"NO VALIDATION LOADER ({e}); training WITHOUT val_* metrics"
+            print("=" * 78 + f"\n!! {msg}\n" + "=" * 78, flush=True)
+            logging.warning(msg)
 
     trainer.fit(model, train_dataloaders=loader, val_dataloaders=val_loader)
 
