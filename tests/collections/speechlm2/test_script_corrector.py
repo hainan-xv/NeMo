@@ -336,3 +336,41 @@ def test_sample_survives_fewer_hypothesis_chunks_than_labels():
     and the dump must still render rather than crash the training run."""
     out = format_sample(["a", "b"], ["a"], [None, "b"])
     assert "chunk 1: <incorrect>" in out
+
+
+# --------------------------------------------------------------------------
+# Rank-uniform logging. A metric that some ranks skip hangs the whole job.
+# --------------------------------------------------------------------------
+
+
+def test_every_decision_stat_is_in_the_fixed_metric_key_list():
+    """decision_stats returns {} for an empty batch, and self.log(sync_dist=True)
+    is a collective -- so a metric logged on some ranks and not others desyncs
+    the group and the job dies ten minutes later in an ALLREDUCE watchdog
+    timeout, with healthy step timings and no traceback. That killed
+    dfw_corrector_v1 at step ~6654.
+
+    Reading _METRIC_KEYS from source keeps this test free of a GPU/torch import
+    chain while still failing if someone adds a stat and forgets the key.
+    """
+    import pathlib
+    import re
+
+    src = pathlib.Path(__file__).parents[3] / "nemo/collections/speechlm2/models/script_corrector_model.py"
+    text = src.read_text()
+    block = re.search(r"_METRIC_KEYS = \((.*?)\)", text, re.S).group(1)
+    keys = set(re.findall(r'"([^"]+)"', block))
+
+    produced = {f"train_{k}" for k in decision_stats([True, False], [True, True])}
+    missing = produced - keys
+    assert not missing, f"decision_stats emits {missing}, absent from _METRIC_KEYS"
+
+
+def test_metric_keys_are_unique():
+    import pathlib
+    import re
+
+    src = pathlib.Path(__file__).parents[3] / "nemo/collections/speechlm2/models/script_corrector_model.py"
+    block = re.search(r"_METRIC_KEYS = \((.*?)\)", src.read_text(), re.S).group(1)
+    keys = re.findall(r'"([^"]+)"', block)
+    assert len(keys) == len(set(keys)), "a duplicated key logs twice on every rank"

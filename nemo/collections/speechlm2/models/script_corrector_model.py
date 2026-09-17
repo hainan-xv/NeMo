@@ -61,6 +61,26 @@ from nemo.utils import logging
 
 __all__ = ["ScriptCorrectorModel", "DEFAULT_CORRECTOR_PROMPT"]
 
+# EVERY rank must log EXACTLY these keys, in this order, on EVERY step.
+#
+# self.log(..., sync_dist=True) is a collective. A rank that skips one -- because
+# its batch had no examples, or a metric was undefined, or a try/except swallowed
+# it -- issues fewer collectives than its peers, and the group desyncs. That is
+# not a slow-training symptom and it does not look like a logging bug: it
+# surfaces ten minutes later as
+#   WorkNCCL(SeqNum=..., OpType=ALLREDUCE, NumelIn=1, NumelOut=1) ran for 600013ms
+# and kills the job. It killed dfw_corrector_v1 at step ~6654 while the step
+# timing was a healthy 0.3-0.8 s.
+_METRIC_KEYS = (
+    "train_loss",
+    "chunks_per_batch",
+    "train_pred_accept_frac",
+    "train_label_accept_frac",
+    "train_reject_precision",
+    "train_reject_recall",
+    "train_chat_wer_tf",
+)
+
 DEFAULT_CORRECTOR_PROMPT = (
     "You are verifying a streaming speech recognizer. Given the transcript so far, the "
     "representation of the next audio chunk, and the recognizer's hypothesis for that chunk, "
@@ -215,6 +235,9 @@ class ScriptCorrectorModel(ScriptSTTModel):
                 examples.append(e)
                 frame_src.append((b, k * cs))
         if not examples:
+            # Still log the full set: a rank that stays silent here desyncs the
+            # logging collectives and hangs every other rank.
+            self._log_all({})
             return enc.sum() * 0.0
 
             if b == 0:
@@ -278,12 +301,14 @@ class ScriptCorrectorModel(ScriptSTTModel):
                 e_tot += e
                 n_tot += n
 
-        self.log("train_loss", loss, prog_bar=True, sync_dist=True)
-        self.log("chunks_per_batch", float(len(examples)), sync_dist=True)
-        for k, v in st.items():
-            self.log(f"train_{k}", float(v), prog_bar=(k == "reject_recall"), sync_dist=True)
-        if n_tot:
-            self.log("train_chat_wer_tf", e_tot / n_tot, prog_bar=True, sync_dist=True)
+        self._log_all(
+            {
+                "train_loss": loss,
+                "chunks_per_batch": float(len(examples)),
+                **{f"train_{k}": float(v) for k, v in st.items()},
+                "train_chat_wer_tf": (e_tot / n_tot) if n_tot else 0.0,
+            }
+        )
 
         # Handed to on_train_batch_end, which computes corrected_wer. Generating
         # inside training_step corrupts activation checkpointing -- that killed
@@ -337,14 +362,33 @@ class ScriptCorrectorModel(ScriptSTTModel):
             n_tot += n
         return (e_tot / n_tot) if n_tot else None
 
+    def _log_all(self, values: dict) -> None:
+        """Log the whole metric set, filling anything absent with 0.0.
+
+        Fixed key set, fixed order, every rank, every step -- see _METRIC_KEYS.
+        """
+        for k in _METRIC_KEYS:
+            v = values.get(k, 0.0)
+            self.log(
+                k,
+                v if torch.is_tensor(v) else float(v),
+                prog_bar=k in ("train_loss", "train_reject_recall", "train_chat_wer_tf"),
+                sync_dist=True,
+            )
+
     def on_train_batch_end(self, outputs, batch, batch_idx):
+        # global_step is identical across ranks, so the BRANCH is taken by all of
+        # them or none -- which is what makes this collective safe. Inside it the
+        # log is unconditional: a rank whose computation failed must still log, or
+        # it desyncs exactly like the training_step case.
         every = int(getattr(self.core_cfg, "corrected_wer_every_n_steps", 0) or 200)
-        last = getattr(self, "_last", None)
-        if every and self.global_step and self.global_step % every == 0 and last:
-            try:
-                w = self._corrected_wer(last)
-                if w is not None:
-                    self.log("train_corrected_wer", w, prog_bar=True, sync_dist=True)
-            except Exception as e:  # a metric must never kill a training run
-                logging.warning("corrected_wer failed at step %s: %s", self.global_step, e)
+        if every and self.global_step and self.global_step % every == 0:
+            w = 0.0
+            last = getattr(self, "_last", None)
+            if last:
+                try:
+                    w = self._corrected_wer(last) or 0.0
+                except Exception as e:  # a metric must never kill a training run
+                    logging.warning("corrected_wer failed at step %s: %s", self.global_step, e)
+            self.log("train_corrected_wer", float(w), prog_bar=True, sync_dist=True)
         self._last = None
