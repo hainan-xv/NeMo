@@ -97,8 +97,17 @@ def main() -> int:
         # the utterance count is exactly batches * batch_size.
         if "use_bucketing" in cfg:
             cfg.use_bucketing = False
-    model.setup_training_data(cfg) if args.source == "train" else model.setup_validation_data(cfg)
-    loader = model._train_dl if args.source == "train" else model._validation_dl
+    # Build the loader through _setup_dataloader_from_config directly with
+    # _want_cuts forced on. setup_training_data enables cuts only for the
+    # forced/banded losses and setup_validation_data never does -- but this probe
+    # needs the cuts on BOTH sources, because the reference word TIMINGS are what
+    # the reference chunk partition is derived from. Without them the held-out
+    # half of the comparison cannot be computed at all.
+    model._want_cuts = True
+    try:
+        loader = model._setup_dataloader_from_config(cfg)
+    finally:
+        model._want_cuts = False
 
     n_utt = n_exact = n_chunk = n_bad = 0
     dump = open(args.dump, "w") if args.dump else None
@@ -108,7 +117,14 @@ def main() -> int:
             if bi >= args.batches:
                 break
             sig, sig_len = batch[0].to(dev), batch[1].to(dev)
-            cuts = batch[-1] if hasattr(batch[-1], "__iter__") else None
+            # LhotseSpeechToTextBpeDataset(return_cuts=True) appends cuts as a
+            # 5th element. Length is the reliable test: a Tensor is iterable, so
+            # checking __iter__ on batch[-1] silently accepted token_lens.
+            cuts = batch[4] if len(batch) >= 5 else None
+            if cuts is None:
+                raise RuntimeError(
+                    "batch carries no cuts; the probe needs word timings to derive " "the reference chunk partition"
+                )
 
             proc, proc_len = model.preprocessor(input_signal=sig, length=sig_len)
             enc, enc_len = model.encoder(audio_signal=proc, length=proc_len)
