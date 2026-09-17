@@ -309,3 +309,30 @@ def test_a_word_straddling_a_chunk_boundary_is_not_two_errors():
         INSTR, [["hello"], ["world"]], [[41], [42]], [[7], [8]], ["hello", "world"], [14, 14]
     )
     assert [e.is_accept for e in ex] == [True, True]
+
+
+# --------------------------------------------------------------------------
+# Sample printing.
+# --------------------------------------------------------------------------
+
+from nemo.collections.speechlm2.parts.script_corrector import format_sample  # noqa: E402
+
+
+def test_sample_shows_chunk_boundaries_on_both_sides():
+    out = format_sample(["the cat", "sat down"], ["the", "cat sat down"], [None, None], step=10)
+    assert "ref : the cat | sat down" in out
+    assert "hyp : the | cat sat down" in out, "hypothesis boundaries must be visible"
+    assert "step 10" in out
+
+
+def test_sample_marks_correct_and_incorrect_chunks():
+    out = format_sample(["a b", "c d"], ["a X", "c d"], ["a b", None])
+    assert "<incorrect>" in out and "-> 'a b'" in out
+    assert "<correct>" in out
+
+
+def test_sample_survives_fewer_hypothesis_chunks_than_labels():
+    """A hypothesis can end early -- that is how a trailing deletion presents --
+    and the dump must still render rather than crash the training run."""
+    out = format_sample(["a", "b"], ["a"], [None, "b"])
+    assert "chunk 1: <incorrect>" in out

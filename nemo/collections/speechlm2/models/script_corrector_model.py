@@ -54,6 +54,7 @@ from nemo.collections.speechlm2.parts.script_corrector import (
     collate_corrector_examples,
     corrector_examples_for_utterance,
     decision_stats,
+    format_sample,
     word_errors,
 )
 from nemo.utils import logging
@@ -197,6 +198,9 @@ class ScriptCorrectorModel(ScriptSTTModel):
             # ONE detokenization of the whole hypothesis, not per chunk.
             hyp_w = self.tokenizer.ids_to_text([t for c in hyp_i[b] for t in c]).split()
             lens = [min(cs, max(0, int(enc_len[b]) - k * cs)) for k in range(n_chunks[b])]
+            from nemo.collections.asr.parts.utils.chunk_error_labels import label_chunks
+
+            chunk_labels, _ = label_chunks(hyp_w, ref_w[b], normalize=simple_normalize)
             exs = corrector_examples_for_utterance(
                 instr,
                 ref_w[b],
@@ -212,6 +216,24 @@ class ScriptCorrectorModel(ScriptSTTModel):
                 frame_src.append((b, k * cs))
         if not examples:
             return enc.sum() * 0.0
+
+            if b == 0:
+                sample = (
+                    [" ".join(c) for c in ref_w[b]],
+                    [self.tokenizer.ids_to_text(t) if t else "" for t in hyp_i[b]],
+                    chunk_labels,
+                )
+
+        # Periodic dump of one real example. Metrics say WHETHER the labels look
+        # right in aggregate; this says WHAT they are -- and in particular shows
+        # the hypothesis's own chunk boundaries, which no metric exposes and
+        # which are the difference between a real error and a timing shift.
+        every = int(getattr(self.core_cfg, "sample_print_every_n_steps", 0) or 100)
+        if every and self.global_step % every == 0 and self.trainer.global_rank == 0:
+            try:
+                logging.info("\n" + format_sample(*sample, step=self.global_step))
+            except Exception as e:
+                logging.warning("sample print failed: %s", e)
 
         cb = collate_corrector_examples(examples, self.text_pad_id, ids=self.ids)
         dev = enc.device

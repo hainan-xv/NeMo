@@ -52,6 +52,7 @@ __all__ = [
     "collate_corrector_examples",
     "decision_stats",
     "word_errors",
+    "format_sample",
 ]
 
 
@@ -299,3 +300,28 @@ def word_errors(hyp_words: Sequence[str], ref_words: Sequence[str]) -> tuple:
     ops = align_words(list(hyp_words), list(ref_words))
     edits = sum(1 for op, _, _ in ops if op != "equal")
     return edits, len(ref_words)
+
+
+def format_sample(ref_chunks: Sequence[str], hyp_chunks: Sequence[str], labels: Sequence, step=None) -> str:
+    """Human-readable dump of one utterance's training example.
+
+    Prints the hypothesis WITH ITS CHUNK BOUNDARIES, which is the thing no metric
+    shows: the labeller deliberately ignores where the ASR broke its output, so a
+    boundary that looks alarming next to the reference may be entirely correct.
+    Seeing both side by side is the only way to tell a real error from a timing
+    difference, and mistaking one for the other is the failure this whole
+    labelling rule exists to avoid.
+    """
+    head = f"=== corrector sample{'' if step is None else f' @ step {step}'} ==="
+    lines = [
+        head,
+        "  ref : " + " | ".join(ref_chunks),
+        "  hyp : " + " | ".join(hyp_chunks),
+    ]
+    for t, lab in enumerate(labels):
+        h = hyp_chunks[t] if t < len(hyp_chunks) else ""
+        if lab is None:
+            lines.append(f"    chunk {t}: <correct>   {h!r}")
+        else:
+            lines.append(f"    chunk {t}: <incorrect> {h!r} -> {lab!r}")
+    return "\n".join(lines)
