@@ -47,8 +47,8 @@ from typing import List, Optional
 import torch
 from omegaconf import open_dict
 
-from nemo.collections.speechlm2.models.script_model import ScriptSTTModel
 from nemo.collections.asr.parts.utils.chunk_error_labels import simple_normalize
+from nemo.collections.speechlm2.models.script_model import ScriptSTTModel
 from nemo.collections.speechlm2.parts.script_corrector import (
     CorrectorIds,
     collate_corrector_examples,
@@ -89,6 +89,10 @@ _METRIC_KEYS = (
 _VAL_METRIC_KEYS = (
     "val_chat_wer_tf",
     "val_corrected_wer",
+    # corrected MINUS chat, so NEGATIVE is the corrector winning. Logged as its
+    # own series because the effect is a couple of WER points on top of numbers
+    # around 0.05 -- a size that two overlaid curves hide and a difference shows.
+    "val_wer_delta",
     "val_reject_precision",
     "val_reject_recall",
     "val_pred_accept_frac",
@@ -412,6 +416,13 @@ class ScriptCorrectorModel(ScriptSTTModel):
         vals = {
             "val_chat_wer_tf": (v["chat_e"] / v["chat_n"]) if v["chat_n"] else 0.0,
             "val_corrected_wer": (v["corr_e"] / v["corr_n"]) if v["corr_n"] else 0.0,
+            # Differenced from the ACCUMULATED counts, not averaged over batches:
+            # corpus WER is total edits over total reference words, so a mean of
+            # per-batch deltas would weight a short utterance like a long one.
+            "val_wer_delta": (
+                ((v["corr_e"] / v["corr_n"]) if v["corr_n"] else 0.0)
+                - ((v["chat_e"] / v["chat_n"]) if v["chat_n"] else 0.0)
+            ),
             **{f"val_{k}": float(x) for k, x in stats.items()},
         }
         # Fixed key set, every rank, every epoch -- same rule as _METRIC_KEYS.
@@ -463,6 +474,12 @@ class ScriptCorrectorModel(ScriptSTTModel):
                 logging.warning("sample print failed: %s", e)
 
         self._last = st["carry"]
+        # Stashed WITH _last, because the delta is only meaningful when both
+        # halves come from the same batch: train_corrected_wer is recomputed
+        # every corrected_wer_every_n_steps, while train_chat_wer_tf is logged
+        # every step, so differencing the two live panels would subtract numbers
+        # measured up to 200 steps apart.
+        self._last_chat_wer = (st["chat_e"] / st["chat_n"]) if st["chat_n"] else None
         return loss
 
     @torch.no_grad()
@@ -534,11 +551,22 @@ class ScriptCorrectorModel(ScriptSTTModel):
         every = int(getattr(self.core_cfg, "corrected_wer_every_n_steps", 0) or 200)
         if every and self.global_step and self.global_step % every == 0:
             w = 0.0
+            ok = False
             last = getattr(self, "_last", None)
             if last:
                 try:
                     w = self._corrected_wer(last) or 0.0
+                    ok = True
                 except Exception as e:  # a metric must never kill a training run
                     logging.warning("corrected_wer failed at step %s: %s", self.global_step, e)
             self.log("train_corrected_wer", float(w), prog_bar=True, sync_dist=True)
+            # Both logs sit INSIDE the rank-uniform branch and are unconditional
+            # within it -- a rank that skipped either one would desync the
+            # sync_dist collective, which is how an earlier version hung.
+            # 0.0 on failure rather than w - chat: with w defaulted to 0.0 a
+            # failed computation would otherwise post a large spurious GAIN.
+            chat = getattr(self, "_last_chat_wer", None)
+            delta = (w - chat) if (ok and chat is not None) else 0.0
+            self.log("train_wer_delta", float(delta), prog_bar=True, sync_dist=True)
         self._last = None
+        self._last_chat_wer = None
