@@ -74,6 +74,16 @@ done
 PRETRAINED_LLM=${HEH}/pretrained_models/huggingface/Qwen/Qwen3-1.7B
 PRETRAINED_ASR=${HEH}/pretrained_models/huggingface/nvidia/nemotron-speech-streaming-en-0.6b/nemotron-speech-streaming-en-0.6b.nemo
 TRAIN_INPUT_CFG=${HEH}/data_configs/granary_v2_en_full_d0.5_b0.5_dfw_qwen_aligned.yaml
+# The config inherits SCRIPT's validation manifest, which is an OCI path
+# (llmservice/.../users/dongjig/...). On DFW that file does not exist and the
+# run dies at the FIRST validation epoch -- ~25 minutes in, after training
+# looked perfectly healthy. Every DFW training launcher overrides this; the
+# corrector's needs to as well.
+VAL_MANIFEST=${HEH}/data/mcv11_en_dev_aligned/mcv11_dev_clean_pcstrip_en_2k_qwen_aligned.json
+if [[ ! -s "$VAL_MANIFEST" ]]; then
+    echo "ERROR: validation manifest not found: ${VAL_MANIFEST}" >&2
+    exit 1
+fi
 
 RESULTS_DIR=${MYDIR}/results/${PROJECT_NAME}/${EXP_NAME}
 HFCACHE=${MYDIR}/hf_cache
@@ -108,6 +118,7 @@ echo "*** CORRECTOR SMOKE: verifying ${CHAT_ARM}, warm start ${SCRIPT_ARM} ***" 
     model.optimizer.lr=5e-5 \
     data.train_ds.input_cfg=${TRAIN_INPUT_CFG} \
     data.train_ds.num_workers=4 \
+    data.validation_ds.datasets.mcv_11_dev.manifest_filepath=${VAL_MANIFEST} \
     ++trainer.limit_train_batches=2000 \
     ++trainer.val_check_interval=2000 \
     ++exp_manager.max_time_per_run=00:03:50:00 \
