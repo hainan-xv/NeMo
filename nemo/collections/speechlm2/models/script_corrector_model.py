@@ -169,20 +169,28 @@ class ScriptCorrectorModel(ScriptSTTModel):
     # ------------------------------------------------------------- data prep
     @torch.no_grad()
     def _reference_chunks(self, cut, n_chunks: int):
-        """Reference words and token ids per chunk, on the model's own grid."""
-        from nemo.collections.asr.parts.utils.chat_alignment import assign_words_to_chunks
+        """Reference token ids and words per chunk, via CHAT'S OWN partitioning.
 
-        aligned = (cut.custom or {}).get("alignments", []) or []
-        words = [w["text"] for w in aligned]
-        groups = assign_words_to_chunks(
-            [w["end_time"] for w in aligned],
-            n_chunks,
-            self.chat.joint.chunk_size,
-            self.chat.frame_length_in_secs,
-            self.chat.num_delay_frames,
-        )
-        w_chunks = [[words[i] for i in g] for g in groups]
-        id_chunks = [self.tokenizer.text_to_ids(" ".join(c)) if c else [] for c in w_chunks]
+        Delegates to ``chat._chunk_tokens`` rather than re-deriving this. Two
+        differences made the hand-rolled version wrong, and both inflated the
+        measured WER roughly fivefold (0.40-0.49 against CHAT's true ~0.08):
+
+          * it used the ALIGNER'S word forms, which have punctuation stripped,
+            while CHAT is trained on the original transcript. Every punctuated
+            sentence then scored as errors. _chunk_tokens' own docstring warns
+            about exactly this.
+          * it tokenized each chunk's text INDEPENDENTLY. Partitioning the full
+            utterance's tokenization is not the same thing -- in Qwen BPE
+            " hello" and "hello" are different tokens -- so every chunk after the
+            first began with the wrong id, and that wrong prefix was then fed to
+            CHAT's prediction network as its history.
+
+        Using the model's own method makes the reference the corrector trains
+        against identical to the one CHAT was trained against, by construction.
+        Words are derived FROM the ids so the two can never disagree.
+        """
+        id_chunks = self.chat._chunk_tokens(cut, n_chunks)
+        w_chunks = [self.tokenizer.ids_to_text(c).split() if c else [] for c in id_chunks]
         return w_chunks, id_chunks
 
     @torch.no_grad()
