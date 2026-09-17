@@ -48,6 +48,8 @@ __all__ = [
     "CorrectorExample",
     "build_corrector_example",
     "corrector_examples_for_utterance",
+    "CorrectorBatch",
+    "collate_corrector_examples",
 ]
 
 
@@ -188,3 +190,63 @@ def corrector_examples_for_utterance(
         # Advance on the REFERENCE, matching the conditioning above.
         history = history + list(ref_chunk_ids[t])
     return out
+
+
+@dataclass
+class CorrectorBatch:
+    """Padded batch, plus where each example's audio frames must be spliced in.
+
+    ``audio_slots`` is ``[(row, position, frame_index)]``: the model replaces the
+    placeholder embedding at ``(row, position)`` with encoder frame
+    ``frame_index`` of that row's chunk. Carrying explicit positions rather than
+    recomputing them from the ids is deliberate -- a placeholder id is an
+    ORDINARY token id, so a search for it would also match real text that happens
+    to use that id, silently scattering audio into the transcript.
+    """
+
+    input_ids: "List[List[int]]"
+    labels: "List[List[int]]"
+    attention_mask: "List[List[int]]"
+    audio_slots: "List[tuple]"
+    is_accept: "List[bool]"
+
+
+def collate_corrector_examples(
+    examples: Sequence[CorrectorExample],
+    pad_id: int,
+    ids: CorrectorIds = CorrectorIds(),
+    ignore_index: int = -100,
+) -> CorrectorBatch:
+    """Right-pad to the longest example.
+
+    Padding is MASKED IN THE LABELS as well as the attention mask. Both matter
+    and for different reasons: the attention mask keeps pad out of the context,
+    while the label mask keeps it out of the loss. Getting only the first right
+    still trains the model to emit pad, which looks like a mysteriously high
+    ACCEPT rate because pad and ACCEPT are both "short output".
+    """
+    if not examples:
+        raise ValueError("no examples to collate")
+    width = max(len(e.input_ids) for e in examples)
+
+    input_ids, labels, attn, slots = [], [], [], []
+    for r, e in enumerate(examples):
+        pad = width - len(e.input_ids)
+        input_ids.append(list(e.input_ids) + [pad_id] * pad)
+        labels.append(list(e.labels) + [ignore_index] * pad)
+        attn.append([1] * len(e.input_ids) + [0] * pad)
+
+        # Audio positions: between this example's vision_start and vision_end.
+        seq = e.input_ids
+        lo = seq.index(ids.vision_start)
+        hi = seq.index(ids.vision_end, lo + 1)
+        for k, pos in enumerate(range(lo + 1, hi)):
+            slots.append((r, pos, k))
+
+    return CorrectorBatch(
+        input_ids=input_ids,
+        labels=labels,
+        attention_mask=attn,
+        audio_slots=slots,
+        is_accept=[e.is_accept for e in examples],
+    )

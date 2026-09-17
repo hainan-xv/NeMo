@@ -174,3 +174,70 @@ def test_first_chunk_has_empty_history():
 def test_mismatched_per_chunk_input_lengths_are_rejected():
     with pytest.raises(ValueError, match="disagree on length"):
         corrector_examples_for_utterance(INSTR, [["a"]], [[41]], [[41], [42]], [["a"], ["b"]], [14])
+
+
+# --------------------------------------------------------------------------
+# Collation.
+# --------------------------------------------------------------------------
+
+from nemo.collections.speechlm2.parts.script_corrector import (  # noqa: E402
+    collate_corrector_examples,
+)
+
+PAD = 151643
+
+
+def test_padding_is_masked_in_labels_not_just_attention():
+    """Masking only the attention still trains the model to emit pad -- which
+    would surface as an inexplicably high ACCEPT rate, since pad and ACCEPT are
+    both 'short output'."""
+    short = build_corrector_example(INSTR, HIST, 2, [20], None)
+    long = build_corrector_example(INSTR, HIST, 9, [20, 21, 22], [30, 31, 32])
+    b = collate_corrector_examples([short, long], PAD)
+    w = len(b.input_ids[0])
+    assert len(b.input_ids[1]) == w
+    npad = w - len(short.input_ids)
+    assert b.attention_mask[0][-npad:] == [0] * npad
+    assert b.labels[0][-npad:] == [IGN] * npad
+
+
+def test_audio_slots_point_between_the_delimiters():
+    ex = build_corrector_example(INSTR, HIST, 3, HYP, None)
+    b = collate_corrector_examples([ex], PAD)
+    seq = b.input_ids[0]
+    lo, hi = seq.index(IDS.vision_start), seq.index(IDS.vision_end)
+    positions = [p for (_r, p, _k) in b.audio_slots]
+    assert positions == list(range(lo + 1, hi))
+    assert [k for (_r, _p, k) in b.audio_slots] == [0, 1, 2], "frame index must be 0-based per row"
+
+
+def test_audio_slots_are_per_row():
+    a = build_corrector_example(INSTR, HIST, 2, HYP, None)
+    c = build_corrector_example(INSTR, HIST, 3, HYP, None)
+    b = collate_corrector_examples([a, c], PAD)
+    rows = {}
+    for r, _p, k in b.audio_slots:
+        rows.setdefault(r, []).append(k)
+    assert rows[0] == [0, 1] and rows[1] == [0, 1, 2]
+
+
+def test_zero_length_audio_produces_no_slots():
+    ex = build_corrector_example(INSTR, HIST, 0, HYP, None)
+    b = collate_corrector_examples([ex], PAD)
+    assert b.audio_slots == []
+
+
+def test_empty_batch_is_rejected():
+    with pytest.raises(ValueError, match="no examples"):
+        collate_corrector_examples([], PAD)
+
+
+def test_accept_flags_survive_collation():
+    b = collate_corrector_examples(
+        [
+            build_corrector_example(INSTR, HIST, 2, HYP, None),
+            build_corrector_example(INSTR, HIST, 2, HYP, [30]),
+        ],
+        PAD,
+    )
+    assert b.is_accept == [True, False]
