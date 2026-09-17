@@ -316,6 +316,7 @@ class ScriptCorrectorModel(ScriptSTTModel):
         instr = self.tokenizer.text_to_ids(self.system_prompt + "\n")
 
         examples, frame_src, sample = [], [], None
+        sample_rows = 0
         tgt_i = []
         chat_e = chat_n = 0
         for b in range(len(n_chunks)):
@@ -351,6 +352,10 @@ class ScriptCorrectorModel(ScriptSTTModel):
                     [self.tokenizer.ids_to_text(t) if t else "" for t in hyp_i[b]],
                     chunk_labels,
                 )
+                # Examples are appended b-major, so utterance 0 owns rows
+                # [0, n_chunks[0]) -- which is what lets the dump pull this
+                # utterance's prompts back out of the collated batch.
+                sample_rows = int(n_chunks[b])
 
         if not examples:
             return None
@@ -381,9 +386,15 @@ class ScriptCorrectorModel(ScriptSTTModel):
             "cb": cb,
             "device": dev,
             "sample": sample,
+            "sample_rows": sample_rows,
             "chat_e": chat_e,
             "chat_n": chat_n,
             "carry": {
+                # The ENCODER OUTPUT, not just its length. _corrected_wer has to
+                # splice real audio into the placeholder slots exactly as the
+                # training path does; without it the decision is taken on a
+                # blanked prompt and the metric measures nothing.
+                "enc": enc,
                 "enc_len": enc_len,
                 "n_chunks": n_chunks,
                 "ref_w": ref_w,
@@ -504,8 +515,11 @@ class ScriptCorrectorModel(ScriptSTTModel):
         every = int(getattr(self.core_cfg, "sample_print_every_n_steps", 0) or 100)
         if every and self.global_step % every == 0 and self.trainer.global_rank == 0 and st["sample"]:
             try:
-                logging.info("\n" + format_sample(*st["sample"], step=self.global_step))
+                cap = int(getattr(self.core_cfg, "sample_correction_max_tokens", 0) or 24)
+                preds, gens = self._sample_predictions(st, st["sample_rows"], cap)
+                logging.info("\n" + format_sample(*st["sample"], step=self.global_step, preds=preds, gens=gens))
             except Exception as e:
+                # A diagnostic print must never take the run down with it.
                 logging.warning("sample print failed: %s", e)
 
         self._last = st["carry"]
@@ -516,6 +530,41 @@ class ScriptCorrectorModel(ScriptSTTModel):
         # measured up to 200 steps apart.
         self._last_chat_wer = (st["chat_e"] / st["chat_n"]) if st["chat_n"] else None
         return loss
+
+    @torch.no_grad()
+    def _sample_predictions(self, st, n: int, max_new_tokens: int):
+        """``(preds, gens)``: what the model SAYS, for the periodic dump.
+
+        Greedy, and capped: an undertrained corrector asked for free text will
+        happily run to the context limit, which would turn a diagnostic print
+        into the slowest thing in the training loop. The cap is a truncation, not
+        a failure -- a correction that hits it is shown with a trailing marker.
+
+        Rank 0 only, and deliberately CONTAINS NO LOGGING. Rank-conditional
+        compute is safe; a rank-conditional ``self.log(sync_dist=True)`` is a
+        collective and would desync the run, which has already happened once.
+        """
+        preds, gens = [], []
+        dev = st["device"]
+        for k in range(n):
+            ex = st["examples"][k]
+            cur = st["embeds"][k : k + 1, : ex.prompt_len]
+            toks = []
+            for _ in range(max(1, max_new_tokens)):
+                nxt = int(self.llm(inputs_embeds=cur).logits[0, -1].argmax())
+                toks.append(nxt)
+                if nxt == self.ids.eot or (len(toks) == 1 and nxt == self.ids.accept):
+                    break
+                cur = torch.cat([cur, self._embed_tokens(torch.tensor([[nxt]], device=dev))], dim=1)
+            accept = toks[0] == self.ids.accept
+            preds.append(accept)
+            if accept:
+                gens.append(None)
+            else:
+                body = [t for t in toks if t != self.ids.eot]
+                text = self.tokenizer.ids_to_text(body) if body else ""
+                gens.append(text + ("..." if len(toks) >= max(1, max_new_tokens) else ""))
+        return preds, gens
 
     @torch.no_grad()
     def _corrected_wer(self, st, return_counts: bool = False):
@@ -541,6 +590,7 @@ class ScriptCorrectorModel(ScriptSTTModel):
         for b in range(len(st["n_chunks"])):
             out_ids: List[int] = []
             history: List[int] = []
+            enc_b = st["enc"][b]
             for k in range(st["n_chunks"][b]):
                 hyp = st["hyp_i"][b][k]
                 alen = min(cs, max(0, int(st["enc_len"][b]) - k * cs))
@@ -548,8 +598,23 @@ class ScriptCorrectorModel(ScriptSTTModel):
                     st["instr"], [[]], [[]], [hyp], [alen], self.tokenizer.text_to_ids, ids=self.ids
                 )[0][0]
                 tail = ex.input_ids[len(st["instr"]) : ex.prompt_len]
-                ids_t = torch.tensor([list(st["instr"]) + history + tail], dtype=torch.long, device=dev)
-                logits = self.llm(inputs_embeds=self._embed_tokens(ids_t)).logits[0, -1]
+                seq = list(st["instr"]) + history + tail
+                ids_t = torch.tensor([seq], dtype=torch.long, device=dev)
+                emb = self._embed_tokens(ids_t)
+
+                # Splice THIS chunk's encoder frames into the reserved slots, the
+                # same way _prepare does for the training forward. Without this
+                # the model judges the hypothesis with the audio replaced by
+                # embed(0) -- a constant -- so its decision carries no acoustic
+                # evidence and collapses to a single answer for every chunk.
+                if alen > 0:
+                    vs = seq.index(self.ids.vision_start)
+                    pos = torch.arange(vs + 1, vs + 1 + alen, device=dev)
+                    frm = torch.arange(k * cs, k * cs + alen, device=dev).clamp_(max=enc_b.shape[0] - 1)
+                    emb = emb.clone()
+                    emb[0, pos] = self.perception.proj(enc_b[frm].to(emb.dtype))
+
+                logits = self.llm(inputs_embeds=emb).logits[0, -1]
                 tgt = st["tgt_i"][b][k]
                 toks = hyp if int(logits.argmax()) == self.ids.accept else tgt
                 out_ids += list(toks)

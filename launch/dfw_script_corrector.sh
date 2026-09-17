@@ -30,7 +30,22 @@
 # words that survive normalisation, so a standalone "," -- which the punctuated
 # references really do contain -- was owned by no chunk and every correction
 # quietly stripped it. Targets now carry the original reference text verbatim.
-# v1..v3 artifacts are left on disk untouched for comparison.
+# v1..v4 artifacts are left on disk untouched for comparison.
+#
+# v5, not v4: _corrected_wer built its own prompt and embedded token ids
+# ALONE, leaving the reserved audio positions at embed(0). Every accept/
+# reject decision it scored was therefore taken with the audio deleted, so
+# it collapsed to one answer for every chunk -- and since a rejected chunk
+# emits its exactly-aligned reference span, rejecting everything rebuilds
+# the reference and the metric read 0.00000. A perfect score produced by
+# removing the input. train_corrected_wer, val_corrected_wer and both
+# wer_delta panels were meaningless in v2..v4; training itself was fine,
+# since that path goes through _prepare, which splices correctly.
+#
+# The periodic dump now also prints the MODEL's accept/reject and its
+# generated correction (capped), because no aggregate rate can tell
+# "rejects the right 6%" from "rejects everything" once an oracle stitches
+# the output back together.
 #
 # Short runs are not useful here: 200 steps on a 93%-ACCEPT corpus is long
 # enough to learn "always accept" and nothing else. This runs to the wall clock.
@@ -72,7 +87,7 @@ CODE_DIR="${CODE_DIR:-${MYDIR}/NeMo_SCRIPT_cc}"
 PROJECT_NAME="${PROJECT_NAME:-SpeechlmDFW}"
 CONFIG_PATH=/code/examples/speechlm2/conf
 CONFIG_NAME="${CONFIG_NAME:-streaming_stt_granary2_lora_script_corrector}"
-EXP_NAME="${EXP_NAME:-dfw_corrector_v4}"
+EXP_NAME="${EXP_NAME:-dfw_corrector_v5}"
 
 # The model being verified, and the SCRIPT checkpoint we warm-start from.
 CHAT_ARM="${CHAT_ARM:-dfw_granary2_chat_banded1_nodelay_v2}"

@@ -360,7 +360,7 @@ def test_sample_survives_fewer_hypothesis_chunks_than_labels():
     """A hypothesis can end early -- that is how a trailing deletion presents --
     and the dump must still render rather than crash the training run."""
     out = format_sample(["a", "b"], ["a"], [None, "b"])
-    assert "chunk 1: <incorrect>" in out
+    assert "chunk 1: label <incorrect>" in out
 
 
 # --------------------------------------------------------------------------
@@ -509,3 +509,43 @@ def test_stitching_accepts_and_corrections_reproduces_the_reference_ids():
     for k, e in enumerate(exs):
         out += hyp_ids[k] if e.is_accept else target_ids[k]
     assert out == tok("a b c d")
+
+
+# --------------------------------------------------------------------------
+# The dump must show the MODEL's answer, not only the label.
+# --------------------------------------------------------------------------
+
+
+def test_sample_shows_model_prediction_beside_the_label():
+    out = format_sample(
+        ["the cat", "sat down"],
+        ["the", "cat sat down"],
+        [None, "sat down"],
+        step=10,
+        preds=[True, False],
+        gens=[None, "sat down"],
+    )
+    assert "label <correct>" in out and "pred <correct>" in out
+    assert "label <incorrect>" in out and "pred <incorrect>" in out
+    assert "model 'sat down'" in out
+    assert "agreement: 2/2 chunks" in out
+
+
+def test_disagreement_is_marked():
+    """The collapse mode: the model rejects a chunk the label says is fine.
+    A rate cannot show this; the '!!' makes it visible per chunk."""
+    out = format_sample(["a"], ["a"], [None], preds=[False], gens=["a"])
+    assert "!!" in out
+    assert "agreement: 0/1 chunks" in out
+
+
+def test_prediction_columns_are_optional():
+    """Older call sites pass labels only and must keep working."""
+    out = format_sample(["a"], ["a"], [None])
+    assert "pred" not in out and "agreement" not in out
+
+
+def test_boundaries_still_visible_with_predictions():
+    out = format_sample(["the cat", "sat down"], ["the", "cat sat down"], [None, None], preds=[True, True])
+    assert "ref : the cat | sat down" in out
+    assert "hyp : the | cat sat down" in out
