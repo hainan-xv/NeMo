@@ -125,3 +125,26 @@ def test_simple_normalize_strips_edge_punctuation_only():
     assert simple_normalize("Hello,") == "hello"
     assert simple_normalize('"world."') == "world"
     assert simple_normalize("don't") == "don't", "internal apostrophes must survive"
+
+
+def test_standalone_punctuation_in_the_reference_is_not_an_error():
+    """CHAT trains on the punctuated transcript, so a chunk can legitimately
+    start with a bare '.'. split() makes it a word and simple_normalize maps it
+    to '' -- which matches nothing, so the chunk scored wrong even when the
+    hypothesis was perfect. Measured: accept rate 0.93 -> 0.77."""
+    labels, n = label_chunks(
+        ["And", "my", "cousin"], [[".", "And", "my", "cousin"]], normalize=simple_normalize
+    )
+    assert n == 0 and labels == [None]
+
+
+def test_punctuation_only_chunk_is_accepted_when_hypothesis_omits_it():
+    labels, n = label_chunks(["a", "b"], [["a"], [","], ["b"]], normalize=simple_normalize)
+    assert n == 0, "a chunk that is pure punctuation cannot be got wrong"
+
+
+def test_real_errors_still_detected_alongside_punctuation():
+    labels, n = label_chunks(
+        ["And", "my", "COUSIN_X"], [[".", "And", "my", "cousin"]], normalize=simple_normalize
+    )
+    assert n == 1

@@ -102,9 +102,17 @@ def label_chunks(hyp_words: Sequence[str], ref_chunks: Sequence[Sequence[str]], 
             HYPOTHESIS are deliberately not an input -- see the module docstring.
         ref_chunks: reference words grouped by chunk.
     """
+    # Drop tokens that normalise to NOTHING. CHAT is trained on the original
+    # punctuated transcript, so a chunk can legitimately begin with a standalone
+    # "." or "," -- which split() makes its own word and simple_normalize maps to
+    # "". An empty string matches nothing, so every such chunk scored as an error
+    # even when the hypothesis was perfect. Measured: it pushed the accept rate
+    # from ~0.93 down to ~0.77 and taught the corrector to reject nearly
+    # everything.
     norm = normalize or (lambda w: w)
-    hyp_words = [norm(w) for w in hyp_words]
-    ref_chunks_cmp = [[norm(w) for w in c] for c in ref_chunks]
+    _n = lambda ws: [x for x in (norm(w) for w in ws) if x]  # noqa: E731
+    hyp_words = _n(hyp_words)
+    ref_chunks_cmp = [_n(c) for c in ref_chunks]
     ref_words: List[str] = [w for c in ref_chunks_cmp for w in c]
     # Which reference chunk each reference word belongs to.
     owner: List[int] = [t for t, c in enumerate(ref_chunks_cmp) for _ in c]

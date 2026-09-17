@@ -95,6 +95,17 @@ _VAL_METRIC_KEYS = (
     "val_label_accept_frac",
 )
 
+
+def _norm_words(words):
+    """Normalise and DROP anything that normalises away.
+
+    Standalone punctuation becomes "" and would otherwise count as an unmatched
+    word on both sides, inflating every WER computed here -- the same defect that
+    pushed the label accept rate from ~0.93 to ~0.77.
+    """
+    return [w for w in (simple_normalize(x) for x in words) if w]
+
+
 DEFAULT_CORRECTOR_PROMPT = (
     "You are verifying a streaming speech recognizer. Given the transcript so far, the "
     "representation of the next audio chunk, and the recognizer's hypothesis for that chunk, "
@@ -280,7 +291,7 @@ class ScriptCorrectorModel(ScriptSTTModel):
             chunk_labels, _ = label_chunks(hyp_w, ref_w[b], normalize=simple_normalize)
 
             rw = [w for c in ref_w[b] for w in c]
-            e, n = word_errors([simple_normalize(w) for w in hyp_w], [simple_normalize(w) for w in rw])
+            e, n = word_errors(_norm_words(hyp_w), _norm_words(rw))
             chat_e += e
             chat_n += n
 
@@ -486,7 +497,7 @@ class ScriptCorrectorModel(ScriptSTTModel):
             # per-chunk detokenization splits words that straddle a boundary.
             out_words = self.tokenizer.ids_to_text(out_ids).split() if out_ids else []
             rw = [w for c in st["ref_w"][b] for w in c]
-            e, n = word_errors([simple_normalize(w) for w in out_words], [simple_normalize(w) for w in rw])
+            e, n = word_errors(_norm_words(out_words), _norm_words(rw))
             e_tot += e
             n_tot += n
         if return_counts:
@@ -505,7 +516,13 @@ class ScriptCorrectorModel(ScriptSTTModel):
             self.log(
                 k,
                 v if torch.is_tensor(v) else float(v),
-                prog_bar=k in ("train_loss", "train_reject_recall", "train_chat_wer_tf"),
+                prog_bar=k
+                in (
+                    "train_loss",
+                    "train_reject_recall",
+                    "train_chat_wer_tf",
+                    "train_label_accept_frac",
+                ),
                 sync_dist=True,
             )
 
