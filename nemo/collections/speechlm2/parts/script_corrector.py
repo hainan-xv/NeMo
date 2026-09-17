@@ -139,65 +139,79 @@ def build_corrector_example(
     return CorrectorExample(input_ids=input_ids, labels=labels, is_accept=is_accept, prompt_len=len(prompt))
 
 
+def _span_ids(words, tokenize, after_text: bool) -> List[int]:
+    """Token ids for one chunk's reference span.
+
+    The segments are concatenated AS IDS, so a span that follows text needs a
+    leading space: without it the BPE glues the previous chunk's last word to
+    this chunk's first and the detokenized transcript silently loses a word
+    boundary -- the same class of bug as per-chunk detokenization, which measured
+    41% WER against a true ~8%.
+    """
+    if not words:
+        return []
+    return list(tokenize((" " if after_text else "") + " ".join(words)))
+
+
 def corrector_examples_for_utterance(
     instruction_ids: Sequence[int],
     ref_chunk_words: Sequence[Sequence[str]],
-    ref_chunk_ids: Sequence[Sequence[int]],
+    hyp_chunk_words: Sequence[Sequence[str]],
     hyp_chunk_ids: Sequence[Sequence[int]],
-    hyp_words_flat: Sequence[str],
     audio_lens: Sequence[int],
+    tokenize,
     ids: CorrectorIds = CorrectorIds(),
     ignore_index: int = -100,
     normalize=None,
-) -> List[CorrectorExample]:
-    """One utterance -> one example per chunk, labelled ACCEPT or corrected.
+):
+    """One utterance -> ``(examples, labels, target_ids)``, one entry per HYPOTHESIS chunk.
 
-    HISTORY IS THE REFERENCE, not the hypothesis. That is the choice that makes
-    the training distribution match inference: by the time the corrector sees
-    chunk k at inference, chunks 0..k-1 have already been corrected, so their
-    text is (intended to be) the reference. Conditioning on CHAT's raw history
-    instead would train the model on a context it never meets, and would let one
-    early ASR error poison every later chunk's example.
+    The index space is the hypothesis's, because that is what the corrector is
+    handed at inference: chunk k's example must judge the words the ASR actually
+    emitted in chunk k. Labelling on the reference partition instead puts the
+    ``<incorrect>`` mark on a neighbouring chunk whenever emission lags the
+    aligner -- see :mod:`nemo.collections.asr.parts.utils.chunk_error_labels`.
 
-    Labels come from :func:`label_chunks`, so the timing rule applies: a
-    hypothesis with the right words on different chunk boundaries is entirely
-    ACCEPT. Which means ``hyp_chunk_words`` is FLATTENED before labelling -- the
-    hypothesis's own chunk boundaries are deliberately not used.
+    HISTORY IS THE CORRECTED TEXT, not the hypothesis. By the time the corrector
+    sees chunk k at inference, chunks 0..k-1 have been accepted or rewritten, so
+    their text is (intended to be) the reference words those chunks own.
+    Conditioning on CHAT's raw history instead would train the model on a context
+    it never meets, and would let one early ASR error poison every later chunk.
+
+    ``target_ids`` is returned for EVERY chunk, accepted ones included: the
+    caller needs those spans to stitch a transcript back together and to score
+    it, and recomputing them would mean running the alignment twice.
     """
     from nemo.collections.asr.parts.utils.chunk_error_labels import label_chunks
 
-    n = len(ref_chunk_words)
-    if not (len(ref_chunk_ids) == len(hyp_chunk_ids) == len(audio_lens) == n):
+    n = len(hyp_chunk_ids)
+    if not (len(hyp_chunk_words) == len(audio_lens) == n):
         raise ValueError(
             "per-chunk inputs disagree on length: "
-            f"ref_words={len(ref_chunk_words)} ref_ids={len(ref_chunk_ids)} "
-            f"hyp_ids={len(hyp_chunk_ids)} audio={len(audio_lens)}"
+            f"hyp_words={len(hyp_chunk_words)} hyp_ids={len(hyp_chunk_ids)} audio={len(audio_lens)}"
         )
 
-    # The hypothesis arrives ALREADY FLAT and detokenized as one string. Joining
-    # per-chunk detokenizations instead splits any word that straddles a chunk
-    # boundary into two fragments -- CHAT emits BPE pieces and is under no
-    # obligation to break at word edges -- which measured 41% WER against a true
-    # ~8%. The labeller ignores hypothesis chunking by design, so nothing is lost.
-    labels, _ = label_chunks(list(hyp_words_flat), ref_chunk_words, normalize=normalize)
+    labels, _, owned = label_chunks(hyp_chunk_words, ref_chunk_words, normalize=normalize)
 
     out: List[CorrectorExample] = []
+    target_ids: List[List[int]] = []
     history: List[int] = []
     for t in range(n):
+        seg = _span_ids(owned[t], tokenize, bool(history))
+        target_ids.append(seg)
         out.append(
             build_corrector_example(
                 instruction_ids,
                 history,
                 audio_lens[t],
                 hyp_chunk_ids[t],
-                None if labels[t] is None else list(ref_chunk_ids[t]),
+                None if labels[t] is None else seg,
                 ids=ids,
                 ignore_index=ignore_index,
             )
         )
-        # Advance on the REFERENCE, matching the conditioning above.
-        history = history + list(ref_chunk_ids[t])
-    return out
+        history = history + seg
+    return out, labels, target_ids
 
 
 @dataclass

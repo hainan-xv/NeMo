@@ -131,13 +131,20 @@ def test_defaults_are_in_qwen3_range_and_do_not_clash_with_script():
 from nemo.collections.speechlm2.parts.script_corrector import corrector_examples_for_utterance  # noqa: E402
 
 
-def _utt(hyp_words, hyp_ids, ref_words=None, ref_ids=None):
+# The assembler tokenizes correction targets itself, because a target is now an
+# arbitrary aligned span rather than a whole reference chunk.
+_VOCAB = {"a": 41, "b": 42, "c": 43, "d": 44, "X": 99, "hello": 45, "world": 46}
+
+
+def _tok(text):
+    return [_VOCAB[w] for w in text.split()]
+
+
+def _utt(hyp_chunk_words, hyp_ids, ref_words=None):
+    """Examples only. The hypothesis arrives GROUPED BY ITS OWN CHUNK, which is
+    the index space the labels live in."""
     ref_words = ref_words or [["a", "b"], ["c", "d"]]
-    ref_ids = ref_ids or [[41, 42], [43, 44]]
-    # The assembler takes a FLAT hypothesis word list: joining per-chunk
-    # detokenizations would split words straddling a chunk boundary.
-    flat = [w for c in hyp_words for w in c]
-    return corrector_examples_for_utterance(INSTR, ref_words, ref_ids, hyp_ids, flat, [14, 14])
+    return corrector_examples_for_utterance(INSTR, ref_words, hyp_chunk_words, hyp_ids, [14, 14], _tok)[0]
 
 
 def test_perfect_hypothesis_yields_all_accept():
@@ -176,7 +183,7 @@ def test_first_chunk_has_empty_history():
 
 def test_mismatched_per_chunk_input_lengths_are_rejected():
     with pytest.raises(ValueError, match="disagree on length"):
-        corrector_examples_for_utterance(INSTR, [["a"]], [[41]], [[41], [42]], ["a", "b"], [14])
+        corrector_examples_for_utterance(INSTR, [["a"]], [["a"], ["b"]], [[41], [42]], [14], _tok)
 
 
 # --------------------------------------------------------------------------
@@ -300,14 +307,32 @@ def test_wer_accumulates_additively_not_as_a_mean_of_rates():
 def test_a_word_straddling_a_chunk_boundary_is_not_two_errors():
     """The bug that measured 41% WER against a true ~8%.
 
-    CHAT emits BPE pieces and may split a word across chunks. Detokenizing each
-    chunk and joining turns one word into two fragments; the assembler therefore
-    takes the hypothesis ALREADY detokenized as one flat sequence.
+    CHAT emits BPE pieces and may split a word across chunks, so the grouping of
+    hypothesis words into chunks cannot come from detokenizing each chunk alone.
+    _hyp_chunk_words slices ONE detokenization by prefix word-counts, which keeps
+    a straddling word whole and owned by the chunk it started in.
     """
-    # "hello" arrived as two chunks of pieces, detokenized together -> one word
+    import types
+
+    from nemo.collections.speechlm2.models.script_corrector_model import ScriptCorrectorModel
+
+    class _Tok:
+        """Piece 7 is 'hel', 8 completes it into 'hello' and adds 'world'."""
+
+        def ids_to_text(self, ids):
+            return {(7,): "hel", (7, 8): "hello world"}[tuple(ids)]
+
+    per_chunk, flat = ScriptCorrectorModel._hyp_chunk_words(types.SimpleNamespace(tokenizer=_Tok()), [[7], [8]])
+    assert flat == ["hello", "world"]
+    assert per_chunk == [["hello"], ["world"]], "the straddling word must stay whole, not become 'hel'"
+    # The invariant the labeller depends on.
+    assert [w for c in per_chunk for w in c] == flat
+
+
+def test_straddling_words_still_label_as_accept_end_to_end():
     ex = corrector_examples_for_utterance(
-        INSTR, [["hello"], ["world"]], [[41], [42]], [[7], [8]], ["hello", "world"], [14, 14]
-    )
+        INSTR, [["hello"], ["world"]], [["hello"], ["world"]], [[7], [8]], [14, 14], _tok
+    )[0]
     assert [e.is_accept for e in ex] == [True, True]
 
 
@@ -391,9 +416,7 @@ def test_corrector_model_defines_the_hooks_it_must_override():
 
     src = pathlib.Path(__file__).parents[3] / "nemo/collections/speechlm2/models/script_corrector_model.py"
     tree = ast.parse(src.read_text())
-    cls = next(
-        n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "ScriptCorrectorModel"
-    )
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "ScriptCorrectorModel")
     defined = {n.name for n in cls.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
     required = {
         "training_step",
@@ -406,3 +429,35 @@ def test_corrector_model_defines_the_hooks_it_must_override():
     }
     missing = required - defined
     assert not missing, f"ScriptCorrectorModel is missing {missing}"
+
+
+# --------------------------------------------------------------------------
+# Structural guard.
+# --------------------------------------------------------------------------
+
+
+def test_module_still_defines_every_public_symbol():
+    """A span rewrite that replaces one function by matching to the NEXT 'def'
+    silently swallows any class sitting between them. That deleted
+    CorrectorBatch once, and the only symptom was five unrelated collation tests
+    failing. Pin the surface so the next one fails here, loudly.
+    """
+    import ast as _ast
+    import pathlib as _pathlib
+
+    import nemo.collections.speechlm2.parts.script_corrector as _mod
+
+    src = _pathlib.Path(_mod.__file__).read_text()
+    top = {n.name for n in _ast.parse(src).body if isinstance(n, (_ast.FunctionDef, _ast.ClassDef))}
+    expected = {
+        "CorrectorIds",
+        "CorrectorExample",
+        "CorrectorBatch",
+        "build_corrector_example",
+        "corrector_examples_for_utterance",
+        "collate_corrector_examples",
+        "decision_stats",
+        "word_errors",
+        "format_sample",
+    }
+    assert expected <= top, f"missing from the module: {sorted(expected - top)}"

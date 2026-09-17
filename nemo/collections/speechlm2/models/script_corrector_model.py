@@ -208,6 +208,38 @@ class ScriptCorrectorModel(ScriptSTTModel):
         w_chunks = [self.tokenizer.ids_to_text(c).split() if c else [] for c in id_chunks]
         return w_chunks, id_chunks
 
+    def _hyp_chunk_words(self, id_chunks):
+        """``(words_per_chunk, words_flat)`` for CHAT's hypothesis.
+
+        Cumulative detokenization, never per-chunk. CHAT emits BPE pieces and is
+        under no obligation to break at word edges, so detokenizing each chunk
+        alone splits a straddling word into two fragments -- measured at 41% WER
+        against a true ~8%. Detokenizing growing prefixes instead asks only where
+        the word count had reached at each boundary, so a word that straddles is
+        owned by the chunk it STARTED in and is never cut in half.
+        """
+        if not id_chunks:
+            return [], []
+        # Word COUNT at each boundary, from prefixes...
+        acc, counts = [], []
+        for c in id_chunks:
+            acc = acc + list(c)
+            counts.append(len(self.tokenizer.ids_to_text(acc).split()) if acc else 0)
+        # ...but the words themselves from ONE detokenization of the whole thing.
+        # Slicing the final list by those counts is what keeps a straddling word
+        # whole: taking each prefix's own last word instead would hand chunk k the
+        # fragment "hel" and chunk k+1 "lo world", and the chunks would no longer
+        # concatenate to the hypothesis the labeller scores.
+        flat = self.tokenizer.ids_to_text(acc).split() if acc else []
+        out, prev = [], 0
+        for cnt in counts:
+            cnt = min(max(cnt, prev), len(flat))
+            out.append(flat[prev:cnt])
+            prev = cnt
+        if prev < len(flat):  # nothing may be dropped off the end
+            out[-1] = out[-1] + flat[prev:]
+        return out, flat
+
     @torch.no_grad()
     def _chat_hypotheses(self, enc, enc_len, ref_id_chunks, n_chunks):
         """Greedy CHAT output per chunk, conditioned on CHAT'S OWN history.
@@ -283,34 +315,33 @@ class ScriptCorrectorModel(ScriptSTTModel):
         hyp_i = self._chat_hypotheses(enc, enc_len, ref_i, n_chunks)
         instr = self.tokenizer.text_to_ids(self.system_prompt + "\n")
 
-        from nemo.collections.asr.parts.utils.chunk_error_labels import label_chunks
-
         examples, frame_src, sample = [], [], None
+        tgt_i = []
         chat_e = chat_n = 0
         for b in range(len(n_chunks)):
-            # ONE detokenization of the whole hypothesis; per-chunk detokenization
-            # splits words that straddle a chunk boundary.
-            hyp_w = self.tokenizer.ids_to_text([t for c in hyp_i[b] for t in c]).split()
+            hyp_cw, hyp_w = self._hyp_chunk_words(hyp_i[b])
             lens = [min(cs, max(0, int(enc_len[b]) - k * cs)) for k in range(n_chunks[b])]
-            chunk_labels, _ = label_chunks(hyp_w, ref_w[b], normalize=simple_normalize)
 
             rw = [w for c in ref_w[b] for w in c]
             e, n = word_errors(_norm_words(hyp_w), _norm_words(rw))
             chat_e += e
             chat_n += n
 
-            for k, ex in enumerate(
-                corrector_examples_for_utterance(
-                    instr,
-                    ref_w[b],
-                    ref_i[b],
-                    hyp_i[b],
-                    hyp_w,
-                    lens,
-                    ids=self.ids,
-                    normalize=simple_normalize,
-                )
-            ):
+            # Labels and per-chunk reference spans come back from the same
+            # alignment that built the examples; recomputing them here would run
+            # the Levenshtein DP a second time per utterance.
+            exs, chunk_labels, spans = corrector_examples_for_utterance(
+                instr,
+                ref_w[b],
+                hyp_cw,
+                hyp_i[b],
+                lens,
+                self.tokenizer.text_to_ids,
+                ids=self.ids,
+                normalize=simple_normalize,
+            )
+            tgt_i.append(spans)
+            for k, ex in enumerate(exs):
                 examples.append(ex)
                 frame_src.append((b, k * cs))
 
@@ -358,6 +389,10 @@ class ScriptCorrectorModel(ScriptSTTModel):
                 "ref_w": ref_w,
                 "ref_i": ref_i,
                 "hyp_i": hyp_i,
+                # Reference words the alignment assigns to each HYPOTHESIS chunk.
+                # Not ref_i: that is the reference's own partition, which holds
+                # different words whenever emission lags the aligner.
+                "tgt_i": tgt_i,
                 "instr": instr,
                 "device": dev,
             },
@@ -493,6 +528,12 @@ class ScriptCorrectorModel(ScriptSTTModel):
         A/B on identical audio -- any gap is the decision doing work. Generating
         the corrections instead would fold two skills into one number and make a
         regression impossible to attribute.
+
+        READ IT WITH pred_accept_frac. Being an oracle, this metric is MINIMISED
+        by rejecting everything: a model that rejects every chunk is handed the
+        entire reference and scores ~0. The smoke run's 0.0167 against a chat WER
+        of 0.103 was exactly that -- an untrained head over-rejecting, not a win.
+        It is an upper bound on decision quality, never a system WER.
         """
         cs = self.chat.joint.chunk_size
         dev = st["device"]
@@ -503,13 +544,16 @@ class ScriptCorrectorModel(ScriptSTTModel):
             for k in range(st["n_chunks"][b]):
                 hyp = st["hyp_i"][b][k]
                 alen = min(cs, max(0, int(st["enc_len"][b]) - k * cs))
-                ex = corrector_examples_for_utterance(st["instr"], [[]], [[]], [hyp], [], [alen], ids=self.ids)[0]
+                ex = corrector_examples_for_utterance(
+                    st["instr"], [[]], [[]], [hyp], [alen], self.tokenizer.text_to_ids, ids=self.ids
+                )[0][0]
                 tail = ex.input_ids[len(st["instr"]) : ex.prompt_len]
                 ids_t = torch.tensor([list(st["instr"]) + history + tail], dtype=torch.long, device=dev)
                 logits = self.llm(inputs_embeds=self._embed_tokens(ids_t)).logits[0, -1]
-                toks = hyp if int(logits.argmax()) == self.ids.accept else st["ref_i"][b][k]
+                tgt = st["tgt_i"][b][k]
+                toks = hyp if int(logits.argmax()) == self.ids.accept else tgt
                 out_ids += list(toks)
-                history = history + list(st["ref_i"][b][k])
+                history = history + list(tgt)
             # One detokenization of the whole output, for the same reason as above:
             # per-chunk detokenization splits words that straddle a boundary.
             out_words = self.tokenizer.ids_to_text(out_ids).split() if out_ids else []

@@ -13,138 +13,188 @@
 # limitations under the License.
 """Chunk-level ACCEPT/CORRECT labels for training a verifier.
 
-The property that matters most is the one that is easiest to get wrong: an ASR
-that emits the RIGHT WORDS on DIFFERENT chunk boundaries must be labelled
-entirely correct. Per-chunk string comparison fails that, and a corrector
-trained on those labels would learn to fight emission timing -- which the banded
-losses in this project deliberately leave loose.
+Two properties matter most, and both are easy to get wrong:
+
+1. An ASR that emits the RIGHT WORDS on DIFFERENT chunk boundaries must be
+   labelled entirely correct. Per-chunk string comparison fails that, and a
+   corrector trained on those labels would fight emission timing -- which the
+   banded losses in this project deliberately leave loose.
+
+2. Labels must be indexed on the HYPOTHESIS partition, because that is the span
+   the corrector is handed at inference. Indexing on the reference looks
+   equivalent and is not; see the regression test below, taken from a real
+   training dump.
 """
 
-from nemo.collections.asr.parts.utils.chunk_error_labels import align_words, label_chunks
+import pytest
+
+from nemo.collections.asr.parts.utils.chunk_error_labels import align_words, label_chunks, simple_normalize
 
 
+def _stitch(hyp_chunks, labels, owned):
+    """What the corrector would emit: hypothesis where accepted, reference where not."""
+    out = []
+    for k in range(len(hyp_chunks)):
+        out += list(hyp_chunks[k]) if labels[k] is None else list(owned[k])
+    return out
+
+
+@pytest.mark.unit
 def test_perfect_transcript_is_all_accept():
-    labels, n = label_chunks(["a", "b", "c", "d"], [["a", "b"], ["c", "d"]])
+    labels, n, owned = label_chunks([["a", "b"], ["c", "d"]], [["a", "b"], ["c", "d"]])
     assert labels == [None, None] and n == 0
+    assert owned == [["a", "b"], ["c", "d"]]
 
 
+@pytest.mark.unit
 def test_same_words_different_chunk_boundaries_is_all_accept():
     """The headline case: the ASR was early or late, not wrong."""
-    # reference splits 1|3, the hypothesis would have split 3|1 -- but the
-    # flattened words are identical, so nothing is wrong.
-    labels, n = label_chunks(["a", "b", "c", "d"], [["a"], ["b", "c", "d"]])
+    labels, n, _ = label_chunks([["a"], ["b", "c", "d"]], [["a", "b"], ["c", "d"]])
     assert labels == [None, None] and n == 0
-    labels, n = label_chunks(["a", "b", "c", "d"], [["a", "b", "c"], ["d"]])
+    labels, n, _ = label_chunks([["a", "b", "c"], ["d"]], [["a", "b"], ["c", "d"]])
     assert labels == [None, None] and n == 0
 
 
-def test_substitution_marks_only_its_own_chunk():
-    labels, n = label_chunks(["a", "X", "c", "d"], [["a", "b"], ["c", "d"]])
+@pytest.mark.unit
+def test_substitution_marks_the_hypothesis_chunk_holding_it():
+    labels, n, owned = label_chunks([["a", "X"], ["c", "d"]], [["a", "b"], ["c", "d"]])
     assert n == 1
     assert labels[0] == "a b", "the wrong chunk carries the REFERENCE text as its target"
     assert labels[1] is None
+    assert _stitch([["a", "X"], ["c", "d"]], labels, owned) == ["a", "b", "c", "d"]
 
 
-def test_deletion_is_attributed_via_the_reference_chunk():
-    """A word the ASR never emitted has no hypothesis position -- only a
-    reference one. Indexing on the reference is what makes this expressible."""
-    labels, n = label_chunks(["a", "c", "d"], [["a", "b"], ["c", "d"]])
-    assert n == 1 and labels[0] == "a b" and labels[1] is None
+@pytest.mark.unit
+def test_lagging_emission_marks_the_chunk_that_actually_holds_the_error():
+    """REGRESSION, from a real dump (2026-09-17 11:00:16).
 
+    CHAT emitted 'real time' for the reference's 'real-time', one word late
+    throughout. Labelling on the reference partition put <incorrect> on the chunk
+    holding ' kernel to provide' -- correct text -- and marked the chunk holding
+    ' real time filtering and' ACCEPT. Applying that target deleted 'kernel' and
+    duplicated 'real time', so the correction RAISED WER.
+    """
+    ref = [["operating", "system", "kernel"], ["to", "provide", "real-time"], ["filtering", "and"]]
+    hyp = [["operating", "system"], ["kernel", "to", "provide"], ["real", "time", "filtering", "and"]]
+    labels, n, owned = label_chunks(hyp, ref, normalize=simple_normalize)
 
-def test_insertion_blames_the_chunk_it_precedes_not_the_one_before():
-    """A spurious word before chunk 1's first reference word belongs to chunk 1;
-    blaming chunk 0 would mark a chunk the reference says was fine."""
-    labels, n = label_chunks(["a", "b", "X", "c", "d"], [["a", "b"], ["c", "d"]])
-    assert labels[1] == "c d"
+    assert labels[1] is None, "the chunk holding 'kernel to provide' is CORRECT and must be accepted"
+    assert labels[2] == "real-time filtering and", "the chunk actually holding 'real time' carries the fix"
     assert n == 1
 
+    # The whole point: stitching loses nothing and duplicates nothing.
+    assert _stitch(hyp, labels, owned) == [
+        "operating",
+        "system",
+        "kernel",
+        "to",
+        "provide",
+        "real-time",
+        "filtering",
+        "and",
+    ]
 
-def test_trailing_insertion_lands_on_the_final_chunk():
-    labels, n = label_chunks(["a", "b", "c", "d", "X"], [["a", "b"], ["c", "d"]])
-    assert labels[-1] == "c d" and n == 1
+
+@pytest.mark.unit
+def test_deletion_lands_on_the_chunk_it_would_have_been_read_into():
+    """A word the ASR never emitted has no hypothesis position, so it is charged
+    to the chunk owning the next aligned hypothesis word."""
+    labels, n, owned = label_chunks([["a"], ["c", "d"]], [["a", "b"], ["c", "d"]])
+    assert n == 1
+    assert labels[0] is None, "chunk 0 emitted 'a' correctly"
+    assert labels[1] == "b c d", "'b' is charged to the chunk that was about to be read"
+    assert _stitch([["a"], ["c", "d"]], labels, owned) == ["a", "b", "c", "d"]
 
 
+@pytest.mark.unit
+def test_trailing_deletion_lands_on_the_final_chunk():
+    labels, n, owned = label_chunks([["a", "b"], ["c"]], [["a", "b"], ["c", "d"]])
+    assert n == 1 and labels[1] == "c d"
+    assert _stitch([["a", "b"], ["c"]], labels, owned) == ["a", "b", "c", "d"]
+
+
+@pytest.mark.unit
+def test_insertion_marks_the_chunk_that_emitted_it():
+    labels, n, owned = label_chunks([["a", "b", "X"], ["c", "d"]], [["a", "b"], ["c", "d"]])
+    assert n == 1 and labels[0] == "a b"
+    assert _stitch([["a", "b", "X"], ["c", "d"]], labels, owned) == ["a", "b", "c", "d"]
+
+
+@pytest.mark.unit
+def test_a_chunk_of_pure_insertion_is_corrected_to_nothing():
+    """A chunk that owns no reference word must be rewritten to the empty
+    string; leaving it ACCEPT would keep the spurious words."""
+    labels, n, owned = label_chunks([["a", "b"], ["X"], ["c", "d"]], [["a", "b"], ["c", "d"]])
+    assert labels[1] == ""
+    assert owned[1] == []
+    assert _stitch([["a", "b"], ["X"], ["c", "d"]], labels, owned) == ["a", "b", "c", "d"]
+
+
+@pytest.mark.unit
 def test_errors_in_several_chunks_are_all_marked():
-    labels, n = label_chunks(["X", "b", "c", "Y"], [["a", "b"], ["c", "d"]])
-    assert n == 2 and labels == ["a b", "c d"]
+    labels, n, _ = label_chunks([["X", "b"], ["c", "Y"]], [["a", "b"], ["c", "d"]])
+    assert n == 2 and labels[0] == "a b" and labels[1] == "c d"
 
 
-def test_empty_hypothesis_marks_every_chunk():
-    labels, n = label_chunks([], [["a", "b"], ["c", "d"]])
-    assert n == 2 and all(l is not None for l in labels)
-
-
-def test_alignment_ops_are_what_they_claim():
-    ops = [o for o, _, _ in align_words(["a", "X", "c"], ["a", "b", "c"])]
-    assert ops == ["equal", "sub", "equal"]
-    ops = [o for o, _, _ in align_words(["a", "c"], ["a", "b", "c"])]
-    assert ops == ["equal", "del", "equal"]
-    ops = [o for o, _, _ in align_words(["a", "b", "c"], ["a", "c"])]
-    assert ops == ["equal", "ins", "equal"]
-
-
-# --------------------------------------------------------------------------
-# Normalisation for the label decision.
-# --------------------------------------------------------------------------
-
-from nemo.collections.asr.parts.utils.chunk_error_labels import simple_normalize  # noqa: E402
-
-
-def test_casing_and_punctuation_alone_do_not_mark_a_chunk_wrong():
-    """The ASR writes 'Hello, world.'; the aligner has 'hello world'. Compared
-    literally that is two errors -- measured, this inflated the wrong-chunk rate
-    from 7% to 75%."""
-    labels, n = label_chunks(
-        ["Hello,", "world."], [["hello"], ["world"]], normalize=simple_normalize
-    )
-    assert n == 0 and labels == [None, None]
-
-
-def test_without_a_normalizer_the_same_input_looks_entirely_wrong():
-    """Pins the default as exact-match, so the normalisation is a visible choice."""
-    _, n = label_chunks(["Hello,", "world."], [["hello"], ["world"]])
-    assert n == 2
-
-
-def test_a_real_error_still_shows_through_normalisation():
-    labels, n = label_chunks(
-        ["Hello,", "word."], [["hello"], ["world"]], normalize=simple_normalize
-    )
-    assert n == 1 and labels[1] == "world"
-
-
-def test_correction_target_keeps_the_original_reference_text():
-    """Normalisation decides IF a chunk is wrong; the target must stay the true
-    reference, casing and punctuation included, since that is what to emit."""
-    labels, _ = label_chunks(["X"], [["Hello,"]], normalize=simple_normalize)
-    assert labels[0] == "Hello,", "target must not be normalised"
-
-
-def test_simple_normalize_strips_edge_punctuation_only():
-    assert simple_normalize("Hello,") == "hello"
-    assert simple_normalize('"world."') == "world"
-    assert simple_normalize("don't") == "don't", "internal apostrophes must survive"
-
-
-def test_standalone_punctuation_in_the_reference_is_not_an_error():
-    """CHAT trains on the punctuated transcript, so a chunk can legitimately
-    start with a bare '.'. split() makes it a word and simple_normalize maps it
-    to '' -- which matches nothing, so the chunk scored wrong even when the
-    hypothesis was perfect. Measured: accept rate 0.93 -> 0.77."""
-    labels, n = label_chunks(
-        ["And", "my", "cousin"], [[".", "And", "my", "cousin"]], normalize=simple_normalize
-    )
-    assert n == 0 and labels == [None]
-
-
-def test_punctuation_only_chunk_is_accepted_when_hypothesis_omits_it():
-    labels, n = label_chunks(["a", "b"], [["a"], [","], ["b"]], normalize=simple_normalize)
-    assert n == 0, "a chunk that is pure punctuation cannot be got wrong"
-
-
-def test_real_errors_still_detected_alongside_punctuation():
-    labels, n = label_chunks(
-        ["And", "my", "COUSIN_X"], [[".", "And", "my", "cousin"]], normalize=simple_normalize
-    )
+@pytest.mark.unit
+def test_empty_hypothesis_marks_the_final_chunk_with_everything():
+    labels, n, owned = label_chunks([[], []], [["a", "b"], ["c", "d"]])
     assert n == 1
+    assert labels[-1] == "a b c d", "with no hypothesis position anywhere, all deletions are trailing"
+    assert _stitch([[], []], labels, owned) == ["a", "b", "c", "d"]
+
+
+@pytest.mark.unit
+def test_casing_and_punctuation_alone_do_not_mark_a_chunk_wrong():
+    labels, n, _ = label_chunks(
+        [["Hello,", "world."], ["how", "are", "you?"]],
+        [["hello", "world"], ["how", "are", "you"]],
+        normalize=simple_normalize,
+    )
+    assert labels == [None, None] and n == 0
+
+
+@pytest.mark.unit
+def test_without_a_normalizer_the_same_input_looks_entirely_wrong():
+    labels, n, _ = label_chunks(
+        [["Hello,", "world."], ["how", "are", "you?"]],
+        [["hello", "world"], ["how", "are", "you"]],
+    )
+    assert n > 0, "this is why simple_normalize exists"
+
+
+@pytest.mark.unit
+def test_a_real_error_still_shows_through_normalisation():
+    labels, n, _ = label_chunks(
+        [["Hello,", "planet."], ["how", "are", "you?"]],
+        [["hello", "world"], ["how", "are", "you"]],
+        normalize=simple_normalize,
+    )
+    assert n == 1 and labels[0] == "hello world"
+
+
+@pytest.mark.unit
+def test_correction_target_keeps_the_original_reference_text():
+    """The DECISION is normalised; the TARGET is the true reference, casing and
+    punctuation included, because that is what the model must emit."""
+    labels, _, _ = label_chunks([["wrong", "words"], ["c"]], [["Hello,", "World!"], ["c"]], normalize=simple_normalize)
+    assert labels[0] == "Hello, World!"
+
+
+@pytest.mark.unit
+def test_standalone_punctuation_in_the_reference_is_not_an_error():
+    """CHAT is trained on punctuated text, so a reference chunk can begin with a
+    bare ',' that normalises to nothing. Counting it as an unmatched word pushed
+    the accept rate from ~0.93 to ~0.77."""
+    labels, n, _ = label_chunks(
+        [["stack"], ["or", "in", "the", "case"]],
+        [["stack"], [",", "or", "in", "the", "case"]],
+        normalize=simple_normalize,
+    )
+    assert labels == [None, None] and n == 0
+
+
+@pytest.mark.unit
+def test_alignment_ops_are_the_expected_four():
+    ops = {op for op, _, _ in align_words(["a", "X", "c"], ["a", "b", "c"])}
+    assert ops <= {"equal", "sub", "ins", "del"}

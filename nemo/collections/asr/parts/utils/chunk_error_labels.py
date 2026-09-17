@@ -33,10 +33,26 @@ So:
      are correct wherever they landed. Only words inside an edit mark their
      chunk as wrong.
 
-Chunks are indexed on the REFERENCE partition, not the hypothesis's. That is
-what makes deletions expressible: a word the ASR never emitted has no
-hypothesis position and therefore no hypothesis chunk, but it always has a
-reference chunk -- and the correction target is reference text anyway.
+Chunks are indexed on the HYPOTHESIS partition, because that is the decision the
+corrector actually makes: at inference it is handed hypothesis chunk k and must
+accept or rewrite THAT span. Indexing on the reference instead looks equivalent
+and is not -- the ASR's emission lags the aligner's chunking by around a word, so
+reference chunk k and hypothesis chunk k hold different words, and a label
+computed on one applied to the other lands on the wrong chunk. Observed: the
+error "real time" (for reference "real-time") marked hypothesis chunk 16
+' kernel to provide' -- text that is correct -- while chunk 17, which held the
+actual error, was labelled ACCEPT. Applying such a target deletes the words the
+hypothesis emitted late and duplicates the ones it emitted early, so the
+"correction" raises WER.
+
+Deletions still have somewhere to go: a reference word the ASR never emitted has
+no hypothesis position, so it is charged to the chunk it would have been read
+into -- the one owning the next aligned hypothesis word, or the last chunk if the
+deletion is trailing.
+
+Every chunk also reports the reference words the alignment assigns to it, not
+just the wrong ones. The caller needs the accepted chunks' spans too, to build
+the conditioning history.
 """
 
 from __future__ import annotations
@@ -94,51 +110,93 @@ def align_words(hyp: Sequence[str], ref: Sequence[str]) -> List[Tuple[str, int, 
     return out
 
 
-def label_chunks(hyp_words: Sequence[str], ref_chunks: Sequence[Sequence[str]], normalize=None):
-    """``(labels, n_wrong)`` where ``labels[t]`` is None for ACCEPT else the target.
+def label_chunks(
+    hyp_chunks: Sequence[Sequence[str]],
+    ref_chunks: Sequence[Sequence[str]],
+    normalize=None,
+):
+    """``(labels, n_wrong, owned)``, all indexed by HYPOTHESIS chunk.
 
     Args:
-        hyp_words: the ASR's full hypothesis, flattened. Chunk boundaries in the
-            HYPOTHESIS are deliberately not an input -- see the module docstring.
-        ref_chunks: reference words grouped by chunk.
-    """
-    # Drop tokens that normalise to NOTHING. CHAT is trained on the original
-    # punctuated transcript, so a chunk can legitimately begin with a standalone
-    # "." or "," -- which split() makes its own word and simple_normalize maps to
-    # "". An empty string matches nothing, so every such chunk scored as an error
-    # even when the hypothesis was perfect. Measured: it pushed the accept rate
-    # from ~0.93 down to ~0.77 and taught the corrector to reject nearly
-    # everything.
-    norm = normalize or (lambda w: w)
-    _n = lambda ws: [x for x in (norm(w) for w in ws) if x]  # noqa: E731
-    hyp_words = _n(hyp_words)
-    ref_chunks_cmp = [_n(c) for c in ref_chunks]
-    ref_words: List[str] = [w for c in ref_chunks_cmp for w in c]
-    # Which reference chunk each reference word belongs to.
-    owner: List[int] = [t for t, c in enumerate(ref_chunks_cmp) for _ in c]
+        hyp_chunks: the ASR's words grouped by ITS OWN chunk. This is the index
+            space of the result -- see the module docstring for why it is not the
+            reference's.
+        ref_chunks: reference words grouped by chunk. Used only to recover the
+            reference word SEQUENCE; its chunk boundaries do not survive.
 
-    # Rule 1: the transcript is right, so nothing is wrong anywhere.
-    if list(hyp_words) == ref_words:
-        return [None] * len(ref_chunks), 0
+    Returns:
+        labels: ``None`` for ACCEPT, else the correction target text.
+        n_wrong: how many chunks are labelled wrong.
+        owned: for EVERY chunk, the reference words the alignment assigns to it.
+            Concatenated over all chunks this reproduces the reference exactly,
+            which is what lets accept-or-correct decisions be stitched back into
+            a transcript.
+    """
+    # Drop tokens that normalise to NOTHING, remembering which chunk each
+    # surviving word came from. CHAT is trained on the original punctuated
+    # transcript, so a chunk can legitimately begin with a standalone "." or ","
+    # -- which split() makes its own word and simple_normalize maps to "". An
+    # empty string matches nothing, so every such chunk scored as an error even
+    # when the hypothesis was perfect: measured, it pushed the accept rate from
+    # ~0.93 down to ~0.77 and taught the corrector to reject nearly everything.
+    norm = normalize or (lambda w: w)
+
+    hyp_words: List[str] = []
+    hyp_owner: List[int] = []
+    for k, c in enumerate(hyp_chunks):
+        for w in c:
+            x = norm(w)
+            if x:
+                hyp_words.append(x)
+                hyp_owner.append(k)
+
+    ref_words: List[str] = []
+    ref_orig: List[str] = []
+    for c in ref_chunks:
+        for w in c:
+            x = norm(w)
+            if x:
+                ref_words.append(x)
+                ref_orig.append(w)
+
+    n = len(hyp_chunks)
+    if n == 0:
+        return [], 0, []
+
+    owned: List[List[int]] = [[] for _ in range(n)]
+
+    # Rule 1: the transcript is right, so nothing is wrong anywhere -- whatever
+    # the boundaries did. Each chunk still owns the words it emitted.
+    if hyp_words == ref_words:
+        for i in range(len(ref_words)):
+            owned[hyp_owner[i]].append(i)
+        return [None] * n, 0, [[ref_orig[j] for j in o] for o in owned]
 
     bad = set()
-    pending_ins = 0  # insertions seen before the next reference-anchored op
-    for op, _hi, rj in align_words(hyp_words, ref_words):
-        if op == "ins":
-            pending_ins += 1
+    pending_del: List[int] = []
+    for op, hi, rj in align_words(hyp_words, ref_words):
+        if op == "del":
+            # No hypothesis position exists for this reference word; hold it for
+            # the next hypothesis-anchored op and charge it to that chunk.
+            pending_del.append(rj)
             continue
-        if rj >= 0:
-            t = owner[rj]
-            if op in ("sub", "del"):
-                bad.add(t)
-            if pending_ins:
-                # Spurious words belong to the chunk that was about to be read;
-                # attributing them to the PREVIOUS chunk would blame a chunk the
-                # reference says was fine.
-                bad.add(t)
-        pending_ins = 0
-    if pending_ins:  # trailing insertions land on the final chunk
-        bad.add(len(ref_chunks) - 1)
+        owner = hyp_owner[hi]
+        if pending_del:
+            owned[owner].extend(pending_del)
+            bad.add(owner)
+            pending_del = []
+        if op == "ins":
+            # A spurious word: this chunk owns no reference word for it, but it
+            # must still be rewritten -- to nothing, if it owns nothing at all.
+            bad.add(owner)
+            continue
+        owned[owner].append(rj)
+        if op == "sub":
+            bad.add(owner)
+    if pending_del:  # trailing deletions land on the final chunk
+        owned[n - 1].extend(pending_del)
+        bad.add(n - 1)
 
-    labels = [(" ".join(ref_chunks[t]) if t in bad else None) for t in range(len(ref_chunks))]
-    return labels, len(bad)
+    out_words = [[ref_orig[j] for j in sorted(o)] for o in owned]
+    labels = [(" ".join(out_words[k]) if k in bad else None) for k in range(n)]
+    return labels, len(bad), out_words
