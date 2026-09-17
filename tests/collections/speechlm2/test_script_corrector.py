@@ -374,3 +374,35 @@ def test_metric_keys_are_unique():
     block = re.search(r"_METRIC_KEYS = \((.*?)\)", src.read_text(), re.S).group(1)
     keys = re.findall(r'"([^"]+)"', block)
     assert len(keys) == len(set(keys)), "a duplicated key logs twice on every rank"
+
+
+def test_corrector_model_defines_the_hooks_it_must_override():
+    """Guards against an edit silently deleting a method.
+
+    A span-based rewrite of _chat_hypotheses once removed validation_step and
+    both validation hooks along with it. Nothing failed at import: the PARENT's
+    validation_step ran instead and died 4 minutes into the job with "'list'
+    object has no attribute 'text'", because it expects SCRIPT's batch type.
+
+    Parsed from source so the test needs no torch/GPU import chain.
+    """
+    import ast
+    import pathlib
+
+    src = pathlib.Path(__file__).parents[3] / "nemo/collections/speechlm2/models/script_corrector_model.py"
+    tree = ast.parse(src.read_text())
+    cls = next(
+        n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "ScriptCorrectorModel"
+    )
+    defined = {n.name for n in cls.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    required = {
+        "training_step",
+        "validation_step",
+        "on_validation_epoch_start",
+        "on_validation_epoch_end",
+        "on_train_batch_end",
+        "_prepare",
+        "_log_all",
+    }
+    missing = required - defined
+    assert not missing, f"ScriptCorrectorModel is missing {missing}"

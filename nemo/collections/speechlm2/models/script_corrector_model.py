@@ -348,6 +348,71 @@ class ScriptCorrectorModel(ScriptSTTModel):
             },
         }
 
+    # ------------------------------------------------------------- validation
+    def validation_step(self, batch, batch_idx, dataloader_idx=0):
+        """Same pipeline as training, ACCUMULATED rather than logged per batch.
+
+        Nothing is logged here on purpose: logging inside the loop would average
+        rates (wrong for corpus WER) and make the number of collectives depend on
+        how many val batches a rank happened to get -- the desync that killed
+        dfw_corrector_v1.
+
+        Overrides the PARENT's validation_step, which expects SCRIPT's own batch
+        type and dies with "'list' object has no attribute 'text'" on a plain
+        lhotse batch.
+        """
+        try:
+            st = self._prepare(batch)
+        except RuntimeError:
+            return
+        if st is None:
+            return
+
+        out = self.llm(inputs_embeds=st["embeds"], attention_mask=st["attn"], labels=st["labels"])
+        first = torch.tensor([e.prompt_len - 1 for e in st["examples"]], device=st["device"])
+        rows = torch.arange(len(st["examples"]), device=st["device"])
+        pred_accept = (out.logits[rows, first].argmax(-1) == self.ids.accept).tolist()
+
+        v = self._val
+        v["pred"] += pred_accept
+        v["label"] += st["cb"].is_accept
+        v["chat_e"] += st["chat_e"]
+        v["chat_n"] += st["chat_n"]
+        try:
+            e, n = self._corrected_wer(st["carry"], return_counts=True)
+            v["corr_e"] += e
+            v["corr_n"] += n
+        except Exception as exc:
+            logging.warning("val corrected_wer failed: %s", exc)
+
+    def on_validation_epoch_start(self):
+        self._val = {"pred": [], "label": [], "chat_e": 0, "chat_n": 0, "corr_e": 0, "corr_n": 0}
+
+    def on_validation_epoch_end(self):
+        v = getattr(self, "_val", None) or {
+            "pred": [],
+            "label": [],
+            "chat_e": 0,
+            "chat_n": 0,
+            "corr_e": 0,
+            "corr_n": 0,
+        }
+        stats = decision_stats(v["pred"], v["label"]) if v["pred"] else {}
+        vals = {
+            "val_chat_wer_tf": (v["chat_e"] / v["chat_n"]) if v["chat_n"] else 0.0,
+            "val_corrected_wer": (v["corr_e"] / v["corr_n"]) if v["corr_n"] else 0.0,
+            **{f"val_{k}": float(x) for k, x in stats.items()},
+        }
+        # Fixed key set, every rank, every epoch -- same rule as _METRIC_KEYS.
+        for k in _VAL_METRIC_KEYS:
+            self.log(
+                k,
+                float(vals.get(k, 0.0)),
+                prog_bar=k in ("val_corrected_wer", "val_chat_wer_tf"),
+                sync_dist=True,
+            )
+        self._val = None
+
     def training_step(self, batch, batch_idx):
         st = self._prepare(batch)
         if st is None:
