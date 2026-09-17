@@ -39,11 +39,69 @@ from nemo.utils import logging
 from nemo.utils.exp_manager import exp_manager
 from nemo.utils.trainer_utils import resolve_trainer_cfg
 
-torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
+# Keys that must NEVER be written by a warm start. ``perception.encoder`` IS
+# ``chat.encoder`` -- the same module object, shared deliberately -- so loading
+# the donor SCRIPT arm's encoder weights would overwrite the FROZEN CHAT encoder
+# in place and silently corrupt the very model this run is supposed to verify.
+# The corruption would be invisible: shapes match, the load succeeds, and CHAT
+# just quietly stops being the model we measured.
+SHARED_PREFIXES = ("perception.encoder.", "chat.")
+
+
+def _init_from_ckpt(model, path: str) -> None:
+    """Load WEIGHTS ONLY from a training checkpoint, discarding optimizer state.
+
+    This is an INITIALISATION, not a resume: the step counter, LR schedule and
+    optimizer moments are left fresh, so the corrector starts its own schedule
+    from step 0 with the donor SCRIPT arm's parameters. The warm start is
+    deliberately PARTIAL -- the encoder comes from CHAT, not from the donor.
+
+    A checkpoint matching NOTHING raises rather than no-ops: a silent miss looks
+    exactly like a successful warm start while training from scratch, which is
+    precisely what this run did before the key was wired up at all.
+    """
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    src = ckpt.get("state_dict", ckpt)
+    tgt = model.state_dict()
+
+    loaded, skipped, missing, shared = {}, [], [], 0
+    for k, v in src.items():
+        if k.startswith(SHARED_PREFIXES):
+            shared += 1
+            continue
+        if k in tgt and tgt[k].shape == v.shape:
+            loaded[k] = v
+        elif k in tgt:
+            skipped.append(f"{k} {tuple(v.shape)} != {tuple(tgt[k].shape)}")
+        else:
+            missing.append(k)
+
+    if not loaded:
+        raise ValueError(
+            f"init_from_ckpt matched ZERO parameters from {path}. "
+            f"{len(skipped)} shape mismatches, {len(missing)} keys absent, {shared} shared-encoder keys held back. "
+            "Refusing to train from scratch under the guise of a warm start."
+        )
+
+    model.load_state_dict(loaded, strict=False)
+    logging.info(
+        "init_from_ckpt: loaded %d/%d tensors from %s (%d shape-mismatched, %d unknown, %d shared-encoder held back)",
+        len(loaded),
+        len(tgt),
+        path,
+        len(skipped),
+        len(missing),
+        shared,
+    )
+    for line in skipped[:10]:
+        logging.warning("init_from_ckpt: shape mismatch, left at init: %s", line)
 
 
 @hydra_runner(config_path="conf", config_name="streaming_stt_granary2_lora_script_corrector")
 def train(cfg):
+    # At module scope this ran on import, which made the module unimportable on a
+    # CPU-only box and so untestable.
+    torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
     OmegaConf.resolve(cfg)
     torch.distributed.init_process_group(backend="nccl")
     torch.set_float32_matmul_precision("medium")
@@ -53,6 +111,13 @@ def train(cfg):
     OmegaConf.save(cfg, log_dir / "exp_config.yaml")
 
     model = ScriptCorrectorModel(OmegaConf.to_container(cfg.model, resolve=True))
+
+    # The launcher passes ++init_from_ckpt; before this existed the key was
+    # accepted by Hydra and then read by nobody, so every corrector run so far
+    # trained cold.
+    init_ckpt = cfg.get("init_from_ckpt", None)
+    if init_ckpt:
+        _init_from_ckpt(model, str(init_ckpt))
 
     ds_cfg = cfg.data.train_ds
     with open_dict(ds_cfg):
