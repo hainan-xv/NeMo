@@ -195,79 +195,45 @@ class ScriptCorrectorModel(ScriptSTTModel):
 
     @torch.no_grad()
     def _chat_hypotheses(self, enc, enc_len, ref_id_chunks, n_chunks):
-        """Greedy CHAT output per chunk, conditioned on the REFERENCE prefix."""
+        """Greedy CHAT output per chunk, conditioned on CHAT'S OWN history.
+
+        FREE-RUNNING, not teacher-forced, and the reason is not a preference --
+        teacher forcing cannot produce a coherent transcript here at all.
+
+        CHAT defers words past a chunk boundary by design; in free-running decode
+        they reappear in the next chunk and the transcript is complete. Feed it
+        the REFERENCE prefix instead and the deferred words are already present
+        in that prefix, so CHAT never re-emits them and they vanish from the
+        concatenation. Every boundary leaks a word or two. Measured: a
+        deletion-dominated 0.40-0.49 WER against CHAT's true ~0.08, visible in
+        the sample dump as a missing tail on nearly every chunk --
+        "help you out" -> "help you", "provide you with an" -> "provide you with".
+
+        The labelling rule flattens the hypothesis and aligns it to the
+        reference, which presumes a real transcript. So the hypothesis has to be
+        one.
+
+        The cost is the property reference-history was chosen for: at inference
+        the corrector sees history that has ALREADY been corrected, whereas here
+        it sees CHAT's raw output. That mismatch is real, and an early error now
+        propagates into later chunks' context -- but it is a second-order effect
+        next to a hypothesis that is not a transcript.
+        """
         from nemo.collections.speechlm2.parts.chat_fusion import ChatFusionScorer, chat_only_chunk
 
         scorer = ChatFusionScorer(self.chat, enc, enc_len)
         B = len(ref_id_chunks)
         hyp = [[] for _ in range(B)]
-        for k in range(max(n_chunks)):
+        for k in range(max(n_chunks) if n_chunks else 0):
             rows = [b for b in range(B) if k < n_chunks[b]]
             if not rows:
                 continue
-            prefixes = [[t for c in ref_id_chunks[b][:k] for t in c] for b in rows]
+            # CHAT's OWN emitted prefix, so deferred words carry forward.
+            prefixes = [[t for c in hyp[b] for t in c] for b in rows]
             toks, _ = chat_only_chunk(scorer, rows, k, prefixes, max_new_tokens=32, margin_threshold=0.0)
             for i, b in enumerate(rows):
                 hyp[b].append(toks[i])
         return hyp
-
-    # ------------------------------------------------------------- train step
-    # ------------------------------------------------------------- validation
-    def validation_step(self, batch, batch_idx, dataloader_idx=0):
-        """Same pipeline as training, but ACCUMULATED rather than logged per batch.
-
-        Nothing is logged here on purpose. Logging inside the loop would both
-        average rates (wrong for corpus WER) and make the number of collectives
-        depend on how many val batches a rank happened to receive -- the same
-        desync that killed dfw_corrector_v1.
-        """
-        try:
-            st = self._prepare(batch)
-        except RuntimeError:
-            return
-        if st is None:
-            return
-
-        out = self.llm(inputs_embeds=st["embeds"], attention_mask=st["attn"], labels=st["labels"])
-        first = torch.tensor([e.prompt_len - 1 for e in st["examples"]], device=st["device"])
-        rows = torch.arange(len(st["examples"]), device=st["device"])
-        pred_accept = (out.logits[rows, first].argmax(-1) == self.ids.accept).tolist()
-
-        v = self._val
-        v["pred"] += pred_accept
-        v["label"] += st["cb"].is_accept
-        v["chat_e"] += st["chat_e"]
-        v["chat_n"] += st["chat_n"]
-        try:
-            w = self._corrected_wer(st["carry"], return_counts=True)
-            v["corr_e"] += w[0]
-            v["corr_n"] += w[1]
-        except Exception as e:
-            logging.warning("val corrected_wer failed: %s", e)
-
-    def on_validation_epoch_start(self):
-        self._val = {"pred": [], "label": [], "chat_e": 0, "chat_n": 0, "corr_e": 0, "corr_n": 0}
-
-    def on_validation_epoch_end(self):
-        v = getattr(self, "_val", None) or {
-            "pred": [],
-            "label": [],
-            "chat_e": 0,
-            "chat_n": 0,
-            "corr_e": 0,
-            "corr_n": 0,
-        }
-        stats = decision_stats(v["pred"], v["label"]) if v["pred"] else {}
-        vals = {
-            "val_chat_wer_tf": (v["chat_e"] / v["chat_n"]) if v["chat_n"] else 0.0,
-            "val_corrected_wer": (v["corr_e"] / v["corr_n"]) if v["corr_n"] else 0.0,
-            **{f"val_{k}": float(x) for k, x in stats.items()},
-        }
-        for k in _VAL_METRIC_KEYS:
-            self.log(
-                k, float(vals.get(k, 0.0)), prog_bar=k in ("val_corrected_wer", "val_chat_wer_tf"), sync_dist=True
-            )
-        self._val = None
 
     # ------------------------------------------------------- shared pipeline
     def _prepare(self, batch):

@@ -327,7 +327,11 @@ exp_manager:
 
   checkpoint_callback_params:
     filename: "{step}-{val_wer:.4f}"
-    monitor: val_wer
+    # The corrector never logs val_wer -- it logs val_corrected_wer, the WER
+    # AFTER its decisions. Monitoring the inherited key raises
+    # MisconfigurationException at the first checkpoint, after validation has
+    # already run and the metric it wanted was sitting right there.
+    monitor: val_corrected_wer
     mode: min
     every_n_train_steps: null
     every_n_epochs: 1
