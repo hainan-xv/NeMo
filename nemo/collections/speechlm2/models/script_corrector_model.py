@@ -194,7 +194,8 @@ class ScriptCorrectorModel(ScriptSTTModel):
         instr = self.tokenizer.text_to_ids(self.system_prompt + "\n")
         examples, frame_src = [], []
         for b in range(len(n_chunks)):
-            hyp_w = [self.tokenizer.ids_to_text(t).split() if t else [] for t in hyp_i[b]]
+            # ONE detokenization of the whole hypothesis, not per chunk.
+            hyp_w = self.tokenizer.ids_to_text([t for c in hyp_i[b] for t in c]).split()
             lens = [min(cs, max(0, int(enc_len[b]) - k * cs)) for k in range(n_chunks[b])]
             exs = corrector_examples_for_utterance(
                 instr,
@@ -249,7 +250,7 @@ class ScriptCorrectorModel(ScriptSTTModel):
             # must not be quoted as CHAT's WER, hence the _tf suffix.
             e_tot = n_tot = 0
             for b in range(len(n_chunks)):
-                hw = [w for t in hyp_i[b] for w in self.tokenizer.ids_to_text(t).split()]
+                hw = self.tokenizer.ids_to_text([t for c in hyp_i[b] for t in c]).split()
                 rw = [w for c in ref_w[b] for w in c]
                 e, n = word_errors([simple_normalize(w) for w in hw], [simple_normalize(w) for w in rw])
                 e_tot += e
@@ -293,18 +294,21 @@ class ScriptCorrectorModel(ScriptSTTModel):
         dev = st["device"]
         e_tot = n_tot = 0
         for b in range(len(st["n_chunks"])):
-            out_words: List[str] = []
+            out_ids: List[int] = []
             history: List[int] = []
             for k in range(st["n_chunks"][b]):
                 hyp = st["hyp_i"][b][k]
                 alen = min(cs, max(0, int(st["enc_len"][b]) - k * cs))
-                ex = corrector_examples_for_utterance(st["instr"], [[]], [[]], [hyp], [[]], [alen], ids=self.ids)[0]
+                ex = corrector_examples_for_utterance(st["instr"], [[]], [[]], [hyp], [], [alen], ids=self.ids)[0]
                 tail = ex.input_ids[len(st["instr"]) : ex.prompt_len]
                 ids_t = torch.tensor([list(st["instr"]) + history + tail], dtype=torch.long, device=dev)
                 logits = self.llm(inputs_embeds=self._embed_tokens(ids_t)).logits[0, -1]
                 toks = hyp if int(logits.argmax()) == self.ids.accept else st["ref_i"][b][k]
-                out_words += self.tokenizer.ids_to_text(toks).split() if toks else []
+                out_ids += list(toks)
                 history = history + list(st["ref_i"][b][k])
+            # One detokenization of the whole output, for the same reason as above:
+            # per-chunk detokenization splits words that straddle a boundary.
+            out_words = self.tokenizer.ids_to_text(out_ids).split() if out_ids else []
             rw = [w for c in st["ref_w"][b] for w in c]
             e, n = word_errors([simple_normalize(w) for w in out_words], [simple_normalize(w) for w in rw])
             e_tot += e

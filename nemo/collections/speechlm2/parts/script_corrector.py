@@ -143,7 +143,7 @@ def corrector_examples_for_utterance(
     ref_chunk_words: Sequence[Sequence[str]],
     ref_chunk_ids: Sequence[Sequence[int]],
     hyp_chunk_ids: Sequence[Sequence[int]],
-    hyp_chunk_words: Sequence[Sequence[str]],
+    hyp_words_flat: Sequence[str],
     audio_lens: Sequence[int],
     ids: CorrectorIds = CorrectorIds(),
     ignore_index: int = -100,
@@ -166,15 +166,19 @@ def corrector_examples_for_utterance(
     from nemo.collections.asr.parts.utils.chunk_error_labels import label_chunks
 
     n = len(ref_chunk_words)
-    if not (len(ref_chunk_ids) == len(hyp_chunk_ids) == len(hyp_chunk_words) == len(audio_lens) == n):
+    if not (len(ref_chunk_ids) == len(hyp_chunk_ids) == len(audio_lens) == n):
         raise ValueError(
             "per-chunk inputs disagree on length: "
             f"ref_words={len(ref_chunk_words)} ref_ids={len(ref_chunk_ids)} "
-            f"hyp_ids={len(hyp_chunk_ids)} hyp_words={len(hyp_chunk_words)} audio={len(audio_lens)}"
+            f"hyp_ids={len(hyp_chunk_ids)} audio={len(audio_lens)}"
         )
 
-    flat_hyp = [w for c in hyp_chunk_words for w in c]
-    labels, _ = label_chunks(flat_hyp, ref_chunk_words, normalize=normalize)
+    # The hypothesis arrives ALREADY FLAT and detokenized as one string. Joining
+    # per-chunk detokenizations instead splits any word that straddles a chunk
+    # boundary into two fragments -- CHAT emits BPE pieces and is under no
+    # obligation to break at word edges -- which measured 41% WER against a true
+    # ~8%. The labeller ignores hypothesis chunking by design, so nothing is lost.
+    labels, _ = label_chunks(list(hyp_words_flat), ref_chunk_words, normalize=normalize)
 
     out: List[CorrectorExample] = []
     history: List[int] = []

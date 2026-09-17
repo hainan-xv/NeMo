@@ -134,7 +134,10 @@ from nemo.collections.speechlm2.parts.script_corrector import corrector_examples
 def _utt(hyp_words, hyp_ids, ref_words=None, ref_ids=None):
     ref_words = ref_words or [["a", "b"], ["c", "d"]]
     ref_ids = ref_ids or [[41, 42], [43, 44]]
-    return corrector_examples_for_utterance(INSTR, ref_words, ref_ids, hyp_ids, hyp_words, [14, 14])
+    # The assembler takes a FLAT hypothesis word list: joining per-chunk
+    # detokenizations would split words straddling a chunk boundary.
+    flat = [w for c in hyp_words for w in c]
+    return corrector_examples_for_utterance(INSTR, ref_words, ref_ids, hyp_ids, flat, [14, 14])
 
 
 def test_perfect_hypothesis_yields_all_accept():
@@ -173,7 +176,7 @@ def test_first_chunk_has_empty_history():
 
 def test_mismatched_per_chunk_input_lengths_are_rejected():
     with pytest.raises(ValueError, match="disagree on length"):
-        corrector_examples_for_utterance(INSTR, [["a"]], [[41]], [[41], [42]], [["a"], ["b"]], [14])
+        corrector_examples_for_utterance(INSTR, [["a"]], [[41]], [[41], [42]], ["a", "b"], [14])
 
 
 # --------------------------------------------------------------------------
@@ -292,3 +295,17 @@ def test_wer_accumulates_additively_not_as_a_mean_of_rates():
     e1, n1 = word_errors(["X"], ["a"])
     e2, n2 = word_errors(list("bcdefghij"), list("bcdefghij"))
     assert (e1 + e2) / (n1 + n2) == pytest.approx(0.1)
+
+
+def test_a_word_straddling_a_chunk_boundary_is_not_two_errors():
+    """The bug that measured 41% WER against a true ~8%.
+
+    CHAT emits BPE pieces and may split a word across chunks. Detokenizing each
+    chunk and joining turns one word into two fragments; the assembler therefore
+    takes the hypothesis ALREADY detokenized as one flat sequence.
+    """
+    # "hello" arrived as two chunks of pieces, detokenized together -> one word
+    ex = corrector_examples_for_utterance(
+        INSTR, [["hello"], ["world"]], [[41], [42]], [[7], [8]], ["hello", "world"], [14, 14]
+    )
+    assert [e.is_accept for e in ex] == [True, True]
