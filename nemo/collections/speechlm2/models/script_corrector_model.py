@@ -516,7 +516,8 @@ class ScriptCorrectorModel(ScriptSTTModel):
         if every and self.global_step % every == 0 and self.trainer.global_rank == 0 and st["sample"]:
             try:
                 cap = int(getattr(self.core_cfg, "sample_correction_max_tokens", 0) or 24)
-                preds, gens = self._sample_predictions(st, st["sample_rows"], cap)
+                preds = pred_accept[: st["sample_rows"]]
+                gens = self._sample_predictions(st, st["sample_rows"], cap, preds)
                 logging.info("\n" + format_sample(*st["sample"], step=self.global_step, preds=preds, gens=gens))
             except Exception as e:
                 # A diagnostic print must never take the run down with it.
@@ -532,8 +533,15 @@ class ScriptCorrectorModel(ScriptSTTModel):
         return loss
 
     @torch.no_grad()
-    def _sample_predictions(self, st, n: int, max_new_tokens: int):
-        """``(preds, gens)``: what the model SAYS, for the periodic dump.
+    def _sample_predictions(self, st, n: int, max_new_tokens: int, preds):
+        """``gens``: the model's generated correction for each rejected chunk.
+
+        The accept/reject decision is PASSED IN, taken from the same
+        ``out.logits`` the metrics are computed from, rather than recomputed
+        here. A second forward is a second implementation, and the two disagreed:
+        this dump reported every chunk rejected while reject_recall was 0.375,
+        which is only possible if the model was accepting most bad chunks. One of
+        them was wrong and the printout is not the one to trust.
 
         Greedy, and capped: an undertrained corrector asked for free text will
         happily run to the context limit, which would turn a diagnostic print
@@ -544,27 +552,30 @@ class ScriptCorrectorModel(ScriptSTTModel):
         compute is safe; a rank-conditional ``self.log(sync_dist=True)`` is a
         collective and would desync the run, which has already happened once.
         """
-        preds, gens = [], []
+        gens = []
         dev = st["device"]
         for k in range(n):
+            if k >= len(preds) or preds[k]:
+                gens.append(None)  # accepted: there is no correction to show
+                continue
             ex = st["examples"][k]
             cur = st["embeds"][k : k + 1, : ex.prompt_len]
             toks = []
             for _ in range(max(1, max_new_tokens)):
                 nxt = int(self.llm(inputs_embeds=cur).logits[0, -1].argmax())
-                toks.append(nxt)
-                if nxt == self.ids.eot or (len(toks) == 1 and nxt == self.ids.accept):
+                if nxt == self.ids.accept and not toks:
+                    # The generator disagrees with the logged decision. Say so
+                    # rather than hide it -- it means the two paths have drifted
+                    # apart again.
+                    toks = []
                     break
+                if nxt == self.ids.eot:
+                    break
+                toks.append(nxt)
                 cur = torch.cat([cur, self._embed_tokens(torch.tensor([[nxt]], device=dev))], dim=1)
-            accept = toks[0] == self.ids.accept
-            preds.append(accept)
-            if accept:
-                gens.append(None)
-            else:
-                body = [t for t in toks if t != self.ids.eot]
-                text = self.tokenizer.ids_to_text(body) if body else ""
-                gens.append(text + ("..." if len(toks) >= max(1, max_new_tokens) else ""))
-        return preds, gens
+            text = self.tokenizer.ids_to_text(toks) if toks else ""
+            gens.append(text + ("..." if len(toks) >= max(1, max_new_tokens) else ""))
+        return gens
 
     @torch.no_grad()
     def _corrected_wer(self, st, return_counts: bool = False):
@@ -648,6 +659,10 @@ class ScriptCorrectorModel(ScriptSTTModel):
                     "train_reject_recall",
                     "train_chat_wer_tf",
                     "train_label_accept_frac",
+                    # THE collapse detector, and it was wandb-only: with ~90% of
+                    # chunks needing no change, which way this drifts is the
+                    # single most diagnostic number in the run.
+                    "train_pred_accept_frac",
                 ),
                 sync_dist=True,
             )
