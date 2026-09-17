@@ -27,6 +27,7 @@ from typing import Callable, List, Optional, Sequence, Tuple
 
 __all__ = [
     "assert_clean_transcript",
+    "clean_transcript",
     "assign_words_to_chunks",
     "build_forced_path",
     "word_spans",
@@ -220,6 +221,29 @@ def assert_clean_transcript(transcript: str, source: str = "") -> None:
             f"{f' in {source}' if source else ''}: {transcript[-40:]!r}. "
             "This tokenizes to an orphan word-start piece at the end of the targets."
         )
+
+
+def clean_transcript(transcript: str):
+    """``(cleaned, n_fixed)`` -- collapse whitespace that would orphan a token.
+
+    REPAIRS rather than raises. The same code path builds training AND validation
+    targets, and the mcv11 validation manifest has a double space in 25% of its
+    utterances (the comma was merged onto the previous word, leaving an empty
+    placeholder). A hard assertion there kills the job at the first validation
+    epoch -- which is exactly what it did.
+
+    Collapsing is the right repair, not a workaround: the orphan piece carries no
+    word, so removing it makes the targets match the words they are supposed to
+    encode. See :func:`assert_clean_transcript` for what counts as orphaning and
+    why a tab or a leading space does not.
+
+    Returns the count so the caller can report it. Silence would turn a data
+    defect into an invisible one, which is how this started.
+    """
+    if not transcript:
+        return transcript, 0
+    fixed = " ".join(transcript.split())
+    return fixed, int(fixed != transcript)
 
 
 def assign_words_to_chunks(

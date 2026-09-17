@@ -57,6 +57,7 @@ from nemo.collections.asr.parts.utils.chat_alignment import (
     assign_words_to_chunks,
     build_forced_path,
     chunk_texts,
+    clean_transcript,
     word_core_end,
     word_spans,
 )
@@ -228,7 +229,15 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
             )
         # How often to report aligner/transcript spelling mismatches. 0 disables.
         self.log_target_mismatch_every_n_steps = int(fa.get("log_target_mismatch_every_n_steps", 500))
-        self._mismatch_stats = {"utts": 0, "words": 0, "respelled": 0, "dropped": 0, "missing": 0, "fallback": 0}
+        self._mismatch_stats = {
+            "utts": 0,
+            "words": 0,
+            "respelled": 0,
+            "dropped": 0,
+            "missing": 0,
+            "fallback": 0,
+            "whitespace_fixed": 0,
+        }
         self._mismatch_examples: List[str] = []
         self._fallback_examples: List[str] = []
         self._mismatch_last_logged = -1
@@ -487,11 +496,22 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
         aligned = (cut.custom or {}).get("alignments", []) or []
         words = [w["text"] for w in aligned]
         transcript = " ".join(s.text for s in cut.supervisions if s.text) if cut.supervisions else ""
-        # Fail loudly on text that would tokenize to an orphan word-start piece.
-        # The chunk targets below are a SPLIT of one tokenization of this string,
-        # so a marker with no word attached silently consumes an emission slot
-        # and desynchronises a chunk's token count from its word count.
-        assert_clean_transcript(transcript, source=str(getattr(cut, "id", "")))
+        # Repair text that would tokenize to an orphan word-start piece. The
+        # chunk targets below are a SPLIT of one tokenization of this string, so
+        # a marker with no word attached silently consumes an emission slot and
+        # desynchronises a chunk's token count from its word count. REPAIRED, not
+        # asserted: this path serves validation too, and the mcv11 dev manifest
+        # has this in 25% of utterances -- a raise here killed job 18848949 at
+        # the first validation epoch. Counted and sampled so it stays visible.
+        transcript, n_fixed = clean_transcript(transcript)
+        if n_fixed:
+            self._mismatch_stats["whitespace_fixed"] += 1
+            if self._mismatch_stats["whitespace_fixed"] <= 3:
+                logging.warning(
+                    "transcript had orphaning whitespace (repaired) in %s: %r",
+                    getattr(cut, "id", "?"),
+                    transcript[:80],
+                )
 
         groups = assign_words_to_chunks(
             [w["end_time"] for w in aligned],
