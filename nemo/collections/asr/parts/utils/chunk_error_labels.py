@@ -110,6 +110,38 @@ def align_words(hyp: Sequence[str], ref: Sequence[str]) -> List[Tuple[str, int, 
     return out
 
 
+def _expand(owned, ref_at, ref_all, n):
+    """Alignable-word indices per chunk -> the ORIGINAL reference words per chunk.
+
+    Words that normalise to nothing -- a standalone "," or "." on its own, which
+    CHAT's punctuated references really do contain -- take no part in the
+    alignment and so are owned by nobody. Dropping them would make every
+    correction strip punctuation and would break the invariant that the per-chunk
+    spans concatenate back to the reference. Each is attached to the chunk owning
+    the NEXT alignable word, which is where it would be read.
+    """
+    owner = {}
+    for k, idxs in enumerate(owned):
+        for a in idxs:
+            owner[ref_at[a]] = k
+
+    out: List[List[str]] = [[] for _ in range(n)]
+    pending: List[str] = []
+    last = None
+    for oi, w in enumerate(ref_all):
+        k = owner.get(oi)
+        if k is None:
+            pending.append(w)
+            continue
+        out[k].extend(pending)
+        pending = []
+        out[k].append(w)
+        last = k
+    if pending:  # trailing punctuation follows the last real word
+        out[last if last is not None else n - 1].extend(pending)
+    return out
+
+
 def label_chunks(
     hyp_chunks: Sequence[Sequence[str]],
     ref_chunks: Sequence[Sequence[str]],
@@ -150,14 +182,20 @@ def label_chunks(
                 hyp_words.append(x)
                 hyp_owner.append(k)
 
+    # ref_all keeps EVERY reference word, including the ones that normalise to
+    # nothing. Only the alignable ones take part in the alignment, but a chunk's
+    # target is rebuilt from ref_all -- otherwise a standalone "," is owned by no
+    # chunk at all and every correction silently strips it.
     ref_words: List[str] = []
-    ref_orig: List[str] = []
+    ref_at: List[int] = []
+    ref_all: List[str] = []
     for c in ref_chunks:
         for w in c:
+            ref_all.append(w)
             x = norm(w)
             if x:
                 ref_words.append(x)
-                ref_orig.append(w)
+                ref_at.append(len(ref_all) - 1)
 
     n = len(hyp_chunks)
     if n == 0:
@@ -170,7 +208,7 @@ def label_chunks(
     if hyp_words == ref_words:
         for i in range(len(ref_words)):
             owned[hyp_owner[i]].append(i)
-        return [None] * n, 0, [[ref_orig[j] for j in o] for o in owned]
+        return [None] * n, 0, _expand(owned, ref_at, ref_all, n)
 
     bad = set()
     pending_del: List[int] = []
@@ -197,6 +235,6 @@ def label_chunks(
         owned[n - 1].extend(pending_del)
         bad.add(n - 1)
 
-    out_words = [[ref_orig[j] for j in sorted(o)] for o in owned]
+    out_words = _expand([sorted(o) for o in owned], ref_at, ref_all, n)
     labels = [(" ".join(out_words[k]) if k in bad else None) for k in range(n)]
     return labels, len(bad), out_words

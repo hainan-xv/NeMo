@@ -25,7 +25,12 @@
 # showed: val_corrected_wer went 0.0891 -> 0.0916 -> 0.1090 while chat_wer_tf sat
 # at 0.0876, i.e. correcting made the transcript WORSE, monotonically.
 # resume_if_exists would have reloaded those weights, so the run needs a new name.
-# v1 and v2 artifacts are left on disk untouched for comparison.
+#
+# v4, not v3: v3 had the hypothesis-space labels but rebuilt targets only from
+# words that survive normalisation, so a standalone "," -- which the punctuated
+# references really do contain -- was owned by no chunk and every correction
+# quietly stripped it. Targets now carry the original reference text verbatim.
+# v1..v3 artifacts are left on disk untouched for comparison.
 #
 # Short runs are not useful here: 200 steps on a 93%-ACCEPT corpus is long
 # enough to learn "always accept" and nothing else. This runs to the wall clock.
@@ -67,7 +72,7 @@ CODE_DIR="${CODE_DIR:-${MYDIR}/NeMo_SCRIPT_cc}"
 PROJECT_NAME="${PROJECT_NAME:-SpeechlmDFW}"
 CONFIG_PATH=/code/examples/speechlm2/conf
 CONFIG_NAME="${CONFIG_NAME:-streaming_stt_granary2_lora_script_corrector}"
-EXP_NAME="${EXP_NAME:-dfw_corrector_v3}"
+EXP_NAME="${EXP_NAME:-dfw_corrector_v4}"
 
 # The model being verified, and the SCRIPT checkpoint we warm-start from.
 CHAT_ARM="${CHAT_ARM:-dfw_granary2_chat_banded1_nodelay_v2}"

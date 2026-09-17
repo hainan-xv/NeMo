@@ -281,3 +281,93 @@ def test_reconstruction_holds_over_random_errors_and_chunkings(seed):
 
     assert [w for c in owned for w in c] == ref_words, "the reference spans must partition the reference"
     assert _stitch(hyp_chunks, labels, owned) == ref_words, "accept-or-correct must rebuild the reference"
+
+
+# --------------------------------------------------------------------------
+# Words that normalise to nothing must still survive into the targets.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_a_word_emitted_late_is_not_dropped_from_the_target():
+    """REGRESSION. Reference 'like | , I'm not', hypothesis emitting 'like' one
+    chunk late. Reference-indexed labels targeted chunk 21 with ', I'm not',
+    deleting 'like' -- it lived in the PREVIOUS reference chunk."""
+    ref = [["like"], [",", "I'm", "not"], []]
+    hyp = [[], ["like,", "I", "don't", "know"], ["."]]
+    labels, _, owned = label_chunks(hyp, ref, normalize=simple_normalize)
+    assert "like" in labels[1], f"the late-emitted word was dropped: {labels[1]!r}"
+    assert [w for c in owned for w in c] == ["like", ",", "I'm", "not"]
+
+
+@pytest.mark.unit
+def test_standalone_punctuation_survives_into_the_correction_target():
+    """A bare ',' normalises to '' and takes no part in the alignment, so it is
+    owned by nobody unless explicitly reattached -- and every correction would
+    quietly strip the reference's punctuation."""
+    ref = [["hello"], [",", "world"]]
+    hyp = [["hello"], ["planet"]]
+    labels, _, owned = label_chunks(hyp, ref, normalize=simple_normalize)
+    assert "," in labels[1], f"punctuation stripped from the target: {labels[1]!r}"
+    assert [w for c in owned for w in c] == ["hello", ",", "world"]
+
+
+@pytest.mark.unit
+def test_trailing_punctuation_follows_the_last_real_word():
+    ref = [["a", "b"], ["c", "."]]
+    hyp = [["a", "b"], ["X"]]
+    _, _, owned = label_chunks(hyp, ref, normalize=simple_normalize)
+    assert [w for c in owned for w in c] == ["a", "b", "c", "."]
+
+
+@pytest.mark.unit
+def test_leading_punctuation_attaches_to_the_first_real_word():
+    ref = [[",", "a"], ["b"]]
+    hyp = [["a"], ["b"]]
+    _, _, owned = label_chunks(hyp, ref, normalize=simple_normalize)
+    assert [w for c in owned for w in c] == [",", "a", "b"]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("seed", range(40))
+def test_reconstruction_holds_with_punctuation_and_normalisation(seed):
+    """The fuzz test above runs without a normalizer, so every word is alignable.
+    This one mixes in bare punctuation and casing, which is what the real
+    references look like -- and is the case that hid the dropped comma.
+    """
+    import random
+
+    rnd = random.Random(1000 + seed)
+    ref_all = []
+    for i in range(rnd.randint(4, 12)):
+        ref_all.append(rnd.choice([f"w{i}", f"W{i},", f"w{i}."]))
+        if rnd.random() < 0.25:
+            ref_all.append(rnd.choice([",", ".", "?"]))  # a bare punctuation token
+
+    hyp_words = []
+    for w in ref_all:
+        if not simple_normalize(w):
+            continue  # the ASR does not emit bare punctuation as its own word
+        r = rnd.random()
+        if r < 0.15:
+            continue
+        hyp_words.append("SUB" if r < 0.30 else w)
+        if r > 0.93:
+            hyp_words.append("INS")
+
+    def _rand_chunks(words):
+        if not words:
+            return [[]]
+        cuts = sorted(rnd.sample(range(1, len(words) + 1), k=min(3, len(words))))
+        out, prev = [], 0
+        for c in cuts:
+            out.append(words[prev:c])
+            prev = c
+        out.append(words[prev:])
+        return out
+
+    ref_chunks = _rand_chunks(ref_all)
+    hyp_chunks = _rand_chunks(hyp_words)
+    _, _, owned = label_chunks(hyp_chunks, ref_chunks, normalize=simple_normalize)
+
+    assert [w for c in owned for w in c] == ref_all, "every reference word, punctuation included, must survive"
