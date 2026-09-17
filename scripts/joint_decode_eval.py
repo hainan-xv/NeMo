@@ -137,6 +137,7 @@ def decode_batch(
     stats=None,
     skips=(float("inf"),),
     skipped=None,
+    hists=(0,),
 ):
     """Decode a BATCH at every lam, through SCRIPT's production decode loop.
 
@@ -160,19 +161,26 @@ def decode_batch(
     for lam in lams:
         for tau in taus:
             for sk in skips:
-                out[(lam, tau, sk)] = script_m.generate(
-                    wav,
-                    wav_len,
-                    system_prompt=prompt,
-                    max_new_tokens=max_new_tokens,
-                    chunk_size_override=chunk_size,
-                    chat_fusion=None if lam == 0.0 else scorer,
-                    fusion_lam=lam,
-                    fusion_margin_threshold=tau,
-                    fusion_stats=stats.get((lam, tau, sk)) if stats else None,
-                    fusion_skip_threshold=sk,
-                    fusion_skipped=skipped.get((lam, tau, sk)) if skipped else None,
-                )
+                for h in hists:
+                    out[(lam, tau, sk, h)] = script_m.generate(
+                        wav,
+                        wav_len,
+                        system_prompt=prompt,
+                        max_new_tokens=max_new_tokens,
+                        chunk_size_override=chunk_size,
+                        # lam=0 normally means "SCRIPT alone, never build the CHAT
+                        # scorer". But with a skip threshold set, CHAT is still
+                        # needed -- it decides WHICH chunks SCRIPT sees. Nulling it
+                        # here would silently turn an either-or routing run into a
+                        # plain SCRIPT-alone run that happens to report a skip rate.
+                        chat_fusion=None if (lam == 0.0 and sk == float("inf")) else scorer,
+                        fusion_lam=lam,
+                        fusion_margin_threshold=tau,
+                        fusion_stats=stats.get((lam, tau, sk, h)) if stats else None,
+                        fusion_skip_threshold=sk,
+                        fusion_skipped=skipped.get((lam, tau, sk, h)) if skipped else None,
+                        max_history_tokens=h,
+                    )
     return out
 
 
@@ -204,6 +212,14 @@ def main() -> int:
     )
     ap.add_argument("--fusion_stats", action="store_true", help="report override rate by CHAT confidence")
     ap.add_argument(
+        "--max_history_tokens",
+        default="0",
+        help="comma-separated caps on SCRIPT's TEXT-history conditioning (0 = unlimited). "
+        "SCRIPT rebuilds instruction+history+audio every chunk, so history growth makes decode "
+        "O(T^2) in chunks; a cap makes it O(T). NOTE the v2 models trained with UNLIMITED history, "
+        "so any cap is a train/test mismatch -- this measures how much long context they actually use.",
+    )
+    ap.add_argument(
         "--skip_threshold",
         default="inf",
         help="ON-DEMAND fusion: decode each chunk with CHAT alone first and only invoke SCRIPT "
@@ -226,6 +242,7 @@ def main() -> int:
     lams = [float(x) for x in args.lam.split(",") if x.strip()]
     taus = [float(x) for x in args.margin_threshold.split(",") if x.strip()]
     skips = [float(x) for x in args.skip_threshold.split(",") if x.strip()]
+    hists = [int(x) for x in args.max_history_tokens.split(",") if x.strip()]
     device = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float32
 
@@ -255,7 +272,7 @@ def main() -> int:
             flush=True,
         )
 
-        keys = [(l, t, s_) for l in lams for t in taus for s_ in skips]
+        keys = [(l, t, s_, h) for l in lams for t in taus for s_ in skips for h in hists]
         skipped = {k: {} for k in keys}
         stats = None
         if args.fusion_stats:
@@ -281,6 +298,7 @@ def main() -> int:
                 stats,
                 skips,
                 skipped,
+                hists,
             )
             for k in keys:
                 hyps[k].extend(got[k])
@@ -294,24 +312,24 @@ def main() -> int:
                 for j in range(min(2, len(chunk_paths))):
                     print(f"   ref: {refs[j]}")
                     for k in keys:
-                        print(f"   lam={k[0]} tau={k[1]} skip={k[2]}: {got[k][j]}")
+                        print(f"   lam={k[0]} skip={k[2]} hist={k[3]}: {got[k][j]}")
 
-        print(f"\n  {'lam':>6}  {'tau':>6}  {'skip':>6}  {'WER%':>7}  {'SCRIPT skipped':>15}")
-        print(f"  {'-'*50}")
-        for lam, tau, sk in keys:
+        print(f"\n  {'lam':>6}  {'skip':>6}  {'hist':>6}  {'WER%':>7}  {'SCRIPT skipped':>15}")
+        print(f"  {'-'*52}")
+        for lam, tau, sk, h in keys:
             # A FRESH scorer per lam: LeaderboardWER accumulates across update()
             # calls, so reusing one would pool every lam's hypotheses together
             # and report the same blended number for all of them.
             sc = LeaderboardWER()
-            sc.update(f"{ds}/{split}", refs, hyps[(lam, tau, sk)])
+            sc.update(f"{ds}/{split}", refs, hyps[(lam, tau, sk, h)])
             wer = sc.compute()["wer"] * 100.0
-            d = skipped.get((lam, tau, sk), {})
+            d = skipped.get((lam, tau, sk, h), {})
             frac = (100.0 * d.get("skipped", 0) / d["total"]) if d.get("total") else 0.0
-            print(f"  {lam:>6}  {tau:>6}  {sk:>6}  {wer:>7.2f}  {frac:>14.1f}%")
+            print(f"  {lam:>6}  {sk:>6}  {h:>6}  {wer:>7.2f}  {frac:>14.1f}%")
         if stats:
             for k in keys:
                 if stats[k].steps:
-                    print(f"\n  lam={k[0]} tau={k[1]} skip={k[2]}\n  " + stats[k].report().replace("\n", "\n  "))
+                    print(f"\n  lam={k[0]} skip={k[2]} hist={k[3]}\n  " + stats[k].report().replace("\n", "\n  "))
     return 0
 
 
