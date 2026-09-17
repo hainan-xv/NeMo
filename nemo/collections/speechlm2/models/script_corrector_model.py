@@ -81,6 +81,20 @@ _METRIC_KEYS = (
     "train_chat_wer_tf",
 )
 
+# Validation reports the same quantities, but ACCUMULATED over the whole split
+# rather than per batch: corpus WER is total edits over total reference words,
+# and averaging per-batch rates would over-weight batches of short utterances.
+# Logged once in on_validation_epoch_end, so the same rank-uniformity rule
+# applies there -- every rank logs every key, every epoch.
+_VAL_METRIC_KEYS = (
+    "val_chat_wer_tf",
+    "val_corrected_wer",
+    "val_reject_precision",
+    "val_reject_recall",
+    "val_pred_accept_frac",
+    "val_label_accept_frac",
+)
+
 DEFAULT_CORRECTOR_PROMPT = (
     "You are verifying a streaming speech recognizer. Given the transcript so far, the "
     "representation of the next audio chunk, and the recognizer's hypothesis for that chunk, "
@@ -190,11 +204,78 @@ class ScriptCorrectorModel(ScriptSTTModel):
         return hyp
 
     # ------------------------------------------------------------- train step
-    def training_step(self, batch, batch_idx):
+    # ------------------------------------------------------------- validation
+    def validation_step(self, batch, batch_idx, dataloader_idx=0):
+        """Same pipeline as training, but ACCUMULATED rather than logged per batch.
+
+        Nothing is logged here on purpose. Logging inside the loop would both
+        average rates (wrong for corpus WER) and make the number of collectives
+        depend on how many val batches a rank happened to receive -- the same
+        desync that killed dfw_corrector_v1.
+        """
+        try:
+            st = self._prepare(batch)
+        except RuntimeError:
+            return
+        if st is None:
+            return
+
+        out = self.llm(inputs_embeds=st["embeds"], attention_mask=st["attn"], labels=st["labels"])
+        first = torch.tensor([e.prompt_len - 1 for e in st["examples"]], device=st["device"])
+        rows = torch.arange(len(st["examples"]), device=st["device"])
+        pred_accept = (out.logits[rows, first].argmax(-1) == self.ids.accept).tolist()
+
+        v = self._val
+        v["pred"] += pred_accept
+        v["label"] += st["cb"].is_accept
+        v["chat_e"] += st["chat_e"]
+        v["chat_n"] += st["chat_n"]
+        try:
+            w = self._corrected_wer(st["carry"], return_counts=True)
+            v["corr_e"] += w[0]
+            v["corr_n"] += w[1]
+        except Exception as e:
+            logging.warning("val corrected_wer failed: %s", e)
+
+    def on_validation_epoch_start(self):
+        self._val = {"pred": [], "label": [], "chat_e": 0, "chat_n": 0, "corr_e": 0, "corr_n": 0}
+
+    def on_validation_epoch_end(self):
+        v = getattr(self, "_val", None) or {
+            "pred": [],
+            "label": [],
+            "chat_e": 0,
+            "chat_n": 0,
+            "corr_e": 0,
+            "corr_n": 0,
+        }
+        stats = decision_stats(v["pred"], v["label"]) if v["pred"] else {}
+        vals = {
+            "val_chat_wer_tf": (v["chat_e"] / v["chat_n"]) if v["chat_n"] else 0.0,
+            "val_corrected_wer": (v["corr_e"] / v["corr_n"]) if v["corr_n"] else 0.0,
+            **{f"val_{k}": float(x) for k, x in stats.items()},
+        }
+        for k in _VAL_METRIC_KEYS:
+            self.log(
+                k, float(vals.get(k, 0.0)), prog_bar=k in ("val_corrected_wer", "val_chat_wer_tf"), sync_dist=True
+            )
+        self._val = None
+
+    # ------------------------------------------------------- shared pipeline
+    def _prepare(self, batch):
+        """Audio -> CHAT hypotheses -> labels -> a padded, audio-spliced batch.
+
+        Shared by training and validation so the two cannot drift: a corrector
+        evaluated on differently-built examples than it trained on would report a
+        number about a different task.
+
+        Returns ``None`` when the batch yields no chunks at all, which the caller
+        must still treat as a LOGGING step -- see _METRIC_KEYS.
+        """
         sig, sig_len = batch[0], batch[1]
         cuts = batch[4] if len(batch) >= 5 else None
         if cuts is None:
-            raise RuntimeError("corrector training needs cuts (word timings) on the batch")
+            raise RuntimeError("corrector needs cuts (word timings) on the batch")
 
         with torch.no_grad():
             proc, proc_len = self.chat.preprocessor(input_signal=sig, length=sig_len)
@@ -211,34 +292,38 @@ class ScriptCorrectorModel(ScriptSTTModel):
             ref_i.append(i)
 
         hyp_i = self._chat_hypotheses(enc, enc_len, ref_i, n_chunks)
-
         instr = self.tokenizer.text_to_ids(self.system_prompt + "\n")
-        examples, frame_src = [], []
+
+        from nemo.collections.asr.parts.utils.chunk_error_labels import label_chunks
+
+        examples, frame_src, sample = [], [], None
+        chat_e = chat_n = 0
         for b in range(len(n_chunks)):
-            # ONE detokenization of the whole hypothesis, not per chunk.
+            # ONE detokenization of the whole hypothesis; per-chunk detokenization
+            # splits words that straddle a chunk boundary.
             hyp_w = self.tokenizer.ids_to_text([t for c in hyp_i[b] for t in c]).split()
             lens = [min(cs, max(0, int(enc_len[b]) - k * cs)) for k in range(n_chunks[b])]
-            from nemo.collections.asr.parts.utils.chunk_error_labels import label_chunks
-
             chunk_labels, _ = label_chunks(hyp_w, ref_w[b], normalize=simple_normalize)
-            exs = corrector_examples_for_utterance(
-                instr,
-                ref_w[b],
-                ref_i[b],
-                hyp_i[b],
-                hyp_w,
-                lens,
-                ids=self.ids,
-                normalize=simple_normalize,
-            )
-            for k, e in enumerate(exs):
-                examples.append(e)
+
+            rw = [w for c in ref_w[b] for w in c]
+            e, n = word_errors([simple_normalize(w) for w in hyp_w], [simple_normalize(w) for w in rw])
+            chat_e += e
+            chat_n += n
+
+            for k, ex in enumerate(
+                corrector_examples_for_utterance(
+                    instr,
+                    ref_w[b],
+                    ref_i[b],
+                    hyp_i[b],
+                    hyp_w,
+                    lens,
+                    ids=self.ids,
+                    normalize=simple_normalize,
+                )
+            ):
+                examples.append(ex)
                 frame_src.append((b, k * cs))
-        if not examples:
-            # Still log the full set: a rank that stays silent here desyncs the
-            # logging collectives and hangs every other rank.
-            self._log_all({})
-            return enc.sum() * 0.0
 
             if b == 0:
                 sample = (
@@ -247,16 +332,8 @@ class ScriptCorrectorModel(ScriptSTTModel):
                     chunk_labels,
                 )
 
-        # Periodic dump of one real example. Metrics say WHETHER the labels look
-        # right in aggregate; this says WHAT they are -- and in particular shows
-        # the hypothesis's own chunk boundaries, which no metric exposes and
-        # which are the difference between a real error and a timing shift.
-        every = int(getattr(self.core_cfg, "sample_print_every_n_steps", 0) or 100)
-        if every and self.global_step % every == 0 and self.trainer.global_rank == 0:
-            try:
-                logging.info("\n" + format_sample(*sample, step=self.global_step))
-            except Exception as e:
-                logging.warning("sample print failed: %s", e)
+        if not examples:
+            return None
 
         cb = collate_corrector_examples(examples, self.text_pad_id, ids=self.ids)
         dev = enc.device
@@ -267,7 +344,6 @@ class ScriptCorrectorModel(ScriptSTTModel):
         embeds = self._embed_tokens(input_ids)
         if cb.audio_slots:
             # Splice CHAT's frames through the projection into the reserved slots.
-            proj = self.perception.proj
             rows = torch.tensor([r for r, _, _ in cb.audio_slots], device=dev)
             poss = torch.tensor([p for _, p, _ in cb.audio_slots], device=dev)
             srcb = torch.tensor([frame_src[r][0] for r, _, _ in cb.audio_slots], device=dev)
@@ -275,58 +351,72 @@ class ScriptCorrectorModel(ScriptSTTModel):
                 max=enc.shape[1] - 1
             )
             embeds = embeds.clone()
-            embeds[rows, poss] = proj(enc[srcb, srcf].to(embeds.dtype))
+            embeds[rows, poss] = self.perception.proj(enc[srcb, srcf].to(embeds.dtype))
 
-        out = self.llm(inputs_embeds=embeds, attention_mask=attn, labels=labels)
+        return {
+            "embeds": embeds,
+            "attn": attn,
+            "labels": labels,
+            "examples": examples,
+            "cb": cb,
+            "device": dev,
+            "sample": sample,
+            "chat_e": chat_e,
+            "chat_n": chat_n,
+            "carry": {
+                "enc_len": enc_len,
+                "n_chunks": n_chunks,
+                "ref_w": ref_w,
+                "ref_i": ref_i,
+                "hyp_i": hyp_i,
+                "instr": instr,
+                "device": dev,
+            },
+        }
+
+    def training_step(self, batch, batch_idx):
+        st = self._prepare(batch)
+        if st is None:
+            # A rank that stays silent here desyncs the logging collectives.
+            self._log_all({})
+            return torch.zeros((), device=self.device, requires_grad=True)
+
+        out = self.llm(inputs_embeds=st["embeds"], attention_mask=st["attn"], labels=st["labels"])
         loss = out.loss
 
         with torch.no_grad():
             # The DECISION is the argmax at prompt_len - 1: logits at position i
             # predict token i+1, so that column is the first target token.
-            first = torch.tensor([e.prompt_len - 1 for e in examples], device=dev)
-            rows = torch.arange(len(examples), device=dev)
+            first = torch.tensor([e.prompt_len - 1 for e in st["examples"]], device=st["device"])
+            rows = torch.arange(len(st["examples"]), device=st["device"])
             pred_accept = (out.logits[rows, first].argmax(-1) == self.ids.accept).tolist()
-            st = decision_stats(pred_accept, cb.is_accept)
-
-            # CHAT's WER on this batch, TEACHER-FORCED: every chunk was decoded
-            # given the REFERENCE prefix, so it is optimistic versus deployment
-            # where CHAT conditions on its own output. It is the right baseline
-            # for the corrector -- it is exactly what the corrector saw -- but it
-            # must not be quoted as CHAT's WER, hence the _tf suffix.
-            e_tot = n_tot = 0
-            for b in range(len(n_chunks)):
-                hw = self.tokenizer.ids_to_text([t for c in hyp_i[b] for t in c]).split()
-                rw = [w for c in ref_w[b] for w in c]
-                e, n = word_errors([simple_normalize(w) for w in hw], [simple_normalize(w) for w in rw])
-                e_tot += e
-                n_tot += n
+            stats = decision_stats(pred_accept, st["cb"].is_accept)
 
         self._log_all(
             {
                 "train_loss": loss,
-                "chunks_per_batch": float(len(examples)),
-                **{f"train_{k}": float(v) for k, v in st.items()},
-                "train_chat_wer_tf": (e_tot / n_tot) if n_tot else 0.0,
+                "chunks_per_batch": float(len(st["examples"])),
+                **{f"train_{k}": float(v) for k, v in stats.items()},
+                "train_chat_wer_tf": (st["chat_e"] / st["chat_n"]) if st["chat_n"] else 0.0,
             }
         )
 
-        # Handed to on_train_batch_end, which computes corrected_wer. Generating
-        # inside training_step corrupts activation checkpointing -- that killed
-        # both SCRIPT arms at step 500 ("Recomputed values ... different
-        # metadata"), so generation stays out of the graph-building step.
-        self._last = {
-            "enc_len": enc_len,
-            "n_chunks": n_chunks,
-            "ref_w": ref_w,
-            "ref_i": ref_i,
-            "hyp_i": hyp_i,
-            "instr": instr,
-            "device": dev,
-        }
+        # Periodic dump of one real example. Metrics say WHETHER the labels look
+        # right in aggregate; this says WHAT they are -- and shows the
+        # hypothesis's own chunk boundaries, which no metric exposes and which
+        # separate a real error from a timing shift.
+        every = int(getattr(self.core_cfg, "sample_print_every_n_steps", 0) or 100)
+        if every and self.global_step % every == 0 and self.trainer.global_rank == 0 and st["sample"]:
+            try:
+                logging.info("\n" + format_sample(*st["sample"], step=self.global_step))
+            except Exception as e:
+                logging.warning("sample print failed: %s", e)
+
+        self._last = st["carry"]
         return loss
 
     @torch.no_grad()
-    def _corrected_wer(self, st) -> Optional[float]:
+    def _corrected_wer(self, st, return_counts: bool = False):
         """WER after applying the corrector's own accept/reject decisions.
 
         Accept keeps CHAT's chunk; reject substitutes the reference. That makes
@@ -360,6 +450,10 @@ class ScriptCorrectorModel(ScriptSTTModel):
             e, n = word_errors([simple_normalize(w) for w in out_words], [simple_normalize(w) for w in rw])
             e_tot += e
             n_tot += n
+        if return_counts:
+            # Counts, not a rate: corpus WER is total edits over total reference
+            # words, so validation must accumulate and divide ONCE at the end.
+            return e_tot, n_tot
         return (e_tot / n_tot) if n_tot else None
 
     def _log_all(self, values: dict) -> None:

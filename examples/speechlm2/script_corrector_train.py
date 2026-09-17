@@ -24,6 +24,7 @@ tensor-only loader cannot drive this at all. That is why the loader is built her
 rather than through the model's ordinary setup path.
 """
 
+import copy
 import os
 
 import torch
@@ -34,6 +35,7 @@ from nemo.collections.asr.data.audio_to_text_lhotse import LhotseSpeechToTextBpe
 from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
 from nemo.collections.speechlm2.models.script_corrector_model import ScriptCorrectorModel
 from nemo.core.config import hydra_runner
+from nemo.utils import logging
 from nemo.utils.exp_manager import exp_manager
 from nemo.utils.trainer_utils import resolve_trainer_cfg
 
@@ -67,7 +69,29 @@ def train(cfg):
         tokenizer=model.tokenizer,
     )
 
-    trainer.fit(model, train_dataloaders=loader)
+    # Validation needs cuts for exactly the same reason training does: the
+    # reference chunk partition comes from the aligner's word timings. Built the
+    # same way, so val examples are constructed identically to train ones --
+    # otherwise val_* would describe a different task from the one being trained.
+    val_loader = None
+    val_cfg = cfg.data.get("validation_ds")
+    if val_cfg is not None:
+        vc = copy.deepcopy(val_cfg)
+        with open_dict(vc):
+            vc.use_lhotse = True
+            vc.shuffle = False
+        try:
+            val_loader = get_lhotse_dataloader_from_config(
+                vc,
+                global_rank=trainer.global_rank,
+                world_size=trainer.world_size,
+                dataset=LhotseSpeechToTextBpeDataset(tokenizer=model.tokenizer, return_cuts=True),
+                tokenizer=model.tokenizer,
+            )
+        except Exception as e:
+            logging.warning("no validation loader (%s); training without val_* metrics", e)
+
+    trainer.fit(model, train_dataloaders=loader, val_dataloaders=val_loader)
 
 
 if __name__ == "__main__":
