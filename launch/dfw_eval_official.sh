@@ -102,7 +102,10 @@ for entry in "${ALL[@]}"; do
     for cfg in "${DATASETS[@]}"; do
         read -r DS SPLIT DSPATH <<< "$cfg"
         DSPATH="${DSPATH:-$DEFAULT_PATH}"
-        echo "--- ${key} / ${DS} ${SPLIT}"
+        # Marker goes into the per-model LOG too, not just job stdout: without it
+        # the log is a bare list of WERs with no way to tell which dataset each
+        # belongs to, or which ones produced nothing at all.
+        echo "--- ${key} / ${DS} ${SPLIT}" | tee -a "${OUT}/${key}.log"
         srun --container-image="$CONTAINER" \
              --container-mounts="${DFW}:${DFW},${CODE_DIR}:/code,${OASR}:/oasr" \
              bash -c "export PYTHONPATH=/code:/oasr:${MY}/pylibs:\${PYTHONPATH:-} HF_HOME=${MY}/hf_cache HF_TOKEN=${HF_TOKEN} && \
