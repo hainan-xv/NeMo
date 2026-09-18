@@ -129,10 +129,16 @@ for entry in "${ALL[@]}"; do
         DLOG="${OUT}/${key}.${DS}_${SPLIT}.log"
         echo "--- ${key} / ${DS} ${SPLIT} -> gpu ${gpu}" | tee "${DLOG}"
         (
-            srun --exclusive -n1 -N1 --gpus-per-task=1 \
+            # --overlap, NOT --exclusive. On an srun STEP, --exclusive means "do
+            # not share this allocation with other steps", so Slurm SERIALISES the
+            # eight backgrounded steps instead of running them side by side --
+            # observed directly: only step .1 was ever live. --overlap lets them
+            # share the node, and CUDA_VISIBLE_DEVICES pins each to its own GPU.
+            CUDA_VISIBLE_DEVICES=${gpu} \
+            srun --overlap -n1 -N1 \
                  --container-image="$CONTAINER" \
                  --container-mounts="${DFW}:${DFW},${CODE_DIR}:/code,${OASR}:/oasr" \
-                 bash -c "export PYTHONPATH=/code:/code/scripts:/oasr:${MY}/pylibs:\${PYTHONPATH:-} HF_HOME=${MY}/hf_cache HF_TOKEN=${HF_TOKEN} && \
+                 bash -c "export CUDA_VISIBLE_DEVICES=${gpu} PYTHONPATH=/code:/code/scripts:/oasr:${MY}/pylibs:\${PYTHONPATH:-} HF_HOME=${MY}/hf_cache HF_TOKEN=${HF_TOKEN} && \
                           cd /oasr/nemo_asr && \
                           python run_eval.py --model_id='${nemo}' --dataset_path='${DSPATH}' \
                             --dataset='${DS}' --split='${SPLIT}' --device=0 \
