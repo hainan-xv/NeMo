@@ -3,10 +3,11 @@
 #SBATCH -J nemotron_speechprod_asr:dfw-eval-official
 #SBATCH -p batch
 #SBATCH -N 1
-#SBATCH --gpus-per-node=1
+#SBATCH --gpus-per-node=8
 #SBATCH -t 04:00:00
 #SBATCH --time-min 02:00:00
-#SBATCH --cpus-per-task=16
+#SBATCH --exclusive
+#SBATCH --mem=0
 #SBATCH --ntasks-per-node=1
 #SBATCH --output=slurm_out/%x=%j --error=slurm_out/%x=%j
 #SBATCH --exclude=pool0-00407,pool0-01815
@@ -40,11 +41,14 @@
 # ENV
 #   MODELS   space-separated subset of the keys below (default: all)
 #
-# ONE GPU, ONE MODEL PER JOB, on the BATCH partition. Each model is an
-# independent 8-dataset sweep with no shared state, so running them as five
-# single-GPU jobs finishes in the time of the slowest model rather than the
-# sum of all five -- and a 0.6B model decoding at batch 128 does not need a
-# whole 8-GPU node. NOT --exclusive for the same reason.
+# ONE MODEL PER JOB, and within a job the 8 DATASETS RUN CONCURRENTLY, one per
+# GPU. Wall-clock is then the slowest single dataset (spgispeech, 39k utts)
+# rather than the sum of all eight -- measured serially at ~30 min per model on
+# one GPU with seven idle.
+#
+# Utterances are NOT split within a dataset: run_eval.py has no sharding support,
+# and adding it would mean patching the official code at the point that decides
+# which utterances are scored. Across datasets needs no code change at all.
 # ============================================================================
 set -uo pipefail
 mkdir -p slurm_out
@@ -105,23 +109,51 @@ for entry in "${ALL[@]}"; do
     fi
     echo; echo "############ ${key}  (pad=${pad}s)"; echo "###   ${nemo}"
 
+    # ONE DATASET PER GPU, all 8 concurrently. run_eval.py has no sharding
+    # support (no --num_shards/--shard_index), so utterances cannot be split
+    # within a dataset without patching the official code -- which is exactly the
+    # code we adopted BECAUSE it is authoritative, and the place where a mistake
+    # silently loses or double-counts utterances. Across datasets is free: each
+    # was already an independent invocation writing its own manifest, so this
+    # changes only WHEN they run, not WHAT they compute.
+    #
+    # Wall-clock becomes the slowest single dataset (spgispeech, 39k utts)
+    # instead of the sum of all eight.
+    gpu=0
+    pids=()
     for cfg in "${DATASETS[@]}"; do
         read -r DS SPLIT DSPATH <<< "$cfg"
         DSPATH="${DSPATH:-$DEFAULT_PATH}"
-        # Marker goes into the per-model LOG too, not just job stdout: without it
-        # the log is a bare list of WERs with no way to tell which dataset each
-        # belongs to, or which ones produced nothing at all.
-        echo "--- ${key} / ${DS} ${SPLIT}" | tee -a "${OUT}/${key}.log"
-        srun --container-image="$CONTAINER" \
-             --container-mounts="${DFW}:${DFW},${CODE_DIR}:/code,${OASR}:/oasr" \
-             bash -c "export PYTHONPATH=/code:/code/scripts:/oasr:${MY}/pylibs:\${PYTHONPATH:-} HF_HOME=${MY}/hf_cache HF_TOKEN=${HF_TOKEN} && \
-                      cd /oasr/nemo_asr && \
-                      python run_eval.py --model_id='${nemo}' --dataset_path='${DSPATH}' \
-                        --dataset='${DS}' --split='${SPLIT}' --device=0 \
-                        --batch_size=${BATCH_SIZE} --max_eval_samples=-1 \
-                        --pad_extra_seconds=${pad}" \
-            2>&1 | tee -a "${OUT}/${key}.log" | grep -E "WER|RTFx|Error|Traceback" | tail -3
+        # Per-dataset log: concurrent writers would interleave a shared file and
+        # make the WER-to-dataset mapping unrecoverable.
+        DLOG="${OUT}/${key}.${DS}_${SPLIT}.log"
+        echo "--- ${key} / ${DS} ${SPLIT} -> gpu ${gpu}" | tee "${DLOG}"
+        (
+            srun --exclusive -n1 -N1 --gpus-per-task=1 \
+                 --container-image="$CONTAINER" \
+                 --container-mounts="${DFW}:${DFW},${CODE_DIR}:/code,${OASR}:/oasr" \
+                 bash -c "export PYTHONPATH=/code:/code/scripts:/oasr:${MY}/pylibs:\${PYTHONPATH:-} HF_HOME=${MY}/hf_cache HF_TOKEN=${HF_TOKEN} && \
+                          cd /oasr/nemo_asr && \
+                          python run_eval.py --model_id='${nemo}' --dataset_path='${DSPATH}' \
+                            --dataset='${DS}' --split='${SPLIT}' --device=0 \
+                            --batch_size=${BATCH_SIZE} --max_eval_samples=-1 \
+                            --pad_extra_seconds=${pad}" >> "${DLOG}" 2>&1
+        ) &
+        pids+=($!)
+        gpu=$((gpu + 1))
     done
+
+    # Wait for every dataset and report which ones failed. A silent failure here
+    # loses that dataset's result entirely -- run_eval.py writes its manifest
+    # BEFORE printing the WER, so a crash costs the number, not just the file.
+    fail=0
+    for i in "${!pids[@]}"; do
+        wait "${pids[$i]}" || { echo "  [FAIL] dataset index ${i} for ${key}" >&2; fail=$((fail + 1)); }
+    done
+    # Concatenate per-dataset logs into the per-model log the summary reads.
+    cat "${OUT}/${key}."*.log > "${OUT}/${key}.log" 2>/dev/null
+    n_wer=$(grep -hc "^WER: " "${OUT}/${key}.log" 2>/dev/null || echo 0)
+    echo "### ${key}: ${n_wer}/${#DATASETS[@]} datasets scored, ${fail} process failures"
 done
 
 echo; echo "############ summary"
