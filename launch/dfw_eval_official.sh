@@ -33,9 +33,9 @@
 # --pad_extra_seconds (and to key its audio cache on it, so a padded run cannot
 # silently reuse unpadded wavs); duration/RTFx still use the ORIGINAL audio.
 #
-# NOT COVERED: the two SCRIPT arms. They are speechlm2 ScriptSTTModel, not
-# ASRModel, and have no .transcribe() -- the official harness cannot load them.
-# They keep their numbers from scripts/script_leaderboard_eval.py.
+# SCRIPT arms ARE covered, via scripts/script_asr_shim.py: they are speechlm2
+# ScriptSTTModel Lightning checkpoints with no .transcribe(), so the shim exposes
+# the ASRModel surface run_eval.py needs while reusing SCRIPT's own decode path.
 #
 # ENV
 #   MODELS   space-separated subset of the keys below (default: all)
@@ -68,6 +68,12 @@ ALL=(
   "chat_later|${MY}/results/SpeechlmDFW/dfw_granary2_chat_banded1_nodelay_v2/averaged/top5-averaged.nemo|0.5"
   "parakeet|${MY}/pretrained_models/nvidia/parakeet-tdt-0.6b-v2/parakeet-tdt-0.6b-v2.nemo|0"
   "nemotron|${DFW}/users/heh/pretrained_models/huggingface/nvidia/nemotron-speech-streaming-en-0.6b/nemotron-speech-streaming-en-0.6b.nemo|0.5"
+  # SCRIPT arms are Lightning .ckpt, not .nemo: run_eval.py routes them through
+  # scripts/script_asr_shim.py, which reuses script_leaderboard_eval's own loader
+  # and generate path. pad 0.5 because SCRIPT trains with
+  # data.dataset.pad_extra_duration and its emission lags the audio.
+  "script_later|${MY}/results/SpeechlmDFW/dfw_granary2_script_banded1_nodelay_v2/dfw_granary2_script_banded1_nodelay_v2/checkpoints/dfw_granary2_script_banded1_nodelay_v2-averaged.ckpt|0.5"
+  "script_both|${MY}/results/SpeechlmDFW/dfw_granary2_script_banded1_both_nodelay_v2/dfw_granary2_script_banded1_both_nodelay_v2/checkpoints/dfw_granary2_script_banded1_both_nodelay_v2-averaged.ckpt|0.5"
 )
 
 # Exactly the configs nemo_asr/run_parakeet.sh evaluates, including the chunked
@@ -108,7 +114,7 @@ for entry in "${ALL[@]}"; do
         echo "--- ${key} / ${DS} ${SPLIT}" | tee -a "${OUT}/${key}.log"
         srun --container-image="$CONTAINER" \
              --container-mounts="${DFW}:${DFW},${CODE_DIR}:/code,${OASR}:/oasr" \
-             bash -c "export PYTHONPATH=/code:/oasr:${MY}/pylibs:\${PYTHONPATH:-} HF_HOME=${MY}/hf_cache HF_TOKEN=${HF_TOKEN} && \
+             bash -c "export PYTHONPATH=/code:/code/scripts:/oasr:${MY}/pylibs:\${PYTHONPATH:-} HF_HOME=${MY}/hf_cache HF_TOKEN=${HF_TOKEN} && \
                       cd /oasr/nemo_asr && \
                       python run_eval.py --model_id='${nemo}' --dataset_path='${DSPATH}' \
                         --dataset='${DS}' --split='${SPLIT}' --device=0 \
