@@ -1,13 +1,12 @@
 #!/bin/bash
 #SBATCH -A nemotron_speechprod_asr
 #SBATCH -J nemotron_speechprod_asr:dfw-eval-official
-#SBATCH -p interactive
+#SBATCH -p batch
 #SBATCH -N 1
-#SBATCH --gpus-per-node=8
+#SBATCH --gpus-per-node=1
 #SBATCH -t 04:00:00
 #SBATCH --time-min 02:00:00
-#SBATCH --exclusive
-#SBATCH --mem=0
+#SBATCH --cpus-per-task=16
 #SBATCH --ntasks-per-node=1
 #SBATCH --output=slurm_out/%x=%j --error=slurm_out/%x=%j
 #SBATCH --exclude=pool0-00407,pool0-01815
@@ -40,6 +39,12 @@
 #
 # ENV
 #   MODELS   space-separated subset of the keys below (default: all)
+#
+# ONE GPU, ONE MODEL PER JOB, on the BATCH partition. Each model is an
+# independent 8-dataset sweep with no shared state, so running them as five
+# single-GPU jobs finishes in the time of the slowest model rather than the
+# sum of all five -- and a 0.6B model decoding at batch 128 does not need a
+# whole 8-GPU node. NOT --exclusive for the same reason.
 # ============================================================================
 set -uo pipefail
 mkdir -p slurm_out
