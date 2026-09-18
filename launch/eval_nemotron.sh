@@ -92,6 +92,15 @@ PAD_EXTRA_SECONDS="${PAD_EXTRA_SECONDS:-0.5}"
 FRAME_TRIM="${FRAME_TRIM:-}"
 FRAME_TRIM_ARG=""
 [[ -n "${FRAME_TRIM}" ]] && FRAME_TRIM_ARG="--frame_trim ${FRAME_TRIM}"
+
+# FULL_CONTEXT=1 for a NON-CAUSAL encoder (att_context_size [-1,-1]). The joint
+# still chunks emission at CHUNK_SIZE, so the objective is unchanged -- but the
+# encoder sees the whole utterance, nothing is emitted until the audio ends, and
+# the resulting WER is an OFFLINE number. It is labelled as such in the results
+# directory so it can never be mistaken for a streaming one.
+FULL_CONTEXT="${FULL_CONTEXT:-0}"
+FULL_CONTEXT_ARG=""
+[[ "${FULL_CONTEXT}" == "1" ]] && FULL_CONTEXT_ARG="--full_context"
 MODE="${MODE:-offline}"                     # offline | streaming
 EXP_NAME="${EXP_NAME:-nemotron_streaming_0.6b}"
 PROJECT="${PROJECT:-SpeechlmScriptCC}"
@@ -142,6 +151,7 @@ else
 fi
 DECODE_LABEL="chunk${CHUNK_SIZE:-default}_${MODE}"
 [[ -n "${FRAME_TRIM}" ]] && DECODE_LABEL="${DECODE_LABEL}_trim${FRAME_TRIM}"
+[[ "${FULL_CONTEXT}" == "1" ]] && DECODE_LABEL="${DECODE_LABEL}_fullctx"
 [[ "${PAD_EXTRA_SECONDS}" != "0" && "${PAD_EXTRA_SECONDS}" != "0.0" ]] && DECODE_LABEL="${DECODE_LABEL}_pad${PAD_EXTRA_SECONDS}"
 
 # <exp>/eval_<checkpoint timestamp>/<decode config>/ -- the model name is not repeated
@@ -251,6 +261,7 @@ echo "*******STARTING NEMOTRON LEADERBOARD EVAL********" \
         --chunk_size ${CHUNK_SIZE} \
         --pad_extra_seconds ${PAD_EXTRA_SECONDS} \
         ${FRAME_TRIM_ARG} \
+        ${FULL_CONTEXT_ARG} \
         --dtype ${DTYPE} \
         > "\${log}" 2>&1 & \
       pids+=(\$!); \

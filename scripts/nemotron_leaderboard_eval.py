@@ -118,7 +118,7 @@ def load_model(model_path: str, device: torch.device, dtype: torch.dtype, frame_
     return model.to(dtype).to(device).eval()
 
 
-def resolve_att_context(model, chunk_size: int, left_context: int = None) -> List[int]:
+def resolve_att_context(model, chunk_size: int, left_context: int = None, full_context: bool = False) -> List[int]:
     """Map a chunk size in encoder frames to a supported ``att_context_size``.
 
     A chunk of ``C`` frames means the encoder may look ahead ``C-1`` frames, i.e.
@@ -129,6 +129,32 @@ def resolve_att_context(model, chunk_size: int, left_context: int = None) -> Lis
     supported = [list(x) for x in getattr(model.encoder, "att_context_size_all", [])]
     if not supported:
         raise ValueError("Model exposes no att_context_size_all; it is not a multi-lookahead cache-aware model.")
+
+    # FULL-CONTEXT arms. A non-causal encoder has exactly one supported setting,
+    # [-1, -1]: it attends to the whole utterance, so there is no look-ahead to
+    # choose. Forcing [left, chunk-1] on it asks for a context it was never
+    # trained with, which is what the refusal below is for.
+    #
+    # The chunking that still matters is the JOINT's, not the encoder's -- a CHAT
+    # model chunks the encoder OUTPUT a second time, and that is what makes the
+    # emission chunk-synchronous. So the encoder is left alone and the joint
+    # still emits on the requested grid. The result is NOT streamable (no output
+    # until the audio ends) and must not be compared to the streaming arms as
+    # though it were.
+    if full_context:
+        if supported != [[-1, -1]]:
+            raise ValueError(
+                f"--full_context given, but this model supports {supported}. It is a cache-aware "
+                "streaming model; full-context decoding would report a number for a mode it was "
+                "not trained in."
+            )
+        return [-1, -1]
+    if supported == [[-1, -1]]:
+        raise ValueError(
+            "This model is FULL-CONTEXT (att_context_size_all == [[-1, -1]]): its encoder attends to "
+            "the whole utterance and has no look-ahead to set. Pass --full_context to decode it that "
+            "way -- and note the result is an OFFLINE number, not comparable to the streaming arms."
+        )
 
     default_left = int(model.encoder.att_context_size[0])
     left = int(left_context) if left_context is not None else default_left
@@ -423,6 +449,13 @@ def parse_args():
         "--left_context", type=int, default=None, help="left attention context in frames; default = the model's own"
     )
     p.add_argument(
+        "--full_context",
+        action="store_true",
+        help="decode a NON-CAUSAL encoder at att_context_size [-1,-1] (whole utterance). The joint still "
+        "chunks emission at --chunk_size. Produces an OFFLINE number: nothing is emitted until the audio "
+        "ends, so it is NOT comparable to the streaming arms.",
+    )
+    p.add_argument(
         "--pad_and_drop_preencoded",
         action="store_true",
         help="streaming mode: also cache/drop pre-encoded frames on step 0",
@@ -472,12 +505,15 @@ def main() -> int:
     model = load_model(args.model_path, device, dtype, frame_trim=args.frame_trim)
 
     try:
-        att = resolve_att_context(model, args.chunk_size, args.left_context)
+        att = resolve_att_context(model, args.chunk_size, args.left_context, args.full_context)
     except ValueError as e:
         _log(f"ERROR: {e}")
         return 1
     # Also recomputes encoder.streaming_cfg, which the streaming buffer reads.
-    model.encoder.set_default_att_context_size(att)
+    # Skipped for full context: the encoder is already at [-1, -1] and there is
+    # no streaming cache to reconfigure.
+    if not args.full_context:
+        model.encoder.set_default_att_context_size(att)
 
     # A CHAT model chunks the ENCODER OUTPUT a second time, inside the joint, and
     # that chunk size is fixed at construction (rnnt_models.py reads it from the
@@ -498,7 +534,11 @@ def main() -> int:
         f"==> mode={args.mode} chunk_size={args.chunk_size} frames "
         f"({args.chunk_size * _FRAME_SECONDS:.2f}s) att_context_size={att} dtype={dtype}"
     )
-    _log(f"==> streaming_cfg: {model.encoder.streaming_cfg}")
+    if args.full_context:
+        _log("==> FULL CONTEXT: encoder sees the whole utterance; emission still chunked by the joint.")
+        _log("==> this is an OFFLINE number and is not comparable to the streaming arms.")
+    else:
+        _log(f"==> streaming_cfg: {model.encoder.streaming_cfg}")
 
     evaluate_shard(model, args)
     return 0

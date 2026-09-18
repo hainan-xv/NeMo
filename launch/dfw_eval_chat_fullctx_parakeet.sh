@@ -77,6 +77,10 @@ export TOPK="${TOPK:-5}"
 export FORCE_AVERAGE="${FORCE_AVERAGE:-0}"
 export EVAL_TAG="avg${TOPK}"
 export FRAME_TRIM=""
+# The encoder is NON-CAUSAL: att_context_size [-1,-1], no look-ahead to choose.
+# Without this the shared backend forces [left, 13] to decode at chunk 14 and the
+# model refuses -- correctly, since that is a context it never trained with.
+export FULL_CONTEXT=1
 
 CKPTS="${OUTPUT_PREFIX}/results/${PROJECT}/${ARM_EXP_NAME}/${ARM_EXP_NAME}/checkpoints"
 NCK="$(ls -1 "$CKPTS"/*.ckpt 2>/dev/null | grep -vc -- '-last' || true)"
