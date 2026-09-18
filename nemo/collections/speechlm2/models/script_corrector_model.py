@@ -308,6 +308,27 @@ class ScriptCorrectorModel(ScriptSTTModel):
         if cuts is None:
             raise RuntimeError("corrector needs cuts (word timings) on the batch")
 
+        # FLUSH PAD. CHAT's emission lags its audio by design -- that is exactly
+        # what the banded loss leaves loose -- so without trailing frames the
+        # final words of an utterance are never emitted. Training on those
+        # truncated hypotheses teaches the corrector to APPEND missing trailing
+        # words, a task that does not exist once the audio is padded. Measured at
+        # eval: pad 0.0 gave librispeech test-other 5.57 where pad 0.5 gives 4.00,
+        # and the corrector's apparent "gain" at pad 0.0 was largely it repairing
+        # that artefact.
+        #
+        # The pad simply extends every row into the batch's existing zero padding,
+        # so it is real silence. It adds roughly one trailing chunk whose
+        # REFERENCE is empty -- harmless, because label_chunks assigns reference
+        # words to hypothesis chunks by ALIGNMENT, not by the time grid, so words
+        # flushed into that chunk still own the reference words they match.
+        flush_s = float(getattr(self.core_cfg, "chat_flush_seconds", None) or 0.5)
+        if flush_s > 0:
+            sr = int(getattr(self.chat.preprocessor, "_sample_rate", 16000))
+            n_pad = int(flush_s * sr)
+            sig = torch.nn.functional.pad(sig, (0, n_pad))
+            sig_len = sig_len + n_pad
+
         with torch.no_grad():
             proc, proc_len = self.chat.preprocessor(input_signal=sig, length=sig_len)
             enc, enc_len = self.chat.encoder(audio_signal=proc, length=proc_len)
