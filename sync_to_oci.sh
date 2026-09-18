@@ -67,6 +67,7 @@ SCRIPT_PATHS=(
     'nemo/collections/asr/losses/banded_rnnt.py'
     tests/collections/speechlm2/test_script.py
     scripts/script_leaderboard_eval.py
+    scripts/script_asr_shim.py
     scripts/nemotron_leaderboard_eval.py
     scripts/speechlm_leaderboard_eval.py
     scripts/leaderboard_common.py
