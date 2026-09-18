@@ -49,6 +49,10 @@ MY=${DFW}/hainanx
 CONTAINER="${CONTAINER:-${DFW}/users/heh/containers/nemo-26.02-streaming-speechlm.sqsh}"
 CODE_DIR="${CODE_DIR:-${MY}/NeMo_SCRIPT_cc}"
 OASR="${MY}/open_asr_leaderboard"
+# num2words is imported by the official normalizer and is NOT in the container.
+# pip-installed once into ${MY}/pylibs (inside a container job, not on the login
+# node) and put on PYTHONPATH rather than installed per job.
+PYLIBS="${MY}/pylibs"
 OUT="${MY}/results/official_eval/$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$OUT"
 
@@ -96,7 +100,7 @@ for entry in "${ALL[@]}"; do
         echo "--- ${key} / ${DS} ${SPLIT}"
         srun --container-image="$CONTAINER" \
              --container-mounts="${DFW}:${DFW},${CODE_DIR}:/code,${OASR}:/oasr" \
-             bash -c "export PYTHONPATH=/code:/oasr:\${PYTHONPATH:-} HF_HOME=${MY}/hf_cache HF_TOKEN=${HF_TOKEN} && \
+             bash -c "export PYTHONPATH=/code:/oasr:${MY}/pylibs:\${PYTHONPATH:-} HF_HOME=${MY}/hf_cache HF_TOKEN=${HF_TOKEN} && \
                       cd /oasr/nemo_asr && \
                       python run_eval.py --model_id='${nemo}' --dataset_path='${DSPATH}' \
                         --dataset='${DS}' --split='${SPLIT}' --device=0 \
