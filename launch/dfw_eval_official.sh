@@ -106,6 +106,14 @@ DATASETS=(
 )
 DEFAULT_PATH="hf-audio/open-asr-leaderboard"
 BATCH_SIZE="${BATCH_SIZE:-128}"
+# MAX_SYMBOLS: tokens the greedy decoder may emit per step. For CHAT a step is
+# a CHUNK, and measurement showed 8.9 inner iterations against a cap of 10 --
+# so chunks were plausibly being truncated and losing words. 0 keeps each
+# model's own value; frame-synchronous baselines never approach the cap, so
+# setting it is safe to apply uniformly.
+MAX_SYMBOLS="${MAX_SYMBOLS:-0}"
+MAX_SYM_ARG=""
+[[ "${MAX_SYMBOLS}" != "0" ]] && MAX_SYM_ARG="--max_symbols=${MAX_SYMBOLS}"
 
 read_token() { [[ -r "$1" ]] || { echo "ERROR: missing $1" >&2; exit 1; }; tr -d '\r\n' < "$1"; }
 HF_TOKEN="$(read_token "$HOME/.hf_token")"
@@ -179,7 +187,7 @@ for entry in "${ALL[@]}"; do
                           python run_eval.py --model_id='${nemo}' --dataset_path='${DSPATH}' \
                             --dataset='${DS}' --split='${SPLIT}' --device=0 \
                             --batch_size=${BATCH_SIZE} --max_eval_samples=-1 \
-                            --pad_extra_seconds=${pad}" >> "${DLOG}" 2>&1
+                            --pad_extra_seconds=${pad} ${MAX_SYM_ARG}" >> "${DLOG}" 2>&1
         ) &
         pids+=($!)
         gpu=$((gpu + 1))
