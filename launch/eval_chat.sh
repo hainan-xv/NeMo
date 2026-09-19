@@ -163,6 +163,14 @@ fi
 [[ -f "$AVG_NEMO" ]] || { echo "ERROR: averaging produced no ${AVG_NEMO}" >&2; exit 1; }
 echo "==> averaged model: ${AVG_NEMO}"
 
+# AVERAGE_ONLY: produce the .nemo and stop. Lets another launcher refresh an
+# average WITHOUT also paying for this script's own (non-official) eval, so
+# "re-average then score officially" is one job instead of two.
+if [[ "${AVERAGE_ONLY:-0}" == "1" ]]; then
+    echo "==> AVERAGE_ONLY=1: stopping before the eval"
+    exit 0
+fi
+
 export MODEL_PATH="$AVG_NEMO"
 export EXP_NAME="$ARM_EXP_NAME"
 export EVAL_TAG="${EVAL_TAG:-avg${TOPK}}"

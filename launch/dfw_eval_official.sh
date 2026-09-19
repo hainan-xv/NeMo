@@ -67,7 +67,7 @@ mkdir -p "$OUT"
 
 # key | .nemo | pad  (pad>0 ONLY for models trained with trailing silence)
 ALL=(
-  "fullctx|${MY}/results/SpeechlmDFW/dfw_granary2_chat_banded1_both_fullctx_parakeet/averaged/top5-averaged.nemo|0"
+  "fullctx|${MY}/results/SpeechlmDFW/dfw_granary2_chat_banded1_both_fullctx_parakeet/averaged/top5-averaged.nemo|0|dfw_eval_chat_fullctx_parakeet.sh|${MY}/results/SpeechlmDFW/dfw_granary2_chat_banded1_both_fullctx_parakeet/dfw_granary2_chat_banded1_both_fullctx_parakeet/checkpoints"
   "chat_both|${MY}/results/SpeechlmDFW/dfw_granary2_chat_banded1_both_nodelay_v2/averaged/top5-averaged.nemo|0.5"
   "chat_later|${MY}/results/SpeechlmDFW/dfw_granary2_chat_banded1_nodelay_v2/averaged/top5-averaged.nemo|0.5"
   "parakeet|${MY}/pretrained_models/nvidia/parakeet-tdt-0.6b-v2/parakeet-tdt-0.6b-v2.nemo|0"
@@ -98,11 +98,35 @@ BATCH_SIZE="${BATCH_SIZE:-128}"
 read_token() { [[ -r "$1" ]] || { echo "ERROR: missing $1" >&2; exit 1; }; tr -d '\r\n' < "$1"; }
 HF_TOKEN="$(read_token "$HOME/.hf_token")"
 
+# Under sbatch $0 is a spool copy, and SLURM_SUBMIT_DIR is unreliable on a
+# requeue -- hence the absolute fallback to the grid checkout.
+LAUNCH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[[ -f "${LAUNCH_DIR}/eval_chat.sh" ]] || LAUNCH_DIR="${CODE_DIR}/launch"
+
 WANT="${MODELS:-}"
 echo "==> official leaderboard harness | out=${OUT} | batch=${BATCH_SIZE}"
 
 for entry in "${ALL[@]}"; do
-    IFS='|' read -r key nemo pad <<< "$entry"
+    IFS='|' read -r key nemo pad avg_launcher ckpt_dir <<< "$entry"
+
+    # Refresh the average IN THIS JOB when asked, or refuse to score a stale one.
+    # Previously averaging lived only in eval_chat.sh, reached from a different
+    # launcher -- so refreshing meant running a second job that ALSO ran its own
+    # redundant eval, and FORCE_AVERAGE=1 passed here was silently ignored while
+    # 32 minutes were spent re-scoring weights from 50 epochs earlier.
+    if [[ -n "${avg_launcher:-}" && -n "${ckpt_dir:-}" && -d "$ckpt_dir" ]]; then
+        newest="$(ls -t "${ckpt_dir}"/*.ckpt 2>/dev/null | head -1)"
+        stale=0
+        [[ -n "$newest" && -f "$nemo" && "$newest" -nt "$nemo" ]] && stale=1
+        if [[ "${FORCE_AVERAGE:-0}" == "1" || "$stale" == "1" ]]; then
+            echo "### ${key}: rebuilding average (force=${FORCE_AVERAGE:-0} stale=${stale})"
+            AVERAGE_ONLY=1 FORCE_AVERAGE=1 bash "${LAUNCH_DIR:-$(dirname "${BASH_SOURCE[0]}")}/${avg_launcher}" \
+                || { echo "### ${key}: SKIP, averaging failed" >&2; continue; }
+        elif [[ "$stale" == "1" ]]; then
+            echo "### ${key}: REFUSING -- ${nemo} is older than its checkpoints. FORCE_AVERAGE=1 to rebuild." >&2
+            continue
+        fi
+    fi
     [[ -n "$WANT" && " $WANT " != *" $key "* ]] && continue
     if [[ ! -f "$nemo" ]]; then
         echo "### ${key}: SKIP, missing ${nemo}" >&2; continue
