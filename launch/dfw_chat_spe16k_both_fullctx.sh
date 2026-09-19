@@ -19,7 +19,7 @@
 
 # ============================================================================
 # CHAT band-1 both-side, FULL-CONTEXT encoder, 16k SentencePiece vocabulary,
-# at 10x the streaming arms' batch size.
+# at 2x the streaming arms' batch size (10x OOM'd -- see the batch block).
 #
 #   sbatch launch/dfw_chat_spe16k_both_fullctx.sh      <- no arguments
 #
@@ -58,46 +58,38 @@ export WARMUP_STEPS=5000
 export MAX_STEPS=500000
 export EPOCH_STEPS=2000
 
-# --- BATCH x10 vs the streaming arms ----------------------------------------
+# --- BATCH x2 vs the streaming arms -----------------------------------------
 #
-# REQUESTED EXPLICITLY, and it is the one knob that differs from a plain
-# fullctx+SPE16k arm. The streaming arms run
+# x10 WAS TRIED FIRST AND OOM'd, job 18956472, before a single logged step.
+# It was not marginal: two ranks died with ~280 MiB free of a 79.11 GiB card
+# while asking for ~585 MiB, i.e. the card was saturated, not just over.
+#
+#   GPU 4: 79.11 GiB total, 302.94 MiB free -- tried to allocate 586.00 MiB
+#   GPU 5: 79.11 GiB total, 266.94 MiB free -- tried to allocate 582.00 MiB
+#
+# That is the ladder's x2 rung, reached by SKIPPING x5. The skip is deliberate:
+# full attention is quadratic in utterance length, the bucket sizes were all
+# measured against a [70,13] streaming window, and the Qwen full-context sibling
+# carries a "WATCH MEMORY" warning while running the 1x list. x5 would have been
+# another guess at a number this project has now OOM'd six times by guessing.
+#
+# This is the streaming arms' list x2 -- which is also the list the Qwen
+# full-context arm runs, so memory behaviour here has a direct precedent rather
+# than an extrapolation. Absolute, not a multiplier, so a YAML retune cannot
+# silently change it.
+export BUCKET_BATCH_SIZE='[152,116,100,88,80,72,68,60,56,52,48,44,40,32,28,24,20,16]'
+#
+# If this OOMs too, the only rung left is x1:
 #   [76,58,50,44,40,36,34,30,28,26,24,22,20,16,14,12,10,8]
-# (itself 2x the YAML), and this is that list x10, written out absolutely so a
-# YAML retune cannot silently change it.
-export BUCKET_BATCH_SIZE='[760,580,500,440,400,360,340,300,280,260,240,220,200,160,140,120,100,80]'
 #
-# READ THIS BEFORE THE FIRST LAUNCH. Two independent reasons to expect trouble,
-# neither of which is a reason not to try it -- only a reason to watch step 1
-# rather than discover it at hour 3:
+# STEP COUNTS ARE STILL NOT COMPARABLE to the streaming arms -- 2x batch means
+# 2x samples per step. Compare samples-seen or wall-clock, not the step counter.
 #
-#   1. OOM RISK IS HIGH, and higher here than the multiplier suggests. Those
-#      bucket sizes were measured against a [70,13] streaming window at ~30 GiB
-#      of 81. Full attention is QUADRATIC in utterance length, so the per-sample
-#      activation cost in this arm is already above where any of those numbers
-#      were taken -- the Qwen fullctx sibling runs the 1x list and carries a
-#      "WATCH MEMORY" warning at that. 10x on top is well outside measured
-#      territory. This project has OOM'd five times from batch sizes reasoned
-#      about rather than measured.
-#
-#      If it OOMs, step DOWN this ladder rather than re-deriving a number:
-#        x5  [380,290,250,220,200,180,170,150,140,130,120,110,100,80,70,60,50,40]
-#        x2  [152,116,100,88,80,72,68,60,56,52,48,44,40,32,28,24,20,16]
-#        x1  [76,58,50,44,40,36,34,30,28,26,24,22,20,16,14,12,10,8]
-#
-#   2. STEP COUNTS ARE NOT COMPARABLE to any other arm. 10x batch means 10x
-#      samples per step, so this arm's step 10,000 has seen what a streaming arm
-#      sees at step 100,000. Compare samples-seen or wall-clock, never the step
-#      counter, and do not read an early val_wer curve against the other arms'
-#      without rescaling the x-axis.
-#
-# LR IS DELIBERATELY UNCHANGED at the streaming arms' 5e-5, so this arm differs
-# from dfw_granary2_chat_spe16k_both in encoder and batch only. That is the
-# minimal-change choice, and it is also the DEBATABLE one: at 10x the batch,
-# linear scaling would argue for 5e-4 and sqrt scaling for ~1.6e-4, and an
-# unscaled LR at 10x batch is effectively a much smaller step per sample -- the
-# most likely way for this arm to come out looking flat rather than wrong. If it
-# trains stably but slowly, raise LR here first.
+# LR UNCHANGED at the streaming arms' 5e-5. At x2 this is far less of a concern
+# than it was at x10: it is the same batch/LR pairing the other v2 arms and the
+# Qwen full-context arm already run, so this arm now differs from
+# dfw_granary2_chat_spe16k_both in the ENCODER ALONE -- which is the comparison
+# the 2x2 actually wants.
 export LR=5e-5
 # ---------------------------------------------------------------------------
 
