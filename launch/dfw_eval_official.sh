@@ -248,4 +248,8 @@ for k, v in sorted((results or {}).items()):
     model, _, ds = k.partition(' | ')
     print(f'{ds}\t{v.get(\"wer\")}\t{model[-60:]}')
 PYEOF
-" 2>&1 | grep -vE "^srun:|CSV Summary|^\*{4,}|^model,|^$" | tail -60
+" 2>&1 | grep -vE "^srun:|CSV Summary|^\*{4,}|^model,|^$" | tail -200
+# tail -200, not -60. The scorer prints ~8 lines per model in the shared results
+# dir, so at 10 models the 60-line window cut off the "Composite Results" header
+# and every composite WER -- the per-dataset rows survived, which made the log
+# look complete while the summary was silently gone.
