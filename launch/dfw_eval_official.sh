@@ -198,9 +198,38 @@ for entry in "${ALL[@]}"; do
     echo "### ${key}: ${n_wer}/${#DATASETS[@]} datasets scored, ${fail} process failures"
 done
 
-echo; echo "############ summary"
+echo; echo "############ summary (printed WER -- NOT the leaderboard metric)"
 for f in "${OUT}"/*.log; do
     [[ -f "$f" ]] || continue
     echo "### $(basename "$f" .log)"
     grep -hoE "WER: [0-9.]+|wer: [0-9.]+" "$f" | tail -8
 done
+
+# ---------------------------------------------------------------------------
+# OFFICIAL SCORE, in this job.
+#
+# run_eval.py PRINTS evaluate/jiwer WER; the leaderboard PUBLISHES what
+# normalizer/eval_utils.score_results() computes -- kaldialign batch_error_rate
+# with merge_compounds=True, which counts split compounds ("white paper" vs
+# "whitepaper") as zero errors. That is 0.3-0.5 WER more lenient, so the numbers
+# above are systematically pessimistic and not comparable to published figures.
+#
+# Scoring re-reads the saved manifests, so it costs seconds and needs no GPU --
+# there was never a reason for it to be a separate job, and running it by hand
+# is how a table of jiwer numbers got reported as if it were leaderboard-
+# comparable.
+# ---------------------------------------------------------------------------
+echo; echo "############ OFFICIAL SCORE (kaldialign, merge_compounds=True)"
+srun --overlap -n1 -N1 --container-image="$CONTAINER" \
+     --container-mounts="${DFW}:${DFW},${CODE_DIR}:/code,${OASR}:/oasr" \
+     bash -c "export PYTHONPATH=${PYLIBS}:/oasr:\${PYTHONPATH:-} && python - <<'PYEOF'
+import sys
+sys.path.insert(0, '/oasr')
+from normalizer import eval_utils
+score, results = eval_utils.score_results('/oasr/nemo_asr/results')
+print()
+for k, v in sorted((results or {}).items()):
+    model, _, ds = k.partition(' | ')
+    print(f'{ds}\t{v.get(\"wer\")}\t{model[-60:]}')
+PYEOF
+" 2>&1 | grep -vE "^srun:|CSV Summary|^\*{4,}|^model,|^$" | tail -60
