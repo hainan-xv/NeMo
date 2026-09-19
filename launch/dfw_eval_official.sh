@@ -124,7 +124,10 @@ LAUNCH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [[ -f "${LAUNCH_DIR}/eval_chat.sh" ]] || LAUNCH_DIR="${CODE_DIR}/launch"
 
 WANT="${MODELS:-}"
-echo "==> official leaderboard harness | out=${OUT} | batch=${BATCH_SIZE}"
+# Echo the decode overrides in the JOB log. run_eval.py prints MAX_SYMBOLS only
+# into the per-dataset log, so checking the slurm_out file for it looked like
+# the override had not taken effect when in fact it had.
+echo "==> official leaderboard harness | out=${OUT} | batch=${BATCH_SIZE} | max_symbols=${MAX_SYMBOLS} | models=${WANT:-<all>}"
 
 for entry in "${ALL[@]}"; do
     IFS='|' read -r key nemo pad avg_launcher ckpt_dir <<< "$entry"
