@@ -69,6 +69,11 @@ mkdir -p "$OUT"
 ALL=(
   "fullctx|${MY}/results/SpeechlmDFW/dfw_granary2_chat_banded1_both_fullctx_parakeet/averaged/top5-averaged.nemo|0|dfw_eval_chat_fullctx_parakeet.sh|${MY}/results/SpeechlmDFW/dfw_granary2_chat_banded1_both_fullctx_parakeet/dfw_granary2_chat_banded1_both_fullctx_parakeet/checkpoints"
   "chat_both|${MY}/results/SpeechlmDFW/dfw_granary2_chat_banded1_both_nodelay_v2/averaged/top5-averaged.nemo|0.5"
+  # FULL-CONTEXT with the 16k purpose-built vocabulary -- the fourth cell of the
+  # {streaming, full-context} x {Qwen 151k, SPE 16k} grid. pad 0 like the other
+  # full-context arm: a non-causal encoder emits nothing until the audio ends,
+  # so there is no lagging tail for trailing silence to flush.
+  "fullctx_spe16k|${MY}/results/SpeechlmDFW/dfw_granary2_chat_spe16k_both_fullctx/averaged/top5-averaged.nemo|0|dfw_eval_chat_spe16k_fullctx.sh|${MY}/results/SpeechlmDFW/dfw_granary2_chat_spe16k_both_fullctx/dfw_granary2_chat_spe16k_both_fullctx/checkpoints"
   "chat_later|${MY}/results/SpeechlmDFW/dfw_granary2_chat_banded1_nodelay_v2/averaged/top5-averaged.nemo|0.5"
   "parakeet|${MY}/pretrained_models/nvidia/parakeet-tdt-0.6b-v2/parakeet-tdt-0.6b-v2.nemo|0"
   "nemotron|${DFW}/users/heh/pretrained_models/huggingface/nvidia/nemotron-speech-streaming-en-0.6b/nemotron-speech-streaming-en-0.6b.nemo|0.5"
