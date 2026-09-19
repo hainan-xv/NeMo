@@ -129,6 +129,12 @@ echo "==> official leaderboard harness | out=${OUT} | batch=${BATCH_SIZE}"
 for entry in "${ALL[@]}"; do
     IFS='|' read -r key nemo pad avg_launcher ckpt_dir <<< "$entry"
 
+    # MODEL FILTER FIRST. It used to sit AFTER the averaging block, so a job
+    # asked for one model still re-averaged every arm that has an averaging
+    # launcher -- burning time on models it would not score, and racing the
+    # trainers of arms it was never asked about.
+    [[ -n "$WANT" && " $WANT " != *" $key "* ]] && continue
+
     # Refresh the average IN THIS JOB when asked, or refuse to score a stale one.
     # Previously averaging lived only in eval_chat.sh, reached from a different
     # launcher -- so refreshing meant running a second job that ALSO ran its own
@@ -147,7 +153,6 @@ for entry in "${ALL[@]}"; do
             continue
         fi
     fi
-    [[ -n "$WANT" && " $WANT " != *" $key "* ]] && continue
     if [[ ! -f "$nemo" ]]; then
         echo "### ${key}: SKIP, missing ${nemo}" >&2; continue
     fi

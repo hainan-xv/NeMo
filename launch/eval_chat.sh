@@ -111,6 +111,19 @@ if [[ ${#DROPPED[@]} -gt 0 ]]; then
     printf '      %s\n' "${DROPPED[@]}"
 fi
 
+# Drop any checkpoint that has VANISHED since the listing above. A live training
+# run with save_top_k deletes a checkpoint the moment a better one lands, so the
+# averaging step can select a file and then fail on it with FileNotFoundError --
+# observed, and it aborts the whole arm rather than degrading.
+declare -a ALIVE=()
+for path in "${KEPT[@]}"; do
+    [[ -f "$path" ]] && ALIVE+=("$path")
+done
+if [[ ${#ALIVE[@]} -lt ${#KEPT[@]} ]]; then
+    echo "==> $(( ${#KEPT[@]} - ${#ALIVE[@]} )) checkpoint(s) disappeared mid-listing (live training); using ${#ALIVE[@]}"
+fi
+KEPT=("${ALIVE[@]}")
+
 BEST=("${KEPT[@]:0:$TOPK}")
 if [[ ${#BEST[@]} -eq 0 ]]; then
     echo "ERROR: every checkpoint in ${CKPT_DIR} was excluded as an outlier" >&2
