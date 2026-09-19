@@ -77,6 +77,18 @@ ALL=(
   # and generate path. pad 0.5 because SCRIPT trains with
   # data.dataset.pad_extra_duration and its emission lags the audio.
   "script_later|${MY}/results/SpeechlmDFW/dfw_granary2_script_banded1_nodelay_v2/dfw_granary2_script_banded1_nodelay_v2/checkpoints/dfw_granary2_script_banded1_nodelay_v2-averaged.ckpt|0.5"
+  # Purpose-built 8k SentencePiece vocabulary. STREAMING, so pad 0.5 like the
+  # other CHAT arms; its own eval launcher carries the tokenizer override that
+  # averaging needs.
+  "spe8k|${MY}/results/SpeechlmDFW/dfw_granary2_chat_spe8k_both/averaged/top5-averaged.nemo|0.5|dfw_eval_chat_spe8k.sh|${MY}/results/SpeechlmDFW/dfw_granary2_chat_spe8k_both/dfw_granary2_chat_spe8k_both/checkpoints"
+  # Purpose-built 16k SentencePiece vocabulary. STREAMING, so pad 0.5 like the
+  # other CHAT arms; its own eval launcher carries the tokenizer override that
+  # averaging needs.
+  "spe16k|${MY}/results/SpeechlmDFW/dfw_granary2_chat_spe16k_both/averaged/top5-averaged.nemo|0.5|dfw_eval_chat_spe16k.sh|${MY}/results/SpeechlmDFW/dfw_granary2_chat_spe16k_both/dfw_granary2_chat_spe16k_both/checkpoints"
+  # Purpose-built 32k SentencePiece vocabulary. STREAMING, so pad 0.5 like the
+  # other CHAT arms; its own eval launcher carries the tokenizer override that
+  # averaging needs.
+  "spe32k|${MY}/results/SpeechlmDFW/dfw_granary2_chat_spe32k_both/averaged/top5-averaged.nemo|0.5|dfw_eval_chat_spe32k.sh|${MY}/results/SpeechlmDFW/dfw_granary2_chat_spe32k_both/dfw_granary2_chat_spe32k_both/checkpoints"
   "script_both|${MY}/results/SpeechlmDFW/dfw_granary2_script_banded1_both_nodelay_v2/dfw_granary2_script_banded1_both_nodelay_v2/checkpoints/dfw_granary2_script_banded1_both_nodelay_v2-averaged.ckpt|0.5"
 )
 
