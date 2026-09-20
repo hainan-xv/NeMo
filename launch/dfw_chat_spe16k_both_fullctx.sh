@@ -73,9 +73,13 @@ export EPOCH_STEPS=2000
 # carries a "WATCH MEMORY" warning while running the 1x list. x5 would have been
 # another guess at a number this project has now OOM'd six times by guessing.
 #
-# This is the streaming arms' list x2 -- which is also the list the Qwen
-# full-context arm runs, so memory behaviour here has a direct precedent rather
-# than an extrapolation. Absolute, not a multiplier, so a YAML retune cannot
+# This is the streaming arms' list x2.
+#
+# CORRECTION: an earlier version of this comment claimed the Qwen full-context
+# arm (dfw_chat_banded1_both_fullctx_parakeet.sh) also runs this list. It does
+# NOT -- it runs [76,58,...,8], half of this. So a WER comparison between that
+# arm and this one confounds vocabulary with batch size, and is not a clean
+# vocabulary result. Absolute, not a multiplier, so a YAML retune cannot
 # silently change it.
 export BUCKET_BATCH_SIZE='[152,116,100,88,80,72,68,60,56,52,48,44,40,32,28,24,20,16]'
 #

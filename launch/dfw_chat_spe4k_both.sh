@@ -127,7 +127,20 @@ export EPOCH_STEPS=2000
 #   [38, 29, 25, 22, 20, 18, 17, 15, 14, 13, 12, 11, 10, 8, 7, 6, 5, 4]
 # which is duplicated here deliberately: an absolute override cannot silently
 # become wrong if the YAML is retuned, whereas a multiplier could.
-export BUCKET_BATCH_SIZE='[76,58,50,44,40,36,34,30,28,26,24,22,20,16,14,12,10,8]'
+#
+# BATCH x2 AGAIN on top of that, matching dfw_chat_spe16k_both_fullctx.sh, i.e.
+# 4x the YAML base. Requested explicitly.
+#
+# COMPARABILITY WARNING. The FINISHED 8k/16k/32k arms ran at the x2 list above
+# (4.92/4.95/4.95 macro-7). These three run at x4, so a 1k-vs-8k difference now
+# confounds vocabulary size with batch size. To read the six-point sweep as a
+# vocabulary result, one arm must be re-run at x4 as a bridge -- spe8k is the
+# natural choice, being the best of the finished three.
+#
+# MEMORY IS FINE, measured not assumed: the full-context arm runs this exact
+# list at ~47 GiB of 81.5 per rank, and full attention costs MORE per sample
+# than this arm's [70,13] window, so streaming at the same batch sits below that.
+export BUCKET_BATCH_SIZE='[152,116,100,88,80,72,68,60,56,52,48,44,40,32,28,24,20,16]'
 #
 # LR 1e-4 -> 5e-5. Two reasons, and the second is the stronger one:
 #   1. it is the conservative direction while the batch change beds in;
