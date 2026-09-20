@@ -86,6 +86,9 @@ ALL=(
   # other CHAT arms; its own eval launcher carries the tokenizer override that
   # averaging needs.
   "spe8k|${MY}/results/SpeechlmDFW/dfw_granary2_chat_spe8k_both/averaged/top5-averaged.nemo|0.5|dfw_eval_chat_spe8k.sh|${MY}/results/SpeechlmDFW/dfw_granary2_chat_spe8k_both/dfw_granary2_chat_spe8k_both/checkpoints"
+  "spe1k|${MY}/results/SpeechlmDFW/dfw_granary2_chat_spe1k_both/averaged/top5-averaged.nemo|0.5|dfw_eval_chat_spe1k.sh|${MY}/results/SpeechlmDFW/dfw_granary2_chat_spe1k_both/dfw_granary2_chat_spe1k_both/checkpoints"
+  "spe2k|${MY}/results/SpeechlmDFW/dfw_granary2_chat_spe2k_both/averaged/top5-averaged.nemo|0.5|dfw_eval_chat_spe2k.sh|${MY}/results/SpeechlmDFW/dfw_granary2_chat_spe2k_both/dfw_granary2_chat_spe2k_both/checkpoints"
+  "spe4k|${MY}/results/SpeechlmDFW/dfw_granary2_chat_spe4k_both/averaged/top5-averaged.nemo|0.5|dfw_eval_chat_spe4k.sh|${MY}/results/SpeechlmDFW/dfw_granary2_chat_spe4k_both/dfw_granary2_chat_spe4k_both/checkpoints"
   # Purpose-built 16k SentencePiece vocabulary. STREAMING, so pad 0.5 like the
   # other CHAT arms; its own eval launcher carries the tokenizer override that
   # averaging needs.
