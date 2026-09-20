@@ -51,6 +51,11 @@ from omegaconf import DictConfig, OmegaConf
 
 from nemo.collections.asr.data.audio_to_text_lhotse import LhotseSpeechToTextBpeDataset
 from nemo.collections.asr.losses.banded_rnnt import BandedLattice, banded_rnnt_loss, build_lattices
+from nemo.collections.asr.parts.numba.banded_rnnt.banded_rnnt_numba import (
+    banded_rnnt_loss_cuda,
+    build_band_index,
+    kernel_is_usable,
+)
 from nemo.collections.asr.models.rnnt_bpe_models import EncDecRNNTBPEModel
 from nemo.collections.asr.parts.utils.chat_alignment import (
     assert_clean_transcript,
@@ -765,7 +770,13 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
         n_chunks = torch.div(encoded_len + chunk_size - 1, chunk_size, rounding_mode="floor").cpu()
 
         chunks_per_utt = [self._chunk_tokens(cut, int(n_chunks[b])) for b, cut in enumerate(cuts)]
-        per_utt, num_chunks, target_lens = build_lattices(chunks_per_utt, self.band_chunks, self.band_side)
+        # Band GEOMETRY first, and from numpy rather than the Python dict the
+        # reference lattice builds: the guards below and the joint both need only
+        # the node triples and the per-chunk bounds, and on the kernel path the
+        # predecessor/diagonal bookkeeping is never used at all.
+        band = build_band_index(chunks_per_utt, self.band_chunks, self.band_side)
+        num_chunks = band.num_chunks.tolist()
+        target_lens = band.target_lens.tolist()
         if sum(target_lens) == 0:
             logging.warning(f"empty banded lattice at step {self.global_step}; contributing zero loss")
             return encoded.sum() * 0.0
@@ -780,8 +791,29 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
             )
             return encoded.sum() * 0.0
 
-        lattice = BandedLattice(per_utt, num_chunks, target_lens)
-        b_idx, t_idx, u_idx = lattice.index_tensors(encoded.device)
+        # CUDA kernels when they can run this batch, reference otherwise. The
+        # kernels are validated against the reference for both value and
+        # gradient (tests/collections/asr/test_banded_rnnt_numba.py); the
+        # fallback exists for CPU, for an empty band, and for targets longer
+        # than one CUDA block of threads.
+        use_kernel, kernel_why = kernel_is_usable(band, encoded.device)
+        if os.environ.get("CHAT_BANDED_KERNEL", "1") == "0":
+            use_kernel, kernel_why = False, "disabled by CHAT_BANDED_KERNEL=0"
+        if not getattr(self, "_banded_path_logged", False):
+            logging.info(
+                "CHAT banded loss path: %s%s",
+                "CUDA kernels" if use_kernel else "reference (PyTorch)",
+                "" if use_kernel else f" -- {kernel_why}",
+            )
+            self._banded_path_logged = True
+
+        if use_kernel:
+            lattice = band
+            b_idx, t_idx, u_idx = band.index_tensors(encoded.device)
+        else:
+            per_utt, ref_chunks, ref_lens = build_lattices(chunks_per_utt, self.band_chunks, self.band_side)
+            lattice = BandedLattice(per_utt, ref_chunks, ref_lens)
+            b_idx, t_idx, u_idx = lattice.index_tensors(encoded.device)
 
         # Targets, and the prediction network run over them. u indexes emitted
         # labels, exactly as in the forced path.
@@ -800,7 +832,10 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
         log_probs = logits.float().log_softmax(-1)
 
         blank = self.joint.num_classes_with_blank - 1
-        nll = banded_rnnt_loss(log_probs, lattice, targets, blank)
+        if use_kernel:
+            nll = banded_rnnt_loss_cuda(log_probs, band, targets, blank)
+        else:
+            nll = banded_rnnt_loss(log_probs, lattice, targets, blank)
         # mean_volume: per target token, matching the rnnt arm's reduction so the
         # two losses are on the same scale.
         loss = nll.sum() / max(int(pred_lens.sum()), 1)
