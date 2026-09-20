@@ -87,6 +87,7 @@ ALL=(
   # averaging needs.
   "spe8k|${MY}/results/SpeechlmDFW/dfw_granary2_chat_spe8k_both/averaged/top5-averaged.nemo|0.5|dfw_eval_chat_spe8k.sh|${MY}/results/SpeechlmDFW/dfw_granary2_chat_spe8k_both/dfw_granary2_chat_spe8k_both/checkpoints"
   "spe1k|${MY}/results/SpeechlmDFW/dfw_granary2_chat_spe1k_both/averaged/top5-averaged.nemo|0.5|dfw_eval_chat_spe1k.sh|${MY}/results/SpeechlmDFW/dfw_granary2_chat_spe1k_both/dfw_granary2_chat_spe1k_both/checkpoints"
+  "spe1krnnt|${MY}/results/SpeechlmDFW/dfw_granary2_chat_spe1k_rnnt/averaged/top5-averaged.nemo|0.5|dfw_eval_chat_spe1krnnt.sh|${MY}/results/SpeechlmDFW/dfw_granary2_chat_spe1k_rnnt/dfw_granary2_chat_spe1k_rnnt/checkpoints"
   "spe2k|${MY}/results/SpeechlmDFW/dfw_granary2_chat_spe2k_both/averaged/top5-averaged.nemo|0.5|dfw_eval_chat_spe2k.sh|${MY}/results/SpeechlmDFW/dfw_granary2_chat_spe2k_both/dfw_granary2_chat_spe2k_both/checkpoints"
   "spe4k|${MY}/results/SpeechlmDFW/dfw_granary2_chat_spe4k_both/averaged/top5-averaged.nemo|0.5|dfw_eval_chat_spe4k.sh|${MY}/results/SpeechlmDFW/dfw_granary2_chat_spe4k_both/dfw_granary2_chat_spe4k_both/checkpoints"
   "spe8kbb|${MY}/results/SpeechlmDFW/dfw_granary2_chat_spe8k_both_bigbatch/averaged/top5-averaged.nemo|0.5|dfw_eval_chat_spe8kbb.sh|${MY}/results/SpeechlmDFW/dfw_granary2_chat_spe8k_both_bigbatch/dfw_granary2_chat_spe8k_both_bigbatch/checkpoints"
