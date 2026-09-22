@@ -110,12 +110,26 @@ class EncDecMultiVocabCHATBPEModel(EncDecCHATBPEModel):
             logging.info("CHAT multi-vocab: no multivocab section (donor restore?); running single-head")
 
         self._heads: List[_Head] = [_Head(self, dirs[0])]
+        ref_joint = self._heads[0].joint
         for d in dirs[1:]:
             # change_vocabulary rebuilds tokenizer/decoder/joint/decoding/wer/loss
             # in place. The previous head's modules survive because _heads still
             # references them, so its `del self.joint` only drops the attribute.
             self.change_vocabulary(d, "bpe")
+            self._inherit_chunk_geometry(ref_joint, self.joint)
             self._heads.append(_Head(self, d))
+
+        # HARD CHECK, because the failure this guards is silent. chunk_size is
+        # inferred by the model from the encoder's att_context_size and set as a
+        # RUNTIME attribute on head 0's joint; it is not written back to the
+        # config, so a joint rebuilt from to_config_dict() gets the -1 default.
+        # Heads 1 and 2 then have window_width 0 and train against a degenerate
+        # emission grid -- observed, with the loss still falling, until the WER
+        # decode finally raised in chunk_concat_audio 11 minutes in. A wrong
+        # chunk_size does not fail fast, so it is asserted rather than trusted.
+        sizes = [int(h.joint.chunk_size) for h in self._heads]
+        if len(set(sizes)) != 1 or sizes[0] <= 0:
+            raise ValueError(f"heads disagree on joint.chunk_size or it is unset: {sizes}")
 
         # Register every head's parameters. named_parameters() de-duplicates by
         # identity, so the active head being reachable as BOTH self.decoder and
@@ -155,6 +169,18 @@ class EncDecMultiVocabCHATBPEModel(EncDecCHATBPEModel):
         )
 
     # ----------------------------------------------------------------- heads
+    @staticmethod
+    def _inherit_chunk_geometry(ref, new) -> None:
+        """Copy the joint's INFERRED geometry, which to_config_dict() does not carry.
+
+        These are the attributes CHAT derives at construction rather than reads
+        from the config. Everything vocabulary-shaped must differ between heads;
+        everything about the emission grid must not.
+        """
+        for attr in ("chunk_size", "history_chunks", "frame_trim"):
+            if hasattr(ref, attr):
+                setattr(new, attr, getattr(ref, attr))
+
     def _select_head(self, i: int) -> None:
         """Make head ``i`` the one every inherited code path sees."""
         if i == self._active_head:
