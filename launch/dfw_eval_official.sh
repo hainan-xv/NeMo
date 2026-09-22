@@ -74,6 +74,7 @@ ALL=(
   # full-context arm: a non-causal encoder emits nothing until the audio ends,
   # so there is no lagging tail for trailing silence to flush.
   "fullctx_spe16k|${MY}/results/SpeechlmDFW/dfw_granary2_chat_spe16k_both_fullctx/averaged/top5-averaged.nemo|0|dfw_eval_chat_spe16k_fullctx.sh|${MY}/results/SpeechlmDFW/dfw_granary2_chat_spe16k_both_fullctx/dfw_granary2_chat_spe16k_both_fullctx/checkpoints"
+  "fullctx_spe1k|${MY}/results/SpeechlmDFW/dfw_granary2_chat_spe1k_both_fullctx/averaged/top5-averaged.nemo|0|dfw_eval_chat_spe1k_fullctx.sh|${MY}/results/SpeechlmDFW/dfw_granary2_chat_spe1k_both_fullctx/dfw_granary2_chat_spe1k_both_fullctx/checkpoints"
   "chat_later|${MY}/results/SpeechlmDFW/dfw_granary2_chat_banded1_nodelay_v2/averaged/top5-averaged.nemo|0.5"
   "parakeet|${MY}/pretrained_models/nvidia/parakeet-tdt-0.6b-v2/parakeet-tdt-0.6b-v2.nemo|0"
   "nemotron|${DFW}/users/heh/pretrained_models/huggingface/nvidia/nemotron-speech-streaming-en-0.6b/nemotron-speech-streaming-en-0.6b.nemo|0.5"
