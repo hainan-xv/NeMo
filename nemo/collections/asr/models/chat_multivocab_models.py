@@ -246,6 +246,29 @@ class EncDecMultiVocabCHATBPEModel(EncDecCHATBPEModel):
             lens[b] = len(x)
         return out, lens
 
+    def state_dict(self, *args, **kwargs):
+        """Always emit head 0 under ``decoder.*`` / ``joint.*``.
+
+        The active head is reachable BOTH as self.decoder and as
+        heads_decoders[i], so those keys describe whichever head happened to be
+        sampled when the state was captured. Scheduled checkpoints are written
+        after validation, which pins head 0 -- but a TERMINATION checkpoint is
+        not, and one written mid-training with the 2k head active produced
+        decoder.prediction.embed.weight of [2049, 640]. Resuming then failed with
+        a size mismatch against the 1k head the fresh model builds.
+
+        Pinning head 0 for the duration of the capture makes the alias
+        deterministic, so a checkpoint is always readable by a fresh model.
+        """
+        prev = self._active_head
+        if prev != 0:
+            self._select_head(0)
+        try:
+            return super().state_dict(*args, **kwargs)
+        finally:
+            if prev != 0:
+                self._select_head(prev)
+
     # ------------------------------------------------------------- lightning
     def training_step(self, batch, batch_nb):
         i = self._sample_head()

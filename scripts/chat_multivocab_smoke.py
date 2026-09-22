@@ -237,10 +237,30 @@ def run_model(cfg, root, devices):
 
     trainer.fit(model)
     check("training completed", trainer.global_step >= 1, f"global_step={trainer.global_step}")
+    # Captured BEFORE the checkpoint checks below perturb the active head.
+    post_val_head = model._active_head
+
+    # A TERMINATION checkpoint is written with whatever head was last sampled.
+    # Capture the state with a non-zero head active and confirm a fresh model can
+    # load it -- the exact failure that killed 19118299 on resume.
+    import torch as _t2
+
+    model._select_head(len(model._heads) - 1)
+    sd = model.state_dict()
+    shape = tuple(sd["decoder.prediction.embed.weight"].shape)
+    want = model._heads[0].decoder.prediction.embed.weight.shape
+    check("state_dict pins head 0 under decoder.*", shape == tuple(want),
+          f"{shape} vs head0 {tuple(want)} (active head was {model._active_head})")
+    fresh = EncDecMultiVocabCHATBPEModel(cfg=cfg.model, trainer=None)
+    try:
+        fresh.load_state_dict(sd, strict=True)
+        check("fresh model loads that checkpoint", True, "(strict)")
+    except Exception as e:
+        check("fresh model loads that checkpoint", False, f"{type(e).__name__}: {str(e)[:110]}")
     counts = model._head_counts
     check("more than one head sampled", sum(1 for c in counts if c > 0) > 1, f"head counts {counts}")
-    check("validation ran on head 0", model._active_head == model._val_head,
-          f"active={model._active_head} val={model._val_head}")
+    check("validation ran on head 0", post_val_head == model._val_head,
+          f"active-after-validation={post_val_head} val={model._val_head}")
     return ok
 
 
