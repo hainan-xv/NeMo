@@ -120,9 +120,20 @@ class EncDecMultiVocabCHATBPEModel(EncDecCHATBPEModel):
         # Register every head's parameters. named_parameters() de-duplicates by
         # identity, so the active head being reachable as BOTH self.decoder and
         # heads_decoders[i] does not double-count it in the optimizer.
-        self.heads_decoders = torch.nn.ModuleList([h.decoder for h in self._heads])
-        self.heads_joints = torch.nn.ModuleList([h.joint for h in self._heads])
-        self.heads_wers = torch.nn.ModuleList([h.wer for h in self._heads])
+        #
+        # ONLY WHEN THERE IS MORE THAN ONE HEAD. With a single head self.decoder
+        # and self.joint already register everything, and the ModuleLists would
+        # be pure duplication -- but worse, they add heads_decoders.0.* /
+        # heads_joints.0.* keys that a plain CHAT checkpoint does not have. That
+        # is not hypothetical: init_from_nemo_model builds this class from the
+        # DONOR config (single head) and then calls load_state_dict(strict=True)
+        # with the donor's weights, which failed with 21 "Missing key(s)" and
+        # took the run down at 3m16. Skipping the lists on that path makes the
+        # instance structurally identical to the plain model the donor is.
+        if len(self._heads) > 1:
+            self.heads_decoders = torch.nn.ModuleList([h.decoder for h in self._heads])
+            self.heads_joints = torch.nn.ModuleList([h.joint for h in self._heads])
+            self.heads_wers = torch.nn.ModuleList([h.wer for h in self._heads])
 
         w = mv.get("sample_weights", None) if mv else None
         self._head_weights = [float(x) for x in w] if w else [1.0] * len(self._heads)
