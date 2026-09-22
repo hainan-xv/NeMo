@@ -82,22 +82,32 @@ class EncDecMultiVocabCHATBPEModel(EncDecCHATBPEModel):
 
     def __init__(self, cfg: DictConfig, trainer=None):
         mv = cfg.get("multivocab", None)
-        if mv is None or not mv.get("tokenizer_dirs", None):
-            raise ValueError("model.multivocab.tokenizer_dirs must list at least one tokenizer directory")
-        dirs = [str(d) for d in mv["tokenizer_dirs"]]
+        dirs = [str(d) for d in mv["tokenizer_dirs"]] if (mv and mv.get("tokenizer_dirs", None)) else None
 
         # Head 0 is special: the LhotseSpeechToTextBpeDataset is constructed with
         # self.tokenizer during setup_training_data (called from inside
         # ModelPT.__init__), so whatever cfg.tokenizer.dir points at is what
         # every batch's `transcript` tensor is encoded with. Pinning it to
         # dirs[0] keeps validation on one vocabulary for the whole run.
-        if str(cfg.tokenizer.dir) != dirs[0]:
+        if dirs and str(cfg.tokenizer.dir) != dirs[0]:
             raise ValueError(
                 f"model.tokenizer.dir ({cfg.tokenizer.dir}) must equal multivocab.tokenizer_dirs[0] ({dirs[0]}); "
                 "head 0 feeds the dataloader and validation."
             )
 
         super().__init__(cfg, trainer=trainer)
+
+        if not dirs:
+            # SINGLE-HEAD FALLBACK, and it is load-bearing rather than defensive.
+            # init_from_nemo_model restores the DONOR .nemo by calling
+            # from_config_dict with THIS class and the donor's own config -- which
+            # has no multivocab section, because the donor is an ordinary
+            # single-vocabulary CHAT model. Requiring multivocab here made warm
+            # starting impossible: the run died in 97 s at
+            # from_config_dict -> imported_cls(cfg=donor_cfg). Degrading to one
+            # head is correct for that path, which only wants encoder weights.
+            dirs = [str(cfg.tokenizer.dir)]
+            logging.info("CHAT multi-vocab: no multivocab section (donor restore?); running single-head")
 
         self._heads: List[_Head] = [_Head(self, dirs[0])]
         for d in dirs[1:]:
@@ -114,11 +124,11 @@ class EncDecMultiVocabCHATBPEModel(EncDecCHATBPEModel):
         self.heads_joints = torch.nn.ModuleList([h.joint for h in self._heads])
         self.heads_wers = torch.nn.ModuleList([h.wer for h in self._heads])
 
-        w = mv.get("sample_weights", None)
+        w = mv.get("sample_weights", None) if mv else None
         self._head_weights = [float(x) for x in w] if w else [1.0] * len(self._heads)
         if len(self._head_weights) != len(self._heads):
             raise ValueError(f"sample_weights has {len(self._head_weights)} entries for {len(self._heads)} heads")
-        self._val_head = int(mv.get("val_head", 0))
+        self._val_head = int(mv.get("val_head", 0)) if mv else 0
         self._head_rng: Optional[random.Random] = None
         self._active_head = -1
         self._head_counts = [0] * len(self._heads)
