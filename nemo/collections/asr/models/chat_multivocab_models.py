@@ -159,6 +159,8 @@ class EncDecMultiVocabCHATBPEModel(EncDecCHATBPEModel):
         self._head_counts = [0] * len(self._heads)
 
         self._select_head(0)
+        # change_vocabulary left cfg describing the LAST head built; put it back.
+        self._sync_cfg_to_head(0)
         logging.info(
             "CHAT multi-vocab: %d heads %s, sample weights %s, validation pinned to head %d (%s)",
             len(self._heads),
@@ -192,12 +194,21 @@ class EncDecMultiVocabCHATBPEModel(EncDecCHATBPEModel):
         self.decoding = h.decoding
         self.wer = h.wer
         self.loss = h.loss
-        # Keep cfg consistent with the live modules so a checkpoint saved at any
-        # point describes the head it actually contains.
+        self._active_head = i
+
+    def _sync_cfg_to_head(self, i: int) -> None:
+        """Point cfg.decoder/cfg.joint at head ``i``'s shapes.
+
+        NOT done on every switch. Rebuilding two OmegaConf nodes per batch cost
+        a measured 23% of step time against a single-vocab arm -- for a config
+        nothing reads mid-step. Checkpoints are written after validation, which
+        pins head 0, so syncing at construction and before a save is sufficient
+        and the .nemo still describes the head it contains.
+        """
+        h = self._heads[i]
         with open_dict(self.cfg):
             self.cfg.decoder = OmegaConf.create(h.cfg_decoder)
             self.cfg.joint = OmegaConf.create(h.cfg_joint)
-        self._active_head = i
 
     def _sample_head(self) -> int:
         if self._head_rng is None:
@@ -266,4 +277,7 @@ class EncDecMultiVocabCHATBPEModel(EncDecCHATBPEModel):
 
     def on_validation_epoch_start(self):
         self._select_head(self._val_head)
+        # Checkpoints are written at the end of validation, so this is the point
+        # where cfg must describe the live head.
+        self._sync_cfg_to_head(self._val_head)
         return super().on_validation_epoch_start()

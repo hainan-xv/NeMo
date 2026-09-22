@@ -145,7 +145,16 @@ export DESIGN_NODES=2
 # from a 151.7k-piece Qwen arm. Including them would not warm-start more; the
 # shapes would simply fail to match and the tensors would stay at init while
 # the load reported success.
-export INIT_INCLUDE='["encoder."]'
+# FULL init of head 0, not encoder-only. The donor is the TRAINED single-vocab
+# 1k arm (macro-7 4.81), whose vocabulary is head 0's exactly, so its decoder and
+# joint transfer tensor for tensor -- there is no reason to throw them away and
+# relearn them. Heads 1 (2k) and 2 (4k) have different vocabularies, so their
+# decoder/joint start from scratch, which is the intended asymmetry.
+#
+# INIT_EXCLUDE is empty on purpose: the launcher's default excludes
+# prediction.embed, which is right when the vocabulary CHANGES and wrong here,
+# where donor and head 0 are both 1,024 pieces.
+export INIT_INCLUDE='["encoder.","decoder.","joint."]'
 export INIT_EXCLUDE='[]'
 
 # The standard CHAT arm's top-5 average, produced by its own leaderboard eval.
@@ -161,7 +170,7 @@ if [[ ! -f "${TOKENIZER_DIR}/tokenizer.model" ]]; then
     echo "       Build it first: sbatch launch/dfw_build_spe_vocabs.sh" >&2
     exit 1
 fi
-export INIT_NEMO="${INIT_NEMO:-${DFW}/hainanx/results/SpeechlmDFW/dfw_granary2_chat_forced/averaged/top5-averaged.nemo}"
+export INIT_NEMO="${INIT_NEMO:-${DFW}/hainanx/results/SpeechlmDFW/dfw_granary2_chat_spe1k_both/averaged/top5-averaged.nemo}"
 
 if [[ ! -f "${INIT_NEMO}" ]]; then
     echo "ERROR: warm-start model not found: ${INIT_NEMO}" >&2

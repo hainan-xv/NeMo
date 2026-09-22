@@ -189,6 +189,9 @@ def run_model(cfg, root, devices):
     with open_dict(dcfg):
         del dcfg.model["multivocab"]
     donor = EncDecCHATBPEModel(cfg=dcfg.model, trainer=None)
+    # Keep a reference tensor so we can prove head 0 actually RECEIVED the
+    # donor's decoder, rather than merely that the restore raised nothing.
+    donor_embed = donor.decoder.prediction.embed.weight.detach().clone().cpu()
     donor_path = os.path.join(root, "donor.nemo")
     donor.save_to(donor_path)
     del donor
@@ -200,8 +203,11 @@ def run_model(cfg, root, devices):
         check("donor saved", os.path.exists(donor_path), donor_path)
 
     with open_dict(cfg):
+        # FULL init of head 0, not just the encoder: the donor is a single-vocab
+        # model at the SAME vocabulary as head 0, so its decoder and joint
+        # transfer exactly. Heads 1-2 have different vocabularies and stay random.
         cfg.init_from_nemo_model = OmegaConf.create(
-            {"model0": {"path": donor_path, "include": ["encoder."], "exclude": []}})
+            {"model0": {"path": donor_path, "include": ["encoder.", "decoder.", "joint."], "exclude": []}})
 
     print("\n=== construct + warm start + train ===", flush=True)
     trainer = pl.Trainer(**resolve_trainer_cfg(cfg.trainer))
@@ -217,6 +223,18 @@ def run_model(cfg, root, devices):
     model.maybe_init_from_pretrained_checkpoint(cfg)
     check("donor restore survived", True, "(no exception)")
 
+    import torch as _t
+
+    got = model._heads[0].decoder.prediction.embed.weight.detach().cpu()
+    check("head 0 decoder LOADED from donor", _t.allclose(got, donor_embed),
+          f"max|diff|={float((got - donor_embed).abs().max()):.3e}")
+    for k in (1, 2):
+        w = model._heads[k].decoder.prediction.embed.weight.detach().cpu()
+        # Different vocabulary sizes, so not even comparable -- assert the shape
+        # differs, which is what makes 'heads 1-2 are untouched' meaningful.
+        check(f"head {k} decoder NOT from donor", w.shape[0] != donor_embed.shape[0],
+              f"{tuple(w.shape)} vs donor {tuple(donor_embed.shape)}")
+
     trainer.fit(model)
     check("training completed", trainer.global_step >= 1, f"global_step={trainer.global_step}")
     counts = model._head_counts
@@ -226,11 +244,74 @@ def run_model(cfg, root, devices):
     return ok
 
 
+def time_steps(cfg, root, multivocab: bool, fup: bool, steps: int, devices: int):
+    """Wall-clock for `steps` training steps, single-vocab vs multi-vocab."""
+    import time
+
+    import lightning.pytorch as pl
+    from omegaconf import OmegaConf, open_dict
+
+    from nemo.collections.asr.models import EncDecCHATBPEModel, EncDecMultiVocabCHATBPEModel
+    from nemo.utils.trainer_utils import resolve_trainer_cfg
+
+    c = OmegaConf.create(OmegaConf.to_container(cfg, resolve=False))
+    with open_dict(c):
+        if not multivocab:
+            del c.model["multivocab"]
+        c.trainer.strategy.find_unused_parameters = fup
+        c.trainer.max_steps = steps
+        c.trainer.limit_train_batches = steps
+        c.trainer.limit_val_batches = 0
+        c.trainer.num_sanity_val_steps = 0
+        # Must track limit_train_batches or Lightning refuses when the warmup
+        # runs fewer steps than the outer config's interval.
+        c.trainer.val_check_interval = steps
+        c.trainer.devices = devices
+    cls = EncDecMultiVocabCHATBPEModel if multivocab else EncDecCHATBPEModel
+    trainer = pl.Trainer(**resolve_trainer_cfg(c.trainer))
+    model = cls(cfg=c.model, trainer=trainer)
+    import torch
+
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    trainer.fit(model)
+    torch.cuda.synchronize()
+    dt = time.perf_counter() - t0
+    n = max(trainer.global_step, 1)
+    return dt / n * 1e3
+
+
+def run_compare(cfg, root, devices, steps):
+    """Decompose the multi-vocab slowdown into DDP cost and model cost.
+
+    The config pins DDPStrategy even for one device, so find_unused_parameters
+    cannot simply be turned off to isolate it -- a single-vocab run with the flag
+    ON is the control that prices the flag, and multi-vocab against THAT prices
+    the model.
+    """
+    print(f"\n=== ms/step, {devices} GPU(s), {steps} steps ===", flush=True)
+    # WARMUP, discarded. The first fit in a process pays CUDA context creation,
+    # cuDNN/cuBLAS init and -- the big one -- numba JIT-compiling the banded
+    # kernels. Without this the first config measured looks 2.4x SLOWER than the
+    # others purely because it went first.
+    time_steps(cfg, root, True, True, max(steps // 2, 4), devices)
+    print("  (warmup done)", flush=True)
+    a = time_steps(cfg, root, False, False, steps, devices)   # production single-vocab
+    b = time_steps(cfg, root, False, True, steps, devices)    # same model, flag on
+    c = time_steps(cfg, root, True, True, steps, devices)     # production multi-vocab
+    print(f"  single-vocab, find_unused=False   {a:8.1f} ms/step   1.00x  (production single)", flush=True)
+    print(f"  single-vocab, find_unused=True    {b:8.1f} ms/step   {b/a:5.2f}x  (cost of the DDP flag)", flush=True)
+    print(f"  multi-vocab,  find_unused=True    {c:8.1f} ms/step   {c/a:5.2f}x  (production multi)", flush=True)
+    print(f"\n  attribution: DDP flag {b/a:5.2f}x, extra heads {c/b:5.2f}x", flush=True)
+    return [a, b, c]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--devices", type=int, default=1, help="2 exercises DDP, where unused-parameter bugs appear")
     ap.add_argument("--steps", type=int, default=6)
     ap.add_argument("--keep", action="store_true")
+    ap.add_argument("--compare", action="store_true", help="time single- vs multi-vocab instead of smoke-testing")
     args = ap.parse_args()
 
     root = tempfile.mkdtemp(prefix="mvsmoke_")
@@ -242,6 +323,9 @@ def main():
         cuts = make_data(root)
         print(f"  tokenizers {[os.path.basename(d) for d in tok_dirs]}, {sum(1 for _ in open(cuts))} cuts", flush=True)
         cfg = toy_cfg(tok_dirs, cuts, args.steps, args.devices)
+        if args.compare:
+            run_compare(cfg, root, args.devices, args.steps)
+            return 0
         ok = run_model(cfg, root, args.devices)
         print("\nRESULT:", "ALL PASS" if ok else "FAILURES ABOVE", flush=True)
         return 0 if ok else 1
