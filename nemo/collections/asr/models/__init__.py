@@ -15,6 +15,9 @@
 from nemo.collections.asr.models.aed_multitask_models import EncDecMultiTaskModel  # noqa: F401
 from nemo.collections.asr.models.asr_model import ASRModel  # noqa: F401
 from nemo.collections.asr.models.chat_bpe_models import EncDecCHATBPEModel  # noqa: F401
+from nemo.collections.asr.models.chat_multivocab_models import (  # noqa: F401
+    EncDecMultiVocabCHATBPEModel,
+)
 from nemo.collections.asr.models.classification_models import (  # noqa: F401
     ClassificationInferConfig,
     EncDecClassificationModel,
@@ -57,6 +60,7 @@ __all__ = [
     'EncDecMultiTaskModel',
     'EncDecMultiTalkerRNNTBPEModel',
     'EncDecCHATBPEModel',
+    'EncDecMultiVocabCHATBPEModel',
     'EncDecRNNTBPEModel',
     'EncDecRNNTBPEModelWithPrompt',
     'EncDecRNNTModel',

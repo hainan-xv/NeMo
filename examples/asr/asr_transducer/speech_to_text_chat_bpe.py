@@ -36,7 +36,7 @@ python speech_to_text_chat_bpe.py \
 import lightning.pytorch as pl
 from omegaconf import OmegaConf
 
-from nemo.collections.asr.models import EncDecCHATBPEModel
+from nemo.collections.asr.models import EncDecCHATBPEModel, EncDecMultiVocabCHATBPEModel
 from nemo.core.config import hydra_runner
 from nemo.utils import logging
 from nemo.utils.exp_manager import exp_manager
@@ -51,7 +51,12 @@ def main(cfg):
 
     trainer = pl.Trainer(**resolve_trainer_cfg(cfg.trainer))
     exp_manager(trainer, cfg.get("exp_manager", None))
-    asr_model = EncDecCHATBPEModel(cfg=cfg.model, trainer=trainer)
+    # One entry point, class chosen by the config: a multi-vocab run differs
+    # only in carrying model.multivocab, and a separate script would drift out
+    # of step with this one on every other flag.
+    model_cls = EncDecMultiVocabCHATBPEModel if cfg.model.get("multivocab", None) else EncDecCHATBPEModel
+    logging.info(f"CHAT model class: {model_cls.__name__}")
+    asr_model = model_cls(cfg=cfg.model, trainer=trainer)
 
     asr_model.maybe_init_from_pretrained_checkpoint(cfg)
 
