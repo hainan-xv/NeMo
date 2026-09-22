@@ -384,7 +384,14 @@ trainer:
   strategy:
     _target_: lightning.pytorch.strategies.DDPStrategy
     gradient_as_bucket_view: true
-    find_unused_parameters: false
+    # TRUE HERE, unlike every single-vocab arm. Each batch is scored with ONE
+    # sampled head, so the other two heads' decoder and joint parameters receive
+    # no gradient that step -- which is the whole point of the design and which
+    # DDP rejects by default. Without it the run dies at the first backward with
+    # "parameters that were not used in producing the loss" (observed: 6m56).
+    # It costs an extra graph traversal per step; the alternative, a zero-weighted
+    # term touching every head, would waste a full forward on two of them.
+    find_unused_parameters: true
   accumulate_grad_batches: 1
   gradient_clip_val: 1.0
   # fp32 master weights with bf16 compute. bf16-true kept optimizer state in
