@@ -156,13 +156,35 @@ def toy_cfg(tok_dirs, cuts, steps, devices):
         cfg.trainer.devices = devices
         cfg.trainer.num_nodes = 1
         cfg.trainer.max_steps = steps
-        cfg.trainer.val_check_interval = steps
+        # Validate PART WAY THROUGH, not at the end. Training after a validation
+        # pass is its own code path -- the modules Lightning put in eval mode
+        # have to come back to train, and a head rebound by _select_head may not.
+        # With validation only at the end this never runs, and the smoke test
+        # passed while the grid died with "cudnn RNN backward can only be called
+        # in training mode" at the first step after validation.
+        cfg.trainer.val_check_interval = None
+        cfg.trainer.check_val_every_n_epoch = 1
         cfg.trainer.limit_val_batches = 2
-        cfg.trainer.limit_train_batches = steps
+        # EVERY step, not the default 50. training_step only runs the greedy
+        # decode for training_batch_wer on this cadence, and that decode is what
+        # flips the decoder into eval mode. At the default a short smoke run
+        # never executes it, which is how the grid failure slipped through.
+        cfg.trainer.log_every_n_steps = 1
+        # MULTIPLE EPOCHS with checkpointing ON. The grid died at "Epoch 1: 0%" --
+        # the first training step after an epoch boundary, where Lightning runs
+        # validation, saves a checkpoint (which invokes our state_dict override)
+        # and then returns to training. With one epoch and checkpointing off,
+        # none of that executes and the smoke test cannot see it.
+        cfg.trainer.limit_train_batches = max(steps // 3, 2)
         cfg.trainer.accelerator = "gpu"
         cfg.trainer.logger = False
-        cfg.trainer.enable_checkpointing = False
-        cfg.trainer.precision = "32"
+        cfg.trainer.enable_checkpointing = os.environ.get("MVSMOKE_NOCKPT", "0") != "1"
+        # bf16-mixed, MATCHING THE GRID. Under autocast the LSTM takes the
+        # cuDNN RNN path, which raises "cudnn RNN backward can only be called
+        # in training mode" if the forward ran in eval. In fp32 the fallback
+        # kernel tolerates it silently, so a 32-bit smoke test cannot see the
+        # bug the grid hit.
+        cfg.trainer.precision = "bf16-mixed"
         cfg.exp_manager = None
     return cfg
 
@@ -237,9 +259,13 @@ def run_model(cfg, root, devices):
 
     trainer.fit(model)
     check("training completed", trainer.global_step >= 1, f"global_step={trainer.global_step}")
-    # Captured BEFORE the checkpoint checks below perturb the active head.
-    post_val_head = model._active_head
-
+    model.train()
+    modes = [(h.decoder.training, h.joint.training) for h in model._heads]
+    check("every head follows model.train()", all(a and b for a, b in modes), f"{modes}")
+    model.eval()
+    modes = [(h.decoder.training, h.joint.training) for h in model._heads]
+    check("every head follows model.eval()", not any(a or b for a, b in modes), f"{modes}")
+    model.train()
     # A TERMINATION checkpoint is written with whatever head was last sampled.
     # Capture the state with a non-zero head active and confirm a fresh model can
     # load it -- the exact failure that killed 19118299 on resume.
@@ -259,8 +285,14 @@ def run_model(cfg, root, devices):
         check("fresh model loads that checkpoint", False, f"{type(e).__name__}: {str(e)[:110]}")
     counts = model._head_counts
     check("more than one head sampled", sum(1 for c in counts if c > 0) > 1, f"head counts {counts}")
-    check("validation ran on head 0", post_val_head == model._val_head,
-          f"active-after-validation={post_val_head} val={model._val_head}")
+    # Test the PINNING MECHANISM, not the head left over after fit: with more
+    # than one epoch, training continues past the last validation, so the
+    # post-fit head is whatever was sampled last and says nothing about
+    # validation.
+    model._select_head(len(model._heads) - 1)
+    model.on_validation_epoch_start()
+    check("validation pins head 0", model._active_head == model._val_head,
+          f"selected {model._active_head} from head {len(model._heads) - 1}; val_head={model._val_head}")
     return ok
 
 
@@ -283,9 +315,8 @@ def time_steps(cfg, root, multivocab: bool, fup: bool, steps: int, devices: int)
         c.trainer.limit_train_batches = steps
         c.trainer.limit_val_batches = 0
         c.trainer.num_sanity_val_steps = 0
-        # Must track limit_train_batches or Lightning refuses when the warmup
-        # runs fewer steps than the outer config's interval.
-        c.trainer.val_check_interval = steps
+        c.trainer.val_check_interval = None
+        c.trainer.check_val_every_n_epoch = 10**6
         c.trainer.devices = devices
     cls = EncDecMultiVocabCHATBPEModel if multivocab else EncDecCHATBPEModel
     trainer = pl.Trainer(**resolve_trainer_cfg(c.trainer))

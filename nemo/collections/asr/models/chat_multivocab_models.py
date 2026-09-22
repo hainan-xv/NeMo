@@ -194,6 +194,10 @@ class EncDecMultiVocabCHATBPEModel(EncDecCHATBPEModel):
         self.decoding = h.decoding
         self.wer = h.wer
         self.loss = h.loss
+        # Match the model's mode at the moment of selection: a head bound in
+        # while the model is training must not still be in eval from a decode.
+        h.decoder.train(self.training)
+        h.joint.train(self.training)
         self._active_head = i
 
     def _sync_cfg_to_head(self, i: int) -> None:
@@ -245,6 +249,25 @@ class EncDecMultiVocabCHATBPEModel(EncDecCHATBPEModel):
                 out[b, : len(x)] = torch.tensor(x, dtype=torch.long, device=device)
             lens[b] = len(x)
         return out, lens
+
+    def train(self, mode: bool = True):
+        """Put EVERY head in ``mode``, not just whichever the tree walk reaches.
+
+        Observed: after a validation epoch, Lightning's model.train() left the
+        previously-active head's decoder and joint in eval while the others came
+        back to train -- even though all three are reachable from modules() and
+        the ModuleList holds them. The next training step then ran that head's
+        LSTM forward in eval and died in backward with "cudnn RNN backward can
+        only be called in training mode" (grid job 19118743, reproduced locally).
+
+        The precise mechanism is not identified; the invariant is simple enough
+        to assert directly rather than depend on it emerging.
+        """
+        super().train(mode)
+        for h in getattr(self, "_heads", ()):
+            h.decoder.train(mode)
+            h.joint.train(mode)
+        return self
 
     def state_dict(self, *args, **kwargs):
         """Always emit head 0 under ``decoder.*`` / ``joint.*``.
