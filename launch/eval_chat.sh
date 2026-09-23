@@ -133,6 +133,39 @@ echo "==> averaging ${#BEST[@]} checkpoints for ${ARM_EXP_NAME}:"
 printf '      %s\n' "${BEST[@]##*/}"
 CKPT_CSV="$(IFS=,; echo "${BEST[*]}")"
 
+# PIN the selected checkpoints before averaging reads them.
+#
+# Averaging an arm that is STILL TRAINING races save_top_k: the list is built
+# here, and by the time average_model_checkpoints.py gets to the fifth file the
+# trainer may have rotated it out. That is not hypothetical -- job 19169776 died
+# in 68 s with FileNotFoundError on the multi-vocab arm's epoch=25 checkpoint,
+# which epoch=42 had just displaced.
+#
+# Hard links, not copies: same filesystem, O(1), no 12 GB of I/O. Rotation's
+# unlink then just drops one of two links and the data stays put until we are
+# done. Staged OUTSIDE ${CKPT_DIR} so nothing else globbing that directory --
+# including Lightning's own rotation -- can see the pinned copies.
+_STAGE="${RUN_DIR}/.avg_stage_$$"
+if mkdir -p "$_STAGE" 2>/dev/null; then
+    _STAGED=()
+    for _c in "${BEST[@]}"; do
+        _d="${_STAGE}/${_c##*/}"
+        if ln "$_c" "$_d" 2>/dev/null || cp "$_c" "$_d" 2>/dev/null; then
+            _STAGED+=("$_d")
+        else
+            _STAGED=(); break
+        fi
+    done
+    if [[ ${#_STAGED[@]} -eq ${#BEST[@]} ]]; then
+        CKPT_CSV="$(IFS=,; echo "${_STAGED[*]}")"
+        trap 'rm -rf "$_STAGE"' EXIT
+        echo "==> pinned ${#_STAGED[@]} checkpoints against save_top_k rotation"
+    else
+        rm -rf "$_STAGE"
+        echo "==> WARNING: could not pin checkpoints; averaging directly (racy while the arm trains)" >&2
+    fi
+fi
+
 # The third mount carries the TOKENIZER and the donor .nemo, and it is
 # cluster-specific: OCI keeps them under llmservice, DFW under the
 # nemotron_speechprod_asr project. Averaging CONSTRUCTS the model, so an

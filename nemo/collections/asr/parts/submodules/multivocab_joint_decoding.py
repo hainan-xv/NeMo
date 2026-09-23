@@ -70,6 +70,7 @@ class _Head:
     blank: int
     weight: float
     name: str
+    word_start: List[bool]
 
 
 @dataclass
@@ -115,6 +116,7 @@ class MultiVocabChunkJointDecoder:
         beam: int = 4,
         max_symbols: Optional[int] = None,
         max_candidates: int = 16,
+        emit_bonus: float = 0.0,
     ):
         heads = getattr(model, "_heads", None)
         if not heads:
@@ -128,6 +130,7 @@ class MultiVocabChunkJointDecoder:
         self.model = model
         self.beam = int(beam)
         self.max_candidates = int(max_candidates)
+        self.emit_bonus = float(emit_bonus)
         self.heads: List[_Head] = []
         for i, h in enumerate(heads):
             # num_classes_with_blank counts the blank, and RNN-T puts it last.
@@ -140,6 +143,7 @@ class MultiVocabChunkJointDecoder:
                     blank=blank,
                     weight=float(weights[i]),
                     name=str(h.name),
+                    word_start=self._word_start_mask(h.tokenizer, blank),
                 )
             )
 
@@ -156,6 +160,28 @@ class MultiVocabChunkJointDecoder:
         self.max_symbols = int(max_symbols)
 
     # ------------------------------------------------------------------ utils
+
+    @staticmethod
+    def _word_start_mask(tokenizer, blank: int) -> List[bool]:
+        """Which token ids begin a word, so emissions can be counted in WORDS.
+
+        SentencePiece marks a word start with U+2581. Counting words rather than
+        tokens keeps the emission bonus comparable across heads: the 1k head
+        spends ~23 tokens where the 4k head spends ~13 on the same sentence, so
+        a per-TOKEN bonus would silently push the small-vocabulary head harder.
+        """
+        mask = [False] * (blank + 1)
+        try:
+            pieces = list(getattr(tokenizer, "vocab", []) or [])
+            for i, piece in enumerate(pieces[: blank + 1]):
+                mask[i] = str(piece).startswith("\u2581")
+        except Exception:  # pragma: no cover - tokenizer without a vocab list
+            logging.warning("could not read tokenizer vocab; emission bonus will count TOKENS, not words")
+            mask = [True] * (blank + 1)
+        return mask
+
+    def _n_words(self, head: _Head, tokens: Sequence[int]) -> int:
+        return sum(1 for t in tokens if head.word_start[t])
 
     def _pred(
         self, head: _Head, tokens: Sequence[int], state: _State
