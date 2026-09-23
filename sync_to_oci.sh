@@ -74,6 +74,7 @@ SCRIPT_PATHS=(
     'nemo/collections/asr/parts/numba/banded_rnnt/*.py'
     scripts/chat_multivocab_smoke.py
     scripts/chat_multivocab_joint_decode_check.py
+    scripts/chat_band_layout_check.py
     'nemo/collections/asr/parts/submodules/multivocab_joint_decoding.py'
     tests/collections/speechlm2/test_script.py
     scripts/script_leaderboard_eval.py

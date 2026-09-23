@@ -49,7 +49,13 @@ def main():
         with torch.no_grad():
             enc, enc_len = model.forward(input_signal=sig, input_signal_length=sig_len)
 
-        dec = MultiVocabChunkJointDecoder(model, weights=[1.0, 1.0, 1.0], beam=2, max_candidates=8)
+        # Tests A-E exercise the BEAM strategy's internals (candidate pool,
+        # cross-head scoring, summed argmax). Pin it explicitly -- the default is
+        # now the chunk-synchronous greedy strategy, under which a "pool" does
+        # not exist and these checks would be testing nothing.
+        dec = MultiVocabChunkJointDecoder(
+            model, weights=[1.0, 1.0, 1.0], beam=2, max_candidates=8, strategy="beam"
+        )
         h0 = dec.heads[0]
 
         chunk_fn = h0.joint.chunk_encoder_for_decoding
@@ -95,7 +101,7 @@ def main():
         # --- C. a zero weight truly removes a head ----------------------------
         # Compare SCORES, not just text: on a random model the text is often
         # empty, and ""=="" would pass this test without exercising anything.
-        d100 = MultiVocabChunkJointDecoder(model, weights=[1.0, 0.0, 0.0], beam=2)
+        d100 = MultiVocabChunkJointDecoder(model, weights=[1.0, 0.0, 0.0], beam=2, strategy="beam")
         before = d100.decode(enc, enc_len)[0]
         uni_before = dec.decode(enc, enc_len)[0]
         with torch.no_grad():
@@ -171,6 +177,40 @@ def main():
                 tot[i] += s
         best = pool[max(range(len(pool)), key=lambda i: tot[i])]
         check("chunk 0 winner is the summed argmax", res.chunk_texts[0] == best, f"got {res.chunk_texts[0]!r}")
+
+        # --- F. THE correctness test: [1,0,0] == head-0 greedy, exactly --------
+        # Not "close to" -- identical text. The chunk-synchronous greedy strategy
+        # uses each head's own local argmax rule, so with one head active it IS
+        # the greedy decoder. Anything else means the state hand-off, the
+        # max_symbols cap or the chunk geometry disagrees with the real path.
+        # This is what caught the winning head being advanced on
+        # text_to_ids(ids_to_text(t)), which is not the identity.
+        model._select_head(0)
+        ms = getattr(model.decoding.decoding, "max_symbols", None)
+        with torch.no_grad():
+            ref = model.decoding.rnnt_decoder_predictions_tensor(enc, enc_len, return_hypotheses=False)
+        if isinstance(ref, tuple):
+            ref = ref[0]
+        ref_text = [h.text if hasattr(h, "text") else h for h in ref]
+        gdec = MultiVocabChunkJointDecoder(model, weights=[1.0, 0.0, 0.0], strategy="greedy", max_symbols=ms)
+        with torch.no_grad():
+            got_text = [r.text for r in gdec.decode(enc, enc_len)]
+        check(
+            "greedy [1,0,0] == head-0 greedy, exactly",
+            ref_text == got_text,
+            f"{len(ref_text)} utt(s), max_symbols={ms}",
+        )
+        if ref_text != got_text:
+            for a, b in zip(ref_text, got_text):
+                if a != b:
+                    print(f"    greedy: {a[:100]!r}\n    joint : {b[:100]!r}")
+                    break
+
+        # all heads active still runs and yields text
+        adec = MultiVocabChunkJointDecoder(model, weights=[1.0, 1.0, 1.0], strategy="greedy", max_symbols=ms)
+        with torch.no_grad():
+            a3 = adec.decode(enc, enc_len)
+        check("greedy 3-head decode runs", all(isinstance(r.text, str) for r in a3), f"{len(a3)} utt(s)")
 
         print("\nRESULT:", "ALL PASS" if OK else "FAILURES ABOVE", flush=True)
         return 0 if OK else 1

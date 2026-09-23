@@ -54,7 +54,10 @@ from nemo.collections.asr.losses.banded_rnnt import BandedLattice, banded_rnnt_l
 from nemo.collections.asr.parts.numba.banded_rnnt.banded_rnnt_numba import (
     banded_rnnt_loss_cuda,
     build_band_index,
+    build_token_band,
+    chunk_band_rnnt_loss,
     kernel_is_usable,
+    token_band_rnnt_loss,
 )
 from nemo.collections.asr.models.rnnt_bpe_models import EncDecRNNTBPEModel
 from nemo.collections.asr.parts.utils.chat_alignment import (
@@ -303,6 +306,21 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
         # band. Matches the SCRIPT models' band_side so the two families' banded
         # arms mean the same thing.
         self.band_side = str(fa.get("band_side", "later")).lower()
+        # HOW the band is laid out, not WHICH nodes it contains -- the two forms
+        # cover the same node set ("u in [S(t-b), S(t+b+1)) <=> a(u) in [t-b,
+        # t+b]"), so this changes cost, not the objective.
+        #   chunk: per chunk t, a contiguous u range -> N arbitrary (b,t,u)
+        #          triples, gathered per node, query gathered per node.
+        #   token: per token u, a FIXED W = 2*band+1 chunks -> one dense
+        #          [B, U+1, W, V+1] tensor, query computed once and broadcast.
+        self.band_layout = str(fa.get("band_layout", "chunk")).lower()
+        #   chunk_band: per chunk t, the band's CONTIGUOUS u-range as a dense
+        #          [B, T, W] grid -> attention is a GEMM with M = W and K/V are
+        #          indexed, not gathered. Same nodes, ~1.6x faster than 'chunk'.
+        if self.band_layout not in ("chunk", "token", "chunk_band"):
+            raise ValueError(
+                f"forced_alignment.band_layout must be 'chunk', 'token' or 'chunk_band', got {self.band_layout!r}"
+            )
         if self.band_side not in ("both", "later", "earlier"):
             raise ValueError(f"forced_alignment.band_side must be both|later|earlier, got {self.band_side!r}")
         self._log_normalised_wer = bool(fa.get("log_normalised_wer", True))
@@ -796,6 +814,11 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
         # gradient (tests/collections/asr/test_banded_rnnt_numba.py); the
         # fallback exists for CPU, for an empty band, and for targets longer
         # than one CUDA block of threads.
+        if self.band_layout == "token":
+            return self._token_band_loss(encoded, encoded_len, chunks_per_utt, target_lens)
+        if self.band_layout == "chunk_band":
+            return self._chunk_band_loss(encoded, encoded_len, chunks_per_utt, target_lens, band)
+
         use_kernel, kernel_why = kernel_is_usable(band, encoded.device)
         if os.environ.get("CHAT_BANDED_KERNEL", "1") == "0":
             use_kernel, kernel_why = False, "disabled by CHAT_BANDED_KERNEL=0"
@@ -842,6 +865,96 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
 
         if not torch.isfinite(loss):
             return self._skip_nonfinite_batch(loss, encoded, g, logits, nll, encoded_len, lattice, target_lens)
+        return loss
+
+    def _chunk_band_loss(self, encoded, encoded_len, chunks_per_utt, target_lens, band) -> torch.Tensor:
+        """The banded objective with the band grouped BY CHUNK.
+
+        Identical nodes and identical loss to the default path; the difference
+        is that the band's contiguous u-range at each chunk becomes a dense
+        [B, T, W] grid, so the joint's attention is a GEMM over W queries that
+        share one chunk's keys rather than W separate 1-query matvecs.
+        """
+        device = encoded.device
+        B = len(chunks_per_utt)
+
+        u_max = max(target_lens)
+        targets = torch.zeros((B, max(u_max, 1)), dtype=torch.long, device=device)
+        for b, chunks in enumerate(chunks_per_utt):
+            flat = [tok for c in chunks for tok in c]
+            if flat:
+                targets[b, : len(flat)] = torch.tensor(flat, dtype=torch.long, device=device)
+        pred_lens = torch.tensor(target_lens, dtype=torch.long, device=device)
+
+        g, _, _ = self.decoder(targets=targets, target_length=pred_lens)
+        g = g.transpose(1, 2)
+
+        lo = torch.from_numpy(band.band_lo).to(device).long()  # [B, maxT]
+        hi = torch.from_numpy(band.band_hi).to(device).long()
+        T = int(band.num_chunks.max())
+        lo, hi = lo[:, :T], hi[:, :T]
+        W = int((hi - lo + 1).max().item())
+
+        logits, u_idx, in_range = self.joint.joint_on_chunk_band(encoded.transpose(1, 2), g, lo, W, encoded_len)
+        # in_range only checks 0 <= u < U+1; the band's own upper bound and the
+        # per-utterance chunk count still have to be applied.
+        nc = torch.from_numpy(band.num_chunks).to(device).long()[:, None, None]
+        t_ar = torch.arange(logits.shape[1], device=device).view(1, -1, 1)
+        valid = in_range & (u_idx <= hi[:, :, None]) & (u_idx >= lo[:, :, None]) & (t_ar < nc)
+
+        log_probs = logits.float().log_softmax(-1)
+        blank = self.joint.num_classes_with_blank - 1
+        nll = chunk_band_rnnt_loss(log_probs, targets, band, blank, u_idx, valid)
+        loss = nll.sum() / max(int(pred_lens.sum()), 1)
+
+        if not torch.isfinite(loss):
+            logging.warning(f"non-finite chunk-band loss at step {self.global_step}; contributing zero loss")
+            return encoded.sum() * 0.0
+        return loss
+
+    def _token_band_loss(self, encoded, encoded_len, chunks_per_utt, target_lens) -> torch.Tensor:
+        """The same banded objective over the TOKEN-CENTRIC layout.
+
+        Identical node set to the chunk-centric path, so the loss values agree;
+        what differs is that the band is a dense [B, U+1, W, ...] grid rather
+        than N scattered (b, t, u) triples. That removes the per-node query
+        gather in the joint and the scatter/gather buffer in the loss.
+        """
+        device = encoded.device
+        tband = build_token_band(chunks_per_utt, self.band_chunks, self.band_side)
+        B, U1 = tband.base.shape
+        W = tband.width
+
+        u_max = max(target_lens)
+        targets = torch.zeros((B, max(u_max, 1)), dtype=torch.long, device=device)
+        for b, chunks in enumerate(chunks_per_utt):
+            flat = [tok for c in chunks for tok in c]
+            if flat:
+                targets[b, : len(flat)] = torch.tensor(flat, dtype=torch.long, device=device)
+        pred_lens = torch.tensor(target_lens, dtype=torch.long, device=device)
+
+        g, _, _ = self.decoder(targets=targets, target_length=pred_lens)
+        g = g.transpose(1, 2)  # [B, U+1, D]
+
+        base = torch.from_numpy(tband.base).to(device).long()
+        nc = torch.from_numpy(tband.num_chunks).to(device).long()
+        valid = torch.from_numpy(tband.valid).to(device)
+        t_idx = base[:, :, None] + torch.arange(W, device=device)[None, None, :]
+        # Clamp into range for the gather; `valid` is what actually masks the
+        # out-of-band nodes, so the clamped index is only ever read for nodes
+        # whose contribution is discarded.
+        t_idx = t_idx.clamp(min=0).minimum((nc - 1).clamp(min=0)[:, None, None])
+
+        logits = self.joint.joint_on_token_band(encoded.transpose(1, 2), g, t_idx, valid, encoded_len)
+        log_probs = logits.float().log_softmax(-1)
+
+        blank = self.joint.num_classes_with_blank - 1
+        nll = token_band_rnnt_loss(log_probs, targets, tband, blank)
+        loss = nll.sum() / max(int(pred_lens.sum()), 1)
+
+        if not torch.isfinite(loss):
+            logging.warning(f"non-finite token-band loss at step {self.global_step}; contributing zero loss")
+            return encoded.sum() * 0.0
         return loss
 
     def _skip_nonfinite_batch(self, loss, encoded, g, logits, nll, encoded_len, lattice, target_lens):

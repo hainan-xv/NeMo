@@ -117,6 +117,8 @@ class MultiVocabChunkJointDecoder:
         max_symbols: Optional[int] = None,
         max_candidates: int = 16,
         emit_bonus: float = 0.0,
+        strategy: str = "greedy",
+        length_norm: bool = False,
     ):
         heads = getattr(model, "_heads", None)
         if not heads:
@@ -131,6 +133,10 @@ class MultiVocabChunkJointDecoder:
         self.beam = int(beam)
         self.max_candidates = int(max_candidates)
         self.emit_bonus = float(emit_bonus)
+        if strategy not in ("greedy", "beam"):
+            raise ValueError(f"strategy must be 'greedy' or 'beam', got {strategy!r}")
+        self.strategy = strategy
+        self.length_norm = bool(length_norm)
         self.heads: List[_Head] = []
         for i, h in enumerate(heads):
             # num_classes_with_blank counts the blank, and RNN-T puts it last.
@@ -151,6 +157,14 @@ class MultiVocabChunkJointDecoder:
         # not of how much audio the joint may look at -- the same distinction
         # that made the greedy path's old `x.shape[-1] // encoder_hidden` wrong
         # once history_chunks was turned on.
+        if max_symbols is None:
+            # Take it from the DECODING STRATEGY the greedy path uses, not from
+            # the model or the joint. --max_symbols on the eval harness lands
+            # there, and if the joint decoder silently used chunk_size instead
+            # the two would cap emissions differently -- which is exactly the
+            # confound that made fullctx SPE-1k look 1.19 WER worse than it is.
+            inner = getattr(getattr(model, "decoding", None), "decoding", None)
+            max_symbols = getattr(inner, "max_symbols", None)
         if max_symbols is None:
             max_symbols = getattr(model, "max_symbols", None)
         if max_symbols is None:
@@ -325,6 +339,46 @@ class MultiVocabChunkJointDecoder:
         finished.sort(key=lambda p: p[1], reverse=True)
         return [tokens for tokens, _ in finished[: self.beam]]
 
+    # ------------------------------------------------- chunk-synchronous greedy
+
+    def _greedy_chunk(self, head: _Head, f, f_len, state: _State):
+        """This head's OWN greedy emission for this chunk.
+
+        Emit while the argmax over V+1 is a token; stop at blank. Byte for byte
+        the rule ``_greedy_decode_chat`` uses, which is what makes ``weights=[1,
+        0, 0]`` reduce to plain head-0 greedy and gives us a hard equivalence
+        test.
+
+        The emit-or-stop decision is LOCAL to each step, so nothing here ever
+        compares emissions of different length -- which is precisely the trap
+        the beam strategy fell into (it scored whole chunk-emissions as
+        sequences, so every extra token multiplied in another probability < 1
+        and silence won; 16% of words were deleted).
+
+        Returns (tokens, score_tokens, score_with_blank). The first score sums
+        only the emitted tokens, as the greedy decoder's own hypothesis.score
+        does; the second adds the terminating blank, making it the probability
+        of "this chunk emits exactly these tokens".
+        """
+        tokens: List[int] = []
+        score = 0.0
+        st = state
+        for _ in range(self.max_symbols):
+            g, _ = self._pred(head, [], st)
+            lp = self._logp(head, f, f_len, g[:, -1:])[0, 0]
+            v, k = lp.max(0)
+            k = int(k)
+            if k == head.blank:
+                return tokens, score, score + float(v)
+            tokens.append(k)
+            score += float(v)
+            st = self._advance(head, [k], st)
+        # Hit the cap without ever choosing blank. Charge the blank it would
+        # have had to emit so the score stays a comparable path probability.
+        g, _ = self._pred(head, [], st)
+        lp = self._logp(head, f, f_len, g[:, -1:])[0, 0]
+        return tokens, score, score + float(lp[head.blank])
+
     # ---------------------------------------------------------------- scoring
 
     @torch.no_grad()
@@ -433,42 +487,80 @@ class MultiVocabChunkJointDecoder:
             f = x.narrow(dim=0, start=t, length=1)  # [1, 1, D]
             f_len = chunk_lens[:, t : t + 1]  # [1, 1]
 
-            # --- 1/2. propose per head, pool as TEXT ---------------------------
-            # Text is the only representation the heads share. Pooling on token
-            # ids would be meaningless -- id 412 is a different piece in each
-            # vocabulary.
-            texts: Dict[str, None] = {"": None}  # a chunk may legitimately emit nothing
-            for head, state in zip(self.heads, states):
-                if head.weight == 0.0:
-                    continue
-                for tokens in self._propose(head, f, f_len, state):
-                    texts.setdefault(head.tokenizer.ids_to_text(tokens), None)
-                    if len(texts) >= self.max_candidates:
-                        break
-            cands = list(texts.keys())
-            n_cands.append(len(cands))
+            if self.strategy == "greedy":
+                # CHUNK-SYNCHRONOUS GREEDY. Every head decodes this chunk with
+                # its OWN greedy rule, then the best-scoring head's TEXT is
+                # adopted by all of them. One decision per chunk, N greedy
+                # decodes, no pool and no cross-scoring -- so the cost is N x
+                # greedy rather than the beam strategy's ~40x.
+                best_i, best_sc, best_toks = None, None, None
+                head_scores: Dict[str, float] = {}
+                for i, (head, state) in enumerate(zip(self.heads, states)):
+                    if head.weight == 0.0:
+                        continue
+                    toks, s_tok, s_full = self._greedy_chunk(head, f, f_len, state)
+                    sc = s_full
+                    if self.length_norm and toks:
+                        # Heads spend different numbers of tokens on the same
+                        # words, so the raw path score favours whichever head
+                        # segments most coarsely. Optional, off by default.
+                        sc = sc / (len(toks) + 1)
+                    sc *= head.weight
+                    head_scores[head.name] = sc
+                    if best_sc is None or sc > best_sc:
+                        best_i, best_sc, best_toks = i, sc, toks
+                if best_i is None:
+                    raise ValueError("every head has weight 0; nothing to decode with")
+                won = self.heads[best_i].tokenizer.ids_to_text(best_toks)
+                n_cands.append(sum(1 for h in self.heads if h.weight != 0.0))
+            else:
+                # --- 1/2. propose per head, pool as TEXT -----------------------
+                # Text is the only representation the heads share. Pooling on
+                # token ids would be meaningless -- id 412 is a different piece
+                # in each vocabulary.
+                texts: Dict[str, None] = {"": None}
+                for head, state in zip(self.heads, states):
+                    if head.weight == 0.0:
+                        continue
+                    for tokens in self._propose(head, f, f_len, state):
+                        texts.setdefault(head.tokenizer.ids_to_text(tokens), None)
+                        if len(texts) >= self.max_candidates:
+                            break
+                cands = list(texts.keys())
+                n_cands.append(len(cands))
 
-            # --- 3. score every candidate under every head --------------------
-            totals = [0.0] * len(cands)
-            head_scores: Dict[str, float] = {}
-            for head, state in zip(self.heads, states):
-                if head.weight == 0.0:
-                    continue
-                retok = [head.tokenizer.text_to_ids(w) for w in cands]
-                scores = self._score(head, retok, f, f_len, state)
-                for i, s in enumerate(scores):
-                    totals[i] += head.weight * s
-                head_scores[head.name] = max(scores) if scores else 0.0
+                # --- 3. score every candidate under every head -----------------
+                totals = [0.0] * len(cands)
+                head_scores = {}
+                for head, state in zip(self.heads, states):
+                    if head.weight == 0.0:
+                        continue
+                    retok = [head.tokenizer.text_to_ids(w) for w in cands]
+                    scores = self._score(head, retok, f, f_len, state)
+                    for i, sc in enumerate(scores):
+                        totals[i] += head.weight * sc
+                    head_scores[head.name] = max(scores) if scores else 0.0
+                best = max(range(len(cands)), key=lambda i: totals[i])
+                won = cands[best]
+                best_sc = totals[best]
+                best_i, best_toks = None, None
 
-            # --- 4. commit the joint argmax and advance every head ------------
-            best = max(range(len(cands)), key=lambda i: totals[i])
-            won = cands[best]
+            # --- commit: every head re-encodes the winning TEXT ---------------
             chunk_texts.append(won)
-            chunk_scores.append(totals[best])
+            chunk_scores.append(float(best_sc))
             per_head.append(head_scores)
 
+            # THE WINNING HEAD CARRIES ITS OWN TOKEN IDS. Re-encoding its text
+            # (text_to_ids(ids_to_text(t))) is NOT the identity -- unknown pieces
+            # and repeated subwords come back different, so the head would be fed
+            # a token stream it never emitted and drift from the next chunk on.
+            # Only the OTHER heads have to re-encode, because the text is the
+            # only thing they can consume.
             for i, (head, state) in enumerate(zip(self.heads, states)):
-                ids = head.tokenizer.text_to_ids(won)
+                if self.strategy == "greedy" and i == best_i:
+                    ids = best_toks
+                else:
+                    ids = head.tokenizer.text_to_ids(won)
                 if i == ref_head:
                     ref_ids.extend(ids)
                 states[i] = self._advance(head, ids, state)

@@ -2223,6 +2223,165 @@ class RNNTAttJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMix
         attended = attended.transpose(1, 2).reshape(N, D)
         return attended + g[b_idx, u_idx]  # same residual as the full path
 
+    def cross_attention_on_chunk_band(self, f, g, sizes, u_start, width, num_heads=4):
+        """Cross-attention on the band grouped BY CHUNK: [B, T, W] nodes.
+
+        The point of this form is the GEMM. ``cross_attention_on_path`` and
+        ``cross_attention_on_token_band`` both carry ONE query per node, so
+        ``matmul`` runs with M=1 -- a batched matrix-VECTOR product, which is
+        memory bound and wastes the tensor cores. Measured, that makes the band
+        3.6x more expensive PER NODE than the dense joint, which is why banding
+        to a third of the nodes still came out slower.
+
+        Here every node at chunk t shares that chunk's keys, exactly as the dense
+        path does, so:
+          * K/V are indexed, never gathered or replicated (they are already
+            [B, T, C, D] -- the natural layout);
+          * scores are a real GEMM with M = W, the band width.
+        It is the dense computation with U replaced by W.
+
+        Args:
+            f: chunked, projected encoder output [B, T, C, D].
+            g: projected prediction-net output [B, U+1, D].
+            sizes: valid frames per chunk [B, T], or None.
+            u_start: [B, T] first label index in the band at chunk t.
+            width: W, the padded band width in labels.
+        Returns:
+            (out [B, T, W, D], u_idx [B, T, W], valid [B, T, W])
+        """
+        zeros = torch.zeros_like(f[:, :, :1, :])
+        f = torch.cat([f, zeros], dim=2)  # [B, T, C+1, D]
+        B, T, C, D = f.shape
+        U1 = g.shape[1]
+        assert D % num_heads == 0, f"D ({D}) must be divisible by num_heads ({num_heads})"
+        head_dim = D // num_heads
+
+        k = self.K(f).view(B, T, C, num_heads, head_dim)  # no gather
+        v = self.V(f).view(B, T, C, num_heads, head_dim)
+
+        u_idx = u_start[:, :, None] + torch.arange(width, device=f.device)[None, None, :]  # [B,T,W]
+        valid = (u_idx >= 0) & (u_idx < U1)
+        u_cl = u_idx.clamp(0, U1 - 1)
+
+        # Project the prediction net ONCE over U+1 positions, then gather; U+1 is
+        # smaller than T*W here, so projecting first is the cheaper order.
+        qfull = self.Q(g)  # [B, U1, D]
+        flat = u_cl.reshape(B, T * width, 1).expand(B, T * width, D)
+        q = qfull.gather(1, flat).view(B, T, width, num_heads, head_dim)
+        gq = g.gather(1, flat).view(B, T, width, D)
+
+        scores = torch.einsum("btwhd,btchd->btwhc", q, k)
+        if sizes is not None:
+            lens = sizes.view(B, T, 1, 1, 1)
+            idx = torch.arange(C, device=scores.device).view(1, 1, 1, 1, C)
+            scores = scores.masked_fill(torch.logical_and(idx >= lens, idx != C - 1), -19999)
+        scores = scores.masked_fill(~valid.view(B, T, width, 1, 1), -19999)
+
+        w = F.softmax(scores / (head_dim**0.5), dim=-1)
+        w = self.attention_dropout(w)
+        attended = torch.einsum("btwhc,btchd->btwhd", w, v).reshape(B, T, width, D)
+        attended = attended * valid.unsqueeze(-1)
+        return attended + gq, u_idx, valid
+
+    def joint_on_chunk_band(self, f, g, u_start, width, f_len=None):
+        """Joint logits on the chunk-grouped band -> ([B, T, W, V+1], u_idx, valid)."""
+        if f_len is not None and f_len.dim() == 1 and self.chunk_size > 0:
+            f, chunk_lengths = chunk_concat_audio(f, f_len, self.chunk_size)
+            self.num_chunks_per_utterance = (chunk_lengths != 0).sum(dim=1)
+            f, chunk_lengths = self._apply_history_window(f, chunk_lengths)
+        else:
+            chunk_lengths = f_len
+            self.num_chunks_per_utterance = None
+        f = self.project_encoder(f)
+        g = self.project_prednet(g)
+        B, T, D = f.shape
+        f = torch.reshape(f, [B, T, -1, self.joint_hidden])
+        inp, u_idx, valid = self.cross_attention_on_chunk_band(f, g, chunk_lengths, u_start, width)
+        res = self.joint_net(inp)  # [B, T, W, V+1]
+
+        if self.log_softmax is None:
+            if not res.is_cuda:
+                res = (res / self.temperature).log_softmax(dim=-1) if self.temperature != 1.0 else res.log_softmax(-1)
+        elif self.log_softmax:
+            res = (res / self.temperature).log_softmax(dim=-1) if self.temperature != 1.0 else res.log_softmax(-1)
+        return res, u_idx, valid
+
+    def cross_attention_on_token_band(self, f, g, sizes, t_idx, valid, num_heads=4):
+        """Cross-attention on the TOKEN-CENTRIC band: [B, U, W] nodes.
+
+        The counterpart of ``cross_attention_on_path``, which takes N arbitrary
+        ``(b, t, u)`` triples and therefore has to gather a query PER NODE. Here
+        the band has a fixed width W, so the layout is a regular grid and the
+        query depends only on u -- one ``Q(g)`` for the whole utterance,
+        broadcast across the W candidate chunks instead of gathered W times.
+
+        Args:
+            f: chunked, projected encoder output [B, T, C, D].
+            g: projected prediction-net output [B, U(+1), D].
+            sizes: valid frames per chunk [B, T], or None.
+            t_idx: [B, U, W] chunk index a(u)+o, already clamped into range.
+            valid: [B, U, W] bool, false where a(u)+o left the utterance.
+        Returns:
+            [B, U, W, D]
+        """
+        zeros = torch.zeros_like(f[:, :, :1, :])
+        f = torch.cat([f, zeros], dim=2)  # [B, T, C+1, D]; the zero slot is always attendable
+        B, T, C, D = f.shape
+        U, W = t_idx.shape[1], t_idx.shape[2]
+        assert D % num_heads == 0, f"D ({D}) must be divisible by num_heads ({num_heads})"
+        head_dim = D // num_heads
+
+        k_all = self.K(f)  # [B, T, C, D] -- over every chunk, as before
+        v_all = self.V(f)
+        bix = torch.arange(B, device=f.device).view(B, 1, 1).expand(B, U, W)
+        k = k_all[bix, t_idx].view(B, U, W, C, num_heads, head_dim)
+        v = v_all[bix, t_idx].view(B, U, W, C, num_heads, head_dim)
+
+        gq = g[:, :U]
+        q = self.Q(gq).view(B, U, num_heads, head_dim)  # NOT gathered: shared across W
+        scores = torch.einsum("buhd,buwchd->buwhc", q, k)
+
+        if sizes is not None:
+            lens = sizes[bix, t_idx].view(B, U, W, 1, 1)
+            idx = torch.arange(C, device=scores.device).view(1, 1, 1, 1, C)
+            scores = scores.masked_fill(torch.logical_and(idx >= lens, idx != C - 1), -19999)
+        scores = scores.masked_fill(~valid.view(B, U, W, 1, 1), -19999)
+
+        w = F.softmax(scores / (head_dim**0.5), dim=-1)
+        w = self.attention_dropout(w)
+        attended = torch.einsum("buwhc,buwchd->buwhd", w, v).reshape(B, U, W, D)
+        attended = attended * valid.unsqueeze(-1)  # dead nodes contribute nothing
+        return attended + gq.unsqueeze(2)  # same residual as every other path
+
+    def joint_on_token_band(self, f, g, t_idx, valid, f_len=None):
+        """Joint logits on the token-centric band -> [B, U, W, V + 1].
+
+        Same node set as ``joint_on_path`` with the equivalent chunk-centric
+        band, same chunking, same normalisation -- only the LAYOUT differs, so
+        the two are interchangeable as training objectives.
+        """
+        if f_len is not None and f_len.dim() == 1 and self.chunk_size > 0:
+            f, chunk_lengths = chunk_concat_audio(f, f_len, self.chunk_size)
+            self.num_chunks_per_utterance = (chunk_lengths != 0).sum(dim=1)
+            f, chunk_lengths = self._apply_history_window(f, chunk_lengths)
+        else:
+            chunk_lengths = f_len
+            self.num_chunks_per_utterance = None
+        f = self.project_encoder(f)
+        g = self.project_prednet(g)
+        B, T, D = f.shape
+        f = torch.reshape(f, [B, T, -1, self.joint_hidden])
+        inp = self.cross_attention_on_token_band(f, g, chunk_lengths, t_idx, valid)
+        res = self.joint_net(inp)  # [B, U, W, V + 1]
+
+        # Mirror joint_after_projection's normalisation exactly, as joint_on_path does.
+        if self.log_softmax is None:
+            if not res.is_cuda:
+                res = (res / self.temperature).log_softmax(dim=-1) if self.temperature != 1.0 else res.log_softmax(-1)
+        elif self.log_softmax:
+            res = (res / self.temperature).log_softmax(dim=-1) if self.temperature != 1.0 else res.log_softmax(-1)
+        return res
+
     def joint_on_path(self, f, g, b_idx, t_idx, u_idx, f_len=None):
         """Joint logits at the aligned (b, t, u) triples only -> [N, V+1].
 

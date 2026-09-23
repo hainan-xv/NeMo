@@ -335,7 +335,9 @@ class EncDecMultiVocabCHATBPEModel(EncDecCHATBPEModel):
 
     # ---------------------------------------------------- joint decoding
 
-    def enable_joint_decoding(self, weights=None, beam: int = 4, max_candidates: int = 16) -> None:
+    def enable_joint_decoding(
+        self, weights=None, beam: int = 4, max_candidates: int = 16, strategy: str = "greedy"
+    ) -> None:
         """Decode with ALL heads at once rather than the selected head alone.
 
         Hooks the ordinary transcribe() pipeline, so batching, audio loading and
@@ -345,12 +347,13 @@ class EncDecMultiVocabCHATBPEModel(EncDecCHATBPEModel):
         from nemo.collections.asr.parts.submodules.multivocab_joint_decoding import MultiVocabChunkJointDecoder
 
         self._joint_decoder = MultiVocabChunkJointDecoder(
-            self, weights=weights, beam=beam, max_candidates=max_candidates
+            self, weights=weights, beam=beam, max_candidates=max_candidates, strategy=strategy
         )
         logging.info(
             f"CHAT multi-vocab JOINT decoding: {len(self._heads)} heads "
             f"{[h.name.rsplit('/', 1)[-1] for h in self._heads]}, weights "
-            f"{[h.weight for h in self._joint_decoder.heads]}, beam {beam}"
+            f"{[h.weight for h in self._joint_decoder.heads]}, strategy {strategy}, "
+            f"max_symbols {self._joint_decoder.max_symbols}"
         )
 
     def disable_joint_decoding(self) -> None:
