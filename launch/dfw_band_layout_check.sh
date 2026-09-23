@@ -29,10 +29,14 @@ CODE_DIR="${CODE_DIR:-${MY}/NeMo_SCRIPT_cc}"
 CONTAINER="${CONTAINER:-${DFW}/users/heh/containers/nemo-26.02-streaming-speechlm.sqsh}"
 NEMO="${NEMO:-${MY}/results/SpeechlmDFW/dfw_granary2_chat_spe1k_both/averaged/top5-averaged.nemo}"
 
+# The aligned val manifest lives under the llmservice portfolio, not nemotron --
+# same extra mount eval_chat.sh already carries for exactly this reason.
+EXTRA_MOUNTS="${EXTRA_MOUNTS:-/lustre/fsw/portfolios/llmservice:/lustre/fsw/portfolios/llmservice}"
+
 [[ -f "$NEMO" ]] || { echo "### no model at $NEMO" >&2; exit 1; }
 echo "==> band layout check on $NEMO"
 
 srun --overlap -n1 -N1 --container-image="$CONTAINER" \
-     --container-mounts="${DFW}:${DFW},${CODE_DIR}:/code" \
+     --container-mounts="${DFW}:${DFW},${CODE_DIR}:/code,${EXTRA_MOUNTS}" \
      bash -c "export PYTHONPATH=/code:/code/scripts:${MY}/pylibs:\${PYTHONPATH:-} && \
               cd /code && python scripts/chat_band_layout_check.py --nemo='${NEMO}' --batches=2"
