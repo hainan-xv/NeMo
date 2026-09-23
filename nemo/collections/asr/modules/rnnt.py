@@ -2251,6 +2251,19 @@ class RNNTAttJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMix
         """
         zeros = torch.zeros_like(f[:, :, :1, :])
         f = torch.cat([f, zeros], dim=2)  # [B, T, C+1, D]
+
+        # The joint chunks f ITSELF, and that chunk count need not equal the one
+        # the band geometry was built from: _apply_history_window and the flush
+        # chunk can add trailing chunks, and encoded_len rounds independently.
+        # Trailing chunks carry no band nodes, so trim to the overlap rather
+        # than trusting either side -- a mismatch here is a reshape error deep
+        # in the attention (job 19177252 died on '[28, 798, 1]' vs 21280).
+        Tu = min(int(u_start.shape[1]), int(f.shape[1]))
+        f = f[:, :Tu]
+        u_start = u_start[:, :Tu]
+        if sizes is not None:
+            sizes = sizes[:, :Tu]
+
         B, T, C, D = f.shape
         U1 = g.shape[1]
         assert D % num_heads == 0, f"D ({D}) must be divisible by num_heads ({num_heads})"

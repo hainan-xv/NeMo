@@ -898,9 +898,13 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
         logits, u_idx, in_range = self.joint.joint_on_chunk_band(encoded.transpose(1, 2), g, lo, W, encoded_len)
         # in_range only checks 0 <= u < U+1; the band's own upper bound and the
         # per-utterance chunk count still have to be applied.
+        # The joint returns its own chunk count (it trims to the overlap); align
+        # the band bounds to whatever it actually produced.
+        Tj = logits.shape[1]
+        hi_j, lo_j = hi[:, :Tj], lo[:, :Tj]
         nc = torch.from_numpy(band.num_chunks).to(device).long()[:, None, None]
-        t_ar = torch.arange(logits.shape[1], device=device).view(1, -1, 1)
-        valid = in_range & (u_idx <= hi[:, :, None]) & (u_idx >= lo[:, :, None]) & (t_ar < nc)
+        t_ar = torch.arange(Tj, device=device).view(1, -1, 1)
+        valid = in_range & (u_idx <= hi_j[:, :, None]) & (u_idx >= lo_j[:, :, None]) & (t_ar < nc)
 
         log_probs = logits.float().log_softmax(-1)
         blank = self.joint.num_classes_with_blank - 1
