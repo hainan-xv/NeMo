@@ -49,6 +49,11 @@ fi
 FA=model.forced_alignment
 export ARM_EXP_NAME=dfw_granary2_chat_spe_multivocab
 export ARM_CONFIG_NAME=nemotron_chat_transducer_granary2_spe_multivocab
+# The averaging script instantiates a model and load_state_dict(strict=True)s
+# the averaged weights into it. Built as the BASE class it has no heads_*
+# entries, so every head key is 'unexpected' and averaging dies before any
+# decoding (job 19136695, 73s). Must be the multi-vocab class.
+export ARM_MODEL_CLASS=nemo.collections.asr.models.EncDecMultiVocabCHATBPEModel
 export ARM_TOKENIZER_DIR="${DFW}/hainanx/tokenizers/granary2_en_spe/v1024"
 export ARM_MODEL_OVERRIDES="model.loss_type=banded ${FA}.band_chunks=1 ++${FA}.band_side=both \
 ${FA}.recover_history_words=0 ${FA}.num_delay_frames=0 ${FA}.max_delay_frames=0 \

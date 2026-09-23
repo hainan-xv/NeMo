@@ -162,7 +162,7 @@ else
             --config-path=/code/examples/asr/conf/fastconformer/cache_aware_streaming \
             --config-name=${ARM_CONFIG_NAME} \
             name=${AVG_NAME} \
-            +model_class=nemo.collections.asr.models.EncDecCHATBPEModel \
+            +model_class=${ARM_MODEL_CLASS:-nemo.collections.asr.models.EncDecCHATBPEModel} \
             +checkpoint_paths=\\\"[${CKPT_CSV}]\\\" \
             model.tokenizer.dir=${TOKENIZER_DIR} \
             ${ARM_MODEL_OVERRIDES:-} \
