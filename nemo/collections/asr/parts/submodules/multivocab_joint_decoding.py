@@ -385,6 +385,17 @@ class MultiVocabChunkJointDecoder:
         n_chunks_total = chunk_lens.shape[1]
         states = [_State(dec_state=None, last_token=None) for _ in self.heads]
 
+        # DETOKENISE ONCE, AT THE END -- never per chunk. ids_to_text drops the
+        # leading word-boundary marker, so gluing per-chunk strings together
+        # welds the last word of one chunk to the first word of the next:
+        # "If we look into" + "take this forward" -> "If welook intotake this
+        # forward". Every word is correct and the WER is still 58-74%, because a
+        # ~9-chunk utterance loses ~8 word boundaries. Accumulating ids and
+        # decoding once is also exactly what the greedy path does, which keeps
+        # the two directly comparable.
+        ref_head = next((i for i, h in enumerate(self.heads) if h.weight != 0.0), 0)
+        ref_ids: List[int] = []
+
         chunk_texts: List[str] = []
         chunk_scores: List[float] = []
         per_head: List[Dict[str, float]] = []
@@ -432,10 +443,12 @@ class MultiVocabChunkJointDecoder:
 
             for i, (head, state) in enumerate(zip(self.heads, states)):
                 ids = head.tokenizer.text_to_ids(won)
+                if i == ref_head:
+                    ref_ids.extend(ids)
                 states[i] = self._advance(head, ids, state)
 
         return JointDecodeResult(
-            text="".join(chunk_texts),
+            text=self.heads[ref_head].tokenizer.ids_to_text(ref_ids),
             chunk_texts=chunk_texts,
             chunk_scores=chunk_scores,
             per_head_scores=per_head,

@@ -127,6 +127,33 @@ def main():
         )
         check("candidate pool is non-trivial", max(res.n_candidates) > 1, f"pool sizes {res.n_candidates[:6]}")
 
+        # --- D2. chunk boundaries keep their word boundary --------------------
+        # Tested at the TOKENISER level, not on the decode: on a toy model the
+        # second chunk often emits nothing, and a word-count check then passes
+        # even with the bug present -- verified by reintroducing it. This pins
+        # the mechanism the decoder relies on and cannot pass vacuously.
+        tok = h0.tokenizer
+        a, b = "the cat", "sat down"
+        via_ids = tok.ids_to_text(tok.text_to_ids(a) + tok.text_to_ids(b))
+        via_join = tok.ids_to_text(tok.text_to_ids(a)) + tok.ids_to_text(tok.text_to_ids(b))
+        check(
+            "accumulating ids preserves the word boundary",
+            via_ids.split() == (a + " " + b).split(),
+            f"{via_ids!r}",
+        )
+        check(
+            "control: per-chunk join really does weld",
+            via_join.split() != (a + " " + b).split(),
+            f"{via_join!r} -- this is the 58-74% WER",
+        )
+        # And the decoder must use the first form.
+        n_text, n_chunks_w = len(res.text.split()), sum(len(c.split()) for c in res.chunk_texts)
+        nonempty = sum(1 for c in res.chunk_texts if c.strip())
+        if nonempty >= 2:
+            check("decoder text keeps every word", n_text == n_chunks_w, f"{n_text} vs {n_chunks_w}")
+        else:
+            print(f"  [SKIP] decoder text keeps every word  only {nonempty} non-empty chunk(s) on toy audio")
+
         # --- E. the argmax really is the joint argmax -------------------------
         # Re-score the winner and every head's own favourite under the SUM; the
         # winner must not be beaten by any of them, or the combination is not
