@@ -69,6 +69,8 @@ HISTORY_CHUNKS="${HISTORY_CHUNKS:-0}"
 MAX_DELAY_FRAMES="${MAX_DELAY_FRAMES:-0}"
 BAND_CHUNKS="${BAND_CHUNKS:-1}"
 BAND_SIDE="${BAND_SIDE:-later}"
+# chunk (default) | token | chunk_band -- layout only, identical objective.
+BAND_LAYOUT="${BAND_LAYOUT:-chunk}"
 DELAY_PUNCT="${DELAY_PUNCT:-true}"
 TARGET_CONSTRUCTION="${TARGET_CONSTRUCTION:-partition}"
 INFER_DELAY_FRAMES="${INFER_DELAY_FRAMES:-null}"
@@ -148,7 +150,7 @@ fi
 read -r -d '' cmd <<EOF
 echo "*******STARTING********" \
 && echo "*** DFW CHAT transducer (RNNTAttJoint), loss_type=${LOSS_TYPE} ***" \
-&& echo "*** knobs: delay=${DELAY_FRAMES} recover=${RECOVER_WORDS} history_chunks=${HISTORY_CHUNKS} band=${BAND_CHUNKS} band_side=${BAND_SIDE} targets=${TARGET_CONSTRUCTION} punct_delay=${DELAY_PUNCT} ***" \
+&& echo "*** knobs: delay=${DELAY_FRAMES} recover=${RECOVER_WORDS} history_chunks=${HISTORY_CHUNKS} band=${BAND_CHUNKS} band_side=${BAND_SIDE} band_layout=${BAND_LAYOUT} targets=${TARGET_CONSTRUCTION} punct_delay=${DELAY_PUNCT} ***" \
 && echo "*** schedule: epoch=${EPOCH_STEPS} lr=${LR} warmup=${WARMUP_STEPS} max_steps=${MAX_STEPS} ***" \
 && nvidia-smi \
 && export WANDB_API_KEY=${WANDB} \
@@ -187,6 +189,7 @@ print('    tokenizer ->', dst)
     model.forced_alignment.max_delay_frames=${MAX_DELAY_FRAMES} \
     model.forced_alignment.band_chunks=${BAND_CHUNKS} \
     ++model.forced_alignment.band_side=${BAND_SIDE} \
+    ++model.forced_alignment.band_layout=${BAND_LAYOUT} \
     model.forced_alignment.delay_word_final_punctuation=${DELAY_PUNCT} \
     model.forced_alignment.target_construction=${TARGET_CONSTRUCTION} \
     model.forced_alignment.inference_delay_frames=${INFER_DELAY_FRAMES} \
