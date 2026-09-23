@@ -28,6 +28,9 @@ MY=${DFW}/hainanx
 CODE_DIR="${CODE_DIR:-${MY}/NeMo_SCRIPT_cc}"
 CONTAINER="${CONTAINER:-${DFW}/users/heh/containers/nemo-26.02-streaming-speechlm.sqsh}"
 NEMO="${NEMO:-${MY}/results/SpeechlmDFW/dfw_granary2_chat_spe1k_both/averaged/top5-averaged.nemo}"
+# The aligned dev manifest the arms actually train against. The path inside the
+# .nemo is stale -- it names an llmservice location that no longer exists.
+VAL_MANIFEST="${VAL_MANIFEST:-${DFW}/users/heh/data/mcv11_en_dev_aligned/mcv11_dev_clean_pcstrip_en_2k_qwen_aligned.json}"
 
 # The aligned val manifest lives under the llmservice portfolio, not nemotron --
 # same extra mount eval_chat.sh already carries for exactly this reason.
@@ -39,4 +42,4 @@ echo "==> band layout check on $NEMO"
 srun --overlap -n1 -N1 --container-image="$CONTAINER" \
      --container-mounts="${DFW}:${DFW},${CODE_DIR}:/code,${EXTRA_MOUNTS}" \
      bash -c "export PYTHONPATH=/code:/code/scripts:${MY}/pylibs:\${PYTHONPATH:-} && \
-              cd /code && python scripts/chat_band_layout_check.py --nemo='${NEMO}' --batches=2"
+              cd /code && python scripts/chat_band_layout_check.py --nemo='${NEMO}' --manifest='${VAL_MANIFEST}' --batches=2"

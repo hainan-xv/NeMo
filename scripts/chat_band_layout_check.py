@@ -20,6 +20,7 @@ def main():
     ap.add_argument("--nemo", required=True)
     ap.add_argument("--batches", type=int, default=2)
     ap.add_argument("--layouts", default="chunk,token,chunk_band")
+    ap.add_argument("--manifest", default="", help="override validation_ds.manifest_filepath")
     args = ap.parse_args()
 
     from nemo.collections.asr.models import ASRModel
@@ -56,9 +57,18 @@ def main():
         dl = model._train_dl
         print("data: train_ds", flush=True)
     else:
-        model.setup_validation_data(model.cfg.validation_ds)
+        vcfg = model.cfg.validation_ds
+        if args.manifest:
+            # The averaged .nemo carries the manifest path from whenever the
+            # config was first written, and that path has since moved portfolios
+            # (llmservice -> nemotron). Override rather than trust it.
+            from omegaconf import open_dict
+
+            with open_dict(vcfg):
+                vcfg.manifest_filepath = args.manifest
+        model.setup_validation_data(vcfg)
         dl = model._validation_dl
-        print(f"data: validation_ds -> {model.cfg.validation_ds.get('manifest_filepath', '?')}", flush=True)
+        print(f"data: validation_ds -> {vcfg.get('manifest_filepath', '?')}", flush=True)
     layouts = args.layouts.split(",")
     ok_all = True
 
