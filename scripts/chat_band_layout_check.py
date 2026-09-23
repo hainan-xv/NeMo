@@ -47,8 +47,18 @@ def main():
             n_dp += 1
     print(f"dropout modules disabled: {n_dp}", flush=True)
 
-    model.setup_training_data(model.cfg.train_ds)
-    dl = model._train_dl
+    # The averaged .nemo is built with `~model.train_ds`, so train_ds is gone.
+    # validation_ds survives and points at an ALIGNED manifest, which is what
+    # this check actually needs: real audio, real forced alignments, real pauses
+    # (empty chunks) and real T/U spread.
+    if "train_ds" in model.cfg and model.cfg.train_ds is not None:
+        model.setup_training_data(model.cfg.train_ds)
+        dl = model._train_dl
+        print("data: train_ds", flush=True)
+    else:
+        model.setup_validation_data(model.cfg.validation_ds)
+        dl = model._validation_dl
+        print(f"data: validation_ds -> {model.cfg.validation_ds.get('manifest_filepath', '?')}", flush=True)
     layouts = args.layouts.split(",")
     ok_all = True
 
