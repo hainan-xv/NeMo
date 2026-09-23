@@ -66,7 +66,15 @@ def main():
 
             with open_dict(vcfg):
                 vcfg.manifest_filepath = args.manifest
-        model.setup_validation_data(vcfg)
+        # The validation loader returns a 4-tuple (validation_step never needs
+        # cuts), but the banded loss is built FROM the cuts' alignments.
+        # setup_training_data's only trick is flipping _want_cuts, so do the same
+        # around the validation setup and the loader yields them.
+        model._want_cuts = True
+        try:
+            model.setup_validation_data(vcfg)
+        finally:
+            model._want_cuts = False
         dl = model._validation_dl
         print(f"data: validation_ds -> {vcfg.get('manifest_filepath', '?')}", flush=True)
     layouts = args.layouts.split(",")
@@ -75,6 +83,11 @@ def main():
     for nb, batch in enumerate(dl):
         if nb >= args.batches:
             break
+        if len(batch) != 5:
+            raise RuntimeError(
+                f"dataloader returned a {len(batch)}-tuple; the banded loss needs cuts "
+                f"(set _want_cuts before building the loader)"
+            )
         signal, signal_len, _t, _tl, cuts = batch
         signal, signal_len = signal.cuda(), signal_len.cuda()
         with torch.no_grad():
