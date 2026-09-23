@@ -35,7 +35,7 @@ width. Every one of those is rebuilt per batch from the active head.
 
 import os
 import random
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import torch
 from omegaconf import DictConfig, OmegaConf, open_dict
@@ -332,6 +332,48 @@ class EncDecMultiVocabCHATBPEModel(EncDecCHATBPEModel):
             path = os.path.join(d, fname)
             if os.path.isfile(path):
                 self.register_artifact(key, path)
+
+    # ---------------------------------------------------- joint decoding
+
+    def enable_joint_decoding(self, weights=None, beam: int = 4, max_candidates: int = 16) -> None:
+        """Decode with ALL heads at once rather than the selected head alone.
+
+        Hooks the ordinary transcribe() pipeline, so batching, audio loading and
+        manifest writing are untouched -- only the step that turns encoder
+        output into text changes. ``weights=[1, 0, 0]`` falls back to head 0.
+        """
+        from nemo.collections.asr.parts.submodules.multivocab_joint_decoding import MultiVocabChunkJointDecoder
+
+        self._joint_decoder = MultiVocabChunkJointDecoder(
+            self, weights=weights, beam=beam, max_candidates=max_candidates
+        )
+        logging.info(
+            f"CHAT multi-vocab JOINT decoding: {len(self._heads)} heads "
+            f"{[h.name.rsplit('/', 1)[-1] for h in self._heads]}, weights "
+            f"{[h.weight for h in self._joint_decoder.heads]}, beam {beam}"
+        )
+
+    def disable_joint_decoding(self) -> None:
+        self._joint_decoder = None
+
+    def _transcribe_output_processing(self, outputs, trcfg) -> Any:
+        """Substitute the joint decode for the active head's greedy decode."""
+        jd = getattr(self, "_joint_decoder", None)
+        if jd is None:
+            return super()._transcribe_output_processing(outputs, trcfg)
+
+        from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
+
+        encoded = outputs.pop("encoded")
+        encoded_len = outputs.pop("encoded_len")
+        results = jd.decode(encoded, encoded_len)
+        del encoded, encoded_len
+        # y_sequence is left empty on purpose: the winning TEXT has no single
+        # token sequence, it has one per head. Everything downstream (the
+        # leaderboard scorer included) reads .text.
+        return [
+            Hypothesis(score=float(sum(r.chunk_scores)), y_sequence=[], text=r.text, timestamp=[]) for r in results
+        ]
 
     def save_to(self, save_path: str):
         """Always write head 0's config, weights and tokenizer.
