@@ -65,6 +65,14 @@ SCRIPT_PATHS=(
     'nemo/collections/asr/models/chat_bpe_models.py'
     'nemo/collections/asr/parts/utils/chat_alignment.py'
     'nemo/collections/asr/losses/banded_rnnt.py'
+    # The multi-vocab model and the banded CUDA kernels it trains with.
+    # Both were tracked by hand and NOT listed here, so every later edit
+    # had to be scp'd -- the exact drift the CHAT-config note above warns
+    # about, just with a slower failure mode.
+    nemo/collections/asr/models/chat_multivocab_models.py
+    nemo/collections/asr/models/__init__.py
+    'nemo/collections/asr/parts/numba/banded_rnnt/*.py'
+    scripts/chat_multivocab_smoke.py
     tests/collections/speechlm2/test_script.py
     scripts/script_leaderboard_eval.py
     scripts/script_asr_shim.py

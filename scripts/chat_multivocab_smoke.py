@@ -285,6 +285,30 @@ def run_model(cfg, root, devices):
         check("fresh model loads that checkpoint", False, f"{type(e).__name__}: {str(e)[:110]}")
     counts = model._head_counts
     check("more than one head sampled", sum(1 for c in counts if c > 0) > 1, f"head counts {counts}")
+    # SAVE AND RESTORE the multi-vocab model itself, which is what the eval
+    # harness does. Nothing else in this test exercises save_to/restore_from on
+    # the multi-head model, and a config that describes the wrong head's
+    # tokenizer only fails there.
+    mv_path = os.path.join(root, "multivocab.nemo")
+    model._select_head(len(model._heads) - 1)
+    model.save_to(mv_path)
+    if int(os.environ.get("LOCAL_RANK", "0")) == 0:
+        from nemo.collections.asr.models import ASRModel as _A
+
+        _c = _A.restore_from(restore_path=mv_path, return_config=True)
+        print(f"    saved cfg: tokenizer={_c.tokenizer.dir.rstrip('/').split('/')[-1]} "
+              f"joint.num_classes={_c.joint.get('num_classes')} "
+              f"decoder.vocab_size={_c.decoder.get('vocab_size')}", flush=True)
+        try:
+            back = EncDecMultiVocabCHATBPEModel.restore_from(mv_path, map_location="cpu")
+            sizes = [h.joint.num_classes_with_blank - 1 for h in back._heads]
+            check("saved .nemo restores", sizes == [h.joint.num_classes_with_blank - 1 for h in model._heads],
+                  f"{sizes}")
+            check("restored model is on head 0", back._active_head == 0,
+                  f"active={back._active_head}, tokenizer={back.tokenizer.vocab_size}")
+        except Exception as e:
+            check("saved .nemo restores", False, f"{type(e).__name__}: " + " | ".join(str(e).split(chr(10))[1:4]))
+
     # Test the PINNING MECHANISM, not the head left over after fit: with more
     # than one epoch, training continues past the last validation, so the
     # post-fit head is whatever was sampled last and says nothing about

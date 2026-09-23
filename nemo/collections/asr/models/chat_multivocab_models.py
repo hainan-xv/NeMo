@@ -33,6 +33,7 @@ targets, the band geometry and the number of lattice nodes, not only the softmax
 width. Every one of those is rebuilt per batch from the active head.
 """
 
+import os
 import random
 from typing import List, Optional
 
@@ -48,7 +49,18 @@ __all__ = ["EncDecMultiVocabCHATBPEModel"]
 class _Head:
     """One vocabulary's worth of model: everything downstream of the encoder."""
 
-    __slots__ = ("tokenizer", "decoder", "joint", "decoding", "wer", "loss", "cfg_decoder", "cfg_joint", "name")
+    __slots__ = (
+        "tokenizer",
+        "decoder",
+        "joint",
+        "decoding",
+        "wer",
+        "loss",
+        "cfg_decoder",
+        "cfg_joint",
+        "cfg_tokenizer",
+        "name",
+    )
 
     def __init__(self, model, name: str):
         self.name = name
@@ -63,6 +75,10 @@ class _Head:
         # last, and a restore would construct the wrong-sized output layer.
         self.cfg_decoder = OmegaConf.to_container(model.cfg.decoder, resolve=False)
         self.cfg_joint = OmegaConf.to_container(model.cfg.joint, resolve=False)
+        # The tokenizer dir belongs to the head too. change_vocabulary rewrites
+        # cfg.tokenizer as it builds each head, so without capturing it here the
+        # saved config keeps whichever head was built LAST.
+        self.cfg_tokenizer = OmegaConf.to_container(model.cfg.tokenizer, resolve=False)
 
 
 class EncDecMultiVocabCHATBPEModel(EncDecCHATBPEModel):
@@ -159,8 +175,10 @@ class EncDecMultiVocabCHATBPEModel(EncDecCHATBPEModel):
         self._head_counts = [0] * len(self._heads)
 
         self._select_head(0)
-        # change_vocabulary left cfg describing the LAST head built; put it back.
+        # change_vocabulary left cfg AND the tokenizer artifacts describing the
+        # LAST head built; put both back.
         self._sync_cfg_to_head(0)
+        self._register_head_tokenizer(0)
         logging.info(
             "CHAT multi-vocab: %d heads %s, sample weights %s, validation pinned to head %d (%s)",
             len(self._heads),
@@ -213,6 +231,10 @@ class EncDecMultiVocabCHATBPEModel(EncDecCHATBPEModel):
         with open_dict(self.cfg):
             self.cfg.decoder = OmegaConf.create(h.cfg_decoder)
             self.cfg.joint = OmegaConf.create(h.cfg_joint)
+            # MUST include the tokenizer. Saved with head 2's dir but head 0's
+            # weights, the .nemo failed its own constructor check on restore --
+            # every decode in job 19136746 died before producing a single WER.
+            self.cfg.tokenizer = OmegaConf.create(h.cfg_tokenizer)
 
     def _sample_head(self) -> int:
         if self._head_rng is None:
@@ -288,6 +310,61 @@ class EncDecMultiVocabCHATBPEModel(EncDecCHATBPEModel):
             self._select_head(0)
         try:
             return super().state_dict(*args, **kwargs)
+        finally:
+            if prev != 0:
+                self._select_head(prev)
+
+    def _register_head_tokenizer(self, i: int) -> None:
+        """Point the tokenizer.* ARTIFACTS at head ``i``'s files.
+
+        change_vocabulary calls register_artifact('tokenizer.model_path', ...)
+        for every head, and each call overwrites the same key -- so a .nemo saved
+        after building three heads bundles the LAST head's tokenizer. On restore
+        NeMo rewrites cfg.tokenizer.model_path to that bundled file, and head 0
+        is then constructed with head 2's vocabulary: _heads[0] came back with
+        96 pieces instead of 48, and every eval decode died on a size mismatch.
+
+        Syncing cfg.tokenizer alone is not enough, because the artifact registry
+        is what decides which FILE ends up inside the .nemo.
+        """
+        d = self._heads[i].name
+        for key, fname in (("tokenizer.model_path", "tokenizer.model"), ("tokenizer.vocab_path", "vocab.txt")):
+            path = os.path.join(d, fname)
+            if os.path.isfile(path):
+                self.register_artifact(key, path)
+
+    def save_to(self, save_path: str):
+        """Always write head 0's config, weights and tokenizer.
+
+        state_dict() already pins head 0 for the weights; the config and the
+        tokenizer artifacts have to agree with it or the .nemo cannot rebuild
+        itself.
+        """
+        prev = self._active_head
+        self._select_head(0)
+        self._sync_cfg_to_head(0)
+        self._register_head_tokenizer(0)
+        try:
+            return super().save_to(save_path)
+        finally:
+            if prev != 0:
+                self._select_head(prev)
+
+    def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
+        """Read ``decoder.*`` / ``joint.*`` as head 0, matching state_dict().
+
+        Those keys are an ALIAS of whichever head is bound, so save and load must
+        agree on which one they mean. state_dict() pins head 0; without the same
+        pin here a restore whose instance happens to be on another head fails
+        with a size mismatch -- observed restoring a .nemo whose config and
+        weights were both head 0 (48 pieces) into an instance presenting head 2
+        (96), which broke every multi-vocab eval decode.
+        """
+        prev = getattr(self, "_active_head", 0)
+        if prev != 0:
+            self._select_head(0)
+        try:
+            return super().load_state_dict(state_dict, strict=strict, assign=assign)
         finally:
             if prev != 0:
                 self._select_head(prev)
