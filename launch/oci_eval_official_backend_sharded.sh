@@ -166,7 +166,7 @@ for cfg in "${DATASETS[@]}"; do
                           python run_eval.py --model_id='${MODEL}' --dataset_path='${DSPATH}' \
                             --dataset='${DS}' --split='${SPLIT}' --device=0 \
                             --batch_size=${BATCH_SIZE} --max_eval_samples=-1 \
-                            --num_shards=${NGPU} --shard_index=${gpu} \
+                            --num_shards=${NGPU} --shard_index=${gpu} --run_tag='${KEY}' \
                             --pad_extra_seconds=${PAD} ${MAX_SYM_ARG} ${CHUNK_ARG} ${TYPE_ARG}" >> "${DLOG}" 2>&1
         ) &
         pids+=($!)
