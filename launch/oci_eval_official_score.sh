@@ -44,12 +44,42 @@ PYLIBS="${MY}/pylibs"
 srun --overlap -n1 -N1 --container-image="$CONTAINER" \
      --container-mounts="${LUSTRE}:${LUSTRE},${HEH}:${HEH},${CODE_DIR}:/code,${OASR}:/oasr" \
      bash -c "export PYTHONPATH=${PYLIBS}:/oasr:\${PYTHONPATH:-} && python - <<'PYEOF'
+import glob
+import os
+import re
+import shutil
 import sys
+import tempfile
+
 sys.path.insert(0, '/oasr')
+
+# SCORE A SNAPSHOT OF THE MERGED MANIFESTS ONLY.
+#
+# score_results globs the whole results dir. Run while other arms are still
+# decoding, that sweeps up their -shard<i>of<N> files -- which are partial by
+# definition, and get DELETED under the scorer the instant their arm merges.
+# That produced both bogus one-eighth-sized rows and outright FileNotFoundError.
+#
+# Linking just the merged manifests into a private directory makes this callable
+# at ANY time, including mid-run for a partial table, without racing anything.
+SRC = '/oasr/nemo_asr/results'
+SNAP = tempfile.mkdtemp(prefix='score_snapshot_')
+kept = skipped = 0
+for f in sorted(glob.glob(os.path.join(SRC, '*.jsonl'))):
+    if re.search(r'-shard\\d+of\\d+', os.path.basename(f)):
+        skipped += 1
+        continue
+    try:
+        shutil.copy2(f, os.path.join(SNAP, os.path.basename(f)))
+        kept += 1
+    except FileNotFoundError:
+        skipped += 1       # merged away mid-copy; harmless
+print(f'scoring {kept} merged manifests ({skipped} in-flight shard files skipped)')
 from collections import defaultdict
 from normalizer import eval_utils
 
-score, results = eval_utils.score_results('/oasr/nemo_asr/results')
+score, results = eval_utils.score_results(SNAP)
+shutil.rmtree(SNAP, ignore_errors=True)
 per = defaultdict(dict)
 for k, v in (results or {}).items():
     m, _, ds = k.partition(' | ')

@@ -55,8 +55,8 @@ HEH=/lustre/fsw/portfolios/llmservice/users/heh
 
 resolve_launch_dir() {
     if [[ -n "${SLURM_SUBMIT_DIR:-}" ]]; then
-        [[ -f "${SLURM_SUBMIT_DIR}/oci_eval_official_backend_sharded.sh" ]] && { echo "${SLURM_SUBMIT_DIR}"; return; }
-        [[ -f "${SLURM_SUBMIT_DIR}/launch/oci_eval_official_backend_sharded.sh" ]] && { echo "${SLURM_SUBMIT_DIR}/launch"; return; }
+        [[ -f "${SLURM_SUBMIT_DIR}/oci_eval_official_backend.sh" ]] && { echo "${SLURM_SUBMIT_DIR}"; return; }
+        [[ -f "${SLURM_SUBMIT_DIR}/launch/oci_eval_official_backend.sh" ]] && { echo "${SLURM_SUBMIT_DIR}/launch"; return; }
     fi
     echo "${MY}/NeMo_SCRIPT_cc/launch"
 }
@@ -64,7 +64,7 @@ resolve_launch_dir() {
 HEH_EXP=oci_streaming_stt_granary2_lora_mcs_noblank_v2_lr0.0001_warmup10000_n8_delay3_rnd_compacttrue_r1_t1
 CKPT="${CKPT:-${HEH}/results/Streaming_SLM_debug/${HEH_EXP}/${HEH_EXP}/checkpoints/step=200000-last.ckpt}"
 
-exec bash "$(resolve_launch_dir)/oci_eval_official_backend_sharded.sh" \
+exec bash "$(resolve_launch_dir)/oci_eval_official_backend.sh" \
     speechlm_interleaved_cs7 \
     "${CKPT}" \
     0.5 0 7 speechlm

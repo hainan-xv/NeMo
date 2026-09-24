@@ -1,6 +1,11 @@
 #!/bin/bash
 # ============================================================================
-# SHARED BACKEND for the official Open-ASR-Leaderboard eval on OCI.
+# SHARED BACKEND (SHARDED) for the official Open-ASR-Leaderboard eval on OCI.
+#
+# Supersedes oci_eval_official_backend.sh, which gave each GPU a whole dataset.
+# Kept as a separate file only while the unsharded interleaved jobs are still
+# executing the original -- overwriting a running bash script truncates it under
+# the interpreter. Fold this over the old name once those land.
 #
 # NOT submitted directly -- every model has its own bare-sbatch launcher
 # (oci_eval_official_<arm>.sh) that execs this with five positional arguments:
@@ -119,46 +124,113 @@ echo "==> model  : ${MODEL}"
 echo "==> logs   : ${OUT}"
 echo "==> results: ${RESULTS}  (shared across arms; filenames are keyed per arm)"
 
-# ONE DATASET PER GPU, all 8 concurrently -- wall-clock becomes the slowest
-# single dataset (spgispeech, 39k utts) instead of the sum of eight. run_eval.py
-# has no sharding, so utterances are never split WITHIN a dataset; doing that
-# would mean patching the authoritative code at the exact point that decides
-# which utterances get scored.
+# ONE DATASET AT A TIME, SHARDED ACROSS ALL 8 GPUs.
 #
-# --overlap, NOT --exclusive: on an srun STEP --exclusive means "do not share
-# this allocation", which SERIALISES the eight backgrounded steps.
-gpu=0; pids=()
+# The previous layout gave each GPU a whole dataset, but the eight differ in size
+# by 115x -- spgispeech is 39,341 utterances (52% of all 75,078) while
+# earnings22-chunked is 341. So spgispeech sat alone on one GPU while seven idled,
+# and eight GPUs bought ~1.9x over serial instead of 8x. Measured: the cs2 job
+# took 2h11m, almost all of it spgispeech.
+#
+# Now every GPU gets an equal 1/8 slice of whichever dataset is in flight, so
+# wall-clock is (total work)/8 rather than (largest dataset). run_eval.py assigns
+# utterance i to shard i % 8, so all shards see the same duration mix.
+#
+# THE COST is reloading the model once per dataset per GPU (64 loads instead of
+# 8). That is 7 extra load rounds, a few minutes -- bought back many times over
+# on the long datasets. Pooling all datasets into one sharded pass would avoid it,
+# as scripts/leaderboard_common.py build_global_items does for the internal
+# harness, but run_eval.py is per-dataset by construction and restructuring that
+# means rewriting the authoritative runner rather than extending it.
+#
+# --overlap, NOT --exclusive: on an srun STEP --exclusive means "do not share this
+# allocation", which SERIALISES the backgrounded steps.
+NGPU="${NGPU:-8}"
+overall_fail=0
 for cfg in "${DATASETS[@]}"; do
     read -r DS SPLIT DSPATH <<< "$cfg"
     DSPATH="${DSPATH:-$DEFAULT_PATH}"
-    DLOG="${OUT}/${KEY}.${DS}_${SPLIT}.log"
-    echo "--- ${KEY} / ${DS} ${SPLIT} -> gpu ${gpu}" | tee "${DLOG}"
-    (
-        CUDA_VISIBLE_DEVICES=${gpu} \
-        srun --overlap -n1 -N1 \
-             --container-image="$CONTAINER" \
-             --container-mounts="${LUSTRE}:${LUSTRE},${HEH}:${HEH},${CODE_DIR}:/code,${OASR}:/oasr" \
-             bash -c "export CUDA_VISIBLE_DEVICES=${gpu} PYTHONPATH=/code:/code/scripts:/oasr:${PYLIBS}:\${PYTHONPATH:-} HF_HOME=${MY}/hf_cache HF_TOKEN=${HF_TOKEN} && \
-                      cd /oasr/nemo_asr && \
-                      python run_eval.py --model_id='${MODEL}' --dataset_path='${DSPATH}' \
-                        --dataset='${DS}' --split='${SPLIT}' --device=0 \
-                        --batch_size=${BATCH_SIZE} --max_eval_samples=-1 \
-                        --pad_extra_seconds=${PAD} ${MAX_SYM_ARG} ${CHUNK_ARG} ${TYPE_ARG}" >> "${DLOG}" 2>&1
-    ) &
-    pids+=($!); gpu=$((gpu + 1))
+    echo; echo "--- ${KEY} / ${DS} ${SPLIT}: ${NGPU} shards across ${NGPU} GPUs"
+    DS_START=$(date +%s)
+
+    # WARM THE HUB RESOLUTION ONCE, then decode OFFLINE.
+    #
+    # The audio is already cached (19G of open-asr-leaderboard on lustre; the
+    # shards fetch zero bytes). What is NOT cached is the repo FILE LISTING:
+    # load_dataset re-resolves /api/datasets/<repo>/tree/<rev>/<config> on every
+    # invocation. Sharding turned that into NGPU identical metadata calls per
+    # dataset, and several concurrent arms pushed it past HF's quota of 1000 API
+    # requests per 5 minutes -- a 429 that killed whole datasets while the data
+    # sat on local disk the entire time.
+    #
+    # So: resolve once here (online, 1 call), then run every shard with
+    # HF_HUB_OFFLINE=1 so they read purely from cache and make NO API calls at
+    # all. That is an 8x reduction, and the fan-out stops depending on the Hub
+    # being reachable or generous.
+    srun --overlap -n1 -N1 --container-image="$CONTAINER" \
+         --container-mounts="${LUSTRE}:${LUSTRE},${HEH}:${HEH},${CODE_DIR}:/code,${OASR}:/oasr" \
+         bash -c "export PYTHONPATH=/code:/code/scripts:/oasr:${PYLIBS}:\${PYTHONPATH:-} HF_HOME=${MY}/hf_cache HF_TOKEN=${HF_TOKEN} && \
+                  python -c \"
+import sys; sys.path.insert(0,'/oasr')
+from normalizer import data_utils
+class A:
+    dataset_path='${DSPATH}'; dataset='${DS}'; split='${SPLIT}'
+    max_eval_samples=1; streaming=False
+data_utils.load_data(A())
+print('hub resolution warmed: ${DS} ${SPLIT}')
+\"" >> "${OUT}/${KEY}.${DS}_${SPLIT}.warmup.log" 2>&1 \
+        || echo "  [warn] warm-up failed for ${DS} ${SPLIT}; shards will fall back to online resolution"
+
+    pids=()
+    for gpu in $(seq 0 $((NGPU - 1))); do
+        DLOG="${OUT}/${KEY}.${DS}_${SPLIT}.shard${gpu}.log"
+        : > "${DLOG}"
+        (
+            CUDA_VISIBLE_DEVICES=${gpu} \
+            srun --overlap -n1 -N1 \
+                 --container-image="$CONTAINER" \
+                 --container-mounts="${LUSTRE}:${LUSTRE},${HEH}:${HEH},${CODE_DIR}:/code,${OASR}:/oasr" \
+                 bash -c "export CUDA_VISIBLE_DEVICES=${gpu} PYTHONPATH=/code:/code/scripts:/oasr:${PYLIBS}:\${PYTHONPATH:-} HF_HOME=${MY}/hf_cache HF_TOKEN=${HF_TOKEN} HF_HUB_OFFLINE=${HF_OFFLINE:-1} HF_DATASETS_OFFLINE=${HF_OFFLINE:-1} && \
+                          cd /oasr/nemo_asr && \
+                          python run_eval.py --model_id='${MODEL}' --dataset_path='${DSPATH}' \
+                            --dataset='${DS}' --split='${SPLIT}' --device=0 \
+                            --batch_size=${BATCH_SIZE} --max_eval_samples=-1 \
+                            --num_shards=${NGPU} --shard_index=${gpu} --run_tag='${KEY}' \
+                            --pad_extra_seconds=${PAD} ${MAX_SYM_ARG} ${CHUNK_ARG} ${TYPE_ARG}" >> "${DLOG}" 2>&1
+        ) &
+        pids+=($!)
+    done
+    fail=0
+    for i in "${!pids[@]}"; do
+        wait "${pids[$i]}" || { echo "  [FAIL] ${DS} ${SPLIT} shard ${i}" >&2; fail=$((fail + 1)); }
+    done
+    overall_fail=$((overall_fail + fail))
+    echo "### ${DS} ${SPLIT}: ${fail} shard failures, $(( ($(date +%s) - DS_START) / 60 )) min"
 done
 
-# run_eval.py writes its manifest BEFORE printing the WER, so a crash costs the
-# number rather than just the file -- report every failure explicitly.
-fail=0
-for i in "${!pids[@]}"; do
-    wait "${pids[$i]}" || { echo "  [FAIL] dataset index ${i} (${DATASETS[$i]}) for ${KEY}" >&2; fail=$((fail + 1)); }
-done
 cat "${OUT}/${KEY}."*.log > "${OUT}/${KEY}.log" 2>/dev/null
-n_wer=$(grep -hc "^WER: " "${OUT}/${KEY}.log" 2>/dev/null || echo 0)
-echo; echo "### ${KEY}: ${n_wer}/${#DATASETS[@]} datasets scored, ${fail} process failures"
+echo; echo "### ${KEY}: ${overall_fail} total shard failures across ${#DATASETS[@]} datasets"
 
-echo; echo "############ OFFICIAL SCORE so far (kaldialign, merge_compounds=True)"
-echo "### partial by design -- the other arms write into the same results dir as"
-echo "### they finish. Run launch/oci_eval_official_score.sh for the final table."
-bash "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/oci_eval_official_score.sh" --inline
+# ---- merge shards back to one manifest per dataset -------------------------
+# MUST happen before scoring: score_results derives the model id from the
+# filename, so unmerged shards become eight one-eighth-sized rows. The merger
+# refuses to write a canonical manifest unless all 8 shards are present and no
+# audio id appears twice -- a partial merge would score as ~1/8 deletions and
+# look merely "a bit poor" rather than broken.
+echo; echo "############ MERGING SHARDS"
+srun --overlap -n1 -N1 --container-image="$CONTAINER" \
+     --container-mounts="${LUSTRE}:${LUSTRE},${HEH}:${HEH},${CODE_DIR}:/code,${OASR}:/oasr" \
+     bash -c "export PYTHONPATH=/code:/code/scripts:/oasr:${PYLIBS}:\${PYTHONPATH:-} && \
+              python /code/scripts/merge_shard_manifests.py ${RESULTS} --tag '${KEY}'" \
+  || { echo "### MERGE REPORTED PROBLEMS -- see above; affected datasets were NOT written" >&2; }
+
+# NO INLINE SCORER. It used to run here, and it was both redundant and harmful:
+# normalizer/eval_utils.score_results globs the ENTIRE shared results dir, so a
+# finishing arm would read another arm's in-flight shard manifests and die with
+# FileNotFoundError the moment that arm's merge deleted them -- marking a job
+# FAILED even though its own eight datasets had merged perfectly. Scoring is a
+# whole-table operation over a shared directory; it does not belong in a
+# per-arm job.
+echo
+echo "==> ${KEY} done. Manifests in ${RESULTS}"
+echo "==> For the table (all arms): sbatch launch/oci_eval_official_score.sh"

@@ -45,13 +45,13 @@ HEH=/lustre/fsw/portfolios/llmservice/users/heh
 # the directory sbatch was run FROM, which may be the repo root or launch/.
 resolve_launch_dir() {
     if [[ -n "${SLURM_SUBMIT_DIR:-}" ]]; then
-        [[ -f "${SLURM_SUBMIT_DIR}/oci_eval_official_backend_sharded.sh" ]] && { echo "${SLURM_SUBMIT_DIR}"; return; }
-        [[ -f "${SLURM_SUBMIT_DIR}/launch/oci_eval_official_backend_sharded.sh" ]] && { echo "${SLURM_SUBMIT_DIR}/launch"; return; }
+        [[ -f "${SLURM_SUBMIT_DIR}/oci_eval_official_backend.sh" ]] && { echo "${SLURM_SUBMIT_DIR}"; return; }
+        [[ -f "${SLURM_SUBMIT_DIR}/launch/oci_eval_official_backend.sh" ]] && { echo "${SLURM_SUBMIT_DIR}/launch"; return; }
     fi
     echo "${MY}/NeMo_SCRIPT_cc/launch"
 }
 
-exec bash "$(resolve_launch_dir)/oci_eval_official_backend_sharded.sh" \
+exec bash "$(resolve_launch_dir)/oci_eval_official_backend.sh" \
     chat_fullctx1k \
     "${MY}/results/SpeechlmOCI/oci_granary2_chat_spe1k_both_fullctx/averaged/top5-averaged.nemo" \
     0 30 14
