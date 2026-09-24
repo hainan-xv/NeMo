@@ -115,7 +115,10 @@ INIT_NEMO="${INIT_NEMO:-${HEH}/pretrained_models/huggingface/nvidia/nemotron-spe
 # of the benefit of warm starting at all.
 INIT_INCLUDE="${INIT_INCLUDE:-[\"encoder.\",\"decoder.\",\"joint.enc.\",\"joint.pred.\"]}"
 TRAIN_INPUT_CFG="${TRAIN_INPUT_CFG:-${HEH}/data_configs/granary_v2_en_full_d0.5_b0.5_local_qwen_aligned.yaml}"
-VAL_MANIFEST="${VAL_MANIFEST:-${HEH}/data/mcv11_en_dev_aligned/mcv11_dev_clean_pcstrip_en_2k_qwen_aligned.json}"
+# OCI's OWN aligned val set (2000 entries, alignments present), whose audio
+# lives under /data. Not DFW's copy: that one is only partially staged here
+# and its audio paths are relative to the manifest directory.
+VAL_MANIFEST="${VAL_MANIFEST:-${DATA_ROOT}/users/dongjig/aligned_amos/steve_val_mmlpc_mcv11_2k/mcv11_dev_clean_pcstrip_en_2k_qwen_aligned.json}"
 TOKENIZER_DIR="${TOKENIZER_DIR:-${QWEN_TOK}}"
 
 # A 1-node allocation writes to a DIFFERENT EXP_NAME so a smoke test can never
@@ -152,7 +155,12 @@ HF_TOKEN="$(read_required_token "$HOME/.hf_token")"
 # portfolio (llmservice vs nemotron) and neither ${LUSTRE} nor ${DATA_ROOT}
 # covers it -- yet it holds the granary input_cfg, the aligned val manifest
 # AND the parakeet donor. Job 13602254 died 53 s in on exactly this.
-MOUNTS="--container-mounts=${CODE_DIR}:/code,${RESULTS_DIR}:/results,${HFCACHE}:/hfcache,${LUSTRE}:${LUSTRE},${DATA_ROOT}:${DATA_ROOT},${HEH}:${HEH}"
+# ${DATA_ROOT}/data MUST also appear at /data. OCI manifests carry ABSOLUTE
+# paths of the form /data/ASR/... , which only resolve inside the container
+# via this mount; DFW manifests use paths relative to their own directory
+# and need no such thing, so the inherited DFW mount line silently omitted
+# it and every validation audio load failed (job 13602309).
+MOUNTS="--container-mounts=${CODE_DIR}:/code,${RESULTS_DIR}:/results,${HFCACHE}:/hfcache,${LUSTRE}:${LUSTRE},${DATA_ROOT}:${DATA_ROOT},${HEH}:${HEH},${DATA_ROOT}/data:/data"
 
 # Do NOT enable xtrace: the command below contains expanded token values.
 BUCKET_BATCH_CLAUSE=""
