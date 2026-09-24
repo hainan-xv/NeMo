@@ -46,6 +46,12 @@ export EXP_NAME="${EXP_NAME:-parakeet_tdt_0.6b_v2_baseline}"
 export MODE="${MODE:-offline}"
 export CHUNK_SIZE="${CHUNK_SIZE:-14}"
 export PAD_EXTRA_SECONDS="${PAD_EXTRA_SECONDS:-0}"
+# REQUIRED for this model. parakeet-tdt has att_context_size [-1,-1] -- a
+# non-causal encoder that attends to the whole utterance -- and the eval
+# refuses to run without this rather than silently decoding it as if it had a
+# look-ahead:
+#   ERROR: This model is FULL-CONTEXT ... Pass --full_context
+export FULL_CONTEXT="${FULL_CONTEXT:-1}"
 
 if [[ ! -f "${MODEL_PATH}" ]]; then
     echo "ERROR: model not found: ${MODEL_PATH}" >&2
