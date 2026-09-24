@@ -227,6 +227,26 @@ AUDIO_HISTORY_CHUNKS="${AUDIO_HISTORY_CHUNKS:-0}"
 # Validation needs no pinning either: val_chunk_size defaults to 14 when 14 is
 # among the candidates, so val_wer stays comparable with the single-chunk arm.
 CHUNK_SIZES="${CHUNK_SIZES:-[2,7,14]}"
+
+# MEMORY AT chunk_size=2. Job 13605298 died with 25 consecutive OOM batches, and
+# every one of them was chunk_size=2 -- 7 and 14 were fine. At chunk 2 an
+# utterance has 7x the chunks of chunk 14, and both the SCRIPT forward and the
+# banded lattice scale with chunk count, so the recipe's batch sizes (already
+# mostly 1, because the banded loss is heavy) do not fit.
+#
+# Two levers, applied together:
+#   1. CAP DURATION. The failures were long utterances at small chunk size -- a
+#      40 s cut is ~250 chunks at chunk 2. Capping at 20 s removes the tail that
+#      cannot fit rather than shrinking batches that are already 1. The bins are
+#      truncated to match; lhotse needs len(bins) == len(batch_size).
+#   2. HALVE THE BATCH SIZES, floored at 1.
+#
+# NOTE this makes the arm's DATA DISTRIBUTION differ from the chunk-14 arm, which
+# sees the full 40 s tail. WER between the two is therefore not a clean
+# like-for-like comparison of look-ahead alone.
+MAX_DURATION="${MAX_DURATION:-20}"
+BUCKET_BINS="${BUCKET_BINS:-[4.32,6.0,7.04,7.92,8.8,9.6,10.4,11.12,11.89,12.66,13.47,14.8,16.92,20.0]}"
+BUCKET_BATCH_SIZE="${BUCKET_BATCH_SIZE:-[2,1,1,1,1,1,1,1,1,1,1,1,1,1]}"
 # Apostrophe-free by construction: the Hydra override wraps it in single quotes.
 SYSTEM_PROMPT="${SYSTEM_PROMPT:-You are doing streaming speech recognition. Given the transcript so far and the representation of the next audio chunk, output the words spoken in that chunk.}"
 
@@ -349,7 +369,7 @@ MOUNTS="--container-mounts=${DATA_DIR}:${DATA_DIR},${H_DIR}:${H_DIR},$HAINAN_DIR
 
 read -r -d '' cmd <<EOF
 echo "*******STARTING********" \
-&& echo "*** RECIPE: ${CONFIG_NAME} (SCRIPT, granary2, no-blank | band_words=${BAND_WORDS} side=${BAND_SIDE} | delay=${DELAY} | audio_history_chunks=${AUDIO_HISTORY_CHUNKS} | chunk sizes ${CHUNK_SIZES}) ***" \
+&& echo "*** RECIPE: ${CONFIG_NAME} (SCRIPT, granary2, no-blank | band_words=${BAND_WORDS} side=${BAND_SIDE} | delay=${DELAY} | audio_history_chunks=${AUDIO_HISTORY_CHUNKS} | chunk sizes ${CHUNK_SIZES} | max_dur ${MAX_DURATION} | bbs ${BUCKET_BATCH_SIZE}) ***" \
 && echo "*** OBJECTIVE: p(words_k | text_history_<k, audio_k); packed spine+branch, single O(L) forward ***" \
 && echo "*** MONITOR: val_wer (min) -- chunk-synchronous streaming decode ***" \
 && echo "*** WARM START: init=${INIT_CKPT:-none} ***" \
@@ -381,6 +401,9 @@ echo "*******STARTING********" \
     model.optimizer.lr=$LR \
     model.lr_scheduler.warmup_steps=$WARMUP_STEPS \
     model.chunk_size="${CHUNK_SIZES}" \
+    ++data.train_ds.max_duration=${MAX_DURATION} \
+    ++data.train_ds.bucket_duration_bins="${BUCKET_BINS}" \
+    ++data.train_ds.bucket_batch_size="${BUCKET_BATCH_SIZE}" \
     model.audio_history_chunks=${AUDIO_HISTORY_CHUNKS} \
     data.dataset.num_delay_frames=${DELAY} \
     ++model.attn_backend=${ATTN_BACKEND} \
