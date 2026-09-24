@@ -147,7 +147,12 @@ read_required_token() {
 WANDB="$(read_required_token "$HOME/.wandb_token")"
 HF_TOKEN="$(read_required_token "$HOME/.hf_token")"
 
-MOUNTS="--container-mounts=${CODE_DIR}:/code,${RESULTS_DIR}:/results,${HFCACHE}:/hfcache,${LUSTRE}:${LUSTRE},${DATA_ROOT}:${DATA_ROOT}"
+# ${HEH} MUST be mounted explicitly here, unlike on DFW. There it lived under
+# ${LUSTRE} and came along for free; on OCI-IAD it is in a different
+# portfolio (llmservice vs nemotron) and neither ${LUSTRE} nor ${DATA_ROOT}
+# covers it -- yet it holds the granary input_cfg, the aligned val manifest
+# AND the parakeet donor. Job 13602254 died 53 s in on exactly this.
+MOUNTS="--container-mounts=${CODE_DIR}:/code,${RESULTS_DIR}:/results,${HFCACHE}:/hfcache,${LUSTRE}:${LUSTRE},${DATA_ROOT}:${DATA_ROOT},${HEH}:${HEH}"
 
 # Do NOT enable xtrace: the command below contains expanded token values.
 BUCKET_BATCH_CLAUSE=""
