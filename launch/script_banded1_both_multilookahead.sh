@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH -A nemotron_speech_asr
-#SBATCH -J nemotron_speechprod_asr:streaming-stt-script-banded1-both
+#SBATCH -J nemotron_speechprod_asr:streaming-stt-script-banded1-both-multi
 #SBATCH -p batch_block1,batch_block3,batch_block4
 #SBATCH -N 8
 #SBATCH --gpus-per-node=8
@@ -215,13 +215,24 @@ AUDIO_HISTORY_CHUNKS="${AUDIO_HISTORY_CHUNKS:-0}"
 # sixth of every epoch in the 5.4x case for a latency setting we are not yet
 # trying to answer questions about. Pinning 14 buys a fast first read; widen it
 # once the band is known to help.
-CHUNK_SIZES="${CHUNK_SIZES:-14}"
+# MULTIPLE LOOK-AHEADS. chunk_size is sampled PER BATCH from this list, so one
+# model is trained across 2, 7 and 14 frames of look-ahead (~0.16 s / 0.56 s /
+# 1.12 s) instead of a separate arm per latency.
+#
+# The band needs no adjustment for this: band_candidate_cuts counts the band
+# in WORDS, off the aligner word starts, and takes no chunk_size at all. So
+# band_words=1 means the same thing at every chunk size -- the band structure
+# is held fixed across look-aheads by construction, not by configuration.
+#
+# Validation needs no pinning either: val_chunk_size defaults to 14 when 14 is
+# among the candidates, so val_wer stays comparable with the single-chunk arm.
+CHUNK_SIZES="${CHUNK_SIZES:-[2,7,14]}"
 # Apostrophe-free by construction: the Hydra override wraps it in single quotes.
 SYSTEM_PROMPT="${SYSTEM_PROMPT:-You are doing streaming speech recognition. Given the transcript so far and the representation of the next audio chunk, output the words spoken in that chunk.}"
 
 CONFIG_PATH=/code/examples/speechlm2/conf/
 CONFIG_NAME="${CONFIG_NAME:-streaming_stt_granary2_lora_script_banded1}"
-EXP_NAME="${EXP_NAME:-granary2_script_banded1_both}"
+EXP_NAME="${EXP_NAME:-granary2_script_banded1_both_multilookahead}"
 
 # --- Tag runs that use a non-default node count ---
 # RESULTS_DIR is derived from EXP_NAME and the recipe sets resume_if_exists=true,
