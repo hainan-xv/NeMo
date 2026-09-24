@@ -157,7 +157,10 @@ LUSTRE_ACCOUNT_PREFIX=/lustre/fsw/portfolios/${SLURM_ACCOUNT}
 # We use the container only for its environment; the NeMo code comes from /code.
 CONTAINER="/lustre/fsw/portfolios/llmservice/users/heh/containers/nemo-26.02-streaming-speechlm.sqsh"
 
-PROJECT_NAME=SpeechlmScriptCC
+# Same wandb/results namespace as the OCI CHAT arms (oci_chat_train.sh), so the
+# SCRIPT and CHAT runs of this era sit together rather than split across the
+# older SpeechlmScriptCC tree.
+PROJECT_NAME=SpeechlmOCI
 
 # --- Training parameters ---
 MAX_STEPS="${MAX_STEPS:-300000}"
