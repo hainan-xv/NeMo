@@ -65,6 +65,12 @@ DATA_ROOT=/lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm
 # resumed from -- an OCI one of the same arm name.
 PROJECT_NAME="${PROJECT_NAME:-SpeechlmOCI}"
 
+# AIStore credentials. OCI streams the training AUDIO from object storage
+# (s3://) rather than reading tar shards off lustre, so without this the
+# data layer has nothing to authenticate with.
+AIS_AUTHN_TOKEN=""
+[[ -r "$HOME/.ais_authn_token" ]] && AIS_AUTHN_TOKEN="$(tr -d '\r\n' < "$HOME/.ais_authn_token")"
+
 CONTAINER="${CONTAINER:-${HEH}/containers/nemo-26.02-streaming-speechlm.sqsh}"
 CODE_DIR="${CODE_DIR:-${MYDIR}/NeMo_SCRIPT_cc}"
 CONFIG_PATH=/code/examples/asr/conf/fastconformer/cache_aware_streaming
@@ -114,7 +120,11 @@ INIT_NEMO="${INIT_NEMO:-${HEH}/pretrained_models/huggingface/nvidia/nemotron-spe
 # slowest-to-learn tensors in the model, and leaving them at init discards most
 # of the benefit of warm starting at all.
 INIT_INCLUDE="${INIT_INCLUDE:-[\"encoder.\",\"decoder.\",\"joint.enc.\",\"joint.pred.\"]}"
-TRAIN_INPUT_CFG="${TRAIN_INPUT_CFG:-${HEH}/data_configs/granary_v2_en_full_d0.5_b0.5_local_qwen_aligned.yaml}"
+# OCI-IAD reads AUDIO from AIStore (s3://) with MANIFESTS on lustre; DFW reads
+# tar shards straight off lustre. Pointing OCI at a DFW-style lustre config
+# does not fail loudly -- NeMo skips missing shards -- it just silently
+# trains on whatever subset happens to be staged (measured: ~40%).
+TRAIN_INPUT_CFG="${TRAIN_INPUT_CFG:-${DATA_ROOT}/users/dongjig/aligned_amos/granary_v2_en_pnc_qwen_aligned_filtered/granary_v2_en_pnc_qwen_aligned_filtered_safe_iad_s3_audio.yaml}"
 # OCI's OWN aligned val set (2000 entries, alignments present), whose audio
 # lives under /data. Not DFW's copy: that one is only partially staged here
 # and its audio paths are relative to the manifest directory.
@@ -178,6 +188,8 @@ echo "*******STARTING********" \
 && cd /code && export PYTHONPATH="/code/.:\${PYTHONPATH}" \
 && echo "CODE COMMIT:" && git rev-parse HEAD \
 && export HF_HOME="/hfcache/" HF_TOKEN=${HF_TOKEN} HF_HUB_OFFLINE=1 HYDRA_FULL_ERROR=1 \
+&& export AIS_ENDPOINT=http://asr.iad.oci.aistore.nvidia.com:51080 AIS_AUTHN_TOKEN="${AIS_AUTHN_TOKEN}" \
+&& export NEMO_DATA_STORE_CACHE_DIR=${HEH}/nemo_cache \
 && export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
 && export PYTORCH_ALLOC_CONF=expandable_segments:True \
 && export TORCH_NCCL_TIMEOUT_SEC=3600 \
