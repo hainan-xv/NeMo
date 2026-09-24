@@ -129,7 +129,12 @@ def stage_split(dataset_path, dataset, split, cache_dir, max_samples, gt_field, 
             else:
                 raise ValueError(
                     f"Unrecognized audio entry for {dataset}/{split}: "
-                    f"keys={list(audio) if isinstance(audio, dict) else type(audio)}"
+                    f"audio={list(audio) if isinstance(audio, dict) else type(audio)} "
+                    # The sample's own columns: a repo that is not
+                    # hf-audio/open-asr-leaderboard may put the audio somewhere
+                    # else entirely, and without this the failure says only
+                    # "NoneType" and gives nothing to act on.
+                    f"| sample columns={sorted(sample.keys())}"
                 )
             wav = _to_16k_mono(wav, sr)
             wav_path = os.path.join(out_dir, f"{n:06d}.wav")
