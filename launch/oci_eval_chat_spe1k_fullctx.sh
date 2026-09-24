@@ -78,6 +78,12 @@ FA=model.forced_alignment
 export PAD_EXTRA_SECONDS="${PAD_EXTRA_SECONDS:-0}"
 export CHUNK_SIZE="${CHUNK_SIZE:-14}"
 
+# MATCH DFW'S MACRO-7. The backends default to plain earnings22:test; DFW's
+# macro-7 scores the ArtificialAnalysis CHUNKED variant and excludes the plain
+# one. Same seven slots otherwise. Stage it first:
+#   sbatch launch/oci_stage_earnings22_chunked.sh
+export DATASETS="${DATASETS:-librispeech:test.clean librispeech:test.other ami_cleaned:test earnings22_cleaned_aa_chunked:test gigaspeech_cleaned:test spgispeech:test voxpopuli_cleaned_aa:test}"
+
 export ARM_EXP_NAME=oci_granary2_chat_spe1k_both_fullctx
 export ARM_CONFIG_NAME=nemotron_chat_transducer_granary2_spe_fullctx
 # MANDATORY. Averaging CONSTRUCTS the model before loading weights, so with the
