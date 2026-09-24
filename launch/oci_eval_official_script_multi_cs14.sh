@@ -4,7 +4,7 @@
 #SBATCH -p batch_block1,batch_block3,batch_block4
 #SBATCH -N 1
 #SBATCH --gpus-per-node=8
-#SBATCH -t 06:00:00
+#SBATCH -t 04:00:00
 #SBATCH --exclusive
 #SBATCH --mem=0
 #SBATCH --ntasks-per-node=1
