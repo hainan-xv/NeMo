@@ -79,6 +79,7 @@ SCRIPT_PATHS=(
     tests/collections/speechlm2/test_script.py
     scripts/script_leaderboard_eval.py
     scripts/script_asr_shim.py
+    scripts/speechlm_asr_shim.py
     scripts/build_chat_spe_corpus.py
     'scripts/tokenizers/process_asr_text_tokenizer.py'
     scripts/nemotron_leaderboard_eval.py

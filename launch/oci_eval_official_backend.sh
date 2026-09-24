@@ -30,11 +30,14 @@
 # ============================================================================
 set -uo pipefail
 
-KEY="${1:?usage: $0 KEY MODEL PAD MAX_SYMBOLS CHUNK_SIZE}"
+KEY="${1:?usage: $0 KEY MODEL PAD MAX_SYMBOLS CHUNK_SIZE [MODEL_TYPE]}"
 MODEL="${2:?}"
 PAD="${3:?}"
 MAX_SYMBOLS="${4:?}"
 CHUNK_SIZE="${5:?}"
+# Which shim a .ckpt is routed through. Defaults to script, so every existing
+# caller is unchanged; 'speechlm' selects the interleaved StreamingSTTModel.
+MODEL_TYPE="${6:-script}"
 
 LUSTRE=/lustre/fsw/portfolios/nemotron
 MY=${LUSTRE}/users/hainanx
@@ -94,6 +97,23 @@ MAX_SYM_ARG=""
 CHUNK_ARG=""
 [[ "$MODEL" == *.ckpt ]] && CHUNK_ARG="--chunk_size=${CHUNK_SIZE}"
 
+# The interleaved model's base LLM and encoder. Its checkpoint records bare hub
+# ids that do not resolve offline on the grid, and pointing these at the same
+# snapshots our own arms load also keeps the base model byte-identical across
+# every row of the table.
+TYPE_ARG=""
+if [[ "$MODEL_TYPE" != "script" ]]; then
+    HF_PRE="${HEH}/pretrained_models/huggingface"
+    P_LLM="${PRETRAINED_LLM:-${HF_PRE}/Qwen/Qwen3-1.7B}"
+    P_ASR="${PRETRAINED_ASR:-${HF_PRE}/nvidia/nemotron-speech-streaming-en-0.6b/nemotron-speech-streaming-en-0.6b.nemo}"
+    for p in "$P_LLM" "$P_ASR"; do
+        [[ -e "$p" ]] || { echo "ERROR: missing base model $p" >&2; exit 1; }
+    done
+    TYPE_ARG="--model_type=${MODEL_TYPE} --pretrained_llm='${P_LLM}' --pretrained_asr='${P_ASR}'"
+    echo "==> model_type=${MODEL_TYPE} | base llm ${P_LLM}"
+    echo "==> base asr ${P_ASR}"
+fi
+
 echo "==> OFFICIAL harness | key=${KEY} pad=${PAD}s batch=${BATCH_SIZE} max_symbols=${MAX_SYMBOLS} ${CHUNK_ARG:-(chunk n/a)}"
 echo "==> model  : ${MODEL}"
 echo "==> logs   : ${OUT}"
@@ -123,7 +143,7 @@ for cfg in "${DATASETS[@]}"; do
                       python run_eval.py --model_id='${MODEL}' --dataset_path='${DSPATH}' \
                         --dataset='${DS}' --split='${SPLIT}' --device=0 \
                         --batch_size=${BATCH_SIZE} --max_eval_samples=-1 \
-                        --pad_extra_seconds=${PAD} ${MAX_SYM_ARG} ${CHUNK_ARG}" >> "${DLOG}" 2>&1
+                        --pad_extra_seconds=${PAD} ${MAX_SYM_ARG} ${CHUNK_ARG} ${TYPE_ARG}" >> "${DLOG}" 2>&1
     ) &
     pids+=($!); gpu=$((gpu + 1))
 done
