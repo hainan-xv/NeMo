@@ -85,7 +85,7 @@ def _reference(sample, gt_field):
     return ""
 
 
-def stage_split(dataset_path, dataset, split, cache_dir, max_samples, gt_field, refresh, token):
+def stage_split(dataset_path, dataset, split, cache_dir, max_samples, gt_field, refresh, token, config=None):
     """Materialize one (dataset, split) -> 16 kHz wavs + _cache_manifest.jsonl."""
     import numpy as np
     import soundfile as sf
@@ -103,7 +103,8 @@ def stage_split(dataset_path, dataset, split, cache_dir, max_samples, gt_field, 
         return n
 
     _log(f"  downloading {dataset}/{split} from {dataset_path} (streaming) ...")
-    ds = load_dataset(dataset_path, dataset, split=split, streaming=True, token=token)
+    # config selects the HF BuilderConfig; `dataset` only names the cache dir.
+    ds = load_dataset(dataset_path, config or dataset, split=split, streaming=True, token=token)
     # Disable HF's built-in audio decode (pulls torchcodec/FFmpeg); decode bytes
     # ourselves with soundfile (libsndfile handles WAV/FLAC without FFmpeg).
     try:
@@ -170,16 +171,27 @@ def main():
     for e in (x.strip() for x in args.datasets.replace(",", " ").split()):
         if not e:
             continue
-        name, _, split = e.partition(":")
-        entries.append((name, split or "test"))
+        # "name[:split[:config]]". The third field exists because the CACHE
+        # DIRECTORY name and the HF BuilderConfig name are not always the same:
+        # hf-audio/open-asr-leaderboard is multi-config, so config == name, but a
+        # standalone repo like ArtificialAnalysis/Earnings22-Cleaned-AA-chunked
+        # exposes only 'default' and errors with
+        #   BuilderConfig 'earnings22_cleaned_aa_chunked' not found. Available: ['default']
+        # while the eval still needs the cache under the descriptive name.
+        parts = e.split(":")
+        name = parts[0]
+        split = parts[1] if len(parts) > 1 and parts[1] else "test"
+        config = parts[2] if len(parts) > 2 and parts[2] else name
+        entries.append((name, split, config))
 
     _log(f"Staging {len(entries)} splits from {args.dataset_path} -> {args.cache_dir}")
     total = 0
     failures = []
-    for dataset, split in entries:
+    for dataset, split, config in entries:
         try:
             total += stage_split(
-                args.dataset_path, dataset, split, args.cache_dir, args.max_samples, args.gt_field, args.refresh, token
+                args.dataset_path, dataset, split, args.cache_dir, args.max_samples, args.gt_field,
+                args.refresh, token, config
             )
         except Exception as ex:  # noqa: BLE001 - keep staging the rest
             _log(f"  ERROR staging {dataset}/{split}: {type(ex).__name__}: {ex}")

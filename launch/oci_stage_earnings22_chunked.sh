@@ -90,7 +90,7 @@ fi
 mkdir -p slurm_out
 
 DATASET_PATH="${DATASET_PATH:-ArtificialAnalysis/Earnings22-Cleaned-AA-chunked}"
-DATASETS="${DATASETS:-earnings22_cleaned_aa_chunked:test}"
+DATASETS="${DATASETS:-earnings22_cleaned_aa_chunked:test:default}"
 DATASETS_CSV="$(echo "$DATASETS" | tr -s ' ' ',')"
 MAX_SAMPLES="${MAX_SAMPLES:-0}"
 REFRESH="${REFRESH:-0}"
