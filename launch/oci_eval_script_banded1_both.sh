@@ -54,10 +54,4 @@ find_launch_dir() {
 }
 
 export EVAL_TAG="${EVAL_TAG:-granary2_script_banded1_both_cs14}"
-# MATCH DFW'S MACRO-7. The backends default to plain earnings22:test; DFW's
-# macro-7 scores the ArtificialAnalysis CHUNKED variant and excludes the plain
-# one. Same seven slots otherwise. Stage it first:
-#   sbatch launch/oci_stage_earnings22_chunked.sh
-export DATASETS="${DATASETS:-librispeech:test.clean librispeech:test.other ami_cleaned:test earnings22_cleaned_aa_chunked:test gigaspeech_cleaned:test spgispeech:test voxpopuli_cleaned_aa:test}"
-
 exec bash "$(find_launch_dir)/eval_script.sh" granary2_script_banded1_both 14
