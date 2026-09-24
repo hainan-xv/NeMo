@@ -289,12 +289,15 @@ if [[ -z "$INIT_CKPT" && -n "$INIT_EXP" ]]; then
     fi
 fi
 
+# NOTE: with ++init_from_ckpt (weights only) global_step starts at 0, so this
+# guard no longer applies -- it is kept only for the resume_from_checkpoint
+# path and is skipped below.
 # A warm start restores the FULL training state, global_step included. If the
 # parent is already at or past MAX_STEPS this run has nothing to do: Lightning
 # prints "max_steps reached", exits 0 after ~3 minutes, and Slurm reports
 # COMPLETED with no checkpoints -- a failure that looks like a success. Job
 # 12865606 died exactly this way. Fail loudly instead.
-if [[ -n "$INIT_CKPT" && "$INIT_CKPT" != "none" ]]; then
+if [[ "${INIT_WEIGHTS_ONLY:-1}" != "1" && -n "$INIT_CKPT" && "$INIT_CKPT" != "none" ]]; then
     _INIT_STEP="$(basename "$INIT_CKPT" | grep -oE 'step=[0-9]+' | head -1 | cut -d= -f2)"
     if [[ -n "$_INIT_STEP" && "$_INIT_STEP" -ge "$MAX_STEPS" ]]; then
         echo "ERROR: warm-start checkpoint is at step ${_INIT_STEP}, but MAX_STEPS=${MAX_STEPS}." >&2
@@ -312,7 +315,12 @@ INIT_MOUNT=""
 if [[ -n "$INIT_CKPT" && "$INIT_CKPT" != "none" ]]; then
     ln -sfn "$INIT_CKPT" "${RESULTS_DIR}/init_from.ckpt"
     INIT_MOUNT="$(dirname "$INIT_CKPT")"
-    INIT_CKPT_ARG="++exp_manager.resume_from_checkpoint=/results/init_from.ckpt"
+    # WEIGHTS ONLY, not resume_from_checkpoint. This arm changes the LOSS, so it
+    # needs a fresh LR schedule and fresh optimizer moments; resuming the parent
+    # trainer state starts it at the baseline's epoch 47 / step ~194k on an
+    # already-decayed LR, which is a continuation, not a warm start. Observed on
+    # job 13602919, which came up at "Epoch 47". Matches dfw_script_banded1_both_nodelay_v2.
+    INIT_CKPT_ARG="++init_from_ckpt=/results/init_from.ckpt"
 fi
 
 MOUNTS="--container-mounts=${DATA_DIR}:${DATA_DIR},${H_DIR}:${H_DIR},$HAINAN_DIR:$HAINAN_DIR,$CODE_DIR:/code,$RESULTS_DIR:/results,$DATA_DIR:/data,$PRETRAINED_MODEL_DIR:/pretrained,$CHECKPOINT_DIR:/checkpoints,${QUESTIONS_DIR}:/questions/,${HFCACHE}:/hfcache/,$DONGJI_ROOT:$DONGJI_ROOT${INIT_MOUNT:+,${INIT_MOUNT}:${INIT_MOUNT}}"
