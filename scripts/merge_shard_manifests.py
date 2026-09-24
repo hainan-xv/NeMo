@@ -64,14 +64,26 @@ def main():
         metavar="SUBSTR=N",
         help="Assert the merged manifest whose name contains SUBSTR has exactly N rows. Repeatable.",
     )
+    ap.add_argument(
+        "--tag",
+        default="",
+        help="Only merge manifests whose name starts with MODEL_<tag>__. REQUIRED when arms run "
+        "concurrently: the results dir is shared, so an unscoped merge inspects OTHER arms' "
+        "in-flight shards. If it ever caught all N present but one still flushing, it would "
+        "merge truncated data AND delete the shards, leaving the owning arm nothing to merge.",
+    )
     ap.add_argument("--keep-shards", action="store_true", help="Do not delete shard files after merging.")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
     groups = defaultdict(dict)  # canonical path -> {shard_index: path}
     totals = {}
+    prefix = f"MODEL_{args.tag}__" if args.tag else ""
     for path in sorted(glob.glob(os.path.join(args.results_dir, "*.jsonl"))):
-        m = SHARD_RE.search(os.path.basename(path))
+        base = os.path.basename(path)
+        if prefix and not base.startswith(prefix):
+            continue
+        m = SHARD_RE.search(base)
         if not m:
             continue
         idx, n = int(m.group(1)), int(m.group(2))

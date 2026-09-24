@@ -152,6 +152,35 @@ for cfg in "${DATASETS[@]}"; do
     DSPATH="${DSPATH:-$DEFAULT_PATH}"
     echo; echo "--- ${KEY} / ${DS} ${SPLIT}: ${NGPU} shards across ${NGPU} GPUs"
     DS_START=$(date +%s)
+
+    # WARM THE HUB RESOLUTION ONCE, then decode OFFLINE.
+    #
+    # The audio is already cached (19G of open-asr-leaderboard on lustre; the
+    # shards fetch zero bytes). What is NOT cached is the repo FILE LISTING:
+    # load_dataset re-resolves /api/datasets/<repo>/tree/<rev>/<config> on every
+    # invocation. Sharding turned that into NGPU identical metadata calls per
+    # dataset, and several concurrent arms pushed it past HF's quota of 1000 API
+    # requests per 5 minutes -- a 429 that killed whole datasets while the data
+    # sat on local disk the entire time.
+    #
+    # So: resolve once here (online, 1 call), then run every shard with
+    # HF_HUB_OFFLINE=1 so they read purely from cache and make NO API calls at
+    # all. That is an 8x reduction, and the fan-out stops depending on the Hub
+    # being reachable or generous.
+    srun --overlap -n1 -N1 --container-image="$CONTAINER" \
+         --container-mounts="${LUSTRE}:${LUSTRE},${HEH}:${HEH},${CODE_DIR}:/code,${OASR}:/oasr" \
+         bash -c "export PYTHONPATH=/code:/code/scripts:/oasr:${PYLIBS}:\${PYTHONPATH:-} HF_HOME=${MY}/hf_cache HF_TOKEN=${HF_TOKEN} && \
+                  python -c \"
+import sys; sys.path.insert(0,'/oasr')
+from normalizer import data_utils
+class A:
+    dataset_path='${DSPATH}'; dataset='${DS}'; split='${SPLIT}'
+    max_eval_samples=1; streaming=False
+data_utils.load_data(A())
+print('hub resolution warmed: ${DS} ${SPLIT}')
+\"" >> "${OUT}/${KEY}.${DS}_${SPLIT}.warmup.log" 2>&1 \
+        || echo "  [warn] warm-up failed for ${DS} ${SPLIT}; shards will fall back to online resolution"
+
     pids=()
     for gpu in $(seq 0 $((NGPU - 1))); do
         DLOG="${OUT}/${KEY}.${DS}_${SPLIT}.shard${gpu}.log"
@@ -161,7 +190,7 @@ for cfg in "${DATASETS[@]}"; do
             srun --overlap -n1 -N1 \
                  --container-image="$CONTAINER" \
                  --container-mounts="${LUSTRE}:${LUSTRE},${HEH}:${HEH},${CODE_DIR}:/code,${OASR}:/oasr" \
-                 bash -c "export CUDA_VISIBLE_DEVICES=${gpu} PYTHONPATH=/code:/code/scripts:/oasr:${PYLIBS}:\${PYTHONPATH:-} HF_HOME=${MY}/hf_cache HF_TOKEN=${HF_TOKEN} && \
+                 bash -c "export CUDA_VISIBLE_DEVICES=${gpu} PYTHONPATH=/code:/code/scripts:/oasr:${PYLIBS}:\${PYTHONPATH:-} HF_HOME=${MY}/hf_cache HF_TOKEN=${HF_TOKEN} HF_HUB_OFFLINE=${HF_OFFLINE:-1} HF_DATASETS_OFFLINE=${HF_OFFLINE:-1} && \
                           cd /oasr/nemo_asr && \
                           python run_eval.py --model_id='${MODEL}' --dataset_path='${DSPATH}' \
                             --dataset='${DS}' --split='${SPLIT}' --device=0 \
@@ -192,7 +221,7 @@ echo; echo "############ MERGING SHARDS"
 srun --overlap -n1 -N1 --container-image="$CONTAINER" \
      --container-mounts="${LUSTRE}:${LUSTRE},${HEH}:${HEH},${CODE_DIR}:/code,${OASR}:/oasr" \
      bash -c "export PYTHONPATH=/code:/code/scripts:/oasr:${PYLIBS}:\${PYTHONPATH:-} && \
-              python /code/scripts/merge_shard_manifests.py ${RESULTS}" \
+              python /code/scripts/merge_shard_manifests.py ${RESULTS} --tag '${KEY}'" \
   || { echo "### MERGE REPORTED PROBLEMS -- see above; affected datasets were NOT written" >&2; }
 
 echo; echo "############ OFFICIAL SCORE so far (kaldialign, merge_compounds=True)"
