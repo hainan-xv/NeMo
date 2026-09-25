@@ -43,6 +43,9 @@ CHUNK_SIZE="${5:?}"
 # Which shim a .ckpt is routed through. Defaults to script, so every existing
 # caller is unchanged; 'speechlm' selects the interleaved StreamingSTTModel.
 MODEL_TYPE="${6:-script}"
+# Lookahead for cache-aware .nemo streaming models (0 = the model's own default).
+# Distinct from CHUNK_SIZE, which only reaches the .ckpt shims.
+ATT_CHUNK="${7:-0}"
 
 LUSTRE=/lustre/fsw/portfolios/nemotron
 MY=${LUSTRE}/users/hainanx
@@ -104,6 +107,8 @@ MAX_SYM_ARG=""
 # size from their own config and ignore it.
 CHUNK_ARG=""
 [[ "$MODEL" == *.ckpt ]] && CHUNK_ARG="--chunk_size=${CHUNK_SIZE}"
+ATT_ARG=""
+[[ "${ATT_CHUNK}" != "0" ]] && ATT_ARG="--att_chunk_size=${ATT_CHUNK}"
 
 # The interleaved model's base LLM and encoder. Its checkpoint records bare hub
 # ids that do not resolve offline on the grid, and pointing these at the same
@@ -220,7 +225,7 @@ for gpu in $(seq 0 $((NGPU - 1))); do
                         --datasets='${SPECS}' --device=0 \
                         --batch_size=${BATCH_SIZE} --max_eval_samples=${MAX_EVAL_SAMPLES} \
                         --num_shards=${NGPU} --shard_index=${gpu} --run_tag='${KEY}' \
-                        --pad_extra_seconds=${PAD} ${MAX_SYM_ARG} ${CHUNK_ARG} ${TYPE_ARG}" >> "${DLOG}" 2>&1
+                        --pad_extra_seconds=${PAD} ${MAX_SYM_ARG} ${CHUNK_ARG} ${TYPE_ARG} ${ATT_ARG}" >> "${DLOG}" 2>&1
     ) &
     pids+=($!)
 done
