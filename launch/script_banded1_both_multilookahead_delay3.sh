@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH -A nemotron_speech_asr
-#SBATCH -J nemotron_speechprod_asr:streaming-stt-script-banded1-both-multi
+#SBATCH -J nemotron_speechprod_asr:streaming-stt-script-banded1-both-multi-delay3
 #SBATCH -p batch_block1,batch_block3,batch_block4
 #SBATCH -N 8
 #SBATCH --gpus-per-node=8
@@ -29,6 +29,13 @@
 # cs14/cs7 and ahead at cs2 (8.917 vs 9.167). Emission delay is the most obvious
 # un-matched variable between the two, and seeing 3 more frames before emitting
 # should help most exactly where our arm is weakest -- the smallest chunk.
+#
+# THE SLURM JOB NAME MUST STAY DISTINCT FROM THE PARENT ARM'S. This file was
+# copied from script_banded1_both_multilookahead.sh, which left both arms sharing
+# the name ...-banded1-both-multi. They then look identical in squeue, and any
+# management that cancels by NAME before resubmitting kills whichever it did not
+# mean to -- observed as three SIGKILLs with no traceback, no CUDA OOM and step
+# state CANCELLED, which reads like a crash and is not one.
 #
 # NOT FREE: 3 frames of delay is 3 frames of added latency at every chunk. At
 # chunk_size 2 that exceeds the chunk itself, so a win there is bought with the
