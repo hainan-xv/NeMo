@@ -64,6 +64,42 @@ if [[ "${VERIFY_ONLY:-0}" != "1" ]]; then
   srun --overlap -n1 -N1 --container-image="$CONTAINER" \
     --container-mounts="${LUSTRE}:${LUSTRE},${HEH}:${HEH}" \
     bash -c "pip install --no-deps --target=${MY}/pylibs 'datasets==3.6.0' num2words docopt 2>&1 | tail -2"
+
+  # WARM THE DATASET CACHE, ONLINE, ONCE.
+  #
+  # Evals decode with HF_HUB_OFFLINE=1 and make NO HuggingFace calls at all -- no
+  # rate limits, no dependency on the Hub being reachable mid-run. That only works
+  # if the cache is complete, and this is the one place that fills it. The cache
+  # lives on lustre and persists, so it is paid once per new dataset rather than
+  # once per job; it used to be an in-job warm-up costing every run ~5-6 minutes
+  # before a single GPU started.
+  echo "==> warming the dataset cache (online, one-time)"
+  srun --overlap -n1 -N1 --container-image="$CONTAINER" \
+    --container-mounts="${LUSTRE}:${LUSTRE},${CODE_DIR}:/code,${OASR}:/oasr" \
+    bash -c "export PYTHONPATH=/code:/code/scripts:/oasr:${MY}/pylibs:\${PYTHONPATH:-} HF_HOME=${MY}/hf_cache HF_TOKEN=${HF_TOKEN} && python - <<'WARMEOF'
+import sys
+sys.path.insert(0, '/oasr')
+from normalizer import data_utils
+for path, name, split in [
+    ('hf-audio/open-asr-leaderboard', 'ami_cleaned', 'test'),
+    ('hf-audio/open-asr-leaderboard', 'gigaspeech_cleaned', 'test'),
+    ('hf-audio/open-asr-leaderboard', 'voxpopuli_cleaned_aa', 'test'),
+    ('hf-audio/open-asr-leaderboard', 'earnings22', 'test'),
+    ('hf-audio/open-asr-leaderboard', 'librispeech', 'test.clean'),
+    ('hf-audio/open-asr-leaderboard', 'librispeech', 'test.other'),
+    ('hf-audio/open-asr-leaderboard', 'spgispeech', 'test'),
+    ('ArtificialAnalysis/Earnings22-Cleaned-AA-chunked', 'earnings22_cleaned_aa_chunked', 'test'),
+]:
+    class A:
+        dataset_path = path
+        dataset = name
+        split = split
+        max_eval_samples = 1
+        streaming = False
+    data_utils.load_data(A())
+    print(f'  cached: {name} {split}', flush=True)
+WARMEOF
+"
 fi
 
 srun --overlap -n1 -N1 --container-image="$CONTAINER" \

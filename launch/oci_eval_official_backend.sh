@@ -159,29 +159,34 @@ for cfg in "${DATASETS[@]}"; do
 done
 echo "==> ${#DATASETS[@]} datasets in ONE process per GPU: ${SPECS}"
 
-# WARM THE HUB RESOLUTION ONCE PER DATASET, then decode offline.
+# NO HUB CALLS IN THE HOT PATH.
 #
-# The audio is cached (19G of open-asr-leaderboard on lustre; shards fetch zero
-# bytes). What is NOT cached is the repo FILE LISTING: load_dataset re-resolves
-# /api/datasets/<repo>/tree/<rev>/<config> on every invocation. Sharding turned
-# that into NGPU identical metadata calls per dataset and blew HF's quota of
-# 1000 API requests / 5 min -- a 429 that killed whole datasets while the data
-# sat on local disk. Resolve once here, then run every shard with
-# HF_HUB_OFFLINE=1 so they make no API calls at all.
-# ALL AT ONCE, not one after another. These were 8 sequential srun calls, each
-# paying container start plus a Hub round-trip -- ~5-6 minutes of dead time before
-# a single GPU did any work, which on a 19-minute arm is most of the startup. They
-# are independent, so they run concurrently; the quota problem was 64 SIMULTANEOUS
-# resolvers from the shard fan-out, and 8 is comfortably inside it.
-_warm_pids=()
-for cfg in "${DATASETS[@]}"; do
-    read -r DS SPLIT DSPATH <<< "$cfg"
-    DSPATH="${DSPATH:-$DEFAULT_PATH}"
-    (
-    srun --overlap -n1 -N1 --container-image="$CONTAINER" \
-         --container-mounts="${LUSTRE}:${LUSTRE},${HEH}:${HEH},${CODE_DIR}:/code,${OASR}:/oasr" \
-         bash -c "export PYTHONPATH=/code:/code/scripts:/oasr:${PYLIBS}:\${PYTHONPATH:-} HF_HOME=${MY}/hf_cache HF_TOKEN=${HF_TOKEN} && \
-                  python -c \"
+# The shards run with HF_HUB_OFFLINE=1 and read purely from the 19G local cache,
+# so a normal run touches HuggingFace ZERO times. What used to sit here was a
+# per-job warm-up that resolved each dataset online first -- insurance against a
+# cold cache, paid on every single job. Sequentially that cost ~5-6 minutes
+# before any GPU started; even parallelised it is container starts and round
+# trips for something the cache already has.
+#
+# Cache warming is a ONE-TIME setup step and now lives in
+# oci_eval_official_prereq.sh, which both warms and then verifies that all eight
+# datasets load offline. The cache is on lustre and persists across jobs, so that
+# is the correct place for it.
+#
+# HUB_WARMUP=1 restores the in-job warm-up for a genuinely cold cache. Otherwise
+# a missing dataset surfaces as an offline-mode error naming the dataset, and the
+# fix is to run the prereq script once.
+if [[ "${HUB_WARMUP:-0}" == "1" ]]; then
+    echo "==> HUB_WARMUP=1: resolving all datasets online before decoding"
+    _warm_pids=()
+    for cfg in "${DATASETS[@]}"; do
+        read -r DS SPLIT DSPATH <<< "$cfg"
+        DSPATH="${DSPATH:-$DEFAULT_PATH}"
+        (
+        srun --overlap -n1 -N1 --container-image="$CONTAINER" \
+             --container-mounts="${LUSTRE}:${LUSTRE},${HEH}:${HEH},${CODE_DIR}:/code,${OASR}:/oasr" \
+             bash -c "export PYTHONPATH=/code:/code/scripts:/oasr:${PYLIBS}:\${PYTHONPATH:-} HF_HOME=${MY}/hf_cache HF_TOKEN=${HF_TOKEN} && \
+                      python -c \"
 import sys; sys.path.insert(0,'/oasr')
 from normalizer import data_utils
 class A:
@@ -189,13 +194,15 @@ class A:
     max_eval_samples=1; streaming=False
 data_utils.load_data(A())
 print('hub resolution warmed: ${DS} ${SPLIT}')
-\"" >> "${OUT}/${KEY}.warmup.log" 2>&1 \
-        || echo "  [warn] hub warm-up failed for ${DS} ${SPLIT}; shards will need online resolution"
-    ) &
-    _warm_pids+=($!)
-done
-for _p in "${_warm_pids[@]}"; do wait "$_p" || true; done
-echo "==> hub resolution warmed for all ${#DATASETS[@]} datasets (in parallel)"
+\"" >> "${OUT}/${KEY}.warmup.log" 2>&1
+        ) &
+        _warm_pids+=($!)
+    done
+    for _p in "${_warm_pids[@]}"; do wait "$_p" || true; done
+    echo "==> hub resolution warmed for all ${#DATASETS[@]} datasets"
+else
+    echo "==> offline decode: no HuggingFace calls (cache warmed once by oci_eval_official_prereq.sh)"
+fi
 
 DECODE_START=$(date +%s)
 pids=()
