@@ -145,6 +145,21 @@ echo "==> results: ${RESULTS}  (shared across arms; filenames are keyed per arm)
 #
 # --overlap, NOT --exclusive: on an srun STEP --exclusive means "do not share this
 # allocation", which SERIALISES the backgrounded steps.
+# CLEAR THIS ARM'S OWN MANIFESTS FIRST.
+#
+# The merger refuses to write a dataset whose shard set is incomplete -- correct,
+# but not sufficient: the PREVIOUS run's manifest for that dataset survives, so
+# the arm still looks complete and the scorer silently blends two vintages. That
+# is exactly what happened to script_multi_cs2, where a GPU died mid-job and 7 of
+# 8 datasets kept yesterday's weights while gigaspeech had today's -- a row that
+# is wrong in a way no count or checksum would reveal.
+#
+# Scoped to MODEL_<KEY>__ so it can never touch another arm's results.
+echo "==> clearing previous manifests for ${KEY} (a partial re-run must not blend vintages)"
+_n_old=$(ls "${RESULTS}"/MODEL_${KEY}__*.jsonl 2>/dev/null | wc -l)
+rm -f "${RESULTS}"/MODEL_${KEY}__*.jsonl
+echo "    removed ${_n_old} stale file(s)"
+
 NGPU="${NGPU:-8}"
 overall_fail=0
 for cfg in "${DATASETS[@]}"; do
@@ -210,6 +225,15 @@ done
 
 cat "${OUT}/${KEY}."*.log > "${OUT}/${KEY}.log" 2>/dev/null
 echo; echo "### ${KEY}: ${overall_fail} total shard failures across ${#DATASETS[@]} datasets"
+if [[ "${overall_fail}" -gt 0 ]]; then
+    # A dead GPU poisons its CUDA context, so one "unspecified launch failure"
+    # costs that shard on EVERY later dataset -- observed as 7 of 8 datasets
+    # losing the same shard index. Say so plainly: the affected datasets have no
+    # manifest at all now, and the arm must be re-run rather than scored.
+    echo "### WARNING: ${KEY} has failed shards. Datasets missing a shard were NOT written," >&2
+    echo "###          so this arm is INCOMPLETE and must be re-run before it is scored." >&2
+    echo "###          Per-shard failures cluster on one GPU when its context is poisoned." >&2
+fi
 
 # ---- merge shards back to one manifest per dataset -------------------------
 # MUST happen before scoring: score_results derives the model id from the
