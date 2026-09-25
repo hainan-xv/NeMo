@@ -168,9 +168,16 @@ echo "==> ${#DATASETS[@]} datasets in ONE process per GPU: ${SPECS}"
 # 1000 API requests / 5 min -- a 429 that killed whole datasets while the data
 # sat on local disk. Resolve once here, then run every shard with
 # HF_HUB_OFFLINE=1 so they make no API calls at all.
+# ALL AT ONCE, not one after another. These were 8 sequential srun calls, each
+# paying container start plus a Hub round-trip -- ~5-6 minutes of dead time before
+# a single GPU did any work, which on a 19-minute arm is most of the startup. They
+# are independent, so they run concurrently; the quota problem was 64 SIMULTANEOUS
+# resolvers from the shard fan-out, and 8 is comfortably inside it.
+_warm_pids=()
 for cfg in "${DATASETS[@]}"; do
     read -r DS SPLIT DSPATH <<< "$cfg"
     DSPATH="${DSPATH:-$DEFAULT_PATH}"
+    (
     srun --overlap -n1 -N1 --container-image="$CONTAINER" \
          --container-mounts="${LUSTRE}:${LUSTRE},${HEH}:${HEH},${CODE_DIR}:/code,${OASR}:/oasr" \
          bash -c "export PYTHONPATH=/code:/code/scripts:/oasr:${PYLIBS}:\${PYTHONPATH:-} HF_HOME=${MY}/hf_cache HF_TOKEN=${HF_TOKEN} && \
@@ -184,8 +191,11 @@ data_utils.load_data(A())
 print('hub resolution warmed: ${DS} ${SPLIT}')
 \"" >> "${OUT}/${KEY}.warmup.log" 2>&1 \
         || echo "  [warn] hub warm-up failed for ${DS} ${SPLIT}; shards will need online resolution"
+    ) &
+    _warm_pids+=($!)
 done
-echo "==> hub resolution warmed for all datasets"
+for _p in "${_warm_pids[@]}"; do wait "$_p" || true; done
+echo "==> hub resolution warmed for all ${#DATASETS[@]} datasets (in parallel)"
 
 DECODE_START=$(date +%s)
 pids=()
