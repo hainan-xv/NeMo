@@ -57,6 +57,9 @@ RESULTS="${OASR}/nemo_asr/results"
 OUT="${MY}/results/official_eval/${KEY}_$(date +%Y%m%d_%H%M%S)"
 PINDIR="${MY}/results/official_eval/pinned/${KEY}"
 BATCH_SIZE="${BATCH_SIZE:-128}"
+# -1 = the whole dataset. Set a small value (with a throwaway KEY) to smoke-test
+# the plumbing without writing real manifests or burning a full decode.
+MAX_EVAL_SAMPLES="${MAX_EVAL_SAMPLES:--1}"
 mkdir -p "$OUT" "$PINDIR" "$RESULTS"
 
 # Exactly the DFW dataset list, including the chunked earnings22 that lives in a
@@ -198,7 +201,7 @@ for gpu in $(seq 0 $((NGPU - 1))); do
                       cd /oasr/nemo_asr && \
                       python run_eval.py --model_id='${MODEL}' --dataset_path='${DEFAULT_PATH}' \
                         --datasets='${SPECS}' --device=0 \
-                        --batch_size=${BATCH_SIZE} --max_eval_samples=-1 \
+                        --batch_size=${BATCH_SIZE} --max_eval_samples=${MAX_EVAL_SAMPLES} \
                         --num_shards=${NGPU} --shard_index=${gpu} --run_tag='${KEY}' \
                         --pad_extra_seconds=${PAD} ${MAX_SYM_ARG} ${CHUNK_ARG} ${TYPE_ARG}" >> "${DLOG}" 2>&1
     ) &
