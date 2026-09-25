@@ -124,64 +124,50 @@ echo "==> model  : ${MODEL}"
 echo "==> logs   : ${OUT}"
 echo "==> results: ${RESULTS}  (shared across arms; filenames are keyed per arm)"
 
-# ONE DATASET AT A TIME, SHARDED ACROSS ALL 8 GPUs.
+# ONE PROCESS PER GPU, COVERING EVERY DATASET.
 #
-# The previous layout gave each GPU a whole dataset, but the eight differ in size
-# by 115x -- spgispeech is 39,341 utterances (52% of all 75,078) while
-# earnings22-chunked is 341. So spgispeech sat alone on one GPU while seven idled,
-# and eight GPUs bought ~1.9x over serial instead of 8x. Measured: the cs2 job
-# took 2h11m, almost all of it spgispeech.
+# Three layouts have been measured here:
 #
-# Now every GPU gets an equal 1/8 slice of whichever dataset is in flight, so
-# wall-clock is (total work)/8 rather than (largest dataset). run_eval.py assigns
-# utterance i to shard i % 8, so all shards see the same duration mix.
+#   1. one dataset per GPU        -- spgispeech is 52% of all 75,078 utterances,
+#                                    so it ran alone while seven GPUs idled.
+#                                    ~1.9x over serial instead of 8x.
+#   2. one dataset at a time,     -- balanced (gigaspeech split 2343-2346 per
+#      sharded 8 ways                shard, all finishing within a minute), but
+#                                    the model was loaded 64 times per arm and
+#                                    the RTFx warm-up ran 8 times. voxpopuli's
+#                                    628 utterances took 5 min against
+#                                    gigaspeech's 12 for 30x the data -- almost
+#                                    pure startup.
+#   3. THIS: one process per GPU, each decoding its 1/8 stride of ALL datasets.
+#                                    8 model loads instead of 64, one warm-up
+#                                    instead of 8, and the same even split.
 #
-# THE COST is reloading the model once per dataset per GPU (64 loads instead of
-# 8). That is 7 extra load rounds, a few minutes -- bought back many times over
-# on the long datasets. Pooling all datasets into one sharded pass would avoid it,
-# as scripts/leaderboard_common.py build_global_items does for the internal
-# harness, but run_eval.py is per-dataset by construction and restructuring that
-# means rewriting the authoritative runner rather than extending it.
-#
-# --overlap, NOT --exclusive: on an srun STEP --exclusive means "do not share this
-# allocation", which SERIALISES the backgrounded steps.
-# CLEAR THIS ARM'S OWN MANIFESTS FIRST.
-#
-# The merger refuses to write a dataset whose shard set is incomplete -- correct,
-# but not sufficient: the PREVIOUS run's manifest for that dataset survives, so
-# the arm still looks complete and the scorer silently blends two vintages. That
-# is exactly what happened to script_multi_cs2, where a GPU died mid-job and 7 of
-# 8 datasets kept yesterday's weights while gigaspeech had today's -- a row that
-# is wrong in a way no count or checksum would reveal.
-#
-# Scoped to MODEL_<KEY>__ so it can never touch another arm's results.
-echo "==> clearing previous manifests for ${KEY} (a partial re-run must not blend vintages)"
-_n_old=$(ls "${RESULTS}"/MODEL_${KEY}__*.jsonl 2>/dev/null | wc -l)
-rm -f "${RESULTS}"/MODEL_${KEY}__*.jsonl
-echo "    removed ${_n_old} stale file(s)"
-
+# The balance is unchanged from (2) -- run_eval.py still assigns utterance i to
+# shard i % NGPU within each dataset -- so this is purely the removal of repeated
+# fixed cost, not a different division of work.
 NGPU="${NGPU:-8}"
-overall_fail=0
+
+# Dataset specs as run_eval.py --datasets wants them: name:split[:dataset_path].
+SPECS=""
+for cfg in "${DATASETS[@]}"; do
+    read -r DS SPLIT DSPATH <<< "$cfg"
+    if [[ -n "${DSPATH:-}" ]]; then entry="${DS}:${SPLIT}:${DSPATH}"; else entry="${DS}:${SPLIT}"; fi
+    SPECS="${SPECS:+${SPECS},}${entry}"
+done
+echo "==> ${#DATASETS[@]} datasets in ONE process per GPU: ${SPECS}"
+
+# WARM THE HUB RESOLUTION ONCE PER DATASET, then decode offline.
+#
+# The audio is cached (19G of open-asr-leaderboard on lustre; shards fetch zero
+# bytes). What is NOT cached is the repo FILE LISTING: load_dataset re-resolves
+# /api/datasets/<repo>/tree/<rev>/<config> on every invocation. Sharding turned
+# that into NGPU identical metadata calls per dataset and blew HF's quota of
+# 1000 API requests / 5 min -- a 429 that killed whole datasets while the data
+# sat on local disk. Resolve once here, then run every shard with
+# HF_HUB_OFFLINE=1 so they make no API calls at all.
 for cfg in "${DATASETS[@]}"; do
     read -r DS SPLIT DSPATH <<< "$cfg"
     DSPATH="${DSPATH:-$DEFAULT_PATH}"
-    echo; echo "--- ${KEY} / ${DS} ${SPLIT}: ${NGPU} shards across ${NGPU} GPUs"
-    DS_START=$(date +%s)
-
-    # WARM THE HUB RESOLUTION ONCE, then decode OFFLINE.
-    #
-    # The audio is already cached (19G of open-asr-leaderboard on lustre; the
-    # shards fetch zero bytes). What is NOT cached is the repo FILE LISTING:
-    # load_dataset re-resolves /api/datasets/<repo>/tree/<rev>/<config> on every
-    # invocation. Sharding turned that into NGPU identical metadata calls per
-    # dataset, and several concurrent arms pushed it past HF's quota of 1000 API
-    # requests per 5 minutes -- a 429 that killed whole datasets while the data
-    # sat on local disk the entire time.
-    #
-    # So: resolve once here (online, 1 call), then run every shard with
-    # HF_HUB_OFFLINE=1 so they read purely from cache and make NO API calls at
-    # all. That is an 8x reduction, and the fan-out stops depending on the Hub
-    # being reachable or generous.
     srun --overlap -n1 -N1 --container-image="$CONTAINER" \
          --container-mounts="${LUSTRE}:${LUSTRE},${HEH}:${HEH},${CODE_DIR}:/code,${OASR}:/oasr" \
          bash -c "export PYTHONPATH=/code:/code/scripts:/oasr:${PYLIBS}:\${PYTHONPATH:-} HF_HOME=${MY}/hf_cache HF_TOKEN=${HF_TOKEN} && \
@@ -193,38 +179,39 @@ class A:
     max_eval_samples=1; streaming=False
 data_utils.load_data(A())
 print('hub resolution warmed: ${DS} ${SPLIT}')
-\"" >> "${OUT}/${KEY}.${DS}_${SPLIT}.warmup.log" 2>&1 \
-        || echo "  [warn] warm-up failed for ${DS} ${SPLIT}; shards will fall back to online resolution"
+\"" >> "${OUT}/${KEY}.warmup.log" 2>&1 \
+        || echo "  [warn] hub warm-up failed for ${DS} ${SPLIT}; shards will need online resolution"
+done
+echo "==> hub resolution warmed for all datasets"
 
-    pids=()
-    for gpu in $(seq 0 $((NGPU - 1))); do
-        DLOG="${OUT}/${KEY}.${DS}_${SPLIT}.shard${gpu}.log"
-        : > "${DLOG}"
-        (
-            CUDA_VISIBLE_DEVICES=${gpu} \
-            srun --overlap -n1 -N1 \
-                 --container-image="$CONTAINER" \
-                 --container-mounts="${LUSTRE}:${LUSTRE},${HEH}:${HEH},${CODE_DIR}:/code,${OASR}:/oasr" \
-                 bash -c "export CUDA_VISIBLE_DEVICES=${gpu} PYTHONPATH=/code:/code/scripts:/oasr:${PYLIBS}:\${PYTHONPATH:-} HF_HOME=${MY}/hf_cache HF_TOKEN=${HF_TOKEN} HF_HUB_OFFLINE=${HF_OFFLINE:-1} HF_DATASETS_OFFLINE=${HF_OFFLINE:-1} && \
-                          cd /oasr/nemo_asr && \
-                          python run_eval.py --model_id='${MODEL}' --dataset_path='${DSPATH}' \
-                            --dataset='${DS}' --split='${SPLIT}' --device=0 \
-                            --batch_size=${BATCH_SIZE} --max_eval_samples=-1 \
-                            --num_shards=${NGPU} --shard_index=${gpu} --run_tag='${KEY}' \
-                            --pad_extra_seconds=${PAD} ${MAX_SYM_ARG} ${CHUNK_ARG} ${TYPE_ARG}" >> "${DLOG}" 2>&1
-        ) &
-        pids+=($!)
-    done
-    fail=0
-    for i in "${!pids[@]}"; do
-        wait "${pids[$i]}" || { echo "  [FAIL] ${DS} ${SPLIT} shard ${i}" >&2; fail=$((fail + 1)); }
-    done
-    overall_fail=$((overall_fail + fail))
-    echo "### ${DS} ${SPLIT}: ${fail} shard failures, $(( ($(date +%s) - DS_START) / 60 )) min"
+DECODE_START=$(date +%s)
+pids=()
+for gpu in $(seq 0 $((NGPU - 1))); do
+    DLOG="${OUT}/${KEY}.shard${gpu}.log"
+    : > "${DLOG}"
+    (
+        CUDA_VISIBLE_DEVICES=${gpu} \
+        srun --overlap -n1 -N1 \
+             --container-image="$CONTAINER" \
+             --container-mounts="${LUSTRE}:${LUSTRE},${HEH}:${HEH},${CODE_DIR}:/code,${OASR}:/oasr" \
+             bash -c "export CUDA_VISIBLE_DEVICES=${gpu} PYTHONPATH=/code:/code/scripts:/oasr:${PYLIBS}:\${PYTHONPATH:-} HF_HOME=${MY}/hf_cache HF_TOKEN=${HF_TOKEN} HF_HUB_OFFLINE=${HF_OFFLINE:-1} HF_DATASETS_OFFLINE=${HF_OFFLINE:-1} && \
+                      cd /oasr/nemo_asr && \
+                      python run_eval.py --model_id='${MODEL}' --dataset_path='${DEFAULT_PATH}' \
+                        --datasets='${SPECS}' --device=0 \
+                        --batch_size=${BATCH_SIZE} --max_eval_samples=-1 \
+                        --num_shards=${NGPU} --shard_index=${gpu} --run_tag='${KEY}' \
+                        --pad_extra_seconds=${PAD} ${MAX_SYM_ARG} ${CHUNK_ARG} ${TYPE_ARG}" >> "${DLOG}" 2>&1
+    ) &
+    pids+=($!)
 done
 
+overall_fail=0
+for i in "${!pids[@]}"; do
+    wait "${pids[$i]}" || { echo "  [FAIL] shard ${i}" >&2; overall_fail=$((overall_fail + 1)); }
+done
+echo "### ${KEY}: decode finished in $(( ($(date +%s) - DECODE_START) / 60 )) min, ${overall_fail} shard failures"
+
 cat "${OUT}/${KEY}."*.log > "${OUT}/${KEY}.log" 2>/dev/null
-echo; echo "### ${KEY}: ${overall_fail} total shard failures across ${#DATASETS[@]} datasets"
 if [[ "${overall_fail}" -gt 0 ]]; then
     # A dead GPU poisons its CUDA context, so one "unspecified launch failure"
     # costs that shard on EVERY later dataset -- observed as 7 of 8 datasets
@@ -248,13 +235,6 @@ srun --overlap -n1 -N1 --container-image="$CONTAINER" \
               python /code/scripts/merge_shard_manifests.py ${RESULTS} --tag '${KEY}'" \
   || { echo "### MERGE REPORTED PROBLEMS -- see above; affected datasets were NOT written" >&2; }
 
-# NO INLINE SCORER. It used to run here, and it was both redundant and harmful:
-# normalizer/eval_utils.score_results globs the ENTIRE shared results dir, so a
-# finishing arm would read another arm's in-flight shard manifests and die with
-# FileNotFoundError the moment that arm's merge deleted them -- marking a job
-# FAILED even though its own eight datasets had merged perfectly. Scoring is a
-# whole-table operation over a shared directory; it does not belong in a
-# per-arm job.
 # ---- score in this job, right after merging -------------------------------
 # The scorer runs against a SNAPSHOT of merged manifests (see
 # scripts/score_leaderboard_snapshot.py), so it cannot trip over other arms'
