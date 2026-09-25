@@ -924,6 +924,136 @@ class ScriptSTTModel(StreamingSTTModel):
         torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MAX)
         return bool(flag.item())
 
+    # ------------------------------------------------------------------
+    # Backward-pass OOM guard
+    # ------------------------------------------------------------------
+    #
+    # training_step's guard covers the FORWARD only: Lightning runs backward
+    # after training_step returns, inside the optimizer closure, so an OOM there
+    # escapes entirely. Measured on the multi-lookahead arms, that is the actual
+    # killer -- an uncaught torch.OutOfMemoryError in _engine_run_backward takes
+    # down one rank (e.g. rank 19), the other 63 tasks block in the gradient
+    # collective, and Slurm SIGKILLs the step. It reads as a silent hang because
+    # the traceback is on a rank nobody thinks to read. 100% of these OOMs occur
+    # at chunk_size=2, the smallest-chunk/longest-audio corner.
+    #
+    # WHY no_sync IS REQUIRED AND NOT AN OPTIMISATION. DDP normally all-reduces
+    # gradient buckets *during* backward. If a rank aborts partway, its peers are
+    # already blocked waiting on buckets it will never contribute -- so catching
+    # the exception locally is not enough; they deadlock before any vote can be
+    # taken. Running backward under no_sync() removes every collective from
+    # backward, which makes the failure purely local and therefore recoverable.
+    # Gradients are then reduced explicitly below, once all ranks agree the step
+    # is sound.
+    #
+    # THE COST IS REAL: one flat all-reduce per step instead of bucketed
+    # all-reduces overlapped with backward compute. That trades some throughput
+    # for not losing the entire job, which on an arm that was failing 12 times a
+    # day is a large net win -- but it is a genuine slowdown on every step, not
+    # only the rare OOM ones.
+    def _ddp_module(self):
+        """The DistributedDataParallel wrapper, if DDP is the active strategy."""
+        for obj in (getattr(getattr(self, "trainer", None), "strategy", None), getattr(self, "trainer", None)):
+            m = getattr(obj, "model", None)
+            if m is not None and hasattr(m, "no_sync"):
+                return m
+        return None
+
+    def backward(self, *args, **kwargs):
+        ddp = self._ddp_module()
+        oom = False
+        try:
+            if ddp is not None:
+                with ddp.no_sync():
+                    super().backward(*args, **kwargs)
+            else:
+                super().backward(*args, **kwargs)
+        except torch.cuda.OutOfMemoryError as e:
+            oom = True
+            self._last_oom = repr(e)[:200]
+
+        if self._any_rank_oom(oom):
+            # Drop the step on EVERY rank. set_to_none=False so the buffers stay
+            # allocated and the optimizer sees a well-formed (zero) gradient
+            # rather than a missing one.
+            self.zero_grad(set_to_none=False)
+            torch.cuda.empty_cache()
+            self._skip_optimizer_step = True
+            self._record_oom_skip(batch_idx=-1, phase="backward")
+            return
+
+        self._skip_optimizer_step = False
+        if ddp is not None:
+            self._allreduce_grads()
+
+    def _allreduce_grads(self):
+        """Average gradients across ranks -- the sync no_sync() suppressed.
+
+        Flattened into one buffer per dtype: 948M trainable parameters issued as
+        individual all-reduces would cost far more in launch latency than the
+        bucketing this replaces.
+        """
+        if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+            return
+        world = torch.distributed.get_world_size()
+        if world == 1:
+            return
+        from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
+
+        by_dtype = defaultdict(list)
+        for prm in self.parameters():
+            if prm.requires_grad and prm.grad is not None:
+                by_dtype[prm.grad.dtype].append(prm)
+        for params in by_dtype.values():
+            grads = [prm.grad.data for prm in params]
+            flat = _flatten_dense_tensors(grads)
+            torch.distributed.all_reduce(flat)
+            flat.div_(world)
+            for g, synced in zip(grads, _unflatten_dense_tensors(flat, grads)):
+                g.copy_(synced)
+
+    def optimizer_step(self, *args, **kwargs):
+        """Skip the update when the step was dropped for OOM.
+
+        Zeroed gradients are NOT equivalent to skipping: Adam still advances its
+        moment estimates and the LR schedule on a zero grad, so a dropped batch
+        would quietly decay the model rather than be a no-op.
+        """
+        if getattr(self, "_skip_optimizer_step", False):
+            self._skip_optimizer_step = False
+            self.zero_grad(set_to_none=True)
+            return
+        out = super().optimizer_step(*args, **kwargs)
+        # An update actually landed, so the streak is broken. This is the only
+        # place that can truthfully say so: it is reached only when forward AND
+        # backward both completed on every rank.
+        self._oom_streak = 0
+        return out
+
+    def _record_oom_skip(self, batch_idx: int, phase: str) -> None:
+        """Shared accounting for forward- and backward-pass OOM skips."""
+        self._oom_skips = getattr(self, "_oom_skips", 0) + 1
+        self._oom_streak = getattr(self, "_oom_streak", 0) + 1
+        limit = int(getattr(self.core_cfg, "oom_skip_limit", 25) or 25)
+        if self._oom_streak >= limit:
+            raise RuntimeError(
+                f"{self._oom_streak} consecutive OOM batches (limit {limit}) at the {phase} pass. This is no "
+                f"longer a rare draw -- the batch size does not fit this configuration. Scale "
+                f"bucket_batch_size for this recipe, or drop the smallest chunk size. "
+                f"Last error: {getattr(self, '_last_oom', '')}"
+            )
+        logging.error(
+            "CUDA OOM in %s pass (batch %s, chunk_size=%s); dropping the step on all ranks. "
+            "total skipped=%d, consecutive=%d. Last: %s",
+            phase,
+            batch_idx,
+            getattr(self, "_last_chunk_size", "?"),
+            self._oom_skips,
+            self._oom_streak,
+            getattr(self, "_last_oom", ""),
+        )
+        self.log("train_batches_skipped_oom", float(self._oom_skips), prog_bar=True, on_step=True)
+
     def _skip_oom_batch(self, batch_idx: int):
         """Drop the batch on EVERY rank, keeping DDP in lockstep."""
         # ONE memory summary, on the FIRST OOM only, before empty_cache() erases
@@ -949,25 +1079,7 @@ class ScriptSTTModel(StreamingSTTModel):
         # Release whatever the failed forward left behind before the next batch.
         torch.cuda.empty_cache()
 
-        self._oom_skips = getattr(self, "_oom_skips", 0) + 1
-        self._oom_streak = getattr(self, "_oom_streak", 0) + 1
-        limit = int(getattr(self.core_cfg, "oom_skip_limit", 25) or 25)
-        if self._oom_streak >= limit:
-            raise RuntimeError(
-                f"{self._oom_streak} consecutive OOM batches (limit {limit}). This is no longer a rare "
-                f"draw -- the batch size does not fit this configuration. Scale bucket_batch_size for "
-                f"this recipe, or drop the smallest chunk size. Last error: {getattr(self, '_last_oom', '')}"
-            )
-        logging.error(
-            "CUDA OOM on batch %d (chunk_size=%s); skipping on all ranks. "
-            "total skipped=%d, consecutive=%d. Last: %s",
-            batch_idx,
-            getattr(self, "_last_chunk_size", "?"),
-            self._oom_skips,
-            self._oom_streak,
-            getattr(self, "_last_oom", ""),
-        )
-        self.log("train_batches_skipped_oom", float(self._oom_skips), prog_bar=True, on_step=True)
+        self._record_oom_skip(batch_idx, phase="forward")
 
         # Graph-connected zero that TOUCHES every trainable parameter, so DDP
         # still receives a gradient for each and does not abort on unused ones.
@@ -1045,7 +1157,12 @@ class ScriptSTTModel(StreamingSTTModel):
                     "target_to_input_ratio": num_targets / (B * T),
                 }
             )
-        self._oom_streak = 0
+        # NOT reset here. A forward that succeeds can still OOM in backward, and
+        # resetting on forward success would mean a run of backward OOMs never
+        # reaches oom_skip_limit -- the job would skip every step forever while
+        # logging a zero loss, which is indistinguishable from having learned the
+        # task perfectly. The reset lives in optimizer_step, where an update has
+        # actually been applied.
         self.log_dict(metrics, on_step=True)
         return {"loss": loss}
 
