@@ -255,6 +255,26 @@ srun --overlap -n1 -N1 --container-image="$CONTAINER" \
 # FAILED even though its own eight datasets had merged perfectly. Scoring is a
 # whole-table operation over a shared directory; it does not belong in a
 # per-arm job.
+# ---- score in this job, right after merging -------------------------------
+# The scorer runs against a SNAPSHOT of merged manifests (see
+# scripts/score_leaderboard_snapshot.py), so it cannot trip over other arms'
+# in-flight shards the way the old inline scorer did -- that version globbed the
+# live directory and died with FileNotFoundError when a peer's merge deleted a
+# file mid-scan, marking finished jobs FAILED.
+#
+# The table printed here includes every arm that has merged so far, so it is a
+# running view rather than only this arm's row; ours is marked with <<<.
+echo; echo "############ OFFICIAL SCORE (kaldialign, merge_compounds=True)"
+if [[ "${overall_fail}" -gt 0 ]]; then
+    echo "### NOT scoring ${KEY}: it has failed shards, so some datasets have no" >&2
+    echo "###   manifest and its row would be computed from a subset." >&2
+fi
+srun --overlap -n1 -N1 --container-image="$CONTAINER" \
+     --container-mounts="${LUSTRE}:${LUSTRE},${HEH}:${HEH},${CODE_DIR}:/code,${OASR}:/oasr" \
+     bash -c "export PYTHONPATH=/code:/code/scripts:/oasr:${PYLIBS}:\${PYTHONPATH:-} && \
+              python /code/scripts/score_leaderboard_snapshot.py ${RESULTS} --highlight '${KEY}' --oasr /oasr" \
+  2>&1 | grep -vE "^srun:|CSV Summary|^\*{4,}|^model,"
+
 echo
 echo "==> ${KEY} done. Manifests in ${RESULTS}"
-echo "==> For the table (all arms): sbatch launch/oci_eval_official_score.sh"
+echo "==> Whole-table rescore any time: sbatch launch/oci_eval_official_score.sh"
