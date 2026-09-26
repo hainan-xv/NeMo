@@ -92,6 +92,24 @@ class TwoStreamSTTModel(ScriptSTTModel):
             llm = llm.base_model.model
         return llm.lm_head
 
+    def _project_to_vocab(self, h: Tensor) -> Tensor:
+        """Final RMSNorm, THEN the head -- the order HF's own forward uses.
+
+        Applying lm_head to a raw layer output skips ``model.norm`` and produces
+        garbage logits. Measured on Qwen3-1.7B predicting its own next token:
+        4.43 nats/token with the norm, 175.37 without. That 40x was the bulk of
+        the two-stream loss starting near 674 where log(V) is 11.93, and it had
+        nothing to do with audio -- the same bug hits text queries identically.
+
+        Late-layer activations here reach absmax > 1e4, so the norm is not a
+        nicety; the head's weights were trained against normalised inputs.
+        """
+        core = self._llm_core()
+        norm = getattr(core, "norm", None)
+        if norm is not None:
+            h = norm(h)
+        return self._lm_head_of()(h)
+
     # ------------------------------------------------------------------
     # Text stream
     # ------------------------------------------------------------------
@@ -181,7 +199,7 @@ class TwoStreamSTTModel(ScriptSTTModel):
             pos[s : s + w] = base + torch.arange(w, device=seq.device)
 
         h = self._run_joint(seq, mask, pos)
-        logits = self._lm_head_of()(h[read_at])  # (n_cells, V) -- ONLY at the cells
+        logits = self._project_to_vocab(h[read_at])  # (n_cells, V) -- ONLY at the cells
         tok_lp, stop_lp = cell_logprobs(logits, cells, spine_ids, self._eot_id)
 
         K = int(span_valid.shape[-1]) - 1

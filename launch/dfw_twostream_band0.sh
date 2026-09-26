@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH -A nemotron_speechprod_asr
-#SBATCH -J nemotron_speechprod_asr:dfw-twostream-band0
+#SBATCH -J nemotron_speechprod_asr:dfw-twostream-band0-v2
 # DFW's default GPU partition. Unlike OCI there is ONE pool of 1850 nodes rather
 # than batch_block1/3/4, so no comma-list is needed.
 #SBATCH -p batch
@@ -35,6 +35,10 @@
 # matching packed SCRIPT and NeMo's RNN-T convention, so every token carries
 # equal weight regardless of which utterance it came from.
 #
+# EXPECTED LOSS AT INIT. Locally, with the fix and a stand-in encoder, the loss
+# starts near 2x log(V) (~24 against log V = 11.93) and falls below log(V) within
+# a few steps. A start in the hundreds means the read-out is broken again.
+#
 # NOTE ON THE REPORTED LOSS. The lattice scores tokens AND one <eot> per chunk,
 # but mean_volume divides by tokens only. num_emissions is logged alongside
 # num_targets so that gap is visible rather than silently inflating the
@@ -60,7 +64,12 @@ PROJECT_NAME="${PROJECT_NAME:-SpeechlmDFW}"
 # --- the banded recipe, identical to the OCI arm ---
 CONFIG_PATH=/code/examples/speechlm2/conf
 CONFIG_NAME="${CONFIG_NAME:-streaming_stt_granary2_lora_script_banded1}"
-EXP_NAME="${EXP_NAME:-dfw_twostream_band0}"
+# v2: FIRST run with a correct read-out. Everything before this trained with
+# lm_head applied WITHOUT model.norm, which made the logits garbage -- measured
+# on Qwen3-1.7B predicting its own next token, 175.37 nats/token without the norm
+# against 4.43 with it. A fresh EXP_NAME so those curves do not sit in the same
+# wandb series as this one; they are not comparable.
+EXP_NAME="${EXP_NAME:-dfw_twostream_band0_v2}"
 
 MAX_STEPS="${MAX_STEPS:-500000}"
 # --- v2 CHANGES: rebalanced buckets, smaller LR ------------------------------
