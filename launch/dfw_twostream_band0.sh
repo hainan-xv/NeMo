@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH -A nemotron_speechprod_asr
-#SBATCH -J nemotron_speechprod_asr:dfw-twostream-band0-v2
+#SBATCH -J nemotron_speechprod_asr:dfw-twostream-band0-v3
 # DFW's default GPU partition. Unlike OCI there is ONE pool of 1850 nodes rather
 # than batch_block1/3/4, so no comma-list is needed.
 #SBATCH -p batch
@@ -69,7 +69,17 @@ CONFIG_NAME="${CONFIG_NAME:-streaming_stt_granary2_lora_script_banded1}"
 # on Qwen3-1.7B predicting its own next token, 175.37 nats/token without the norm
 # against 4.43 with it. A fresh EXP_NAME so those curves do not sit in the same
 # wandb series as this one; they are not comparable.
-EXP_NAME="${EXP_NAME:-dfw_twostream_band0_v2}"
+# v3: FIRST run whose WER is meaningful. Everything earlier decoded validation
+# through the INHERITED packed-SCRIPT generate (audio at layer 0, all N layers)
+# at val_chunk_size=7 while training at 14 -- so dev_wer described a different
+# architecture at a look-ahead the model never trained on. Fresh EXP_NAME because
+# the metric changes MEANING here, not just value; the old points must not sit in
+# the same series.
+#
+# Weights carry over via init_from_ckpt (weights only, optimiser reset): the
+# earlier runs' LOSS was valid -- they already had the normalised read-out -- so
+# the ~1h of training they did is worth keeping even though their WER was not.
+EXP_NAME="${EXP_NAME:-dfw_twostream_band0_v3}"
 
 MAX_STEPS="${MAX_STEPS:-500000}"
 # --- v2 CHANGES: rebalanced buckets, smaller LR ------------------------------
@@ -172,7 +182,7 @@ NUM_WORKERS="${NUM_WORKERS:-4}"
 # so save_top_k cannot rotate it away mid-run. Same banded objective and same
 # band_side, differing only in chunk size and band width -- the closest start
 # available on this grid. band_words is a LOSS-side knob, so 1 -> 2 transfers.
-INIT_CKPT="${INIT_CKPT:-/lustre/fsw/portfolios/nemotron/projects/nemotron_speechprod_asr/hainanx/results/SpeechlmDFW/pinned_init/step=150000-val_wer=0.0882.ckpt}"
+INIT_CKPT="${INIT_CKPT:-/lustre/fsw/portfolios/nemotron/projects/nemotron_speechprod_asr/hainanx/results/SpeechlmDFW/pinned_init/dfw_twostream_band0_v2_carry.ckpt}"
 
 # DFW-side data and model paths. These are the ONLY substantive config
 # differences from the OCI arm, so they are overrides rather than a forked YAML
