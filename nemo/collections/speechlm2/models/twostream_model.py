@@ -337,6 +337,99 @@ class TwoStreamSTTModel(ScriptSTTModel):
         return {"loss": loss}
 
     # ------------------------------------------------------------------
+    # Inference
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def generate(
+        self,
+        audios: Tensor,
+        audio_lens: Tensor,
+        system_prompt: str = "Transcribe the audio into text.",
+        max_new_tokens: int = 64,
+        chunk_size_override: Optional[int] = None,
+        **unused,
+    ) -> List[str]:
+        """Chunk-synchronous decode through the two-stream path.
+
+        MUST override the inherited one. ScriptSTTModel.generate decodes through
+        the PACKED layout -- audio spliced in at layer 0, running all N layers --
+        which is a different architecture from the one being trained here. Left
+        inherited, validation reports the WER of a packed-SCRIPT reading of these
+        weights, which on a warm-started run looks entirely plausible and measures
+        nothing about two-stream.
+
+        The loop is where the design pays off at inference:
+
+          * the text stream is causal and audio-free, so emitting a token EXTENDS
+            it -- previous positions are untouched and stay cached;
+          * a chunk's audio K/V depend only on the encoder output, so they are
+            built once;
+          * per emission only the joint layer runs, over one audio block against
+            the cached text keys.
+
+        Batch entries are looped rather than batched. Correctness first; the
+        batched form is the obvious follow-up and does not change the structure.
+        """
+        chunk = int(chunk_size_override or self.val_chunk_size or 14)
+        core = self._llm_core()
+        dev = audios.device
+        outs: List[str] = []
+
+        for b in range(int(audios.shape[0])):
+            frames = self._chunk_audio(audios[b : b + 1], audio_lens[b : b + 1], chunk, 0)
+            n_chunks = int(frames.shape[0]) if frames.numel() else 0
+
+            prompt_ids = self.tokenizer.text_to_ids(system_prompt)
+            ids = torch.tensor(prompt_ids, dtype=torch.long, device=dev)
+            # Text stream, primed once. past holds layers 1..N K/V so that
+            # appending a token costs one forward over ONE position.
+            out = self._llm_forward(
+                inputs_embeds=self._embed_tokens(ids.unsqueeze(0)),
+                use_cache=True,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+            past = out["past_key_values"]
+            n_joint = int(getattr(self.core_cfg, "joint_layers", 1) or 1)
+            text_h = out["hidden_states"][-(n_joint + 1)][0]  # (P, H)
+
+            emitted: List[int] = []
+            for t in range(n_chunks):
+                audio_t = frames[t]  # (w, H)
+                for _ in range(max_new_tokens):
+                    seq = torch.cat([text_h, audio_t], dim=0)
+                    tu, w = text_h.shape[0], audio_t.shape[0]
+                    total = tu + w
+                    mask = torch.zeros((total, total), dtype=torch.bool, device=dev)
+                    mask[:tu, :tu] = torch.ones((tu, tu), dtype=torch.bool, device=dev).tril()
+                    mask[tu:, :tu] = True  # audio sees the whole prefix so far
+                    ar = torch.arange(w, device=dev)
+                    mask[tu:, tu:] = (ar.unsqueeze(1) >= ar.unsqueeze(0)).T
+
+                    pos = torch.arange(total, device=dev)
+                    pos[tu:] = tu + torch.arange(w, device=dev)
+                    h = self._run_joint(seq, mask, pos)
+                    nxt = int(self._project_to_vocab(h[-1:]).argmax(-1).item())
+                    if nxt == self._eot_id:
+                        break
+
+                    emitted.append(nxt)
+                    # Extend the text stream by ONE position against the cache.
+                    step = torch.tensor([[nxt]], dtype=torch.long, device=dev)
+                    out = self._llm_forward(
+                        inputs_embeds=self._embed_tokens(step),
+                        past_key_values=past,
+                        use_cache=True,
+                        output_hidden_states=True,
+                        return_dict=True,
+                    )
+                    past = out["past_key_values"]
+                    text_h = torch.cat([text_h, out["hidden_states"][-(n_joint + 1)][0]], dim=0)
+
+            outs.append(self.tokenizer.ids_to_text(emitted) if emitted else "")
+        return outs
+
+    # ------------------------------------------------------------------
     def on_train_start(self) -> None:  # pragma: no cover - logging only
         n = int(getattr(self.core_cfg, "joint_layers", 1) or 1)
         logging.info(

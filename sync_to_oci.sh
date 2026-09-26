@@ -51,6 +51,9 @@ SCRIPT_PATHS=(
     nemo/collections/speechlm2/models/script_model.py
     nemo/collections/speechlm2/parts/twostream.py
     nemo/collections/speechlm2/models/twostream_model.py
+    scripts/twostream_local_probe.py
+    scripts/twostream_local_step.py
+    scripts/twostream_local_generate.py
     nemo/collections/speechlm2/__init__.py
     nemo/collections/speechlm2/data/__init__.py
     nemo/collections/speechlm2/models/__init__.py

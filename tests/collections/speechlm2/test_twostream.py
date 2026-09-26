@@ -252,3 +252,45 @@ def test_cost_does_not_grow_with_band_width():
     assert wide[1] >= narrow[1], "wider band should need at least as many cells"
     # J doubled; cells must NOT double -- candidates share the per-chunk block.
     assert wide[1] < 2 * narrow[1], f"cells scaled with J: {narrow[1]} -> {wide[1]}"
+
+
+@pytest.mark.unit
+def test_generate_is_overridden_not_inherited():
+    """THE REGRESSION THIS EXISTS FOR.
+
+    TwoStreamSTTModel originally defined only training methods, so generate,
+    validation_step and _eval_step were all inherited from ScriptSTTModel -- which
+    decodes through the PACKED layout (audio at layer 0, all N layers). Validation
+    therefore reported the WER of a packed-SCRIPT reading of these weights. On a
+    warm-started run that looks entirely plausible and measures nothing about the
+    architecture being trained, which is why it went unnoticed while the training
+    loss was visibly wrong.
+    """
+    from nemo.collections.speechlm2.models.script_model import ScriptSTTModel
+    from nemo.collections.speechlm2.models.twostream_model import TwoStreamSTTModel
+
+    assert "generate" in TwoStreamSTTModel.__dict__, (
+        "generate is inherited from ScriptSTTModel -- validation would decode through the "
+        "packed layout and report WER for a different architecture"
+    )
+    assert TwoStreamSTTModel.generate is not ScriptSTTModel.generate
+
+
+@pytest.mark.unit
+def test_generate_uses_the_two_stream_read_out():
+    """generate must go through _project_to_vocab (norm THEN head), not lm_head raw.
+
+    Applying lm_head without model.norm changed the argmax on 74% of positions on
+    Qwen3-1.7B, so a decode path that skipped it would produce different text --
+    the loss bug and the decode bug are the same bug in two places.
+    """
+    import inspect
+
+    from nemo.collections.speechlm2.models.twostream_model import TwoStreamSTTModel
+
+    src = inspect.getsource(TwoStreamSTTModel.generate)
+    assert "_project_to_vocab" in src, "generate bypasses the normalised read-out"
+    assert "_run_joint" in src, "generate does not use the joint layer"
+    # The incremental text cache is the design's inference claim; assert it is
+    # actually used rather than the prefix being recomputed per token.
+    assert "past_key_values" in src, "generate does not reuse the text-stream cache"

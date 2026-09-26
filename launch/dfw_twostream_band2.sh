@@ -152,6 +152,12 @@ BAND_WORDS="${BAND_WORDS:-2}"
 # How many trailing LLM layers see audio. 1 is the design point; a knob because
 # last-layer-only fusion is a bet, not a known quantity.
 JOINT_LAYERS="${JOINT_LAYERS:-1}"
+# Validation MUST decode at the chunk size this arm trains at. It was pinned to 7
+# here, inherited from the chunk-7 launcher this was copied from, while training
+# ran at 14 -- so val_wer described a look-ahead the model never saw. A
+# CONFIGURED val_chunk_size beats the auto-default, so copying a launcher and
+# changing CHUNK_SIZES alone is not enough.
+VAL_MAX_NEW_TOKENS="${VAL_MAX_NEW_TOKENS:-24}"
 BAND_SIDE="${BAND_SIDE:-both}"
 ACT_CKPT="${ACT_CKPT:-true}"
 ATTN_BACKEND="${ATTN_BACKEND:-dense}"
@@ -280,8 +286,8 @@ echo "*******STARTING********" \
     ++data.train_ds.max_duration=${MAX_DURATION} \
     ++data.train_ds.bucket_duration_bins="${BUCKET_BINS}" \
     data.train_ds.bucket_batch_size="${BUCKET_BATCH_SIZE}" \
-    ++model.val_chunk_size=7 \
-    ++model.val_max_new_tokens_per_chunk=12 \
+    ++model.val_chunk_size=${CHUNK_SIZES} \
+    ++model.val_max_new_tokens_per_chunk=${VAL_MAX_NEW_TOKENS} \
     data.train_ds.seed=${LHOTSE_RND_SEED} \
     data.validation_ds.datasets.mcv_11_dev.manifest_filepath=${VAL_MANIFEST} \
     ++trainer.limit_train_batches=${VAL_CHECK_INTERVAL} \
