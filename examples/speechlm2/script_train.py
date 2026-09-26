@@ -29,6 +29,7 @@ from lightning.pytorch import Trainer
 from omegaconf import DictConfig, OmegaConf, open_dict
 
 from nemo.collections.speechlm2 import DataModule, ScriptSTTDataset, ScriptSTTModel
+from nemo.collections.speechlm2.models.twostream_model import TwoStreamSTTModel
 from nemo.core.config import hydra_runner
 from nemo.utils import logging
 from nemo.utils.exp_manager import exp_manager
@@ -159,7 +160,12 @@ def train(cfg):
         val_dataset_cfg = None
 
     with trainer.init_module():
-        model = ScriptSTTModel(
+        # TWO-STREAM opt-in. Same data path and same lattice; the difference is
+        # that text and audio meet only in the LLM's final layer(s), so the band
+        # selects lattice cells instead of adding packed segments.
+        _cls = TwoStreamSTTModel if bool(cfg.model.get("two_stream", False)) else ScriptSTTModel
+        logging.info("Instantiating %s", _cls.__name__)
+        model = _cls(
             OmegaConf.to_container(cfg.model, resolve=True),
             data_cfg=dataset_cfg,
             val_data_cfg=val_dataset_cfg,

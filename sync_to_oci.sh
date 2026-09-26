@@ -49,6 +49,8 @@ SCRIPT_PATHS=(
     'nemo/collections/speechlm2/parts/script*.py'
     nemo/collections/speechlm2/data/script_dataset.py
     nemo/collections/speechlm2/models/script_model.py
+    nemo/collections/speechlm2/parts/twostream.py
+    nemo/collections/speechlm2/models/twostream_model.py
     nemo/collections/speechlm2/__init__.py
     nemo/collections/speechlm2/data/__init__.py
     nemo/collections/speechlm2/models/__init__.py
