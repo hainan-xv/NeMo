@@ -125,9 +125,24 @@ MAX_STEPS="${MAX_STEPS:-500000}"
 # (two in the shortest). 125 chunks x 5 = 625 units, ~1.7x the OOMing config --
 # still tight, which is why OOM skips are expected and why the backward-pass
 # guard in script_model.py matters here.
-MAX_DURATION="${MAX_DURATION:-20}"
-BUCKET_BINS="${BUCKET_BINS:-[4.32,6.0,7.04,7.92,8.8,9.6,10.4,11.12,11.89,12.66,13.47,14.8,16.92,20.0]}"
-BUCKET_BATCH_SIZE="${BUCKET_BATCH_SIZE:-[2,1,1,1,1,1,1,1,1,1,1,1,1,1]}"
+# 12s, NOT 20s. At 20s this died immediately with CUBLAS_STATUS_ALLOC_FAILED --
+# memory exhausted before the first matmul, on both grids (DFW GPUs are 79.11 GiB
+# against OCI's 79.33, so it was never a hardware difference). The arithmetic said
+# 125 chunks x 5 candidates = 625 packed units against the 375 that already OOMs,
+# and unlike the multi-lookahead arm EVERY batch here is the expensive chunk-2
+# case rather than one in three.
+#
+# 12s gives 75 chunks x 5 = 375 units, back to the load the multi arm survives.
+# THE COST IS REAL: utterances longer than 12s are dropped from training, so this
+# arm sees a shorter-audio distribution than its siblings and its numbers are not
+# strictly comparable to theirs on long-form sets.
+#
+# NOTE the failure class: CUBLAS_STATUS_ALLOC_FAILED is a RuntimeError, NOT a
+# torch.OutOfMemoryError, so neither the forward nor the backward OOM guard
+# catches it. Running out of memory inside a cuBLAS handle aborts the rank.
+MAX_DURATION="${MAX_DURATION:-12}"
+BUCKET_BINS="${BUCKET_BINS:-[4.32,6.0,7.04,7.92,8.8,9.6,10.4,11.12,12.0]}"
+BUCKET_BATCH_SIZE="${BUCKET_BATCH_SIZE:-[2,1,1,1,1,1,1,1,1]}"
 #
 # LR 1e-4 -> 5e-5, matching the CHAT v2 arms. These are WARM STARTS from a
 # converged model, but 1e-4 with a 5000-step warmup is a from-scratch schedule;
