@@ -1000,10 +1000,27 @@ class ScriptSTTModel(StreamingSTTModel):
             return
         from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
+        # EVERY TRAINABLE PARAMETER, on every rank, whether or not backward
+        # populated its gradient.
+        #
+        # Filtering on `prm.grad is not None` made the flat buffer's SIZE depend
+        # on which parameters a rank's batch happened to exercise -- and on
+        # whether the previous step was skipped, which sets grads to None. Ranks
+        # then all-reduced tensors of different shapes and NCCL blocked forever:
+        # "Watchdog caught collective operation timeout: WorkNCCL(OpType=ALLREDUCE)"
+        # at step 510, with no Python error because nothing raised. Real DDP
+        # tolerates unused parameters; this hand-rolled replacement must do so
+        # explicitly.
+        #
+        # Materialising a zero grad is the correct value as well as the safe one:
+        # a parameter that received no gradient contributes zero to the average.
         by_dtype = defaultdict(list)
         for prm in self.parameters():
-            if prm.requires_grad and prm.grad is not None:
-                by_dtype[prm.grad.dtype].append(prm)
+            if not prm.requires_grad:
+                continue
+            if prm.grad is None:
+                prm.grad = torch.zeros_like(prm)
+            by_dtype[prm.grad.dtype].append(prm)
         for params in by_dtype.values():
             grads = [prm.grad.data for prm in params]
             flat = _flatten_dense_tensors(grads)
