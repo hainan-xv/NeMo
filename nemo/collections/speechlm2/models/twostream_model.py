@@ -54,6 +54,12 @@ class TwoStreamSTTModelConfig(ScriptSTTModelConfig):
     # knob is the cheap hedge against last-layer-only fusion being too shallow,
     # since that is a bet rather than a known quantity.
     joint_layers: int = 1
+    # How the per-utterance NLLs are combined. "mean_volume" is NeMo's RNN-T
+    # convention and what packed SCRIPT uses: SUM of losses over SUM of target
+    # lengths, so every token carries equal weight regardless of which utterance
+    # it came from. "mean" would average per-utterance ratios instead, which
+    # over-weights short utterances.
+    loss_reduction: str = "mean_volume"
 
 
 class TwoStreamSTTModel(ScriptSTTModel):
@@ -268,21 +274,45 @@ class TwoStreamSTTModel(ScriptSTTModel):
             )
         losses = []
         n_targets = 0
+        n_chunks_total = 0
         for b in range(int(batch.input_tokens.shape[0])):
             args = self._utt_args(batch, b)
             nll = self.twostream_loss(**args)
             if torch.isfinite(nll):
                 losses.append(nll)
                 n_targets += args["n_tokens"]
+                n_chunks_total += int(args["cut"].shape[0])
             else:
                 # No in-band path completed. Report it rather than letting -inf
                 # dominate the mean, which is how a silent data bug would look.
                 logging.warning("utterance %d has no completable in-band path; skipping", b)
         if not losses:
             raise RuntimeError("no utterance in this batch produced a finite loss")
-        loss = torch.stack(losses).sum() / max(n_targets, 1)
+
+        reduction = str(getattr(self.core_cfg, "loss_reduction", "mean_volume"))
+        stacked = torch.stack(losses)
+        if reduction == "mean_volume":
+            # Token-weighted: one long utterance counts for more than one short
+            # one, which is what keeps the gradient scale stable as the bucket
+            # composition changes.
+            loss = stacked.sum() / max(n_targets, 1)
+        elif reduction == "mean":
+            loss = stacked.mean()
+        elif reduction == "sum":
+            loss = stacked.sum()
+        else:
+            raise ValueError(f"loss_reduction must be mean_volume | mean | sum, got {reduction!r}")
+
         self.log_dict(
-            {"train_loss": loss.detach(), "num_targets": float(n_targets)},
+            {
+                "train_loss": loss.detach(),
+                "num_targets": float(n_targets),
+                # Emissions = tokens + one <eot> per chunk. The lattice scores both,
+                # but mean_volume divides by TOKENS only (matching packed SCRIPT),
+                # so this is logged to make the difference visible rather than
+                # silently inflating the reported per-token loss.
+                "num_emissions": float(n_targets + n_chunks_total),
+            },
             on_step=True,
             prog_bar=True,
         )
