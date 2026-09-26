@@ -924,128 +924,29 @@ class ScriptSTTModel(StreamingSTTModel):
         torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MAX)
         return bool(flag.item())
 
-    # ------------------------------------------------------------------
-    # Backward-pass OOM guard
-    # ------------------------------------------------------------------
+    # NOTE: there is deliberately NO backward-pass OOM guard.
     #
-    # training_step's guard covers the FORWARD only: Lightning runs backward
-    # after training_step returns, inside the optimizer closure, so an OOM there
-    # escapes entirely. Measured on the multi-lookahead arms, that is the actual
-    # killer -- an uncaught torch.OutOfMemoryError in _engine_run_backward takes
-    # down one rank (e.g. rank 19), the other 63 tasks block in the gradient
-    # collective, and Slurm SIGKILLs the step. It reads as a silent hang because
-    # the traceback is on a rank nobody thinks to read. 100% of these OOMs occur
-    # at chunk_size=2, the smallest-chunk/longest-audio corner.
+    # One existed. It ran backward under DDP's no_sync(), voted across ranks on
+    # whether any had OOMed, and then reduced gradients with a hand-rolled flat
+    # all-reduce. Its scorecard over two full 4-hour runs: caught ZERO backward
+    # OOMs, and caused one NCCL deadlock that killed an 8-node job -- the flat
+    # buffer's size depended on which parameters had populated grads, so ranks
+    # all-reduced mismatched shapes and blocked until the watchdog fired.
     #
-    # WHY no_sync IS REQUIRED AND NOT AN OPTIMISATION. DDP normally all-reduces
-    # gradient buckets *during* backward. If a rank aborts partway, its peers are
-    # already blocked waiting on buckets it will never contribute -- so catching
-    # the exception locally is not enough; they deadlock before any vote can be
-    # taken. Running backward under no_sync() removes every collective from
-    # backward, which makes the failure purely local and therefore recoverable.
-    # Gradients are then reduced explicitly below, once all ranks agree the step
-    # is sound.
+    # It also did not address the failure we actually hit at chunk_size=2, which
+    # is CUBLAS_STATUS_ALLOC_FAILED -- a RuntimeError raised inside cuBLAS handle
+    # creation, not a torch.OutOfMemoryError, so no except clause here would see
+    # it.
     #
-    # THE COST IS REAL: one flat all-reduce per step instead of bucketed
-    # all-reduces overlapped with backward compute. That trades some throughput
-    # for not losing the entire job, which on an arm that was failing 12 times a
-    # day is a large net win -- but it is a genuine slowdown on every step, not
-    # only the rare OOM ones.
-    def _ddp_module(self):
-        """The DistributedDataParallel wrapper, if DDP is the active strategy."""
-        for obj in (getattr(getattr(self, "trainer", None), "strategy", None), getattr(self, "trainer", None)):
-            m = getattr(obj, "model", None)
-            if m is not None and hasattr(m, "no_sync"):
-                return m
-        return None
-
-    def backward(self, *args, **kwargs):
-        ddp = self._ddp_module()
-        oom = False
-        try:
-            if ddp is not None:
-                with ddp.no_sync():
-                    super().backward(*args, **kwargs)
-            else:
-                super().backward(*args, **kwargs)
-        except torch.cuda.OutOfMemoryError as e:
-            oom = True
-            self._last_oom = repr(e)[:200]
-
-        if self._any_rank_oom(oom):
-            # Drop the step on EVERY rank. set_to_none=False so the buffers stay
-            # allocated and the optimizer sees a well-formed (zero) gradient
-            # rather than a missing one.
-            self.zero_grad(set_to_none=False)
-            torch.cuda.empty_cache()
-            self._skip_optimizer_step = True
-            self._record_oom_skip(batch_idx=-1, phase="backward")
-            return
-
-        self._skip_optimizer_step = False
-        if ddp is not None:
-            self._allreduce_grads()
-
-    def _allreduce_grads(self):
-        """Average gradients across ranks -- the sync no_sync() suppressed.
-
-        Flattened into one buffer per dtype: 948M trainable parameters issued as
-        individual all-reduces would cost far more in launch latency than the
-        bucketing this replaces.
-        """
-        if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
-            return
-        world = torch.distributed.get_world_size()
-        if world == 1:
-            return
-        from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
-
-        # EVERY TRAINABLE PARAMETER, on every rank, whether or not backward
-        # populated its gradient.
-        #
-        # Filtering on `prm.grad is not None` made the flat buffer's SIZE depend
-        # on which parameters a rank's batch happened to exercise -- and on
-        # whether the previous step was skipped, which sets grads to None. Ranks
-        # then all-reduced tensors of different shapes and NCCL blocked forever:
-        # "Watchdog caught collective operation timeout: WorkNCCL(OpType=ALLREDUCE)"
-        # at step 510, with no Python error because nothing raised. Real DDP
-        # tolerates unused parameters; this hand-rolled replacement must do so
-        # explicitly.
-        #
-        # Materialising a zero grad is the correct value as well as the safe one:
-        # a parameter that received no gradient contributes zero to the average.
-        by_dtype = defaultdict(list)
-        for prm in self.parameters():
-            if not prm.requires_grad:
-                continue
-            if prm.grad is None:
-                prm.grad = torch.zeros_like(prm)
-            by_dtype[prm.grad.dtype].append(prm)
-        for params in by_dtype.values():
-            grads = [prm.grad.data for prm in params]
-            flat = _flatten_dense_tensors(grads)
-            torch.distributed.all_reduce(flat)
-            flat.div_(world)
-            for g, synced in zip(grads, _unflatten_dense_tensors(flat, grads)):
-                g.copy_(synced)
-
-    def optimizer_step(self, *args, **kwargs):
-        """Skip the update when the step was dropped for OOM.
-
-        Zeroed gradients are NOT equivalent to skipping: Adam still advances its
-        moment estimates and the LR schedule on a zero grad, so a dropped batch
-        would quietly decay the model rather than be a no-op.
-        """
-        if getattr(self, "_skip_optimizer_step", False):
-            self._skip_optimizer_step = False
-            self.zero_grad(set_to_none=True)
-            return
-        out = super().optimizer_step(*args, **kwargs)
-        # An update actually landed, so the streak is broken. This is the only
-        # place that can truthfully say so: it is reached only when forward AND
-        # backward both completed on every rank.
-        self._oom_streak = 0
-        return out
+    # So it traded DDP's battle-tested, compute-overlapped bucketed reduction for
+    # a serial flat all-reduce, to catch an exception class never observed in
+    # production. The forward guard below stays: forward OOMs are real and
+    # frequent (41 at chunk 2 on one arm) and are caught cheaply and safely,
+    # before any gradient collective has started.
+    #
+    # If a genuine torch.OutOfMemoryError in backward ever appears, the removed
+    # implementation is in git history with its rank-invariance bug fixed and
+    # regression-tested.
 
     def _record_oom_skip(self, batch_idx: int, phase: str) -> None:
         """Shared accounting for forward- and backward-pass OOM skips."""
@@ -1174,12 +1075,10 @@ class ScriptSTTModel(StreamingSTTModel):
                     "target_to_input_ratio": num_targets / (B * T),
                 }
             )
-        # NOT reset here. A forward that succeeds can still OOM in backward, and
-        # resetting on forward success would mean a run of backward OOMs never
-        # reaches oom_skip_limit -- the job would skip every step forever while
-        # logging a zero loss, which is indistinguishable from having learned the
-        # task perfectly. The reset lives in optimizer_step, where an update has
-        # actually been applied.
+        # A completed forward breaks the streak. With no backward guard this is
+        # again the only place that can say a step went through, so the reset
+        # belongs here (it lived in optimizer_step while that override existed).
+        self._oom_streak = 0
         self.log_dict(metrics, on_step=True)
         return {"loss": loss}
 
