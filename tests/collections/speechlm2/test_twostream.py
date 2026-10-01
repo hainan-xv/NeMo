@@ -199,7 +199,14 @@ def test_twostream_loss_runs_and_is_finite(monkeypatch):
     torch.nn.Module.__init__(model)
 
     class _Cfg:
+        # Mirror the real dataclass's fields. twostream_loss reads
+        # joint_text_context DIRECTLY rather than via getattr(..., default), on
+        # purpose: a silent default is what let a mis-plumbed config train an arm
+        # that was a duplicate of its own baseline. A stub missing a field should
+        # break loudly here instead.
         joint_layers = 1
+        audio_position_mode = "cut"
+        joint_text_context = "full"
 
     model.core_cfg = _Cfg()
     model._eot_id = 0
@@ -294,3 +301,97 @@ def test_generate_uses_the_two_stream_read_out():
     # The incremental text cache is the design's inference claim; assert it is
     # actually used rather than the prefix being recomputed per token.
     assert "past_key_values" in src, "generate does not reuse the text-stream cache"
+
+
+# ----------------------------------------------------------------------
+# Regressions from the first DFW launch of the two-stream arms. Both bugs
+# were invisible locally because the probe's stubs were LOOSER than the
+# real collaborators: a stub tokenizer that batch-encoded a list, and a
+# stub _chunk_audio that ignored n_chunks.
+# ----------------------------------------------------------------------
+def test_chunk_audio_derives_the_count_when_caller_passes_zero():
+    """Decoding cannot know the chunk count up front and passes 0.
+
+    That used to hit ``embs[:0]`` and return an EMPTY tensor, so generate ran
+    zero chunks and every hypothesis came back blank -- a silent total WER
+    failure, not a crash.
+    """
+    import torch
+
+    from nemo.collections.speechlm2.models.twostream_model import TwoStreamSTTModel
+
+    class _Stub:
+        # 40 frames of width-8 chunks -> 5 chunks
+        def perception(self, input_signal, input_signal_length):
+            return torch.zeros(1, 40, 6), None
+
+    frames = TwoStreamSTTModel._chunk_audio(_Stub(), torch.zeros(1, 100), torch.tensor([100]), 8, 0)
+    assert frames.shape[0] == 5, f"expected 5 derived chunks, got {frames.shape[0]}"
+    assert frames.shape[1:] == (8, 6)
+
+    # A partial trailing chunk must round UP, not truncate away real audio.
+    class _Stub2:
+        def perception(self, input_signal, input_signal_length):
+            return torch.zeros(1, 41, 6), None
+
+    assert TwoStreamSTTModel._chunk_audio(_Stub2(), torch.zeros(1, 100), torch.tensor([100]), 8, 0).shape[0] == 6
+
+    # An explicit count from training still wins over the derivation.
+    assert TwoStreamSTTModel._chunk_audio(_Stub(), torch.zeros(1, 100), torch.tensor([100]), 8, 3).shape[0] == 3
+
+
+def test_generate_accepts_one_prompt_per_utterance():
+    """``_validation_system_prompts`` returns a LIST when cuts carry prompts.
+
+    Passing that list straight to ``text_to_ids`` raised "TextEncodeInput must
+    be ..." and killed both arms ~2 min in. The signature must match the
+    inherited contract, and the body must index per utterance.
+    """
+    import inspect
+    import typing
+
+    from nemo.collections.speechlm2.models.script_model import ScriptSTTModel
+    from nemo.collections.speechlm2.models.twostream_model import TwoStreamSTTModel
+
+    ann = inspect.signature(TwoStreamSTTModel.generate).parameters["system_prompt"].annotation
+    base = inspect.signature(ScriptSTTModel.generate).parameters["system_prompt"].annotation
+    assert ann == base, f"two-stream generate must accept what the base one does: {base!r} vs {ann!r}"
+    assert typing.get_args(ann), "expected a Union[str, List[str]], not a bare str"
+
+    src = inspect.getsource(TwoStreamSTTModel.generate)
+    assert "isinstance(system_prompt, (list, tuple))" in src, "generate must select the per-utterance prompt"
+
+
+def test_twostream_config_fields_actually_reach_core_cfg():
+    """The subclass config must be a real dataclass AND be used to build core_cfg.
+
+    Two independent failures conspired here, both silent:
+      * TwoStreamSTTModelConfig lacked @dataclass, so its annotations were plain
+        class attributes and dataclasses.fields() returned only the parent's;
+      * ScriptSTTModel hardcodes to_dataclass(ScriptSTTModelConfig, cfg), so even
+        a correct dataclass would not have been consulted.
+    Every read site uses getattr(..., default), so ++model.joint_layers=4 was
+    accepted, logged, and discarded -- and an arm launched with
+    extra_joint_layer=true trained as an exact duplicate of the baseline.
+    """
+    import dataclasses
+    import inspect
+
+    from nemo.collections.speechlm2.models.script_model import ScriptSTTModelConfig
+    from nemo.collections.speechlm2.models.twostream_model import TwoStreamSTTModel, TwoStreamSTTModelConfig
+
+    own = {f.name for f in dataclasses.fields(TwoStreamSTTModelConfig)}
+    parent = {f.name for f in dataclasses.fields(ScriptSTTModelConfig)}
+    for field in ("joint_layers", "loss_reduction", "extra_joint_layer", "extra_joint_init_from_last"):
+        assert field in own, f"{field} is not a dataclass field -- is @dataclass missing?"
+        assert field not in parent, f"{field} unexpectedly on the parent; this test would not catch a regression"
+
+    # ...and the model must rebuild core_cfg against it, not inherit the parent's.
+    src = inspect.getsource(TwoStreamSTTModel.__init__)
+    assert "to_dataclass(TwoStreamSTTModelConfig" in src, "core_cfg must be rebuilt against the subclass config"
+
+    # ...and the startup log/validation must be DERIVED from the dataclass, not a
+    # hardcoded name list that silently goes stale when a field is added.
+    assert "fields(TwoStreamSTTModelConfig)" in src, "validated field list must come from the dataclass"
+    for field in own - parent:
+        assert f'"{field}"' not in src, f"{field!r} looks hardcoded in __init__; derive the list instead"

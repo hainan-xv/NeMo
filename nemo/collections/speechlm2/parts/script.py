@@ -422,6 +422,7 @@ def build_packed_banded_example(
     vision_end_id: int,
     eot_id: int,
     band_side: str = "both",
+    band_token_cuts: bool = False,
     audio_history_chunks: int = 0,
     audio_window_frames: int = 0,
     position_scheme: str = BRANCH_SCHEME,
@@ -457,7 +458,7 @@ def build_packed_banded_example(
     P = len(spine_ids)
     T = len(chunks)
 
-    cands = band_candidate_cuts(aligner_cuts, word_starts, n_tokens, band_words, band_side)
+    cands = band_candidate_cuts(aligner_cuts, word_starts, n_tokens, band_words, band_side, band_token_cuts)
     C = max((len(c) for c in cands), default=1)
     reach = [max(cands[t + 1]) if t + 1 < T else n_tokens for t in range(T)]
 
@@ -935,17 +936,34 @@ def band_candidate_cuts(
     n_tokens: int,
     band: int,
     side: str = "both",
+    token_cuts: bool = False,
 ) -> List[List[int]]:
-    """Candidate cuts for each chunk: word starts within ``band`` words of the aligner's.
+    """Candidate cuts for each chunk, within ``band`` WORDS of the aligner's.
 
     ``band=0`` returns the aligner's own cut alone, which makes the banded loss
     degenerate to the forced one exactly.
 
-    The candidates are WORD STARTS, never arbitrary token positions. CHAT's band
-    does not do this -- its ``band_nodes`` sees only per-chunk token counts, so a
-    band-1 lattice there admits cuts inside a word and the model can be scored for
-    emitting half of one. Here a cut always separates whole words, which is also
-    the only kind of move the aligner's error can actually justify.
+    ``band`` is always counted in WORDS -- it is the window the aligner's error
+    could plausibly span. What differs is where inside that window a cut may land:
+
+    * ``token_cuts=False`` (default): candidates are WORD STARTS only, so a cut
+      always separates whole words and a word is emitted entirely by one chunk.
+    * ``token_cuts=True``: EVERY token position inside the same word-defined
+      window is a candidate, so a long word may be split across adjacent chunks.
+      At small chunk sizes the word-atomic rule forces a whole multi-token word
+      out of one very short chunk; letting the cut fall mid-word lets the model
+      spread those tokens over the chunks the audio actually covers.
+
+    Splitting is only sound because the banded loss requires
+    ``target_construction='partition'`` (enforced in the dataset), which tokenises
+    the transcript ONCE and slices the id sequence. The spine prefix is therefore
+    the same no matter where the cut falls, so two paths reaching the same
+    ``(chunk, cut)`` state really do share a prefix and the dynamic program stays
+    valid -- which would NOT hold under ``legacy``, where moving a boundary
+    re-tokenises both neighbours.
+
+    Note ``token_cuts=True`` needs ``force_word_start=False`` at inference, or
+    decoding re-imposes the very constraint training just relaxed.
     """
     starts = sorted(set(word_starts) | {0, n_tokens})
     if side not in ("both", "later", "earlier"):
@@ -967,7 +985,14 @@ def band_candidate_cuts(
             lo, hi = max(0, i - band), min(len(starts), i + 1)
         else:  # "earlier"
             lo, hi = i, min(len(starts), i + band + 1)
-        cands = sorted(set(starts[lo:hi]) | {u})
+        window = sorted(set(starts[lo:hi]) | {u})
+        if token_cuts and window:
+            # The WORD window sets the reach; inside it every token boundary is a
+            # legal cut. ``u`` is already in `window`, so the span never shrinks
+            # below the word-granular candidate set.
+            cands = list(range(min(window), max(window) + 1))
+        else:
+            cands = window
         out.append([c for c in cands if 0 <= c <= n_tokens])
     return out
 

@@ -90,6 +90,18 @@ FORCE_WORD_START="${FORCE_WORD_START:-1}"
 NUM_DELAY_FRAMES="${NUM_DELAY_FRAMES:-}"
 CAPITALIZATION="${CAPITALIZATION:-}"      # 1/0, empty = model default
 PUNCTUATION="${PUNCTUATION:-}"            # 1/0, empty = model default
+# Prompt-controlled checkpoints do NOT record cfg.prompt_control, so the driver has
+# to be told. Without it the control flags are accepted and discarded.
+PROMPT_CONTROL="${PROMPT_CONTROL:-}"      # 1 = render controls into the instruction
+# Checkpoints record the absolute pretrained paths of the machine that trained
+# them. When that path is absent the driver falls back to the HF hub id, which
+# needs internet -- compute nodes here have none. Point these at local copies.
+PRETRAINED_LLM="${PRETRAINED_LLM:-}"
+PRETRAINED_ASR="${PRETRAINED_ASR:-}"
+# Record which chunk emitted each word, for the latency metric. generate() and
+# the driver already support it; without this the JSONL keeps only the final
+# concatenated hypothesis and emission latency cannot be recovered after the fact.
+EMIT_CHUNK_IDS="${EMIT_CHUNK_IDS:-}"      # 1 = write rec["chunks"]
 # Match training's data.dataset.pad_extra_duration: the trailing silence is real
 # audio the encoder consumes, and it is where delay-held tail words land.
 PAD_EXTRA_SECONDS="${PAD_EXTRA_SECONDS:-0.5}"
@@ -375,6 +387,9 @@ fi
 if [[ "$EVAL_DRIVER" == "script_leaderboard_eval.py" ]]; then
     DRIVER_ARGS="--max_history_tokens ${MAX_HISTORY_TOKENS} ${FORCE_WORD_START_FLAG}"
     DRIVER_ARGS="${DRIVER_ARGS} ${NUM_DELAY_FRAMES:+--num_delay_frames ${NUM_DELAY_FRAMES}} ${CAP_FLAG} ${PUNCT_FLAG}"
+    [[ "${PROMPT_CONTROL}" == "1" || "${PROMPT_CONTROL}" == "true" ]] && DRIVER_ARGS="${DRIVER_ARGS} --prompt_control"
+    DRIVER_ARGS="${DRIVER_ARGS} ${PRETRAINED_LLM:+--pretrained_llm ${PRETRAINED_LLM}} ${PRETRAINED_ASR:+--pretrained_asr ${PRETRAINED_ASR}}"
+    [[ "${EMIT_CHUNK_IDS}" == "1" || "${EMIT_CHUNK_IDS}" == "true" ]] && DRIVER_ARGS="${DRIVER_ARGS} --emit_chunk_ids"
     [[ "${STATE_MACHINE:-}" == "1" ]] && DRIVER_ARGS="${DRIVER_ARGS} --state_machine"
     [[ "${STREAMING_ENCODE:-}" == "1" ]] && DRIVER_ARGS="${DRIVER_ARGS} --streaming_encode"
 else

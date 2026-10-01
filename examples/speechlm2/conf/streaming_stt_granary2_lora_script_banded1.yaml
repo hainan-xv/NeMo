@@ -102,6 +102,10 @@ model:
   # (and so the logits tensor that dominates memory) scales with that count.
   # Must match data.dataset.band_side.
   band_side: later
+  # Let a cut fall inside a word, within the same word-defined band. Small chunk
+  # sizes otherwise have to emit a whole multi-token word from one short chunk.
+  # Pair with force_word_start=false at inference. Must match data.dataset.
+  band_token_cuts: false
 
   # LAYOUT. The band emits one branch SEGMENT per candidate cut in the FLAT
   # packed layout. That needs no mask change: build_script_mask already gives each
@@ -180,6 +184,7 @@ data:
     loss_type: ${model.loss_type}
     band_words: ${model.band_words}
     band_side: ${model.band_side}
+    band_token_cuts: ${model.band_token_cuts}
     twod_layout: ${model.twod_layout}
     num_delay_frames: 3
     audio_tag: "<audio>"

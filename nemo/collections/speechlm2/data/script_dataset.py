@@ -169,7 +169,24 @@ class ScriptSTTDataConfig(StreamingSTTDataConfig):
     target_construction: str = "legacy"
     loss_type: str = "forced"
     band_words: int = 1
+    # Per-chunk-size band, for multi-lookahead training. A list PARALLEL to
+    # ``chunk_size`` -- e.g. chunk_size=[14, 7, 2] with band_words_by_chunk=[1, 1, 4]
+    # gives the 2-frame lookahead a 4-word band while 14 and 7 keep 1.
+    #
+    # Why it has to vary: a small chunk cuts the transcript far more often, so the
+    # aligner's chunk boundary is a much weaker constraint and the band has to be
+    # wider to cover the plausible assignments. A single scalar either starves
+    # chunk 2 or makes chunk 14 pay for a band it does not need -- and the band is
+    # what multiplies packed length.
+    band_words_by_chunk: Optional[List[int]] = None
     band_side: str = "later"
+    # Allow a cut to land INSIDE a word, anywhere within the same word-defined
+    # band. Off keeps a cut on word starts, so a word is emitted whole by one
+    # chunk; on lets a long word be split across adjacent chunks, which matters
+    # most at small chunk sizes where the word-atomic rule forces every token of
+    # a multi-token word out of one very short chunk. Requires
+    # force_word_start=False at inference or decoding re-imposes the constraint.
+    band_token_cuts: bool = False
 
 
 @dataclass
@@ -291,9 +308,45 @@ class ScriptSTTDataset(StreamingSTTDataset):
         if self._loss_type not in ("forced", "banded"):
             raise ValueError(f"loss_type must be 'forced' or 'banded', got {self.cfg.loss_type!r}")
         self._band_words = max(int(self.cfg.band_words), 0)
+        self._band_by_chunk = None
+        bwc = self.cfg.get("band_words_by_chunk", None) if hasattr(self.cfg, "get") else self.cfg.band_words_by_chunk
+        if bwc is not None:
+            cands = getattr(self, "_chunk_size_candidates", None)
+            bwc = [int(x) for x in bwc]
+            if not cands:
+                # A SCALAR chunk size with a per-chunk band list is the ordinary
+                # validation case: data.dataset is shared between train and val, val
+                # runs one fixed chunk size, and it decodes rather than computing the
+                # banded loss -- so the mapping simply does not apply. Raising here
+                # killed a run whose TRAINING bands had resolved correctly.
+                logging.warning(
+                    "band_words_by_chunk=%s ignored: chunk_size is the scalar %s. Expected for "
+                    "validation; if this is the training dataset, the bands are NOT being applied.",
+                    bwc,
+                    self.cfg.chunk_size,
+                )
+                bwc = None
+            if bwc is not None and len(bwc) != len(cands):
+                raise ValueError(
+                    f"band_words_by_chunk has {len(bwc)} entries but chunk_size has "
+                    f"{len(cands)} ({cands}); they must line up one-to-one."
+                )
+            if bwc is not None:
+                if any(x < 0 for x in bwc):
+                    raise ValueError(f"band_words_by_chunk must be non-negative, got {bwc}")
+                self._band_by_chunk = {int(c): int(b) for c, b in zip(cands, bwc)}
+                logging.info("ScriptSTTDataset: per-chunk bands %s", self._band_by_chunk)
+        self._band_token_cuts = bool(self.cfg.band_token_cuts)
         self._band_side = str(self.cfg.band_side or "later").lower()
         if self._band_side not in ("both", "later", "earlier"):
             raise ValueError(f"band_side must be 'both', 'later' or 'earlier', got {self.cfg.band_side!r}")
+        if self._band_token_cuts:
+            # Logged, not silent: a dropped knob here changes the OBJECTIVE while
+            # the run looks identical from the outside.
+            logging.info(
+                "ScriptSTTDataset: band_token_cuts=True -- cuts may fall inside a word. "
+                "Inference MUST pass force_word_start=False to match."
+            )
         self._banded = self._loss_type == "banded"
         if self._banded and (self._twod_layout or not self._target_partition):
             raise ValueError(
@@ -600,6 +653,16 @@ class ScriptSTTDataset(StreamingSTTDataset):
         else:
             chunk_size = int(self.cfg.chunk_size)
 
+        # The band follows the sampled chunk size when a per-chunk map is configured.
+        band_words = self._band_words
+        if self._band_by_chunk is not None:
+            if chunk_size not in self._band_by_chunk:
+                raise KeyError(
+                    f"sampled chunk_size={chunk_size} has no entry in band_words_by_chunk "
+                    f"{self._band_by_chunk}; the batch would silently use the scalar band."
+                )
+            band_words = self._band_by_chunk[chunk_size]
+
         # One position scheme per batch, drawn like the chunk size.
         position_scheme = self.cfg.position_scheme
         if position_scheme == "sampled":
@@ -675,8 +738,9 @@ class ScriptSTTDataset(StreamingSTTDataset):
                         instruction_ids=instruction_ids,
                         chunks=chunks,
                         word_starts=self._word_start_positions(transcript_ids),
-                        band_words=self._band_words,
+                        band_words=band_words,
                         band_side=self._band_side,
+                        band_token_cuts=self._band_token_cuts,
                         vision_start_id=self.vision_start_id,
                         vision_end_id=self.vision_end_id,
                         eot_id=self.eot_id,

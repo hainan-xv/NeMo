@@ -125,6 +125,7 @@ def build_joint_inputs(
     audio_emb: Tensor,
     cells: CellIndex,
     prompt_len: int,
+    text_context: str = "full",
 ) -> Tuple[Tensor, Tensor, Tensor]:
     """Pack the joint layer's input: the text stream once, then one audio block per cell.
 
@@ -171,12 +172,28 @@ def build_joint_inputs(
     tri = torch.ones((tu, tu), dtype=torch.bool, device=text_h.device).tril()
     mask[:tu, :tu] = tri
 
+    if text_context not in ("full", "last"):
+        raise ValueError(f"text_context must be 'full' or 'last', got {text_context!r}")
+
     ar = torch.arange(w, device=text_h.device)
     for c in range(n):
         s = tu + c * w
         cutoff = prompt_len + int(cells.text_pos[c].item())  # keys strictly before p
-        mask[s : s + w, :cutoff] = True
-        own = (ar.unsqueeze(1) >= ar.unsqueeze(0)).T  # causal within the block
+        if text_context == "last":
+            # RNN-T-style joiner: the audio sees ONE text vector -- the state of the
+            # most recent history token -- rather than the whole prefix. The text
+            # stream is causal, so h[cutoff-1] already summarises everything before
+            # the cut; this makes that summarisation the only channel instead of
+            # letting the joint re-read the prefix token by token.
+            mask[s : s + w, max(cutoff - 1, 0)] = True
+        else:
+            mask[s : s + w, :cutoff] = True
+        # Causal within the block: query i sees keys j <= i, so the LAST position --
+        # the one read_at reads -- sees the WHOLE chunk. The previous trailing .T
+        # transposed this into anti-causal, leaving the read-out able to see only
+        # itself: 1 frame per chunk instead of w, with no indirect path through a
+        # single joint layer.
+        own = ar.unsqueeze(1) >= ar.unsqueeze(0)
         mask[s : s + w, s : s + w] = own
 
     read_at = torch.arange(n, device=text_h.device) * w + (tu + w - 1)

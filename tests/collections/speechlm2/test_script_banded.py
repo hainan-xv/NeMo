@@ -894,3 +894,83 @@ def test_collated_batch_carries_per_segment_lengths():
     assert hasattr(batch, "branch_span_len"), "collator dropped branch_span_len"
     assert batch.branch_span_len.shape == batch.branch_ve_abs.shape
     assert int(batch.branch_span_len.max()) == int(exs[0].branch_span_len.max())
+
+
+def test_band_token_cuts_superset_of_word_cuts():
+    """Token cuts must ADD candidates inside the band, never lose or escape it."""
+    from nemo.collections.speechlm2.parts.script import band_candidate_cuts
+
+    # words start at 0,2,5 -> "ab|cde|fgh" style: multi-token words either side.
+    starts, aligner, n = [0, 2, 5], [0, 2, 5], 8
+    for side in ("both", "later", "earlier"):
+        word = band_candidate_cuts(aligner, starts, n, 1, side)
+        tokq = band_candidate_cuts(aligner, starts, n, 1, side, token_cuts=True)
+        for w, t in zip(word, tokq):
+            assert set(w) <= set(t), f"{side}: token cuts dropped a word cut"
+            # never reaches past the word-defined window
+            assert min(t) == min(w) and max(t) == max(w), f"{side}: band window changed"
+            # contiguous token positions inside that window
+            assert t == list(range(min(w), max(w) + 1))
+
+
+def test_band_token_cuts_splits_a_multitoken_word():
+    """A cut may land strictly inside a word -- the whole point of the knob."""
+    from nemo.collections.speechlm2.parts.script import band_candidate_cuts
+
+    starts, n = [0, 4], 6  # one 4-token word, then a 2-token word
+    cands = band_candidate_cuts([4], starts, n, 1, "later", token_cuts=True)[0]
+    interior = [c for c in cands if c not in starts and 0 < c < n]
+    assert interior, "expected at least one intra-word cut"
+    assert not [c for c in band_candidate_cuts([4], starts, n, 1, "later")[0] if c not in starts]
+
+
+def test_band_token_cuts_degenerate_at_band_zero():
+    """band=0 stays exactly the forced loss, token cuts or not."""
+    from nemo.collections.speechlm2.parts.script import band_candidate_cuts
+
+    for side in ("both", "later", "earlier"):
+        assert band_candidate_cuts([0, 2, 3], list(range(6)), 6, 0, side, token_cuts=True) == [[0], [2], [3]]
+
+
+def test_band_token_cuts_respects_bounds():
+    """Candidates stay within [0, n_tokens] at the utterance edges."""
+    from nemo.collections.speechlm2.parts.script import band_candidate_cuts
+
+    for side in ("both", "later", "earlier"):
+        for c in band_candidate_cuts([0, 5], [0, 5], 5, 3, side, token_cuts=True):
+            assert all(0 <= x <= 5 for x in c)
+
+
+@pytest.mark.unit
+def test_packer_handles_intra_word_cuts_end_to_end():
+    """The packer must build a well-formed example when cuts fall inside words.
+
+    word_starts here are SPARSE (0, 3) -- multi-token words -- so token cuts
+    genuinely introduce boundaries the word-granular packer never sees.
+    """
+    from nemo.collections.speechlm2.parts.script import build_packed_banded_example
+
+    def build(token_cuts):
+        return build_packed_banded_example(
+            instruction_ids=[7, 8],
+            chunks=_chunks(),
+            word_starts=[0, 3],
+            band_words=1,
+            vision_start_id=_VS,
+            vision_end_id=_VE,
+            eot_id=_EOT,
+            band_side="both",
+            band_token_cuts=token_cuts,
+        )
+
+    word, tok = build(False), build(True)
+    # Same transcript and spine -- only the candidate set changed.
+    assert word.spine_len == tok.spine_len
+    assert word.n_tokens == tok.n_tokens
+    assert word.n_chunks == tok.n_chunks
+    # More candidates, since the words here span several tokens.
+    assert tok.n_cand >= word.n_cand
+    assert tok.cut_valid.any(), "no valid candidate survived"
+    # Every valid cut is a real token position in the transcript.
+    valid = tok.cut[tok.cut_valid]
+    assert int(valid.min()) >= 0 and int(valid.max()) <= tok.n_tokens

@@ -88,7 +88,15 @@ def _hubify(path: str) -> str:
     return path
 
 
-def load_model(ckpt_path: str, model_class_path: str, device: torch.device, dtype: torch.dtype):
+def load_model(
+    ckpt_path: str,
+    model_class_path: str,
+    device: torch.device,
+    dtype: torch.dtype,
+    prompt_control: bool = False,
+    pretrained_llm: str = "",
+    pretrained_asr: str = "",
+):
     """Rebuild the model from a Lightning checkpoint's own hyper-parameters.
 
     Deliberately not ``load_from_checkpoint``: we want to override a few config
@@ -104,7 +112,26 @@ def load_model(ckpt_path: str, model_class_path: str, device: torch.device, dtyp
 
     # The checkpoint holds the adapted LLM weights, so skip loading base weights.
     cfg["load_llm_weights"] = False
-    for key in ("pretrained_llm", "pretrained_asr"):
+
+    # Prompt control is NOT recorded in these checkpoints -- granary2_script_promptctl's
+    # saved hyper_parameters carry 23 keys and none of them is prompt_control. Without
+    # this, core_cfg.prompt_control defaults to False, generate() skips
+    # render_control_prompt entirely, and the model decodes on a BARE instruction it
+    # never saw in training. The --capitalization/--punctuation/--num_delay_frames flags
+    # are accepted and then quietly discarded, so the run looks healthy and the WER is
+    # simply understated. Opt in explicitly instead.
+    if prompt_control:
+        cfg["prompt_control"] = True
+        _log("    prompt_control=True (controls will be rendered into the instruction)")
+    for key, override in (("pretrained_llm", pretrained_llm), ("pretrained_asr", pretrained_asr)):
+        if override:
+            # An explicit local path beats _hubify. The hub id only resolves if the HF
+            # cache already holds the model; compute nodes here have no internet, so a
+            # checkpoint recording a path from ANOTHER filesystem (e.g. llmservice) dies
+            # with "couldn't connect to huggingface.co" rather than anything informative.
+            _log(f"    {key}: {cfg.get(key, '')} -> {override}  (explicit override)")
+            cfg[key] = override
+            continue
         p = cfg.get(key, "")
         if p and not os.path.exists(p):
             new = _hubify(p)
@@ -423,6 +450,15 @@ def parse_args():
         help="[prompt-controlled] ask for punctuated output",
     )
     p.add_argument("--no_punctuation", dest="punctuation", action="store_false")
+    p.add_argument("--pretrained_llm", type=str, default="", help="override the checkpoint's LLM path")
+    p.add_argument("--pretrained_asr", type=str, default="", help="override the checkpoint's ASR path")
+    p.add_argument(
+        "--prompt_control",
+        action="store_true",
+        help="force cfg.prompt_control=True before building the model. Required for "
+        "prompt-controlled checkpoints: they do not record the flag, so the control "
+        "options would otherwise be accepted and ignored.",
+    )
 
     p.add_argument(
         "--chat_nemo",
@@ -469,7 +505,31 @@ def main() -> int:
         device = torch.device("cpu")
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float32
 
-    model = load_model(args.ckpt_path, args.model_class, device, dtype)
+    # Refuse to silently ignore control flags on a model that will not use them.
+    _asked_controls = [
+        n
+        for n, v in (
+            ("--num_delay_frames", args.num_delay_frames),
+            ("--capitalization/--no_capitalization", args.capitalization),
+            ("--punctuation/--no_punctuation", args.punctuation),
+        )
+        if v is not None
+    ]
+    if _asked_controls and not args.prompt_control:
+        raise SystemExit(
+            "Control flags given (" + ", ".join(_asked_controls) + ") but --prompt_control is not set.\n"
+            "generate() only renders them when core_cfg.prompt_control is true, and these checkpoints\n"
+            "do not record it -- they would be accepted and discarded, understating the model."
+        )
+    model = load_model(
+        args.ckpt_path,
+        args.model_class,
+        device,
+        dtype,
+        prompt_control=args.prompt_control,
+        pretrained_llm=args.pretrained_llm,
+        pretrained_asr=args.pretrained_asr,
+    )
     args._chat_model = None
     if getattr(args, "chat_nemo", ""):
         from omegaconf import open_dict

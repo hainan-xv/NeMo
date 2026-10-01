@@ -110,10 +110,19 @@ def main():
             self.audio_proj = torch.nn.Linear(1024, H).to(dev)
 
             class _Cfg:
-                joint_layers = 1
+                joint_layers = int(os.environ.get("JOINT_LAYERS", "1"))
                 loss_reduction = "mean_volume"
+                extra_joint_layer = bool(os.environ.get("EXTRA_JOINT"))
+                extra_joint_init_from_last = True
+                audio_position_mode = os.environ.get("AUDIO_POS", "cut")
+                joint_text_context = os.environ.get("JOINT_TEXT", "full")
 
             self.core_cfg = _Cfg()
+            self.joint_layer = None
+            if self.core_cfg.extra_joint_layer:
+                # Same construction path the real model uses, so a mistake here
+                # is a mistake there.
+                self._build_extra_joint_layer()
 
         def _llm_core(self):
             return core

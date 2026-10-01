@@ -16,7 +16,7 @@
 from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -157,6 +157,22 @@ class ScriptSTTModelConfig(StreamingSTTModelConfig):
             for honouring the style it was asked for.
     """
 
+    # Branch-group processing for the banded loss (exact; see _banded_training_step).
+    # 0 disables it and keeps the single fused forward. >0 is the number of branch
+    # SEGMENTS per group, the direct analogue of RNN-T's fused_batch_size.
+    branch_group_size: int = 0
+    # ADAPTIVE grouping: the largest group whose packed POSITIONS fit this budget.
+    # Preferred over branch_group_size, which counts segments and therefore cannot
+    # know how wide they are -- K_t varies per chunk, so a fixed segment count is
+    # simultaneously too large for a dense utterance and too small for a sparse one,
+    # and has to be re-tuned for every (band, chunk_size) pair. A position budget is
+    # tuned once against the GPU and adapts itself.
+    #
+    # 0 disables it and falls back to branch_group_size.
+    branch_group_tokens: int = 0
+    # Rows of the vocab projection to materialise at once when reading out the
+    # scored positions. 0 = all at once (previous behaviour).
+    logit_chunk: int = 0
     audio_history_chunks: int = 0
     audio_window_frames: int = 0
     twod_layout: bool = False
@@ -192,6 +208,16 @@ class ScriptSTTModelConfig(StreamingSTTModelConfig):
     # THIRD less than a two-sided band: candidates per chunk drop 3 -> 2, and the
     # packed sequence scales with that count.
     band_side: str = "later"
+    # Allow a candidate cut to fall INSIDE a word, anywhere within the same
+    # word-defined band. Off, a cut sits on word starts and a word is always
+    # emitted whole by a single chunk. On, a long word can be split across
+    # adjacent chunks -- the point being small chunk sizes, where the word-atomic
+    # rule forces every token of a multi-token word out of one very short chunk.
+    # Costs ~1.2-1.35x candidates per chunk (avg 1.18 subwords/word), so the
+    # packed sequence grows by about that factor.
+    # MUST be paired with force_word_start=False at inference.
+    # Interpolated by data.dataset.band_token_cuts; must match it.
+    band_token_cuts: bool = False
     # Consecutive OOM batches tolerated before training_step re-raises. A few
     # skips are a rare bad draw (chunk_size is sampled per batch while
     # bucket_batch_size is keyed on duration only); a streak means the batch
@@ -704,6 +730,124 @@ class ScriptSTTModel(StreamingSTTModel):
             if getattr(self, "_last_chunk_size", None) is not None:
                 self._set_encoder_att_context(self._last_chunk_size)
 
+    # ------------------------------------------------------------------
+    # Banded loss: exact memory reduction (branch groups + chunked read-out)
+    # ------------------------------------------------------------------
+    def _branch_span_bounds(self, batch: ScriptBatch, lat):
+        """``(start, end, real)`` per (row, lattice segment), derived from the lattice.
+
+        Batch size 1 hides the hard part: after collation each utterance keeps its own
+        spine length and per-chunk span widths, so lattice segment ``n`` sits at a
+        DIFFERENT absolute position in every row, and rows with fewer chunks have no
+        segment there at all. A single shared slice would cut different content out of
+        each row -- which is what the seg_ids-based version did.
+
+        A segment is ``[vs][audio x w][ve][span x kt][eot]`` and ``branch_ve_abs``
+        points at its ``<ve>``, so::
+
+            start = ve_abs - 1 - w        end = ve_abs + span_len + 2
+
+        ``collate_packed_banded_examples`` fills padded entries with ``ve_abs = 0``,
+        and no real ``<ve>`` can land on 0 (the spine is there), so ``ve_abs > 0`` is
+        an exact test for "this row actually has this segment".
+        """
+        hist = int(getattr(self.core_cfg, "audio_history_chunks", 0) or 0)
+        win = int(getattr(self.core_cfg, "audio_window_frames", 0) or 0)
+        if hist or win:
+            raise NotImplementedError(
+                "branch_group_size does not support audio_history_chunks / "
+                "audio_window_frames yet: those make the audio window per-chunk, so a "
+                "segment's width is no longer chunk_size and these bounds would be wrong."
+            )
+        w = int(batch.chunk_size)
+        ve = lat.branch_ve_abs
+        start = ve - 1 - w
+        end = ve + lat.branch_span_len + 2
+        return start, end, ve > 0
+
+    def _readout_logprobs(self, hidden: Tensor, idx: Tensor, tgt: Tensor, chunk: int) -> Tuple[Tensor, Tensor]:
+        """``log P(target)`` and ``log P(<eot>)`` at the scored positions only.
+
+        Two things this avoids, both measured to dominate peak memory:
+          * the ``(B, L, V)`` logits tensor -- only ``idx`` is ever read, so the head
+            runs on gathered hidden states instead of the whole sequence;
+          * the float32 copy of that tensor for the logsumexp -- rows are processed
+            ``chunk`` at a time, so only ``chunk x V`` floats exist at once.
+
+        At band 3 / chunk 2 on Qwen3-0.6B the vocab projection was 63% of peak.
+        """
+        B, M = idx.shape
+        H = hidden.shape[-1]
+        head = self._lm_head_module
+        if head is None:
+            raise RuntimeError("no lm_head module; cannot read out scored positions")
+        hs = hidden.gather(1, idx.unsqueeze(-1).expand(B, M, H))
+        step = int(chunk) if chunk and chunk > 0 else M
+        tok_parts, stop_parts = [], []
+        for i in range(0, M, step):
+            lg = head(hs[:, i : i + step]).float()
+            lse = torch.logsumexp(lg, dim=-1)
+            stop_parts.append(lg[..., self._eot_id] - lse)
+            t = tgt[:, i : i + step]
+            tk = lg.gather(-1, t.clamp(min=0).unsqueeze(-1)).squeeze(-1) - lse
+            tok_parts.append(torch.where(t == IGNORE_INDEX, torch.zeros_like(tk), tk))
+        return torch.cat(tok_parts, dim=1), torch.cat(stop_parts, dim=1)
+
+    def _forward_branch_group(
+        self,
+        batch: ScriptBatch,
+        idx: Tensor,
+        keep_valid: Tensor,
+        ve_abs: Tensor,
+        k1: int,
+        last: Tensor,
+    ):
+        """Run ``[spine | this group's segments]`` per row and score just those segments.
+
+        EXACT, and the mask is why: a branch query attends to spine keys below its own
+        ``prefix_len`` and to its own segment, never to another branch; a spine query
+        attends only to spine. So branches are conditionally independent given the
+        spine, and a group sees exactly what it saw in the fused forward.
+
+        The spine is re-run per group -- small next to the branches it replaces.
+        """
+        gather = lambda t, fill: (None if t is None else t.gather(1, idx).masked_fill(~keep_valid, fill))
+        sub = replace(
+            batch,
+            input_tokens=gather(batch.input_tokens, self.text_pad_id),
+            position_ids=gather(batch.position_ids, 0),
+            order_ids=gather(batch.order_ids, 0),
+            seg_ids=gather(batch.seg_ids, -1),
+            prefix_len=gather(batch.prefix_len, 0),
+            target_tokens=gather(batch.target_tokens, IGNORE_INDEX),
+            is_audio=gather(batch.is_audio, False),
+            audio_frame_index=gather(batch.audio_frame_index, -1),
+            valid=batch.valid.gather(1, idx) & keep_valid,
+        )
+        # attn_plan is an optional attribute, not a field, and it indexes the FULL
+        # packed sequence; carrying it over would mask the wrong pairs.
+        try:
+            sub.attn_plan = None
+        except Exception:
+            pass
+        embeds = self._script_input_embeds(sub)
+        impl, mask = self._training_attention(sub, embeds.dtype)
+        with self._attn_implementation(impl):
+            out = self._llm_forward(
+                inputs_embeds=embeds,
+                attention_mask=mask,
+                position_ids=sub.position_ids,
+                use_cache=False,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+        hidden = out["hidden_states"][-1]
+        seq_len = hidden.shape[1]
+        gidx = ve_abs.unsqueeze(-1) + torch.arange(k1, device=hidden.device)
+        gidx = torch.minimum(gidx, last).clamp(min=0, max=seq_len - 1).reshape(hidden.shape[0], -1)
+        tgt = sub.target_tokens.gather(1, gidx)
+        return self._readout_logprobs(hidden, gidx, tgt, int(self.core_cfg.logit_chunk))
+
     def _banded_training_step(self, batch: ScriptBatch, batch_idx: int):
         """Marginalise the loss over every in-band word-to-chunk assignment.
 
@@ -721,6 +865,31 @@ class ScriptSTTModel(StreamingSTTModel):
         expansion once per branch. Flat has no spine cache at all.
         """
         lat = batch.banded
+        k1 = int(lat.span_len) + 1
+        last = (lat.branch_ve_abs + lat.branch_span_len).unsqueeze(-1)  # (B, N, 1)
+
+        group = int(getattr(self.core_cfg, "branch_group_size", 0) or 0)
+        tokens = int(getattr(self.core_cfg, "branch_group_tokens", 0) or 0)
+        if group > 0 or tokens > 0:
+            # Disarm UNCONDITIONALLY whenever the feature is on -- even for batches that
+            # end up not grouping. Whether a batch needs grouping depends on its own
+            # segment count, so a per-batch decision would leave some ranks using DDP's
+            # bucket all-reduces and others the manual one: rank-dependent collectives,
+            # which is precisely what deadlocked 19470955.
+            self._disarm_ddp_reducer()
+            start, end, real = self._branch_span_bounds(batch, lat)
+            plan = self._plan_groups(start, end, real, int(start.shape[1]), group)
+            if len(plan) > 1:
+                tok_lp, stop_lp = self._banded_logprobs_grouped(batch, lat, k1, last, plan, start, end, real)
+                return self._banded_loss_from_logprobs(tok_lp, stop_lp, lat, batch, batch_idx)
+            # ONE group means the whole utterance fits the budget, so grouping buys
+            # nothing and costs a checkpoint recompute plus a spine re-run. Fall through
+            # to the single fused forward.
+            #
+            # This is what made multi-lookahead slow: at chunk 14 and 7 the band is 1
+            # (C=3) and the utterance fits easily, yet every such batch -- two thirds of
+            # the mix -- was still paying group machinery it never needed. Only chunk 2
+            # at band 4 has to group.
 
         input_embeds = self._script_input_embeds(batch)
         impl, mask = self._training_attention(batch, input_embeds.dtype)
@@ -743,7 +912,6 @@ class ScriptSTTModel(StreamingSTTModel):
 
         logits = out["logits"]  # (B, L, V) -- left in bf16 on purpose
         b_size, seq_len, vocab = logits.shape
-        k1 = int(lat.span_len) + 1
 
         # Absolute <ve> index per segment; segments differ in width because the
         # audio window narrows for early chunks, so this cannot be derived.
@@ -756,7 +924,6 @@ class ScriptSTTModel(StreamingSTTModel):
         # The over-read positions are harmless: span_valid marks every k beyond the
         # segment's real length invalid, and span_scores' cumsum is prefix-only, so
         # a valid k never depends on a garbage k' > k.
-        last = (lat.branch_ve_abs + lat.branch_span_len).unsqueeze(-1)  # (B, N, 1)
         idx = lat.branch_ve_abs.unsqueeze(-1) + torch.arange(k1, device=logits.device)
         idx = torch.minimum(idx, last).clamp(max=seq_len - 1).reshape(b_size, -1)  # (B, N * k1)
 
@@ -772,6 +939,109 @@ class ScriptSTTModel(StreamingSTTModel):
         tok_lp = logits.reshape(-1, vocab)[rows, tgt.clamp(min=0).reshape(-1)].view(b_size, -1).float() - lse_sel
         tok_lp = torch.where(tgt == IGNORE_INDEX, torch.zeros_like(tok_lp), tok_lp)
 
+        return self._banded_loss_from_logprobs(tok_lp, stop_lp, lat, batch, batch_idx)
+
+    def _plan_groups(self, start: Tensor, end: Tensor, real: Tensor, n_seg: int, cap: int):
+        """Pack lattice segments into groups under a POSITION budget.
+
+        Returns ``[(g0, g1)]`` half-open segment ranges.
+
+        Why positions rather than a segment count. Memory follows the packed length of
+        a group, and a segment's width is ``w + K_t + 3`` -- ``K_t`` varies per chunk,
+        so a fixed segment count maps to wildly different memory. Observed on
+        band 7 / chunk 2: 128 segments/group overflowed 79 GiB by 1.31 GiB, while 32
+        fit easily but produced ~59 tiny groups per utterance and ran at 9.35s/step
+        against a 3.0s floor -- launch-overhead bound, not memory bound. A budget in
+        positions removes that guesswork and re-tunes itself when band or chunk change.
+
+        Widths are taken as the MAX across rows, since a group's cost is set by its
+        longest row. The plan therefore depends only on the batch, not on the device,
+        so every rank groups identically for a given utterance -- no new straggler.
+        """
+        budget = int(getattr(self.core_cfg, "branch_group_tokens", 0) or 0)
+        if budget <= 0:
+            cap = max(1, int(cap))
+            return [(g, min(g + cap, n_seg)) for g in range(0, n_seg, cap)]
+
+        widths = torch.where(real, end - start, torch.zeros_like(start)).max(dim=0).values
+        # The BUDGET is authoritative when set. branch_group_size would otherwise cap
+        # group size first and the budget would never bind -- a sweep over budgets then
+        # returns the identical plan at every value, which is exactly what it did.
+        cap = n_seg
+        plan, g0, acc = [], 0, 0
+        for n in range(n_seg):
+            w = int(widths[n])
+            if n > g0 and (acc + w > budget or (n - g0) >= cap):
+                plan.append((g0, n))
+                g0, acc = n, 0
+            acc += w
+        plan.append((g0, n_seg))
+        return plan
+
+    def _banded_logprobs_grouped(self, batch: ScriptBatch, lat, k1: int, last: Tensor, plan, start, end, real):
+        """Score branch segments in groups of ``group``, one group resident at a time.
+
+        The lattice DP couples every segment, so per-group losses cannot simply be
+        summed the way RNN-T's fused path sums per-utterance losses. The coupling runs
+        ONLY through the span logprobs -- a few KiB -- so each group is wrapped in
+        ``checkpoint``: its activations are freed after the forward and recomputed in
+        backward, while the small logprobs stay live.
+
+        Per row, a group is ``[that row's spine | that row's copies of these segments]``.
+        Rows differ in spine length and in which segments exist, so the gather index is
+        built per row and right-padded; padded columns are marked invalid.
+
+        Measured at band 5 / chunk 2 / Qwen3-0.6B with backward: OOM fused, 9.31 GiB at
+        32 groups, loss identical to 1e-4.
+        """
+        B, N = start.shape
+        dev = batch.input_tokens.device
+        # each row's spine ends where its first segment begins
+        spine_len = torch.where(real[:, 0], start[:, 0], torch.zeros_like(start[:, 0]))
+        if not bool(real[:, 0].all()):
+            raise ValueError("a row has no segment 0; cannot locate its spine")
+
+        tok_parts, stop_parts = [], []
+        for g0, g1 in plan:
+            gn = g1 - g0
+            idx_rows, ve_rows = [], torch.zeros((B, gn), dtype=torch.long, device=dev)
+            for b in range(B):
+                pieces = [torch.arange(int(spine_len[b]), device=dev)]
+                cur = int(spine_len[b])
+                for n in range(g0, g1):
+                    if not bool(real[b, n]):
+                        continue  # this row has no such segment; ve stays 0 like collate
+                    s0, e0 = int(start[b, n]), int(end[b, n])
+                    pieces.append(torch.arange(s0, e0, device=dev))
+                    ve_rows[b, n - g0] = cur + (int(lat.branch_ve_abs[b, n]) - s0)
+                    cur += e0 - s0
+                idx_rows.append(torch.cat(pieces))
+            Lg = max(int(r.numel()) for r in idx_rows)
+            idx = torch.zeros((B, Lg), dtype=torch.long, device=dev)
+            keep_valid = torch.zeros((B, Lg), dtype=torch.bool, device=dev)
+            for b, r in enumerate(idx_rows):
+                idx[b, : r.numel()] = r
+                keep_valid[b, : r.numel()] = True
+            last_g = ve_rows + lat.branch_span_len[:, g0:g1]
+
+            args = (batch, idx, keep_valid, ve_rows, k1, last_g.unsqueeze(-1))
+            if torch.is_grad_enabled():
+                tok_g, stop_g = torch.utils.checkpoint.checkpoint(
+                    self._forward_branch_group, *args, use_reentrant=False
+                )
+            else:
+                tok_g, stop_g = self._forward_branch_group(*args)
+            tok_parts.append(tok_g)
+            stop_parts.append(stop_g)
+
+        return torch.cat(tok_parts, dim=1), torch.cat(stop_parts, dim=1)
+
+    def _banded_loss_from_logprobs(self, tok_lp, stop_lp, lat, batch, batch_idx: int):
+        """Lattice DP and reduction. Shared by the fused and grouped paths so the two
+        can only ever differ in HOW the logprobs were produced, never in what is done
+        with them."""
+        b_size = tok_lp.shape[0]
+        k1 = int(lat.span_len) + 1
         t_max, n_cand = int(lat.cut.shape[1]), int(lat.n_cand)
         tok_lp = tok_lp.view(b_size, t_max, n_cand, k1)
         stop_lp = stop_lp.view(b_size, t_max, n_cand, k1)
@@ -961,6 +1231,39 @@ class ScriptSTTModel(StreamingSTTModel):
     # for not losing the entire job, which on an arm that was failing 12 times a
     # day is a large net win -- but it is a genuine slowdown on every step, not
     # only the rare OOM ones.
+    def _disarm_ddp_reducer(self) -> None:
+        """Stop DDP from all-reducing gradient buckets during backward.
+
+        MUST be called before the forward, not before backward. DDP decides whether to
+        arm its reducer inside ``DistributedDataParallel.forward``; ``no_sync()`` around
+        backward alone is too late, because the reducer is already armed.
+
+        Why branch grouping needs this. Each group is checkpointed, so every parameter
+        accumulates a gradient once PER GROUP -- and DDP fires its post-accumulate hooks
+        on each accumulation, marking buckets ready and launching an all-reduce. The
+        group count follows the utterance's segment count, so it differs across ranks,
+        and the ranks then issue DIFFERENT NUMBERS of collectives.
+
+        That is what killed 19470955: every rank stalled on the SAME
+        ``WorkNCCL(SeqNum=406, ALLREDUCE, NumelIn=6295552)`` -- 6295552 x 4B = 25 MB,
+        DDP's default bucket -- rather than one rank lagging. Step time was a healthy
+        4-6s, so this was never a throughput problem.
+
+        Gradients are still synchronised: ``backward()`` calls ``_allreduce_grads()``
+        afterwards, which reduces every trainable parameter in a fixed, rank-invariant
+        order. This is the same reason the backward-OOM guard reduces manually.
+        """
+        # self.trainer is a Lightning PROPERTY that raises when unattached, so
+        # getattr(self, "trainer", None) propagates instead of returning the default.
+        # _ddp_module's original caller (backward) always has a Trainer; this one runs
+        # in training_step, which offline verifiers call directly.
+        try:
+            ddp = self._ddp_module()
+        except RuntimeError:
+            return
+        if ddp is not None:
+            ddp.require_backward_grad_sync = False
+
     def _ddp_module(self):
         """The DistributedDataParallel wrapper, if DDP is the active strategy."""
         for obj in (getattr(getattr(self, "trainer", None), "strategy", None), getattr(self, "trainer", None)):

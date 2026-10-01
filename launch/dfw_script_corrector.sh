@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH -A nemotron_speechprod_asr
-#SBATCH -J nemotron_speechprod_asr:dfw-corrector
+#SBATCH -J nemotron_speechprod_asr:dfw-corrector-v5
 #SBATCH -p batch
 #SBATCH -N 2
 #SBATCH --gpus-per-node=8

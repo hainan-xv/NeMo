@@ -33,7 +33,9 @@ across chunks at inference. It exists to be measured against packed SCRIPT on th
 ``band_words=0 == forced`` equivalence before being optimised.
 """
 
-from typing import List, Optional, Tuple
+import math
+from dataclasses import dataclass, fields
+from typing import List, Optional, Tuple, Union
 
 import torch
 from torch import Tensor, nn
@@ -46,10 +48,17 @@ from nemo.collections.speechlm2.parts.twostream import (
     gather_span_tensors,
     plan_cells,
 )
+from nemo.collections.speechlm2.parts.utils.misc import to_dataclass
 from nemo.utils import logging
 
 
+@dataclass
 class TwoStreamSTTModelConfig(ScriptSTTModelConfig):
+    # @dataclass IS REQUIRED. Without it these annotations stay plain class
+    # attributes: dataclasses.fields() returns only the parent's, so to_dataclass
+    # drops every field below as "not supported and will be ignored", and
+    # is_dataclass() still answers True (inherited) so the omission is invisible.
+    # The result is a config knob Hydra accepts, logs, and silently discards.
     # How many trailing LLM layers see audio. 1 is the design point; making it a
     # knob is the cheap hedge against last-layer-only fusion being too shallow,
     # since that is a bet rather than a known quantity.
@@ -60,10 +69,119 @@ class TwoStreamSTTModelConfig(ScriptSTTModelConfig):
     # it came from. "mean" would average per-utterance ratios instead, which
     # over-weights short utterances.
     loss_reduction: str = "mean_volume"
+    # Give the joint its OWN layer instead of borrowing the LLM's last one.
+    #
+    # With joint_layers=1 and no extra layer, layer N-1 is already exclusively the
+    # joint (the text stream reads hidden_states[-2], i.e. layer N-1's INPUT), so
+    # the text representation is silently one layer short of the full stack AND
+    # the joint is frozen apart from ~0.92M of LoRA on q_proj/v_proj. This flag
+    # fixes both: text gets all N layers, and the joint becomes a fully trainable
+    # ~50M-parameter layer of its own.
+    extra_joint_layer: bool = False
+    # Warm-start the extra layer from the LLM's last layer rather than random init.
+    # A randomly initialised layer sitting directly under the read-out destroys the
+    # representation for thousands of steps, which is indistinguishable from the
+    # design not working.
+    extra_joint_init_from_last: bool = True
+    # Where the audio blocks sit in ATTENTION position space (independent of where
+    # they sit in the tensor -- the joint takes position_ids explicitly).
+    #
+    #   "cut"  : base = m + p, audio adjacent to its own cut. Positive, recency-
+    #            ordered offsets, but the base depends on the cell, so every cell
+    #            of a chunk needs its own copy of identical audio.
+    #   "left" : audio occupies a FIXED slot before all text. Cell-independent, so
+    #            cells of one chunk become bit-identical and can later share one
+    #            block (n_cells*w -> T*w + n_cells). Implemented by shifting text
+    #            right by w rather than using negative indices: RoPE depends only
+    #            on relative offsets, so [audio 0..w-1][text w..] is identical to
+    #            [audio -w..-1][text 0..] while keeping every index >= 0.
+    audio_position_mode: str = "cut"
+    # How much of the text history the joint may attend to.
+    #   "full" : every key before the cut (the original design).
+    #   "last" : ONE key, the most recent history token. The text stream is causal
+    #            so that vector already encodes the whole prefix -- this turns the
+    #            joint into an RNN-T-style joiner f(audio frames, text state) and
+    #            makes the text side trivially cacheable.
+    joint_text_context: str = "full"
 
 
 class TwoStreamSTTModel(ScriptSTTModel):
     """SCRIPT with the band expressed as a lattice instead of as sequence length."""
+
+    def __init__(self, cfg, *args, **kwargs):
+        super().__init__(cfg, *args, **kwargs)
+        # REBUILD core_cfg against this subclass's dataclass. ScriptSTTModel hardcodes
+        # `to_dataclass(ScriptSTTModelConfig, cfg)`, so without this every field added
+        # by TwoStreamSTTModelConfig -- joint_layers, loss_reduction, extra_joint_layer
+        # -- is simply absent, and each read falls back to its getattr() default. That
+        # fails SILENTLY: ++model.joint_layers=4 was accepted by Hydra, logged in the
+        # config, and ignored. Rebuilding is safe because this dataclass is a strict
+        # superset; inherited fields resolve identically.
+        self.core_cfg = to_dataclass(TwoStreamSTTModelConfig, cfg)
+        # Derive the field list from the dataclass instead of hardcoding it, so a
+        # field added later is validated and logged automatically. Hardcoding is how
+        # extra_joint_layer stayed False through an entire 4-node run while the log
+        # looked healthy -- the run was a duplicate of its own baseline.
+        _own = [
+            f.name
+            for f in fields(TwoStreamSTTModelConfig)
+            if f.name not in {g.name for g in fields(ScriptSTTModelConfig)}
+        ]
+        if not _own:
+            raise RuntimeError(
+                "TwoStreamSTTModelConfig adds no fields over its parent -- @dataclass is probably missing"
+            )
+        for _f in _own:
+            if not hasattr(self.core_cfg, _f):
+                raise RuntimeError(f"core_cfg is missing {_f!r} -- config plumbing is broken")
+        logging.info("two-stream config | %s", "  ".join(f"{k}={getattr(self.core_cfg, k)}" for k in _own))
+        self.joint_layer = None
+        # Direct access, no getattr default: the loop above already proved the field
+        # exists, so a default here could only hide a future plumbing break.
+        if bool(self.core_cfg.extra_joint_layer):
+            self._build_extra_joint_layer()
+
+    def _build_extra_joint_layer(self) -> None:
+        """Construct a dedicated, fully trainable joint layer.
+
+        Built as a FRESH decoder layer rather than a deepcopy of the LLM's last
+        one: under PEFT that last layer is LoRA-wrapped, so a copy would carry
+        adapter modules and the wrong parameter names. Instead a clean layer is
+        instantiated from the LLM's own config and seeded from the last layer's
+        BASE weights (``.base_layer.`` stripped out of the keys).
+
+        It lives at the top level, not inside ``self.llm``, so
+        ``freeze_module(self.llm.model)`` never touches it -- it stays trainable
+        without needing the prevent_freeze_params machinery, which cannot
+        resurrect an already-frozen parameter anyway.
+        """
+        core = self._llm_core()
+        last = core.layers[-1]
+        layer_cls = type(last)
+        llm_cfg = getattr(core, "config", None) or self.llm.config
+        idx = int(getattr(getattr(last, "self_attn", last), "layer_idx", len(core.layers) - 1))
+        self.joint_layer = layer_cls(llm_cfg, idx)
+
+        if bool(getattr(self.core_cfg, "extra_joint_init_from_last", True)):
+            src = {}
+            for k, v in last.state_dict().items():
+                if "lora_" in k:
+                    continue  # adapter weights have no counterpart in a clean layer
+                src[k.replace(".base_layer.", ".")] = v
+            missing, unexpected = self.joint_layer.load_state_dict(src, strict=False)
+            if missing:
+                # Loud on purpose: a silently half-seeded joint looks like a warm
+                # start while behaving like a random one.
+                logging.warning("extra joint layer: %d params left at random init: %s", len(missing), missing[:8])
+            logging.info(
+                "extra joint layer: seeded %d/%d tensors from the LLM's last layer (%d unexpected)",
+                len(src) - len(unexpected),
+                len(self.joint_layer.state_dict()),
+                len(unexpected),
+            )
+
+        n_p = sum(p.numel() for p in self.joint_layer.parameters())
+        logging.info("extra joint layer: %s, %.2fM parameters, all trainable", layer_cls.__name__, n_p / 1e6)
 
     # ------------------------------------------------------------------
     # Reaching into the LLM
@@ -80,6 +198,8 @@ class TwoStreamSTTModel(ScriptSTTModel):
         return llm.model if hasattr(llm, "model") else llm
 
     def _joint_layers(self) -> List[nn.Module]:
+        if getattr(self, "joint_layer", None) is not None:
+            return [self.joint_layer]
         n = int(getattr(self.core_cfg, "joint_layers", 1) or 1)
         layers = self._llm_core().layers
         if n > len(layers):
@@ -113,6 +233,67 @@ class TwoStreamSTTModel(ScriptSTTModel):
     # ------------------------------------------------------------------
     # Text stream
     # ------------------------------------------------------------------
+    def _forward_text(self, inputs_embeds: Tensor, use_cache: bool = False, past_key_values=None):
+        """Run the text stream; return ``(text_h, out)``.
+
+        With a dedicated joint layer the text stream uses ALL N LLM layers, and
+        the joint's input must be the last layer's PRE-norm output -- the true
+        residual stream, which is what a real layer N+1 would receive.
+
+        A forward hook is the only honest way to get it: HF appends its final
+        hidden state AFTER ``model.norm``, so ``hidden_states[-1]`` is already
+        normalised. Feeding that to the joint and then normalising again inside
+        ``_project_to_vocab`` would double-norm -- the same class of bug as the
+        missing norm that cost 175 vs 4.43 nats, just inverted. It would also
+        break the warm start, since the layer was seeded from one that expects
+        un-normalised input.
+
+        Without the extra layer, nothing changes: the joint borrows trailing LLM
+        layers and the text stream reads ``hidden_states[-(n_joint+1)]``.
+        """
+        if getattr(self, "joint_layer", None) is not None:
+            cap = {}
+
+            def _hook(_mod, _args, output):
+                cap["h"] = output[0] if isinstance(output, tuple) else output
+
+            handle = self._llm_core().layers[-1].register_forward_hook(_hook)
+            try:
+                out = self._llm_forward(
+                    inputs_embeds=inputs_embeds,
+                    past_key_values=past_key_values,
+                    use_cache=use_cache,
+                    return_dict=True,
+                )
+            finally:
+                handle.remove()
+            if "h" not in cap:
+                raise RuntimeError("joint layer hook did not fire -- the LLM's last layer never ran")
+            return cap["h"], out
+
+        n_joint = int(getattr(self.core_cfg, "joint_layers", 1) or 1)
+        if n_joint >= len(self._llm_core().layers):
+            # FULL-DEPTH FUSION (the SCRIPT/two-stream hybrid). The joint IS the whole
+            # stack, so the text stream's input to it is just the embeddings -- running
+            # the LLM here would compute all N layers and discard every one of them.
+            #
+            # Text still gets all N layers: it sits *inside* the joint sequence under a
+            # causal text-only mask. What it never attends to is audio -- which is the
+            # point. Audio-dependent text would invalidate the text KV cache on every
+            # new frame and force a full prefix recompute per chunk at decode time.
+            #
+            # past_key_values is meaningless here (no LLM call), so None is returned and
+            # callers extend the text stream by concatenating embeddings.
+            return inputs_embeds, None
+        out = self._llm_forward(
+            inputs_embeds=inputs_embeds,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        return out["hidden_states"][-(n_joint + 1)], out
+
     def _text_hidden(self, input_ids: Tensor) -> Tensor:
         """Hidden state entering the joint layers, for ``[prompt][transcript]``.
 
@@ -123,17 +304,32 @@ class TwoStreamSTTModel(ScriptSTTModel):
         against what the packing saves, and it keeps this free of assumptions
         about rotary/position plumbing inside the stack.
         """
-        n_joint = int(getattr(self.core_cfg, "joint_layers", 1) or 1)
-        embeds = self._embed_tokens(input_ids)
-        out = self._llm_forward(
-            inputs_embeds=embeds,
-            use_cache=False,
-            output_hidden_states=True,
-            return_dict=True,
-        )
-        hs = out["hidden_states"]
-        # hidden_states[0] is the embedding output; [-1] is after the last layer.
-        return hs[-(n_joint + 1)]
+        text_h, _ = self._forward_text(self._embed_tokens(input_ids), use_cache=False)
+        return text_h
+
+    def _joint_positions(self, tu: int, w: int, bases: List[int], device) -> Tensor:
+        """Attention positions for ``[text | one block per cell]``.
+
+        Deliberately ONE function for training and decoding. The two paths build
+        different sequences (a lattice vs a single growing hypothesis) but must
+        agree on position semantics exactly; when they were written separately the
+        agreement was a coincidence waiting to break.
+        """
+        n = len(bases)
+        pos = torch.empty(tu + n * w, dtype=torch.long, device=device)
+        ar = torch.arange(w, device=device)
+        mode = str(getattr(self.core_cfg, "audio_position_mode", "cut"))
+        if mode == "left":
+            pos[:tu] = torch.arange(tu, device=device) + w
+            for c in range(n):
+                pos[tu + c * w : tu + (c + 1) * w] = ar
+        elif mode == "cut":
+            pos[:tu] = torch.arange(tu, device=device)
+            for c, b in enumerate(bases):
+                pos[tu + c * w : tu + (c + 1) * w] = int(b) + ar
+        else:
+            raise ValueError(f"audio_position_mode must be 'cut' or 'left', got {mode!r}")
+        return pos
 
     # ------------------------------------------------------------------
     # Joint
@@ -185,18 +381,17 @@ class TwoStreamSTTModel(ScriptSTTModel):
         """
         text_h = self._text_hidden(text_ids.unsqueeze(0)).squeeze(0)  # (m+U, H)
         cells = plan_cells(cut, cut_valid, reach)
-        seq, mask, read_at = build_joint_inputs(text_h, audio_emb, cells, prompt_len)
+        seq, mask, read_at = build_joint_inputs(
+            text_h, audio_emb, cells, prompt_len, text_context=str(self.core_cfg.joint_text_context)
+        )
 
         # Positions: text keeps its own index; a cell's audio continues from its
         # text cutoff, mirroring SCRIPT's branch position scheme so the joint sees
         # a contiguous stretch rather than a jump.
         tu = text_h.shape[0]
         w = audio_emb.shape[1]
-        pos = torch.arange(seq.shape[0], device=seq.device)
-        for c in range(cells.n_cells):
-            s = tu + c * w
-            base = prompt_len + int(cells.text_pos[c].item())
-            pos[s : s + w] = base + torch.arange(w, device=seq.device)
+        bases = [prompt_len + int(cells.text_pos[c].item()) for c in range(cells.n_cells)]
+        pos = self._joint_positions(tu, w, bases, seq.device)
 
         h = self._run_joint(seq, mask, pos)
         logits = self._project_to_vocab(h[read_at])  # (n_cells, V) -- ONLY at the cells
@@ -227,6 +422,11 @@ class TwoStreamSTTModel(ScriptSTTModel):
         embs, _ = self.perception(input_signal=audios, input_signal_length=audio_lens)  # (1, F, H)
         embs = embs[0]
         F, H = embs.shape
+        if n_chunks <= 0:
+            # Inference cannot know the chunk count in advance -- training reads it
+            # off the lattice, decoding has to derive it from the audio. Passing 0
+            # used to produce an EMPTY tensor and silently decode nothing.
+            n_chunks = max(1, math.ceil(F / chunk_size))
         need = n_chunks * chunk_size
         if need > F:
             embs = torch.cat([embs, embs.new_zeros(need - F, H)], dim=0)
@@ -344,7 +544,7 @@ class TwoStreamSTTModel(ScriptSTTModel):
         self,
         audios: Tensor,
         audio_lens: Tensor,
-        system_prompt: str = "Transcribe the audio into text.",
+        system_prompt: Union[str, List[str]] = "Transcribe the audio into text.",
         max_new_tokens: int = 64,
         chunk_size_override: Optional[int] = None,
         **unused,
@@ -379,19 +579,21 @@ class TwoStreamSTTModel(ScriptSTTModel):
             frames = self._chunk_audio(audios[b : b + 1], audio_lens[b : b + 1], chunk, 0)
             n_chunks = int(frames.shape[0]) if frames.numel() else 0
 
-            prompt_ids = self.tokenizer.text_to_ids(system_prompt)
+            # One prompt, or one PER UTTERANCE -- ScriptSTTModel.generate accepts
+            # both and _eval_step passes a list. Taking the list straight to
+            # text_to_ids raised "TextEncodeInput must be ...", which reads like a
+            # tokenizer problem rather than a signature mismatch.
+            prompt = system_prompt[b] if isinstance(system_prompt, (list, tuple)) else system_prompt
+            # "\n" to match the packer (ScriptSTTModel.generate line ~1483 and the
+            # training packer both tokenize prompt + "\n"). Without it the text
+            # stream starts from a prefix training never saw.
+            prompt_ids = self.tokenizer.text_to_ids(prompt + "\n")
             ids = torch.tensor(prompt_ids, dtype=torch.long, device=dev)
             # Text stream, primed once. past holds layers 1..N K/V so that
             # appending a token costs one forward over ONE position.
-            out = self._llm_forward(
-                inputs_embeds=self._embed_tokens(ids.unsqueeze(0)),
-                use_cache=True,
-                output_hidden_states=True,
-                return_dict=True,
-            )
-            past = out["past_key_values"]
-            n_joint = int(getattr(self.core_cfg, "joint_layers", 1) or 1)
-            text_h = out["hidden_states"][-(n_joint + 1)][0]  # (P, H)
+            th, out = self._forward_text(self._embed_tokens(ids.unsqueeze(0)), use_cache=True)
+            past = out["past_key_values"] if out is not None else None
+            text_h = th[0]  # (P, H)
 
             emitted: List[int] = []
             for t in range(n_chunks):
@@ -402,12 +604,19 @@ class TwoStreamSTTModel(ScriptSTTModel):
                     total = tu + w
                     mask = torch.zeros((total, total), dtype=torch.bool, device=dev)
                     mask[:tu, :tu] = torch.ones((tu, tu), dtype=torch.bool, device=dev).tril()
-                    mask[tu:, :tu] = True  # audio sees the whole prefix so far
+                    if str(getattr(self.core_cfg, "joint_text_context", "full")) == "last":
+                        mask[tu:, tu - 1] = True  # ONE key: the most recent history token
+                    else:
+                        mask[tu:, :tu] = True  # audio sees the whole prefix so far
                     ar = torch.arange(w, device=dev)
-                    mask[tu:, tu:] = (ar.unsqueeze(1) >= ar.unsqueeze(0)).T
+                    # CAUSAL within the block: query i sees keys j <= i. The former
+                    # trailing .T made this ANTI-causal, so read_at (the LAST frame)
+                    # saw only itself -- 1 frame of audio instead of w.
+                    mask[tu:, tu:] = ar.unsqueeze(1) >= ar.unsqueeze(0)
 
-                    pos = torch.arange(total, device=dev)
-                    pos[tu:] = tu + torch.arange(w, device=dev)
+                    # base = tu is exactly m + (tokens emitted so far), the decode-time
+                    # value of the training base m + p.
+                    pos = self._joint_positions(tu, w, [tu], dev)
                     h = self._run_joint(seq, mask, pos)
                     nxt = int(self._project_to_vocab(h[-1:]).argmax(-1).item())
                     if nxt == self._eot_id:
@@ -416,15 +625,9 @@ class TwoStreamSTTModel(ScriptSTTModel):
                     emitted.append(nxt)
                     # Extend the text stream by ONE position against the cache.
                     step = torch.tensor([[nxt]], dtype=torch.long, device=dev)
-                    out = self._llm_forward(
-                        inputs_embeds=self._embed_tokens(step),
-                        past_key_values=past,
-                        use_cache=True,
-                        output_hidden_states=True,
-                        return_dict=True,
-                    )
-                    past = out["past_key_values"]
-                    text_h = torch.cat([text_h, out["hidden_states"][-(n_joint + 1)][0]], dim=0)
+                    th, out = self._forward_text(self._embed_tokens(step), use_cache=True, past_key_values=past)
+                    past = out["past_key_values"] if out is not None else None
+                    text_h = torch.cat([text_h, th[0]], dim=0)
 
             outs.append(self.tokenizer.ids_to_text(emitted) if emitted else "")
         return outs

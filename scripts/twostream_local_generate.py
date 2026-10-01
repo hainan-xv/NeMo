@@ -47,8 +47,17 @@ def main():
     CHUNK, NCH = 14, 3
 
     class _Tok:
+        """Deliberately as STRICT as the real NeMo tokenizer.
+
+        The previous stub called ``tok(t)``, which happily BATCH-encodes a list and
+        returns a list-of-lists. The real tokenizer goes through the Rust backend,
+        which rejects a list with "TextEncodeInput must be ...". That leniency is
+        exactly what let the list-prompt bug reach the cluster, so this routes
+        through the same backend and fails the same way.
+        """
+
         def text_to_ids(self, t):
-            return tok(t).input_ids
+            return tok.backend_tokenizer.encode(t, add_special_tokens=False).ids
 
         def ids_to_text(self, ids):
             return tok.decode(ids, skip_special_tokens=True)
@@ -68,11 +77,20 @@ def main():
 
             self.core_cfg = _Cfg()
 
-        # deterministic stand-in encoder: same shape/dtype, fixed values
-        def _chunk_audio(self, audios, audio_lens, chunk_size, n_chunks):
-            g = torch.Generator(device="cpu").manual_seed(7)
-            x = torch.randn(NCH, chunk_size, 1024, generator=g).to(dev)
-            return self.proj(x)
+            # Stub the ENCODER only. _chunk_audio itself is the real method, so the
+            # probe exercises its chunk-count arithmetic -- the earlier override
+            # ignored n_chunks and returned a fixed count, hiding that passing 0
+            # produced an EMPTY tensor and decoded nothing.
+            outer = self
+
+            class _Perception(torch.nn.Module):
+                def forward(self, input_signal, input_signal_length):
+                    b = int(input_signal.shape[0])
+                    g = torch.Generator(device="cpu").manual_seed(7)
+                    x = torch.randn(b, NCH * CHUNK, 1024, generator=g).to(dev)
+                    return outer.proj(x), None
+
+            self.perception = _Perception()
 
         def _llm_core(self):
             return core
@@ -101,6 +119,22 @@ def main():
     out2 = m.generate(torch.zeros(2, 16000, device=dev), torch.tensor([16000, 16000], device=dev), max_new_tokens=6)
     print(f"    len={len(out2)}  identical inputs -> identical outputs: {out2[0] == out2[1]}")
 
+    print("\n==> 2b. LIST prompt -- what _validation_system_prompts actually passes")
+    # This is the call that crashed on DFW with "TextEncodeInput must be ...".
+    outL = m.generate(
+        torch.zeros(2, 16000, device=dev),
+        torch.tensor([16000, 16000], device=dev),
+        system_prompt=["Transcribe the audio into text.", "Transcribe the audio into text."],
+        max_new_tokens=6,
+    )
+    print(f"    accepted List[str]: len={len(outL)}")
+    print(f"    matches the str-prompt decode: {outL[0] == out2[0]}")
+
+    print("\n==> 2c. chunk count is DERIVED, not zero")
+    fr = m._chunk_audio(audios, audio_lens, CHUNK, 0)
+    print(f"    _chunk_audio(..., n_chunks=0) -> {tuple(fr.shape)}  (must NOT be 0 chunks)")
+    assert fr.shape[0] > 0, "still returning an empty tensor -- nothing would decode"
+
     print("\n==> 3. determinism (greedy must be repeatable)")
     again = m.generate(audios, audio_lens, max_new_tokens=8)
     print(f"    same text on rerun: {again[0] == out[0]}")
@@ -112,17 +146,21 @@ def main():
     ref = _Model().to(dev).eval()
     ref.proj.load_state_dict(m.proj.state_dict())
 
-    def slow_generate(self, audios, audio_lens, system_prompt="Transcribe the audio into text.", max_new_tokens=8, **kw):
+    def slow_generate(
+        self, audios, audio_lens, system_prompt="Transcribe the audio into text.", max_new_tokens=8, **kw
+    ):
         chunk = CHUNK
         frames = self._chunk_audio(audios[0:1], audio_lens[0:1], chunk, 0)
-        ids = list(self.tokenizer.text_to_ids(system_prompt))
+        ids = list(self.tokenizer.text_to_ids(system_prompt + "\n"))
         emitted = []
         for t in range(int(frames.shape[0])):
             for _ in range(max_new_tokens):
                 full = torch.tensor(ids + emitted, dtype=torch.long, device=dev)
                 o = self._llm_forward(
                     inputs_embeds=self._embed_tokens(full.unsqueeze(0)),
-                    use_cache=False, output_hidden_states=True, return_dict=True,
+                    use_cache=False,
+                    output_hidden_states=True,
+                    return_dict=True,
                 )
                 text_h = o["hidden_states"][-2][0]  # NO cache: recomputed wholly
                 a = frames[t]
@@ -133,7 +171,7 @@ def main():
                 mask[:tu, :tu] = torch.ones((tu, tu), dtype=torch.bool, device=dev).tril()
                 mask[tu:, :tu] = True
                 ar = torch.arange(w, device=dev)
-                mask[tu:, tu:] = (ar.unsqueeze(1) >= ar.unsqueeze(0)).T
+                mask[tu:, tu:] = ar.unsqueeze(1) >= ar.unsqueeze(0)
                 pos = torch.arange(total, device=dev)
                 pos[tu:] = tu + torch.arange(w, device=dev)
                 h = self._run_joint(seq, mask, pos)

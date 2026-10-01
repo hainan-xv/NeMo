@@ -1,10 +1,10 @@
 #!/bin/bash
 #SBATCH -A nemotron_speechprod_asr
-#SBATCH -J nemotron_speechprod_asr:dfw-granary2-script-chunk7-band2
+#SBATCH -J nemotron_speechprod_asr:dfw-twostream-band0-fulldepth-lr5e5
 # DFW's default GPU partition. Unlike OCI there is ONE pool of 1850 nodes rather
 # than batch_block1/3/4, so no comma-list is needed.
 #SBATCH -p batch
-#SBATCH -N 8
+#SBATCH -N 4
 #SBATCH --gpus-per-node=8
 #SBATCH -t 04:00:00
 #SBATCH --time-min 04:00:00
@@ -21,50 +21,149 @@
 #SBATCH --exclude=pool0-00407,pool0-01815
 
 # ============================================================================
-# SCRIPT, BIDIRECTIONAL band=1, on the UNMODIFIED alignment, warm-started.
+# SCRIPT / TWO-STREAM HYBRID -- FULL-DEPTH FUSION. band_words=0, 4 nodes.
 #
-#   sbatch launch/dfw_script_banded1_both_nodelay.sh   <- no arguments
+# From SCRIPT: audio and text meet at layer 0, so they interact through all 28
+# layers rather than only the last one. joint_layers=28 makes the joint the whole
+# stack, and the text stream's input to it is then just the embeddings -- no
+# separate LLM pass (running one would compute 28 layers and discard all of them).
 #
+# From two-stream: text appears ONCE in the tensor. The band's candidates live in
+# the mask and in position_ids, which are assigned independently of tensor order
+# (audio_position_mode=left: audio in a fixed slot, text shifted right by w).
 #
-# BIDIRECTIONAL BAND, on the unmodified alignment. Identical to the one-sided
-# dfw_script_banded1_nodelay.sh in every knob except band_side=both, so a delta
-# between the two is the band's SECOND side and nothing else.
+# THE INVARIANT THIS RESTS ON: text never attends to audio. Verified structurally
+# -- mask[text_queries, audio_keys].sum() == 0. Audio-dependent text would
+# invalidate the text KV cache on every new frame and force a full prefix
+# recompute per chunk at decode time; keeping text audio-free is what makes the
+# cache reusable. It also means one text copy is trivially correct rather than an
+# approximation.
 #
-# WHY THIS IS WORTH RERUNNING NOW. Two-sided was already tried and lost -- SCRIPT
-# two-sided scored 6.28 against one-sided's 5.97, worse on all seven splits. But
-# that test was run at delay=3, where the earlier half of the band was fighting
-# the delay: the delay had already pushed each word later, so "earlier" could
-# only claw back ground the delay deliberately gave up. At delay=0 the band is
-# centred on the aligner's own output and the earlier half finally means what it
-# says -- a word may be emitted a chunk before the aligner placed it. That is the
-# half that can correct a systematically LATE aligner, and it has never actually
-# been measured on a fair footing.
+# Consequence, stated plainly: text is a pure LM prior with no acoustic
+# conditioning. All audio->text influence happens at the audio blocks' read-out.
+# That is the price of the cache property, not an oversight.
 #
-# THREE DELIBERATE DIFFERENCES from dfw_script_banded1.sh, and they are the
-# whole point of this arm:
+# extra_joint_layer=false: a dedicated layer would REPLACE the whole-stack joint.
+# joint_text_context=full: audio sees the whole prefix, the SCRIPT-like choice.
+# LR 5e-5: extending the full-depth LR ladder DOWNWARD, replacing the 2e-4 arm.
 #
-#   1. delay = 0, NOT 3.  This is the correction that motivated the arm. The
-#      band was never centred on the aligner's own output: the delay was applied
-#      FIRST (data.dataset.num_delay_frames shifts each word's chunk before
-#      targets are built), and band_candidate_cuts then banded around the
-#      already-shifted cuts. With band_side=later the two compounded -- the
-#      delay pushed a word later, and the band could only push it later still,
-#      never back. Nothing in that configuration could place a word at the time
-#      the aligner actually chose. At delay=0 the band is centred on the
-#      unmodified alignment and "later" is measured from the aligner's position.
+# Measured best val_wer on full-depth so far:
+#     2e-4 -> 0.1391      1e-4 -> 0.1267
+# Lower has won every time val_wer was the judge (this is the third such result;
+# training loss pointed the opposite way each time and was wrong). 5e-5 tests
+# whether the trend continues or 1e-4 is the floor.
 #
-#   2. Warm start from the standard SCRIPT arm (see INIT_CKPT). Weights only.
+# One variable from dfw_twostream_band0_fulldepth_lr1e4; same donor ckpt.
 #
-#   3. Two nodes, not four, so more arms run concurrently within the 8-node cap.
-#      NOTE this scales the global batch with it -- 2x8 GPUs rather than 4x8 --
-#      so steps here are NOT equivalent to steps in the 4-node arms, and the
-#      leaderboard table's "steps" column stops being comparable across the two
-#      groups. Compare wall-clock or samples-seen instead.
+# (superseded) LR 1e-4: the OTHER half of the full-depth LR pair. Exactly one variable from
+# dfw_twostream_band0_fulldepth (2e-4); everything else identical, same donor ckpt.
 #
-# Everything else is held fixed against dfw_script_banded1.sh -- band_words=1,
-# band_side=later, chunk 14, partition targets, LR, warmup, bucket batch sizes --
-# so the delta against that arm's 5.97 macro is the delay change plus the warm
-# start, and nothing else.
+# Why re-check rather than reuse 2e-4: that optimum was measured on the
+# single-layer-joint 'lasttok' architecture, whose trainable set differs (it had a
+# 50.34M dedicated joint layer; this has extra_joint_layer=false, so LoRA +
+# encoder + embeddings). No reason its LR optimum transfers. 1e-4 also matches
+# dfw_granary2_script_baseline, so this arm is LR-matched to the reference too.
+#
+# COST: the joint now runs 28 layers over tu + n_cells*w instead of 1. Local probe
+# says it trains (13.26 -> 1.97 over 5 steps, vs 24.7 -> 9.3 for the 1-layer joint)
+# but expect step time well above the 0.21s of the last-layer arms.
+# TWO-STREAM SCRIPT, band_words=0, 4 nodes. RNN-T-STYLE JOINER.
+#
+# LR 2e-4: DOUBLE dfw_granary2_script_baseline, 4x this arm's original 5e-5.
+# Past the matched-baseline point on purpose, to see whether the joint keeps
+# benefiting from a larger step or starts to come apart. The 50.34M fully
+# trainable joint layer is the exposed part -- a local probe already spiked
+# grad_norm to ~1300 at 5e-5, so divergence here is a live possibility rather
+# than a theoretical one. Watch the first few hundred steps.
+#
+# (superseded note) LR MATCHED TO dfw_granary2_script_baseline: 1e-4, not the 5e-5 this arm's
+# ancestor defaulted to. That baseline is the fair reference -- same 4 nodes x 8
+# devices, near-identical step time (0.166s vs 0.21s), same warmup_steps=5000,
+# same CosineAnnealing/min_lr/max_steps -- so steps are comparable units and the
+# 2x LR gap was NOT masked by batch size or parallelism.
+#
+# Deliberately NOT matched to that baseline, and why:
+#   max_duration      20 vs its 40   -- 20 was chosen for two-stream's memory
+#                                       profile (n_cells*w audio duplication);
+#                                       raising it risks the OOMs we already hit.
+#   bucket_batch_size [2,1,...] vs its [4,3,2,...] -- same reason.
+#   num_delay_frames  0  vs its 3    -- a task change, not a hyperparameter; the
+#                                       two-stream arms are designed at delay 0.
+# Those three remain open confounds against that baseline.
+#
+# Exactly ONE change from dfw_twostream_band0_leftpos: joint_text_context=last.
+# The joint attends to a SINGLE text key -- the most recent history token -- instead
+# of the whole prefix before the cut. The text stream is causal, so that one vector
+# already summarises everything before the cut; this makes the summary the only
+# channel rather than letting the joint re-read the prefix token by token. The joint
+# becomes f(audio frames, text state), i.e. an RNN-T joiner.
+#
+# Deliberately one change from leftpos so the pair IS attributable, unlike leftpos
+# vs v3 which moved three things at once.
+#
+# Inherited from leftpos (see that file for the full rationale):
+#
+# 1. audio_position_mode=left. Audio sits in a FIXED attention slot before all
+#    text instead of at base = m + p. Implemented by shifting text right by w, so
+#    every index stays >= 0 -- RoPE sees only relative offsets, so this is exactly
+#    "audio at -w..-1" without negative position_ids. Cells of one chunk now share
+#    identical positions, which is what later allows one block per chunk instead of
+#    one per cell (n_cells*w -> T*w + n_cells).
+#    Trade-off accepted knowingly: audio->text offsets become negative in relative
+#    terms and the most RECENT text token becomes the most distant key.
+#
+# 2. The within-block mask is now causal. It was anti-causal (a stray .T), so the
+#    read-out position saw only ITSELF -- 1 audio frame per chunk instead of w=14,
+#    with no indirect path through a single joint layer.
+#
+# 3. The dedicated joint layer actually takes effect now. In the previous arm
+#    (19353886) the config never reached core_cfg -- TwoStreamSTTModelConfig was
+#    missing @dataclass AND ScriptSTTModel hardcodes to_dataclass(ScriptSTTModelConfig),
+#    so extra_joint_layer silently stayed False and that run was a duplicate of v3.
+#    Confirmed by trainable=948096000, byte-identical to the baseline.
+#
+# These are THREE simultaneous changes; a win is not attributable without follow-ups.
+#
+# Differs from dfw_twostream_band0.sh in exactly one respect: the joint gets its
+# own fully trainable decoder layer (50.34M params, warm-started from the LLM's
+# last layer) instead of borrowing that layer while frozen.
+#
+# Why: with the borrowed layer, ALL audio-text interaction was carried by r=128
+# LoRA on q_proj/v_proj of a single frozen layer -- 917,504 trainable params,
+# under 0.1% of the 948M trainable total. The dedicated layer is 55x that.
+#
+# A second, independent gain: the text stream previously read hidden_states[-2],
+# so the borrowed layer's output never reached it and the text representation was
+# a 27-layer Qwen rather than 28. With a dedicated joint, text uses all 28 layers
+# and the joint reads the last layer's PRE-norm residual stream via a hook
+# (hidden_states[-1] is post-norm; feeding that in would double-normalise).
+#
+# Warm start comes from the SAME donor checkpoint as band0_v3, so the two arms
+# are comparable from step 0 apart from the joint.
+#
+# NOTE: these are TWO changes at once (joint capacity and text depth). If this
+# arm wins, which one did it is not yet separable.
+#
+#   sbatch launch/dfw_twostream_band0.sh
+#
+# Promotion of the 1-node smoke test, which reached ~900 steps with the loss
+# falling 46.9 -> 26.5 and no errors. Still band 0 (the lattice degenerates to
+# the aligner's single assignment, i.e. exactly the forced loss) and chunk 14,
+# so this measures the ARCHITECTURE, not the band and not the small-chunk memory
+# problem. Widening the band is the next experiment.
+#
+# loss_reduction=mean_volume: SUM of per-utterance NLL over SUM of target tokens,
+# matching packed SCRIPT and NeMo's RNN-T convention, so every token carries
+# equal weight regardless of which utterance it came from.
+#
+# EXPECTED LOSS AT INIT. Locally, with the fix and a stand-in encoder, the loss
+# starts near 2x log(V) (~24 against log V = 11.93) and falls below log(V) within
+# a few steps. A start in the hundreds means the read-out is broken again.
+#
+# NOTE ON THE REPORTED LOSS. The lattice scores tokens AND one <eot> per chunk,
+# but mean_volume divides by tokens only. num_emissions is logged alongside
+# num_targets so that gap is visible rather than silently inflating the
+# per-token figure.
 # ============================================================================
 set -uo pipefail
 
@@ -86,7 +185,22 @@ PROJECT_NAME="${PROJECT_NAME:-SpeechlmDFW}"
 # --- the banded recipe, identical to the OCI arm ---
 CONFIG_PATH=/code/examples/speechlm2/conf
 CONFIG_NAME="${CONFIG_NAME:-streaming_stt_granary2_lora_script_banded1}"
-EXP_NAME="${EXP_NAME:-dfw_granary2_script_chunk7_band2}"
+# v2: FIRST run with a correct read-out. Everything before this trained with
+# lm_head applied WITHOUT model.norm, which made the logits garbage -- measured
+# on Qwen3-1.7B predicting its own next token, 175.37 nats/token without the norm
+# against 4.43 with it. A fresh EXP_NAME so those curves do not sit in the same
+# wandb series as this one; they are not comparable.
+# v3: FIRST run whose WER is meaningful. Everything earlier decoded validation
+# through the INHERITED packed-SCRIPT generate (audio at layer 0, all N layers)
+# at val_chunk_size=7 while training at 14 -- so dev_wer described a different
+# architecture at a look-ahead the model never trained on. Fresh EXP_NAME because
+# the metric changes MEANING here, not just value; the old points must not sit in
+# the same series.
+#
+# Weights carry over via init_from_ckpt (weights only, optimiser reset): the
+# earlier runs' LOSS was valid -- they already had the normalised read-out -- so
+# the ~1h of training they did is worth keeping even though their WER was not.
+EXP_NAME="${EXP_NAME:-dfw_twostream_band0_fulldepth_lr5e5}"
 
 MAX_STEPS="${MAX_STEPS:-500000}"
 # --- v2 CHANGES: rebalanced buckets, smaller LR ------------------------------
@@ -163,8 +277,17 @@ LR="${LR:-5e-5}"
 VAL_CHECK_INTERVAL="${VAL_CHECK_INTERVAL:-2000}"
 DELAY="${DELAY:-0}"
 WARMUP_STEPS="${WARMUP_STEPS:-5000}"
-CHUNK_SIZES="${CHUNK_SIZES:-7}"
-BAND_WORDS="${BAND_WORDS:-2}"
+CHUNK_SIZES="${CHUNK_SIZES:-14}"
+BAND_WORDS="${BAND_WORDS:-0}"
+# How many trailing LLM layers see audio. 1 is the design point; a knob because
+# last-layer-only fusion is a bet, not a known quantity.
+JOINT_LAYERS="${JOINT_LAYERS:-28}"
+# Validation MUST decode at the chunk size this arm trains at. It was pinned to 7
+# here, inherited from the chunk-7 launcher this was copied from, while training
+# ran at 14 -- so val_wer described a look-ahead the model never saw. A
+# CONFIGURED val_chunk_size beats the auto-default, so copying a launcher and
+# changing CHUNK_SIZES alone is not enough.
+VAL_MAX_NEW_TOKENS="${VAL_MAX_NEW_TOKENS:-24}"
 BAND_SIDE="${BAND_SIDE:-both}"
 ACT_CKPT="${ACT_CKPT:-true}"
 ATTN_BACKEND="${ATTN_BACKEND:-dense}"
@@ -180,7 +303,7 @@ NUM_WORKERS="${NUM_WORKERS:-4}"
 # so save_top_k cannot rotate it away mid-run. Same banded objective and same
 # band_side, differing only in chunk size and band width -- the closest start
 # available on this grid. band_words is a LOSS-side knob, so 1 -> 2 transfers.
-INIT_CKPT="${INIT_CKPT:-/lustre/fsw/portfolios/nemotron/projects/nemotron_speechprod_asr/hainanx/results/SpeechlmDFW/pinned_init/step=150000-val_wer=0.0882.ckpt}"
+INIT_CKPT="${INIT_CKPT:-/lustre/fsw/portfolios/nemotron/projects/nemotron_speechprod_asr/hainanx/results/SpeechlmDFW/pinned_init/dfw_twostream_band0_v2_carry.ckpt}"
 
 # DFW-side data and model paths. These are the ONLY substantive config
 # differences from the OCI arm, so they are overrides rather than a forked YAML
@@ -279,6 +402,13 @@ echo "*******STARTING********" \
     model.optimizer.lr=${LR} \
     model.lr_scheduler.warmup_steps=${WARMUP_STEPS} \
     model.chunk_size="${CHUNK_SIZES}" \
+    ++model.two_stream=true \
+    ++model.loss_reduction=mean_volume \
+    ++model.joint_layers=${JOINT_LAYERS} \
+    ++model.extra_joint_layer=false \
+    ++model.audio_position_mode=left \
+    ++model.joint_text_context=full \
+    ++model.extra_joint_init_from_last=true \
     ++model.band_words=${BAND_WORDS} \
     ++model.band_side=${BAND_SIDE} \
     ++model.activation_checkpointing=${ACT_CKPT} \
@@ -290,8 +420,8 @@ echo "*******STARTING********" \
     ++data.train_ds.max_duration=${MAX_DURATION} \
     ++data.train_ds.bucket_duration_bins="${BUCKET_BINS}" \
     data.train_ds.bucket_batch_size="${BUCKET_BATCH_SIZE}" \
-    ++model.val_chunk_size=7 \
-    ++model.val_max_new_tokens_per_chunk=12 \
+    ++model.val_chunk_size=${CHUNK_SIZES} \
+    ++model.val_max_new_tokens_per_chunk=${VAL_MAX_NEW_TOKENS} \
     data.train_ds.seed=${LHOTSE_RND_SEED} \
     data.validation_ds.datasets.mcv_11_dev.manifest_filepath=${VAL_MANIFEST} \
     ++trainer.limit_train_batches=${VAL_CHECK_INTERVAL} \
