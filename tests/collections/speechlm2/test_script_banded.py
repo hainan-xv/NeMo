@@ -986,8 +986,8 @@ def test_band_unit_chunk_matches_the_worked_example():
     from nemo.collections.speechlm2.parts.script import band_candidate_cuts
 
     got = band_candidate_cuts([0, 2], [0, 2], 3, 1, "both", band_unit="chunk")
-    assert got[0] == [0]                 # chunk 0 always starts at token 0
-    assert got[1] == [0, 1, 2, 3]        # | unable one |, |unable|one|, |un|able one|, ||unable one|
+    assert got[0] == [0]  # chunk 0 always starts at token 0
+    assert got[1] == [0, 1, 2, 3]  # | unable one |, |unable|one|, |un|able one|, ||unable one|
 
 
 @pytest.mark.unit
@@ -999,7 +999,7 @@ def test_band_unit_chunk_spans_neighbouring_aligner_cuts():
     got = band_candidate_cuts(al, al, 8, 1, "both", band_unit="chunk")
     assert got[1] == [0, 1, 2, 3, 4]
     assert got[2] == [2, 3, 4, 5, 6]
-    assert got[3] == [4, 5, 6, 7, 8]     # last chunk reaches n_tokens
+    assert got[3] == [4, 5, 6, 7, 8]  # last chunk reaches n_tokens
 
 
 @pytest.mark.unit
@@ -1016,5 +1016,5 @@ def test_band_unit_chunk_sides_are_one_directional():
     al = [0, 2, 4]
     later = band_candidate_cuts(al, al, 6, 1, "later", band_unit="chunk")
     earlier = band_candidate_cuts(al, al, 6, 1, "earlier", band_unit="chunk")
-    assert max(later[1]) == 2 and min(later[1]) == 0     # may only give tokens back
+    assert max(later[1]) == 2 and min(later[1]) == 0  # may only give tokens back
     assert min(earlier[1]) == 2 and max(earlier[1]) == 4  # may only take tokens forward

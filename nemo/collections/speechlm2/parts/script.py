@@ -459,9 +459,7 @@ def build_packed_banded_example(
     P = len(spine_ids)
     T = len(chunks)
 
-    cands = band_candidate_cuts(
-        aligner_cuts, word_starts, n_tokens, band_words, band_side, band_token_cuts, band_unit
-    )
+    cands = band_candidate_cuts(aligner_cuts, word_starts, n_tokens, band_words, band_side, band_token_cuts, band_unit)
     C = max((len(c) for c in cands), default=1)
     reach = [max(cands[t + 1]) if t + 1 < T else n_tokens for t in range(T)]
 
