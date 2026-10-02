@@ -218,6 +218,9 @@ class ScriptSTTModelConfig(StreamingSTTModelConfig):
     # MUST be paired with force_word_start=False at inference.
     # Interpolated by data.dataset.band_token_cuts; must match it.
     band_token_cuts: bool = False
+    # 'word' or 'chunk' -- see ScriptSTTDataConfig.band_unit. Interpolated by
+    # data.dataset.band_unit; must match it.
+    band_unit: str = "word"
     # Consecutive OOM batches tolerated before training_step re-raises. A few
     # skips are a rare bad draw (chunk_size is sampled per batch while
     # bucket_batch_size is keyed on duration only); a streak means the batch

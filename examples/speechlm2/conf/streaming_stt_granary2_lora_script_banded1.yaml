@@ -106,6 +106,8 @@ model:
   # sizes otherwise have to emit a whole multi-token word from one short chunk.
   # Pair with force_word_start=false at inference. Must match data.dataset.
   band_token_cuts: false
+  # 'word' or 'chunk'; chunk = band counts CHUNKS per token (see dataset config).
+  band_unit: word
 
   # LAYOUT. The band emits one branch SEGMENT per candidate cut in the FLAT
   # packed layout. That needs no mask change: build_script_mask already gives each
@@ -185,6 +187,7 @@ data:
     band_words: ${model.band_words}
     band_side: ${model.band_side}
     band_token_cuts: ${model.band_token_cuts}
+    band_unit: ${model.band_unit}
     twod_layout: ${model.twod_layout}
     num_delay_frames: 3
     audio_tag: "<audio>"

@@ -974,3 +974,47 @@ def test_packer_handles_intra_word_cuts_end_to_end():
     # Every valid cut is a real token position in the transcript.
     valid = tok.cut[tok.cut_valid]
     assert int(valid.min()) >= 0 and int(valid.max()) <= tok.n_tokens
+
+
+@pytest.mark.unit
+def test_band_unit_chunk_matches_the_worked_example():
+    """tokens [un][able][one]; 2 chunks; aligner emits 'unable' then 'one'.
+
+    B=1 in CHUNKS means every token may move at most one chunk, so all four
+    alignments are legal and chunk 1's cut ranges over every token index.
+    """
+    from nemo.collections.speechlm2.parts.script import band_candidate_cuts
+
+    got = band_candidate_cuts([0, 2], [0, 2], 3, 1, "both", band_unit="chunk")
+    assert got[0] == [0]                 # chunk 0 always starts at token 0
+    assert got[1] == [0, 1, 2, 3]        # | unable one |, |unable|one|, |un|able one|, ||unable one|
+
+
+@pytest.mark.unit
+def test_band_unit_chunk_spans_neighbouring_aligner_cuts():
+    """Chunk t's cut must range over [aligner_{t-B}, aligner_{t+B}]."""
+    from nemo.collections.speechlm2.parts.script import band_candidate_cuts
+
+    al = [0, 2, 4, 6]
+    got = band_candidate_cuts(al, al, 8, 1, "both", band_unit="chunk")
+    assert got[1] == [0, 1, 2, 3, 4]
+    assert got[2] == [2, 3, 4, 5, 6]
+    assert got[3] == [4, 5, 6, 7, 8]     # last chunk reaches n_tokens
+
+
+@pytest.mark.unit
+def test_band_unit_chunk_degenerates_at_zero():
+    from nemo.collections.speechlm2.parts.script import band_candidate_cuts
+
+    assert band_candidate_cuts([0, 2, 4], [0, 2, 4], 6, 0, "both", band_unit="chunk") == [[0], [2], [4]]
+
+
+@pytest.mark.unit
+def test_band_unit_chunk_sides_are_one_directional():
+    from nemo.collections.speechlm2.parts.script import band_candidate_cuts
+
+    al = [0, 2, 4]
+    later = band_candidate_cuts(al, al, 6, 1, "later", band_unit="chunk")
+    earlier = band_candidate_cuts(al, al, 6, 1, "earlier", band_unit="chunk")
+    assert max(later[1]) == 2 and min(later[1]) == 0     # may only give tokens back
+    assert min(earlier[1]) == 2 and max(earlier[1]) == 4  # may only take tokens forward

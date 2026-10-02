@@ -423,6 +423,7 @@ def build_packed_banded_example(
     eot_id: int,
     band_side: str = "both",
     band_token_cuts: bool = False,
+    band_unit: str = "word",
     audio_history_chunks: int = 0,
     audio_window_frames: int = 0,
     position_scheme: str = BRANCH_SCHEME,
@@ -458,7 +459,9 @@ def build_packed_banded_example(
     P = len(spine_ids)
     T = len(chunks)
 
-    cands = band_candidate_cuts(aligner_cuts, word_starts, n_tokens, band_words, band_side, band_token_cuts)
+    cands = band_candidate_cuts(
+        aligner_cuts, word_starts, n_tokens, band_words, band_side, band_token_cuts, band_unit
+    )
     C = max((len(c) for c in cands), default=1)
     reach = [max(cands[t + 1]) if t + 1 < T else n_tokens for t in range(T)]
 
@@ -937,6 +940,7 @@ def band_candidate_cuts(
     band: int,
     side: str = "both",
     token_cuts: bool = False,
+    band_unit: str = "word",
 ) -> List[List[int]]:
     """Candidate cuts for each chunk, within ``band`` WORDS of the aligner's.
 
@@ -968,6 +972,33 @@ def band_candidate_cuts(
     starts = sorted(set(word_starts) | {0, n_tokens})
     if side not in ("both", "later", "earlier"):
         raise ValueError(f"side must be 'both', 'later' or 'earlier', got {side!r}")
+
+    if band_unit == "chunk":
+        # Band counted in CHUNKS, per token: a token may be emitted at most ``band``
+        # chunks away from where the aligner put it. Chunk t may therefore take
+        # everything the previous B chunks held, or give everything to the next B --
+        # so the cut ranges between the aligner's cuts B chunks either side, and EVERY
+        # token index in between is legal. The number of tokens that move is NOT
+        # bounded; only how far each one moves. This is a strictly different
+        # parametrisation from the word band, not a rescaling of it.
+        T = len(aligner_cuts)
+        out = []
+        for t in range(T):
+            u = aligner_cuts[t]
+            if band <= 0 or t == 0:
+                # Chunk 0 always starts at token 0. The DP would mask any other cut
+                # (alpha[0, u != 0] = -inf), but an unpruned candidate still costs a
+                # real branch segment and its forward, so drop it here.
+                out.append([u])
+                continue
+            lo = aligner_cuts[max(0, t - band)] if side in ("both", "later") else u
+            if side in ("both", "earlier"):
+                hi = aligner_cuts[t + band] if t + band < T else n_tokens
+            else:
+                hi = u
+            lo, hi = max(0, min(lo, hi)), min(n_tokens, max(lo, hi))
+            out.append(list(range(lo, hi + 1)))
+        return out
 
     out: List[List[int]] = []
     for u in aligner_cuts:

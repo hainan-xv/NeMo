@@ -187,6 +187,14 @@ class ScriptSTTDataConfig(StreamingSTTDataConfig):
     # a multi-token word out of one very short chunk. Requires
     # force_word_start=False at inference or decoding re-imposes the constraint.
     band_token_cuts: bool = False
+    # 'word'  : band counts WORD STARTS the cut may slide (band_token_cuts then
+    #           decides whether intra-word positions inside that window count).
+    # 'chunk' : band counts CHUNKS, applied PER TOKEN -- a token may be emitted at
+    #           most ``band`` chunks from where the aligner put it, so chunk t's cut
+    #           ranges over [aligner_cut_{t-B}, aligner_cut_{t+B}] and every token
+    #           index in between is legal. The number of tokens that move is
+    #           unbounded; only how far each moves. band_token_cuts is ignored.
+    band_unit: str = "word"
 
 
 @dataclass
@@ -337,6 +345,11 @@ class ScriptSTTDataset(StreamingSTTDataset):
                 self._band_by_chunk = {int(c): int(b) for c, b in zip(cands, bwc)}
                 logging.info("ScriptSTTDataset: per-chunk bands %s", self._band_by_chunk)
         self._band_token_cuts = bool(self.cfg.band_token_cuts)
+        self._band_unit = str(self.cfg.band_unit or "word").lower()
+        if self._band_unit not in ("word", "chunk"):
+            raise ValueError(f"band_unit must be 'word' or 'chunk', got {self.cfg.band_unit!r}")
+        if self._band_unit == "chunk":
+            logging.info("ScriptSTTDataset: band_unit=chunk -- band counts CHUNKS per token")
         self._band_side = str(self.cfg.band_side or "later").lower()
         if self._band_side not in ("both", "later", "earlier"):
             raise ValueError(f"band_side must be 'both', 'later' or 'earlier', got {self.cfg.band_side!r}")
@@ -741,6 +754,7 @@ class ScriptSTTDataset(StreamingSTTDataset):
                         band_words=band_words,
                         band_side=self._band_side,
                         band_token_cuts=self._band_token_cuts,
+                        band_unit=self._band_unit,
                         vision_start_id=self.vision_start_id,
                         vision_end_id=self.vision_end_id,
                         eot_id=self.eot_id,
