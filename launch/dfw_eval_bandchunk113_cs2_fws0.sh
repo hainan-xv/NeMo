@@ -1,11 +1,11 @@
 #!/bin/bash
 #SBATCH -A nemotron_speechprod_asr
 #SBATCH -J nemotron_speechprod_asr:dfw-eval-bandchunk113-cs2-fws0
-#SBATCH -p batch_long
+#SBATCH -p batch
 #SBATCH -N 1
 #SBATCH --gpus-per-node=8
-#SBATCH -t 08:00:00
-#SBATCH --time-min 04:00:00
+#SBATCH -t 04:00:00
+#SBATCH --time-min 02:00:00
 #SBATCH --exclusive
 #SBATCH --overcommit
 #SBATCH --mem=0
