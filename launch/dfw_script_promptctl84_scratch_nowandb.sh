@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH -A nemotron_speechprod_asr
-#SBATCH -J nemotron_speechprod_asr:dfw-script-promptctl84-scratch
+#SBATCH -J nemotron_speechprod_asr:dfw-script-promptctl84-scratch-nowandb
 # DFW's default GPU partition. Unlike OCI there is ONE pool of 1850 nodes rather
 # than batch_block1/3/4, so no comma-list is needed.
 #SBATCH -p batch
@@ -399,7 +399,11 @@ DELAY="${DELAY:-3}"
 WARMUP_STEPS="${WARMUP_STEPS:-10000}"
 # wandb logging. Training does NOT need it: val_wer lives in checkpoint
 # FILENAMES, not in wandb, so a run with this off loses live curves only.
-CREATE_WANDB="${CREATE_WANDB:-true}"
+# OFF for this continuation: ~/.wandb_token on the grid (unchanged since
+# 2026-09-14) is being rejected with 401 "user is not logged in", which killed 11
+# consecutive auto.sh resubmissions ~2 minutes in, during logger init and before
+# any training step. Flip back to true once the key is regenerated.
+CREATE_WANDB="${CREATE_WANDB:-false}"
 CHUNK_SIZES="${CHUNK_SIZES:-[2,7,14,28,42]}"
 # val_chunk_size must stay a single int and match the train chunk here.
 VAL_CHUNK_SIZE="${VAL_CHUNK_SIZE:-14}"
