@@ -84,6 +84,7 @@ SCRIPT_PATHS=(
     tests/collections/speechlm2/test_script.py
     scripts/script_leaderboard_eval.py
     scripts/word_chunk_span.py
+    scripts/probe_dataloader.py
     scripts/emission_latency.py
     scripts/script_asr_shim.py
     scripts/speechlm_asr_shim.py
