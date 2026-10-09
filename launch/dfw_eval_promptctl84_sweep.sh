@@ -27,7 +27,7 @@
 # three chunk sizes in 46 min.
 #
 # The averaged checkpoint is the MODEL, not a decode setting, so it is built at
-# most once and reused across chunk sizes (FORCE_AVERAGE=0; it already exists).
+# most once and reused across chunk sizes (rebuilt on the first pass only).
 # ---------------------------------------------------------------------------
 set -euo pipefail
 resolve_launch_dir() {
@@ -55,19 +55,29 @@ export CAPITALIZATION="${CAPITALIZATION:-1}"
 export PUNCTUATION="${PUNCTUATION:-1}"
 # Forced-loss arm: words are emitted whole, so the word-start guard matches training.
 export FORCE_WORD_START="${FORCE_WORD_START:-1}"
-export RESULTS_SUFFIX="${RESULTS_SUFFIX:-d3c1p1}"
+export RESULTS_SUFFIX="${RESULTS_SUFFIX:-d3c1p1_v2}"
 export RUN_AVERAGING="${RUN_AVERAGING:-1}"
-export FORCE_AVERAGE="${FORCE_AVERAGE:-0}"
+# REBUILD the average, do not reuse the cached file. The cached one was written
+# at 16:02 on 2026-10-07 over roughly steps 60k-114k and predates step 130000 --
+# the best checkpoint by val_wer. With FORCE_AVERAGE=0 a rerun silently scores
+# that stale file again and looks like a fresh result.
+export FORCE_AVERAGE="${FORCE_AVERAGE:-1}"
 export USE_LAST="${USE_LAST:-0}"
 BACKEND="$(resolve_launch_dir)/eval_leaderboard.sh"
 echo "### node: $(hostname)"
 # All five prompt-controlled sizes in ONE allocation so the cold start
 # (container + 5 GB checkpoint + dataset cache off lustre) is paid once.
 CHUNK_LIST="${CHUNK_LIST:-14 28 42 7 2}"
+# The averaged checkpoint is the MODEL, not a decode setting, so it is rebuilt
+# ONCE on the first pass and reused for the rest. Rebuilding per chunk size would
+# repeat a 5 GB read-and-write of a bit-identical file five times.
+first=1
 for cs in ${CHUNK_LIST}; do
     echo ""
-    echo "############ ${EXP_NAME} chunk_size=${cs} fws=0 ############"
+    echo "############ ${EXP_NAME} chunk_size=${cs} (promptctl d3 c1 p1) ############"
     t0=$(date +%s)
-    CHUNK_SIZE="$cs" bash "$BACKEND" || echo "WARNING: chunk ${cs} failed; continuing" >&2
+    CHUNK_SIZE="$cs" FORCE_AVERAGE="${first}" bash "$BACKEND" \
+        || echo "WARNING: chunk ${cs} failed; continuing" >&2
+    first=0
     echo "#### chunk=${cs} wall=$(( $(date +%s) - t0 ))s"
 done
