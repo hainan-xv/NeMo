@@ -3,7 +3,7 @@
 #SBATCH -J nemotron_speechprod_asr:dfw-probe-train-manifest
 # DFW's default GPU partition. Unlike OCI there is ONE pool of 1850 nodes rather
 # than batch_block1/3/4, so no comma-list is needed.
-#SBATCH -p batch
+#SBATCH -p interactive
 #SBATCH -N 1
 #SBATCH --gpus-per-node=8
 #SBATCH -t 04:00:00
