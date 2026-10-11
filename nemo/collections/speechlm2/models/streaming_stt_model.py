@@ -223,6 +223,18 @@ class StreamingSTTModelConfig:
     dynamic_chunk_step: Union[int, List[int]] = 1
     audio_tag: str = "<audio>"
     att_context_size: Optional[List[int]] = None
+    # Decouple the ENCODER look-ahead from the LLM's chunk size.
+    #
+    # Normally one chunk_size does both jobs: it groups audio frames into LLM
+    # turns AND sets the encoder's look-ahead to chunk_size - 1. Pinning this to
+    # a small value (2) keeps encoder features near-causal while the LLM still
+    # consumes long chunks (14/28/42), which otherwise forces 41 frames of
+    # look-ahead to get long-chunk accuracy.
+    #
+    # None (default) keeps the coupled behaviour, so existing arms are unchanged.
+    # The Conformer still requires att_context_size[0] % (right + 1) == 0, which
+    # with right = 1 only asks that the left context be even.
+    encoder_chunk_size: Optional[int] = None
     audio_pad_to: Optional[int] = None
     sample_rate: int = 16000
     frame_length_in_secs: float = 0.08
@@ -1498,6 +1510,12 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         """
         if chunk_size is None or chunk_size <= 0 or self.core_cfg.att_context_size is None:
             return
+        # encoder_chunk_size pins the ENCODER's look-ahead independently of the
+        # LLM chunk. The caller keeps passing the LLM chunk size; only the
+        # look-ahead is overridden here, so frame grouping is untouched.
+        enc_chunk = getattr(self.core_cfg, "encoder_chunk_size", None)
+        if enc_chunk is not None and int(enc_chunk) > 0:
+            chunk_size = int(enc_chunk)
         left = int(self.core_cfg.att_context_size[0])
         encoder = self.perception.encoder
         # Sliding-window cache-aware encoders stream exactly only with no look-ahead; chunk-aligned

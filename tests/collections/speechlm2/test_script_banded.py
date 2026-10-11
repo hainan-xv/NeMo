@@ -1018,3 +1018,37 @@ def test_band_unit_chunk_sides_are_one_directional():
     earlier = band_candidate_cuts(al, al, 6, 1, "earlier", band_unit="chunk")
     assert max(later[1]) == 2 and min(later[1]) == 0  # may only give tokens back
     assert min(earlier[1]) == 2 and max(earlier[1]) == 4  # may only take tokens forward
+
+
+@pytest.mark.unit
+def test_encoder_chunk_size_decouples_lookahead_from_llm_chunk():
+    """encoder_chunk_size pins the encoder look-ahead, LLM chunking unaffected.
+
+    Normally one chunk_size does both jobs (right = chunk_size - 1). Pinning the
+    encoder to 2 must give right = 1 whatever the LLM chunk is, while leaving the
+    left context alone -- and the Conformer's chunked_limited rule
+    (left % (right + 1) == 0) must still hold.
+    """
+    from types import SimpleNamespace
+
+    from nemo.collections.speechlm2.models.streaming_stt_model import StreamingSTTModel
+
+    class Enc:
+        att_context_size = [84, 1]
+
+    def run(enc_chunk, llm_chunk):
+        m = SimpleNamespace(
+            core_cfg=SimpleNamespace(att_context_size=[84, 1], encoder_chunk_size=enc_chunk),
+            perception=SimpleNamespace(encoder=Enc()),
+        )
+        StreamingSTTModel._set_encoder_att_context(m, llm_chunk)
+        return list(m.perception.encoder.att_context_size)
+
+    # coupled (default): look-ahead follows the LLM chunk
+    assert run(None, 42) == [84, 41]
+    assert run(None, 14) == [84, 13]
+    # decoupled: look-ahead pinned at 1 regardless of the LLM chunk
+    for llm in (2, 7, 14, 28, 42):
+        left, right = run(2, llm)
+        assert [left, right] == [84, 1], f"llm chunk {llm} leaked into the encoder"
+        assert left % (right + 1) == 0, "violates the Conformer chunked_limited rule"
