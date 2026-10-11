@@ -1052,3 +1052,29 @@ def test_encoder_chunk_size_decouples_lookahead_from_llm_chunk():
         left, right = run(2, llm)
         assert [left, right] == [84, 1], f"llm chunk {llm} leaked into the encoder"
         assert left % (right + 1) == 0, "violates the Conformer chunked_limited rule"
+
+
+@pytest.mark.unit
+def test_encoder_chunk_size_one_is_strictly_causal():
+    """encoder_chunk_size=1 must give attention right context 0 at every LLM chunk.
+
+    Right context 0 is what makes the encoder strictly causal: the pretrained
+    model is already causal in its convolution (conv_context_size: causal), so
+    attention look-ahead was its only remaining source of future context.
+    """
+    from types import SimpleNamespace
+
+    from nemo.collections.speechlm2.models.streaming_stt_model import StreamingSTTModel
+
+    class Enc:
+        att_context_size = [84, 1]
+
+    for llm_chunk in (2, 7, 14, 28, 42):
+        m = SimpleNamespace(
+            core_cfg=SimpleNamespace(att_context_size=[84, 1], encoder_chunk_size=1),
+            perception=SimpleNamespace(encoder=Enc()),
+        )
+        StreamingSTTModel._set_encoder_att_context(m, llm_chunk)
+        left, right = m.perception.encoder.att_context_size
+        assert right == 0, f"llm chunk {llm_chunk} leaked look-ahead: right={right}"
+        assert left % (right + 1) == 0, "violates the Conformer chunked_limited rule"
