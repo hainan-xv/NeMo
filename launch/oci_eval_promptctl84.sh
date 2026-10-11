@@ -51,16 +51,24 @@ export PUNCTUATION="${PUNCTUATION:-1}"
 # Forced-loss arm: words are emitted whole, matching training.
 export FORCE_WORD_START="${FORCE_WORD_START:-1}"
 # Only ONE checkpoint exists so far (step 132000); nothing to average over.
-export RUN_AVERAGING="${RUN_AVERAGING:-0}"
-export USE_LAST="${USE_LAST:-1}"
-export RESULTS_SUFFIX="${RESULTS_SUFFIX:-d3c1p1}"
+# Every arm now has >=5 checkpoints, so average them rather than scoring a
+# single -last. FORCE_AVERAGE=1 on the FIRST pass only: a cached average from
+# the earlier step-136000 sweep would otherwise be reused silently and look
+# like a fresh result, and rebuilding per chunk size would repeat a 5 GB
+# read/write of a bit-identical file five times.
+export RUN_AVERAGING="${RUN_AVERAGING:-1}"
+export USE_LAST="${USE_LAST:-0}"
+export RESULTS_SUFFIX="${RESULTS_SUFFIX:-d3c1p1_v2}"
 BACKEND="$(resolve_launch_dir)/eval_leaderboard.sh"
 echo "### node: $(hostname)   exp: ${EXP_NAME}"
 CHUNK_LIST="${CHUNK_LIST:-14 28 42 7 2}"
+first=1
 for cs in ${CHUNK_LIST}; do
     echo ""
     echo "############ ${EXP_NAME} chunk_size=${cs} (promptctl d3 c1 p1) ############"
     t0=$(date +%s)
-    CHUNK_SIZE="$cs" bash "$BACKEND" || echo "WARNING: chunk ${cs} failed; continuing" >&2
+    CHUNK_SIZE="$cs" FORCE_AVERAGE="${first}" bash "$BACKEND" \
+        || echo "WARNING: chunk ${cs} failed; continuing" >&2
+    first=0
     echo "#### chunk=${cs} wall=$(( $(date +%s) - t0 ))s"
 done
