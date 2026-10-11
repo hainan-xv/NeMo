@@ -7,7 +7,7 @@
 # the fault is the sharded/tarred read path, not any recipe. This arm continues on
 # OCI until that is resolved.
 #SBATCH -A nemotron_speech_asr
-#SBATCH -J nemotron_speechprod_asr:streaming-stt-script-promptctl
+#SBATCH -J nemotron_speechprod_asr:promptctl84-enc2
 #SBATCH -p batch_block1,batch_block3,batch_block4
 #SBATCH -N 8
 #SBATCH --gpus-per-node=8
