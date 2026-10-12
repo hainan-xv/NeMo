@@ -124,7 +124,11 @@ WARMUP_STEPS="${WARMUP_STEPS:-10000}"
 # --- SCRIPT operating point ---
 DELAY="${DELAY:-3}"
 # dense | flex | script -- all mathematically identical; flex is fastest.
-ATTN_BACKEND="${ATTN_BACKEND:-flex}"
+# dense, NOT flex. flex builds a FlexAttention BlockMask, but without the
+# LoRA/PEFT wrapping Qwen3 dispatches attention through SDPA, which expects a
+# tensor mask -> "BlockMask object has no attribute ndim" at step 0. The
+# backends are mathematically identical; the DFW arms all ran dense.
+ATTN_BACKEND="${ATTN_BACKEND:-dense}"
 # Prompt control. DELAY_CANDIDATES is a Hydra list literal (no spaces).
 # Max delay 4: the chunk grid now reaches 42 frames (3.36 s), so a large
 # frame delay on top of a long chunk pushes emission past anything useful.
