@@ -59,6 +59,10 @@ SCRIPT_PATHS=(
     nemo/collections/speechlm2/models/__init__.py
     examples/speechlm2/script_train.py
     'examples/speechlm2/conf/streaming_stt_granary2_lora_script*.yaml'
+    # Full-finetune variants are NOT named *_lora_*, so the glob above misses
+    # them: a new config was silently left off the grid and the job died with
+    # Hydra MissingConfigException.
+    'examples/speechlm2/conf/streaming_stt_granary2_full_script*.yaml'
     # CHAT recipes live under the ASR collection, not speechlm2. Without this
     # a NEW chat config is untracked, silently skipped, and the job dies at
     # startup with Hydra's MissingConfigException -- which is exactly how
