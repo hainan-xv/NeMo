@@ -82,7 +82,12 @@ model:
   freeze_speech_encoder: false
   freeze_modality_adapter: false
   freeze_modality_proj: false
-  freeze_llm_model: true
+  # FALSE for full finetuning. This flag -- not the lora block -- is what keeps
+  # Qwen3 frozen: _apply_freeze_config() freezes self.llm.model whenever it is
+  # true, regardless of LoRA. Removing `lora:` while leaving this true gave a
+  # model with NO language-side learning capacity (922M trainable, all encoder)
+  # and training diverged to val_wer 4.22.
+  freeze_llm_model: false
   freeze_llm_head: false
   freeze_embed_tokens: false
 
