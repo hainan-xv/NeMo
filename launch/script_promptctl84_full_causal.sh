@@ -118,7 +118,10 @@ VAL_CHECK_INTERVAL="${VAL_CHECK_INTERVAL:-4000}"
 # 2e-5, NOT the 1e-4 the LoRA arms use. 1e-4 is a LoRA learning rate; applied to
 # every weight of a pretrained Qwen3 it damages the model fast. Full-finetune LRs
 # for a 1.7B LLM are normally 1e-5 to 2e-5.
-LR="${LR:-0.00002}"
+# 1e-4, NOT 2e-5. Measured on 1 node with LR as the only variable: at step 4000
+# 2e-5 gave val_wer 1.4091 and 1e-4 gave 0.1809 -- better at 4k than 2e-5 managed
+# at 12k (0.2428). The 2e-5 8-node arms reached 0.1612/0.1753/0.1967 at 12k.
+LR="${LR:-0.0001}"
 WARMUP_STEPS="${WARMUP_STEPS:-10000}"
 
 # --- SCRIPT operating point ---
@@ -157,7 +160,9 @@ SYSTEM_PROMPT="${SYSTEM_PROMPT:-You are doing streaming speech recognition. Give
 
 CONFIG_PATH=/code/examples/speechlm2/conf/
 CONFIG_NAME="${CONFIG_NAME:-streaming_stt_granary2_full_script_promptctl84}"
-EXP_NAME="${EXP_NAME:-granary2_script_promptctl84_full_causal}"
+# _lr1e4: a NEW name, because resume_if_exists=true would otherwise resume from
+# (and overwrite) the 2e-5 run's checkpoints sitting in the old directory.
+EXP_NAME="${EXP_NAME:-granary2_script_promptctl84_full_causal_lr1e4}"
 
 # --- Tag runs that use a non-default node count ---
 # RESULTS_DIR is derived from EXP_NAME and the recipe sets resume_if_exists=true,
