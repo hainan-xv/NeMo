@@ -132,7 +132,13 @@ ATTN_BACKEND="${ATTN_BACKEND:-flex}"
 DELAY_CANDIDATES="${DELAY_CANDIDATES:-[0,1,2,3,4]}"
 CAP_PROB="${CAP_PROB:-0.5}"
 PUNCT_PROB="${PUNCT_PROB:-0.5}"
-ACT_CKPT="${ACT_CKPT:-true}"
+# false, NOT true. Activation checkpointing is BROKEN under full finetuning here:
+# the recompute packs its saved tensors in a different order than the forward and
+# torch aborts with CheckpointError at step 0. The same recipe with LoRA (most
+# weights frozen, so a much shorter save list) checkpoints fine. Verified without
+# it on 1 node: 1.16 it/s, zero OOM, val_wer 1.4091 -> 0.6560 -> 0.2428 over
+# steps 4k/8k/12k from scratch. Per-GPU memory is identical at 8 nodes.
+ACT_CKPT="${ACT_CKPT:-false}"
 AUDIO_HISTORY_CHUNKS="${AUDIO_HISTORY_CHUNKS:-0}"
 # 28 and 42 are new. They are only legal because the config raises the
 # encoder left context to 84: the Conformer requires
