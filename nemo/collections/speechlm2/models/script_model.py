@@ -14,7 +14,7 @@
 """SCRIPT streaming SpeechLM — packed spine + per-chunk branches."""
 
 from collections import defaultdict
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -339,6 +339,9 @@ class ScriptSTTModel(StreamingSTTModel):
                 )
 
         self._bidirectional_audio = bool(self.core_cfg.bidirectional_audio)
+        # (attn_implementation, plan) the last training forward ran under, so the
+        # activation-checkpoint recompute in backward() can re-enter the same one.
+        self._train_attn_ctx = None
         self._attn_backend = str(self.core_cfg.attn_backend or "dense").lower()
         if self._attn_backend not in ("dense", "flex", "script"):
             raise ValueError(f"attn_backend must be dense|flex|script, got {self._attn_backend!r}")
@@ -904,6 +907,13 @@ class ScriptSTTModel(StreamingSTTModel):
             )
         if plan is not None and self._bidirectional_audio:
             plan = replace(plan, bidirectional_audio=True)
+        # Activation checkpointing recomputes this forward during backward(), by
+        # which time the context manager below has already restored the previous
+        # implementation. The recompute would then run under a DIFFERENT attention
+        # backend than the forward -- torch compares the saved tensors' metadata and
+        # raises CheckpointError (or, with flex, the BlockMask reaches SDPA and dies
+        # on .ndim). Record what this step trained under so backward() can re-enter it.
+        self._train_attn_ctx = (impl, plan if self._attn_backend == "script" else None)
         with self._attn_implementation(impl), _maybe_plan(plan if self._attn_backend == "script" else None):
             out = self._llm_forward(
                 inputs_embeds=input_embeds,
@@ -1278,12 +1288,20 @@ class ScriptSTTModel(StreamingSTTModel):
     def backward(self, *args, **kwargs):
         ddp = self._ddp_module()
         oom = False
+        # With activation checkpointing the LLM forward is REPLAYED inside this call.
+        # Replay it under the same attention implementation (and structured plan) the
+        # original forward used -- see the note at the training forward.
+        impl, plan = self._train_attn_ctx or (None, None)
         try:
-            if ddp is not None:
-                with ddp.no_sync():
+            with ExitStack() as stack:
+                if impl is not None:
+                    stack.enter_context(self._attn_implementation(impl))
+                    stack.enter_context(_maybe_plan(plan))
+                if ddp is not None:
+                    with ddp.no_sync():
+                        super().backward(*args, **kwargs)
+                else:
                     super().backward(*args, **kwargs)
-            else:
-                super().backward(*args, **kwargs)
         except torch.cuda.OutOfMemoryError as e:
             oom = True
             self._last_oom = repr(e)[:200]
@@ -1451,6 +1469,13 @@ class ScriptSTTModel(StreamingSTTModel):
             )
         if plan is not None and self._bidirectional_audio:
             plan = replace(plan, bidirectional_audio=True)
+        # Activation checkpointing recomputes this forward during backward(), by
+        # which time the context manager below has already restored the previous
+        # implementation. The recompute would then run under a DIFFERENT attention
+        # backend than the forward -- torch compares the saved tensors' metadata and
+        # raises CheckpointError (or, with flex, the BlockMask reaches SDPA and dies
+        # on .ndim). Record what this step trained under so backward() can re-enter it.
+        self._train_attn_ctx = (impl, plan if self._attn_backend == "script" else None)
         with self._attn_implementation(impl), _maybe_plan(plan if self._attn_backend == "script" else None):
             out = self._llm_forward(
                 inputs_embeds=input_embeds,

@@ -25,6 +25,7 @@ Two tests carry the correctness argument:
 """
 
 import collections
+import contextlib
 import math
 import os
 import re
@@ -3960,3 +3961,56 @@ def test_banded_band_zero_equals_the_forced_loss_end_to_end():
     )
 
     torch.testing.assert_close(got[0], ref, atol=1e-3, rtol=1e-3)
+
+
+def test_backward_replays_the_training_attention_implementation(monkeypatch):
+    """Activation checkpointing replays the LLM forward INSIDE backward().
+
+    The training forward runs under a scoped attention implementation (eager for
+    attn_backend=dense, flex_attention for flex). That scope has already exited by
+    the time backward() runs, so without re-entering it the recompute would use the
+    model's default (SDPA) -- a different kernel than the forward, which torch
+    rejects with CheckpointError, and which with flex hands a BlockMask to SDPA.
+    """
+    from nemo.collections.speechlm2.models.script_model import ScriptSTTModel
+    from nemo.collections.speechlm2.models.streaming_stt_model import StreamingSTTModel
+
+    seen = {}
+
+    def probe_backward(self, *args, **kwargs):
+        seen["impl"] = self._impl_now
+
+    monkeypatch.setattr(StreamingSTTModel, "backward", probe_backward, raising=False)
+
+    fake = ScriptSTTModel.__new__(ScriptSTTModel)
+    fake._impl_now = "sdpa"  # what the model sits at outside the training forward
+    fake._train_attn_ctx = ("flex_attention", None)
+    fake._ddp_module = lambda: None
+    fake._any_rank_oom = lambda local: local
+
+    @contextlib.contextmanager
+    def switch(name):
+        prev, fake._impl_now = fake._impl_now, name
+        try:
+            yield
+        finally:
+            fake._impl_now = prev
+
+    fake._attn_implementation = switch
+
+    ScriptSTTModel.backward(fake)
+
+    assert seen["impl"] == "flex_attention", "recompute ran under a different backend than the forward"
+    assert fake._impl_now == "sdpa", "backward() must restore the decode-time implementation"
+
+
+def test_training_forward_records_the_attention_context_for_backward():
+    """The forward must leave behind what backward() needs to replay it."""
+    import inspect
+
+    from nemo.collections.speechlm2.models.script_model import ScriptSTTModel
+
+    src = inspect.getsource(ScriptSTTModel)
+    # Both training paths (flat and 2-D) record it; backward() consumes it.
+    assert src.count("self._train_attn_ctx = (impl,") == 2
+    assert "self._train_attn_ctx or (None, None)" in src
