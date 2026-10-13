@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH -A nemotron_speech_asr
-#SBATCH -J nemotron_speechprod_asr:oci-eval-promptctl84-enc2
+#SBATCH -J nemotron_speechprod_asr:oci-eval-p84-full-enc2-lr1e4
 #SBATCH -p batch_block1,batch_block3,batch_block4
 #SBATCH -N 1
 #SBATCH --gpus-per-node=8
