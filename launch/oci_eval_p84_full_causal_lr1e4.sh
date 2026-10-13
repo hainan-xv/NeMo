@@ -60,10 +60,16 @@ export FORCE_WORD_START="${FORCE_WORD_START:-1}"
 # read/write of a bit-identical file five times.
 export RUN_AVERAGING="${RUN_AVERAGING:-1}"
 export USE_LAST="${USE_LAST:-0}"
-# Distinct suffix: this is a snapshot of a RUN STILL IN PROGRESS (~12.8k steps),
-# averaged over whatever checkpoints exist now. Keeping it out of the v2
-# namespace stops it being mistaken for a converged result later.
-export RESULTS_SUFFIX="${RESULTS_SUFFIX:-d3c1p1_lr1e4_12k}"
+# These runs are STILL TRAINING, so a fixed suffix would make two sweeps taken at
+# different points overwrite each other and silently mix step counts. Derive it
+# from the highest checkpoint step instead: results are self-labelling, the
+# script stays re-runnable at any point, and nothing lands in the v2 namespace
+# where it could be mistaken for a converged result.
+_CKPT_DIR="${OUTPUT_PREFIX}/results/${PROJECT}/${EXP_NAME}/${EXP_NAME}/checkpoints"
+_MAX_STEP="$(ls "${_CKPT_DIR}"/*.ckpt 2>/dev/null | grep -oE 'step=[0-9]+' | cut -d= -f2 | sort -n | tail -1)"
+export RESULTS_SUFFIX="${RESULTS_SUFFIX:-d3c1p1_lr1e4_step${_MAX_STEP:-unknown}}"
+echo "### averaging over: $(ls "${_CKPT_DIR}"/*.ckpt 2>/dev/null | grep -v -- '-last\.ckpt$' | grep -v -- '-averaged\.ckpt$' | grep -oE 'step=[0-9]+' | tr '\n' ' ')"
+echo "### RESULTS_SUFFIX=${RESULTS_SUFFIX}"
 BACKEND="$(resolve_launch_dir)/eval_leaderboard.sh"
 echo "### node: $(hostname)   exp: ${EXP_NAME}"
 CHUNK_LIST="${CHUNK_LIST:-14 28 42 7 2}"
