@@ -255,7 +255,23 @@ if [[ -n "$INIT_CKPT" && "$INIT_CKPT" != "none" ]]; then
     INIT_CKPT_ARG="++exp_manager.resume_from_checkpoint=/results/init_from.ckpt"
 fi
 
-MOUNTS="--container-mounts=${DATA_DIR}:${DATA_DIR},${H_DIR}:${H_DIR},$HAINAN_DIR:$HAINAN_DIR,$CODE_DIR:/code,$RESULTS_DIR:/results,$DATA_DIR:/data,$PRETRAINED_MODEL_DIR:/pretrained,$CHECKPOINT_DIR:/checkpoints,${QUESTIONS_DIR}:/questions/,${HFCACHE}:/hfcache/,$DONGJI_ROOT:$DONGJI_ROOT${INIT_MOUNT:+,${INIT_MOUNT}:${INIT_MOUNT}}"
+# DATA_DIR is a SHARED symlink -> /lustre/fs11/portfolios/coreai/.../data, and
+# that target vanished on 2026-10-12 between 09:15 and 15:11 (the symlink itself
+# is unchanged since 2026-09-29). Every job since then died at container start:
+#   enroot-mount: failed to mount: .../data: No such file or directory
+# because enroot cannot create a destination under a dangling symlink.
+# This recipe does NOT need it -- the train yaml pulls audio from s3:// (29 refs,
+# 0 /data refs) and its manifests live under users/dongjig on fs12. So mount it
+# only when it actually resolves: a dead path in someone else's portfolio must
+# not be able to stop our training.
+DATA_MOUNT=""
+if [[ -d "${DATA_DIR}" ]]; then
+    DATA_MOUNT="${DATA_DIR}:${DATA_DIR},${DATA_DIR}:/data,"
+else
+    echo "==> WARNING: ${DATA_DIR} does not resolve -- omitting it from container mounts."
+    echo "==>          (train audio comes from s3://, manifests from users/dongjig, so this is survivable)"
+fi
+MOUNTS="--container-mounts=${DATA_MOUNT}${H_DIR}:${H_DIR},$HAINAN_DIR:$HAINAN_DIR,$CODE_DIR:/code,$RESULTS_DIR:/results,$PRETRAINED_MODEL_DIR:/pretrained,$CHECKPOINT_DIR:/checkpoints,${QUESTIONS_DIR}:/questions/,${HFCACHE}:/hfcache/,$DONGJI_ROOT:$DONGJI_ROOT${INIT_MOUNT:+,${INIT_MOUNT}:${INIT_MOUNT}}"
 
 read -r -d '' cmd <<EOF
 echo "*******STARTING********" \
