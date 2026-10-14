@@ -201,3 +201,112 @@ def test_partial_tail_block_still_gets_a_correction():
     out = multi_front_decode(m, None, None)
     assert len(parse(out[0])) == 3
     assert final_text(out[0]) == "A B C"
+
+
+# --------------------------------------------------------------------- display
+
+
+def test_display_frames_paints_then_corrects():
+    """Two frames per block: provisional painted, then replaced."""
+    from nemo.collections.speechlm2.parts.multi_front import display_frames
+
+    assert display_frames(ONE_BLOCK) == [
+        ("", "the quick brown fax"),  # provisional on screen
+        ("the quick brown fox", ""),  # slow front replaced it
+    ]
+
+
+def test_display_frames_accumulate_committed_text():
+    from nemo.collections.speechlm2.parts.multi_front import display_frames
+
+    frames = display_frames(THREE_BLOCKS)
+    assert len(frames) == 6
+    # Block 2 is painted on top of block 1's CORRECTED text, not its provisional.
+    assert frames[2] == ("the quick brown fox", "jumps ovr")
+    assert frames[-1] == ("the quick brown fox jumps over the lazy dog", "")
+
+
+def test_stream_render_erases_exactly_what_it_wrote():
+    """The provisional tail must be rubbed out, not left behind under the fix."""
+    import io
+
+    from nemo.collections.speechlm2.parts.multi_front import render_stream
+
+    buf = io.StringIO()
+    render_stream(ONE_BLOCK, out=buf)
+    written = buf.getvalue()
+    assert "fax" in written  # it WAS shown
+    assert written.count("\b") >= len("the quick brown fax")  # and then erased
+    # What survives once backspaces are applied is the corrected text.
+    assert _apply_backspaces(written).strip() == "the quick brown fox"
+
+
+def test_stream_render_final_screen_equals_final_text():
+    import io
+
+    from nemo.collections.speechlm2.parts.multi_front import render_stream
+
+    buf = io.StringIO()
+    render_stream(THREE_BLOCKS, out=buf)
+    assert _apply_backspaces(buf.getvalue()).split() == final_text(THREE_BLOCKS).split()
+
+
+def _apply_backspaces(s: str) -> str:
+    """Replay a terminal's cursor so we can assert on what is actually visible."""
+    out, col = [], 0
+    for ch in s:
+        if ch == "\b":
+            col = max(0, col - 1)
+        elif ch == "\n":
+            out.append("\n")
+            col = len(out)
+        else:
+            if col < len(out):
+                out[col] = ch
+            else:
+                out.append(ch)
+            col += 1
+    return "".join(out)
+
+
+def test_dual_render_puts_fast_above_slow():
+    from nemo.collections.speechlm2.parts.multi_front import render_dual
+
+    txt = render_dual(ONE_BLOCK, width=100)
+    lines = [ln for ln in txt.splitlines() if ln.strip()]
+    assert lines[0].startswith("  fast") and "fax" in lines[0]
+    assert lines[1].startswith("  slow") and "fox" in lines[1]
+
+
+def test_dual_render_marks_only_corrected_blocks():
+    from nemo.collections.speechlm2.parts.multi_front import render_dual
+
+    txt = render_dual(THREE_BLOCKS, width=200)
+    # Blocks 1 and 2 were corrected, block 3 agreed -> carets under the first two only.
+    marker = [ln for ln in txt.splitlines() if ln.strip().startswith("^")]
+    assert marker, "corrected blocks must be marked"
+    assert "^" in marker[0]
+
+
+def test_dual_render_columns_align():
+    """The two fronts must line up per block, or they cannot be read against each other."""
+    from nemo.collections.speechlm2.parts.multi_front import render_dual
+
+    txt = render_dual(ONE_BLOCK, width=100)
+    fast, slow = txt.splitlines()[0], txt.splitlines()[1]
+    assert fast.index("the") == slow.index("the")
+
+
+def test_dual_render_wraps_to_width():
+    from nemo.collections.speechlm2.parts.multi_front import render_dual
+
+    many = "".join(f"{TEMP_START}word{i}{TEMP_END}word{i}" for i in range(40))
+    txt = render_dual(many, width=60)
+    assert all(len(ln) <= 70 for ln in txt.splitlines())  # 60 + the "  fast  " gutter
+    assert txt.count("  fast  ") > 1  # actually wrapped onto several row groups
+
+
+def test_dual_render_empty_is_empty():
+    from nemo.collections.speechlm2.parts.multi_front import render_dual
+
+    assert render_dual("") == ""

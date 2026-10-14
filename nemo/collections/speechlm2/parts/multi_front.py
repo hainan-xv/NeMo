@@ -247,3 +247,110 @@ def _frame_counts(model, audios, audio_lens, chunk: int) -> List[int]:
     """Encoder frame count per utterance, as the decoder will see it."""
     frames = model.encode_frames(audios, audio_lens, chunk)
     return [int(f.shape[0]) for f in frames]
+
+
+# --------------------------------------------------------------------- display
+
+
+def display_frames(s: str) -> List[Tuple[str, str]]:
+    """What the screen shows, step by step, as ``(committed, provisional)``.
+
+    Two frames per block: the provisional text being painted, then the moment the
+    slow front replaces it. Keeping this separate from any escape-code rendering
+    is what makes the live view testable -- the renderers below are then just
+    printing.
+    """
+    frames: List[Tuple[str, str]] = []
+    committed: List[str] = []
+    for b in parse(s):
+        frames.append((_join(committed), b.provisional))
+        if b.final:
+            committed.append(b.final)
+        frames.append((_join(committed), ""))
+    return frames
+
+
+def render_stream(s: str, out=None, delay: float = 0.0, block_seconds: float = 0.0, width: int = 100) -> None:
+    """ONE-STREAM view: words appear, then the temporary tail is deleted and replaced.
+
+    The provisional tail is erased with backspaces, exactly as described: what was
+    tentatively shown is rubbed out and the authoritative text written over it. A
+    terminal that has wrapped the line cannot be un-wrapped by backspacing, so
+    long transcripts are re-flowed onto a fresh line instead of corrupting the
+    display.
+
+    Args:
+        delay: seconds to pause between steps. ``block_seconds`` sets it from the
+            real block duration so playback runs at the speed a listener would
+            have experienced.
+        width: column at which to break to a fresh line before writing text that
+            will later need erasing.
+    """
+    import sys
+    import time
+
+    out = out or sys.stdout
+    pause = block_seconds / 2.0 if block_seconds else delay
+    printed = 0  # chars of COMMITTED text already written (never erased)
+    col = 0  # current screen column
+    shown = ""  # provisional tail currently on screen, erasable
+    for committed, provisional in display_frames(s):
+        if shown:  # rub out the tentative text before anything replaces it
+            out.write("\b" * len(shown) + " " * len(shown) + "\b" * len(shown))
+            col -= len(shown)
+            shown = ""
+        tail = committed[printed:]
+        if tail:
+            out.write(tail)
+            printed = len(committed)
+            col += len(tail)
+        if provisional:
+            # A wrapped line cannot be un-wrapped by backspacing, so move to a
+            # fresh line BEFORE writing anything that will have to be erased.
+            if col + len(provisional) + 1 > width:
+                out.write("\n")
+                col = 0
+            piece = (" " if col and not provisional.startswith(" ") else "") + provisional
+            out.write(piece)
+            shown = piece
+            col += len(piece)
+        out.flush()
+        if pause:
+            time.sleep(pause)
+    out.write("\n")
+    out.flush()
+
+
+def render_dual(s: str, width: int = 100) -> str:
+    """TWO-STREAM view: the fast front on one line, the slow front beneath it.
+
+    Blocks are column-aligned so the two fronts can be read against each other,
+    and rows are wrapped to ``width``. Corrected blocks are marked, since the
+    point of the view is to see where the second front earned its keep.
+    """
+    blocks = parse(s)
+    if not blocks:
+        return ""
+    sep = " | "
+    rows: List[List[Block]] = [[]]
+    used = 0
+    for b in blocks:
+        w = max(len(b.provisional), len(b.final))
+        if used and used + len(sep) + w > width:
+            rows.append([])
+            used = 0
+        rows[-1].append(b)
+        used += (len(sep) if used else 0) + w
+    lines: List[str] = []
+    for row in rows:
+        widths = [max(len(b.provisional), len(b.final)) for b in row]
+        fast = sep.join(b.provisional.ljust(w) for b, w in zip(row, widths))
+        slow = sep.join(b.final.ljust(w) for b, w in zip(row, widths))
+        lines += [f"  fast  {fast.rstrip()}", f"  slow  {slow.rstrip()}"]
+        if any(b.corrected for b in row):
+            # Only when something actually changed -- a row of bare separators
+            # under every agreeing block is noise that hides the real marks.
+            mark = sep.join(("^" * w if b.corrected else " " * w) for b, w in zip(row, widths))
+            lines.append(f"        {mark.rstrip()}")
+        lines.append("")
+    return "\n".join(lines).rstrip()
