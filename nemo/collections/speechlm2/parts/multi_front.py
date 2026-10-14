@@ -104,14 +104,40 @@ def final_text(s: str) -> str:
     return " ".join(b.final for b in parse(s) if b.final).strip()
 
 
-def provisional_text(s: str) -> str:
-    """What a user would have read if nothing was ever corrected.
+def provisional_text(s: str, dedupe_boundary: bool = True) -> str:
+    """What the reader READS first, before any correction lands.
 
-    This is the fast front's transcript, and scoring it against the reference
-    gives the quality of what is shown FIRST -- the number that matters for how
-    often a reader sees something wrong, as opposed to what they end up with.
+    Naive concatenation double-counts deferred words. When the slow front moves a
+    word into the next block, the fast front paints it in block i, has it erased,
+    and paints it again in block i+1 -- but the reader reads it ONCE. Counting it
+    twice shows up as pure insertions: on an AMI probe it doubled the insertion
+    count (13 -> 31) and overstated the first-paint WER by ~1.5 points.
+
+    ``dedupe_boundary`` drops leading words of a block that merely repeat the
+    previous block's deferred tail. Pass ``False`` for the raw concatenation.
     """
-    return " ".join(b.provisional for b in parse(s) if b.provisional).strip()
+    blocks = parse(s)
+    out: List[str] = []
+    for i, b in enumerate(blocks):
+        words = b.provisional.split()
+        if dedupe_boundary and i and words:
+            prev = blocks[i - 1]
+            # Words the previous block SHOWED but did not commit were deferred to
+            # this one; re-painting them is the same word, not a new one.
+            deferred = prev.provisional.split()[len(prev.final.split()) :]
+            k = 0
+            while k < len(deferred) and k < len(words) and _same_word(deferred[k], words[k]):
+                k += 1
+            words = words[k:]
+        if words:
+            out.append(" ".join(words))
+    return " ".join(out).strip()
+
+
+def _same_word(a: str, b: str) -> bool:
+    """Compare ignoring case and edge punctuation -- 'fingers,' repaints as 'fingers'."""
+    strip = ".,;:!?\"'"
+    return a.strip(strip).lower() == b.strip(strip).lower()
 
 
 @dataclass(frozen=True)

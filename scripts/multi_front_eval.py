@@ -91,7 +91,7 @@ def main():
     from normalizer.normalizer import EnglishTextNormalizer
 
     norm = EnglishTextNormalizer()
-    SYS = ["single_fast", "single_slow", "mf_first", "mf_final"]
+    SYS = ["single_fast", "single_slow", "mf_first", "mf_first_raw", "mf_final"]
     err = {k: 0 for k in SYS}
     words = 0
     rev = {"blocks": 0, "corrected": 0, "prov_words": 0, "revised": 0}
@@ -144,6 +144,9 @@ def main():
                 "single_fast": s_fast[j],
                 "single_slow": s_slow[j],
                 "mf_first": provisional_text(mf[j]),
+                # raw concatenation too: it double-counts deferred words, and
+                # keeping both makes that visible instead of hidden in a choice
+                "mf_first_raw": provisional_text(mf[j], dedupe_boundary=False),
                 "mf_final": final_text(mf[j]),
             }
             for k, v in hyp.items():
@@ -186,7 +189,10 @@ def main():
     print(f"  {'system':<12}{'WER':>8}   what it is")
     print(f"  {'-'*58}")
     print(f"  {'single-2':<12}{100*err['single_fast']/words:>8.2f}   plain fast decode")
-    print(f"  {'mf-first':<12}{100*err['mf_first']/words:>8.2f}   multi-front, shown FIRST")
+    print(f"  {'mf-first':<12}{100*err['mf_first']/words:>8.2f}   multi-front, shown FIRST (deferrals deduped)")
+    print(
+        f"  {'mf-first-raw':<12}{100*err['mf_first_raw']/words:>8.2f}   same, raw concatenation (double-counts deferrals)"
+    )
     print(f"  {'single-14':<12}{100*err['single_slow']/words:>8.2f}   plain slow decode")
     print(f"  {'mf-final':<12}{100*err['mf_final']/words:>8.2f}   multi-front, left WITH")
     print()
