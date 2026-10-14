@@ -1728,6 +1728,8 @@ class ScriptSTTModel(StreamingSTTModel):
         max_new_tokens: int = 64,
         generation_config: Optional[GenerationConfig] = None,
         chunk_size_override: Optional[int] = None,
+        history_text: Optional[Union[str, List[str]]] = None,
+        frame_range: Optional[Tuple[int, int]] = None,
         **generation_kwargs,
     ) -> List[str]:
         """Chunk-by-chunk streaming transcription.
@@ -1747,6 +1749,16 @@ class ScriptSTTModel(StreamingSTTModel):
             max_new_tokens: cap on tokens decoded per chunk.
             chunk_size_override: decode at this chunk size instead of the
                 configured / representative one.
+            history_text: text to seed the spine history with, as if the model
+                had already emitted it. The spine is ``[instruction][history]``,
+                so this is appended to the instruction tokens -- the model sees
+                exactly the sequence it would have built itself. Used by
+                multi-front decoding to re-condition a fast front on text a
+                slower front has committed.
+            frame_range: ``(lo, hi)`` -- decode only encoder frames ``[lo, hi)``.
+                The ENCODER still runs over the whole utterance, so left context
+                is unchanged; only the decode window is narrowed. Slicing the
+                waveform instead would silently shorten the encoder's context.
             num_delay_frames / capitalization / punctuation: prompt-controlled
                 models only — the operating point to request. Default to the
                 ``val_*`` config values. Ignored when ``prompt_control`` is off.
@@ -1810,8 +1822,24 @@ class ScriptSTTModel(StreamingSTTModel):
             frames_list = streaming_encode_frames(self, audios, audio_lens, cs)
         else:
             frames_list = self.encode_frames(audios, audio_lens, cs)
+        if frame_range is not None:
+            lo, hi = int(frame_range[0]), int(frame_range[1])
+            if lo < 0 or hi < lo:
+                raise ValueError(f"frame_range must be a non-empty (lo, hi) with 0 <= lo <= hi, got {frame_range}")
+            frames_list = [f[lo:hi] for f in frames_list]
         # Same instruction/history separator the dataset uses when building the spine.
         instruction_ids_list = [self.tokenizer.text_to_ids(system_prompt[b] + "\n") for b in range(B)]
+        if history_text is not None:
+            # The spine is [instruction][emitted so far]; appending the history
+            # tokens here reproduces exactly what the decoder would have
+            # accumulated, so a re-conditioned front is indistinguishable from
+            # one that emitted the text itself.
+            hist = [history_text] * B if isinstance(history_text, str) else list(history_text)
+            if len(hist) != B:
+                raise ValueError(f"history_text has {len(hist)} entries but the batch has {B}")
+            instruction_ids_list = [
+                ids + (self.tokenizer.text_to_ids(h) if h else []) for ids, h in zip(instruction_ids_list, hist)
+            ]
 
         # Inference-only: a per-emission-index word-insertion penalty (bonus on
         # <eot>). Popped here so a model that ignores it never sees the kwarg.
