@@ -56,6 +56,11 @@ def main():
         "and rewritten; dual: fast front on one line, slow front beneath it",
     )
     ap.add_argument(
+        "--no_wait",
+        action="store_true",
+        help="decode immediately instead of waiting for Enter once the model is loaded",
+    )
+    ap.add_argument(
         "--realtime",
         action="store_true",
         help="with --print stream, pace playback at the real block duration instead of dumping instantly",
@@ -121,6 +126,19 @@ def main():
 
     frame_s = 0.08  # one encoder frame
     tot = {"prov_e": 0, "fin_e": 0, "w": 0, "blocks": 0, "corr": 0, "pw": 0, "rw": 0}
+
+    # Everything slow (weights, dataset, normaliser) is now loaded, so the wait
+    # is immediately before the only part worth watching. Skipped when stdin is
+    # not a terminal, so piping the script into head/grep still works.
+    if not args.no_wait and sys.stdin.isatty():
+        front_desc = f"{args.fast}/{args.slow} ({args.fast*frame_s:.2f}s / {args.slow*frame_s:.2f}s)"
+        print(
+            f"\nREADY -- model loaded, {len(ds)} utterance(s) queued, fronts {front_desc}, " f"print={args.print_mode}"
+        )
+        try:
+            input("Press Enter to decode... ")
+        except EOFError:
+            pass
 
     for i in range(len(ds)):
         row = ds[i]
