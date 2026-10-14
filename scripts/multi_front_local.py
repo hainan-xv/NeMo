@@ -51,9 +51,10 @@ def main():
         "--print",
         dest="print_mode",
         default="plain",
-        choices=["plain", "stream", "dual"],
+        choices=["plain", "stream", "dual", "strike"],
         help="plain: serialised string + stats; stream: one stream, temporary tail erased "
-        "and rewritten; dual: fast front on one line, slow front beneath it",
+        "and rewritten; dual: fast front on one line, slow front beneath it; "
+        "strike: one stream that keeps its mistakes visible, crossed out",
     )
     ap.add_argument(
         "--no_wait",
@@ -83,6 +84,7 @@ def main():
         provisional_text,
         render_dual,
         render_stream,
+        render_strikeout,
         revision_stats,
     )
 
@@ -175,6 +177,9 @@ def main():
             print("  ONE STREAM (temporary text is erased and rewritten as each block closes):")
             print("  ", end="")
             render_stream(s, delay=0.0, block_seconds=args.slow * frame_s if args.realtime else 0.0)
+        elif args.print_mode == "strike":
+            print("  ONE STREAM, corrections crossed out (nothing is erased):")
+            print(f"  {render_strikeout(s, ansi=sys.stdout.isatty())}")
         elif args.print_mode == "dual":
             print("  TWO STREAMS (fast front above, slow front below; ^ marks what changed):")
             print(render_dual(s, width=110))

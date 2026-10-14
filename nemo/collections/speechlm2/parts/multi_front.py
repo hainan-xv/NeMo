@@ -354,3 +354,51 @@ def render_dual(s: str, width: int = 100) -> str:
             lines.append(f"        {mark.rstrip()}")
         lines.append("")
     return "\n".join(lines).rstrip()
+
+
+def strike_markup(provisional: str, final: str) -> List[Tuple[str, bool]]:
+    """Word-level diff as ``(text, struck)`` segments.
+
+    A minimal diff rather than "strike the whole block and reprint": in
+    ``quietude for`` -> ``disquietude for`` only ``quietude`` was wrong, and
+    striking ``for`` as well would misreport what the slow front actually
+    changed. Words the slow front ADDS are plain (nothing was wrong with them);
+    words it drops or replaces are struck.
+    """
+    import difflib
+
+    p, f = provisional.split(), final.split()
+    segs: List[Tuple[str, bool]] = []
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(a=p, b=f, autojunk=False).get_opcodes():
+        if tag == "equal":
+            segs.append((" ".join(p[i1:i2]), False))
+        elif tag == "delete":
+            segs.append((" ".join(p[i1:i2]), True))
+        elif tag == "insert":
+            segs.append((" ".join(f[j1:j2]), False))
+        else:  # replace: show what was wrong, then what replaced it
+            segs.append((" ".join(p[i1:i2]), True))
+            segs.append((" ".join(f[j1:j2]), False))
+    return [(t, k) for t, k in segs if t]
+
+
+STRIKE_ON = "\033[9;2m"  # strikethrough + dim
+STRIKE_OFF = "\033[0m"
+
+
+def render_strikeout(s: str, ansi: bool = True) -> str:
+    """ONE-STREAM view that keeps its mistakes visible, crossed out.
+
+    Nothing is erased: the reader sees the whole self-correction history inline,
+    which is what you want for inspecting behaviour rather than for a live
+    caption. ``ansi=False`` emits ``~~word~~`` so the output survives a pipe into
+    a file or a diff.
+    """
+    out: List[str] = []
+    for b in parse(s):
+        for text, struck in strike_markup(b.provisional, b.final):
+            if struck:
+                out.append(f"{STRIKE_ON}{text}{STRIKE_OFF}" if ansi else f"~~{text}~~")
+            else:
+                out.append(text)
+    return " ".join(out)

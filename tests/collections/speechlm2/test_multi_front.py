@@ -310,3 +310,74 @@ def test_dual_render_empty_is_empty():
     from nemo.collections.speechlm2.parts.multi_front import render_dual
 
     assert render_dual("") == ""
+
+
+# ------------------------------------------------------------------- strikeout
+
+
+def test_strike_markup_strikes_only_the_wrong_word():
+    """'quietude for' -> 'disquietude for': 'for' was never wrong."""
+    from nemo.collections.speechlm2.parts.multi_front import strike_markup
+
+    assert strike_markup("quietude for", "disquietude for") == [
+        ("quietude", True),
+        ("disquietude", False),
+        ("for", False),
+    ]
+
+
+def test_strike_markup_pure_insertion_strikes_nothing():
+    """'then the' -> 'then the prevailing': a word ARRIVED, none was wrong."""
+    from nemo.collections.speechlm2.parts.multi_front import strike_markup
+
+    assert strike_markup("then the", "then the prevailing") == [
+        ("then the", False),
+        ("prevailing", False),
+    ]
+
+
+def test_strike_markup_pure_deletion_strikes_the_dropped_word():
+    """'money, the day' -> 'money, the': 'day' belonged to the next block."""
+    from nemo.collections.speechlm2.parts.multi_front import strike_markup
+
+    assert strike_markup("money, the day", "money, the") == [("money, the", False), ("day", True)]
+
+
+def test_strike_markup_no_change_strikes_nothing():
+    from nemo.collections.speechlm2.parts.multi_front import strike_markup
+
+    assert strike_markup("hello world", "hello world") == [("hello world", False)]
+
+
+def test_strikeout_plain_text_marks_corrections():
+    from nemo.collections.speechlm2.parts.multi_front import render_strikeout
+
+    assert render_strikeout(ONE_BLOCK, ansi=False) == "the quick brown ~~fax~~ fox"
+
+
+def test_strikeout_keeps_every_mistake_visible():
+    """Unlike the stream view, nothing is erased -- the history stays readable."""
+    from nemo.collections.speechlm2.parts.multi_front import render_strikeout
+
+    txt = render_strikeout(THREE_BLOCKS, ansi=False)
+    assert "~~fax~~" in txt and "~~ovr~~" in txt
+    assert "fox" in txt and "over" in txt
+
+
+def test_strikeout_stripped_of_marks_equals_final_text():
+    """Removing the struck words must leave exactly what the user was left with."""
+    import re
+
+    from nemo.collections.speechlm2.parts.multi_front import render_strikeout
+
+    txt = render_strikeout(THREE_BLOCKS, ansi=False)
+    kept = re.sub(r"~~[^~]*~~", "", txt)
+    assert " ".join(kept.split()) == final_text(THREE_BLOCKS)
+
+
+def test_strikeout_ansi_wraps_only_struck_words():
+    from nemo.collections.speechlm2.parts.multi_front import STRIKE_OFF, STRIKE_ON, render_strikeout
+
+    txt = render_strikeout(ONE_BLOCK, ansi=True)
+    assert f"{STRIKE_ON}fax{STRIKE_OFF}" in txt
+    assert txt.count(STRIKE_ON) == 1  # "the quick brown" and "fox" are untouched
