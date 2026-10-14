@@ -141,6 +141,7 @@ class FakeModel:
         return [torch.zeros(self._n, 4)]
 
     def generate(self, audios, audio_lens, system_prompt, chunk_size_override, history_text, frame_range, **kw):
+        assert kw.get("precomputed_frames") is not None, "encoder output must be reused, not recomputed per block"
         self.calls.append({"chunk": chunk_size_override, "history": list(history_text), "range": tuple(frame_range)})
         block = frame_range[0] // 14
         src = self._auth if chunk_size_override == 14 else self._prov

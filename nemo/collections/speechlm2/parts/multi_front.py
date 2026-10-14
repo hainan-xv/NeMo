@@ -195,7 +195,12 @@ def multi_front_decode(
     if slow_chunk == fast_chunk:
         raise ValueError("fast and slow fronts must differ; identical chunk sizes give nothing to correct")
 
-    n_frames = _frame_counts(model, audios, audio_lens, slow_chunk)
+    # Encode ONCE per front and reuse it for every block. The encoder depends
+    # only on the chunk size, so re-running it per block (2 passes x N blocks)
+    # was pure waste -- 62 full encodes on a 31-block utterance instead of 2.
+    frames_fast = model.encode_frames(audios, audio_lens, fast_chunk)
+    frames_slow = model.encode_frames(audios, audio_lens, slow_chunk)
+    n_frames = [int(f.shape[0]) for f in frames_slow]
     batch = len(n_frames)
     committed: List[List[str]] = [[] for _ in range(batch)]
     fast_hist: List[List[str]] = [[] for _ in range(batch)]
@@ -217,6 +222,7 @@ def multi_front_decode(
             chunk_size_override=fast_chunk,
             history_text=fast_hist_text,
             frame_range=(lo, hi),
+            precomputed_frames=frames_fast,
             **generate_kwargs,
         )
         auth = model.generate(
@@ -226,6 +232,7 @@ def multi_front_decode(
             chunk_size_override=slow_chunk,
             history_text=slow_hist_text,
             frame_range=(lo, hi),
+            precomputed_frames=frames_slow,
             **generate_kwargs,
         )
         for b in range(batch):
@@ -241,12 +248,6 @@ def multi_front_decode(
 
 def _join(parts: Sequence[str]) -> str:
     return " ".join(p for p in parts if p).strip()
-
-
-def _frame_counts(model, audios, audio_lens, chunk: int) -> List[int]:
-    """Encoder frame count per utterance, as the decoder will see it."""
-    frames = model.encode_frames(audios, audio_lens, chunk)
-    return [int(f.shape[0]) for f in frames]
 
 
 # --------------------------------------------------------------------- display

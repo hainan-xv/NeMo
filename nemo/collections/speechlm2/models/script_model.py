@@ -1730,6 +1730,7 @@ class ScriptSTTModel(StreamingSTTModel):
         chunk_size_override: Optional[int] = None,
         history_text: Optional[Union[str, List[str]]] = None,
         frame_range: Optional[Tuple[int, int]] = None,
+        precomputed_frames: Optional[List[Tensor]] = None,
         **generation_kwargs,
     ) -> List[str]:
         """Chunk-by-chunk streaming transcription.
@@ -1755,6 +1756,12 @@ class ScriptSTTModel(StreamingSTTModel):
                 exactly the sequence it would have built itself. Used by
                 multi-front decoding to re-condition a fast front on text a
                 slower front has committed.
+            precomputed_frames: encoder output to decode, instead of encoding
+                ``audios`` again. The encoder depends only on the chunk size, so
+                a caller decoding the same utterance repeatedly at one operating
+                point (multi-front decoding walks it block by block) can encode
+                ONCE and reuse it. Must match ``chunk_size_override``, or the
+                decode silently runs on features from a different look-ahead.
             frame_range: ``(lo, hi)`` -- decode only encoder frames ``[lo, hi)``.
                 The ENCODER still runs over the whole utterance, so left context
                 is unchanged; only the decode window is narrowed. Slicing the
@@ -1818,7 +1825,11 @@ class ScriptSTTModel(StreamingSTTModel):
         force_word_start = bool(generation_kwargs.pop("force_word_start", self.core_cfg.force_word_start))
         insert_word_start_id = self._get_word_start_insert_id() if force_word_start else None
 
-        if streaming_encode:
+        if precomputed_frames is not None:
+            if streaming_encode:
+                raise ValueError("precomputed_frames and streaming_encode are mutually exclusive")
+            frames_list = precomputed_frames
+        elif streaming_encode:
             frames_list = streaming_encode_frames(self, audios, audio_lens, cs)
         else:
             frames_list = self.encode_frames(audios, audio_lens, cs)
