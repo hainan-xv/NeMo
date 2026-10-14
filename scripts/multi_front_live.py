@@ -49,9 +49,10 @@ SAMPLES_PER_FRAME = 1280  # one encoder frame = 0.08 s
 class Capture:
     """Raw 16 kHz mono PCM arriving in a queue, from a mic or a file."""
 
-    def __init__(self, wav=None, chunk_samples=2560):
+    def __init__(self, wav=None, pcm=None, chunk_samples=2560):
         self.q = queue.Queue()
         self.wav = wav
+        self.pcm = pcm
         self.chunk = chunk_samples
         self._stop = threading.Event()
         self._proc = None
@@ -59,7 +60,8 @@ class Capture:
 
     def start(self):
         self._stop.clear()
-        self._t = threading.Thread(target=self._wav_loop if self.wav else self._mic_loop, daemon=True)
+        target = self._wav_loop if self.wav else (self._pcm_loop if self.pcm else self._mic_loop)
+        self._t = threading.Thread(target=target, daemon=True)
         self._t.start()
 
     def _mic_loop(self):
@@ -74,6 +76,25 @@ class Capture:
                 break
             self.q.put(np.frombuffer(buf, dtype="<i2").astype("float32") / 32768.0)
         self._kill()
+
+    def _pcm_loop(self):
+        """Raw s16le 16 kHz mono from a file or FIFO.
+
+        This is how a REMOTE microphone reaches the model: the laptop pipes its
+        mic into a FIFO over ssh while this process reads it, leaving stdin free
+        for the ENTER that ends an utterance. Opening a FIFO blocks until the
+        writer attaches, which is the behaviour we want -- it waits for the mic.
+        """
+        import numpy as np
+
+        nbytes = self.chunk * 2
+        with open(self.pcm, "rb") as f:
+            while not self._stop.is_set():
+                buf = f.read(nbytes)
+                if not buf:
+                    break
+                self.q.put(np.frombuffer(buf, dtype="<i2").astype("float32") / 32768.0)
+        self.q.put(None)
 
     def _wav_loop(self):
         """Replay a file at REAL TIME, so timing behaves as it would live."""
@@ -150,6 +171,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--wav", default="", help="replay this file instead of the microphone")
+    ap.add_argument(
+        "--pcm",
+        default="",
+        help="read raw s16le 16kHz mono from this path (file or FIFO) -- use for a mic "
+        "piped in over ssh from another machine",
+    )
     ap.add_argument("--fast", type=int, default=2)
     ap.add_argument("--slow", type=int, default=14)
     ap.add_argument("--max_seconds", type=float, default=60.0, help="hard cap per utterance")
@@ -157,7 +184,7 @@ def main():
     ap.add_argument("--model_class", default="nemo.collections.speechlm2.models.script_model.ScriptSTTModel")
     args = ap.parse_args()
 
-    if not args.wav and not shutil.which("arecord"):
+    if not args.wav and not args.pcm and not shutil.which("arecord"):
         raise SystemExit("arecord not found -- install alsa-utils, or use --wav to replay a file")
 
     import numpy as np
@@ -209,9 +236,13 @@ def main():
     utt = 0
     while True:
         utt += 1
-        src = f"replaying {os.path.basename(args.wav)}" if args.wav else "listening"
+        src = (
+            f"replaying {os.path.basename(args.wav)}"
+            if args.wav
+            else (f"reading {args.pcm}" if args.pcm else "listening")
+        )
         print(f"--- utterance {utt} ({src}) -- speak, then press ENTER ---")
-        cap = Capture(wav=args.wav or None, chunk_samples=chunk_samples)
+        cap = Capture(wav=args.wav or None, pcm=args.pcm or None, chunk_samples=chunk_samples)
 
         stop_flag = threading.Event()
         quit_flag = threading.Event()
@@ -231,7 +262,11 @@ def main():
         blocks_done = 0
         chunks_in_block = 0
         disp.reset()
-        t0 = time.time()
+        # Clock starts on the FIRST SAMPLE, not now: the cap is a limit on how
+        # long an utterance may be, not on how long you may take to start
+        # speaking. Timing from here would expire the utterance while the user
+        # is still thinking, or while a remote writer is still attaching.
+        t0 = None
         eof = False
 
         while not stop_flag.is_set() and not eof:
@@ -254,6 +289,8 @@ def main():
                     eof = True
                     break
                 audio = np.concatenate([audio, more])
+            if t0 is None:
+                t0 = time.time()
             if time.time() - t0 > args.max_seconds:
                 break
 
@@ -313,6 +350,15 @@ def main():
         print(f"       ({len(audio)/SR:.1f}s audio, {blocks_done} full blocks)\n")
 
         if quit_flag.is_set():
+            break
+        if eof and not audio.size:
+            # The source is exhausted (file finished, FIFO writer detached, or
+            # arecord died). Re-opening it would return EOF instantly and spin
+            # out empty utterances forever -- which is exactly what it did.
+            print("audio source ended -- stopping.\n")
+            break
+        if eof and args.pcm:
+            print("PCM writer detached -- stopping.\n")
             break
         if args.wav:
             # A file ends on its own, so ask before replaying. A live mic does
