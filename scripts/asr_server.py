@@ -131,16 +131,27 @@ class Session:
         audio = np.zeros(0, dtype="float32")
         committed, blocks = "", 0
         t0 = None
+        last = time.time()
+        timed_out = False
         self.s.settimeout(1.0)
         while True:
             try:
                 buf = self.s.recv(chunk_bytes)
             except socket.timeout:
+                # A client that stops sending without closing (ffmpeg killed, ssh
+                # half-open, laptop asleep) must not pin the session open forever:
+                # that is what wedged the server and made later clients hang.
+                if time.time() - last > a_.idle_timeout:
+                    # Note it, but do not print here: the live line still has
+                    # provisional text on it and a message mid-line garbles both.
+                    timed_out = True
+                    break
                 continue
             except OSError:
                 break
             if not buf:
                 break
+            last = time.time()
             audio = np.concatenate([audio, np.frombuffer(buf, dtype="<i2").astype("float32") / 32768.0])
             if t0 is None:
                 t0 = time.time()
@@ -203,7 +214,11 @@ class Session:
                     committed = (committed + " " + auth).strip() if auth else committed
         self.update(committed, "")
         ok, diag = speech_report(audio)
-        self.send(f"\r\n\r\n[final] {committed}\r\n")
+        if timed_out:
+            self.send(f"\r\n\r\n[server] no audio for {self.a.idle_timeout:.0f}s -- utterance ended\r\n")
+            self.send(f"[final] {committed}\r\n")
+        else:
+            self.send(f"\r\n\r\n[final] {committed}\r\n")
         self.send(f"[audio] {audio.size/SR:.1f}s, {blocks} blocks\r\n")
         if diag:
             self.send(diag + "\r\n")
@@ -238,11 +253,16 @@ def serve(args):
     srv.listen(4)
     print(f"ready on {args.host}:{args.port} -- fronts {args.fast}/{args.slow}", flush=True)
     print("each connection is one utterance; the client closing its side ends it", flush=True)
-    while True:
-        conn, addr = srv.accept()
+    # One decode at a time (single GPU), but each connection gets its own thread
+    # so a wedged session cannot stop the server accepting -- a new client now
+    # waits its turn instead of hanging on a dead predecessor.
+    gpu = threading.Lock()
+
+    def handle(conn, addr):
         print(f"[{time.strftime('%H:%M:%S')}] session from {addr}", flush=True)
         try:
-            text = Session(model, conn, args, prompt_txt).run()
+            with gpu:
+                text = Session(model, conn, args, prompt_txt).run()
             print(f"[{time.strftime('%H:%M:%S')}] -> {text[:80]!r}", flush=True)
         except (ConnectionResetError, BrokenPipeError):
             print("  client went away", flush=True)
@@ -253,6 +273,10 @@ def serve(args):
                 conn.close()
             except OSError:
                 pass
+
+    while True:
+        conn, addr = srv.accept()
+        threading.Thread(target=handle, args=(conn, addr), daemon=True).start()
 
 
 def client(args):
@@ -294,6 +318,12 @@ def main():
     ap.add_argument("--fast", type=int, default=2)
     ap.add_argument("--slow", type=int, default=14)
     ap.add_argument("--max_seconds", type=float, default=120.0)
+    ap.add_argument(
+        "--idle_timeout",
+        type=float,
+        default=8.0,
+        help="end an utterance after this long with no audio, even if the client never closes",
+    )
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--model_class", default="nemo.collections.speechlm2.models.script_model.ScriptSTTModel")
     args = ap.parse_args()
