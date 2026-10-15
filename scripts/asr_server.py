@@ -301,6 +301,20 @@ class Session:
             self.send(
                 "[hint]  the transcript above is probably empty because the AUDIO is wrong, " "not the model.\r\n"
             )
+        # Close cleanly. If the socket is closed while unread audio is still in
+        # the receive buffer, Linux answers with RST instead of FIN and the
+        # client's reader dies with ECONNRESET after a perfectly good session.
+        # Shut down our write side, then drain whatever the client already sent.
+        try:
+            self.s.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+        try:
+            self.s.settimeout(2.0)
+            while self.s.recv(65536):
+                pass
+        except (OSError, socket.timeout):
+            pass
         return committed
 
 
@@ -362,7 +376,10 @@ def client(args):
 
     def pump_back():
         while True:
-            b = s.recv(4096)
+            try:
+                b = s.recv(4096)
+            except (ConnectionResetError, OSError):
+                break  # server finished and hung up; the transcript is already out
             if not b:
                 break
             sys.stdout.buffer.write(b)

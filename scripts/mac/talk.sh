@@ -95,8 +95,12 @@ while true; do
     printf '\033[2m(recording -- ENTER to finish)\033[0m\n'
 
     # -nostdin: without it ffmpeg eats the ENTER we are waiting on.
+    # We KILL ffmpeg to end the utterance, so its dying "Broken pipe" complaints
+    # are expected noise. Filter exactly those, and nothing else, so a genuine
+    # capture failure (wrong device, permission denied) still reaches you.
     ffmpeg -nostdin -f avfoundation -i "$DEV" -ar 16000 -ac 1 \
-           -af "volume=${GAIN}" -f s16le -loglevel error - > "$FIFO" &
+           -af "volume=${GAIN}" -f s16le -loglevel error - > "$FIFO" \
+        2> >(grep -vE 'Broken pipe|Error muxing|Error submitting|Terminating thread|Error writing trailer|Error closing file' >&2) &
     ff=$!
     ssh "${SSH_OPTS[@]}" "$HOST" ./asr --fast_delay "$FAST_DELAY" --slow_delay "$SLOW_DELAY" < "$FIFO" &
     ss=$!
