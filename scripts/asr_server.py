@@ -155,8 +155,47 @@ class Session:
         dev = next(m.parameters()).device
         chunk_bytes = fast * SAMPLES_PER_FRAME * 2
 
-        self.send(f"\r\n[server] listening -- fronts {fast}/{slow}, first paint {fast*0.08:.2f}s\r\n")
+        # Optional one-line preamble so the CLIENT can choose the operating point
+        # per utterance: "CFG fast_delay=0 slow_delay=3\n". Anything else is
+        # treated as audio, so older clients keep working unchanged.
+        fast_delay, slow_delay = a_.fast_delay, a_.slow_delay
+        pre = b""
+        self.s.settimeout(2.0)
+        try:
+            while b"\n" not in pre and len(pre) < 256:
+                b = self.s.recv(64)
+                if not b:
+                    break
+                pre += b
+        except (socket.timeout, OSError):
+            pass
+        head, _, rest = pre.partition(b"\n")
+        if head.startswith(b"CFG "):
+            for tok in head.decode("ascii", "replace").split()[1:]:
+                k, _, v = tok.partition("=")
+                try:
+                    iv = int(v)
+                except ValueError:
+                    continue
+                if k == "fast_delay":
+                    fast_delay = iv
+                elif k == "slow_delay":
+                    slow_delay = iv
+            leftover = rest
+        else:
+            leftover = pre  # no preamble: every byte was audio
+        fast_delay = max(0, min(a_.max_delay, fast_delay))
+        slow_delay = max(0, min(a_.max_delay, slow_delay))
+
+        self.send(
+            f"\r\n[server] fronts {fast}/{slow} frames, delays {fast_delay}/{slow_delay} "
+            f"-> first paint {(fast+fast_delay)*0.08:.2f}s, settles {(slow+slow_delay)*0.08:.2f}s\r\n"
+        )
         audio = np.zeros(0, dtype="float32")
+        if leftover:
+            if len(leftover) % 2:
+                leftover = leftover[:-1]
+            audio = np.frombuffer(leftover, dtype="<i2").astype("float32") / 32768.0
         committed, blocks = "", 0
         last_prov = ""
         t0 = None
@@ -204,6 +243,7 @@ class Session:
                         history_text=[committed],
                         frame_range=(blo, edge),
                         precomputed_frames=ff,
+                        num_delay_frames=fast_delay,
                     )[0].strip()
                 self.paint(prov)
                 last_prov = prov
@@ -218,6 +258,7 @@ class Session:
                         history_text=[committed],
                         frame_range=(blo, blo + slow),
                         precomputed_frames=sf_,
+                        num_delay_frames=slow_delay,
                     )[0].strip()
                 self.commit_block(last_prov, auth)
                 last_prov = ""
@@ -241,6 +282,7 @@ class Session:
                         history_text=[committed],
                         frame_range=(blocks * slow, total),
                         precomputed_frames=sf_,
+                        num_delay_frames=slow_delay,
                     )[0].strip()
                     self.commit_block(last_prov, auth)
                     last_prov = ""
@@ -315,6 +357,8 @@ def serve(args):
 def client(args):
     """Relay stdin -> server and server -> stdout. Used as: ssh host ./asr"""
     s = socket.create_connection((args.host, args.port))
+    # Tell the server this utterance's operating point before any audio.
+    s.sendall(f"CFG fast_delay={args.fast_delay} slow_delay={args.slow_delay}\n".encode())
 
     def pump_back():
         while True:
@@ -350,6 +394,9 @@ def main():
     ap.add_argument("--port", type=int, default=9876)
     ap.add_argument("--fast", type=int, default=2)
     ap.add_argument("--slow", type=int, default=14)
+    ap.add_argument("--fast_delay", type=int, default=3, help="emission delay (frames) for the fast front")
+    ap.add_argument("--slow_delay", type=int, default=3, help="emission delay (frames) for the slow front")
+    ap.add_argument("--max_delay", type=int, default=6, help="largest delay this checkpoint was trained on")
     ap.add_argument("--max_seconds", type=float, default=120.0)
     ap.add_argument(
         "--idle_timeout",

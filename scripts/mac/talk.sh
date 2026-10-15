@@ -56,6 +56,31 @@ pick_device() {
 }
 [ -z "$DEV" ] && DEV=$(pick_device)
 
+# --- pick emission delays ----------------------------------------------------
+# Delay is the number of frames the model waits past a word before committing to
+# it, and it ADDS to the chunk latency: first paint is (fast + fast_delay) * 80ms.
+# The fast front is provisional and gets overwritten anyway, so a small delay
+# there buys responsiveness cheaply; the slow front is what you keep, so it
+# wants the accuracy. This checkpoint trained exact delays 0-6.
+pick_delays() {
+    local d
+    echo >&2
+    echo "emission delay, in 80ms frames (0-6). Higher = more accurate, slower." >&2
+    printf '  fast front (chunk %s) delay [%s]: ' "${FAST:-2}" "${FAST_DELAY_DEFAULT:-0}" >&2
+    read -r d </dev/tty; FAST_DELAY=${d:-${FAST_DELAY_DEFAULT:-0}}
+    printf '  slow front (chunk %s) delay [%s]: ' "${SLOW:-14}" "${SLOW_DELAY_DEFAULT:-3}" >&2
+    read -r d </dev/tty; SLOW_DELAY=${d:-${SLOW_DELAY_DEFAULT:-3}}
+    for d in "$FAST_DELAY" "$SLOW_DELAY"; do
+        case "$d" in
+            ''|*[!0-9]*) echo "delay must be a number 0-6, got '$d'" >&2; exit 1 ;;
+        esac
+        [ "$d" -gt 6 ] && { echo "delay $d was never trained (max 6)" >&2; exit 1; }
+    done
+    awk -v f="${FAST:-2}" -v fd="$FAST_DELAY" -v s="${SLOW:-14}" -v sd="$SLOW_DELAY" \
+        'BEGIN{printf "  -> first paint %.2fs, settles every %.2fs\n",(f+fd)*0.08,(s+sd)*0.08}' >&2
+}
+[ -z "${FAST_DELAY:-}" ] && pick_delays
+
 SSH_OPTS=(-i "$KEY" -o ControlMaster=auto -o ControlPath=/tmp/asrctl-%r@%h:%p -o ControlPersist=300)
 FIFO=$(mktemp -u /tmp/asrmic.XXXXXX)
 mkfifo "$FIFO"
@@ -73,7 +98,7 @@ while true; do
     ffmpeg -nostdin -f avfoundation -i "$DEV" -ar 16000 -ac 1 \
            -af "volume=${GAIN}" -f s16le -loglevel error - > "$FIFO" &
     ff=$!
-    ssh "${SSH_OPTS[@]}" "$HOST" ./asr < "$FIFO" &
+    ssh "${SSH_OPTS[@]}" "$HOST" ./asr --fast_delay "$FAST_DELAY" --slow_delay "$SLOW_DELAY" < "$FIFO" &
     ss=$!
 
     read -r _ || true                 # second ENTER ends the utterance
