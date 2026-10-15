@@ -50,6 +50,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SR = 16000
 SAMPLES_PER_FRAME = 1280
 
+DIM = "\033[2m"
+STRIKE = "\033[9;2m"
+RESET = "\033[0m"
+BOLD = "\033[1m"
+
 
 def speech_report(a):
     """Does this look like speech? Returns (ok, one-line diagnosis)."""
@@ -87,8 +92,9 @@ class Session:
 
     def __init__(self, model, sock, args, prompt_txt):
         self.m, self.s, self.a, self.p = model, sock, args, prompt_txt
-        self.printed = self.col = 0
-        self.shown = ""
+        self.col = 0
+        self.shown = ""  # provisional text currently on screen
+        self.vis = 0  # its printable length (excludes ANSI escapes)
 
     def send(self, text):
         try:
@@ -96,24 +102,46 @@ class Session:
         except OSError:
             raise ConnectionResetError
 
-    def update(self, committed, provisional):
+    def paint(self, provisional):
+        """Show the fast front's current guess. Erasable until the block closes."""
         buf = ""
         if self.shown:
-            buf += "\b" * len(self.shown) + " " * len(self.shown) + "\b" * len(self.shown)
-            self.col -= len(self.shown)
-            self.shown = ""
-        tail = committed[self.printed :]
-        if tail:
-            buf += tail
-            self.printed = len(committed)
-            self.col += len(tail)
+            buf += "\b" * self.vis + " " * self.vis + "\b" * self.vis
+            self.col -= self.vis
+            self.shown, self.vis = "", 0
         if provisional:
-            if self.col + len(provisional) + 1 > 96:
-                buf += "\n"
+            if self.col + len(provisional) + 1 > 92:
+                buf += "\r\n"
                 self.col = 0
-            piece = (" " if self.col and not provisional.startswith(" ") else "") + provisional
-            buf += piece
-            self.shown = piece
+            piece = (" " if self.col else "") + provisional
+            buf += DIM + piece + RESET
+            self.shown, self.vis = piece, len(piece)
+            self.col += len(piece)
+        if buf:
+            self.send(buf)
+
+    def commit_block(self, provisional, final):
+        """Freeze a block: wrong words stay, crossed out; the fix follows.
+
+        The provisional text is erased and immediately re-drawn rather than
+        simply overwritten, because it has to change colour -- struck-through
+        for what the slow front rejected, normal for what it kept. The net
+        effect on screen is append-only: nothing the model showed you
+        disappears, so the self-correction stays readable.
+        """
+        from nemo.collections.speechlm2.parts.multi_front import strike_markup
+
+        buf = ""
+        if self.shown:
+            buf += "\b" * self.vis + " " * self.vis + "\b" * self.vis
+            self.col -= self.vis
+            self.shown, self.vis = "", 0
+        for text, struck in strike_markup(provisional, final):
+            if self.col + len(text) + 1 > 92:
+                buf += "\r\n"
+                self.col = 0
+            piece = (" " if self.col else "") + text
+            buf += (STRIKE + piece + RESET) if struck else piece
             self.col += len(piece)
         if buf:
             self.send(buf)
@@ -130,6 +158,7 @@ class Session:
         self.send(f"\r\n[server] listening -- fronts {fast}/{slow}, first paint {fast*0.08:.2f}s\r\n")
         audio = np.zeros(0, dtype="float32")
         committed, blocks = "", 0
+        last_prov = ""
         t0 = None
         last = time.time()
         timed_out = False
@@ -176,7 +205,8 @@ class Session:
                         frame_range=(blo, edge),
                         precomputed_frames=ff,
                     )[0].strip()
-                self.update(committed, prov)
+                self.paint(prov)
+                last_prov = prov
             while avail >= blo + slow:
                 with torch.inference_mode():
                     sf_ = m.encode_frames(t, n, slow)
@@ -189,10 +219,11 @@ class Session:
                         frame_range=(blo, blo + slow),
                         precomputed_frames=sf_,
                     )[0].strip()
+                self.commit_block(last_prov, auth)
+                last_prov = ""
                 committed = (committed + " " + auth).strip() if auth else committed
                 blocks += 1
                 blo = blocks * slow
-                self.update(committed, "")
 
         # Flush the tail through the slow front so the result is authoritative.
         if audio.size:
@@ -211,14 +242,16 @@ class Session:
                         frame_range=(blocks * slow, total),
                         precomputed_frames=sf_,
                     )[0].strip()
+                    self.commit_block(last_prov, auth)
+                    last_prov = ""
                     committed = (committed + " " + auth).strip() if auth else committed
-        self.update(committed, "")
+        if last_prov:
+            self.commit_block(last_prov, last_prov)
         ok, diag = speech_report(audio)
+        self.send("\r\n\r\n" + "-" * 72 + "\r\n")
         if timed_out:
-            self.send(f"\r\n\r\n[server] no audio for {self.a.idle_timeout:.0f}s -- utterance ended\r\n")
-            self.send(f"[final] {committed}\r\n")
-        else:
-            self.send(f"\r\n\r\n[final] {committed}\r\n")
+            self.send(f"[server] no audio for {self.a.idle_timeout:.0f}s -- utterance ended\r\n")
+        self.send(f"{BOLD}{committed}{RESET}\r\n")
         self.send(f"[audio] {audio.size/SR:.1f}s, {blocks} blocks\r\n")
         if diag:
             self.send(diag + "\r\n")
