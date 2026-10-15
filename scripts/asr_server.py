@@ -129,7 +129,17 @@ class Session:
         effect on screen is append-only: nothing the model showed you
         disappears, so the self-correction stays readable.
         """
-        from nemo.collections.speechlm2.parts.multi_front import strike_markup
+        from nemo.collections.speechlm2.parts.multi_front import Block, _deferred_tail, strike_markup
+
+        # A trailing deletion is a DEFERRAL, not a rejection: the slow front moved
+        # the word into the next block and it will be repainted there. Striking it
+        # out claims the model got a word wrong that was always right -- which is
+        # how "supposed" came to look like an error. Drop it and let the next
+        # block paint it, so strikethrough means "actually rejected".
+        deferred = _deferred_tail(Block(provisional, final))
+        if deferred:
+            keep = provisional.split()[: len(provisional.split()) - len(deferred)]
+            provisional = " ".join(keep)
 
         buf = ""
         if self.shown:

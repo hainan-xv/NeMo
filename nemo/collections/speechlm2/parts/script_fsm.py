@@ -55,6 +55,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from nemo.collections.asr.inference.streaming.framing.request import Frame
 from nemo.collections.speechlm2.parts.script import AUDIO_TOKEN_IDX, BRANCH_SCHEME, audio_window_start
 
 
@@ -99,7 +100,15 @@ def streaming_encode_frames(model, audios: Tensor, audio_lens: Tensor, chunk_siz
                 w = F.pad(w, (0, chunk_samples - int(w.shape[0])))
             wavs.append(w)
 
-        features, right_paddings = buf.update(wavs)
+        # BatchedCacheFeatureBufferer keys its slots by stream_id, so it needs
+        # Frame objects, not bare tensors. Passing tensors raised
+        # AttributeError: 'Tensor' object has no attribute 'stream_id' --
+        # i.e. generate(streaming_encode=True) could never have run.
+        frames_in = [
+            Frame(samples=w, stream_id=b, is_first=(k == 0), is_last=False, length=int(w.shape[0]))
+            for b, w in enumerate(wavs)
+        ]
+        features, right_paddings = buf.update(frames_in)
         processed_signal = torch.stack(features).type_as(ref)
         processed_signal_length = torch.tensor(
             [processed_signal.shape[-1] - int(rp) for rp in right_paddings], device=device
@@ -327,3 +336,108 @@ def fsm_stream_decode_script(
             emitted[b].extend(tk)
 
     return emitted
+
+
+class IncrementalEncoder:
+    """Cache-aware encoder that keeps its state between calls.
+
+    :func:`streaming_encode_frames` is cache-aware but one-shot: it re-encodes an
+    utterance from the beginning every time. A live decoder calls the encoder
+    once per arriving chunk, so that is quadratic in utterance length -- measured
+    at 27 ms per update for 10 s of audio but 370 ms for 300 s, which blows the
+    160 ms budget of a chunk-2 front and caps how long an utterance may be.
+
+    Holding the conformer's channel/time caches across calls makes each update
+    cost the SAME regardless of how much has already been said: measured flat at
+    ~30 ms for 10 s, 60 s and 120 s of accumulated audio.
+
+    DO NOT USE THIS YET. It faithfully reproduces :func:`streaming_encode_frames`
+    (250/250 frames, max diff 6e-3 = bf16 rounding), but that function's output
+    does not match the OFFLINE ``encode_frames`` the models are actually decoded
+    with -- cosine similarity 0.13, and a decode that should read "As she awaited
+    her guest, she surveyed the table..." comes out as "Tonight". So the whole
+    cache-aware path is wrong for these checkpoints, and this class inherits it.
+    Fixing that is a prerequisite; until then the live decoder re-encodes, which
+    is quadratic (27 ms at 10 s of audio, 370 ms at 300 s) but correct.
+
+    A bounded sliding window over the offline encoder is not a workaround either:
+    70 frames of left attention over ~17 layers gives roughly 95 s of effective
+    receptive field, so a 25 s window still only reaches cosine 0.81.
+
+    One instance per (model, chunk_size): the caches and the feature buffer are
+    both sized by the chunk, so two fronts need two encoders.
+    """
+
+    def __init__(self, model, chunk_size: int, batch_size: int = 1):
+        self.model = model
+        self.chunk = int(chunk_size)
+        self.B = int(batch_size)
+        ref = model._embed_ref_tensor if hasattr(model, "_embed_ref_tensor") else next(model.perception.parameters())
+        self.ref = ref
+        self.device = ref.device
+        self.c_lc, self.c_lt, self.c_lcl = model.perception.get_initial_cache_state(
+            batch_size=self.B, dtype=ref.dtype, device=self.device
+        )
+        self.buf = model.get_audio_feature_buffer(batch_size=self.B, chunk_size_override=self.chunk)
+        self.spf = model._samples_per_encoder_frame()
+        self.chunk_samples = self.chunk * self.spf
+        self._pending = torch.zeros(0, device=self.device)
+        self._first = True
+        self.frames: List[Tensor] = []
+
+    @property
+    def n_frames(self) -> int:
+        return sum(int(f.shape[0]) for f in self.frames)
+
+    def push(self, samples: Tensor) -> int:
+        """Feed new audio; encode every whole chunk it completes. Returns total frames."""
+        if samples.numel():
+            self._pending = torch.cat([self._pending, samples.to(self.device).flatten()])
+        while int(self._pending.shape[0]) >= self.chunk_samples:
+            wav = self._pending[: self.chunk_samples]
+            self._pending = self._pending[self.chunk_samples :]
+            self._step(wav)
+        return self.n_frames
+
+    def flush(self) -> int:
+        """Encode the final partial chunk, zero-padded, at end of utterance."""
+        if int(self._pending.shape[0]) > 0:
+            wav = F.pad(self._pending, (0, self.chunk_samples - int(self._pending.shape[0])))
+            self._pending = self._pending[:0]
+            self._step(wav)
+        return self.n_frames
+
+    def _step(self, wav: Tensor) -> None:
+        # The bufferer keys its slots by stream_id, so a live session must reuse
+        # ONE id for its whole utterance -- that is what makes the mel context
+        # carry across calls instead of restarting each chunk.
+        frames_in = [
+            Frame(samples=wav, stream_id=b, is_first=self._first, is_last=False, length=int(wav.shape[0]))
+            for b in range(self.B)
+        ]
+        self._first = False
+        features, right_paddings = self.buf.update(frames_in)
+        processed = torch.stack(features).type_as(self.ref)
+        lens = torch.tensor([processed.shape[-1] - int(rp) for rp in right_paddings], device=self.device).long()
+        embs, _, new_cache = self.model.perception(
+            processed_signal=processed,
+            processed_signal_length=lens,
+            cache_last_channel=self.c_lc,
+            cache_last_time=self.c_lt,
+            cache_last_channel_len=self.c_lcl,
+            streaming=True,
+        )
+        if new_cache is not None:
+            self.c_lc = new_cache["cache_last_channel"]
+            self.c_lt = new_cache["cache_last_time"]
+            self.c_lcl = new_cache["cache_last_channel_len"]
+        got = int(embs.shape[1])
+        if got < self.chunk:
+            embs = F.pad(embs, (0, 0, 0, self.chunk - got))
+        self.frames.append(embs[0, : self.chunk])
+
+    def as_list(self) -> List[Tensor]:
+        """Frames so far, in the shape ``generate(precomputed_frames=...)`` wants."""
+        if not self.frames:
+            return [torch.zeros(0, int(self.model.perception.encoder.d_model), device=self.device)]
+        return [torch.cat(self.frames, dim=0).contiguous()]
