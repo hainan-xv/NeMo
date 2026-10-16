@@ -1,0 +1,142 @@
+<!doctype html>
+<!-- Browser front-end for the self-correcting SCRIPT demo.
+     Served by scripts/asr_web.py together with its WebSocket on one port. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>SCRIPT — self-correcting streaming ASR</title>
+<style>
+  :root { --bg:#14161a; --fg:#e9ecf1; --mut:#8b93a1; --accent:#76b900; --bad:#ff6b6b; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+  header { padding:18px 28px; border-bottom:1px solid #262a31; display:flex; align-items:center; gap:18px; flex-wrap:wrap; }
+  h1 { font-size:17px; margin:0; font-weight:600; letter-spacing:.2px; }
+  .controls { display:flex; align-items:center; gap:10px; margin-left:auto; flex-wrap:wrap; }
+  label { color:var(--mut); font-size:13px; }
+  select { background:#1d2026; color:var(--fg); border:1px solid #30353e; border-radius:6px; padding:5px 8px; font-size:13px; }
+  button { border:0; border-radius:999px; padding:11px 26px; font-size:15px; font-weight:600; cursor:pointer;
+           background:var(--accent); color:#0d0f12; transition:background .15s, transform .05s; }
+  button:active { transform:scale(.98); }
+  button.rec { background:var(--bad); color:#fff; }
+  button:disabled { background:#333842; color:#6b7280; cursor:default; }
+  #dot { width:9px; height:9px; border-radius:50%; background:#444; display:inline-block; margin-right:7px; vertical-align:middle; }
+  #dot.on { background:var(--bad); animation:pulse 1.1s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.25} }
+  main { padding:28px; max-width:980px; }
+  #out { font-size:23px; line-height:1.7; min-height:220px; white-space:pre-wrap; word-wrap:break-word; }
+  .struck { text-decoration:line-through; text-decoration-thickness:2px; color:var(--mut); }
+  .prov { color:var(--mut); }
+  #final { margin-top:26px; padding-top:18px; border-top:1px solid #262a31; font-size:18px; display:none; }
+  #final .lbl { color:var(--mut); font-size:12px; text-transform:uppercase; letter-spacing:.9px; margin-bottom:8px; }
+  #log { margin-top:18px; color:var(--mut); font:12.5px/1.65 ui-monospace,SFMono-Regular,Menlo,monospace; white-space:pre-wrap; }
+  .hint { color:var(--mut); font-size:13px; }
+</style>
+</head>
+<body>
+<header>
+  <h1><span id="dot"></span>SCRIPT — self-correcting streaming ASR</h1>
+  <div class="controls">
+    <label>fast</label><select id="fast"></select>
+    <label>slow</label><select id="slow"></select>
+    <label>delay</label><select id="fdelay"></select><span class="hint">/</span><select id="sdelay"></select>
+    <button id="rec">Record</button>
+  </div>
+</header>
+<main>
+  <div id="out"><span class="hint">Press Record and speak. Provisional words appear greyed; when the slow front
+overrules them they are crossed out and replaced.</span></div>
+  <div id="final"><div class="lbl">final transcript</div><div id="finaltext"></div></div>
+  <div id="log"></div>
+</main>
+<script>
+const $ = s => document.querySelector(s);
+const out = $('#out'), logEl = $('#log'), recBtn = $('#rec'), dot = $('#dot');
+let ws=null, ctx=null, node=null, stream=null, recording=false, provSpan=null, started=false;
+
+// The checkpoint's trained operating points. A value outside these decodes at a
+// point the model never saw -- it still produces fluent text, which is the
+// dangerous part, so they are not free-form inputs.
+const CHUNKS=[2,7,14,28,42], DELAYS=[0,1,2,3,4];
+function fill(sel, vals, def){ vals.forEach(v=>{const o=document.createElement('option');o.value=v;o.textContent=v;if(v===def)o.selected=true;sel.appendChild(o);}); }
+fill($('#fast'),CHUNKS,2); fill($('#slow'),CHUNKS,28); fill($('#fdelay'),DELAYS,1); fill($('#sdelay'),DELAYS,3);
+
+function log(t){ logEl.textContent += t + "\n"; }
+function clearOut(){ out.textContent=''; provSpan=null; $('#final').style.display='none'; logEl.textContent=''; }
+
+function setProv(text){
+  if(!provSpan){ provSpan=document.createElement('span'); provSpan.className='prov'; out.appendChild(provSpan); }
+  provSpan.textContent = text ? (out.textContent && !provSpan.textContent ? ' ' : '') + text : '';
+}
+function commit(segs){
+  if(provSpan){ provSpan.remove(); provSpan=null; }
+  for(const [text,struck] of segs){
+    const sp=document.createElement('span');
+    if(struck) sp.className='struck';
+    sp.textContent=(out.textContent.length? ' ':'')+text;
+    out.appendChild(sp);
+  }
+  window.scrollTo(0,document.body.scrollHeight);
+}
+
+async function start(){
+  clearOut(); started=false;
+  stream = await navigator.mediaDevices.getUserMedia({audio:{
+    channelCount:1, echoCancellation:true, noiseSuppression:true, autoGainControl:true}});
+  // Ask for 16 kHz directly where supported; otherwise resample below.
+  ctx = new (window.AudioContext||window.webkitAudioContext)({sampleRate:16000});
+  const src = ctx.createMediaStreamSource(stream);
+  node = ctx.createScriptProcessor(2048,1,1);
+  const proto = location.protocol==='https:'?'wss':'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws`);
+  ws.binaryType='arraybuffer';
+  ws.onopen = ()=>{
+    ws.send(JSON.stringify({fast:+$('#fast').value, slow:+$('#slow').value,
+                            fast_delay:+$('#fdelay').value, slow_delay:+$('#sdelay').value}));
+    src.connect(node); node.connect(ctx.destination);
+  };
+  ws.onmessage = e=>{
+    const m = JSON.parse(e.data);
+    if(m.t==='prov') setProv(m.text);
+    else if(m.t==='commit') commit(m.segs);
+    else if(m.t==='log'){
+      // The first non-bracketed line after the banner is the final transcript.
+      if(m.text.startsWith('[')) log(m.text);
+      else { $('#final').style.display='block'; $('#finaltext').textContent += m.text + ' '; }
+    } else if(m.t==='done') stop(true);
+  };
+  node.onaudioprocess = ev=>{
+    if(!recording || !ws || ws.readyState!==1) return;
+    const f = ev.inputBuffer.getChannelData(0);
+    const need = ctx.sampleRate===16000 ? f : resample(f, ctx.sampleRate, 16000);
+    const pcm = new Int16Array(need.length);
+    for(let i=0;i<need.length;i++){ const s=Math.max(-1,Math.min(1,need[i])); pcm[i]=s<0?s*0x8000:s*0x7fff; }
+    ws.send(pcm.buffer);
+  };
+  recording=true; started=true;
+  recBtn.textContent='Stop'; recBtn.classList.add('rec'); dot.classList.add('on');
+}
+
+// Linear resample: only used when the browser refuses a 16 kHz AudioContext
+// (Safari). Good enough for speech and avoids pulling in a library.
+function resample(buf, from, to){
+  const ratio=from/to, n=Math.floor(buf.length/ratio), o=new Float32Array(n);
+  for(let i=0;i<n;i++){ const p=i*ratio, j=Math.floor(p), f=p-j;
+    o[i]=buf[j]*(1-f)+(buf[Math.min(j+1,buf.length-1)])*f; }
+  return o;
+}
+
+function stop(fromServer){
+  recording=false;
+  recBtn.textContent='Record'; recBtn.classList.remove('rec'); dot.classList.remove('on');
+  try{ if(node){node.disconnect(); node.onaudioprocess=null;} }catch(e){}
+  try{ if(stream) stream.getTracks().forEach(t=>t.stop()); }catch(e){}
+  try{ if(ctx) ctx.close(); }catch(e){}
+  if(!fromServer && ws && ws.readyState===1) ws.send(JSON.stringify({t:'stop'}));
+  node=null; stream=null; ctx=null;
+}
+
+recBtn.onclick = ()=>{ if(recording) stop(false); else start().catch(e=>{ log('mic error: '+e.message); stop(false); }); };
+document.addEventListener('keydown', e=>{ if(e.code==='Space' && e.target===document.body){ e.preventDefault(); recBtn.click(); }});
+</script>
+</body>
+</html>
