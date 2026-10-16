@@ -141,14 +141,17 @@ class Session:
             buf += "\b" * self.vis + CLEAR_LINE
             self.vis = 0
         if provisional:
-            if self.col and self.col + 1 + len(provisional) > self.cols:
-                buf += "\r\n"
-                self.col = 0
+            # NEVER break the line for the provisional. The break would be
+            # permanent while the text is transient, so the committed transcript
+            # ended up wrapping at 35-55 columns instead of filling the width --
+            # line breaks were being decided by the fast front's length. Only
+            # commit_block, which writes permanent text, may wrap.
             avail = self.cols - self.col - (1 if self.col else 0)
-            text = provisional if len(provisional) <= avail else "..." + provisional[-(avail - 3) :]
-            piece = (" " if self.col else "") + text
-            buf += DIM + piece + RESET
-            self.vis = len(piece)  # on-screen length, so we can back over it
+            if avail >= 8:
+                text = provisional if len(provisional) <= avail else "..." + provisional[-(avail - 3) :]
+                piece = (" " if self.col else "") + text
+                buf += DIM + piece + RESET
+                self.vis = len(piece)  # on-screen length, so we can back over it
         if buf:
             self.send(buf)
 
