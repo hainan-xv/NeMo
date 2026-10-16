@@ -214,6 +214,36 @@ class Session:
         if buf:
             self.send(buf)
 
+    def emit_final(self, text, audio_s, blocks, diag, ok, timed_out):
+        """Render the end-of-utterance summary. Overridden by the web front-end.
+
+        A named hook rather than a pile of send() calls: the browser needs the
+        transcript and the diagnostics as SEPARATE things, and classifying them
+        by eye ("lines starting with [ are meta") put the speech-band line
+        inside the transcript box.
+        """
+        self.send("\r\n\r\n" + "-" * 72 + "\r\n")
+        if timed_out:
+            self.send(f"[server] no audio for {self.a.idle_timeout:.0f}s -- utterance ended\r\n")
+        words, line, lines = text.split(), "", []
+        for w in words:
+            if line and len(line) + 1 + len(w) > self.cols:
+                lines.append(line)
+                line = w
+            else:
+                line = f"{line} {w}" if line else w
+        if line:
+            lines.append(line)
+        for ln in lines or [""]:
+            self.send(f"{BOLD}{ln}{RESET}\r\n")
+        self.send(f"[audio] {audio_s:.1f}s, {blocks} blocks\r\n")
+        if diag:
+            self.send(diag + "\r\n")
+        if not ok:
+            self.send(
+                "[hint]  the transcript above is probably empty because the AUDIO is wrong, " "not the model.\r\n"
+            )
+
     def run(self):
         import numpy as np
         import torch
@@ -409,30 +439,7 @@ class Session:
         if last_prov:
             self.commit_block(last_prov, last_prov)
         ok, diag = speech_report(audio)
-        self.send("\r\n\r\n" + "-" * 72 + "\r\n")
-        if timed_out:
-            self.send(f"[server] no audio for {self.a.idle_timeout:.0f}s -- utterance ended\r\n")
-        # Wrap the final transcript too. It is the line most likely to be copied
-        # out, and an unwrapped 400-character line gets SOFT-wrapped by the
-        # terminal -- which copies without a space and glues words together.
-        words, line, lines = committed.split(), "", []
-        for w in words:
-            if line and len(line) + 1 + len(w) > self.cols:
-                lines.append(line)
-                line = w
-            else:
-                line = f"{line} {w}" if line else w
-        if line:
-            lines.append(line)
-        for ln in lines or [""]:
-            self.send(f"{BOLD}{ln}{RESET}\r\n")
-        self.send(f"[audio] {audio.size/SR:.1f}s, {blocks} blocks\r\n")
-        if diag:
-            self.send(diag + "\r\n")
-        if not ok:
-            self.send(
-                "[hint]  the transcript above is probably empty because the AUDIO is wrong, " "not the model.\r\n"
-            )
+        self.emit_final(committed, audio.size / SR, blocks, diag, ok, timed_out)
         # Close cleanly. If the socket is closed while unread audio is still in
         # the receive buffer, Linux answers with RST instead of FIN and the
         # client's reader dies with ECONNRESET after a perfectly good session.

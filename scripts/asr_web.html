@@ -30,6 +30,8 @@
   #final .lbl { color:var(--mut); font-size:12px; text-transform:uppercase; letter-spacing:.9px; margin-bottom:8px; }
   #log { margin-top:18px; color:var(--mut); font:12.5px/1.65 ui-monospace,SFMono-Regular,Menlo,monospace; white-space:pre-wrap; }
   .hint { color:var(--mut); font-size:13px; }
+  button.mini { padding:3px 11px; font-size:11px; font-weight:500; background:#2a2f38; color:var(--mut); margin-left:10px; }
+  button.mini:hover { background:#333942; color:var(--fg); }
 </style>
 </head>
 <body>
@@ -46,7 +48,10 @@
 <main>
   <div id="out"><span class="hint">Press Record and speak. Provisional words appear greyed; when the slow front
 overrules them they are crossed out and replaced.</span></div>
-  <div id="final"><div class="lbl">final transcript</div><div id="finaltext"></div></div>
+  <div id="final">
+    <div class="lbl">final transcript <button id="copy" class="mini">copy</button></div>
+    <div id="finaltext"></div>
+  </div>
   <div id="log"></div>
 </main>
 <script>
@@ -125,11 +130,16 @@ async function start(){
     const m = JSON.parse(e.data);
     if(m.t==='prov') setProv(m.text);
     else if(m.t==='commit') commit(m.segs);
-    else if(m.t==='log'){
-      // The first non-bracketed line after the banner is the final transcript.
-      if(m.text.startsWith('[')) log(m.text);
-      else { $('#final').style.display='block'; $('#finaltext').textContent += m.text + ' '; }
-    } else if(m.t==='done') stop(true);
+    else if(m.t==='log') log(m.text);
+    else if(m.t==='final'){
+      $('#final').style.display='block';
+      $('#finaltext').textContent = m.text;
+      log(`[audio] ${m.audio_s}s, ${m.blocks} blocks`);
+      if(m.timed_out) log('[server] ended on silence');
+      if(m.diag) log(m.diag);
+      if(!m.ok) log('[hint] the transcript is probably wrong because of the AUDIO, not the model');
+    }
+    else if(m.t==='done') stop(true);
   };
   node.onaudioprocess = ev=>{
     if(!recording || !ws || ws.readyState!==1) return;
@@ -162,6 +172,10 @@ function stop(fromServer){
   node=null; stream=null; ctx=null;
 }
 
+$('#copy').onclick = ()=>{
+  navigator.clipboard.writeText($('#finaltext').textContent.trim())
+    .then(()=>{ const b=$('#copy'); b.textContent='copied'; setTimeout(()=>b.textContent='copy',1200); });
+};
 recBtn.onclick = ()=>{ if(recording) stop(false); else start().catch(e=>{ log('mic error: '+e.message); stop(false); }); };
 document.addEventListener('keydown', e=>{ if(e.code==='Space' && e.target===document.body){ e.preventDefault(); recBtn.click(); }});
 </script>

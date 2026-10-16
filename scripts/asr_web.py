@@ -120,6 +120,19 @@ class WebSession(Session):
             if s and set(s) != {"-"}:
                 self.emit({"t": "log", "text": s})
 
+    def emit_final(self, text, audio_s, blocks, diag, ok, timed_out):
+        self.emit(
+            {
+                "t": "final",
+                "text": text,
+                "audio_s": round(audio_s, 1),
+                "blocks": blocks,
+                "diag": diag.strip(),
+                "ok": bool(ok),
+                "timed_out": bool(timed_out),
+            }
+        )
+
     def paint(self, provisional):
         self.emit({"t": "prov", "text": provisional})
 
