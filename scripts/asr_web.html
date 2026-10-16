@@ -92,7 +92,11 @@ function clearOut(){ out.textContent=''; provSpan=null; $('#final').style.displa
 
 function setProv(text){
   if(!provSpan){ provSpan=document.createElement('span'); provSpan.className='prov'; out.appendChild(provSpan); }
-  provSpan.textContent = text ? (out.textContent && !provSpan.textContent ? ' ' : '') + text : '';
+  // Measure the COMMITTED text only. out.textContent includes the provisional
+  // span itself, so testing it directly made the leading space appear on the
+  // first paint and vanish on every repaint after it.
+  const committedLen = out.textContent.length - provSpan.textContent.length;
+  provSpan.textContent = text ? (committedLen ? ' ' : '') + text : '';
 }
 function commit(segs){
   if(provSpan){ provSpan.remove(); provSpan=null; }
