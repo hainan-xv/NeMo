@@ -36,6 +36,7 @@
 <header>
   <h1><span id="dot"></span>SCRIPT — self-correcting streaming ASR</h1>
   <div class="controls">
+    <label>mic</label><select id="mic"><option value="">default</option></select>
     <label>fast</label><select id="fast"></select>
     <label>slow</label><select id="slow"></select>
     <label>delay</label><select id="fdelay"></select><span class="hint">/</span><select id="sdelay"></select>
@@ -61,6 +62,27 @@ function fill(sel, vals, def){ vals.forEach(v=>{const o=document.createElement('
 fill($('#fast'),CHUNKS,2); fill($('#slow'),CHUNKS,28); fill($('#fdelay'),DELAYS,1); fill($('#sdelay'),DELAYS,3);
 
 function log(t){ logEl.textContent += t + "\n"; }
+
+// Device labels are hidden until the user has granted mic permission at least
+// once, so the list starts as "default" and is refilled after the first Record.
+async function listMics(){
+  try{
+    const devs = await navigator.mediaDevices.enumerateDevices();
+    const ins = devs.filter(d=>d.kind==='audioinput');
+    const sel = $('#mic'), cur = sel.value;
+    sel.innerHTML = '<option value="">default</option>';
+    ins.forEach((d,i)=>{
+      const o=document.createElement('option');
+      o.value=d.deviceId;
+      o.textContent=d.label || `microphone ${i+1}`;
+      sel.appendChild(o);
+    });
+    if([...sel.options].some(o=>o.value===cur)) sel.value=cur;
+  }catch(e){ log('could not list microphones: '+e.message); }
+}
+listMics();
+if(navigator.mediaDevices && navigator.mediaDevices.addEventListener)
+  navigator.mediaDevices.addEventListener('devicechange', listMics);
 function clearOut(){ out.textContent=''; provSpan=null; $('#final').style.display='none'; logEl.textContent=''; }
 
 function setProv(text){
@@ -80,8 +102,13 @@ function commit(segs){
 
 async function start(){
   clearOut(); started=false;
-  stream = await navigator.mediaDevices.getUserMedia({audio:{
-    channelCount:1, echoCancellation:true, noiseSuppression:true, autoGainControl:true}});
+  const micId = $('#mic').value;
+  const audioCfg = {channelCount:1, echoCancellation:true, noiseSuppression:true, autoGainControl:true};
+  if(micId) audioCfg.deviceId = {exact: micId};
+  stream = await navigator.mediaDevices.getUserMedia({audio: audioCfg});
+  listMics();   // labels become readable once permission has been granted
+  const track = stream.getAudioTracks()[0];
+  if(track) log('mic: ' + (track.label || 'unnamed'));
   // Ask for 16 kHz directly where supported; otherwise resample below.
   ctx = new (window.AudioContext||window.webkitAudioContext)({sampleRate:16000});
   const src = ctx.createMediaStreamSource(stream);
