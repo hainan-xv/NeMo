@@ -124,9 +124,12 @@ while true; do
     # capture failure (wrong device, permission denied) still reaches you.
     ffmpeg -nostdin -f avfoundation -i "$DEV" -ar 16000 -ac 1 \
            -af "volume=${GAIN}" -f s16le -loglevel error - > "$FIFO" \
-        2> >(grep -vE 'Broken pipe|Error muxing|Error submitting|Terminating thread|Error writing trailer|Error closing file' >&2) &
+        2> >(grep -vE 'Broken pipe|Error muxing|Error submitting|Terminating thread|Error writing trailer|Error closing file|Last message repeated' >&2) &
     ff=$!
+    # Pass the REAL terminal width so the server wraps to it. Wrapping wider
+    # lets the terminal soft-wrap first, and soft wraps copy without a space.
     ssh "${SSH_OPTS[@]}" "$HOST" ./asr --fast "$FAST" --slow "$SLOW" \
+        --cols "$(tput cols 2>/dev/null || echo 80)" \
         --fast_delay "$FAST_DELAY" --slow_delay "$SLOW_DELAY" < "$FIFO" &
     ss=$!
 

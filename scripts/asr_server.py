@@ -109,6 +109,7 @@ class Session:
 
     def __init__(self, model, sock, args, prompt_txt):
         self.m, self.s, self.a, self.p = model, sock, args, prompt_txt
+        self.cols = 88
         self.col = 0
         self.shown = ""  # provisional text currently on screen
         self.vis = 0  # its printable length (excludes ANSI escapes)
@@ -127,7 +128,7 @@ class Session:
             self.col -= self.vis
             self.shown, self.vis = "", 0
         if provisional:
-            if self.col + len(provisional) + 1 > 92:
+            if self.col + len(provisional) + 1 > self.cols:
                 buf += "\r\n"
                 self.col = 0
             piece = (" " if self.col else "") + provisional
@@ -164,7 +165,7 @@ class Session:
             self.col -= self.vis
             self.shown, self.vis = "", 0
         for text, is_struck in strike_markup(provisional, final):
-            if self.col + len(text) + 1 > 92:
+            if self.col + len(text) + 1 > self.cols:
                 buf += "\r\n"
                 self.col = 0
             piece = (" " if self.col else "") + text
@@ -186,6 +187,10 @@ class Session:
         # Anything else is treated as audio, so older clients keep working.
         fast, slow = a_.fast, a_.slow
         fast_delay, slow_delay = a_.fast_delay, a_.slow_delay
+        # The CLIENT's terminal width. Wrapping wider than the real terminal lets
+        # IT soft-wrap first, and a soft wrap is copied without a space -- which
+        # is how "streaming fashion" came out as "streamingfashion".
+        cols = a_.cols
         pre = b""
         self.s.settimeout(2.0)
         try:
@@ -212,6 +217,8 @@ class Session:
                     fast = iv
                 elif k == "slow":
                     slow = iv
+                elif k == "cols":
+                    cols = iv
             leftover = rest
         else:
             leftover = pre  # no preamble: every byte was audio
@@ -232,6 +239,7 @@ class Session:
             self.send(f"\r\n[server] rejected: {why}\r\n")
             return ""
 
+        self.cols = max(40, min(200, cols)) - 4
         chunk_bytes = fast * SAMPLES_PER_FRAME * 2
         self.send(
             f"\r\n[server] fronts {fast}/{slow} frames, delays {fast_delay}/{slow_delay} "
@@ -365,7 +373,20 @@ class Session:
         self.send("\r\n\r\n" + "-" * 72 + "\r\n")
         if timed_out:
             self.send(f"[server] no audio for {self.a.idle_timeout:.0f}s -- utterance ended\r\n")
-        self.send(f"{BOLD}{committed}{RESET}\r\n")
+        # Wrap the final transcript too. It is the line most likely to be copied
+        # out, and an unwrapped 400-character line gets SOFT-wrapped by the
+        # terminal -- which copies without a space and glues words together.
+        words, line, lines = committed.split(), "", []
+        for w in words:
+            if line and len(line) + 1 + len(w) > self.cols:
+                lines.append(line)
+                line = w
+            else:
+                line = f"{line} {w}" if line else w
+        if line:
+            lines.append(line)
+        for ln in lines or [""]:
+            self.send(f"{BOLD}{ln}{RESET}\r\n")
         self.send(f"[audio] {audio.size/SR:.1f}s, {blocks} blocks\r\n")
         if diag:
             self.send(diag + "\r\n")
@@ -445,7 +466,7 @@ def client(args):
     s = socket.create_connection((args.host, args.port))
     # Tell the server this utterance's operating point before any audio.
     s.sendall(
-        f"CFG fast={args.fast} slow={args.slow} "
+        f"CFG fast={args.fast} slow={args.slow} cols={args.cols} "
         f"fast_delay={args.fast_delay} slow_delay={args.slow_delay}\n".encode()
     )
 
@@ -503,6 +524,7 @@ def main():
         help="how to cross out corrected words: unicode combining overlay (works everywhere, "
         "including macOS Terminal) or ANSI SGR 9 (ignored by some terminals)",
     )
+    ap.add_argument("--cols", type=int, default=92, help="fallback terminal width if the client sends none")
     ap.add_argument("--timing", action="store_true", help="log a per-update latency breakdown")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--model_class", default="nemo.collections.speechlm2.models.script_model.ScriptSTTModel")
