@@ -56,6 +56,30 @@ pick_device() {
 }
 [ -z "$DEV" ] && DEV=$(pick_device)
 
+# --- pick the two fronts -----------------------------------------------------
+# This checkpoint trained chunk sizes 2, 7, 14 and 28. slow must be a different,
+# exact multiple of fast, or a block would not contain a whole number of fast
+# chunks and the provisional/authoritative spans would not line up.
+pick_fronts() {
+    local d
+    echo >&2
+    echo "front chunk sizes, in 80ms frames. Trained: 2, 7, 14, 28." >&2
+    printf '  fast front (provisional) [%s]: ' "${FAST_DEFAULT:-2}" >&2
+    read -r d </dev/tty; FAST=${d:-${FAST_DEFAULT:-2}}
+    printf '  slow front (authoritative) [%s]: ' "${SLOW_DEFAULT:-14}" >&2
+    read -r d </dev/tty; SLOW=${d:-${SLOW_DEFAULT:-14}}
+    for d in "$FAST" "$SLOW"; do
+        case "$d" in
+            2|7|14|28) ;;
+            *) echo "chunk size $d was never trained (use 2, 7, 14 or 28)" >&2; exit 1 ;;
+        esac
+    done
+    [ "$FAST" -eq "$SLOW" ] && { echo "the two fronts must differ" >&2; exit 1; }
+    [ $((SLOW % FAST)) -ne 0 ] && { echo "slow ($SLOW) must be an exact multiple of fast ($FAST)" >&2; exit 1; }
+    echo "  -> $((SLOW / FAST)) fast chunks per block" >&2
+}
+[ -z "${FAST:-}" ] && pick_fronts
+
 # --- pick emission delays ----------------------------------------------------
 # Delay is the number of frames the model waits past a word before committing to
 # it, and it ADDS to the chunk latency: first paint is (fast + fast_delay) * 80ms.
@@ -102,7 +126,8 @@ while true; do
            -af "volume=${GAIN}" -f s16le -loglevel error - > "$FIFO" \
         2> >(grep -vE 'Broken pipe|Error muxing|Error submitting|Terminating thread|Error writing trailer|Error closing file' >&2) &
     ff=$!
-    ssh "${SSH_OPTS[@]}" "$HOST" ./asr --fast_delay "$FAST_DELAY" --slow_delay "$SLOW_DELAY" < "$FIFO" &
+    ssh "${SSH_OPTS[@]}" "$HOST" ./asr --fast "$FAST" --slow "$SLOW" \
+        --fast_delay "$FAST_DELAY" --slow_delay "$SLOW_DELAY" < "$FIFO" &
     ss=$!
 
     read -r _ || true                 # second ENTER ends the utterance

@@ -179,13 +179,12 @@ class Session:
         import torch
 
         a_, m, args = self.a, self.m, self.a
-        fast, slow = a_.fast, a_.slow
         dev = next(m.parameters()).device
-        chunk_bytes = fast * SAMPLES_PER_FRAME * 2
 
         # Optional one-line preamble so the CLIENT can choose the operating point
-        # per utterance: "CFG fast_delay=0 slow_delay=3\n". Anything else is
-        # treated as audio, so older clients keep working unchanged.
+        # per utterance: "CFG fast=2 slow=28 fast_delay=0 slow_delay=3\n".
+        # Anything else is treated as audio, so older clients keep working.
+        fast, slow = a_.fast, a_.slow
         fast_delay, slow_delay = a_.fast_delay, a_.slow_delay
         pre = b""
         self.s.settimeout(2.0)
@@ -209,12 +208,31 @@ class Session:
                     fast_delay = iv
                 elif k == "slow_delay":
                     slow_delay = iv
+                elif k == "fast":
+                    fast = iv
+                elif k == "slow":
+                    slow = iv
             leftover = rest
         else:
             leftover = pre  # no preamble: every byte was audio
         fast_delay = max(0, min(a_.max_delay, fast_delay))
         slow_delay = max(0, min(a_.max_delay, slow_delay))
+        # Validate the pair HERE, not at startup: it now arrives per session, and
+        # a chunk size the checkpoint never trained still produces fluent text --
+        # it would look like it worked while decoding an operating point the
+        # model has never seen.
+        trained = list(getattr(self.m.core_cfg, "chunk_size", []) or [])
+        bad = [c for c in (fast, slow) if trained and c not in trained]
+        if bad or slow % fast or slow == fast:
+            why = (
+                f"chunk sizes {bad} are not in {trained}"
+                if bad
+                else f"slow ({slow}) must be a different, exact multiple of fast ({fast})"
+            )
+            self.send(f"\r\n[server] rejected: {why}\r\n")
+            return ""
 
+        chunk_bytes = fast * SAMPLES_PER_FRAME * 2
         self.send(
             f"\r\n[server] fronts {fast}/{slow} frames, delays {fast_delay}/{slow_delay} "
             f"-> first paint {(fast+fast_delay)*0.08:.2f}s, settles {(slow+slow_delay)*0.08:.2f}s\r\n"
@@ -426,7 +444,10 @@ def client(args):
     """Relay stdin -> server and server -> stdout. Used as: ssh host ./asr"""
     s = socket.create_connection((args.host, args.port))
     # Tell the server this utterance's operating point before any audio.
-    s.sendall(f"CFG fast_delay={args.fast_delay} slow_delay={args.slow_delay}\n".encode())
+    s.sendall(
+        f"CFG fast={args.fast} slow={args.slow} "
+        f"fast_delay={args.fast_delay} slow_delay={args.slow_delay}\n".encode()
+    )
 
     def pump_back():
         while True:
