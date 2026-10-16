@@ -71,6 +71,9 @@ def struck(text: str, style: str) -> str:
 
 RESET = "\033[0m"
 BOLD = "\033[1m"
+CUR_SAVE = "\0337"  # DECSC -- remember where the provisional starts
+CUR_RESTORE = "\0338"  # DECRC
+CLEAR_TO_END = "\033[J"  # erase to end of SCREEN, so a wrapped provisional goes too
 
 
 def speech_report(a):
@@ -110,9 +113,8 @@ class Session:
     def __init__(self, model, sock, args, prompt_txt):
         self.m, self.s, self.a, self.p = model, sock, args, prompt_txt
         self.cols = 88
-        self.col = 0
-        self.shown = ""  # provisional text currently on screen
-        self.vis = 0  # its printable length (excludes ANSI escapes)
+        self.col = 0  # column of the PERMANENT text
+        self.saved = False  # is a provisional currently drawn?
 
     def send(self, text):
         try:
@@ -121,22 +123,42 @@ class Session:
             raise ConnectionResetError
 
     def paint(self, provisional):
-        """Show the fast front's current guess. Erasable until the block closes."""
+        """Show the fast front's current guess. Erasable until the block closes.
+
+        Erasing with backspaces only works while the text sits on ONE line: a
+        backspace cannot cross a wrap. With a long slow front (2/42 paints a
+        whole block, 100+ characters) the provisional wraps, the erase lands in
+        the wrong place and leaves debris -- which is where the stray newlines
+        came from. Save the cursor instead and clear to end of SCREEN, which
+        removes however many lines the provisional occupied.
+        """
         buf = ""
-        if self.shown:
-            buf += "\b" * self.vis + " " * self.vis + "\b" * self.vis
-            self.col -= self.vis
-            self.shown, self.vis = "", 0
+        if self.saved:
+            buf += CUR_RESTORE + CLEAR_TO_END
+            self.saved = False
         if provisional:
-            if self.col + len(provisional) + 1 > self.cols:
-                buf += "\r\n"
-                self.col = 0
             piece = (" " if self.col else "") + provisional
-            buf += DIM + piece + RESET
-            self.shown, self.vis = piece, len(piece)
-            self.col += len(piece)
+            buf += CUR_SAVE + DIM + self._wrapped(piece, self.col) + RESET
+            self.saved = True
+            # self.col is NOT advanced: the provisional is transient, and the
+            # next paint restores the cursor to exactly here.
         if buf:
             self.send(buf)
+
+    def _wrapped(self, text, start_col):
+        """Break text so no line exceeds the client's width."""
+        out, col = "", start_col
+        for word in text.split(" "):
+            if not word:
+                continue
+            need = len(word) + (1 if col else 0)
+            if col and col + need > self.cols:
+                out += "\r\n"
+                col = 0
+                need = len(word)
+            out += (" " if col else "") + word
+            col += need
+        return out
 
     def commit_block(self, provisional, final):
         """Freeze a block: wrong words stay, crossed out; the fix follows.
@@ -160,18 +182,25 @@ class Session:
             provisional = " ".join(keep)
 
         buf = ""
-        if self.shown:
-            buf += "\b" * self.vis + " " * self.vis + "\b" * self.vis
-            self.col -= self.vis
-            self.shown, self.vis = "", 0
+        if self.saved:
+            buf += CUR_RESTORE + CLEAR_TO_END
+            self.saved = False
+        # Wrap per WORD, not per segment: a segment can be a long span, and
+        # breaking only between segments lets one overflow the line, after which
+        # the terminal soft-wraps and the column count no longer matches reality.
         for text, is_struck in strike_markup(provisional, final):
-            if self.col + len(text) + 1 > self.cols:
-                buf += "\r\n"
-                self.col = 0
-            piece = (" " if self.col else "") + text
-            buf += struck(piece, self.a.strike) if is_struck else piece
-            # Advance by the BASE length: combining overlays add bytes, not columns.
-            self.col += len(piece)
+            for word in text.split(" "):
+                if not word:
+                    continue
+                need = len(word) + (1 if self.col else 0)
+                if self.col and self.col + need > self.cols:
+                    buf += "\r\n"
+                    self.col = 0
+                    need = len(word)
+                piece = (" " if self.col else "") + word
+                buf += struck(piece, self.a.strike) if is_struck else piece
+                # Advance by the BASE length: overlays add bytes, not columns.
+                self.col += need
         if buf:
             self.send(buf)
 
