@@ -230,12 +230,29 @@ class Session:
             if not buf:
                 break
             last = time.time()
+            # Drain whatever else is already waiting. Reading one chunk per cycle
+            # means that if a cycle costs more than the chunk's duration the lag
+            # grows without bound and the display falls progressively behind --
+            # which looks exactly like "it is not real time".
+            self.s.setblocking(False)
+            try:
+                while True:
+                    more = self.s.recv(65536)
+                    if not more:
+                        break
+                    buf += more
+            except (BlockingIOError, OSError):
+                pass
+            finally:
+                self.s.setblocking(True)
+                self.s.settimeout(1.0)
             audio = np.concatenate([audio, np.frombuffer(buf, dtype="<i2").astype("float32") / 32768.0])
             if t0 is None:
                 t0 = time.time()
             if time.time() - t0 > a_.max_seconds:
                 break
 
+            t_upd = time.time()
             t = torch.from_numpy(audio).unsqueeze(0).to(dev)
             n = torch.tensor([audio.shape[0]], device=dev)
             with torch.inference_mode():
@@ -257,6 +274,15 @@ class Session:
                     )[0].strip()
                 self.paint(prov)
                 last_prov = prov
+            if a_.timing:
+                recvd = audio.size / SR
+                wall = time.time() - t0 if t0 else 0.0
+                print(
+                    f"    +{wall:6.2f}s wall | {recvd:6.2f}s audio in | "
+                    f"{(blocks*slow)*0.08:6.2f}s committed | lag {wall - recvd:+.2f}s | "
+                    f"update {1000*(time.time()-t_upd):5.0f}ms",
+                    flush=True,
+                )
             while avail >= blo + slow:
                 with torch.inference_mode():
                     sf_ = m.encode_frames(t, n, slow)
@@ -431,6 +457,7 @@ def main():
         default=8.0,
         help="end an utterance after this long with no audio, even if the client never closes",
     )
+    ap.add_argument("--timing", action="store_true", help="log a per-update latency breakdown")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--model_class", default="nemo.collections.speechlm2.models.script_model.ScriptSTTModel")
     args = ap.parse_args()
