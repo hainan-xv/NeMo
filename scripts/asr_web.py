@@ -173,18 +173,28 @@ async def ws_handler(request):
         if k in cfg:
             a.__dict__[k] = int(cfg[k])
 
+    # Free-text biasing appended to the base instruction, BEFORE the control
+    # clauses that render_control_prompt adds -- so the trained template still
+    # ends the prompt the way the model saw it in training.
+    prompt = app["prompt"]
+    extra = (cfg.get("prompt_extra") or "").strip()
+
     def emit(ev):
         loop.call_soon_threadsafe(out_q.put, ev)
 
     def run():
         try:
-            WebSession(app["model"], QueueSocket(audio_q, out_q), a, app["prompt"], emit).run()
+            sess = WebSession(app["model"], QueueSocket(audio_q, out_q), a, prompt, emit)
+            sess.prompt_suffix = extra or None
+            sess.run()
         except Exception as e:  # a bad session must not take the server down
             emit({"t": "log", "text": f"session error: {type(e).__name__}: {e}"})
         finally:
             emit({"t": "done"})
             done.set()
 
+    if extra:
+        emit({"t": "log", "text": f"[prompt] + {extra}"})
     worker = threading.Thread(target=run, daemon=True)
     worker.start()
 

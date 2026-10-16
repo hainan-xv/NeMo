@@ -111,6 +111,7 @@ class Session:
     def __init__(self, model, sock, args, prompt_txt):
         self.m, self.s, self.a, self.p = model, sock, args, prompt_txt
         self.cols = 88
+        self.prompt_suffix = None  # inference-time text appended after the controls
         self.col = 0  # column of the PERMANENT text
         self.vis = 0  # on-screen length of the provisional, 0 if none
 
@@ -383,6 +384,7 @@ class Session:
                         history_text=[committed],
                         frame_range=(blo, edge),
                         precomputed_frames=ff,
+                        prompt_suffix=self.prompt_suffix,
                         num_delay_frames=fast_delay,
                     )[0].strip()
                 self.paint(prov)
@@ -407,6 +409,7 @@ class Session:
                         history_text=[committed],
                         frame_range=(blo, blo + slow),
                         precomputed_frames=sf_,
+                        prompt_suffix=self.prompt_suffix,
                         num_delay_frames=slow_delay,
                     )[0].strip()
                 self.commit_block(last_prov, auth)
@@ -431,6 +434,7 @@ class Session:
                         history_text=[committed],
                         frame_range=(blocks * slow, total),
                         precomputed_frames=sf_,
+                        prompt_suffix=self.prompt_suffix,
                         num_delay_frames=slow_delay,
                     )[0].strip()
                     self.commit_block(last_prov, auth)

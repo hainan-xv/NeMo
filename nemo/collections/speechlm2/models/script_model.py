@@ -1731,6 +1731,7 @@ class ScriptSTTModel(StreamingSTTModel):
         history_text: Optional[Union[str, List[str]]] = None,
         frame_range: Optional[Tuple[int, int]] = None,
         precomputed_frames: Optional[List[Tensor]] = None,
+        prompt_suffix: Optional[str] = None,
         **generation_kwargs,
     ) -> List[str]:
         """Chunk-by-chunk streaming transcription.
@@ -1762,6 +1763,10 @@ class ScriptSTTModel(StreamingSTTModel):
                 point (multi-front decoding walks it block by block) can encode
                 ONCE and reuse it. Must match ``chunk_size_override``, or the
                 decode silently runs on features from a different look-ahead.
+            prompt_suffix: free text appended AFTER the rendered control clauses.
+                For inference-time experiments (context biasing); the model was
+                trained on a fixed template, so anything here is out of
+                distribution and may perturb the controls rather than help.
             frame_range: ``(lo, hi)`` -- decode only encoder frames ``[lo, hi)``.
                 The ENCODER still runs over the whole utterance, so left context
                 is unchanged; only the decode window is narrowed. Slicing the
@@ -1803,6 +1808,12 @@ class ScriptSTTModel(StreamingSTTModel):
                 f"generate() got {sorted(asked)} but this model has prompt_control=False, so it was never "
                 "trained to honour them. Set model.prompt_control=true (and train that way) or drop these arguments."
             )
+
+        if prompt_suffix:
+            # AFTER the control clauses, so the trained template ends exactly as
+            # it did in training. Appending before them was enough to make the
+            # model stop honouring the punctuation clause.
+            system_prompt = [f"{p.rstrip()} {prompt_suffix}" for p in system_prompt]
 
         # FSM decode knobs. Separable on purpose: streaming_encode swaps the
         # OFFLINE encode for the cache-aware one (the change that was worth 12
