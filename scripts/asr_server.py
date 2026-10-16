@@ -52,6 +52,23 @@ SAMPLES_PER_FRAME = 1280
 
 DIM = "\033[2m"
 STRIKE = "\033[9;2m"
+OVERLAY = "\u0336"  # COMBINING LONG STROKE OVERLAY
+
+
+def struck(text: str, style: str) -> str:
+    """Render text as crossed out.
+
+    macOS Terminal.app ignores SGR 9 (strikethrough), so the ANSI form shows up
+    merely dim there -- the line never appears. The unicode form puts a combining
+    overlay after each character, which draws an actual stroke in any terminal
+    and any font that has the glyph. It costs bytes, not columns: combining marks
+    are zero-width, so the caller must advance the cursor by the BASE length.
+    """
+    if style == "ansi":
+        return f"{STRIKE}{text}{RESET}"
+    return DIM + "".join(c + OVERLAY for c in text) + RESET
+
+
 RESET = "\033[0m"
 BOLD = "\033[1m"
 
@@ -146,12 +163,13 @@ class Session:
             buf += "\b" * self.vis + " " * self.vis + "\b" * self.vis
             self.col -= self.vis
             self.shown, self.vis = "", 0
-        for text, struck in strike_markup(provisional, final):
+        for text, is_struck in strike_markup(provisional, final):
             if self.col + len(text) + 1 > 92:
                 buf += "\r\n"
                 self.col = 0
             piece = (" " if self.col else "") + text
-            buf += (STRIKE + piece + RESET) if struck else piece
+            buf += struck(piece, self.a.strike) if is_struck else piece
+            # Advance by the BASE length: combining overlays add bytes, not columns.
             self.col += len(piece)
         if buf:
             self.send(buf)
@@ -456,6 +474,13 @@ def main():
         type=float,
         default=8.0,
         help="end an utterance after this long with no audio, even if the client never closes",
+    )
+    ap.add_argument(
+        "--strike",
+        default="unicode",
+        choices=["unicode", "ansi"],
+        help="how to cross out corrected words: unicode combining overlay (works everywhere, "
+        "including macOS Terminal) or ANSI SGR 9 (ignored by some terminals)",
     )
     ap.add_argument("--timing", action="store_true", help="log a per-update latency breakdown")
     ap.add_argument("--device", default="cuda:0")
