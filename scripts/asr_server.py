@@ -71,9 +71,7 @@ def struck(text: str, style: str) -> str:
 
 RESET = "\033[0m"
 BOLD = "\033[1m"
-CUR_SAVE = "\0337"  # DECSC -- remember where the provisional starts
-CUR_RESTORE = "\0338"  # DECRC
-CLEAR_TO_END = "\033[J"  # erase to end of SCREEN, so a wrapped provisional goes too
+CLEAR_LINE = "\033[K"  # erase to end of LINE -- no absolute position, scroll-safe
 
 
 def speech_report(a):
@@ -114,7 +112,7 @@ class Session:
         self.m, self.s, self.a, self.p = model, sock, args, prompt_txt
         self.cols = 88
         self.col = 0  # column of the PERMANENT text
-        self.saved = False  # is a provisional currently drawn?
+        self.vis = 0  # on-screen length of the provisional, 0 if none
 
     def send(self, text):
         try:
@@ -123,25 +121,34 @@ class Session:
             raise ConnectionResetError
 
     def paint(self, provisional):
-        """Show the fast front's current guess. Erasable until the block closes.
+        """Show the fast front's current guess, on ONE line, erasable.
 
-        Erasing with backspaces only works while the text sits on ONE line: a
-        backspace cannot cross a wrap. With a long slow front (2/42 paints a
-        whole block, 100+ characters) the provisional wraps, the erase lands in
-        the wrong place and leaves debris -- which is where the stray newlines
-        came from. Save the cursor instead and clear to end of SCREEN, which
-        removes however many lines the provisional occupied.
+        Two earlier approaches both failed for structural reasons:
+          * backspaces alone cannot cross a line wrap, so a provisional longer
+            than the line left debris;
+          * DECSC/DECRC save an ABSOLUTE position, so as soon as the screen
+            scrolls -- which it does constantly in a real session -- restore
+            lands on the wrong row and the clear wipes the wrong text.
+
+        So keep the provisional strictly within one line: wrap to a fresh line
+        first if it will not fit, and show only its tail if it cannot fit at all.
+        Then backspacing to its start is always safe, with no absolute cursor
+        state to go stale. The truncation is cosmetic -- the block's full text is
+        written permanently when it commits.
         """
         buf = ""
-        if self.saved:
-            buf += CUR_RESTORE + CLEAR_TO_END
-            self.saved = False
+        if self.vis:
+            buf += "\b" * self.vis + CLEAR_LINE
+            self.vis = 0
         if provisional:
-            piece = (" " if self.col else "") + provisional
-            buf += CUR_SAVE + DIM + self._wrapped(piece, self.col) + RESET
-            self.saved = True
-            # self.col is NOT advanced: the provisional is transient, and the
-            # next paint restores the cursor to exactly here.
+            if self.col and self.col + 1 + len(provisional) > self.cols:
+                buf += "\r\n"
+                self.col = 0
+            avail = self.cols - self.col - (1 if self.col else 0)
+            text = provisional if len(provisional) <= avail else "..." + provisional[-(avail - 3) :]
+            piece = (" " if self.col else "") + text
+            buf += DIM + piece + RESET
+            self.vis = len(piece)  # on-screen length, so we can back over it
         if buf:
             self.send(buf)
 
@@ -182,9 +189,9 @@ class Session:
             provisional = " ".join(keep)
 
         buf = ""
-        if self.saved:
-            buf += CUR_RESTORE + CLEAR_TO_END
-            self.saved = False
+        if self.vis:
+            buf += "\b" * self.vis + CLEAR_LINE
+            self.vis = 0
         # Wrap per WORD, not per segment: a segment can be a long span, and
         # breaking only between segments lets one overflow the line, after which
         # the terminal soft-wraps and the column count no longer matches reality.
