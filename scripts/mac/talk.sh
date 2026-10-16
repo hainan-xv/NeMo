@@ -63,15 +63,15 @@ pick_device() {
 pick_fronts() {
     local d
     echo >&2
-    echo "front chunk sizes, in 80ms frames. Trained: 2, 7, 14, 28." >&2
+    echo "front chunk sizes, in 80ms frames. Trained: 2, 7, 14, 28, 42." >&2
     printf '  fast front (provisional) [%s]: ' "${FAST_DEFAULT:-2}" >&2
     read -r d </dev/tty; FAST=${d:-${FAST_DEFAULT:-2}}
     printf '  slow front (authoritative) [%s]: ' "${SLOW_DEFAULT:-14}" >&2
     read -r d </dev/tty; SLOW=${d:-${SLOW_DEFAULT:-14}}
     for d in "$FAST" "$SLOW"; do
         case "$d" in
-            2|7|14|28) ;;
-            *) echo "chunk size $d was never trained (use 2, 7, 14 or 28)" >&2; exit 1 ;;
+            2|7|14|28|42) ;;
+            *) echo "chunk size $d was never trained (use 2, 7, 14, 28 or 42)" >&2; exit 1 ;;
         esac
     done
     [ "$FAST" -eq "$SLOW" ] && { echo "the two fronts must differ" >&2; exit 1; }
@@ -83,22 +83,22 @@ pick_fronts() {
 # --- pick emission delays ----------------------------------------------------
 # Delay is the number of frames the model waits past a word before committing to
 # it, and it ADDS to the chunk latency: first paint is (fast + fast_delay) * 80ms.
-# The fast front is provisional and gets overwritten anyway, so a small delay
-# there buys responsiveness cheaply; the slow front is what you keep, so it
-# wants the accuracy. This checkpoint trained exact delays 0-6.
+# The fast front is provisional, so a small delay buys responsiveness cheaply.
+# NOT zero though: on this checkpoint chunk 2 with delay 0 degenerates and drops
+# most of the utterance, while delay 1 decodes it correctly. Trained range 0-4.
 pick_delays() {
     local d
     echo >&2
-    echo "emission delay, in 80ms frames (0-6). Higher = more accurate, slower." >&2
-    printf '  fast front (chunk %s) delay [%s]: ' "${FAST:-2}" "${FAST_DELAY_DEFAULT:-0}" >&2
-    read -r d </dev/tty; FAST_DELAY=${d:-${FAST_DELAY_DEFAULT:-0}}
+    echo "emission delay, in 80ms frames (0-4). Higher = more accurate, slower." >&2
+    printf '  fast front (chunk %s) delay [%s]: ' "${FAST:-2}" "${FAST_DELAY_DEFAULT:-1}" >&2
+    read -r d </dev/tty; FAST_DELAY=${d:-${FAST_DELAY_DEFAULT:-1}}
     printf '  slow front (chunk %s) delay [%s]: ' "${SLOW:-14}" "${SLOW_DELAY_DEFAULT:-3}" >&2
     read -r d </dev/tty; SLOW_DELAY=${d:-${SLOW_DELAY_DEFAULT:-3}}
     for d in "$FAST_DELAY" "$SLOW_DELAY"; do
         case "$d" in
             ''|*[!0-9]*) echo "delay must be a number 0-6, got '$d'" >&2; exit 1 ;;
         esac
-        [ "$d" -gt 6 ] && { echo "delay $d was never trained (max 6)" >&2; exit 1; }
+        [ "$d" -gt 4 ] && { echo "delay $d was never trained (max 4)" >&2; exit 1; }
     done
     awk -v f="${FAST:-2}" -v fd="$FAST_DELAY" -v s="${SLOW:-14}" -v sd="$SLOW_DELAY" \
         'BEGIN{printf "  -> first paint %.2fs, settles every %.2fs\n",(f+fd)*0.08,(s+sd)*0.08}' >&2
