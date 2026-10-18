@@ -269,25 +269,20 @@ class Session:
             )
 
     def run_interleaved(self, leftover, chunk, delay):
-        """Baseline arm: one causal audio-text stream, re-decoded from scratch.
+        """Baseline arm: buffer the utterance, decode it once when it ends.
 
-        The interleaved model has no history / frame-range entry point -- its
-        generate() consumes a whole utterance in one call -- so there is no way
-        to extend a decode by one more chunk the way SCRIPT re-prefills its
-        spine. The only live view available is to decode the growing prefix
-        again each time, and that is expensive: at the reporting settings
-        (state-machine decode) 20s of audio costs ~11s, i.e. 0.55x real time.
+        NO SELF-CORRECTION HERE, deliberately. The interleaved model has no
+        history / frame-range entry point -- its generate() consumes a whole
+        utterance in one call -- so a second front could only be built by
+        decoding the growing prefix from scratch over and over. That costs about
+        0.55x real time at its reporting settings (20s of audio took 11s,
+        measured), i.e. the architecture cannot run self-correction at a price
+        worth paying, and the revisions it produced were an artefact of
+        re-decoding rather than anything the model does.
 
-        So the loop self-throttles -- a new re-decode only starts once the
-        previous one has been paid for -- and the banner says how far behind the
-        text is. The alternative, a fixed refresh rate, would simply queue
-        decodes until the session collapsed.
-
-        NOTHING HERE IS THE MODEL CORRECTING ITSELF. A word that changes between
-        two re-decodes changed because the second decode saw more audio. The
-        crossings-out are re-decode differences, and the banner says so, because
-        a viewer who has just watched the SCRIPT arm will otherwise read them as
-        the same self-correction mechanism.
+        So this arm shows what it actually is: one pass, one transcript. The
+        SCRIPT arm keeps the two fronts; the comparison is between what each
+        layout can do, not between two differently-faked displays.
         """
         import numpy as np
         import torch
@@ -309,8 +304,8 @@ class Session:
         self.send(
             f"\r\n[server] interleaved baseline, chunk {chunk} frames, emit delay {delay} "
             f"-> nominal {(chunk+delay)*0.08:.2f}s\r\n"
-            "[server] no second front: the live text is a FULL RE-DECODE of the audio so far, "
-            "so it lags and its crossings-out are re-decode differences, not self-correction\r\n"
+            "[server] single pass, no second front: this arm buffers the utterance and decodes "
+            "it once at the end, so nothing appears until you stop speaking\r\n"
         )
 
         def decode(wave):
@@ -345,10 +340,8 @@ class Session:
         carry = b""
         audio, carry = _pcm(leftover, carry)
         read_bytes = max(2, chunk) * SAMPLES_PER_FRAME * 2
-        last_prov = ""
         t0 = None
         last = time.time()
-        next_decode = 0.0
         timed_out = False
         self.s.settimeout(1.0)
         while True:
@@ -364,9 +357,8 @@ class Session:
             if not buf:
                 break
             last = time.time()
-            # Same drain as the SCRIPT path, and more important here: a re-decode
-            # blocks this loop for seconds, so without it the backlog is lost
-            # rather than merely late.
+            # Same drain as the SCRIPT path: read everything already waiting so a
+            # slow cycle cannot let the backlog grow without bound.
             self.s.setblocking(False)
             try:
                 while True:
@@ -385,26 +377,16 @@ class Session:
                 t0 = time.time()
             if time.time() - t0 > a_.max_seconds:
                 break
-            if audio.size < SR // 2 or time.time() < next_decode:
-                continue
-            t_dec = time.time()
-            prov = decode(audio)
-            cost = time.time() - t_dec
-            # Spend at most half the wall clock decoding, so audio keeps being
-            # read and the lag grows linearly instead of compounding.
-            next_decode = time.time() + max(a_.il_min_interval, cost)
-            if prov:
-                self.paint(prov)
-                last_prov = prov
-            if a_.timing:
-                print(
-                    f"    interleaved re-decode: {audio.size/SR:6.2f}s audio -> {cost:5.2f}s "
-                    f"({cost/max(audio.size/SR, 1e-6):.2f}x RT)",
-                    flush=True,
-                )
 
+        self.send(f"\r\n[server] decoding {audio.size/SR:.1f}s ...\r\n")
+        t_dec = time.time()
         final = decode(audio) if audio.size >= SR // 4 else ""
-        self.commit_block(last_prov, final)
+        cost = time.time() - t_dec
+        # Pass the text through commit_block so the terminal wrapping and the
+        # page's segment events stay shared with the SCRIPT arm. Provisional ==
+        # final, so nothing is struck: there is nothing to correct.
+        self.commit_block(final, final)
+        self.send(f"\r\n[server] decode took {cost:.1f}s ({cost/max(audio.size/SR, 1e-6):.2f}x real time)\r\n")
         ok, diag = speech_report(audio)
         self.emit_final(final, audio.size / SR, 0, diag, ok, timed_out)
         try:
@@ -815,13 +797,6 @@ def main():
     )
     ap.add_argument("--il_chunk", type=int, default=14, help="chunk size (frames) for the interleaved arm")
     ap.add_argument("--il_delay", type=int, default=0, help="emit delay (frames) for the interleaved arm")
-    ap.add_argument(
-        "--il_min_interval",
-        type=float,
-        default=1.0,
-        help="shortest gap between interleaved re-decodes; the real gap is the larger of this and "
-        "what the last re-decode cost",
-    )
     ap.add_argument("--arm", default="script", choices=["script", "interleaved"], help="which arm the client asks for")
     args = ap.parse_args()
     if args.client:

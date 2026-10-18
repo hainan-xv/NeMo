@@ -284,7 +284,6 @@ def main():
     )
     ap.add_argument("--il_chunk", type=int, default=14)
     ap.add_argument("--il_delay", type=int, default=0)
-    ap.add_argument("--il_min_interval", type=float, default=1.0)
     args = ap.parse_args()
 
     import torch

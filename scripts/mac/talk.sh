@@ -96,7 +96,7 @@ pick_interleaved() {
     esac
     [ "$IL_DELAY" -gt 4 ] && { echo "delay $IL_DELAY was never trained (max 4)" >&2; exit 1; }
     awk -v c="$IL_CHUNK" -v d="$IL_DELAY" \
-        'BEGIN{printf "  -> nominal %.2fs; the live text lags behind that, see the server banner\n",(c+d)*0.08}' >&2
+        'BEGIN{printf "  -> nominal %.2fs per chunk; single pass, printed when the utterance ends\n",(c+d)*0.08}' >&2
 }
 
 # --- pick the two fronts -----------------------------------------------------
