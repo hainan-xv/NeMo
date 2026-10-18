@@ -17,7 +17,7 @@ from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
 from functools import cached_property
-from typing import Any, List, Optional, Union
+from typing import Any, Callable, List, Optional, Union
 
 import torch
 import torch.nn.functional as F
@@ -2350,6 +2350,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         disable_emit_for_debug: bool = False,
         return_alignments: bool = True,
         return_debug_logs: bool = False,
+        on_emit: Optional[Callable[[int, str, str], None]] = None,
         **generation_kwargs,
     ) -> StreamingSTTGenerateResult:
         """Batched dynamic-chunking generation.
@@ -2369,6 +2370,14 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             inference_chunk_size: Number of encoder frames per perception call
                 (default 1).  Embeddings are buffered and fed to the LLM one
                 at a time.
+            on_emit: Optional ``fn(stream_index, chunk_text, text_so_far)``,
+                called the moment a chunk is committed -- i.e. at the chunk
+                separator, in the order the state machine produces them. This
+                is the only way to observe output before the call returns: the
+                loop consumes a waveform that is already complete and returns
+                just the final string, so a caller wanting to show progress
+                otherwise has to re-decode the prefix over and over. The
+                callback must be cheap; it runs inside the decode loop.
             dynamic_min_chunk_size: Minimum frames before the model is allowed
                 to trigger generation (default 0, no minimum).
             dynamic_max_chunk_size: Maximum frames before forcing generation.
@@ -2430,6 +2439,17 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         gen_token_count = [0] * B  # tokens generated in current GENERATING phase
         last_gen_token = [self.text_pad_id] * B  # last generated token per stream
         all_tokens: list[list[int]] = [[] for _ in range(B)]
+        # Text already handed to on_emit, per stream. decode_with_blank joins
+        # per-chunk segments, so a committed chunk only ever EXTENDS the string
+        # -- the delta is a plain suffix and needs no alignment.
+        emitted_text: list[str] = [""] * B
+
+        def _emit_chunk(b: int) -> None:
+            if on_emit is None:
+                return
+            full = decode_with_blank(all_tokens[b], self.blank_token, self.tokenizer)
+            delta, emitted_text[b] = full[len(emitted_text[b]) :], full
+            on_emit(b, delta.strip(), full)
 
         # Per-stream audio embedding buffer (filled by perception, consumed 1 at a time)
         audio_emb_buf: list[list[Tensor]] = [[] for _ in range(B)]
@@ -2868,6 +2888,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                             # Immediately done generating — append chunk separator
                             # (blank when enabled, else EOS so decode_with_blank splits chunks)
                             all_tokens[b].append(self.blank_token_id if self.has_blank else self._eos_id)
+                            _emit_chunk(b)
                             if fixed_chunk_mode and self.has_blank:
                                 # Feed blank to LLM first (matches training sequence)
                                 stream_state[b] = BLANK_FEED
@@ -2905,6 +2926,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                         # Append chunk separator (blank when enabled, else EOS).
                         # decode_with_blank splits per-chunk outputs on this.
                         all_tokens[b].append(self.blank_token_id if self.has_blank else self._eos_id)
+                        _emit_chunk(b)
                         # Do NOT feed <blank> here. Training for non-empty
                         # chunks ends as `text <asst_footer>` (no blank between
                         # text and asst_footer — blank only appears as the
@@ -3256,6 +3278,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         disable_emit_for_debug: bool = False,
         return_alignments: bool = True,
         return_debug_logs: bool = False,
+        on_emit: Optional[Callable[[int, str, str], None]] = None,
         **generation_kwargs,
     ) -> StreamingSTTGenerateResult:
         """
@@ -3284,6 +3307,9 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 start/end times derived from chunk emit positions. Default True.
             return_debug_logs: Populate ``result.debug_logs`` with per-frame
                 LM top-5, aux p_emit, and decision diagnostics. Expensive — opt-in.
+            on_emit: Optional ``fn(stream_index, chunk_text, text_so_far)`` called
+                as each chunk is committed, so a caller can display output while
+                the decode is still running. State-machine path only.
             generation_kwargs: Per-call overrides for generation parameters.
 
         Returns:
@@ -3329,6 +3355,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                     disable_emit_for_debug=disable_emit_for_debug,
                     return_alignments=return_alignments,
                     return_debug_logs=return_debug_logs,
+                    on_emit=on_emit,
                     **generation_kwargs,
                 )
             else:

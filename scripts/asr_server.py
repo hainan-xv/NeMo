@@ -269,20 +269,27 @@ class Session:
             )
 
     def run_interleaved(self, leftover, chunk, delay):
-        """Baseline arm: buffer the utterance, decode it once when it ends.
+        """Baseline arm: buffer the utterance, then stream out ONE decode.
 
-        NO SELF-CORRECTION HERE, deliberately. The interleaved model has no
-        history / frame-range entry point -- its generate() consumes a whole
-        utterance in one call -- so a second front could only be built by
-        decoding the growing prefix from scratch over and over. That costs about
-        0.55x real time at its reporting settings (20s of audio took 11s,
-        measured), i.e. the architecture cannot run self-correction at a price
-        worth paying, and the revisions it produced were an artefact of
-        re-decoding rather than anything the model does.
+        The model's decode genuinely is a streaming state machine -- it steps
+        chunk by chunk and commits text at each boundary -- but its generate()
+        takes a complete waveform and returns only the finished string, so a
+        caller could not see anything until it was over. It now takes an
+        on_emit callback, so each chunk is painted at the moment the state
+        machine commits it, in its own order and granularity, for the cost of
+        the single decode.
 
-        So this arm shows what it actually is: one pass, one transcript. The
-        SCRIPT arm keeps the two fronts; the comparison is between what each
-        layout can do, not between two differently-faked displays.
+        What this is NOT is self-correction. The baseline's emissions are
+        committed and never revised, so nothing here is ever struck out; the
+        earlier version faked a second front by re-decoding the growing prefix,
+        which cost ~0.55x real time (20s of audio took 11s, measured) and whose
+        revisions were an artefact of re-decoding rather than anything the
+        model does.
+
+        The one honest caveat, stated in the banner: the decode starts when the
+        utterance ends, because the state machine consumes a waveform that must
+        already be complete. Streaming it live from the microphone would need
+        the per-stream state lifted into a resumable driver.
         """
         import numpy as np
         import torch
@@ -304,17 +311,18 @@ class Session:
         self.send(
             f"\r\n[server] interleaved baseline, chunk {chunk} frames, emit delay {delay} "
             f"-> nominal {(chunk+delay)*0.08:.2f}s\r\n"
-            "[server] single pass, no second front: this arm buffers the utterance and decodes "
-            "it once at the end, so nothing appears until you stop speaking\r\n"
+            "[server] one pass, no second front: chunks appear as the decode commits them and are "
+            "never revised. The decode starts when you stop speaking -- it needs the whole waveform.\r\n"
         )
 
-        def decode(wave):
+        def decode(wave, on_emit=None):
             t = torch.from_numpy(wave).unsqueeze(0).to(dev)
             n = torch.tensor([wave.shape[0]], device=dev)
             with torch.inference_mode():
                 res = model.generate(
                     audios=t,
                     audio_lens=n,
+                    on_emit=on_emit,
                     system_prompt=prompt,
                     max_new_tokens=64,
                     generation_config=gen_cfg,
@@ -380,12 +388,16 @@ class Session:
 
         self.send(f"\r\n[server] decoding {audio.size/SR:.1f}s ...\r\n")
         t_dec = time.time()
-        final = decode(audio) if audio.size >= SR // 4 else ""
+
+        def paint_chunk(_stream, chunk_text, _so_far):
+            # commit_block with provisional == final strikes nothing, and keeps
+            # the terminal wrapping and the page's segment events shared with
+            # the SCRIPT arm rather than growing a second renderer.
+            if chunk_text:
+                self.commit_block(chunk_text, chunk_text)
+
+        final = decode(audio, on_emit=paint_chunk) if audio.size >= SR // 4 else ""
         cost = time.time() - t_dec
-        # Pass the text through commit_block so the terminal wrapping and the
-        # page's segment events stay shared with the SCRIPT arm. Provisional ==
-        # final, so nothing is struck: there is nothing to correct.
-        self.commit_block(final, final)
         self.send(f"\r\n[server] decode took {cost:.1f}s ({cost/max(audio.size/SR, 1e-6):.2f}x real time)\r\n")
         ok, diag = speech_report(audio)
         self.emit_final(final, audio.size / SR, 0, diag, ok, timed_out)
