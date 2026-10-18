@@ -108,8 +108,14 @@ def speech_report(a):
 class Session:
     """One utterance: PCM in from the socket, display updates back out."""
 
-    def __init__(self, model, sock, args, prompt_txt):
+    def __init__(self, model, sock, args, prompt_txt, alt=None):
         self.m, self.s, self.a, self.p = model, sock, args, prompt_txt
+        # The INTERLEAVED baseline, as (model, its own system prompt), or None
+        # when the server was started without --interleaved_ckpt. It is a second
+        # arm rather than a second server so both can be compared back to back
+        # without reloading, and it carries its OWN instruction: the SCRIPT
+        # prompt would put it out of distribution (see scripts/speechlm_asr_shim).
+        self.alt = alt
         self.cols = 88
         self.prompt_suffix = None  # inference-time text appended after the controls
         self.col = 0  # column of the PERMANENT text
@@ -245,6 +251,153 @@ class Session:
                 "[hint]  the transcript above is probably empty because the AUDIO is wrong, " "not the model.\r\n"
             )
 
+    def run_interleaved(self, leftover, chunk, delay):
+        """Baseline arm: one causal audio-text stream, re-decoded from scratch.
+
+        The interleaved model has no history / frame-range entry point -- its
+        generate() consumes a whole utterance in one call -- so there is no way
+        to extend a decode by one more chunk the way SCRIPT re-prefills its
+        spine. The only live view available is to decode the growing prefix
+        again each time, and that is expensive: at the reporting settings
+        (state-machine decode) 20s of audio costs ~11s, i.e. 0.55x real time.
+
+        So the loop self-throttles -- a new re-decode only starts once the
+        previous one has been paid for -- and the banner says how far behind the
+        text is. The alternative, a fixed refresh rate, would simply queue
+        decodes until the session collapsed.
+
+        NOTHING HERE IS THE MODEL CORRECTING ITSELF. A word that changes between
+        two re-decodes changed because the second decode saw more audio. The
+        crossings-out are re-decode differences, and the banner says so, because
+        a viewer who has just watched the SCRIPT arm will otherwise read them as
+        the same self-correction mechanism.
+        """
+        import numpy as np
+        import torch
+        from transformers import GenerationConfig
+
+        a_ = self.a
+        model, base_prompt = self.alt
+        dev = next(model.parameters()).device
+
+        trained = list(getattr(model.core_cfg, "chunk_size", []) or [])
+        if trained and chunk not in trained:
+            self.send(f"\r\n[server] rejected: chunk {chunk} is not in {trained}\r\n")
+            return ""
+        prompt = base_prompt
+        if self.prompt_suffix:
+            prompt = f"{base_prompt.rstrip()} {self.prompt_suffix}"
+        gen_cfg = GenerationConfig(do_sample=False)
+
+        self.send(
+            f"\r\n[server] interleaved baseline, chunk {chunk} frames, emit delay {delay} "
+            f"-> nominal {(chunk+delay)*0.08:.2f}s\r\n"
+            "[server] no second front: the live text is a FULL RE-DECODE of the audio so far, "
+            "so it lags and its crossings-out are re-decode differences, not self-correction\r\n"
+        )
+
+        def decode(wave):
+            t = torch.from_numpy(wave).unsqueeze(0).to(dev)
+            n = torch.tensor([wave.shape[0]], device=dev)
+            with torch.inference_mode():
+                res = model.generate(
+                    audios=t,
+                    audio_lens=n,
+                    system_prompt=prompt,
+                    max_new_tokens=64,
+                    generation_config=gen_cfg,
+                    chunk_size_override=chunk,
+                    # Both measured on this checkpoint: the state machine is the
+                    # path the model was designed for (6.03 vs 6.63 macro) and
+                    # offline embeddings drop words at chunk starts (17.79).
+                    use_offline_embs=False,
+                    use_state_machine_inference=True,
+                    emit_delay_frames=delay,
+                    return_alignments=False,
+                    return_debug_logs=False,
+                )
+            texts = res.texts if hasattr(res, "texts") else res
+            return (texts[0] or "").strip()
+
+        audio = np.zeros(0, dtype="float32")
+        if leftover:
+            if len(leftover) % 2:
+                leftover = leftover[:-1]
+            audio = np.frombuffer(leftover, dtype="<i2").astype("float32") / 32768.0
+        read_bytes = max(2, chunk) * SAMPLES_PER_FRAME * 2
+        last_prov = ""
+        t0 = None
+        last = time.time()
+        next_decode = 0.0
+        timed_out = False
+        self.s.settimeout(1.0)
+        while True:
+            try:
+                buf = self.s.recv(read_bytes)
+            except socket.timeout:
+                if time.time() - last > a_.idle_timeout:
+                    timed_out = True
+                    break
+                continue
+            except OSError:
+                break
+            if not buf:
+                break
+            last = time.time()
+            # Same drain as the SCRIPT path, and more important here: a re-decode
+            # blocks this loop for seconds, so without it the backlog is lost
+            # rather than merely late.
+            self.s.setblocking(False)
+            try:
+                while True:
+                    more = self.s.recv(65536)
+                    if not more:
+                        break
+                    buf += more
+            except (BlockingIOError, OSError):
+                pass
+            finally:
+                self.s.setblocking(True)
+                self.s.settimeout(1.0)
+            audio = np.concatenate([audio, np.frombuffer(buf, dtype="<i2").astype("float32") / 32768.0])
+            if t0 is None:
+                t0 = time.time()
+            if time.time() - t0 > a_.max_seconds:
+                break
+            if audio.size < SR // 2 or time.time() < next_decode:
+                continue
+            t_dec = time.time()
+            prov = decode(audio)
+            cost = time.time() - t_dec
+            # Spend at most half the wall clock decoding, so audio keeps being
+            # read and the lag grows linearly instead of compounding.
+            next_decode = time.time() + max(a_.il_min_interval, cost)
+            if prov:
+                self.paint(prov)
+                last_prov = prov
+            if a_.timing:
+                print(
+                    f"    interleaved re-decode: {audio.size/SR:6.2f}s audio -> {cost:5.2f}s "
+                    f"({cost/max(audio.size/SR, 1e-6):.2f}x RT)",
+                    flush=True,
+                )
+
+        final = decode(audio) if audio.size >= SR // 4 else ""
+        self.commit_block(last_prov, final)
+        ok, diag = speech_report(audio)
+        self.emit_final(final, audio.size / SR, 0, diag, ok, timed_out)
+        try:
+            self.s.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+        try:
+            self.s.settimeout(2.0)
+            while self.s.recv(65536):
+                pass
+        except (OSError, socket.timeout):
+            pass
+        return final
+
     def run(self):
         import numpy as np
         import torch
@@ -271,13 +424,24 @@ class Session:
                 pre += b
         except (socket.timeout, OSError):
             pass
+        arm = "script"
+        il_chunk, il_delay = a_.il_chunk, a_.il_delay
         head, _, rest = pre.partition(b"\n")
         if head.startswith(b"CFG "):
             for tok in head.decode("ascii", "replace").split()[1:]:
                 k, _, v = tok.partition("=")
+                if k == "model":
+                    arm = v
+                    continue
                 try:
                     iv = int(v)
                 except ValueError:
+                    continue
+                if k == "il_chunk":
+                    il_chunk = iv
+                    continue
+                if k == "il_delay":
+                    il_delay = iv
                     continue
                 if k == "fast_delay":
                     fast_delay = iv
@@ -292,6 +456,13 @@ class Session:
             leftover = rest
         else:
             leftover = pre  # no preamble: every byte was audio
+        self.cols = max(40, min(200, cols)) - 4
+        if arm == "interleaved":
+            if self.alt is None:
+                self.send("\r\n[server] rejected: this server was started without --interleaved_ckpt\r\n")
+                return ""
+            return self.run_interleaved(leftover, il_chunk, il_delay)
+
         fast_delay = max(0, min(a_.max_delay, fast_delay))
         slow_delay = max(0, min(a_.max_delay, slow_delay))
         # Validate the pair HERE, not at startup: it now arrives per session, and
@@ -309,7 +480,6 @@ class Session:
             self.send(f"\r\n[server] rejected: {why}\r\n")
             return ""
 
-        self.cols = max(40, min(200, cols)) - 4
         chunk_bytes = fast * SAMPLES_PER_FRAME * 2
         self.send(
             f"\r\n[server] fronts {fast}/{slow} frames, delays {fast_delay}/{slow_delay} "
@@ -461,6 +631,37 @@ class Session:
         return committed
 
 
+# The interleaved baseline's OWN training instruction. Using the SCRIPT prompt
+# here would put it out of distribution -- see scripts/speechlm_asr_shim.py.
+INTERLEAVED_PROMPT = "Transcribe the audio into text."
+
+SCRIPT_PROMPT = (
+    "You are doing streaming speech recognition. Given the transcript so far and the "
+    "representation of the next audio chunk, output the words spoken in that chunk."
+)
+
+
+def load_interleaved(args):
+    """Load the baseline arm, or return None when the server was started without it.
+
+    Returns (model, prompt) so the pair travels together: the baseline's prompt
+    is not interchangeable with SCRIPT's.
+    """
+    import torch
+
+    if not args.interleaved_ckpt:
+        return None
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__))))
+    from speechlm_leaderboard_eval import load_model as load_interleaved_model
+
+    dev = torch.device(args.interleaved_device or args.device)
+    print(f"loading interleaved baseline on {dev} ...", flush=True)
+    m = load_interleaved_model(args.interleaved_ckpt, args.interleaved_class, dev, torch.bfloat16)
+    m.eval()
+    print(f"  interleaved ready (trained chunks {list(m.core_cfg.chunk_size)})", flush=True)
+    return m, INTERLEAVED_PROMPT
+
+
 def serve(args):
     import torch
 
@@ -474,10 +675,8 @@ def serve(args):
     missing = [c for c in (args.fast, args.slow) if trained and c not in trained]
     if missing:
         raise SystemExit(f"checkpoint trained on {trained}; fronts {missing} are not among them")
-    prompt_txt = (
-        "You are doing streaming speech recognition. Given the transcript so far and the "
-        "representation of the next audio chunk, output the words spoken in that chunk."
-    )
+    prompt_txt = SCRIPT_PROMPT
+    alt = load_interleaved(args)
 
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -494,7 +693,7 @@ def serve(args):
         print(f"[{time.strftime('%H:%M:%S')}] session from {addr}", flush=True)
         try:
             with gpu:
-                text = Session(model, conn, args, prompt_txt).run()
+                text = Session(model, conn, args, prompt_txt, alt).run()
             print(f"[{time.strftime('%H:%M:%S')}] -> {text[:80]!r}", flush=True)
         except (ConnectionResetError, BrokenPipeError):
             print("  client went away", flush=True)
@@ -516,8 +715,9 @@ def client(args):
     s = socket.create_connection((args.host, args.port))
     # Tell the server this utterance's operating point before any audio.
     s.sendall(
-        f"CFG fast={args.fast} slow={args.slow} cols={args.cols} "
-        f"fast_delay={args.fast_delay} slow_delay={args.slow_delay}\n".encode()
+        f"CFG model={args.arm} fast={args.fast} slow={args.slow} cols={args.cols} "
+        f"fast_delay={args.fast_delay} slow_delay={args.slow_delay} "
+        f"il_chunk={args.il_chunk} il_delay={args.il_delay}\n".encode()
     )
 
     def pump_back():
@@ -578,6 +778,32 @@ def main():
     ap.add_argument("--timing", action="store_true", help="log a per-update latency breakdown")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--model_class", default="nemo.collections.speechlm2.models.script_model.ScriptSTTModel")
+    ap.add_argument(
+        "--interleaved_ckpt",
+        default="",
+        help="optional SECOND arm: the interleaved streaming SpeechLM baseline, held resident "
+        "alongside SCRIPT so the two can be compared back to back without a reload",
+    )
+    ap.add_argument(
+        "--interleaved_device",
+        default="",
+        help="device for the baseline (default: same as --device; a second GPU keeps the two arms "
+        "from competing for memory)",
+    )
+    ap.add_argument(
+        "--interleaved_class",
+        default="nemo.collections.speechlm2.models.streaming_stt_model.StreamingSTTModel",
+    )
+    ap.add_argument("--il_chunk", type=int, default=14, help="chunk size (frames) for the interleaved arm")
+    ap.add_argument("--il_delay", type=int, default=0, help="emit delay (frames) for the interleaved arm")
+    ap.add_argument(
+        "--il_min_interval",
+        type=float,
+        default=1.0,
+        help="shortest gap between interleaved re-decodes; the real gap is the larger of this and "
+        "what the last re-decode cost",
+    )
+    ap.add_argument("--arm", default="script", choices=["script", "interleaved"], help="which arm the client asks for")
     args = ap.parse_args()
     if args.client:
         client(args)

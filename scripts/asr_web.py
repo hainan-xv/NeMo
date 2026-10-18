@@ -46,7 +46,7 @@ import threading
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from scripts.asr_server import SR, Session, speech_report  # noqa: E402
+from scripts.asr_server import SCRIPT_PROMPT, SR, Session, load_interleaved, speech_report  # noqa: E402
 
 ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
@@ -94,6 +94,14 @@ class QueueSocket:
         out, self._buf = item[:n], item[n:]
         return out
 
+    def push(self, data):
+        """Put bytes at the FRONT of the stream, ahead of any microphone audio.
+
+        Used for the CFG preamble: Session parses it from the socket, so the web
+        front-end hands it over the same way the terminal client does.
+        """
+        self._buf = data + self._buf
+
     def sendall(self, data):
         self.out_q.put(data)
 
@@ -107,8 +115,8 @@ class QueueSocket:
 class WebSession(Session):
     """Same decode, structured events instead of escape codes."""
 
-    def __init__(self, model, sock, args, prompt_txt, emit):
-        super().__init__(model, sock, args, prompt_txt)
+    def __init__(self, model, sock, args, prompt_txt, emit, alt=None):
+        super().__init__(model, sock, args, prompt_txt, alt)
         self.emit = emit
 
     def send(self, text):
@@ -169,9 +177,10 @@ async def ws_handler(request):
 
     a = A()
     a.__dict__.update(vars(app["args"]))
-    for k in ("fast", "slow", "fast_delay", "slow_delay"):
+    for k in ("fast", "slow", "fast_delay", "slow_delay", "il_chunk", "il_delay"):
         if k in cfg:
             a.__dict__[k] = int(cfg[k])
+    arm = "interleaved" if cfg.get("model") == "interleaved" else "script"
 
     # Free-text biasing appended to the base instruction, BEFORE the control
     # clauses that render_control_prompt adds -- so the trained template still
@@ -184,7 +193,16 @@ async def ws_handler(request):
 
     def run():
         try:
-            sess = WebSession(app["model"], QueueSocket(audio_q, out_q), a, prompt, emit)
+            sock = QueueSocket(audio_q, out_q)
+            # Session reads the operating point from a CFG preamble, so the arm
+            # is pushed through the SAME channel the terminal client uses rather
+            # than a second code path that could drift from it.
+            sock.push(
+                f"CFG model={arm} fast={a.fast} slow={a.slow} cols={a.cols} "
+                f"fast_delay={a.fast_delay} slow_delay={a.slow_delay} "
+                f"il_chunk={a.il_chunk} il_delay={a.il_delay}\n".encode()
+            )
+            sess = WebSession(app["model"], sock, a, prompt, emit, app.get("alt"))
             sess.prompt_suffix = extra or None
             sess.run()
         except Exception as e:  # a bad session must not take the server down
@@ -235,6 +253,12 @@ async def index(request):
     return web.FileResponse(PAGE)
 
 
+async def info(request):
+    from aiohttp import web
+
+    return web.json_response(request.app["info"])
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True)
@@ -252,6 +276,15 @@ def main():
     ap.add_argument("--timing", action="store_true")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--model_class", default="nemo.collections.speechlm2.models.script_model.ScriptSTTModel")
+    ap.add_argument("--interleaved_ckpt", default="", help="optional interleaved-baseline arm")
+    ap.add_argument("--interleaved_device", default="", help="device for the baseline (default: --device)")
+    ap.add_argument(
+        "--interleaved_class",
+        default="nemo.collections.speechlm2.models.streaming_stt_model.StreamingSTTModel",
+    )
+    ap.add_argument("--il_chunk", type=int, default=14)
+    ap.add_argument("--il_delay", type=int, default=0)
+    ap.add_argument("--il_min_interval", type=float, default=1.0)
     args = ap.parse_args()
 
     import torch
@@ -262,13 +295,24 @@ def main():
     print("loading model ...", flush=True)
     model = load_model(args.ckpt, args.model_class, torch.device(args.device), torch.bfloat16, prompt_control=True)
     model.eval()
-    prompt = (
-        "You are doing streaming speech recognition. Given the transcript so far and the "
-        "representation of the next audio chunk, output the words spoken in that chunk."
-    )
+    prompt = SCRIPT_PROMPT
+    alt = load_interleaved(args)
     app = web.Application(client_max_size=1 << 22)
-    app["model"], app["args"], app["prompt"] = model, args, prompt
+    app["model"], app["args"], app["prompt"], app["alt"] = model, args, prompt, alt
+    # The page fills its dropdowns from this rather than a hard-coded list: the
+    # two checkpoints were trained on DIFFERENT chunk sets ([2,7,14,28,42] vs
+    # [2,4,7,10,14,28]), and offering a size a model never saw still yields
+    # fluent text -- which is the dangerous failure, not a loud one.
+    app["info"] = {
+        "script": {"chunks": [int(c) for c in model.core_cfg.chunk_size], "delays": list(range(args.max_delay + 1))},
+        "interleaved": (
+            None
+            if alt is None
+            else {"chunks": [int(c) for c in alt[0].core_cfg.chunk_size], "delays": list(range(args.max_delay + 1))}
+        ),
+    }
     app.router.add_get("/", index)
+    app.router.add_get("/info", info)
     app.router.add_get("/ws", ws_handler)
     print(f"ready on http://{args.host}:{args.port}  (trained chunks {list(model.core_cfg.chunk_size)})", flush=True)
     web.run_app(app, host=args.host, port=args.port, print=None)

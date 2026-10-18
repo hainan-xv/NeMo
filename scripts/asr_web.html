@@ -4,7 +4,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>SCRIPT — self-correcting streaming ASR</title>
+<title>SCRIPT vs interleaved — streaming ASR</title>
 <style>
   :root { --bg:#14161a; --fg:#e9ecf1; --mut:#8b93a1; --accent:#76b900; --bad:#ff6b6b; }
   * { box-sizing: border-box; }
@@ -30,23 +30,42 @@
   #final .lbl { color:var(--mut); font-size:12px; text-transform:uppercase; letter-spacing:.9px; margin-bottom:8px; }
   #log { margin-top:18px; color:var(--mut); font:12.5px/1.65 ui-monospace,SFMono-Regular,Menlo,monospace; white-space:pre-wrap; }
   .hint { color:var(--mut); font-size:13px; }
+  #bias { margin-bottom:22px; }
+  #bias input { width:100%; background:#1d2026; color:var(--fg); border:1px solid #30353e;
+                border-radius:8px; padding:11px 14px; font-size:14px; font-family:inherit; }
+  #bias input::placeholder { color:#5d6472; }
+  #bias input:focus { outline:none; border-color:var(--accent); }
   button.mini { padding:3px 11px; font-size:11px; font-weight:500; background:#2a2f38; color:var(--mut); margin-left:10px; }
   button.mini:hover { background:#333942; color:var(--fg); }
 </style>
 </head>
 <body>
 <header>
-  <h1><span id="dot"></span>SCRIPT — self-correcting streaming ASR</h1>
+  <h1><span id="dot"></span>streaming ASR — SCRIPT vs interleaved</h1>
   <div class="controls">
     <label>mic</label><select id="mic"><option value="">default</option></select>
-    <label>fast</label><select id="fast"></select>
-    <label>slow</label><select id="slow"></select>
-    <label>delay</label><select id="fdelay"></select><span class="hint">/</span><select id="sdelay"></select>
+    <label>model</label><select id="arm">
+      <option value="script">SCRIPT</option>
+      <option value="interleaved">interleaved</option>
+    </select>
+    <span id="scriptctl">
+      <label>fast</label><select id="fast"></select>
+      <label>slow</label><select id="slow"></select>
+      <label>delay</label><select id="fdelay"></select><span class="hint">/</span><select id="sdelay"></select>
+    </span>
+    <span id="ilctl" hidden>
+      <label>chunk</label><select id="ilchunk"></select>
+      <label>delay</label><select id="ildelay"></select>
+    </span>
     <button id="rec">Record</button>
   </div>
 </header>
 <main>
-  <div id="out"><span class="hint">Press Record and speak. Provisional words appear greyed; when the slow front
+  <div id="bias">
+    <input id="prompt_extra" type="text" spellcheck="false"
+      placeholder="optional prompt, appended to the instruction - e.g. &quot;The audio may contain the names Hainan, Crichton and Vanderpool.&quot;">
+  </div>
+  <div id="out"><span class="hint" id="intro">Press Record and speak. Provisional words appear greyed; when the slow front
 overrules them they are crossed out and replaced.</span></div>
   <div id="final">
     <div class="lbl">final transcript <button id="copy" class="mini">copy</button></div>
@@ -59,12 +78,48 @@ const $ = s => document.querySelector(s);
 const out = $('#out'), logEl = $('#log'), recBtn = $('#rec'), dot = $('#dot');
 let ws=null, ctx=null, node=null, stream=null, recording=false, provSpan=null, started=false;
 
-// The checkpoint's trained operating points. A value outside these decodes at a
-// point the model never saw -- it still produces fluent text, which is the
-// dangerous part, so they are not free-form inputs.
-const CHUNKS=[2,7,14,28,42], DELAYS=[0,1,2,3,4];
-function fill(sel, vals, def){ vals.forEach(v=>{const o=document.createElement('option');o.value=v;o.textContent=v;if(v===def)o.selected=true;sel.appendChild(o);}); }
-fill($('#fast'),CHUNKS,2); fill($('#slow'),CHUNKS,28); fill($('#fdelay'),DELAYS,1); fill($('#sdelay'),DELAYS,3);
+// Trained operating points come from the SERVER, per arm. The two checkpoints
+// were trained on different chunk sets, and decoding at a size a model never
+// saw still produces fluent text -- which is the dangerous failure mode, so
+// these are never free-form inputs and never a list hard-coded here.
+let INFO = null;
+function fill(sel, vals, def){ sel.innerHTML=''; vals.forEach(v=>{const o=document.createElement('option');o.value=v;o.textContent=v;if(v===def)o.selected=true;sel.appendChild(o);}); }
+function nearest(vals, want){ return vals.includes(want) ? want : vals[vals.length-1]; }
+
+const INTRO = {
+  script: 'Press Record and speak. Provisional words appear greyed; when the slow front '
+        + 'overrules them they are crossed out and replaced.',
+  interleaved: 'Press Record and speak. The interleaved baseline has one front and no way to extend '
+        + 'a decode, so the live text is a full re-decode of the audio so far: it lags, and anything '
+        + 'crossed out changed because the next re-decode heard more audio -- not because the model '
+        + 'corrected itself.'
+};
+
+function applyArm(){
+  const arm = $('#arm').value;
+  $('#scriptctl').hidden = arm !== 'script';
+  $('#ilctl').hidden = arm !== 'interleaved';
+  const i = $('#intro');   // gone once a transcript has replaced it
+  if(i) i.textContent = INTRO[arm];
+}
+
+fetch('/info').then(r=>r.json()).then(j=>{
+  INFO = j;
+  fill($('#fast'), j.script.chunks, nearest(j.script.chunks,2));
+  fill($('#slow'), j.script.chunks, nearest(j.script.chunks,28));
+  fill($('#fdelay'), j.script.delays, nearest(j.script.delays,1));
+  fill($('#sdelay'), j.script.delays, nearest(j.script.delays,3));
+  const il = $('#arm').querySelector('option[value=interleaved]');
+  if(!j.interleaved){
+    il.disabled = true;
+    il.textContent = 'interleaved (not loaded)';
+  } else {
+    fill($('#ilchunk'), j.interleaved.chunks, nearest(j.interleaved.chunks,14));
+    fill($('#ildelay'), j.interleaved.delays, nearest(j.interleaved.delays,0));
+  }
+  applyArm();
+}).catch(e=>log('could not read /info: '+e.message));
+$('#arm').onchange = applyArm;
 
 function log(t){ logEl.textContent += t + "\n"; }
 
@@ -126,8 +181,11 @@ async function start(){
   ws = new WebSocket(`${proto}://${location.host}/ws`);
   ws.binaryType='arraybuffer';
   ws.onopen = ()=>{
-    ws.send(JSON.stringify({fast:+$('#fast').value, slow:+$('#slow').value,
-                            fast_delay:+$('#fdelay').value, slow_delay:+$('#sdelay').value}));
+    ws.send(JSON.stringify({model:$('#arm').value,
+                            fast:+$('#fast').value, slow:+$('#slow').value,
+                            fast_delay:+$('#fdelay').value, slow_delay:+$('#sdelay').value,
+                            il_chunk:+$('#ilchunk').value, il_delay:+$('#ildelay').value,
+                            prompt_extra:$('#prompt_extra').value}));
     src.connect(node); node.connect(ctx.destination);
   };
   ws.onmessage = e=>{
