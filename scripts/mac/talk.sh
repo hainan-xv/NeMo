@@ -56,6 +56,49 @@ pick_device() {
 }
 [ -z "$DEV" ] && DEV=$(pick_device)
 
+# --- pick the arm ------------------------------------------------------------
+# The server holds both checkpoints resident, so this costs nothing but a word
+# in the CFG preamble. They were trained on DIFFERENT chunk sets, so the prompts
+# below branch on it rather than offering one list for both.
+pick_arm() {
+    local d
+    echo >&2
+    echo "model: [s] SCRIPT (two fronts, self-correcting)  [i] interleaved baseline" >&2
+    printf '  model [%s]: ' "${ARM_DEFAULT:-s}" >&2
+    read -r d </dev/tty; d=${d:-${ARM_DEFAULT:-s}}
+    case "$d" in
+        s|S|script)      ARM=script ;;
+        i|I|interleaved) ARM=interleaved ;;
+        *) echo "pick s or i, got '$d'" >&2; exit 1 ;;
+    esac
+    echo "  -> $ARM" >&2
+}
+[ -z "${ARM:-}" ] && pick_arm
+
+# --- interleaved: one front, so one chunk size and one delay -----------------
+# No second front means no self-correction: the live text is a full re-decode of
+# the audio so far, and it lags -- ~0.55x real time at chunk 14, worse at chunk
+# 2. The server says so in its banner too.
+pick_interleaved() {
+    local d
+    echo >&2
+    echo "chunk size, in 80ms frames. Trained: 2, 4, 7, 10, 14, 28." >&2
+    printf '  chunk [%s]: ' "${IL_CHUNK_DEFAULT:-14}" >&2
+    read -r d </dev/tty; IL_CHUNK=${d:-${IL_CHUNK_DEFAULT:-14}}
+    case "$IL_CHUNK" in
+        2|4|7|10|14|28) ;;
+        *) echo "chunk size $IL_CHUNK was never trained (use 2, 4, 7, 10, 14 or 28)" >&2; exit 1 ;;
+    esac
+    printf '  emit delay (0-4) [%s]: ' "${IL_DELAY_DEFAULT:-0}" >&2
+    read -r d </dev/tty; IL_DELAY=${d:-${IL_DELAY_DEFAULT:-0}}
+    case "$IL_DELAY" in
+        ''|*[!0-9]*) echo "delay must be a number 0-4, got '$IL_DELAY'" >&2; exit 1 ;;
+    esac
+    [ "$IL_DELAY" -gt 4 ] && { echo "delay $IL_DELAY was never trained (max 4)" >&2; exit 1; }
+    awk -v c="$IL_CHUNK" -v d="$IL_DELAY" \
+        'BEGIN{printf "  -> nominal %.2fs; the live text lags behind that, see the server banner\n",(c+d)*0.08}' >&2
+}
+
 # --- pick the two fronts -----------------------------------------------------
 # This checkpoint trained chunk sizes 2, 7, 14 and 28. slow must be a different,
 # exact multiple of fast, or a block would not contain a whole number of fast
@@ -78,7 +121,7 @@ pick_fronts() {
     [ $((SLOW % FAST)) -ne 0 ] && { echo "slow ($SLOW) must be an exact multiple of fast ($FAST)" >&2; exit 1; }
     echo "  -> $((SLOW / FAST)) fast chunks per block" >&2
 }
-[ -z "${FAST:-}" ] && pick_fronts
+[ "$ARM" = script ] && [ -z "${FAST:-}" ] && pick_fronts
 
 # --- pick emission delays ----------------------------------------------------
 # Delay is the number of frames the model waits past a word before committing to
@@ -103,14 +146,22 @@ pick_delays() {
     awk -v f="${FAST:-2}" -v fd="$FAST_DELAY" -v s="${SLOW:-14}" -v sd="$SLOW_DELAY" \
         'BEGIN{printf "  -> first paint %.2fs, settles every %.2fs\n",(f+fd)*0.08,(s+sd)*0.08}' >&2
 }
-[ -z "${FAST_DELAY:-}" ] && pick_delays
+if [ "$ARM" = script ]; then
+    [ -z "${FAST_DELAY:-}" ] && pick_delays
+else
+    [ -z "${IL_CHUNK:-}" ] && pick_interleaved
+fi
+# The server ignores the front settings on the interleaved arm, but the client
+# still renders them into the CFG line, so give them trained values.
+: "${FAST:=2}" "${SLOW:=14}" "${FAST_DELAY:=1}" "${SLOW_DELAY:=3}"
+: "${IL_CHUNK:=14}" "${IL_DELAY:=0}"
 
 SSH_OPTS=(-i "$KEY" -o ControlMaster=auto -o ControlPath=/tmp/asrctl-%r@%h:%p -o ControlPersist=300)
 FIFO=$(mktemp -u /tmp/asrmic.XXXXXX)
 mkfifo "$FIFO"
 trap 'rm -f "$FIFO"; echo; echo "bye."; exit 0' EXIT INT
 
-echo "push-to-talk  ->  $HOST   device $DEV"
+echo "push-to-talk  ->  $HOST   device $DEV   model $ARM"
 echo "ENTER starts, ENTER finishes, Ctrl-C quits."
 n=0
 while true; do
@@ -128,9 +179,10 @@ while true; do
     ff=$!
     # Pass the REAL terminal width so the server wraps to it. Wrapping wider
     # lets the terminal soft-wrap first, and soft wraps copy without a space.
-    ssh "${SSH_OPTS[@]}" "$HOST" ./asr --fast "$FAST" --slow "$SLOW" \
+    ssh "${SSH_OPTS[@]}" "$HOST" ./asr --arm "$ARM" --fast "$FAST" --slow "$SLOW" \
         --cols "$(tput cols 2>/dev/null || echo 80)" \
-        --fast_delay "$FAST_DELAY" --slow_delay "$SLOW_DELAY" < "$FIFO" &
+        --fast_delay "$FAST_DELAY" --slow_delay "$SLOW_DELAY" \
+        --il_chunk "$IL_CHUNK" --il_delay "$IL_DELAY" < "$FIFO" &
     ss=$!
 
     read -r _ || true                 # second ENTER ends the utterance

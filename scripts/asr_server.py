@@ -74,6 +74,23 @@ BOLD = "\033[1m"
 CLEAR_LINE = "\033[K"  # erase to end of LINE -- no absolute position, scroll-safe
 
 
+def _pcm(buf, carry):
+    """Decode little-endian 16-bit PCM, carrying a split sample to the next read.
+
+    Returns (samples, new_carry). A socket read can end mid-sample, so the
+    length is not reliably even; truncating instead of carrying would misalign
+    every following sample by one byte and turn the rest of the utterance into
+    noise.
+    """
+    import numpy as np
+
+    buf = carry + bytes(buf)
+    carry = b""
+    if len(buf) % 2:
+        buf, carry = buf[:-1], buf[-1:]
+    return np.frombuffer(buf, dtype="<i2").astype("float32") / 32768.0, carry
+
+
 def speech_report(a):
     """Does this look like speech? Returns (ok, one-line diagnosis)."""
     import numpy as np
@@ -320,10 +337,13 @@ class Session:
             return (texts[0] or "").strip()
 
         audio = np.zeros(0, dtype="float32")
-        if leftover:
-            if len(leftover) % 2:
-                leftover = leftover[:-1]
-            audio = np.frombuffer(leftover, dtype="<i2").astype("float32") / 32768.0
+        # A read can split a 16-bit sample, and the CFG preamble leaves an
+        # arbitrary number of bytes behind it, so an odd byte is normal rather
+        # than exceptional. Carry it to the next read instead of dropping it:
+        # dropping one byte shifts every later sample by half a sample and turns
+        # the rest of the utterance into noise.
+        carry = b""
+        audio, carry = _pcm(leftover, carry)
         read_bytes = max(2, chunk) * SAMPLES_PER_FRAME * 2
         last_prov = ""
         t0 = None
@@ -359,7 +379,8 @@ class Session:
             finally:
                 self.s.setblocking(True)
                 self.s.settimeout(1.0)
-            audio = np.concatenate([audio, np.frombuffer(buf, dtype="<i2").astype("float32") / 32768.0])
+            fresh, carry = _pcm(buf, carry)
+            audio = np.concatenate([audio, fresh])
             if t0 is None:
                 t0 = time.time()
             if time.time() - t0 > a_.max_seconds:
@@ -485,11 +506,8 @@ class Session:
             f"\r\n[server] fronts {fast}/{slow} frames, delays {fast_delay}/{slow_delay} "
             f"-> first paint {(fast+fast_delay)*0.08:.2f}s, settles {(slow+slow_delay)*0.08:.2f}s\r\n"
         )
-        audio = np.zeros(0, dtype="float32")
-        if leftover:
-            if len(leftover) % 2:
-                leftover = leftover[:-1]
-            audio = np.frombuffer(leftover, dtype="<i2").astype("float32") / 32768.0
+        carry = b""
+        audio, carry = _pcm(leftover, carry)
         committed, blocks = "", 0
         last_prov = ""
         t0 = None
@@ -530,7 +548,8 @@ class Session:
             finally:
                 self.s.setblocking(True)
                 self.s.settimeout(1.0)
-            audio = np.concatenate([audio, np.frombuffer(buf, dtype="<i2").astype("float32") / 32768.0])
+            fresh, carry = _pcm(buf, carry)
+            audio = np.concatenate([audio, fresh])
             if t0 is None:
                 t0 = time.time()
             if time.time() - t0 > a_.max_seconds:
