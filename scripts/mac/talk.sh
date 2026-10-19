@@ -76,9 +76,9 @@ pick_arm() {
 [ -z "${ARM:-}" ] && pick_arm
 
 # --- interleaved: one front, so one chunk size and one delay -----------------
-# No second front means no self-correction: the live text is a full re-decode of
-# the audio so far, and it lags -- ~0.55x real time at chunk 14, worse at chunk
-# 2. The server says so in its banner too.
+# This arm decodes live but has no self-correction, and is not meant to: it has
+# one front, and each chunk is committed as the decode produces it and never
+# revised. Nothing is ever crossed out here.
 pick_interleaved() {
     local d
     echo >&2
@@ -96,7 +96,7 @@ pick_interleaved() {
     esac
     [ "$IL_DELAY" -gt 4 ] && { echo "delay $IL_DELAY was never trained (max 4)" >&2; exit 1; }
     awk -v c="$IL_CHUNK" -v d="$IL_DELAY" \
-        'BEGIN{printf "  -> nominal %.2fs per chunk; single pass, printed when the utterance ends\n",(c+d)*0.08}' >&2
+        'BEGIN{printf "  -> nominal %.2fs per chunk; one front, committed as decoded, never revised\n",(c+d)*0.08}' >&2
 }
 
 # --- pick the two fronts -----------------------------------------------------

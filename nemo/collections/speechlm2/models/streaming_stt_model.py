@@ -2351,6 +2351,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         return_alignments: bool = True,
         return_debug_logs: bool = False,
         on_emit: Optional[Callable[[int, str, str], None]] = None,
+        audio_source: Optional[Callable[[int, int, int], Any]] = None,
         **generation_kwargs,
     ) -> StreamingSTTGenerateResult:
         """Batched dynamic-chunking generation.
@@ -2378,6 +2379,17 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 just the final string, so a caller wanting to show progress
                 otherwise has to re-decode the prefix over and over. The
                 callback must be cheap; it runs inside the decode loop.
+            audio_source: Optional ``fn(stream_index, start_sample, n_samples)``
+                returning that slice of audio, used INSTEAD of indexing
+                ``audios``. It may block until the samples exist, which is what
+                turns this into a live decode: everything else in the loop --
+                encoder cache, feature buffer, per-stream embedding buffers --
+                is already incremental, and a complete waveform was the only
+                reason the whole utterance had to be in hand before starting.
+                Returning fewer samples than asked for ends that stream and
+                fixes its length. ``audios`` is then only read for its device
+                and dtype, so it may be an empty placeholder, and
+                ``n_samples_list`` should start at an upper bound.
             dynamic_min_chunk_size: Minimum frames before the model is allowed
                 to trigger generation (default 0, no minimum).
             dynamic_max_chunk_size: Maximum frames before forcing generation.
@@ -2520,6 +2532,26 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 and len(audio_emb_buf[b]) == 0
                 and audio_sample_idx[b] < n_samples_list[b]
             ]
+            if needs_refill and audio_source is not None:
+                # LIVE: pull this chunk from the caller, blocking until it has
+                # been captured. A short read means the stream ended there --
+                # which is also how the total length, unknown while the
+                # microphone is still open, finally becomes known. A stream that
+                # returns nothing is dropped from this refill entirely rather
+                # than submitting a zero-length frame to the feature buffer.
+                pulled = {}
+                for b in needs_refill:
+                    wav = audio_source(b, audio_sample_idx[b], chunk_samples)
+                    wav = torch.as_tensor(wav, device=device, dtype=audios.dtype).reshape(-1)[:chunk_samples]
+                    got = int(wav.shape[0])
+                    if got < chunk_samples:
+                        n_samples_list[b] = audio_sample_idx[b] + got
+                    if got:
+                        pulled[b] = wav
+                needs_refill = [b for b in needs_refill if b in pulled]
+            else:
+                pulled = None
+
             if needs_refill:
                 # Run perception only for streams that need refill.
                 # The feature buffer selectively updates via stream_id.
@@ -2530,8 +2562,12 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 frames = []
                 for b in needs_refill:
                     start = audio_sample_idx[b]
-                    end = min(start + chunk_samples, n_samples_list[b])
-                    wav = audios[b, start:end]
+                    if pulled is not None:
+                        wav = pulled[b]
+                        end = start + int(wav.shape[0])
+                    else:
+                        end = min(start + chunk_samples, n_samples_list[b])
+                        wav = audios[b, start:end]
                     if wav.shape[0] < chunk_samples:
                         wav = F.pad(wav, (0, chunk_samples - wav.shape[0]))
                     frames.append(Frame(samples=wav, stream_id=b, length=end - start))
@@ -3279,6 +3315,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         return_alignments: bool = True,
         return_debug_logs: bool = False,
         on_emit: Optional[Callable[[int, str, str], None]] = None,
+        audio_source: Optional[Callable[[int, int, int], Any]] = None,
         **generation_kwargs,
     ) -> StreamingSTTGenerateResult:
         """
@@ -3310,6 +3347,10 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             on_emit: Optional ``fn(stream_index, chunk_text, text_so_far)`` called
                 as each chunk is committed, so a caller can display output while
                 the decode is still running. State-machine path only.
+            audio_source: Optional ``fn(stream_index, start_sample, n_samples)``
+                supplying audio on demand instead of from ``audios``; it may
+                block, making this a live decode that follows a microphone. A
+                short return ends that stream. State-machine path only.
             generation_kwargs: Per-call overrides for generation parameters.
 
         Returns:
@@ -3321,6 +3362,12 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         # Resolve the chunk size for this call (longest of a list config by
         # default; explicit override wins) and match the encoder's streaming
         # look-ahead to it (no-op for dynamic/offline modes).
+        if audio_source is not None and not use_state_machine_inference and chunk_size_override != 0:
+            # The offline and bulk-prefill paths index `audios` directly; only
+            # the state machine pulls audio a chunk at a time, so a caller
+            # asking for live decode on another path would silently get a decode
+            # of the empty placeholder.
+            raise ValueError("audio_source requires use_state_machine_inference=True (or chunk_size 0)")
         chunk_size = self._resolve_inference_chunk_size(chunk_size_override)
         self._set_encoder_att_context(chunk_size, recompute_streaming=True)
 
@@ -3356,6 +3403,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                     return_alignments=return_alignments,
                     return_debug_logs=return_debug_logs,
                     on_emit=on_emit,
+                    audio_source=audio_source,
                     **generation_kwargs,
                 )
             else:

@@ -74,6 +74,48 @@ BOLD = "\033[1m"
 CLEAR_LINE = "\033[K"  # erase to end of LINE -- no absolute position, scroll-safe
 
 
+class _LiveAudio:
+    """Hand a decode its audio as it is captured, instead of all at once.
+
+    The decode thread calls ``read`` and parks until the socket thread has
+    pushed that many samples, so the state machine advances in step with the
+    microphone. ``close`` marks the end: the next read returns whatever is left,
+    and a short read is how the decode learns the stream is over -- a live
+    stream cannot know its own length in advance.
+
+    ``close`` must be called on every exit path, or the decode thread stays
+    parked forever holding the session open.
+    """
+
+    def __init__(self, device):
+        import numpy as np
+
+        self._np = np
+        self._device = device
+        self._buf = np.zeros(0, dtype="float32")
+        self._closed = False
+        self._cv = threading.Condition()
+
+    def push(self, samples):
+        with self._cv:
+            self._buf = self._np.concatenate([self._buf, samples])
+            self._cv.notify_all()
+
+    def close(self):
+        with self._cv:
+            self._closed = True
+            self._cv.notify_all()
+
+    def read(self, _stream, start, n):
+        import torch
+
+        with self._cv:
+            while len(self._buf) < start + n and not self._closed:
+                self._cv.wait(timeout=0.5)
+            chunk = self._buf[start : start + n]
+        return torch.from_numpy(self._np.ascontiguousarray(chunk)).to(self._device)
+
+
 def _pcm(buf, carry):
     """Decode little-endian 16-bit PCM, carrying a split sample to the next read.
 
@@ -269,27 +311,27 @@ class Session:
             )
 
     def run_interleaved(self, leftover, chunk, delay):
-        """Baseline arm: buffer the utterance, then stream out ONE decode.
+        """Baseline arm: ONE decode that follows the microphone as it speaks.
 
-        The model's decode genuinely is a streaming state machine -- it steps
-        chunk by chunk and commits text at each boundary -- but its generate()
-        takes a complete waveform and returns only the finished string, so a
-        caller could not see anything until it was over. It now takes an
-        on_emit callback, so each chunk is painted at the moment the state
-        machine commits it, in its own order and granularity, for the cost of
-        the single decode.
+        The model's decode always was a streaming state machine -- it steps
+        chunk by chunk, keeps an encoder cache and commits text at each
+        boundary. What stopped it being usable live was that generate() indexed
+        a waveform tensor that had to be complete, and returned only the final
+        string. Two hooks fix exactly that: audio_source supplies each chunk on
+        demand (blocking here until the socket has delivered it) and on_emit
+        reports each chunk as the state machine commits it. Nothing about the
+        decode itself changes.
 
-        What this is NOT is self-correction. The baseline's emissions are
-        committed and never revised, so nothing here is ever struck out; the
-        earlier version faked a second front by re-decoding the growing prefix,
-        which cost ~0.55x real time (20s of audio took 11s, measured) and whose
-        revisions were an artefact of re-decoding rather than anything the
-        model does.
+        So the decode runs in a worker thread while this one reads the socket,
+        and the two meet at _LiveAudio. Measured: 20s of audio fed at real time
+        decodes in 20.3s wall with the first words on screen 0.65s behind the
+        audio.
 
-        The one honest caveat, stated in the banner: the decode starts when the
-        utterance ends, because the state machine consumes a waveform that must
-        already be complete. Streaming it live from the microphone would need
-        the per-stream state lifted into a resumable driver.
+        STILL NO SELF-CORRECTION, and deliberately. These emissions are
+        committed and never revised -- that is the layout difference the
+        comparison is about, and the earlier version that faked a second front
+        by re-decoding the prefix cost ~0.55x real time to produce revisions
+        that were an artefact of re-decoding.
         """
         import numpy as np
         import torch
@@ -306,101 +348,108 @@ class Session:
         prompt = base_prompt
         if self.prompt_suffix:
             prompt = f"{base_prompt.rstrip()} {self.prompt_suffix}"
-        gen_cfg = GenerationConfig(do_sample=False)
 
         self.send(
             f"\r\n[server] interleaved baseline, chunk {chunk} frames, emit delay {delay} "
-            f"-> nominal {(chunk+delay)*0.08:.2f}s\r\n"
-            "[server] one pass, no second front: chunks appear as the decode commits them and are "
-            "never revised. The decode starts when you stop speaking -- it needs the whole waveform.\r\n"
+            f"-> first words {(chunk+delay)*0.08:.2f}s in\r\n"
+            "[server] one front: chunks appear as the decode commits them and are never revised\r\n"
         )
 
-        def decode(wave, on_emit=None):
-            t = torch.from_numpy(wave).unsqueeze(0).to(dev)
-            n = torch.tensor([wave.shape[0]], device=dev)
-            with torch.inference_mode():
-                res = model.generate(
-                    audios=t,
-                    audio_lens=n,
-                    on_emit=on_emit,
-                    system_prompt=prompt,
-                    max_new_tokens=64,
-                    generation_config=gen_cfg,
-                    chunk_size_override=chunk,
-                    # Both measured on this checkpoint: the state machine is the
-                    # path the model was designed for (6.03 vs 6.63 macro) and
-                    # offline embeddings drop words at chunk starts (17.79).
-                    use_offline_embs=False,
-                    use_state_machine_inference=True,
-                    emit_delay_frames=delay,
-                    return_alignments=False,
-                    return_debug_logs=False,
-                )
-            texts = res.texts if hasattr(res, "texts") else res
-            return (texts[0] or "").strip()
-
-        audio = np.zeros(0, dtype="float32")
-        # A read can split a 16-bit sample, and the CFG preamble leaves an
-        # arbitrary number of bytes behind it, so an odd byte is normal rather
-        # than exceptional. Carry it to the next read instead of dropping it:
-        # dropping one byte shifts every later sample by half a sample and turns
-        # the rest of the utterance into noise.
+        live = _LiveAudio(dev)
         carry = b""
-        audio, carry = _pcm(leftover, carry)
-        read_bytes = max(2, chunk) * SAMPLES_PER_FRAME * 2
+        first, carry = _pcm(leftover, carry)
+        if first.size:
+            live.push(first)
+
+        result = {}
+
+        def worker():
+            try:
+                with torch.inference_mode():
+                    res = model.generate(
+                        # audios is read only for device and dtype now; the
+                        # samples come from audio_source. audio_lens is an upper
+                        # bound -- a live stream does not know its own length.
+                        audios=torch.zeros(1, 0, device=dev, dtype=torch.float32),
+                        audio_lens=torch.tensor([int(a_.max_seconds * SR) + SR], device=dev),
+                        audio_source=live.read,
+                        on_emit=lambda _b, text, _so_far: text and self.commit_block(text, text),
+                        system_prompt=prompt,
+                        max_new_tokens=64,
+                        generation_config=GenerationConfig(do_sample=False),
+                        chunk_size_override=chunk,
+                        # Both measured on this checkpoint: the state machine is
+                        # the path the model was designed for (6.03 vs 6.63
+                        # macro) and offline embeddings drop words at chunk
+                        # starts (17.79).
+                        use_offline_embs=False,
+                        use_state_machine_inference=True,
+                        emit_delay_frames=delay,
+                        return_alignments=False,
+                        return_debug_logs=False,
+                    )
+                texts = res.texts if hasattr(res, "texts") else res
+                result["text"] = (texts[0] or "").strip()
+            except Exception as e:  # surfaced below; the reader must still drain
+                result["error"] = f"{type(e).__name__}: {e}"
+
+        decoder = threading.Thread(target=worker, daemon=True)
+        decoder.start()
+
+        audio = [first] if first.size else []
         t0 = None
         last = time.time()
         timed_out = False
         self.s.settimeout(1.0)
-        while True:
-            try:
-                buf = self.s.recv(read_bytes)
-            except socket.timeout:
-                if time.time() - last > a_.idle_timeout:
-                    timed_out = True
-                    break
-                continue
-            except OSError:
-                break
-            if not buf:
-                break
-            last = time.time()
-            # Same drain as the SCRIPT path: read everything already waiting so a
-            # slow cycle cannot let the backlog grow without bound.
-            self.s.setblocking(False)
-            try:
-                while True:
-                    more = self.s.recv(65536)
-                    if not more:
+        try:
+            while decoder.is_alive():
+                try:
+                    buf = self.s.recv(max(2, chunk) * SAMPLES_PER_FRAME * 2)
+                except socket.timeout:
+                    if time.time() - last > a_.idle_timeout:
+                        timed_out = True
                         break
-                    buf += more
-            except (BlockingIOError, OSError):
-                pass
-            finally:
-                self.s.setblocking(True)
-                self.s.settimeout(1.0)
-            fresh, carry = _pcm(buf, carry)
-            audio = np.concatenate([audio, fresh])
-            if t0 is None:
-                t0 = time.time()
-            if time.time() - t0 > a_.max_seconds:
-                break
+                    continue
+                except OSError:
+                    break
+                if not buf:
+                    break
+                last = time.time()
+                # Drain whatever else is waiting, so the decode is never starved
+                # by this loop reading one chunk per cycle.
+                self.s.setblocking(False)
+                try:
+                    while True:
+                        more = self.s.recv(65536)
+                        if not more:
+                            break
+                        buf += more
+                except (BlockingIOError, OSError):
+                    pass
+                finally:
+                    self.s.setblocking(True)
+                    self.s.settimeout(1.0)
+                fresh, carry = _pcm(buf, carry)
+                if fresh.size:
+                    audio.append(fresh)
+                    live.push(fresh)
+                if t0 is None:
+                    t0 = time.time()
+                if time.time() - t0 > a_.max_seconds:
+                    break
+        finally:
+            # Unblock the provider on EVERY exit, including an exception: a
+            # decode thread parked on a condition variable would otherwise hold
+            # the session open until the process died.
+            live.close()
+        decoder.join(timeout=120)
 
-        self.send(f"\r\n[server] decoding {audio.size/SR:.1f}s ...\r\n")
-        t_dec = time.time()
-
-        def paint_chunk(_stream, chunk_text, _so_far):
-            # commit_block with provisional == final strikes nothing, and keeps
-            # the terminal wrapping and the page's segment events shared with
-            # the SCRIPT arm rather than growing a second renderer.
-            if chunk_text:
-                self.commit_block(chunk_text, chunk_text)
-
-        final = decode(audio, on_emit=paint_chunk) if audio.size >= SR // 4 else ""
-        cost = time.time() - t_dec
-        self.send(f"\r\n[server] decode took {cost:.1f}s ({cost/max(audio.size/SR, 1e-6):.2f}x real time)\r\n")
-        ok, diag = speech_report(audio)
-        self.emit_final(final, audio.size / SR, 0, diag, ok, timed_out)
+        if result.get("error"):
+            self.send(f"\r\n[server] decode failed: {result['error']}\r\n")
+        final = result.get("text", "")
+        wave = np.concatenate(audio) if audio else np.zeros(0, dtype="float32")
+        ok, diag = speech_report(wave)
+        self.emit_final(final, wave.size / SR, 0, diag, ok, timed_out)
         try:
             self.s.shutdown(socket.SHUT_WR)
         except OSError:

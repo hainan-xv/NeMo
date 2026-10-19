@@ -89,9 +89,9 @@ function nearest(vals, want){ return vals.includes(want) ? want : vals[vals.leng
 const INTRO = {
   script: 'Press Record and speak. Provisional words appear greyed; when the slow front '
         + 'overrules them they are crossed out and replaced.',
-  interleaved: 'Press Record and speak. The interleaved baseline is a single pass: it has no way to '
-        + 'extend a decode, so a second front would mean re-decoding the whole utterance over and over '
-        + 'at roughly half real time. It buffers instead, and the transcript appears when you stop.'
+  interleaved: 'Press Record and speak. The interleaved baseline decodes live, one front only: '
+        + 'each chunk appears as the decode commits it and is never revised, so nothing here is ever '
+        + 'crossed out.'
 };
 
 function applyArm(){
