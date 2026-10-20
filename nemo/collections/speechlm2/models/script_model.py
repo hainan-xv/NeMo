@@ -1445,7 +1445,10 @@ class ScriptSTTModel(StreamingSTTModel):
 
         # Pin the encoder look-ahead to this batch's chunk size so a frame's
         # receptive field never crosses its chunk boundary.
-        self._set_encoder_att_context(batch.chunk_size)
+        # Text grid and encoder grid must move TOGETHER: shifting the branch
+        # boundaries without shifting the mask would leave each branch's right
+        # context ending at the wrong frame.
+        self._set_encoder_att_context(batch.chunk_size, first_chunk_size=getattr(batch, "first_chunk_size", None))
         self._last_chunk_size = batch.chunk_size
 
         if self._loss_type == "banded":

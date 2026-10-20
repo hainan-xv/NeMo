@@ -1479,7 +1479,9 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             list(self._user_header_ids) + [AUDIO_TOKEN_IDX] * chunk_size + list(self._user_footer_and_asst_header_ids)
         )
 
-    def _set_encoder_att_context(self, chunk_size: Optional[int], recompute_streaming: bool = False) -> None:
+    def _set_encoder_att_context(
+        self, chunk_size: Optional[int], recompute_streaming: bool = False, first_chunk_size: Optional[int] = None
+    ) -> None:
         """Match the encoder's attention look-ahead to ``chunk_size``.
 
         The left context is taken from ``att_context_size[0]`` (fixed). The right context
@@ -1518,6 +1520,13 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             chunk_size = int(enc_chunk)
         left = int(self.core_cfg.att_context_size[0])
         encoder = self.perception.encoder
+        # Shift the chunk GRID so a window of this size can start anywhere, not
+        # only at multiples of itself. first_chunk_size=None/chunk_size leaves
+        # the grid exactly where it has always been.
+        _fcs = chunk_size if first_chunk_size is None else int(first_chunk_size)
+        if not 1 <= _fcs <= chunk_size:
+            raise ValueError(f"first_chunk_size must be in [1, {chunk_size}], got {_fcs}")
+        encoder.att_chunk_offset = (chunk_size - _fcs) % chunk_size
         # Sliding-window cache-aware encoders stream exactly only with no look-ahead; chunk-aligned
         # (chunked_limited) encoders look ahead to the chunk end without compounding across layers.
         sliding_window_transformer = (

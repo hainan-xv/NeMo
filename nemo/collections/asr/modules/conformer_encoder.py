@@ -861,6 +861,16 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                         left_chunks_num = 10000
 
                     chunk_idx = torch.arange(0, max_audio_length, dtype=torch.int, device=att_mask.device)
+                    # att_chunk_offset shifts the chunk GRID so boundaries need
+                    # not land on multiples of chunk_size: with a shift of
+                    # (chunk_size - w) the first chunk is w frames wide and
+                    # every later one is full width. Default 0 reproduces the
+                    # plain floor-division grid exactly. Only chunk INDICES are
+                    # used downstream, so left_chunks_num/diff_chunks are
+                    # unaffected.
+                    _shift = int(getattr(self, "att_chunk_offset", 0) or 0) % chunk_size
+                    if _shift:
+                        chunk_idx = chunk_idx + _shift
                     chunk_idx = torch.div(chunk_idx, chunk_size, rounding_mode="trunc")
                     diff_chunks = chunk_idx.unsqueeze(1) - chunk_idx.unsqueeze(0)
                     chunked_limited_mask = torch.logical_and(

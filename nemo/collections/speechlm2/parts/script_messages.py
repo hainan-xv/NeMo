@@ -74,6 +74,7 @@ def get_llm_messages_for_sample(
     word_delay_prob: float = 0.0,
     rng: Optional[random.Random] = None,
     respell: bool = False,
+    first_chunk_size: Optional[int] = None,
 ) -> List[dict]:
     """Build the alternating user/assistant turns for one utterance.
 
@@ -208,14 +209,25 @@ def get_llm_messages_for_sample(
         # transcript, so stripping punctuation first would invalidate them.
         return apply_text_style(text, capitalization, punctuation)
 
-    num_chunks = math.ceil(num_frames / chunk_size) if num_frames > 0 else 0
+    # Chunk WIDTHS, not a single size: the first may be short, which slides
+    # every later boundary by the same amount.
+    first_w = chunk_size if first_chunk_size is None else int(first_chunk_size)
+    if not 1 <= first_w <= chunk_size:
+        raise ValueError(f"first_chunk_size must be in [1, {chunk_size}], got {first_w}")
+    if num_frames <= 0:
+        widths: List[int] = []
+    elif first_w >= num_frames:
+        widths = [first_w]
+    else:
+        widths = [first_w] + [chunk_size] * math.ceil((num_frames - first_w) / chunk_size)
+    num_chunks = len(widths)
 
     # PASS 1: which words each chunk reveals under the frame-delay rule.
     chunk_words: List[List[int]] = []
     word_idx = 0
     chunk_end_frame = 0
-    for _ in range(num_chunks):
-        chunk_end_frame += chunk_size
+    for _w in widths:
+        chunk_end_frame += _w
         ready: List[int] = []
         while word_idx < len(alignments):
             word_end_frame = math.ceil(alignments[word_idx].end_time / frame_length_in_secs)
@@ -267,7 +279,7 @@ def get_llm_messages_for_sample(
 
     # PASS 3: emit the turns.
     for t in range(num_chunks):
-        messages.append({"role": "user", "content": audio_tag * chunk_size})
+        messages.append({"role": "user", "content": audio_tag * widths[t]})
         # Styling can empty a chunk whose text was punctuation only; that makes it
         # silent, exactly like a chunk that revealed no words at all.
         content = _content_for(chunk_words[t]) if chunk_words[t] else ""
@@ -322,6 +334,7 @@ def get_llm_messages_for_batch(
     punctuation: Union[bool, Sequence[bool]] = True,
     word_delay_prob: float = 0.0,
     rng: Optional[random.Random] = None,
+    first_chunk_size: Optional[int] = None,
 ) -> List[List[dict]]:
     """Per-sample :func:`get_llm_messages_for_sample` over a batch.
 
@@ -356,6 +369,7 @@ def get_llm_messages_for_batch(
             word_delay_prob=word_delay_prob,
             rng=rng,
             respell=respell,
+            first_chunk_size=first_chunk_size,
         )
         for i in range(n)
     ]

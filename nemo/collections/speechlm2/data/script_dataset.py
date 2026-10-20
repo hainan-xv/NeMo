@@ -115,6 +115,8 @@ class ScriptSTTDataConfig(StreamingSTTDataConfig):
             recipes and checkpoints are unaffected.
         delay_candidates: delays in frames to draw from when ``prompt_control``
             is on. ``None`` means always use ``num_delay_frames``.
+        random_first_chunk: draw the first chunk's width per batch so chunk
+            boundaries are not locked to multiples of chunk_size.
         capitalization_prob: probability an example keeps its casing.
         punctuation_prob: probability an example keeps its punctuation.
         control_seed: base seed for the per-example control draw. Kept separate
@@ -162,6 +164,13 @@ class ScriptSTTDataConfig(StreamingSTTDataConfig):
     position_seed: int = 91011
     prompt_control: bool = False
     delay_candidates: Optional[List[int]] = None
+    # Draw the FIRST chunk's width uniformly from [1, chunk_size] per batch,
+    # sliding every later boundary with it, so a window of a given size is
+    # seen starting at EVERY position rather than only at multiples of its
+    # own width. Off by default: with the uniform grid the model becomes
+    # locked to that alignment -- a half-chunk shift at inference was
+    # measured to cost ~1.5 WER on AMI.
+    random_first_chunk: bool = False
     capitalization_prob: float = 0.5
     punctuation_prob: float = 0.5
     control_seed: int = 5678
@@ -219,6 +228,7 @@ class ScriptBatch:
         valid: (B, T) False at right-padding.
         text / cuts: passthrough for metrics and per-cut prompts.
         chunk_size: the fixed chunk size drawn for this batch.
+        first_chunk_size: width of this batch's first chunk (<= chunk_size).
     """
 
     audios: Optional[torch.Tensor] = None
@@ -235,6 +245,10 @@ class ScriptBatch:
     text: Optional[List[str]] = None
     cuts: Optional[object] = None
     chunk_size: Optional[int] = None
+    # Width of the FIRST chunk for this batch; every later chunk is chunk_size.
+    # Equal to chunk_size unless random_first_chunk is on. The model must shift
+    # the encoder's chunk grid by (chunk_size - first_chunk_size) to match.
+    first_chunk_size: Optional[int] = None
     # 2-D layout only (twod_layout=True); the flat fields above are then unset.
     twod: Optional[object] = None
     # Banded loss only (loss_type='banded'); `twod` is then unset.
@@ -666,6 +680,18 @@ class ScriptSTTDataset(StreamingSTTDataset):
         else:
             chunk_size = int(self.cfg.chunk_size)
 
+        # RAGGED FIRST CHUNK. Drawn per BATCH, like chunk_size and for the same
+        # reason: the encoder's chunk grid is shared across the batch. Sliding
+        # the first chunk slides every later boundary with it, so across
+        # training the model sees a window of a given size starting at EVERY
+        # position rather than only at multiples of its own width -- which is
+        # the alignment it was previously locked to. random_first_chunk=False
+        # draws chunk_size every time and reproduces the old grid exactly.
+        if bool(getattr(self.cfg, "random_first_chunk", False)) and chunk_size > 1:
+            first_chunk_size = int(self._get_chunk_rng().integers(1, chunk_size + 1))
+        else:
+            first_chunk_size = chunk_size
+
         # The band follows the sampled chunk size when a per-chunk map is configured.
         band_words = self._band_words
         if self._band_by_chunk is not None:
@@ -715,6 +741,7 @@ class ScriptSTTDataset(StreamingSTTDataset):
             audio_tag=self.cfg.audio_tag,
             blank_token=self.cfg.blank_token,
             chunk_size=chunk_size,
+            first_chunk_size=first_chunk_size,
             num_delay_frames=delays,
             audio_durations_secs=audio_durations_secs,
             frame_length_in_secs=self.cfg.frame_length_in_secs,
@@ -799,6 +826,7 @@ class ScriptSTTDataset(StreamingSTTDataset):
                 text=text,
                 cuts=cuts,
                 chunk_size=chunk_size,
+                first_chunk_size=first_chunk_size,
             )
 
         if self._twod_layout:
@@ -809,6 +837,7 @@ class ScriptSTTDataset(StreamingSTTDataset):
                 text=text,
                 cuts=cuts,
                 chunk_size=chunk_size,
+                first_chunk_size=first_chunk_size,
             )
 
         packed = collate_packed_chunk_examples(examples, pad_id=self.tokenizer.pad_id)
@@ -833,4 +862,5 @@ class ScriptSTTDataset(StreamingSTTDataset):
             text=text,
             cuts=cuts,
             chunk_size=chunk_size,
+            first_chunk_size=first_chunk_size,
         )
