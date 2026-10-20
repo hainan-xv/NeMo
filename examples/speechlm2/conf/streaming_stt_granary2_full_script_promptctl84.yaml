@@ -139,6 +139,11 @@ data:
     delay_candidates: [0, 1, 2, 3, 4]
     capitalization_prob: 0.5
     punctuation_prob: 0.5
+    # Draw the FIRST chunk's width per batch so chunk boundaries are not locked
+    # to multiples of chunk_size. Declared here (not only on the dataclass) so
+    # Hydra will accept a plain override -- struct mode refuses to set a key the
+    # config does not already contain.
+    random_first_chunk: false
     control_seed: 5678
     num_delay_frames: 3
     audio_tag: "<audio>"
