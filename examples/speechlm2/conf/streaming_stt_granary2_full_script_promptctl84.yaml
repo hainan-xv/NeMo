@@ -153,6 +153,12 @@ data:
     # constructed targets, and the operating point comes from the model's val_*
     # settings. Drawing controls here would just add nondeterminism, so leave it off.
     prompt_control: false
+    # Validation stays on the UNIFORM grid even when training randomises it, so
+    # val_wer remains comparable with every earlier run. The point of the
+    # ragged grid is to remove the model's dependence on grid phase; whether it
+    # worked is measured by re-running the phase sweep on the checkpoint, not
+    # by a val_wer computed on shifted grids.
+    random_first_chunk: false
 
   # --- Lhotse dataloader config ---
   train_ds:
