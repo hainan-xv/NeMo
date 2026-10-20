@@ -124,7 +124,11 @@ def provisional_text(s: str, dedupe_boundary: bool = True) -> str:
             prev = blocks[i - 1]
             # Words the previous block SHOWED but did not commit were deferred to
             # this one; re-painting them is the same word, not a new one.
-            deferred = prev.provisional.split()[len(prev.final.split()) :]
+            # ALIGN to find them -- a word-count difference is not enough. When a
+            # block goes 'to, uh, mute' -> 'to mute,' the slow front dropped a word
+            # from the MIDDLE, and counting would wrongly treat 'mute' as deferred
+            # and delete a legitimate repeat in the next block.
+            deferred = _deferred_tail(prev)
             k = 0
             while k < len(deferred) and k < len(words) and _same_word(deferred[k], words[k]):
                 k += 1
@@ -132,6 +136,22 @@ def provisional_text(s: str, dedupe_boundary: bool = True) -> str:
         if words:
             out.append(" ".join(words))
     return " ".join(out).strip()
+
+
+def _deferred_tail(block: "Block") -> List[str]:
+    """Words the slow front moved to the NEXT block: a trailing deletion only.
+
+    Anything else the slow front did (a substitution, a mid-span drop) is a
+    correction, not a deferral, and must not license deleting words downstream.
+    """
+    import difflib
+
+    p, f = block.provisional.split(), block.final.split()
+    ops = difflib.SequenceMatcher(a=p, b=f, autojunk=False).get_opcodes()
+    if not ops:
+        return []
+    tag, i1, i2, _, _ = ops[-1]
+    return p[i1:i2] if tag == "delete" else []
 
 
 def _same_word(a: str, b: str) -> bool:

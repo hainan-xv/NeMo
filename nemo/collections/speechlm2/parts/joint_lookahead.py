@@ -112,6 +112,7 @@ def joint_lookahead_decode(
     weight: float = 0.5,
     max_new_tokens: int = 64,
     num_delay_frames: Optional[int] = None,
+    s_first_tokens: int = 0,
     history_text: Optional[List[str]] = None,
     _trace: Optional[list] = None,
 ) -> List[str]:
@@ -119,8 +120,11 @@ def joint_lookahead_decode(
 
     Args:
         commit_chunk: U, the commit granularity, and S's declared chunk size.
-        look_chunk: C, L's declared chunk size. Must be a multiple of U; with
-            ``C = 2U`` every unit alternates between the two encoder phases.
+        look_chunk: C, L's declared chunk size. Must be exactly ``2*U``; unit
+            ``k`` takes its lookahead from encoder phase ``k % 2``.
+        s_first_tokens: how many tokens at the start of each unit come from S
+            alone. Protects words S deferred from the previous unit, which L
+            knows nothing about. 0 disables.
         weight: mixing weight on L's log-probs. 0 reproduces S alone (a plain
             chunk-U decode), 1 is L alone with S supplying only the stop
             decision, 0.5 is the even ensemble. Sweeping it is the cheapest way
@@ -128,9 +132,11 @@ def joint_lookahead_decode(
             the work.
     """
     U, C = int(commit_chunk), int(look_chunk)
-    if C % U:
-        raise ValueError(f"look_chunk {C} must be a multiple of commit_chunk {U}")
-    phases = C // U
+    # TWO PHASES ONLY: the original grid and the one cut in the middle. A
+    # general C = n*U would need n encoder passes and n-way parity, which is
+    # more machinery than the idea needs while it is still being tested.
+    if C != 2 * U:
+        raise ValueError(f"look_chunk must be exactly 2*commit_chunk; got U={U}, C={C}")
     for name, cs in (("commit_chunk", U), ("look_chunk", C)):
         trained = list(getattr(model.core_cfg, "chunk_size", []) or [])
         if trained and cs not in trained:
@@ -161,12 +167,14 @@ def joint_lookahead_decode(
 
     # S: one grid of chunk U anchored at 0 serves every commit unit.
     frames_S = model.encode_frames(audios, audio_lens, U)
-    # L: one encode per phase. Phase p starts the WAVEFORM p*U frames in, so its
-    # grid lands on p*U without ever introducing silence.
-    frames_L = [model.encode_frames(audios, audio_lens, C)]
-    for p in range(1, phases):
-        off = p * U * SAMPLES_PER_FRAME
-        frames_L.append(model.encode_frames(audios[:, off:], (audio_lens - off).clamp(min=0), C))
+    # L on BOTH phases: phase 0's grid is anchored at frame 0, phase 1's at U.
+    # Phase 1 is built by starting the encode U frames later in the WAVEFORM,
+    # never by prepending silence -- 0.56 s of leading zeros costs 0.32 WER.
+    off = U * SAMPLES_PER_FRAME
+    frames_L = [
+        model.encode_frames(audios, audio_lens, C),
+        model.encode_frames(audios[:, off:], (audio_lens - off).clamp(min=0), C),
+    ]
 
     # The instruction is NOT the bare prompt: with prompt_control the model was
     # trained on an instruction carrying its chunk size, emission delay,
@@ -200,7 +208,9 @@ def joint_lookahead_decode(
         active = [b for b in range(B) if k < n_units[b]]
         if not active:
             break
-        p = k % phases
+        # Even units start a phase-0 chunk, odd units a phase-1 chunk, so each
+        # gets lookahead running C frames past its own start.
+        p = k % 2
         seqs, frs = [], []
         for b in active:
             for which in ("S", "L"):
@@ -223,15 +233,49 @@ def joint_lookahead_decode(
         na = len(active)
         words: List[List[int]] = [[] for _ in range(na)]
         done = [False] * na
-        for _ in range(max_new_tokens):
+        for step_idx in range(max_new_tokens):
             lp = torch.log_softmax(logits.float(), dim=-1)  # (2*na, V)
             lpS, lpL = lp[0::2], lp[1::2]
+            # DEFERRED WORDS BELONG TO S ALONE. S declares chunk U with an
+            # emission delay, so it holds back a word ending near t+U and emits
+            # it at the START of the next unit -- from text context, since its
+            # window no longer contains that word's audio. L, whose window is
+            # [t+U, t+U+C), has no notion of that word and wants the first word
+            # of its own window instead. Averaging the two suppresses the
+            # deferred word, and nothing downstream can recover it: no later
+            # window contains its audio either. Measured, that showed up as
+            # deletions 3.07 vs chunk-14's 2.71 while substitutions were nearly
+            # matched (2.86 vs 2.78) -- the lookahead was working and the
+            # deferral was leaking.
+            #
+            # Costs almost nothing to protect: a unit's first word sits at the
+            # START of S's window, where S already has its maximum right
+            # context. The words that need L are the later ones, near S's blind
+            # boundary.
             # L's window runs past the commit boundary, so L always wants to keep
             # going. S owns the boundary, so S owns the stop: mask L's <eot> out
             # of the mixture instead of letting it vote the span longer.
-            mixed = (1.0 - weight) * lpS + weight * lpL
-            mixed[:, eot] = lpS[:, eot]
-            nxt = mixed.argmax(dim=-1)  # (na,)
+            #
+            # STOP IS DECIDED BY S ALONE, OUTSIDE THE MIXTURE. Leaving <eot> at
+            # S's raw log-prob while averaging every word column biases the
+            # decode toward stopping: when S and L disagree about the next word,
+            # the average sits below either member's mode, but the untouched
+            # <eot> column does not move -- so stop wins comparisons it should
+            # lose. Measured, that was deletions 3.07 (highest of any arm),
+            # insertions 1.46 (lowest) and 0.984 words emitted per reference
+            # word (fewest): a stop bias, not a deferral problem.
+            #
+            # So S decides stop exactly as it would decoding alone, and L only
+            # influences WHICH word is emitted once S has decided to emit one.
+            # This also keeps the weight=0 identity exact.
+            if step_idx < s_first_tokens:
+                mixed = lpS.clone()
+            else:
+                mixed = (1.0 - weight) * lpS + weight * lpL
+            stop_now = lpS.argmax(dim=-1) == eot
+            mixed = mixed.clone()
+            mixed[:, eot] = torch.finfo(mixed.dtype).min
+            nxt = torch.where(stop_now, torch.full_like(stop_now, eot, dtype=torch.long), mixed.argmax(dim=-1))
             step = []
             for i in range(na):
                 t = int(nxt[i])
