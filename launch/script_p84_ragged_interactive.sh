@@ -220,10 +220,17 @@ INIT_EXP="${INIT_EXP:-}"
 # No SCRIPT warm start on purpose: the existing checkpoints carry LoRA adapter
 # weights, which have no counterpart in a full-finetune model. Starts from the
 # pretrained Qwen3 + nemotron encoder.
-# Warm start from the best full-finetune checkpoint: this run only teaches the
-# model that the chunk grid is not fixed to multiples of chunk_size, so there
-# is nothing to gain from re-learning the task from scratch.
-INIT_CKPT="${INIT_CKPT:-/lustre/fsw/portfolios/nemotron/users/hainanx/results/SpeechlmPromptCtl84/granary2_script_promptctl84_full_lr1e4/granary2_script_promptctl84_full_lr1e4/checkpoints/granary2_script_promptctl84_full_lr1e4-averaged.ckpt}"
+# Warm start from the best full-finetune checkpoint (step 52k, val_wer 0.0859):
+# this run only teaches the model that the chunk grid is not fixed to
+# multiples of chunk_size, so there is nothing to re-learn from scratch.
+#
+# NOT the -averaged.ckpt. INIT_CKPT is consumed as
+# exp_manager.resume_from_checkpoint, i.e. Lightning's RESUME path, which
+# restores optimizer and scheduler state. The averaged checkpoint is
+# weights-only (5.3 GB vs 14 GB) and dies with "Trying to restore optimizer
+# state but checkpoint contains only the model". The auto-resolve branch
+# below already filters -averaged for exactly this reason.
+INIT_CKPT="${INIT_CKPT:-/lustre/fsw/portfolios/nemotron/users/hainanx/results/SpeechlmPromptCtl84/granary2_script_promptctl84_full_lr1e4/granary2_script_promptctl84_full_lr1e4/checkpoints/step=52000-val_wer=0.0859.ckpt}"
 if [[ -z "$INIT_CKPT" && -n "$INIT_EXP" ]]; then
     _INIT_DIR="${OUTPUT_PREFIX}/results/${PROJECT_NAME}/${INIT_EXP}/${INIT_EXP}/checkpoints"
     INIT_CKPT="$(ls -t "${_INIT_DIR}"/*-last.ckpt 2>/dev/null | head -1)"
