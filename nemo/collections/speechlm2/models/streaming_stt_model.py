@@ -1515,6 +1515,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         # encoder_chunk_size pins the ENCODER's look-ahead independently of the
         # LLM chunk. The caller keeps passing the LLM chunk size; only the
         # look-ahead is overridden here, so frame grouping is untouched.
+        llm_chunk = int(chunk_size)
         enc_chunk = getattr(self.core_cfg, "encoder_chunk_size", None)
         if enc_chunk is not None and int(enc_chunk) > 0:
             chunk_size = int(enc_chunk)
@@ -1523,10 +1524,16 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         # Shift the chunk GRID so a window of this size can start anywhere, not
         # only at multiples of itself. first_chunk_size=None/chunk_size leaves
         # the grid exactly where it has always been.
-        _fcs = chunk_size if first_chunk_size is None else int(first_chunk_size)
-        if not 1 <= _fcs <= chunk_size:
-            raise ValueError(f"first_chunk_size must be in [1, {chunk_size}], got {_fcs}")
-        encoder.att_chunk_offset = (chunk_size - _fcs) % chunk_size
+        #
+        # first_chunk_size is drawn by the dataset against the LLM chunk, so it
+        # is validated against llm_chunk -- NOT against the (possibly smaller)
+        # encoder look-ahead chunk. The resulting shift is a count of encoder
+        # FRAMES, which is then reduced modulo the encoder grid's period. With
+        # encoder_chunk_size unset the two are equal and this is unchanged.
+        _fcs = llm_chunk if first_chunk_size is None else int(first_chunk_size)
+        if not 1 <= _fcs <= llm_chunk:
+            raise ValueError(f"first_chunk_size must be in [1, {llm_chunk}], got {_fcs}")
+        encoder.att_chunk_offset = (llm_chunk - _fcs) % chunk_size
         # Sliding-window cache-aware encoders stream exactly only with no look-ahead; chunk-aligned
         # (chunked_limited) encoders look ahead to the chunk end without compounding across layers.
         sliding_window_transformer = (
