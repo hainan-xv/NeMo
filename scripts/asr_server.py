@@ -167,7 +167,7 @@ def speech_report(a):
 class Session:
     """One utterance: PCM in from the socket, display updates back out."""
 
-    def __init__(self, model, sock, args, prompt_txt, alt=None):
+    def __init__(self, model, sock, args, prompt_txt, alt=None, nemotron=None):
         self.m, self.s, self.a, self.p = model, sock, args, prompt_txt
         # The INTERLEAVED baseline, as (model, its own system prompt), or None
         # when the server was started without --interleaved_ckpt. It is a second
@@ -175,6 +175,8 @@ class Session:
         # without reloading, and it carries its OWN instruction: the SCRIPT
         # prompt would put it out of distribution (see scripts/speechlm_asr_shim).
         self.alt = alt
+        # (model, [trained chunk sizes]) for the nemotron RNN-T arm, or None.
+        self.nemotron = nemotron
         self.cols = 88
         self.prompt_suffix = None  # inference-time text appended after the controls
         self.col = 0  # column of the PERMANENT text
@@ -309,6 +311,233 @@ class Session:
             self.send(
                 "[hint]  the transcript above is probably empty because the AUDIO is wrong, " "not the model.\r\n"
             )
+
+    def _nt_emit(self, txt, shown, final):
+        """Show RNN-T output, committing only COMPLETE words.
+
+        The decoder emits subword tokens, so a word can straddle two streaming
+        steps: one step ends "...architect", the next has "...architecture".
+        Committing the raw delta makes that a separate segment, and the display
+        puts a space before every segment -- which is how "architecture" came
+        out as "architect ure".
+
+        So commit only up to the last space (whole words), and paint the
+        trailing partial word as provisional until it completes. Nothing is
+        ever revised here; the provisional tail is just not yet a word.
+        """
+        cut = txt.rfind(" ") + 1 if not final else len(txt)
+        if cut > len(shown):
+            new = txt[len(shown) : cut].strip()
+            if new:
+                self.commit_block(new, new)
+            shown = txt[:cut]
+        if not final:
+            tail = txt[cut:].strip()
+            self.paint(tail)
+        else:
+            self.paint("")
+        return shown
+
+    def run_nemotron_2f(self, leftover, fast, slow):
+        """Self-correcting RNN-T: a fast front that is overruled by a slow one.
+
+        Verified on 8/8 AMI utterances that the committed text equals decoding
+        with the SLOW front alone, so the responsiveness costs nothing in final
+        accuracy -- the RNN-T analogue of SCRIPT's mf_final == single-slow.
+
+        Resync is a state copy here rather than SCRIPT's text re-prefill: the
+        encoder caches and previous_hypotheses go into conformer_stream_step
+        and come back out, so the fast front can simply adopt the slow front's
+        state at each block boundary.
+        """
+        import numpy as np
+        import torch
+
+        from nemo.collections.speechlm2.parts.nemotron_stream import NemotronTwoFront
+
+        a_ = self.a
+        model, chunks = self.nemotron
+        bad = [c for c in (fast, slow) if c not in chunks]
+        if bad or slow % fast or slow == fast:
+            why = (
+                f"chunk sizes {bad} are not in {chunks}"
+                if bad
+                else f"slow ({slow}) must be a different, exact multiple of fast ({fast})"
+            )
+            self.send(f"\r\n[server] rejected: {why}\r\n")
+            return ""
+        dev = next(model.parameters()).device
+        tf = NemotronTwoFront(model, fast, slow, dev)
+        self.send(
+            f"\r\n[server] nemotron RNN-T, fronts {fast}/{slow} frames "
+            f"-> first paint {fast*0.08:.2f}s, settles {slow*0.08:.2f}s\r\n"
+            "[server] the slow front overrules the fast one; struck-out words are real corrections\r\n"
+        )
+
+        def drain(final):
+            events, tail = tf.poll(final=final)
+            for _kind, prov, fin in events:
+                self.commit_block(prov, fin)
+            self.paint(tail)
+
+        carry = b""
+        audio, carry = _pcm(leftover, carry)
+        parts = [audio] if audio.size else []
+        if audio.size:
+            tf.push(torch.from_numpy(audio))
+        t0 = None
+        last = time.time()
+        timed_out = False
+        self.s.settimeout(1.0)
+        while True:
+            try:
+                buf = self.s.recv(max(2, fast) * SAMPLES_PER_FRAME * 2)
+            except socket.timeout:
+                if time.time() - last > a_.idle_timeout:
+                    timed_out = True
+                    break
+                continue
+            except OSError:
+                break
+            if not buf:
+                break
+            last = time.time()
+            self.s.setblocking(False)
+            try:
+                while True:
+                    more = self.s.recv(65536)
+                    if not more:
+                        break
+                    buf += more
+            except (BlockingIOError, OSError):
+                pass
+            finally:
+                self.s.setblocking(True)
+                self.s.settimeout(1.0)
+            fresh, carry = _pcm(buf, carry)
+            if fresh.size:
+                parts.append(fresh)
+                tf.push(torch.from_numpy(fresh))
+            if t0 is None:
+                t0 = time.time()
+            if time.time() - t0 > a_.max_seconds:
+                break
+            drain(final=False)
+
+        drain(final=True)
+        wave = np.concatenate(parts) if parts else np.zeros(0, dtype="float32")
+        ok, diag = speech_report(wave)
+        self.emit_final(tf.committed, wave.size / SR, 0, diag, ok, timed_out)
+        try:
+            self.s.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+        try:
+            self.s.settimeout(2.0)
+            while self.s.recv(65536):
+                pass
+        except (OSError, socket.timeout):
+            pass
+        return tf.committed
+
+    def run_nemotron(self, leftover, chunk):
+        """Cache-aware RNN-T arm: streams live, one front, never revises.
+
+        Unlike the interleaved baseline this decodes genuinely incrementally --
+        conformer_stream_step takes the encoder caches and previous_hypotheses
+        and hands them back, so audio is consumed as it arrives with no
+        re-decoding. Its emissions are committed, so nothing is struck out.
+
+        NOT yet self-correcting, though the state handles are all here: the
+        model carries chunk sizes 1/2/7/14 in one checkpoint and NemotronStream
+        exposes snapshot()/restore(), which is what a second front would need.
+        """
+        import numpy as np
+        import torch
+
+        from nemo.collections.speechlm2.parts.nemotron_stream import NemotronStream
+
+        a_ = self.a
+        model, chunks = self.nemotron
+        if chunk not in chunks:
+            self.send(f"\r\n[server] rejected: chunk {chunk} is not in {chunks}\r\n")
+            return ""
+        dev = next(model.parameters()).device
+        st = NemotronStream(model, chunk, dev)
+        self.send(
+            f"\r\n[server] nemotron RNN-T, chunk {chunk} frames -> {chunk*0.08:.2f}s steps\r\n"
+            "[server] one front, committed as decoded, never revised\r\n"
+        )
+
+        carry = b""
+        audio, carry = _pcm(leftover, carry)
+        chunks_sent = [audio] if audio.size else []
+        if audio.size:
+            st.push(torch.from_numpy(audio))
+        shown = ""
+        t0 = None
+        last = time.time()
+        timed_out = False
+        self.s.settimeout(1.0)
+        while True:
+            try:
+                buf = self.s.recv(max(2, chunk) * SAMPLES_PER_FRAME * 2)
+            except socket.timeout:
+                if time.time() - last > a_.idle_timeout:
+                    timed_out = True
+                    break
+                continue
+            except OSError:
+                break
+            if not buf:
+                break
+            last = time.time()
+            self.s.setblocking(False)
+            try:
+                while True:
+                    more = self.s.recv(65536)
+                    if not more:
+                        break
+                    buf += more
+            except (BlockingIOError, OSError):
+                pass
+            finally:
+                self.s.setblocking(True)
+                self.s.settimeout(1.0)
+            fresh, carry = _pcm(buf, carry)
+            if fresh.size:
+                chunks_sent.append(fresh)
+                # push() appends to the stream's own raw buffer and re-derives
+                # mel frames over all of it, so only the NEW audio goes in.
+                st.push(torch.from_numpy(fresh))
+            if t0 is None:
+                t0 = time.time()
+            if time.time() - t0 > a_.max_seconds:
+                break
+            while st.ready():
+                txt = st.step_once(last=False)
+                shown = self._nt_emit(txt, shown, final=False)
+
+        if st.remaining() > 0:
+            txt = st.step_once(last=True)
+            shown = self._nt_emit(txt, shown, final=True)
+        else:
+            shown = self._nt_emit(shown, shown, final=True)
+
+        wave = np.concatenate(chunks_sent) if chunks_sent else np.zeros(0, dtype="float32")
+        ok, diag = speech_report(wave)
+        self.emit_final(shown, wave.size / SR, 0, diag, ok, timed_out)
+        try:
+            self.s.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+        try:
+            self.s.settimeout(2.0)
+            while self.s.recv(65536):
+                pass
+        except (OSError, socket.timeout):
+            pass
+        return shown
 
     def run_interleaved(self, leftover, chunk, delay):
         """Baseline arm: ONE decode that follows the microphone as it speaks.
@@ -490,6 +719,7 @@ class Session:
             pass
         arm = "script"
         il_chunk, il_delay = a_.il_chunk, a_.il_delay
+        nt_chunk, nt_fast = a_.nt_chunk, a_.nt_fast
         head, _, rest = pre.partition(b"\n")
         if head.startswith(b"CFG "):
             for tok in head.decode("ascii", "replace").split()[1:]:
@@ -500,6 +730,12 @@ class Session:
                 try:
                     iv = int(v)
                 except ValueError:
+                    continue
+                if k == "nt_chunk":
+                    nt_chunk = iv
+                    continue
+                if k == "nt_fast":
+                    nt_fast = iv
                     continue
                 if k == "il_chunk":
                     il_chunk = iv
@@ -521,6 +757,14 @@ class Session:
         else:
             leftover = pre  # no preamble: every byte was audio
         self.cols = max(40, min(200, cols)) - 4
+        if arm == "nemotron":
+            if self.nemotron is None:
+                self.send("\r\n[server] rejected: this server was started without --nemotron_ckpt\r\n")
+                return ""
+            if nt_fast and nt_fast != nt_chunk:
+                return self.run_nemotron_2f(leftover, nt_fast, nt_chunk)
+            return self.run_nemotron(leftover, nt_chunk)
+
         if arm == "interleaved":
             if self.alt is None:
                 self.send("\r\n[server] rejected: this server was started without --interleaved_ckpt\r\n")
@@ -724,6 +968,38 @@ def load_interleaved(args):
     return m, INTERLEAVED_PROMPT
 
 
+NEMOTRON_DEFAULT = (
+    "/home/hainanx/.cache/huggingface/hub/models--nvidia--nemotron-speech-streaming-en-0.6b/"
+    "snapshots/ef3bf40c90df5cd2de55cc07e06681e03d8e6ee4/nemotron-speech-streaming-en-0.6b.nemo"
+)
+
+
+def load_nemotron(args):
+    """Load the nemotron RNN-T arm, or None when not requested.
+
+    Trained with att_context_size [[70,13],[70,6],[70,1],[70,0]] -- right
+    context is chunk-1, so chunk sizes 1, 2, 7 and 14 all live in one
+    checkpoint, the same multi-lookahead property SCRIPT's two fronts rely on.
+    """
+    import torch
+
+    if not args.nemotron_ckpt:
+        return None
+    if args.nemotron_ckpt == "default":
+        args.nemotron_ckpt = NEMOTRON_DEFAULT
+    from nemo.collections.asr.models import ASRModel
+
+    from nemo.collections.speechlm2.parts.nemotron_stream import available_chunks
+
+    dev = torch.device(args.nemotron_device or args.device)
+    print(f"loading nemotron RNN-T on {dev} ...", flush=True)
+    m = ASRModel.restore_from(args.nemotron_ckpt, map_location=dev)
+    m.eval()
+    chunks = available_chunks(m)
+    print(f"  nemotron ready (trained chunks {chunks})", flush=True)
+    return m, chunks
+
+
 def serve(args):
     import torch
 
@@ -739,6 +1015,7 @@ def serve(args):
         raise SystemExit(f"checkpoint trained on {trained}; fronts {missing} are not among them")
     prompt_txt = SCRIPT_PROMPT
     alt = load_interleaved(args)
+    nemotron = load_nemotron(args)
 
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -755,7 +1032,7 @@ def serve(args):
         print(f"[{time.strftime('%H:%M:%S')}] session from {addr}", flush=True)
         try:
             with gpu:
-                text = Session(model, conn, args, prompt_txt, alt).run()
+                text = Session(model, conn, args, prompt_txt, alt, nemotron).run()
             print(f"[{time.strftime('%H:%M:%S')}] -> {text[:80]!r}", flush=True)
         except (ConnectionResetError, BrokenPipeError):
             print("  client went away", flush=True)
@@ -779,7 +1056,7 @@ def client(args):
     s.sendall(
         f"CFG model={args.arm} fast={args.fast} slow={args.slow} cols={args.cols} "
         f"fast_delay={args.fast_delay} slow_delay={args.slow_delay} "
-        f"il_chunk={args.il_chunk} il_delay={args.il_delay}\n".encode()
+        f"il_chunk={args.il_chunk} il_delay={args.il_delay} nt_chunk={args.nt_chunk} nt_fast={args.nt_fast}\n".encode()
     )
 
     def pump_back():
@@ -856,9 +1133,27 @@ def main():
         "--interleaved_class",
         default="nemo.collections.speechlm2.models.streaming_stt_model.StreamingSTTModel",
     )
+    ap.add_argument(
+        "--nemotron_ckpt",
+        default="",
+        help="optional THIRD arm: the nemotron cache-aware RNN-T (.nemo). Pass 'default' for the HF cache copy",
+    )
+    ap.add_argument("--nemotron_device", default="", help="device for the nemotron arm (default: --device)")
+    ap.add_argument("--nt_chunk", type=int, default=14, help="chunk size (frames) for the nemotron arm")
+    ap.add_argument(
+        "--nt_fast",
+        type=int,
+        default=0,
+        help="fast front (frames) for the nemotron arm; 0 = single front, no self-correction",
+    )
     ap.add_argument("--il_chunk", type=int, default=14, help="chunk size (frames) for the interleaved arm")
     ap.add_argument("--il_delay", type=int, default=0, help="emit delay (frames) for the interleaved arm")
-    ap.add_argument("--arm", default="script", choices=["script", "interleaved"], help="which arm the client asks for")
+    ap.add_argument(
+        "--arm",
+        default="script",
+        choices=["script", "interleaved", "nemotron"],
+        help="which arm the client asks for",
+    )
     args = ap.parse_args()
     if args.client:
         client(args)

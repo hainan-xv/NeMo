@@ -49,12 +49,17 @@
       <label>model</label><select id="arm">
         <option value="script">SCRIPT</option>
         <option value="interleaved">interleaved</option>
+        <option value="nemotron">nemotron RNN-T</option>
       </select>
     </span>
     <span id="scriptctl">
       <label>fast</label><select id="fast"></select>
       <label>slow</label><select id="slow"></select>
       <label>delay</label><select id="fdelay"></select><span class="hint">/</span><select id="sdelay"></select>
+    </span>
+    <span id="ntctl" hidden>
+      <label>fast</label><select id="ntfast"></select>
+      <label>slow</label><select id="ntchunk"></select>
     </span>
     <span id="ilctl" hidden>
       <label>chunk</label><select id="ilchunk"></select>
@@ -92,6 +97,9 @@ function nearest(vals, want){ return vals.includes(want) ? want : vals[vals.leng
 const INTRO = {
   script: 'Press Record and speak. Provisional words appear greyed; when the slow front '
         + 'overrules them they are crossed out and replaced.',
+  nemotron: 'Press Record and speak. The nemotron RNN-T carries chunk sizes 1/2/7/14 in one '
+        + 'checkpoint. With fast=off it streams a single front and never revises; set a fast front '
+        + 'and the slow one overrules it at each block, crossing out what it got wrong.',
   interleaved: 'Press Record and speak. The interleaved baseline decodes live, one front only: '
         + 'each chunk appears as the decode commits it and is never revised, so nothing here is ever '
         + 'crossed out.'
@@ -101,6 +109,10 @@ function applyArm(){
   const arm = $('#arm').value;
   $('#scriptctl').hidden = arm !== 'script';
   $('#ilctl').hidden = arm !== 'interleaved';
+  $('#ntctl').hidden = arm !== 'nemotron';
+  // The RNN-T has no prompt at all -- no instruction, no text history. Leaving
+  // the biasing box on screen would invite typing that cannot do anything.
+  $('#bias').hidden = arm === 'nemotron';
   const i = $('#intro');   // gone once a transcript has replaced it
   if(i) i.textContent = INTRO[arm];
 }
@@ -114,6 +126,15 @@ fetch('/info').then(r=>r.json()).then(j=>{
   // The model picker only appears when a SECOND arm is actually loaded. With
   // one arm there is nothing to pick, and a disabled dropdown is just clutter
   // in a demo recording.
+  const nt = $('#arm').querySelector('option[value=nemotron]');
+  if(!j.nemotron){ nt.disabled = true; }
+  else {
+    fill($('#ntchunk'), j.nemotron.chunks, nearest(j.nemotron.chunks,14));
+    // 0 = single front. The slow front must be an exact multiple of the fast.
+    fill($('#ntfast'), [0].concat(j.nemotron.chunks), 2);
+    $('#ntfast').options[0].textContent = 'off';
+    $('#armsel').hidden = false;
+  }
   const il = $('#arm').querySelector('option[value=interleaved]');
   if(!j.interleaved){
     il.disabled = true;
@@ -195,6 +216,8 @@ async function start(){
                             fast:+$('#fast').value, slow:+$('#slow').value,
                             fast_delay:+$('#fdelay').value, slow_delay:+$('#sdelay').value,
                             il_chunk:+$('#ilchunk').value, il_delay:+$('#ildelay').value,
+                            nt_chunk:+($('#ntchunk').value||14),
+                            nt_fast:+($('#ntfast').value||0),
                             prompt_extra:$('#prompt_extra').value}));
     src.connect(node); node.connect(ctx.destination);
   };

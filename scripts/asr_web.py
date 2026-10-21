@@ -46,7 +46,14 @@ import threading
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from scripts.asr_server import SCRIPT_PROMPT, SR, Session, load_interleaved, speech_report  # noqa: E402
+from scripts.asr_server import (  # noqa: E402
+    SCRIPT_PROMPT,
+    SR,
+    Session,
+    load_interleaved,
+    load_nemotron,
+    speech_report,
+)
 
 ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
@@ -115,8 +122,8 @@ class QueueSocket:
 class WebSession(Session):
     """Same decode, structured events instead of escape codes."""
 
-    def __init__(self, model, sock, args, prompt_txt, emit, alt=None):
-        super().__init__(model, sock, args, prompt_txt, alt)
+    def __init__(self, model, sock, args, prompt_txt, emit, alt=None, nemotron=None):
+        super().__init__(model, sock, args, prompt_txt, alt, nemotron)
         self.emit = emit
 
     def send(self, text):
@@ -177,10 +184,10 @@ async def ws_handler(request):
 
     a = A()
     a.__dict__.update(vars(app["args"]))
-    for k in ("fast", "slow", "fast_delay", "slow_delay", "il_chunk", "il_delay"):
+    for k in ("fast", "slow", "fast_delay", "slow_delay", "il_chunk", "il_delay", "nt_chunk", "nt_fast"):
         if k in cfg:
             a.__dict__[k] = int(cfg[k])
-    arm = "interleaved" if cfg.get("model") == "interleaved" else "script"
+    arm = cfg.get("model") if cfg.get("model") in ("interleaved", "nemotron") else "script"
 
     # Free-text biasing appended to the base instruction, BEFORE the control
     # clauses that render_control_prompt adds -- so the trained template still
@@ -200,9 +207,9 @@ async def ws_handler(request):
             sock.push(
                 f"CFG model={arm} fast={a.fast} slow={a.slow} cols={a.cols} "
                 f"fast_delay={a.fast_delay} slow_delay={a.slow_delay} "
-                f"il_chunk={a.il_chunk} il_delay={a.il_delay}\n".encode()
+                f"il_chunk={a.il_chunk} il_delay={a.il_delay} nt_chunk={a.nt_chunk} nt_fast={a.nt_fast}\n".encode()
             )
-            sess = WebSession(app["model"], sock, a, prompt, emit, app.get("alt"))
+            sess = WebSession(app["model"], sock, a, prompt, emit, app.get("alt"), app.get("nemotron"))
             sess.prompt_suffix = extra or None
             sess.run()
         except Exception as e:  # a bad session must not take the server down
@@ -282,6 +289,10 @@ def main():
         "--interleaved_class",
         default="nemo.collections.speechlm2.models.streaming_stt_model.StreamingSTTModel",
     )
+    ap.add_argument("--nemotron_ckpt", default="", help="optional nemotron RNN-T arm ('default' = HF cache copy)")
+    ap.add_argument("--nemotron_device", default="", help="device for the nemotron arm (default: --device)")
+    ap.add_argument("--nt_chunk", type=int, default=14)
+    ap.add_argument("--nt_fast", type=int, default=0)
     ap.add_argument("--il_chunk", type=int, default=14)
     ap.add_argument("--il_delay", type=int, default=0)
     args = ap.parse_args()
@@ -296,8 +307,10 @@ def main():
     model.eval()
     prompt = SCRIPT_PROMPT
     alt = load_interleaved(args)
+    nemotron = load_nemotron(args)
     app = web.Application(client_max_size=1 << 22)
     app["model"], app["args"], app["prompt"], app["alt"] = model, args, prompt, alt
+    app["nemotron"] = nemotron
     # The page fills its dropdowns from this rather than a hard-coded list: the
     # two checkpoints were trained on DIFFERENT chunk sets ([2,7,14,28,42] vs
     # [2,4,7,10,14,28]), and offering a size a model never saw still yields
@@ -309,6 +322,7 @@ def main():
             if alt is None
             else {"chunks": [int(c) for c in alt[0].core_cfg.chunk_size], "delays": list(range(args.max_delay + 1))}
         ),
+        "nemotron": None if nemotron is None else {"chunks": list(nemotron[1])},
     }
     app.router.add_get("/", index)
     app.router.add_get("/info", info)
