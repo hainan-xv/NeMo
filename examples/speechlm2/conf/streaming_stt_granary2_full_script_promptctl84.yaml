@@ -51,6 +51,12 @@ model:
   # dense | flex | script -- all mathematically identical. See the header for
   # measured memory/step-time; decoding always falls back to SDPA.
   attn_backend: flex
+  # Let each branch's audio block attend ITSELF both ways. The whole chunk
+  # has already arrived when the branch starts and the model waits for the
+  # boundary regardless, so this is streaming-legal and costs no FLOPs --
+  # the block is computed then masked either way. Declared here so Hydra
+  # accepts a plain override; struct mode refuses unknown keys.
+  bidirectional_audio: false
   activation_checkpointing: true
 
   # --- SCRIPT ---
