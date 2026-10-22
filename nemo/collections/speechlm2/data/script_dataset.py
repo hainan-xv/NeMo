@@ -164,6 +164,14 @@ class ScriptSTTDataConfig(StreamingSTTDataConfig):
     position_seed: int = 91011
     prompt_control: bool = False
     delay_candidates: Optional[List[int]] = None
+    # State the chunk size in the instruction. Turning this OFF makes the
+    # instruction independent of the chunk size, so two fronts decoding the same
+    # audio at different chunk sizes share one [instruction][history] prefix and
+    # therefore one prefill. The chunk size stays learnable because the audio
+    # window the model is shown is exactly that many frames wide.
+    # MUST match the model's prompt_include_chunk_size: a mismatch is silent
+    # out-of-distribution decoding.
+    prompt_include_chunk_size: bool = True
     # Draw the FIRST chunk's width uniformly from [1, chunk_size] per batch,
     # sliding every later boundary with it, so a window of a given size is
     # seen starting at EVERY position rather than only at multiples of its
@@ -727,7 +735,10 @@ class ScriptSTTDataset(StreamingSTTDataset):
                 )
                 for _ in cuts
             ]
-            system_prompts = [render_control_prompt(p, c) for p, c in zip(system_prompts, controls)]
+            _inc_cs = bool(getattr(self.cfg, "prompt_include_chunk_size", True))
+            system_prompts = [
+                render_control_prompt(p, c, include_chunk_size=_inc_cs) for p, c in zip(system_prompts, controls)
+            ]
             delays = [c.num_delay_frames for c in controls]
             caps = [c.capitalization for c in controls]
             puncts = [c.punctuation for c in controls]

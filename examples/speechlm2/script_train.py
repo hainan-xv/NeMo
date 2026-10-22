@@ -108,6 +108,7 @@ def train(cfg):
         "audio_window_frames",
         "twod_layout",
         "prompt_control",
+        "prompt_include_chunk_size",
         "read_write",
         "gate_in_history",
         "full_context",

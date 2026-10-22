@@ -6,6 +6,9 @@
 #   ./oci_status.sh 13089420 200       # ... last 200 lines
 #   ./oci_status.sh                    # your whole queue
 #
+# Set RESULTS_ROOT to point at a different results tree; PROJECT_NAME and
+# EXP_NAME below it are globbed, so recipes that use different projects all work.
+#
 # WHY: after a launch the useful question is almost always "did it get past
 # the first validation, and if not what was the traceback" -- which otherwise
 # takes a scontrol call to find StdOut, then a tail. `--follow` on the launcher
@@ -27,9 +30,14 @@ if [[ -z "$JOB_ID" ]]; then
     exit 0
 fi
 
-oci_ssh bash -s -- "$JOB_ID" "$TAIL_LINES" "$OCI_REPO" <<'REMOTE'
+# Root of the per-run results trees. PROJECT_NAME (the level below) differs per
+# recipe -- SpeechlmScriptCC, SpeechlmPromptCtl84, ... -- so it is NOT part of
+# this path; the remote half globs it.
+RESULTS_ROOT="${RESULTS_ROOT:-/lustre/fsw/portfolios/nemotron/users/hainanx/results}"
+
+oci_ssh bash -s -- "$JOB_ID" "$TAIL_LINES" "$OCI_REPO" "$RESULTS_ROOT" <<'REMOTE'
 set -uo pipefail
-job_id="$1"; n="$2"; repo="$3"
+job_id="$1"; n="$2"; repo="$3"; res_root="$4"
 
 echo "==> job ${job_id}"
 scontrol show job "$job_id" 2>/dev/null | tr ' ' '\n' \
@@ -57,13 +65,38 @@ fi
 # results dir instead. Looking only at the sbatch log makes a job that is
 # training happily and a job that is wedged look identical (one line, forever).
 # Rank 0 is the one worth reading; the others mostly echo it.
-res_root="/lustre/fsw/portfolios/nemotron/users/hainanx/results/SpeechlmScriptCC"
-rank0="$(ls -t "${res_root}"/*/slurm-"${job_id}"-0.out 2>/dev/null | head -1)"
-[[ -f "$rank0" ]] || rank0="$(ls -t "${res_root}"/*/slurm-"${job_id}"-*.out 2>/dev/null | head -1)"
+# Rank logs live at $res_root/<PROJECT_NAME>/<EXP_NAME>/slurm-<id>-<node>.out.
+# Glob BOTH levels: pinning a single PROJECT_NAME here made this script report
+# "no rank log yet" for jobs that had crashed hours earlier with a full
+# traceback already on disk, because their recipe used a different project.
+rank0="$(ls -t "${res_root}"/*/*/slurm-"${job_id}"-0.out 2>/dev/null | head -1)"
+[[ -f "$rank0" ]] || rank0="$(ls -t "${res_root}"/*/*/slurm-"${job_id}"-*.out 2>/dev/null | head -1)"
+
+# srun is given SEPARATE stdout and stderr files (-o slurm-%j-%n.out,
+# -e error-%j-%n.out), and a Python traceback goes to the ERROR one. Reading
+# only the stdout log makes a job that died on an exception look like a job that
+# merely stopped logging, so surface the first real traceback up front.
+err=""
+for _e in $(ls -t "${res_root}"/*/*/error-"${job_id}"-*.out 2>/dev/null); do
+    if grep -aq 'Traceback (most recent call last)' "$_e"; then err="$_e"; break; fi
+done
+if [[ -n "$err" ]]; then
+    echo ""
+    echo "==> ${err}  (FIRST TRACEBACK)"
+    # Print the tail of the first traceback block only: the deepest frames plus
+    # the exception line. The rest of the file is the NCCL/TCPStore teardown
+    # cascade every other rank emits, which says nothing about the cause.
+    tr '\r' '\n' < "$err" | awk '
+        /Traceback \(most recent call last\)/ { inblock = 1 }
+        inblock { buf[++k] = $0 }
+        inblock && /^(\[rank[0-9]+\]: )?[A-Za-z_][A-Za-z0-9_.]*(Error|Exception)/ { exit }
+        END { start = (k > 14 ? k - 14 : 0); for (i = start + 1; i <= k; i++) print buf[i] }
+    '
+fi
 
 if [[ ! -f "$rank0" ]]; then
     echo ""
-    echo "  (no srun rank log yet under ${res_root}/*/slurm-${job_id}-*.out --"
+    echo "  (no srun rank log under ${res_root}/*/*/slurm-${job_id}-*.out --"
     echo "   normal for the first ~10 min while the container image is pulled)"
     exit 0
 fi

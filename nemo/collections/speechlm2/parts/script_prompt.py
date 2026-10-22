@@ -136,20 +136,44 @@ def _frames(n: int) -> str:
     return f"{n} frame" + ("" if n == 1 else "s")
 
 
-def render_control_prompt(base_prompt: str, controls: ScriptControls) -> str:
+def render_control_prompt(base_prompt: str, controls: ScriptControls, include_chunk_size: bool = True) -> str:
     """Append the natural-language description of ``controls`` to ``base_prompt``.
 
     The single source of truth for the control wording. Training builds the
     instruction with it and so must inference; see the module docstring.
+
+    Args:
+        base_prompt: the recipe's base instruction.
+        controls: the settings to describe.
+        include_chunk_size: state the chunk size in words. When False the
+            sentence carries only the emission delay.
+
+            Why it is optional: the chunk size is already OBSERVABLE to the
+            model -- the audio window it is shown is exactly ``chunk_size``
+            frames wide -- so naming it is redundant. Naming it is also costly
+            for multi-front decoding: it makes the instruction, and therefore
+            the whole ``[instruction][history]`` prefix, DIFFER between two
+            fronts that run at different chunk sizes, so no prefix KV can be
+            shared across fronts. The emission delay is not observable and so
+            is always stated.
+
+            The two wordings deliberately differ by as little as possible, so a
+            model trained with the chunk size stated is a close warm start for
+            one trained without it.
     """
     delay = (
         "no emission delay"
         if controls.num_delay_frames == 0
         else f"an emission delay of {_frames(controls.num_delay_frames)}"
     )
+    chunking = (
+        f"The audio is chunked every {_frames(controls.chunk_size)} with {delay}."
+        if include_chunk_size
+        else f"The audio is chunked with {delay}."
+    )
     parts = [
         base_prompt.rstrip(),
-        f"The audio is chunked every {_frames(controls.chunk_size)} with {delay}.",
+        chunking,
         "Use capitalization." if controls.capitalization else "Do not use capitalization.",
         "Use punctuation." if controls.punctuation else "Do not use punctuation.",
     ]

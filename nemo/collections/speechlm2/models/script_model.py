@@ -151,6 +151,11 @@ class ScriptSTTModelConfig(StreamingSTTModelConfig):
             through the same function the dataset uses, so decoding cannot drift
             out of distribution by wording the instruction differently. MUST match
             ``data.dataset.prompt_control``.
+        prompt_include_chunk_size: whether that instruction states the chunk
+            size. False makes the instruction chunk-size independent, so fronts
+            at different chunk sizes share one ``[instruction][history]``
+            prefill; the chunk size stays learnable from the audio window's
+            width. Must match ``data.dataset.prompt_include_chunk_size``.
         val_num_delay_frames / val_capitalization / val_punctuation: the operating
             point validation decodes at, used only when ``prompt_control`` is on.
             References are restyled to match, or the WER would penalise the model
@@ -181,6 +186,10 @@ class ScriptSTTModelConfig(StreamingSTTModelConfig):
     activation_checkpointing: bool = False
     bidirectional_audio: bool = False
     prompt_control: bool = False
+    # Whether the instruction NAMES the chunk size. Must match the training
+    # dataset's data.dataset.prompt_include_chunk_size -- a mismatch decodes
+    # out of distribution without erroring. See render_control_prompt.
+    prompt_include_chunk_size: bool = True
     read_write: bool = False
     read_token: str = "<|box_start|>"
     write_token: str = "<|box_end|>"
@@ -1803,7 +1812,8 @@ class ScriptSTTModel(StreamingSTTModel):
                 capitalization=bool(asked.get("capitalization", self.core_cfg.val_capitalization)),
                 punctuation=bool(asked.get("punctuation", self.core_cfg.val_punctuation)),
             )
-            system_prompt = [render_control_prompt(p, controls) for p in system_prompt]
+            _inc_cs = bool(getattr(self.core_cfg, "prompt_include_chunk_size", True))
+            system_prompt = [render_control_prompt(p, controls, include_chunk_size=_inc_cs) for p in system_prompt]
         elif asked:
             # Silently ignoring these would look like the knobs work when the model
             # never learned them, which is the expensive kind of mistake.

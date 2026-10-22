@@ -194,7 +194,11 @@ def joint_lookahead_decode(
                 capitalization=bool(model.core_cfg.val_capitalization),
                 punctuation=bool(model.core_cfg.val_punctuation),
             )
-            prompts[tag] = render_control_prompt(system_prompt, controls)
+            prompts[tag] = render_control_prompt(
+                system_prompt,
+                controls,
+                include_chunk_size=bool(getattr(model.core_cfg, "prompt_include_chunk_size", True)),
+            )
         else:
             prompts[tag] = system_prompt
 

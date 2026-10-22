@@ -69,6 +69,13 @@ model:
   # generate() renders the control sentence through the same function the
   # dataset used, and rejects the knobs outright when this is false.
   prompt_control: true
+  # Whether the instruction NAMES the chunk size. False makes the instruction
+  # chunk-size independent, so two fronts decoding at different chunk sizes
+  # share one [instruction][history] prefix -- and therefore one prefill. The
+  # chunk size stays learnable because the audio window is exactly that wide.
+  # data.dataset interpolates this, so one override flips both and they can
+  # never disagree.
+  prompt_include_chunk_size: true
 
   # Decode-only validation. val_chunk_size pins one well-supported chunk size
   # instead of the largest candidate (whose look-ahead can be slow to stream).
@@ -140,6 +147,7 @@ data:
 
     # --- Prompt control (paired with model.prompt_control) ---
     prompt_control: ${model.prompt_control}
+    prompt_include_chunk_size: ${model.prompt_include_chunk_size}
     # Delays in frames (0.08s each): 0 -> 0.00s ... 8 -> 0.64s. num_delay_frames
     # below is the fallback used only when prompt_control is off.
     delay_candidates: [0, 1, 2, 3, 4]
