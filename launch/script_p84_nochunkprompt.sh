@@ -253,7 +253,15 @@ INIT_EXP="${INIT_EXP:-}"
 # step-52k parent and restores ITS global_step, which would silently throw
 # away everything this experiment has trained since. With it unset,
 # resume_if_exists=true picks up this run's own -last.ckpt instead.
-INIT_CKPT="${INIT_CKPT:-/lustre/fsw/portfolios/nemotron/users/hainanx/results/SpeechlmPromptCtl84/granary2_script_promptctl84_full_lr1e4/granary2_script_promptctl84_full_lr1e4/checkpoints/step=52000-val_wer=0.0859.ckpt}"
+# CONTINUATION-ONLY from here on. This experiment now HAS its own
+# checkpoints, and auto.sh resubmits this exact script whenever the job
+# ends on the 3:55 slice limit. INIT_CKPT is consumed as
+# exp_manager.resume_from_checkpoint, which restores the PARENT's
+# global_step -- so leaving the step-52000 warm start here made every
+# automatic resubmission rewind and silently discard the steps trained
+# since. With it "none", resume_if_exists=true picks up this run's own
+# -last.ckpt instead. To re-seed from scratch, pass INIT_CKPT=<path>.
+INIT_CKPT="${INIT_CKPT:-none}"
 if [[ -z "$INIT_CKPT" && -n "$INIT_EXP" ]]; then
     _INIT_DIR="${OUTPUT_PREFIX}/results/${PROJECT_NAME}/${INIT_EXP}/${INIT_EXP}/checkpoints"
     INIT_CKPT="$(ls -t "${_INIT_DIR}"/*-last.ckpt 2>/dev/null | head -1)"
