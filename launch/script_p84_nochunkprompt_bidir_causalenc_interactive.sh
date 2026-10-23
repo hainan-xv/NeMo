@@ -268,6 +268,23 @@ INIT_EXP="${INIT_EXP:-}"
 # away everything this experiment has trained since. With it unset,
 # resume_if_exists=true picks up this run's own -last.ckpt instead.
 INIT_CKPT="${INIT_CKPT:-/lustre/fsw/portfolios/nemotron/users/hainanx/results/SpeechlmPromptCtl84/granary2_script_p84_nochunkprompt_bidir/granary2_script_p84_nochunkprompt_bidir/checkpoints/step=92002-val_wer=0.0865.ckpt}"
+
+# Make this script SAFE TO RESUBMIT. auto.sh re-runs it verbatim whenever the
+# job ends on the 3:55 slice limit, and INIT_CKPT is consumed as
+# exp_manager.resume_from_checkpoint -- which restores the PARENT's global_step.
+# Left pinned, every resubmission would rewind to the warm-start step and
+# silently discard the slice just trained.
+#
+# A plain INIT_CKPT=none is NOT the fix here: on the very first launch this
+# experiment has no checkpoints, so "none" would train from the base pretrained
+# model instead of warm-starting. So decide by what is on disk: warm-start only
+# while this run has no -last.ckpt of its own, and continue from it afterwards.
+_OWN_CKPTS="${OUTPUT_PREFIX}/results/${PROJECT_NAME}/${EXP_NAME}/${EXP_NAME}/checkpoints"
+if compgen -G "${_OWN_CKPTS}/*-last.ckpt" >/dev/null 2>&1; then
+    echo "==> ${EXP_NAME} already has its own checkpoints; ignoring the warm start"
+    echo "    (resume_if_exists will continue from $(ls -t "${_OWN_CKPTS}"/*-last.ckpt | head -1))"
+    INIT_CKPT="none"
+fi
 if [[ -z "$INIT_CKPT" && -n "$INIT_EXP" ]]; then
     _INIT_DIR="${OUTPUT_PREFIX}/results/${PROJECT_NAME}/${INIT_EXP}/${INIT_EXP}/checkpoints"
     INIT_CKPT="$(ls -t "${_INIT_DIR}"/*-last.ckpt 2>/dev/null | head -1)"
