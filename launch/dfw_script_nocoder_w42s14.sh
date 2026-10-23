@@ -607,7 +607,18 @@ LHOTSE_RND_SEED="${1:-42}"
 # TRAINING batch with FileNotFoundError on .../ASR/YTC/en12/audio_52.tar.
 DATA_ROOT=/lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm
 
-MOUNTS="--container-mounts=${CODE_DIR}:/code,${RESULTS_DIR}:/results,${HFCACHE}:/hfcache,${LUSTRE}:${LUSTRE},${DATA_ROOT}:${DATA_ROOT}"
+# THIRD root, and it is NOT optional. The inherited comment claimed the
+# input_cfg needs exactly two roots; scanning the file says otherwise:
+#   457 paths under /lustre/fsw/portfolios/llmservice   (DATA_ROOT)
+#    54 paths under /lustre/fsw/portfolios/nemotron/users/heh/manifests
+# ${LUSTRE} is .../nemotron/PROJECTS/nemotron_speechprod_asr, which does NOT
+# cover .../nemotron/USERS. The sharded manifests live there, exist on the
+# host, and were simply invisible inside the container -- the job reached the
+# training loop and then died on the first shard read with
+#   FileNotFoundError: .../nemotron/users/heh/manifests/.../manifest_639.jsonl
+# This is the sharded/tarred read-path failure DFW has shown since ~2026-10-07.
+NEMO_USERS=/lustre/fsw/portfolios/nemotron/users
+MOUNTS="--container-mounts=${CODE_DIR}:/code,${RESULTS_DIR}:/results,${HFCACHE}:/hfcache,${LUSTRE}:${LUSTRE},${DATA_ROOT}:${DATA_ROOT},${NEMO_USERS}:${NEMO_USERS}"
 
 # Do NOT enable xtrace: the command below contains expanded token values.
 read -r -d '' cmd <<EOF
