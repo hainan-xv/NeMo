@@ -55,14 +55,31 @@ class StackingEncoder(nn.Module):
             differs from that product, a single Linear maps onto it -- the "one
             linear transform to match dimension" case, for feature/LLM widths
             that do not already line up.
+        match_conv_subsampling: emit one extra trailing frame, so the frame
+            COUNT equals what NeMo's ``ConvSubsampling`` produces for the same
+            input (``ceil(T / s) + 1``; its conv padding yields that extra
+            frame). Default True, because the SCRIPT dataset builds
+            ``audio_frame_index`` against the Conformer's count: with one fewer
+            frame the final index falls past the end and is zero-padded during
+            TRAINING, while ``encode_frames`` at inference returns only the real
+            frames -- so the last chunk would be a different width in training
+            than at decode time. Set False only if the consuming grid is built
+            from this module's own length.
     """
 
-    def __init__(self, feat_in: int = 128, subsampling_factor: int = 8, d_model: Optional[int] = None):
+    def __init__(
+        self,
+        feat_in: int = 128,
+        subsampling_factor: int = 8,
+        d_model: Optional[int] = None,
+        match_conv_subsampling: bool = True,
+    ):
         super().__init__()
         if feat_in <= 0 or subsampling_factor <= 0:
             raise ValueError(f"feat_in and subsampling_factor must be positive, got {feat_in}, {subsampling_factor}")
         self.feat_in = int(feat_in)
         self.subsampling_factor = int(subsampling_factor)
+        self.match_conv_subsampling = bool(match_conv_subsampling)
         stacked = self.feat_in * self.subsampling_factor
         self.stacked_dim = stacked
         if d_model is None or int(d_model) == stacked:
@@ -86,7 +103,9 @@ class StackingEncoder(nn.Module):
             raise ValueError(f"expected {self.feat_in} features, got {f}")
         s = self.subsampling_factor
 
-        pad = (-t) % s
+        # One extra frame when matching ConvSubsampling's count (see __init__).
+        extra = s if self.match_conv_subsampling else 0
+        pad = ((-t) % s) + extra
         if pad:
             audio_signal = torch.nn.functional.pad(audio_signal, (0, pad))
         t_out = audio_signal.shape[-1] // s
@@ -99,5 +118,8 @@ class StackingEncoder(nn.Module):
         if self.out_proj is not None:
             x = self.out_proj(x.transpose(1, 2)).transpose(1, 2)
 
-        out_len = torch.div(length + s - 1, s, rounding_mode="floor").clamp(max=t_out)
+        out_len = torch.div(length + s - 1, s, rounding_mode="floor")
+        if self.match_conv_subsampling:
+            out_len = out_len + 1
+        out_len = out_len.clamp(max=t_out)
         return x, out_len
