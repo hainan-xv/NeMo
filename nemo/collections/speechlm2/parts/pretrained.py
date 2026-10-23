@@ -334,15 +334,27 @@ def setup_perception(
             cfg.perception.preprocessor = asr.cfg.preprocessor
             if audio_pad_to is not None:
                 cfg.perception.preprocessor.pad_to = cfg.audio_pad_to
-            cfg.perception.encoder = asr.cfg.encoder
-            if att_context_size is not None:
-                cfg.perception.encoder.att_context_size = att_context_size
+            _user_target = user_encoder_config.get("_target_")
+            _asr_target = asr.cfg.encoder.get("_target_")
+            if _user_target is not None and _user_target != _asr_target:
+                # The user asked for a DIFFERENT encoder class than the pretrained
+                # one (e.g. the encoder-free StackingEncoder). Merging would carry
+                # the Conformer's keys -- n_layers, subsampling, d_model,
+                # sync_max_audio_length -- into a constructor that does not accept
+                # them, so take the user's encoder config wholesale instead.
+                # att_context_size is skipped for the same reason: a replacement
+                # front-end defines its own look-ahead, or has none.
+                cfg.perception.encoder = OmegaConf.create(user_encoder_config)
+            else:
+                cfg.perception.encoder = asr.cfg.encoder
+                if att_context_size is not None:
+                    cfg.perception.encoder.att_context_size = att_context_size
+                # Override with user-specified encoder parameters, e.g. initializiing a non-causal encoder for causal setup.
+                if user_encoder_config:
+                    for key, value in user_encoder_config.items():
+                        if value is not None:  # Only override if user explicitly set a value
+                            cfg.perception.encoder[key] = value
             cfg.perception.output_dim = output_dim
-            # Override with user-specified encoder parameters, e.g. initializiing a non-causal encoder for causal setup.
-            if user_encoder_config:
-                for key, value in user_encoder_config.items():
-                    if value is not None:  # Only override if user explicitly set a value
-                        cfg.perception.encoder[key] = value
         perception = AudioPerceptionModule(cfg.perception).train()
         perception.load_state_dict(asr.state_dict(), strict=False)
     else:
