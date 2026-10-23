@@ -69,6 +69,18 @@ model:
   # M: each branch's audio window spans chunks [k-M .. k]. 0 = current chunk only.
   # Must match data.dataset.audio_history_chunks (script_train.py asserts this).
   audio_history_chunks: 0
+  # F > 0 gives every branch a FIXED window of F frames ending at its chunk
+  # boundary, so the acoustic context is constant and INDEPENDENT of chunk size;
+  # it takes precedence over audio_history_chunks. With chunk_size as the stride,
+  # (F, chunk) = (42, 14) means overlapping windows: 42 frames of audio seen,
+  # advancing 14 each step.
+  #
+  # WHY: with non-overlapping windows the window IS the chunk, so a small chunk
+  # cannot contain a whole word -- chunk 2 is 160ms. Decoupling the two lets the
+  # emission stride stay short while the model still sees enough audio to
+  # resolve a word. Declared here (not only on the dataclass) because Hydra
+  # struct mode refuses to set a key the config does not already contain.
+  audio_window_frames: 0
 
   # --- Prompt control ---
   # Must match data.dataset.prompt_control (script_train.py asserts this).
@@ -164,6 +176,7 @@ data:
     frame_length_in_secs: ${model.frame_length_in_secs}
     chunk_size: ${model.chunk_size}
     audio_history_chunks: ${model.audio_history_chunks}
+    audio_window_frames: ${model.audio_window_frames}
 
     # --- Prompt control (paired with model.prompt_control) ---
     prompt_control: ${model.prompt_control}
