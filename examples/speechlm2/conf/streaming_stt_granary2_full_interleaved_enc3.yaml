@@ -98,14 +98,16 @@ data:
     shuffle: true
     shard_seed: "randomized"
     num_workers: 4
-    batch_size: 4
-    # Optional bucketing:
-    # batch_size: null
-    # use_bucketing: true
-    # batch_duration: 200
-    # bucket_duration_bins: [5, 10, 15, 20, 25, 30]
-    # num_buckets: 6
-    # bucket_buffer_size: 5000
+    # Bucketing ON, mirroring the SCRIPT enc3 arm so the two see the same batch
+    # composition. The launch script overrides the bins and sizes, but Hydra's
+    # struct mode refuses to SET a key the config does not already contain --
+    # leaving these out made the job die immediately with
+    #   Error: Key 'bucket_batch_size' is not in struct
+    batch_size: null
+    use_bucketing: true
+    bucket_duration_bins: [4.32,6.0,7.04,7.92,8.8,9.6,10.4,11.12,11.89,12.66,13.47,14.8,16.92,20.0]
+    bucket_batch_size: [38,29,25,22,20,18,17,15,14,13,12,11,10,8]
+    max_duration: 20
 
   validation_ds:
     datasets:
