@@ -93,6 +93,12 @@ data:
   train_ds:
     sample_rate: ${data.dataset.sample_rate}
     input_cfg: null
+    # The granary2 shards have a few manifest/tar mismatches. Without this the
+    # dataloader raises
+    #   RuntimeError: Mismatched entry between JSON manifest and tar file
+    # and kills the job; with it the offending tar is skipped. The SCRIPT arms
+    # set this too, so both see the same data policy.
+    skip_missing_manifest_entries: true
     manifest_filepath: null
     seed: 42
     shuffle: true
