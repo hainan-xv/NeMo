@@ -367,7 +367,17 @@ def setup_perception(
                             cfg.perception.encoder[key] = value
             cfg.perception.output_dim = output_dim
         perception = AudioPerceptionModule(cfg.perception).train()
-        perception.load_state_dict(asr.state_dict(), strict=False)
+        _sd = asr.state_dict()
+        if bool(cfg.perception.get("random_init_encoder", False)):
+            # Take the pretrained encoder's STRUCTURE but not its weights. Used to
+            # ask whether an architecture helps on its own, separately from whether
+            # pretrained acoustic features transfer -- otherwise a truncated
+            # encoder silently inherits layers 0..n-1 and the two effects are
+            # confounded. The preprocessor keys (featurizer.window / .fb, the mel
+            # filterbank) are NOT encoder keys and still load.
+            _sd = {k: v for k, v in _sd.items() if not k.startswith("encoder.")}
+            logging.info("setup_perception: random_init_encoder=True -- encoder weights NOT loaded")
+        perception.load_state_dict(_sd, strict=False)
     else:
         with open_dict(cfg):
             cfg.perception.output_dim = output_dim
