@@ -97,7 +97,21 @@ class AudioPerceptionModule(NeuralModule, Exportable):
                 raise ValueError(
                     "when `output_dim` is not set in cfg.modality_adapter, `output_dim` is required in the cfg to be used for projection."
                 )
-            self.proj = nn.Linear(d_model, cfg.output_dim)
+            # proj_hidden_dim > 0 makes this a 2-layer MLP with ReLU instead of a
+            # single affine map. That matters most for an ENCODER-FREE front-end:
+            # with the Conformer removed, a bare Linear is the ONLY learned
+            # transform between log-mel and the LLM's first attention layer, so
+            # the LLM itself has to absorb the feature distribution. 0 (default)
+            # keeps the historical single Linear, so existing checkpoints load.
+            hidden = int(cfg.get("proj_hidden_dim", 0) or 0)
+            if hidden > 0:
+                self.proj = nn.Sequential(
+                    nn.Linear(d_model, hidden),
+                    nn.ReLU(),
+                    nn.Linear(hidden, cfg.output_dim),
+                )
+            else:
+                self.proj = nn.Linear(d_model, cfg.output_dim)
         else:
             self.proj = nn.Identity()
         # Optional Rotary Time Embedding (ROTE), applied to the encoder output features

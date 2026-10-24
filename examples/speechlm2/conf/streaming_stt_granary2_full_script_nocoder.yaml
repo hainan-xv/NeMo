@@ -135,6 +135,22 @@ model:
   # a causal-encoder arm could not have been rescued by the LLM even in
   # principle. Full finetuning removes that confound.
   perception:
+    # The pretrained nemotron ships normalize: NA -- its Conformer's convolutions
+    # and LayerNorms absorb the log-mel scale, so raw features were fine. With
+    # the encoder removed there is NOTHING between log-mel and the LLM's first
+    # attention layer, and log-mel has a large arbitrary offset and wide dynamic
+    # range while Qwen3's text embeddings are ~unit scale. Normalising here stops
+    # proj having to absorb that mismatch on its own.
+    #
+    # CAVEAT: per_feature uses WHOLE-UTTERANCE statistics, so a frame's features
+    # depend on audio that arrives later. That is fine for training and for
+    # offline scoring, but it is NOT streaming-legal -- for a true streaming
+    # claim this must become fixed global mean/std computed once over the corpus.
+    preprocessor:
+      normalize: per_feature
+    # Two-layer MLP with ReLU instead of a single affine map; 4 x the LLM width.
+    # 1024 -> 8192 -> 2048 is ~25M params against the 609M Conformer we removed.
+    proj_hidden_dim: 8192
     modality_adapter:
       _target_: nemo.collections.speechlm2.modules.perception.IdentityConnector
     # ENCODER-FREE. The 609M-parameter Conformer is replaced by a reshape: 8

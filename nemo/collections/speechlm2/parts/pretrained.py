@@ -330,8 +330,19 @@ def setup_perception(
             user_encoder_config = OmegaConf.to_container(cfg.perception.encoder, resolve=True)
 
         asr = load_pretrained_nemo(ASRModel, pretrained_asr).eval()
+        # Preprocessor keys the USER set survive the pretrained copy below. The
+        # pretrained nemotron ships normalize: NA because its Conformer's convs
+        # and LayerNorms absorb the log-mel scale; an encoder-free front-end has
+        # nothing between log-mel and the LLM, so it needs to set normalize
+        # itself. Without this the copy would silently discard that.
+        user_pre = {}
+        if 'preprocessor' in cfg.perception and cfg.perception.preprocessor is not None:
+            user_pre = OmegaConf.to_container(cfg.perception.preprocessor, resolve=True) or {}
         with open_dict(cfg):
             cfg.perception.preprocessor = asr.cfg.preprocessor
+            for key, value in user_pre.items():
+                if value is not None:
+                    cfg.perception.preprocessor[key] = value
             if audio_pad_to is not None:
                 cfg.perception.preprocessor.pad_to = cfg.audio_pad_to
             _user_target = user_encoder_config.get("_target_")
