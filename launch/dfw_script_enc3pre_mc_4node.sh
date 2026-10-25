@@ -11,12 +11,12 @@
 #     it restores a latency curve: a single-stride model cannot show a
 #     latency/accuracy tradeoff at all.
 #
-# prompt_include_chunk_size is TRUE here, and that is forced by (2):
-# audio_window_frames pins the window at 42 frames regardless of chunk, so
-# window width no longer signals the operating point -- chunk 2 and chunk 14
-# look identical inside a branch. Multi-chunk therefore needs the chunk size
-# stated in the instruction. Cost: fronts at different chunk sizes no longer
-# share an [instruction][history] prefix.
+# prompt_include_chunk_size is FALSE here, which is only coherent because of:
+#  3. audio_history_chunks=2 instead of a FIXED audio_window_frames. A fixed
+#     window is the same width at every chunk size, so under multi-chunk it
+#     cannot signal the operating point and the model would be guessing how
+#     many words to emit. (M+1)*chunk scales, so the chunk size can stay OUT
+#     of the prompt and fronts keep a shared [instruction][history] prefix.
 #
 # att_context_size [84,1] is already compatible: chunked_limited needs
 # left %% (right+1) == 0, and 84 divides 2/7/14/28/42 exactly.
@@ -448,7 +448,11 @@ BUCKET_BATCH_SIZE="${BUCKET_BATCH_SIZE:-[38,29,25,22,20,18,17,15,14,13,12,11,10,
 # AND restores the latency curve -- a single-stride model cannot show a
 # latency/accuracy tradeoff at all, which is the point of the multi-front work.
 CHUNK_SIZES="${CHUNK_SIZES:-[2,7,14,28,42]}"
-AUDIO_WINDOW_FRAMES="${AUDIO_WINDOW_FRAMES:-42}"
+# 0 -- audio_window_frames takes PRECEDENCE over audio_history_chunks, so any
+# non-zero value here would pin the window and defeat the scaling. The
+# window comes from the config's audio_history_chunks: 2 instead, i.e.
+# (2+1) * chunk frames -- 42 at chunk 14, but scaling with the chunk size.
+AUDIO_WINDOW_FRAMES="${AUDIO_WINDOW_FRAMES:-0}"
 # val_chunk_size must stay a single int and match the train chunk here.
 VAL_CHUNK_SIZE="${VAL_CHUNK_SIZE:-14}"
 # Scalar fallback only; BAND_BY_CHUNK below is what actually applies.

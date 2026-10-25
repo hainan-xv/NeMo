@@ -71,7 +71,11 @@ model:
   # --- SCRIPT ---
   # M: each branch's audio window spans chunks [k-M .. k]. 0 = current chunk only.
   # Must match data.dataset.audio_history_chunks (script_train.py asserts this).
-  audio_history_chunks: 0
+  # M=2 -> each branch sees its own chunk plus the 2 before it, i.e. a window of
+  # (2+1) * chunk frames. At chunk 14 that is 42 frames -- identical to the fixed
+  # window this replaces -- but it SCALES with the chunk size, which is what lets
+  # prompt_include_chunk_size stay false under multi-chunk training.
+  audio_history_chunks: 2
   # F > 0 gives every branch a FIXED window of F frames ending at its chunk
   # boundary, so the acoustic context is constant and INDEPENDENT of chunk size;
   # it takes precedence over audio_history_chunks. With chunk_size as the stride,
@@ -96,7 +100,15 @@ model:
   # chunk size stays learnable because the audio window is exactly that wide.
   # data.dataset interpolates this, so one override flips both and they can
   # never disagree.
-  prompt_include_chunk_size: true
+  # FALSE: the chunk size stays out of the instruction, so fronts at different
+  # chunk sizes keep a shared [instruction][history] prefix.
+  #
+  # That is only coherent because this arm uses audio_history_chunks (below)
+  # rather than a FIXED audio_window_frames. A fixed window is the same width at
+  # every chunk size, so it cannot signal the operating point and the model
+  # would be guessing how many words to emit. A history-chunks window is
+  # (M+1) * chunk, so its width still tells the model which chunk it is on.
+  prompt_include_chunk_size: false
 
   # Decode-only validation. val_chunk_size pins one well-supported chunk size
   # instead of the largest candidate (whose look-ahead can be slow to stream).
