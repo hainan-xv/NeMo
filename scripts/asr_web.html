@@ -46,11 +46,7 @@
   <div class="controls">
     <label>mic</label><select id="mic"><option value="">default</option></select>
     <span id="armsel" hidden>
-      <label>model</label><select id="arm">
-        <option value="script">SCRIPT</option>
-        <option value="interleaved">interleaved</option>
-        <option value="nemotron">nemotron RNN-T</option>
-      </select>
+      <label>model</label><select id="arm"></select>
     </span>
     <span id="scriptctl">
       <label>fast</label><select id="fast"></select>
@@ -105,48 +101,63 @@ const INTRO = {
         + 'crossed out.'
 };
 
+function armOf(id){ return (INFO.arms||[]).find(a=>a.id===id) || {id:id, kind:id, fixed:false}; }
+
 function applyArm(){
-  const arm = $('#arm').value;
-  $('#scriptctl').hidden = arm !== 'script';
-  $('#ilctl').hidden = arm !== 'interleaved';
-  $('#ntctl').hidden = arm !== 'nemotron';
+  const arm = $('#arm').value, A = armOf(arm);
+  // A FIXED-chunk arm has one operating point, so there is nothing to choose
+  // and no self-correction to show: hide the latency controls entirely rather
+  // than offer settings the checkpoint never saw.
+  $('#scriptctl').hidden = !(A.kind === 'script' && !A.fixed);
+  $('#ilctl').hidden     = !(A.kind === 'interleaved' && !A.fixed);
+  $('#ntctl').hidden     = A.kind !== 'nemotron';
   // The RNN-T has no prompt at all -- no instruction, no text history. Leaving
   // the biasing box on screen would invite typing that cannot do anything.
-  $('#bias').hidden = arm === 'nemotron';
+  $('#bias').hidden = A.kind === 'nemotron';
   const i = $('#intro');   // gone once a transcript has replaced it
-  if(i) i.textContent = INTRO[arm];
+  if(i) i.textContent = A.fixed
+      ? (A.label + ' — fixed chunk ' + (A.chunks[0]||'?') + ' frames, no self-correction')
+      : (INTRO[A.kind] || '');
 }
 
 fetch('/info').then(r=>r.json()).then(j=>{
   INFO = j;
-  fill($('#fast'), j.script.chunks, nearest(j.script.chunks,2));
-  fill($('#slow'), j.script.chunks, nearest(j.script.chunks,28));
-  fill($('#fdelay'), j.script.delays, nearest(j.script.delays,1));
-  fill($('#sdelay'), j.script.delays, nearest(j.script.delays,3));
-  // The model picker only appears when a SECOND arm is actually loaded. With
-  // one arm there is nothing to pick, and a disabled dropdown is just clutter
-  // in a demo recording.
-  const nt = $('#arm').querySelector('option[value=nemotron]');
-  if(!j.nemotron){ nt.disabled = true; }
-  else {
-    fill($('#ntchunk'), j.nemotron.chunks, nearest(j.nemotron.chunks,14));
-    // 0 = single front. The slow front must be an exact multiple of the fast.
-    fill($('#ntfast'), [0].concat(j.nemotron.chunks), 2);
-    $('#ntfast').options[0].textContent = 'off';
-    $('#armsel').hidden = false;
+  const arms = j.arms || [];
+  // Build the picker from what the SERVER actually loaded. Hard-coding options
+  // let a model be selected that was never loaded, and offering a chunk size a
+  // checkpoint never trained still yields fluent text -- a silent failure.
+  const sel = $('#arm');
+  sel.innerHTML = '';
+  arms.forEach(a=>{
+    const o = document.createElement('option');
+    o.value = a.id; o.textContent = a.label;
+    sel.appendChild(o);
+  });
+  $('#armsel').hidden = arms.length < 2;
+
+  const sc = arms.find(a=>a.kind==='script' && !a.fixed);
+  if(sc){
+    fill($('#fast'), sc.chunks, nearest(sc.chunks,2));
+    fill($('#slow'), sc.chunks, nearest(sc.chunks,28));
+    fill($('#fdelay'), sc.delays, nearest(sc.delays,1));
+    fill($('#sdelay'), sc.delays, nearest(sc.delays,3));
   }
-  const il = $('#arm').querySelector('option[value=interleaved]');
-  if(!j.interleaved){
-    il.disabled = true;
-    $('#arm').value = 'script';
-  } else {
-    $('#armsel').hidden = false;
-    // Only name the second arm in the heading when it is actually loaded, so a
-    // SCRIPT-only server reads as a SCRIPT demo.
-    $('#htitle').textContent = 'streaming ASR — SCRIPT vs interleaved';
-    document.title = 'SCRIPT vs interleaved — streaming ASR';
-    fill($('#ilchunk'), j.interleaved.chunks, nearest(j.interleaved.chunks,14));
-    fill($('#ildelay'), j.interleaved.delays, nearest(j.interleaved.delays,0));
+  const il = arms.find(a=>a.kind==='interleaved' && !a.fixed);
+  if(il){
+    fill($('#ilchunk'), il.chunks, nearest(il.chunks,14));
+    fill($('#ildelay'), il.delays, nearest(il.delays,0));
+  }
+  const nt = arms.find(a=>a.kind==='nemotron');
+  if(nt){
+    fill($('#ntchunk'), nt.chunks, nearest(nt.chunks,14));
+    // 0 = single front. The slow front must be an exact multiple of the fast.
+    fill($('#ntfast'), [0].concat(nt.chunks), 2);
+    $('#ntfast').options[0].textContent = 'off';
+  }
+  // Name the comparison in the heading only when there IS one.
+  if(arms.length > 1){
+    $('#htitle').textContent = 'streaming ASR — model comparison';
+    document.title = 'streaming ASR — model comparison';
   }
   applyArm();
 }).catch(e=>log('could not read /info: '+e.message));

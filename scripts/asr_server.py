@@ -539,6 +539,123 @@ class Session:
             pass
         return shown
 
+    def run_script_fixed(self, leftover, chunk, delay):
+        """SCRIPT at ONE fixed chunk size: no fast front, no revision.
+
+        The two-front path needs slow to be a different exact multiple of fast,
+        so a model trained at a single chunk size (the encoder-free arms, which
+        use CHUNK_SIZES=[14]) cannot use it -- it would be rejected outright.
+        There is also nothing to revise with: self-correction needs a SECOND,
+        slower operating point, and these checkpoints only ever saw one.
+
+        So this emits each block once, committed, as soon as its audio is
+        complete. Latency is (chunk + delay) * 0.08s and the text never changes
+        after it appears.
+        """
+        import numpy as np
+        import torch
+
+        a_, m = self.a, self.m
+        dev = next(m.parameters()).device
+        trained = list(getattr(m.core_cfg, "chunk_size", []) or [])
+        if trained and chunk not in trained:
+            self.send(f"\r\n[server] rejected: chunk {chunk} is not in {trained}\r\n")
+            return ""
+        delay = max(0, min(a_.max_delay, delay))
+        self.send(
+            f"\r\n[server] fixed chunk {chunk} frames, delay {delay} "
+            f"-> emits every {(chunk + delay) * 0.08:.2f}s (no self-correction)\r\n"
+        )
+
+        chunk_bytes = chunk * SAMPLES_PER_FRAME * 2
+        carry = b""
+        audio, carry = _pcm(leftover, carry)
+        committed, blocks = "", 0
+        t0 = None
+        last = time.time()
+        self.s.settimeout(1.0)
+        while True:
+            try:
+                buf = self.s.recv(chunk_bytes)
+            except socket.timeout:
+                if time.time() - last > a_.idle_timeout:
+                    break
+                continue
+            except OSError:
+                break
+            if not buf:
+                break
+            last = time.time()
+            # Same drain as the two-front path: one recv per cycle lets lag grow
+            # without bound when a cycle costs more than the chunk's duration.
+            self.s.setblocking(False)
+            try:
+                while True:
+                    more = self.s.recv(65536)
+                    if not more:
+                        break
+                    buf += more
+            except (BlockingIOError, OSError):
+                pass
+            finally:
+                self.s.setblocking(True)
+                self.s.settimeout(1.0)
+            fresh, carry = _pcm(buf, carry)
+            audio = np.concatenate([audio, fresh])
+            if t0 is None:
+                t0 = time.time()
+            if time.time() - t0 > a_.max_seconds:
+                break
+
+            t = torch.from_numpy(audio).unsqueeze(0).to(dev)
+            n = torch.tensor([audio.shape[0]], device=dev)
+            with torch.inference_mode():
+                ff = m.encode_frames(t, n, chunk)
+            avail = int(ff[0].shape[0])
+            while avail >= (blocks + 1) * chunk:
+                lo = blocks * chunk
+                with torch.inference_mode():
+                    out = m.generate(
+                        t,
+                        n,
+                        system_prompt=self.p,
+                        chunk_size_override=chunk,
+                        history_text=[committed],
+                        frame_range=(lo, lo + chunk),
+                        precomputed_frames=ff,
+                        prompt_suffix=self.prompt_suffix,
+                        num_delay_frames=delay,
+                    )[0].strip()
+                # commit_block with an empty provisional: nothing to strike out,
+                # so this is a plain append.
+                self.commit_block("", out)
+                committed = (committed + " " + out).strip() if out else committed
+                blocks += 1
+
+        # Flush the tail so the final partial block is not dropped.
+        if audio.size:
+            t = torch.from_numpy(audio).unsqueeze(0).to(dev)
+            n = torch.tensor([audio.shape[0]], device=dev)
+            with torch.inference_mode():
+                ff = m.encode_frames(t, n, chunk)
+                total = int(ff[0].shape[0])
+                if total > blocks * chunk:
+                    out = m.generate(
+                        t,
+                        n,
+                        system_prompt=self.p,
+                        chunk_size_override=chunk,
+                        history_text=[committed],
+                        frame_range=(blocks * chunk, total),
+                        precomputed_frames=ff,
+                        prompt_suffix=self.prompt_suffix,
+                        num_delay_frames=delay,
+                    )[0].strip()
+                    self.commit_block("", out)
+                    committed = (committed + " " + out).strip() if out else committed
+        self.send("\r\n")
+        return committed
+
     def run_interleaved(self, leftover, chunk, delay):
         """Baseline arm: ONE decode that follows the microphone as it speaks.
 
@@ -770,6 +887,12 @@ class Session:
                 self.send("\r\n[server] rejected: this server was started without --interleaved_ckpt\r\n")
                 return ""
             return self.run_interleaved(leftover, il_chunk, il_delay)
+
+        # ONE operating point -> single front, no revision. A model trained at a
+        # single chunk size (the encoder-free arms) can only ever do this, and
+        # the two-front validation below would reject it outright.
+        if fast == slow:
+            return self.run_script_fixed(leftover, fast, fast_delay)
 
         fast_delay = max(0, min(a_.max_delay, fast_delay))
         slow_delay = max(0, min(a_.max_delay, slow_delay))

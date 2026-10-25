@@ -187,7 +187,29 @@ async def ws_handler(request):
     for k in ("fast", "slow", "fast_delay", "slow_delay", "il_chunk", "il_delay", "nt_chunk", "nt_fast"):
         if k in cfg:
             a.__dict__[k] = int(cfg[k])
-    arm = cfg.get("model") if cfg.get("model") in ("interleaved", "nemotron") else "script"
+    # The session only understands three kinds. Extra arms are resolved HERE by
+    # swapping in a different model object and keeping the kind the session sees,
+    # so no new code path can drift from the one the terminal client exercises.
+    arm_id = cfg.get("model") or "script"
+    sess_model, sess_alt = app["model"], app.get("alt")
+    if arm_id == "script2" and app.get("model2") is not None:
+        sess_model, arm = app["model2"], "script"
+    elif arm_id == "script3" and app.get("model3") is not None:
+        sess_model, arm = app["model3"], "script"
+    elif arm_id == "interleaved2" and app.get("alt2") is not None:
+        sess_alt, arm = app["alt2"], "interleaved"
+    elif arm_id in ("interleaved", "nemotron"):
+        arm = arm_id
+    else:
+        arm = "script"
+    # A fixed-chunk arm has ONE operating point: force fast == slow so the server
+    # takes the single-front path instead of rejecting the pair.
+    fixed = (app.get("fixed") or {}).get(arm_id)
+    if fixed:
+        a.__dict__["fast"] = a.__dict__["slow"] = int(fixed["chunk"])
+        a.__dict__["fast_delay"] = a.__dict__["slow_delay"] = int(fixed.get("delay", 0))
+        a.__dict__["il_chunk"] = int(fixed["chunk"])
+        a.__dict__["il_delay"] = int(fixed.get("delay", 0))
 
     # Free-text biasing appended to the base instruction, BEFORE the control
     # clauses that render_control_prompt adds -- so the trained template still
@@ -209,7 +231,7 @@ async def ws_handler(request):
                 f"fast_delay={a.fast_delay} slow_delay={a.slow_delay} "
                 f"il_chunk={a.il_chunk} il_delay={a.il_delay} nt_chunk={a.nt_chunk} nt_fast={a.nt_fast}\n".encode()
             )
-            sess = WebSession(app["model"], sock, a, prompt, emit, app.get("alt"), app.get("nemotron"))
+            sess = WebSession(sess_model, sock, a, prompt, emit, sess_alt, app.get("nemotron"))
             sess.prompt_suffix = extra or None
             sess.run()
         except Exception as e:  # a bad session must not take the server down
@@ -283,6 +305,19 @@ def main():
     ap.add_argument("--timing", action="store_true")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--model_class", default="nemo.collections.speechlm2.models.script_model.ScriptSTTModel")
+    ap.add_argument("--ckpt2", default="", help="optional SECOND SCRIPT arm (e.g. an encoder-free model)")
+    ap.add_argument("--ckpt2_label", default="SCRIPT (encoder-free)")
+    ap.add_argument("--ckpt2_chunk", type=int, default=14, help="fixed chunk for the second SCRIPT arm")
+    ap.add_argument("--ckpt2_delay", type=int, default=0)
+    ap.add_argument("--ckpt_label", default="SCRIPT (self-correcting)")
+    ap.add_argument("--ckpt3", default="", help="optional THIRD SCRIPT arm")
+    ap.add_argument("--ckpt3_label", default="SCRIPT (third)")
+    ap.add_argument("--ckpt3_chunk", type=int, default=14)
+    ap.add_argument("--ckpt3_delay", type=int, default=0)
+    ap.add_argument("--interleaved_ckpt2", default="", help="optional SECOND interleaved arm")
+    ap.add_argument("--interleaved_ckpt2_label", default="interleaved (encoder-free)")
+    ap.add_argument("--interleaved_ckpt2_chunk", type=int, default=14)
+    ap.add_argument("--interleaved_label", default="interleaved (baseline)")
     ap.add_argument("--interleaved_ckpt", default="", help="optional interleaved-baseline arm")
     ap.add_argument("--interleaved_device", default="", help="device for the baseline (default: --device)")
     ap.add_argument(
@@ -308,9 +343,43 @@ def main():
     prompt = SCRIPT_PROMPT
     alt = load_interleaved(args)
     nemotron = load_nemotron(args)
+
+    # Optional extra arms. Each is an ordinary model of an existing KIND; only
+    # the page's dropdown and the arm->object mapping know there is more than one.
+    model2 = None
+    if args.ckpt2:
+        print("loading second SCRIPT arm ...", flush=True)
+        model2 = load_model(args.ckpt2, args.model_class, torch.device(args.device), torch.bfloat16,
+                            prompt_control=True)
+        model2.eval()
+        print(f"  second SCRIPT ready (trained chunks {list(model2.core_cfg.chunk_size)})", flush=True)
+    model3 = None
+    if args.ckpt3:
+        print("loading third SCRIPT arm ...", flush=True)
+        model3 = load_model(args.ckpt3, args.model_class, torch.device(args.device), torch.bfloat16,
+                            prompt_control=True)
+        model3.eval()
+        print(f"  third SCRIPT ready (trained chunks {list(model3.core_cfg.chunk_size)})", flush=True)
+    alt2 = None
+    if args.interleaved_ckpt2:
+        import copy as _copy
+        a2 = _copy.copy(args)
+        a2.interleaved_ckpt = args.interleaved_ckpt2
+        alt2 = load_interleaved(a2)
     app = web.Application(client_max_size=1 << 22)
     app["model"], app["args"], app["prompt"], app["alt"] = model, args, prompt, alt
     app["nemotron"] = nemotron
+    app["model2"], app["alt2"], app["model3"] = model2, alt2, model3
+    # Arms whose checkpoint knows ONE chunk size. The handler forces fast==slow
+    # for these so the server takes the single-front path -- the two-front one
+    # requires slow to be a different exact multiple of fast and would reject it.
+    app["fixed"] = {}
+    if model2 is not None:
+        app["fixed"]["script2"] = {"chunk": args.ckpt2_chunk, "delay": args.ckpt2_delay}
+    if model3 is not None:
+        app["fixed"]["script3"] = {"chunk": args.ckpt3_chunk, "delay": args.ckpt3_delay}
+    if alt2 is not None:
+        app["fixed"]["interleaved2"] = {"chunk": args.interleaved_ckpt2_chunk, "delay": 0}
     # The page fills its dropdowns from this rather than a hard-coded list: the
     # two checkpoints were trained on DIFFERENT chunk sets ([2,7,14,28,42] vs
     # [2,4,7,10,14,28]), and offering a size a model never saw still yields
@@ -324,6 +393,29 @@ def main():
         ),
         "nemotron": None if nemotron is None else {"chunks": list(nemotron[1])},
     }
+    arms = [{"id": "script", "label": args.ckpt_label, "kind": "script", "fixed": False,
+             "chunks": [int(c) for c in model.core_cfg.chunk_size],
+             "delays": list(range(args.max_delay + 1))}]
+    if model2 is not None:
+        arms.append({"id": "script2", "label": args.ckpt2_label, "kind": "script", "fixed": True,
+                     "chunks": [int(c) for c in model2.core_cfg.chunk_size],
+                     "delays": list(range(args.max_delay + 1))})
+    if model3 is not None:
+        arms.append({"id": "script3", "label": args.ckpt3_label, "kind": "script", "fixed": True,
+                     "chunks": [int(c) for c in model3.core_cfg.chunk_size],
+                     "delays": list(range(args.max_delay + 1))})
+    if alt is not None:
+        arms.append({"id": "interleaved", "label": args.interleaved_label, "kind": "interleaved",
+                     "fixed": False, "chunks": [int(c) for c in alt[0].core_cfg.chunk_size],
+                     "delays": list(range(args.max_delay + 1))})
+    if alt2 is not None:
+        arms.append({"id": "interleaved2", "label": args.interleaved_ckpt2_label, "kind": "interleaved",
+                     "fixed": True, "chunks": [int(c) for c in alt2[0].core_cfg.chunk_size],
+                     "delays": list(range(args.max_delay + 1))})
+    if nemotron is not None:
+        arms.append({"id": "nemotron", "label": "nemotron RNN-T", "kind": "nemotron",
+                     "fixed": False, "chunks": list(nemotron[1]), "delays": []})
+    app["info"]["arms"] = arms
     app.router.add_get("/", index)
     app.router.add_get("/info", info)
     app.router.add_get("/ws", ws_handler)
