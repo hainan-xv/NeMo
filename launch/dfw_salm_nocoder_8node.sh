@@ -84,8 +84,11 @@ CREATE_WANDB="${CREATE_WANDB:-true}"
 
 # Matched to the streaming arms so the offline/streaming comparison is about the
 # task, not the data distribution.
-MAX_DURATION="${MAX_DURATION:-54}"
-BUCKET_BINS="${BUCKET_BINS:-[4.32,6.0,7.04,7.92,8.8,9.6,10.4,11.12,11.89,12.66,13.47,14.8,16.92,20.0,22.4,29.44,35.0,39.6]}"
+# TOKENS, not seconds: the SALM path buckets NeMoMultimodalConversation by token
+# count. MAX_TOKENS = ceil(54 / 0.08) and the bins are ceil(bin / 0.08) of the
+# streaming arms' duration bins, so the distribution is matched exactly.
+MAX_TOKENS="${MAX_TOKENS:-675}"
+BUCKET_BINS="${BUCKET_BINS:-[54,75,88,99,110,120,130,139,149,159,169,185,212,250,280,368,438,495]}"
 BUCKET_BATCH_SIZE="${BUCKET_BATCH_SIZE:-[38,29,25,22,20,18,17,15,14,13,12,11,10,8,7,6,5,4]}"
 
 # 4, not the YAML's 8. DFW nodes have 128 CPUs against OCI's 248, so 8 ranks x 8
@@ -192,7 +195,7 @@ MOUNTS="--container-mounts=${CODE_DIR}:/code,${RESULTS_DIR}:/results,${HFCACHE}:
 read -r -d '' cmd <<EOF
 echo "*******STARTING********" \
 && nvidia-smi \
-&& echo "*** RECIPE: ${CONFIG_NAME} (DFW, OFFLINE SALM encoder-free | lr ${LR} | max_dur ${MAX_DURATION} | 8 nodes) ***" \
+&& echo "*** RECIPE: ${CONFIG_NAME} (DFW, OFFLINE SALM encoder-free | lr ${LR} | max_tokens ${MAX_TOKENS} | 8 nodes) ***" \
 && export WANDB_API_KEY=${WANDB} \
 && export HF_HOME="/hfcache/" \
 && export HF_TOKEN=${HF_TOKEN} \
@@ -223,7 +226,7 @@ echo "*******STARTING********" \
     trainer.max_steps=${MAX_STEPS} \
     data.train_ds.input_cfg.0.input_cfg=${TRAIN_INPUT_CFG} \
     data.train_ds.num_workers=${NUM_WORKERS} \
-    ++data.train_ds.max_duration=${MAX_DURATION} \
+    ++data.train_ds.max_tokens=${MAX_TOKENS} \
     data.train_ds.bucket_duration_bins="${BUCKET_BINS}" \
     data.train_ds.bucket_batch_size="${BUCKET_BATCH_SIZE}" \
     data.train_ds.seed=${LHOTSE_RND_SEED} \

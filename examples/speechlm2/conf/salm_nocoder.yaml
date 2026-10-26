@@ -155,9 +155,22 @@ data:
     batch_size: null
     skip_missing_manifest_entries: true
     use_bucketing: true
-    bucket_duration_bins: [4.32,6.0,7.04,7.92,8.8,9.6,10.4,11.12,11.89,12.66,13.47,14.8,16.92,20.0,22.4,29.44,35.0,39.6]
+    # MULTIMODAL (token) SAMPLING, not duration sampling. The SALM data path yields
+    # NeMoMultimodalConversation, which has no `.duration` -- bucketing it by seconds
+    # raises AttributeError in the sampler before step 1. Lengths here are TOKENS.
+    use_multimodal_sampling: true
+    # Input length only (audio frames), NOT input+output. That makes the conversion
+    # from the streaming arms' duration bins EXACT -- bin = ceil(seconds / 0.08) --
+    # instead of resting on a guessed text-token rate, and it matches what those arms
+    # actually bucketed on, which was duration alone.
+    measure_total_length: false
+    # ceil(d / token_equivalent_duration) of the streaming arms' bins, so the two
+    # recipes see the same length distribution and the same batch composition.
+    bucket_duration_bins: [54,75,88,99,110,120,130,139,149,159,169,185,212,250,280,368,438,495]
     bucket_batch_size: [38,29,25,22,20,18,17,15,14,13,12,11,10,8,7,6,5,4]
-    max_duration: 54
+    # max_duration is a no-op here: DurationFilter passes non-Cut examples through
+    # untouched. max_tokens is the equivalent cap -- ceil(54 / 0.08).
+    max_tokens: 675
     # Optional bucketing:
     # batch_size: null
     # use_bucketing: true
@@ -190,6 +203,11 @@ data:
               context: "Transcribe the following:"
     sample_rate: 16000
     batch_size: 1
+    # Same reason as train_ds: the examples are conversations, so the sampler must
+    # measure them in tokens. num_sanity_val_steps runs this BEFORE step 1, so a
+    # duration-based constraint here fails the job just as early.
+    use_multimodal_sampling: true
+    measure_total_length: false
     seed: 42
     shard_seed: "randomized"
 
