@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import inspect
 import logging
 import os
 from dataclasses import dataclass
@@ -98,10 +99,11 @@ class SALMDataset(torch.utils.data.Dataset):
         # Setting USE_AIS_GET_BATCH=true makes the loader issue a single AIStore GetBatch
         # call per minibatch, paired with URL-backed cuts produced by the multimodal
         # conversation adapters (NeMoMultimodalConversation{Jsonl,ShareGPTJsonl}Adapter).
+        _audio_kwargs = {"mono_downmix": True} if _AUDIOSAMPLES_MONO_DOWNMIX else {}
         self.load_audio = AudioSamples(
             fault_tolerant=True,
             use_batch_loader=os.environ.get("USE_AIS_GET_BATCH", "False").lower() == "true",
-            mono_downmix=True,
+            **_audio_kwargs,
         )
         self.multispeaker_cfg = MultiSpeakerConfig.from_dict(multispeaker_cfg)
         self.multispeaker_processor = (
@@ -181,6 +183,14 @@ def default_multimodal_conversation_prompt_format_fn(
     return prompt.encode_dialog(turns, **prompt_kwargs)
 
 
+# lhotse gained `mono_downmix` on AudioSamples/MultiCut.to_mono after this file was
+# written. The training container ships an older lhotse, where passing it is a
+# TypeError at construction -- i.e. SALM could not start at all. Probe the signature
+# instead of pinning a version: on new lhotse this is identical to passing it
+# unconditionally, on old lhotse we fall back to that version's default behaviour.
+_AUDIOSAMPLES_MONO_DOWNMIX = "mono_downmix" in inspect.signature(AudioSamples.__init__).parameters
+
+
 @dataclass(frozen=True)
 class MultiSpeakerConfig:
     """Configuration for auxiliary multi-speaker SOT targets."""
@@ -254,7 +264,10 @@ class SALMMultiSpeakerProcessor:
     def _prepare_audio_turn_cut(turn: AudioTurn):
         cut = turn.cut
         if isinstance(cut, MultiCut):
-            cut = cut.to_mono(mono_downmix=True)
+            if "mono_downmix" in inspect.signature(cut.to_mono).parameters:
+                cut = cut.to_mono(mono_downmix=True)
+            else:
+                cut = cut.to_mono()
         elif isinstance(cut, MixedCut):
             pass
         elif cut.num_channels is not None and cut.num_channels > 1:
