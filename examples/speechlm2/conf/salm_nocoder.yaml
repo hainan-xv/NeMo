@@ -146,7 +146,20 @@ trainer:
     # Replace DDPStrategy with ModelParallelStrategy to enable model parallelism
     _target_: lightning.pytorch.strategies.DDPStrategy
     gradient_as_bucket_view: true
-    find_unused_parameters: true
+    # static_graph is REQUIRED here, not an optimisation. This arm enables HF
+    # activation checkpointing, and PyTorch documents that DDP + activation
+    # checkpointing needs static_graph=True; pairing checkpointing with
+    # find_unused_parameters=True can silently yield wrong gradients. Measured:
+    # 1 GPU + checkpointing ran 1500 steps clean (loss 6.07 -> 2.20, anomaly
+    # detection quiet), while 8 nodes with the same code went NaN at ~step 641 --
+    # DDP was the only difference left. The streaming arms do not need this because
+    # they checkpoint via NeMo's checkpoint_wrapper rather than HF's.
+    #
+    # find_unused_parameters goes to false: static_graph handles unused parameters
+    # itself, and if one genuinely is unused DDP raises a clear error instead of
+    # producing NaN -- a loud failure beats a silent one.
+    static_graph: true
+    find_unused_parameters: false
     # _target_: lightning.pytorch.strategies.ModelParallelStrategy
     # tensor_parallel_size: 1
     # data_parallel_size: 8  # This is FSDP2
