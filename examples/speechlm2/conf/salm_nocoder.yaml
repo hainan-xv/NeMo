@@ -17,13 +17,16 @@ model:
   init_from_checkpoint: null
 
   # Regexp (re.compile) patterns matching parameters to be frozen.
-  freeze_params:
-    # Frozen LLM
-    - "^llm\\..+$"  # LLM
-    - "^embed_tokens\\..+$"  # LLM embedding is moved
-    # Frozen pretrained ASR (only the modality adapter layers are trainable)
-    - "^perception\\.preprocessor\\..+$"
-    - "^perception\\.encoder\\..+$"
+  # EMPTY, matching the streaming arms (freeze_params: []). Stock salm.yaml freezes
+  # the LLM, the moved embedding, the preprocessor and the encoder, leaving ONLY
+  # perception.proj trainable -- 4 tensors. Inheriting that silently made this arm a
+  # frozen-LLM projector probe rather than the matched offline counterpart of the
+  # streaming runs, so any WER comparison against them would have been meaningless.
+  # It also made the NaN diagnostics misleading: with everything else frozen,
+  # "4 of 314 parameter tensors are non-finite" is 100% of the TRAINABLE tensors,
+  # not evidence that the fault is localised to the projector, and a NaN originating
+  # inside the LLM backward is invisible because frozen parameters have .grad = None.
+  freeze_params: []
   prevent_freeze_params: []  # Use to make specific submodules trainable; overrides freeze_params
 
   prompt_format: qwen
@@ -32,6 +35,10 @@ model:
   # concatenate the encoded chunks back into one sequence before passing them to the LLM.
   # Leave as null (default) to encode each audio row directly and preserve existing behavior.
   encoder_chunk_size_seconds: null
+
+  # As in the streaming arms. Required here now that the LLM is trainable:
+  # offline feeds whole utterances, not a 42-frame window.
+  activation_checkpointing: true
 
   # Note: Uncomment the block below to enable LoRA on LLM via HuggingFace PEFT library.
   #   It will automatically freeze LLM parameters even if freeze_params was unused,
@@ -114,19 +121,11 @@ trainer:
   devices: -1
   accelerator: gpu
   num_nodes: 1
-  # bf16-MIXED, not the streaming arms' bf16-true, and this is a deliberate,
-  # measured deviation. Under bf16-true the backward pass through the projector
-  # overflows: the in-train diagnostic caught non-finite GRADIENTS in exactly
-  # perception.proj.{0,2}.{weight,bias} -- 4 of 314 parameter tensors, with the LLM
-  # and encoder clean -- which then wrote NaN into those weights and made every
-  # later loss NaN. It is not the data (a 400-batch forward sweep is finite in both
-  # fp32 and bf16) and not weight growth (it hits around step 170, at a warmup LR of
-  # ~1.7e-6). gradient_clip_val cannot catch it either, since the total norm is
-  # itself NaN. The streaming arms share this projector but feed it a 42-frame
-  # window, while offline SALM feeds whole utterances up to 675 frames, so the weight
-  # gradient sums ~16x more terms per step. bf16-mixed keeps fp32 master weights and
-  # fp32 reductions, which is what absorbs it.
-  precision: bf16-mixed
+  # bf16-true, matching the streaming arms. An earlier bf16-mixed attempt here was
+  # based on a wrong premise -- bf16 has the SAME 8-bit exponent as fp32, so there is
+  # no reduced range to overflow -- and it did not help: the identical non-finite
+  # gradients reappeared. Keeping it matched removes a confound.
+  precision: bf16-true
   logger: False # logger provided by exp_manager
   enable_checkpointing: False
   use_distributed_sampler: False

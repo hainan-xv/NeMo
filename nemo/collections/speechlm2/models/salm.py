@@ -74,6 +74,15 @@ class SALM(LightningModule, HFHubMixin):
             pretrained_weights=self.cfg.pretrained_weights,
             trust_remote_code=self.cfg.get("trust_remote_code", False),
         )
+        if self.cfg.get("activation_checkpointing", False):
+            # Parity with the streaming arms, which train with activation
+            # checkpointing on. Offline SALM feeds whole utterances (up to ~675 audio
+            # frames plus text) rather than a 42-frame window, so with the LLM
+            # trainable the stored activations are what decides whether the matched
+            # bucket_batch_size fits at all. use_reentrant=False is required for the
+            # inputs_embeds path, where the graph enters through the projector.
+            self.llm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+
         # Note: we have to "move out" the token embedding outside of LLM to avoid
         #       messing up FSDP/TP hooks.
         self.embed_tokens = self.llm.model.embed_tokens
