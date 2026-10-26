@@ -79,6 +79,7 @@ EXP_NAME="${EXP_NAME:-dfw_salm_nocoder_8node}"
 LR="${LR:-1e-4}"
 WARMUP_STEPS="${WARMUP_STEPS:-10000}"
 VAL_CHECK_INTERVAL="${VAL_CHECK_INTERVAL:-2000}"
+MAX_STEPS="${MAX_STEPS:-500000}"
 CREATE_WANDB="${CREATE_WANDB:-true}"
 
 # Matched to the streaming arms so the offline/streaming comparison is about the
@@ -217,6 +218,9 @@ echo "*******STARTING********" \
     model.pretrained_asr=${PRETRAINED_ASR} \
     model.optimizer.lr=${LR} \
     model.lr_scheduler.warmup_steps=${WARMUP_STEPS} \
+    trainer.num_nodes=${SLURM_JOB_NUM_NODES} \
+    trainer.devices=${GPUS_PER_NODE} \
+    trainer.max_steps=${MAX_STEPS} \
     data.train_ds.input_cfg.0.input_cfg=${TRAIN_INPUT_CFG} \
     data.train_ds.num_workers=${NUM_WORKERS} \
     ++data.train_ds.max_duration=${MAX_DURATION} \
