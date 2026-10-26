@@ -218,15 +218,37 @@ class SALM(LightningModule, HFHubMixin):
         inputs = self.prepare_inputs(batch)
         forward_outputs = self(inputs["input_embeds"], attention_mask=inputs["attention_mask"])
         num_frames = (inputs["target_ids"] != -100).long().sum()
+        if num_frames == 0:
+            # Every target position in this batch is ignore_index, so the "sum"
+            # reduction returns 0 and dividing by num_frames is 0/0 -> NaN. That NaN
+            # reaches the optimizer moments on the very next step and the run never
+            # recovers: loss is NaN for every subsequent step even at a warmup LR too
+            # small to move the weights. Contribute a zero loss instead, which is what
+            # a batch with nothing to predict should contribute, and say so, because
+            # silently zeroing batches would hide a broken manifest.
+            logging.warning(
+                "training_step: batch %d has no target tokens (all ignore_index); contributing zero loss.",
+                batch_idx,
+            )
         with loss_parallel():
-            loss = (
-                torch.nn.functional.cross_entropy(
-                    forward_outputs["logits"].flatten(0, 1),  # (B, T, Vt) -> (*, Vt)
-                    inputs["target_ids"].flatten(0, 1),
-                    reduction="sum",
-                    ignore_index=-100,
-                )
-                / num_frames
+            loss = torch.nn.functional.cross_entropy(
+                forward_outputs["logits"].flatten(0, 1),  # (B, T, Vt) -> (*, Vt)
+                inputs["target_ids"].flatten(0, 1),
+                reduction="sum",
+                ignore_index=-100,
+            ) / num_frames.clamp(min=1)
+
+        if not torch.isfinite(loss):
+            # Distinguishes a 0/0 loss (num_frames == 0, handled above) from a
+            # non-finite FORWARD pass, which the clamp cannot fix. Costs one device
+            # sync on an already-broken step, and a NaN here poisons the optimizer
+            # moments permanently, so it is worth naming the cause the first time.
+            logging.warning(
+                "training_step: non-finite loss at batch %d -- num_frames=%d, " "finite embeds=%s, finite logits=%s",
+                batch_idx,
+                int(num_frames),
+                bool(torch.isfinite(inputs["input_embeds"]).all()),
+                bool(torch.isfinite(forward_outputs["logits"]).all()),
             )
 
         B, T = inputs["input_embeds"].shape[:2]
