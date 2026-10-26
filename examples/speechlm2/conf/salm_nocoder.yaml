@@ -40,6 +40,11 @@ model:
   # offline feeds whole utterances, not a 42-frame window.
   activation_checkpointing: true
 
+  # Work around a NaN-producing cuDNN SDPA BACKWARD kernel. See salm.py for the
+  # autograd-anomaly evidence; without this the run loses every gradient on ~step 1
+  # while the forward still looks perfectly healthy.
+  disable_cudnn_sdpa: true
+
   # Note: Uncomment the block below to enable LoRA on LLM via HuggingFace PEFT library.
   #   It will automatically freeze LLM parameters even if freeze_params was unused,
   #   and prevent freezing any parameter that has the string '.lora_' in its name.

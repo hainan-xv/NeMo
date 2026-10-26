@@ -74,6 +74,21 @@ class SALM(LightningModule, HFHubMixin):
             pretrained_weights=self.cfg.pretrained_weights,
             trust_remote_code=self.cfg.get("trust_remote_code", False),
         )
+        if self.cfg.get("disable_cudnn_sdpa", False):
+            # torch's cuDNN SDPA backend returns NaN from its BACKWARD here while the
+            # forward is finite. Caught by torch.autograd.detect_anomaly in the
+            # container:
+            #   Function 'ScaledDotProductCudnnAttentionBackward0' returned nan values
+            #   in its 0th output.
+            # Signature matches what training showed exactly: finite loss (~4.7) and
+            # finite logits, then every gradient NaN on the same step. The streaming
+            # arms never hit it because they select an attention backend explicitly
+            # (attn_backend: flex); the SALM path passes no attn_implementation and so
+            # takes HF's default, which dispatches to this kernel. Disabling it leaves
+            # the flash / mem-efficient / math SDPA kernels, which are correct here.
+            torch.backends.cuda.enable_cudnn_sdp(False)
+            logging.info("disable_cudnn_sdpa=True -- cuDNN SDPA backend disabled for this process")
+
         if self.cfg.get("activation_checkpointing", False):
             # Parity with the streaming arms, which train with activation
             # checkpointing on. Offline SALM feeds whole utterances (up to ~675 audio
