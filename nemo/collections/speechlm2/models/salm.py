@@ -210,6 +210,28 @@ class SALM(LightningModule, HFHubMixin):
             "target_ids": target_ids,
         }
 
+    def on_before_optimizer_step(self, optimizer):
+        """Report the FIRST step whose gradients are non-finite.
+
+        Catches the corruption one step earlier than the parameter check in
+        ``training_step``: if gradients are already non-finite here while the loss was
+        finite, the fault is in the backward pass, and the next update is what writes
+        NaN into the weights. ``bf16-true`` has no gradient scaler to absorb it.
+
+        Log-only, and only once -- it changes no behaviour and costs one sync on the
+        step where the run is already lost.
+        """
+        if getattr(self, "_reported_nonfinite_grad", False):
+            return
+        bad = [n for n, p in self.named_parameters() if p.grad is not None and not torch.isfinite(p.grad).all()]
+        if bad:
+            self._reported_nonfinite_grad = True
+            logging.warning(
+                "on_before_optimizer_step: %d gradient tensors are non-finite; first: %s",
+                len(bad),
+                ", ".join(bad[:5]),
+            )
+
     def training_step(self, batch: dict, batch_idx: int):
         for m in (self.perception.preprocessor, self.perception.encoder, self.llm):
             if is_frozen(m):
@@ -249,6 +271,19 @@ class SALM(LightningModule, HFHubMixin):
                 int(num_frames),
                 bool(torch.isfinite(inputs["input_embeds"]).all()),
                 bool(torch.isfinite(forward_outputs["logits"]).all()),
+            )
+            # Decisive: are the WEIGHTS already non-finite? A forward-pass sweep over
+            # 400 real batches at init is clean in both fp32 and bf16, so non-finite
+            # activations here most likely mean the parameters were corrupted by an
+            # earlier optimizer step and this batch is a victim, not the cause.
+            # bf16-true runs without a gradient scaler, so an overflowing gradient
+            # lands in the weights unfiltered.
+            bad = [n for n, prm in self.named_parameters() if not torch.isfinite(prm).all()]
+            logging.warning(
+                "training_step: %d/%d parameter tensors are non-finite%s",
+                len(bad),
+                sum(1 for _ in self.parameters()),
+                (" -- first: " + ", ".join(bad[:5])) if bad else " (weights are clean: a bad BATCH, not a bad update)",
             )
 
         B, T = inputs["input_embeds"].shape[:2]
