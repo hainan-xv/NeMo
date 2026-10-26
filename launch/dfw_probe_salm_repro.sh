@@ -39,6 +39,7 @@ TRAIN_INPUT_CFG=${HEH}/data_configs/granary_v2_en_full_d0.5_b0.5_dfw_qwen_aligne
 VAL_MANIFEST=${HEH}/data/mcv11_en_dev_aligned/mcv11_dev_clean_pcstrip_en_2k_qwen_aligned.json
 
 STEPS="${STEPS:-60}"
+EXTRA="${EXTRA:-}"
 
 MOUNTS="--container-mounts=${CODE_DIR}:/code,${HFCACHE}:/hfcache,${LUSTRE}:${LUSTRE},${DATA_ROOT}:${DATA_ROOT},${NEMO_USERS}:${NEMO_USERS}"
 
@@ -51,6 +52,6 @@ srun --container-image="$CONTAINER" $MOUNTS bash -c "
       --asr '${PRETRAINED_ASR}' \
       --train_input_cfg '${TRAIN_INPUT_CFG}' \
       --val_manifest '${VAL_MANIFEST}' \
-      --device cuda:0 \
+      --device cuda:0 ${EXTRA} \
       --steps ${STEPS}
 "

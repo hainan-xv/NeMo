@@ -54,6 +54,10 @@ def main():
     # the NaN, so the remaining suspects are the data and the sampler; this flag runs
     # the real ones on a single GPU rather than on 8 nodes.
     p.add_argument("--train_input_cfg", default=None)
+    # The forward is finite and the BACKWARD produces the NaN, so the useful question
+    # is which op. detect_anomaly walks the graph and names the forward operation whose
+    # backward went non-finite. It is slow, which is fine: the failure lands on step 1.
+    p.add_argument("--detect_anomaly", action="store_true")
     args = p.parse_args()
 
     cfg = OmegaConf.load(args.config)
@@ -99,9 +103,17 @@ def main():
     dm.setup("fit")
     opt = torch.optim.AdamW(trainable, lr=args.lr)
 
+    if args.detect_anomaly:
+        torch.autograd.set_detect_anomaly(True)
+        print("### autograd anomaly detection ON", flush=True)
+
     for i, batch in enumerate(dm.train_dataloader()):
         if i >= args.steps:
             break
+        cuts = batch.get("cuts", [])
+        if cuts:
+            durs = [round(getattr(c, "duration", float("nan")), 2) for c in cuts]
+            print(f"      batch {i}: n={len(cuts)} durations={durs}", flush=True)
         batch = {k: (v.to(args.device) if torch.is_tensor(v) else v) for k, v in batch.items()}
         inputs = model.prepare_inputs(batch)
         out = model(inputs["input_embeds"], attention_mask=inputs["attention_mask"])
