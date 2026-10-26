@@ -114,7 +114,19 @@ trainer:
   devices: -1
   accelerator: gpu
   num_nodes: 1
-  precision: bf16-true
+  # bf16-MIXED, not the streaming arms' bf16-true, and this is a deliberate,
+  # measured deviation. Under bf16-true the backward pass through the projector
+  # overflows: the in-train diagnostic caught non-finite GRADIENTS in exactly
+  # perception.proj.{0,2}.{weight,bias} -- 4 of 314 parameter tensors, with the LLM
+  # and encoder clean -- which then wrote NaN into those weights and made every
+  # later loss NaN. It is not the data (a 400-batch forward sweep is finite in both
+  # fp32 and bf16) and not weight growth (it hits around step 170, at a warmup LR of
+  # ~1.7e-6). gradient_clip_val cannot catch it either, since the total norm is
+  # itself NaN. The streaming arms share this projector but feed it a 42-frame
+  # window, while offline SALM feeds whole utterances up to 675 frames, so the weight
+  # gradient sums ~16x more terms per step. bf16-mixed keeps fp32 master weights and
+  # fp32 reductions, which is what absorbs it.
+  precision: bf16-mixed
   logger: False # logger provided by exp_manager
   enable_checkpointing: False
   use_distributed_sampler: False
