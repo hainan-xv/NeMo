@@ -488,7 +488,12 @@ JOINT_LAYERS="${JOINT_LAYERS:-28}"
 # ran at 14 -- so val_wer described a look-ahead the model never saw. A
 # CONFIGURED val_chunk_size beats the auto-default, so copying a launcher and
 # changing CHUNK_SIZES alone is not enough.
-VAL_MAX_NEW_TOKENS="${VAL_MAX_NEW_TOKENS:-24}"
+# 24 is sized for a 14-FRAME chunk (1.12 s of audio, ~3-4 tokens). This arm decodes
+# the whole utterance in ONE chunk, so 24 tokens truncates every transcript past
+# ~8 s -- at max_duration 54 s the reference needs ~162 tokens. The cap applies to
+# val_wer AND to training_batch_wer, so leaving it would make both read
+# catastrophically bad for reasons that have nothing to do with the model.
+VAL_MAX_NEW_TOKENS="${VAL_MAX_NEW_TOKENS:-256}"
 # THE POINT OF THIS ARM: a candidate cut may land inside a word, anywhere within
 # the same word-defined band. The word-atomic rule makes a 2-frame chunk emit an
 # entire multi-token word in one 0.16 s step; letting the cut fall mid-word
