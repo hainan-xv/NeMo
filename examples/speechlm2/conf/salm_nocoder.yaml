@@ -224,7 +224,15 @@ data:
 
 exp_manager:
    exp_dir: null
-   explicit_log_dir: salm_results/
+   # null, as in the streaming arms. Stock salm.yaml sets explicit_log_dir to the
+   # RELATIVE path "salm_results/", which takes precedence over exp_dir and silently
+   # made the launcher's ++exp_manager.exp_dir=/results/ a no-op: every run wrote its
+   # checkpoints into /code/salm_results/ -- inside the git checkout that sync_to_dfw
+   # resets -- and, because the path has no EXP_NAME in it, every SALM arm would have
+   # shared one directory. With resume_if_exists: true that is what made this run try
+   # to restore a frozen-LLM optimizer state into an unfrozen model:
+   #   ValueError: loaded state dict contains a parameter group that doesn't match
+   explicit_log_dir: null
    name: salm
    create_tensorboard_logger: false
    create_checkpoint_callback: true
@@ -244,7 +252,7 @@ exp_manager:
      resume: true
 
    checkpoint_callback_params:
-     filename: "{step}"
+     filename: "{step}-{val_acc:.4f}"
      monitor: val_acc
      mode: max
      every_n_train_steps: null
