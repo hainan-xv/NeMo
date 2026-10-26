@@ -146,6 +146,73 @@ def setup_audio_codec(model: torch.nn.Module):
     del model.audio_codec.discriminator  # free up some memory
 
 
+def resolve_perception_sources(perception_cfg, asr_cfg, att_context_size=None):
+    """Resolve a perception config's ``preprocessor`` and ``encoder`` against a pretrained ASR.
+
+    Shared by :func:`setup_perception` (SCRIPT / streaming) and
+    :func:`setup_speech_encoder` (SALM / offline). They used to carry separate
+    copies of this logic, which meant an encoder-free front-end worked in one and
+    silently did nothing in the other -- and an offline-vs-streaming comparison
+    would then not be comparing the same model at all.
+
+    ``perception_cfg`` is mutated in place; the caller holds ``open_dict``.
+
+    Two behaviours beyond the historical "merge user keys onto the pretrained
+    config":
+
+    * PREPROCESSOR keys the user set SURVIVE the copy. The pretrained nemotron
+      ships ``normalize: NA`` because its Conformer absorbs the log-mel scale; a
+      front-end with no encoder has to set normalisation itself.
+    * A user ``_target_`` that DIFFERS from the pretrained encoder's replaces the
+      encoder config WHOLESALE. Merging would drag the Conformer's keys
+      (``n_layers``, ``subsampling``, ``sync_max_audio_length``) into a
+      constructor that does not accept them. ``att_context_size`` is skipped in
+      that case too: a replacement front-end defines its own look-ahead, or has
+      none.
+    """
+    user_pre = {}
+    if perception_cfg.get("preprocessor", None) is not None:
+        user_pre = OmegaConf.to_container(perception_cfg.preprocessor, resolve=True) or {}
+    user_enc = {}
+    if perception_cfg.get("encoder", None) is not None:
+        user_enc = OmegaConf.to_container(perception_cfg.encoder, resolve=True) or {}
+
+    perception_cfg.preprocessor = asr_cfg.preprocessor
+    for key, value in user_pre.items():
+        if value is not None:
+            perception_cfg.preprocessor[key] = value
+
+    user_target = user_enc.get("_target_")
+    asr_target = asr_cfg.encoder.get("_target_")
+    if user_target is not None and user_target != asr_target:
+        perception_cfg.encoder = OmegaConf.create(user_enc)
+    else:
+        perception_cfg.encoder = asr_cfg.encoder
+        if att_context_size is not None:
+            perception_cfg.encoder.att_context_size = att_context_size
+        for key, value in user_enc.items():
+            if value is not None:
+                perception_cfg.encoder[key] = value
+
+
+def filter_pretrained_encoder_weights(state_dict, perception_cfg):
+    """Drop encoder weights when ``random_init_encoder`` is set.
+
+    Takes the pretrained encoder's STRUCTURE but not its parameters, so an
+    experiment can ask whether an architecture helps on its own, separately from
+    whether pretrained acoustic features transfer. Without this a truncated
+    encoder silently inherits layers 0..n-1 and the two effects are confounded.
+
+    Preprocessor keys (``featurizer.window`` / ``.fb``, the mel filterbank) are
+    not encoder keys and still load.
+    """
+    if not bool(perception_cfg.get("random_init_encoder", False)):
+        return state_dict
+    out = {k: v for k, v in state_dict.items() if not k.startswith(("encoder.", "encoder_multilayer."))}
+    logging.info("random_init_encoder=True -- %d encoder tensors NOT loaded", len(state_dict) - len(out))
+    return out
+
+
 def setup_speech_encoder(model: torch.nn.Module, pretrained_weights: bool = True):
     """
     Sets up an ``AudioPerceptionModule``, initializing its ``encoder`` and ``preprocessor``
@@ -165,8 +232,9 @@ def setup_speech_encoder(model: torch.nn.Module, pretrained_weights: bool = True
 
         asr = load_pretrained_nemo(ASRModel, model.cfg.pretrained_asr).eval()
         with open_dict(model.cfg):
-            model.cfg.perception.preprocessor = asr.cfg.preprocessor
-            model.cfg.perception.encoder = asr.cfg.encoder
+            # Shared with setup_perception so the OFFLINE (SALM) and STREAMING
+            # (SCRIPT) paths resolve an encoder-free front-end identically.
+            resolve_perception_sources(model.cfg.perception, asr.cfg)
             if model.llm is not None:
                 hidden_size = model.llm.config.hidden_size
                 model.cfg.perception.output_dim = hidden_size
@@ -176,11 +244,6 @@ def setup_speech_encoder(model: torch.nn.Module, pretrained_weights: bool = True
                 adapter_cfg = model.cfg.perception.get('modality_adapter', None)
                 if adapter_cfg is not None and 'output_dim' in adapter_cfg:
                     adapter_cfg.output_dim = hidden_size
-            # Override with user-specified encoder parameters, e.g. initializiing a non-causal encoder for causal setup.
-            if user_encoder_config:
-                for key, value in user_encoder_config.items():
-                    if value is not None:  # Only override if user explicitly set a value
-                        model.cfg.perception.encoder[key] = value
         model.perception = AudioPerceptionModule(model.cfg.perception).train()
         asr_sd = asr.state_dict()
         # When a multilayer/Qformer connector is used, the encoder lives at
@@ -188,6 +251,7 @@ def setup_speech_encoder(model: torch.nn.Module, pretrained_weights: bool = True
         # state-dict keys so pretrained encoder weights actually load.
         if isinstance(model.perception.modality_adapter, (QformerConnector, MultiLayerProjectionConnector)):
             asr_sd = {('encoder_multilayer.' + k if k.startswith('encoder.') else k): v for k, v in asr_sd.items()}
+        asr_sd = filter_pretrained_encoder_weights(asr_sd, model.cfg.perception)
         model.perception.load_state_dict(asr_sd, strict=False)
     else:
         model.perception = AudioPerceptionModule(model.cfg.perception).train()
@@ -324,59 +388,16 @@ def setup_perception(
     """
     if pretrained_weights:
         # Save user-specified encoder config before loading pretrained model
-        user_encoder_config = {}
-
-        if 'encoder' in cfg.perception:
-            user_encoder_config = OmegaConf.to_container(cfg.perception.encoder, resolve=True)
-
         asr = load_pretrained_nemo(ASRModel, pretrained_asr).eval()
-        # Preprocessor keys the USER set survive the pretrained copy below. The
-        # pretrained nemotron ships normalize: NA because its Conformer's convs
-        # and LayerNorms absorb the log-mel scale; an encoder-free front-end has
-        # nothing between log-mel and the LLM, so it needs to set normalize
-        # itself. Without this the copy would silently discard that.
-        user_pre = {}
-        if 'preprocessor' in cfg.perception and cfg.perception.preprocessor is not None:
-            user_pre = OmegaConf.to_container(cfg.perception.preprocessor, resolve=True) or {}
         with open_dict(cfg):
-            cfg.perception.preprocessor = asr.cfg.preprocessor
-            for key, value in user_pre.items():
-                if value is not None:
-                    cfg.perception.preprocessor[key] = value
+            # Shared with setup_speech_encoder so the STREAMING (SCRIPT) and
+            # OFFLINE (SALM) paths resolve an encoder-free front-end identically.
+            resolve_perception_sources(cfg.perception, asr.cfg, att_context_size=att_context_size)
             if audio_pad_to is not None:
                 cfg.perception.preprocessor.pad_to = cfg.audio_pad_to
-            _user_target = user_encoder_config.get("_target_")
-            _asr_target = asr.cfg.encoder.get("_target_")
-            if _user_target is not None and _user_target != _asr_target:
-                # The user asked for a DIFFERENT encoder class than the pretrained
-                # one (e.g. the encoder-free StackingEncoder). Merging would carry
-                # the Conformer's keys -- n_layers, subsampling, d_model,
-                # sync_max_audio_length -- into a constructor that does not accept
-                # them, so take the user's encoder config wholesale instead.
-                # att_context_size is skipped for the same reason: a replacement
-                # front-end defines its own look-ahead, or has none.
-                cfg.perception.encoder = OmegaConf.create(user_encoder_config)
-            else:
-                cfg.perception.encoder = asr.cfg.encoder
-                if att_context_size is not None:
-                    cfg.perception.encoder.att_context_size = att_context_size
-                # Override with user-specified encoder parameters, e.g. initializiing a non-causal encoder for causal setup.
-                if user_encoder_config:
-                    for key, value in user_encoder_config.items():
-                        if value is not None:  # Only override if user explicitly set a value
-                            cfg.perception.encoder[key] = value
             cfg.perception.output_dim = output_dim
         perception = AudioPerceptionModule(cfg.perception).train()
-        _sd = asr.state_dict()
-        if bool(cfg.perception.get("random_init_encoder", False)):
-            # Take the pretrained encoder's STRUCTURE but not its weights. Used to
-            # ask whether an architecture helps on its own, separately from whether
-            # pretrained acoustic features transfer -- otherwise a truncated
-            # encoder silently inherits layers 0..n-1 and the two effects are
-            # confounded. The preprocessor keys (featurizer.window / .fb, the mel
-            # filterbank) are NOT encoder keys and still load.
-            _sd = {k: v for k, v in _sd.items() if not k.startswith("encoder.")}
-            logging.info("setup_perception: random_init_encoder=True -- encoder weights NOT loaded")
+        _sd = filter_pretrained_encoder_weights(asr.state_dict(), cfg.perception)
         perception.load_state_dict(_sd, strict=False)
     else:
         with open_dict(cfg):

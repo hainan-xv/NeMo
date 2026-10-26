@@ -61,6 +61,12 @@
       <label>chunk</label><select id="ilchunk"></select>
       <label>delay</label><select id="ildelay"></select>
     </span>
+    <!-- Fixed-chunk arms know ONE chunk size, so there is no chunk to pick -- but
+         the emission delay IS prompt-controlled and was trained over 0..4, so it
+         is a real latency/accuracy knob and the only one these models still have. -->
+    <span id="fixedctl" hidden>
+      <label>delay</label><select id="fixdelay"></select>
+    </span>
     <button id="rec">Record</button>
   </div>
 </header>
@@ -111,12 +117,16 @@ function applyArm(){
   $('#scriptctl').hidden = !(A.kind === 'script' && !A.fixed);
   $('#ilctl').hidden     = !(A.kind === 'interleaved' && !A.fixed);
   $('#ntctl').hidden     = A.kind !== 'nemotron';
+  $('#fixedctl').hidden  = !A.fixed;
+  if(A.fixed && $('#fixdelay').options.length === 0)
+    fill($('#fixdelay'), A.delays || [0], 0);
   // The RNN-T has no prompt at all -- no instruction, no text history. Leaving
   // the biasing box on screen would invite typing that cannot do anything.
   $('#bias').hidden = A.kind === 'nemotron';
   const i = $('#intro');   // gone once a transcript has replaced it
   if(i) i.textContent = A.fixed
-      ? (A.label + ' — fixed chunk ' + (A.chunks[0]||'?') + ' frames, no self-correction')
+      ? (A.label + ' — fixed chunk ' + (A.chunks[0]||'?') + ' frames, delay '
+         + ($('#fixdelay').value||0) + ', no self-correction')
       : (INTRO[A.kind] || '');
 }
 
@@ -229,6 +239,7 @@ async function start(){
                             il_chunk:+$('#ilchunk').value, il_delay:+$('#ildelay').value,
                             nt_chunk:+($('#ntchunk').value||14),
                             nt_fast:+($('#ntfast').value||0),
+                            fixed_delay:+($('#fixdelay').value||0),
                             prompt_extra:$('#prompt_extra').value}));
     src.connect(node); node.connect(ctx.destination);
   };

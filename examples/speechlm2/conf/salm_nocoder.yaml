@@ -1,0 +1,225 @@
+model:
+  # Every name/path here starting with 'pretrained' is used to initialize the model weights.
+  pretrained_llm: Qwen/Qwen3-1.7B
+  # nemotron, NOT canary. The streaming arms all use it, and the stacking
+  # arithmetic depends on its shape: 128 mel x 8 frames = 1024 = the Conformer's
+  # d_model, and 8 x 10ms = 0.08s = its frame. Using a different pretrained ASR
+  # here would change the front-end as well as the task, so the offline-vs-
+  # streaming comparison would no longer isolate anything.
+  pretrained_asr: nvidia/nemotron-speech-streaming-en-0.6b
+
+  pretrained_weights: True  # When False, we use pretrained_name to load the architecture, but with random init
+
+  # Fine-tune from a previous training checkpoint (model weights only — optimizer,
+  # scheduler, and step counter start fresh). Supports DCP directories (from
+  # FSDP2/TP training), HuggingFace directories (model.safetensors), and
+  # single-file .ckpt checkpoints. Set to null to train from pretrained_llm/asr.
+  init_from_checkpoint: null
+
+  # Regexp (re.compile) patterns matching parameters to be frozen.
+  freeze_params:
+    # Frozen LLM
+    - "^llm\\..+$"  # LLM
+    - "^embed_tokens\\..+$"  # LLM embedding is moved
+    # Frozen pretrained ASR (only the modality adapter layers are trainable)
+    - "^perception\\.preprocessor\\..+$"
+    - "^perception\\.encoder\\..+$"
+  prevent_freeze_params: []  # Use to make specific submodules trainable; overrides freeze_params
+
+  prompt_format: qwen
+  audio_locator_tag: "<|audioplaceholder|>"  # placeholder token for audio turn is expected
+  # Optional: split audios longer than this before the speech encoder forward, then
+  # concatenate the encoded chunks back into one sequence before passing them to the LLM.
+  # Leave as null (default) to encode each audio row directly and preserve existing behavior.
+  encoder_chunk_size_seconds: null
+
+  # Note: Uncomment the block below to enable LoRA on LLM via HuggingFace PEFT library.
+  #   It will automatically freeze LLM parameters even if freeze_params was unused,
+  #   and prevent freezing any parameter that has the string '.lora_' in its name.
+  # lora:
+  #   task_type: CAUSAL_LM
+  #   r: 128
+  #   lora_alpha: 256
+  #   lora_dropout: 0.01
+  #   # target_modules are only necessary if the `pretrained_llm` is not yet registered in PEFT library
+  #   target_modules: ["q_proj", "v_proj"]
+
+  perception:
+    target: nemo.collections.speechlm2.modules.perception.AudioPerceptionModule
+    output_dim: 2048
+
+    # ---- ENCODER-FREE, matching the best streaming arm (val_wer 0.193) ----
+    # The point of this config is a FAIR offline/streaming comparison: same
+    # front-end, same projector, same augmentation, same pretrained ASR -- only
+    # the task differs (offline SALM vs chunked streaming SCRIPT). SALM resolves
+    # its perception through setup_speech_encoder, which now shares
+    # resolve_perception_sources() with the streaming path, so these keys behave
+    # identically in both.
+    preprocessor:
+      # nemotron ships normalize: NA because its Conformer absorbs the log-mel
+      # scale; with no encoder there is nothing between log-mel and the LLM.
+      normalize: per_feature
+
+    encoder:
+      # Replaces the 609M Conformer with a reshape: 8 consecutive 128-bin mel
+      # frames concatenated into one 1024-d vector, preserving the 0.08s frame.
+      _target_: nemo.collections.speechlm2.modules.stacking_encoder.StackingEncoder
+      feat_in: 128
+      subsampling_factor: 8
+      d_model: 1024
+
+    # Two-layer MLP projector (1024 -> 8192 -> 2048) instead of a single affine
+    # map. Worth a large gain on the streaming side.
+    proj_hidden_dim: 8192
+
+    spec_augment:
+      _target_: nemo.collections.asr.modules.SpectrogramAugmentation
+      freq_masks: 2
+      time_masks: 10
+      freq_width: 27
+      time_width: 0.05
+    modality_adapter:
+      _target_: nemo.collections.speechlm2.modules.perception.IdentityConnector
+      d_model: 1024
+    
+    # Optional Rotary Time Embedding (RoTE, https://arxiv.org/abs/2410.12109): encodes absolute time into the encoder output
+    # features (at the modality-adapter entrance). Omit this block to disable (default).
+    # rote:
+    #   _target_: nemo.collections.speechlm2.modules.rote.RotaryTimeEmbedding
+    #   dim: 1024             # must match the encoder output feature dim (must be even)
+    #   theta: 1200.0         # base of the geometric frequency bank
+    #   rotary_fraction: 0.2  # fraction of dim to rotate
+    
+    # spec_augment:
+    #   _target_: nemo.collections.asr.modules.SpectrogramAugmentation
+    #   freq_masks: 2 # set to zero to disable it
+    #   time_masks: 10 # set to zero to disable it
+    #   freq_width: 27
+    #   time_width: 5  # 5 frames = 50ms
+
+  optimizer:
+    _target_: torch.optim.AdamW
+    lr: 5e-4
+    betas: [0.9, 0.98]
+    weight_decay: 1e-3
+    foreach: true # set to false if having issues with tensor-parallelism
+
+  lr_scheduler:
+    _target_: nemo.core.optim.lr_scheduler.CosineAnnealing
+    warmup_steps: 1000
+    min_lr: 1e-6
+    max_steps: ${trainer.max_steps}
+
+trainer:
+  devices: -1
+  accelerator: gpu
+  num_nodes: 1
+  precision: bf16-true
+  logger: False # logger provided by exp_manager
+  enable_checkpointing: False
+  use_distributed_sampler: False
+  max_steps: 100000
+  limit_train_batches: 5000  # "epoch" size
+  val_check_interval: ${trainer.limit_train_batches}
+  limit_val_batches: 10
+  log_every_n_steps: 10
+  num_sanity_val_steps: 1
+  gradient_clip_val: 1.0
+  accumulate_grad_batches: 1
+  strategy:
+    # Replace DDPStrategy with ModelParallelStrategy to enable model parallelism
+    _target_: lightning.pytorch.strategies.DDPStrategy
+    gradient_as_bucket_view: true
+    find_unused_parameters: true
+    # _target_: lightning.pytorch.strategies.ModelParallelStrategy
+    # tensor_parallel_size: 1
+    # data_parallel_size: 8  # This is FSDP2
+
+data:
+  train_ds:
+    sample_rate: 16000
+    prompt_format: ${model.prompt_format}
+    token_equivalent_duration: 0.08
+    input_cfg:
+      - type: lhotse_as_conversation
+        input_cfg: ???  # set by the launch script (TRAIN_INPUT_CFG)
+        audio_locator_tag: ${model.audio_locator_tag}
+        tags:
+          # Uncomment below line to include a system prompt for supported models (e.g. Llama; not Qwen).
+          # system_prompt: "some system prompt"
+          context: "Transcribe the following:"
+    seed: 42
+    shuffle: true
+    shard_seed: "randomized"
+    num_workers: 4
+    batch_size: null
+    skip_missing_manifest_entries: true
+    use_bucketing: true
+    bucket_duration_bins: [4.32,6.0,7.04,7.92,8.8,9.6,10.4,11.12,11.89,12.66,13.47,14.8,16.92,20.0,22.4,29.44,35.0,39.6]
+    bucket_batch_size: [38,29,25,22,20,18,17,15,14,13,12,11,10,8,7,6,5,4]
+    max_duration: 54
+    # Optional bucketing:
+    # batch_size: null
+    # use_bucketing: true
+    # use_multimodal_sampling: true
+    # measure_total_length: true
+    # Note: `batch_tokens`, `bucket_duration_bins`, and `max_tokens` all represent tokens as
+    #  the sum of input audio frames and output text tokens. Number of audio frames is
+    #  calculated using `token_equivalent_duration`.
+    # batch_tokens: 4000
+    # max_tokens: 2048
+    # bucket_duration_bins: [64, 128, 256, 384, 512, 768, 1024, 1280, 1536, 2048]
+    # num_buckets: 10
+    # bucket_buffer_size: 5000
+
+  validation_ds:
+    # The entries under 'datasets' are a list of separate dataloaders.
+    # The structure is <dataset-name>: {<dataloader-dict-config>}
+    # They inherit all settings from validation_ds, but can individually override them.
+    prompt_format: ${model.prompt_format}
+    token_equivalent_duration: 0.08
+    datasets:
+      mcv_11_dev:  # the same val set the streaming arms report val_wer on
+        input_cfg:
+          - type: lhotse_as_conversation
+            manifest_filepath: ???  # set by the launch script (VAL_MANIFEST)
+            audio_locator_tag: ${model.audio_locator_tag}
+            tags:
+              # Uncomment below line to include a system prompt for supported models (e.g. Llama; not Qwen).
+              # system_prompt: "some system prompt"
+              context: "Transcribe the following:"
+    sample_rate: 16000
+    batch_size: 1
+    seed: 42
+    shard_seed: "randomized"
+
+exp_manager:
+   exp_dir: null
+   explicit_log_dir: salm_results/
+   name: salm
+   create_tensorboard_logger: false
+   create_checkpoint_callback: true
+   use_datetime_version: true
+   max_time_per_run: 00:03:50:00
+
+   resume_from_checkpoint: null # The path to a checkpoint file to continue the training, restores the whole state including the epoch, step, LR schedulers, apex, etc.
+   # you need to set these two to True to continue the training
+   resume_if_exists: true
+   resume_ignore_no_checkpoint: true
+
+   # You may use this section to create a W&B logger
+   create_wandb_logger: false
+   wandb_logger_kwargs:
+     name: development-run
+     project: salm
+     resume: true
+
+   checkpoint_callback_params:
+     filename: "{step}"
+     monitor: val_acc
+     mode: max
+     every_n_train_steps: null
+     every_n_epochs: 1
+     save_top_k: 1
+     always_save_nemo: false
+     save_nemo_on_train_end: false

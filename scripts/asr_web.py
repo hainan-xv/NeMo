@@ -206,10 +206,21 @@ async def ws_handler(request):
     # takes the single-front path instead of rejecting the pair.
     fixed = (app.get("fixed") or {}).get(arm_id)
     if fixed:
-        a.__dict__["fast"] = a.__dict__["slow"] = int(fixed["chunk"])
-        a.__dict__["fast_delay"] = a.__dict__["slow_delay"] = int(fixed.get("delay", 0))
-        a.__dict__["il_chunk"] = int(fixed["chunk"])
-        a.__dict__["il_delay"] = int(fixed.get("delay", 0))
+        ch = int(fixed["chunk"])
+        a.__dict__["fast"] = a.__dict__["slow"] = ch
+        a.__dict__["il_chunk"] = ch
+        # The CHUNK is forced -- these checkpoints know exactly one. The DELAY is
+        # not: it is prompt-controlled and was trained over delay_candidates
+        # [0..4], so it is a genuine latency/accuracy knob and the only one these
+        # single-chunk models still expose. Honour what the client asked for,
+        # falling back to the server default.
+        try:
+            dl = int(cfg.get("fixed_delay", fixed.get("delay", 0)))
+        except (TypeError, ValueError):
+            dl = int(fixed.get("delay", 0))
+        dl = max(0, min(int(a.__dict__.get("max_delay", 4)), dl))
+        a.__dict__["fast_delay"] = a.__dict__["slow_delay"] = dl
+        a.__dict__["il_delay"] = dl
 
     # Free-text biasing appended to the base instruction, BEFORE the control
     # clauses that render_control_prompt adds -- so the trained template still
