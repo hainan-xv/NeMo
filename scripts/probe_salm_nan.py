@@ -50,6 +50,10 @@ def main():
     p.add_argument("--batches", type=int, default=400)
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--seed", type=int, default=42)
+    # MUST default to bf16: training runs precision="bf16-true", which casts the whole
+    # stack -- preprocessor included -- to bfloat16. A float32 probe passes cleanly and
+    # proves nothing about the run it is meant to explain.
+    p.add_argument("--dtype", choices=["bf16", "fp32"], default="bf16")
     args = p.parse_args()
 
     cfg = OmegaConf.load(args.config)
@@ -62,7 +66,10 @@ def main():
     OmegaConf.resolve(cfg)
 
     torch.set_float32_matmul_precision("medium")
+    dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float32
+    print(f"### probing in {args.dtype} (training uses {cfg.trainer.precision})", flush=True)
     model = SALM(OmegaConf.to_container(cfg.model, resolve=True)).cuda().eval()
+    model = model.to(dtype)
     # SpecAugment only runs in training mode, and it is one of the suspects, so the
     # perception stack is probed in the same mode training uses.
     model.perception.train()
@@ -76,7 +83,7 @@ def main():
     for i, batch in enumerate(dm.train_dataloader()):
         if i >= args.batches:
             break
-        audios = batch["audios"].cuda()
+        audios = batch["audios"].cuda().to(dtype)
         audio_lens = batch["audio_lens"].cuda()
         cut_ids = [getattr(c, "id", "?") for c in batch.get("cuts", [])]
 
