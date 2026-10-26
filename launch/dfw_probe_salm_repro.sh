@@ -51,5 +51,6 @@ srun --container-image="$CONTAINER" $MOUNTS bash -c "
       --asr '${PRETRAINED_ASR}' \
       --train_input_cfg '${TRAIN_INPUT_CFG}' \
       --val_manifest '${VAL_MANIFEST}' \
+      --device cuda:0 \
       --steps ${STEPS}
 "
