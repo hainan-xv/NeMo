@@ -238,6 +238,19 @@ class ScriptSTTModelConfig(StreamingSTTModelConfig):
     oom_skip_limit: int = 25
     val_position_scheme: str = "continuous"
     val_chunk_size: Optional[int] = None
+    # SECOND validation operating point, decoded in the same pass and logged as
+    # val_wer_offline. val_chunk_size is a single int, so a model trained on several
+    # chunk sizes (e.g. chunk_size: [14, 1024]) can otherwise only ever SEE one of
+    # them during training -- the offline end of a unified model was invisible in
+    # wandb and needed a separate 25-minute leaderboard job to measure at all.
+    #
+    # None disables it, so every existing arm is unaffected.
+    #
+    # val_offline_max_new_tokens is NOT optional when this is set: the budget is PER
+    # CHUNK, so a value sized for chunk 14 (24 tokens) truncates a whole-utterance
+    # decode and reports a number that measures truncation rather than the model.
+    val_offline_chunk_size: Optional[int] = None
+    val_offline_max_new_tokens: Optional[int] = None
     val_max_new_tokens_per_chunk: Optional[int] = None
     val_system_prompt: Optional[str] = None
     val_prompt_field: str = "system_prompt"
@@ -1571,6 +1584,8 @@ class ScriptSTTModel(StreamingSTTModel):
     def on_validation_epoch_start(self) -> None:
         self._partial_wer_refs: dict = defaultdict(list)
         self._partial_wer_hyps: dict = defaultdict(list)
+        self._partial_wer_refs_offline: dict = defaultdict(list)
+        self._partial_wer_hyps_offline: dict = defaultdict(list)
 
     def on_validation_epoch_end(self) -> None:
         # Gather the decoded strings and compute a true corpus WER. Averaging
@@ -1619,8 +1634,34 @@ class ScriptSTTModel(StreamingSTTModel):
                 log_name = "val_wer_verbatim" if metric_name == "wer" else f"val_{metric_name}_verbatim"
                 self.log(log_name, metric_value.to(self.device), on_epoch=True, sync_dist=False)
 
+        # Same corpus-WER treatment for the second operating point, logged under
+        # val_wer_offline. Deliberately NOT the checkpoint monitor: save_top_k for
+        # every existing run was selected against val_wer and that must not change.
+        if self.core_cfg.get("val_offline_chunk_size", None) and self._partial_wer_refs_offline:
+            local_off = {
+                name: {
+                    "refs": self._partial_wer_refs_offline[name],
+                    "hyps": self._partial_wer_hyps_offline[name],
+                }
+                for name in self._partial_wer_refs_offline
+            }
+            if torch.distributed.is_initialized():
+                gathered_off = [None] * torch.distributed.get_world_size()
+                torch.distributed.all_gather_object(gathered_off, local_off)
+            else:
+                gathered_off = [local_off]
+            wer_off = WER(normalize=True, verbose=False)
+            for rank_data in gathered_off:
+                for name, values in rank_data.items():
+                    wer_off.update(name, refs=values["refs"], hyps=values["hyps"])
+            for metric_name, metric_value in wer_off.compute().items():
+                log_name = "val_wer_offline" if metric_name == "wer" else f"val_{metric_name}_offline"
+                self.log(log_name, metric_value.to(self.device), on_epoch=True, sync_dist=False)
+
         self._partial_wer_refs.clear()
         self._partial_wer_hyps.clear()
+        self._partial_wer_refs_offline.clear()
+        self._partial_wer_hyps_offline.clear()
 
     def validation_step(self, batch, batch_idx: int):
         if isinstance(batch, dict):  # multiple validation dataloaders
@@ -1649,6 +1690,29 @@ class ScriptSTTModel(StreamingSTTModel):
         )
         self._partial_wer_refs[name].extend(refs)
         self._partial_wer_hyps[name].extend(hyps)
+
+        # Second operating point, same batch and same references. Decoding both in
+        # one pass is what makes them comparable: identical utterances, identical
+        # reference styling, differing ONLY in chunk size.
+        off_chunk = self.core_cfg.get("val_offline_chunk_size", None)
+        if off_chunk:
+            off_tokens = self.core_cfg.get("val_offline_max_new_tokens", None)
+            if not off_tokens:
+                raise ValueError(
+                    "val_offline_chunk_size is set but val_offline_max_new_tokens is not. "
+                    "The token budget is PER CHUNK, so reusing the primary budget would "
+                    "truncate a whole-utterance decode and report truncation as WER."
+                )
+            off_hyps = self.generate(
+                audios=batch.audios,
+                audio_lens=batch.audio_lens,
+                system_prompt=self._validation_system_prompts(batch),
+                max_new_tokens=int(off_tokens),
+                generation_config=GenerationConfig(do_sample=False),
+                chunk_size_override=int(off_chunk),
+            )
+            self._partial_wer_refs_offline[name].extend(refs)
+            self._partial_wer_hyps_offline[name].extend(off_hyps)
 
         if batch_idx % self.core_cfg.log_every_n_steps == 0 and refs and hyps:
             logging.info(

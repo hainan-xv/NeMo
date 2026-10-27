@@ -503,6 +503,11 @@ JOINT_LAYERS="${JOINT_LAYERS:-28}"
 # The offline end needs 256 and is evaluated separately
 # (launch/dfw_eval_nocoder_offline.sh), NOT by this in-training validation.
 VAL_MAX_NEW_TOKENS="${VAL_MAX_NEW_TOKENS:-24}"
+# Second validation point -> wandb val_wer_offline. Costs a second decode pass
+# over limit_val_batches, which is bounded, and makes the offline end visible
+# without a separate 25-minute leaderboard job.
+VAL_OFFLINE_CHUNK_SIZE="${VAL_OFFLINE_CHUNK_SIZE:-1024}"
+VAL_OFFLINE_MAX_NEW_TOKENS="${VAL_OFFLINE_MAX_NEW_TOKENS:-256}"
 # THE POINT OF THIS ARM: a candidate cut may land inside a word, anywhere within
 # the same word-defined band. The word-atomic rule makes a 2-frame chunk emit an
 # entire multi-token word in one 0.16 s step; letting the cut fall mid-word
@@ -713,6 +718,8 @@ echo "*******STARTING********" \
     data.train_ds.bucket_batch_size="${BUCKET_BATCH_SIZE}" \
     ++model.val_chunk_size=${VAL_CHUNK_SIZE} \
     ++model.val_max_new_tokens_per_chunk=${VAL_MAX_NEW_TOKENS} \
+    ++model.val_offline_chunk_size=${VAL_OFFLINE_CHUNK_SIZE} \
+    ++model.val_offline_max_new_tokens=${VAL_OFFLINE_MAX_NEW_TOKENS} \
     data.train_ds.seed=${LHOTSE_RND_SEED} \
     data.validation_ds.datasets.mcv_11_dev.manifest_filepath=${VAL_MANIFEST} \
     ++trainer.limit_train_batches=${VAL_CHECK_INTERVAL} \

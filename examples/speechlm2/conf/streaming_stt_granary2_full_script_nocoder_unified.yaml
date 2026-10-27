@@ -127,6 +127,16 @@ model:
   # at 14 for continuity with the existing table (nocoder_sa 0.1888 etc.); the
   # offline end is measured separately with launch/dfw_eval_nocoder_offline.sh.
   val_chunk_size: 14
+  # SECOND validation point, logged to wandb as val_wer_offline. Without this the
+  # offline end of this model is invisible during training -- val_chunk_size is a
+  # single int, so wandb's val_wer has only ever shown chunk 14, which is exactly
+  # how a model that is best-in-class at streaming (0.1823) and poor at offline
+  # (44.86 macro) looked healthy for two legs.
+  val_offline_chunk_size: 1024
+  # 256, because the budget is PER CHUNK and one chunk here is the whole utterance
+  # (~162 tokens for a 54 s example). Reusing the chunk-14 budget of 24 would
+  # measure truncation, not the model.
+  val_offline_max_new_tokens: 256
   val_num_delay_frames: 3
   val_capitalization: true
   val_punctuation: true
