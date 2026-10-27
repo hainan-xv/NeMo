@@ -1637,7 +1637,7 @@ class ScriptSTTModel(StreamingSTTModel):
         # Same corpus-WER treatment for the second operating point, logged under
         # val_wer_offline. Deliberately NOT the checkpoint monitor: save_top_k for
         # every existing run was selected against val_wer and that must not change.
-        if self.core_cfg.get("val_offline_chunk_size", None) and self._partial_wer_refs_offline:
+        if getattr(self.core_cfg, "val_offline_chunk_size", None) and self._partial_wer_refs_offline:
             local_off = {
                 name: {
                     "refs": self._partial_wer_refs_offline[name],
@@ -1694,9 +1694,9 @@ class ScriptSTTModel(StreamingSTTModel):
         # Second operating point, same batch and same references. Decoding both in
         # one pass is what makes them comparable: identical utterances, identical
         # reference styling, differing ONLY in chunk size.
-        off_chunk = self.core_cfg.get("val_offline_chunk_size", None)
+        off_chunk = getattr(self.core_cfg, "val_offline_chunk_size", None)
         if off_chunk:
-            off_tokens = self.core_cfg.get("val_offline_max_new_tokens", None)
+            off_tokens = getattr(self.core_cfg, "val_offline_max_new_tokens", None)
             if not off_tokens:
                 raise ValueError(
                     "val_offline_chunk_size is set but val_offline_max_new_tokens is not. "
