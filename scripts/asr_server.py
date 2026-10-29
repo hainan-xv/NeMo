@@ -539,7 +539,7 @@ class Session:
             pass
         return shown
 
-    def run_script_fixed(self, leftover, chunk, delay):
+    def run_script_fixed(self, leftover, chunk, delay, max_new_tokens=None):
         """SCRIPT at ONE fixed chunk size: no fast front, no revision.
 
         The two-front path needs slow to be a different exact multiple of fast,
@@ -551,6 +551,13 @@ class Session:
         So this emits each block once, committed, as soon as its audio is
         complete. Latency is (chunk + delay) * 0.08s and the text never changes
         after it appears.
+
+        ``max_new_tokens`` is the budget PER BLOCK and must scale with the chunk.
+        generate() defaults to 64, ample for a 14-frame chunk (1.12 s of audio,
+        ~3-4 tokens) but truncating past roughly 21 s of speech once the chunk
+        covers a whole utterance. An OFFLINE arm must raise it or the transcript
+        stops mid-sentence -- the same truncation that made an earlier validation
+        report a WER measuring the token cap rather than the model.
         """
         import numpy as np
         import torch
@@ -625,6 +632,7 @@ class Session:
                         precomputed_frames=ff,
                         prompt_suffix=self.prompt_suffix,
                         num_delay_frames=delay,
+                        **({} if max_new_tokens is None else {"max_new_tokens": int(max_new_tokens)}),
                     )[0].strip()
                 # commit_block with an empty provisional: nothing to strike out,
                 # so this is a plain append.
@@ -650,6 +658,7 @@ class Session:
                         precomputed_frames=ff,
                         prompt_suffix=self.prompt_suffix,
                         num_delay_frames=delay,
+                        **({} if max_new_tokens is None else {"max_new_tokens": int(max_new_tokens)}),
                     )[0].strip()
                     self.commit_block("", out)
                     committed = (committed + " " + out).strip() if out else committed
@@ -892,7 +901,9 @@ class Session:
         # single chunk size (the encoder-free arms) can only ever do this, and
         # the two-front validation below would reject it outright.
         if fast == slow:
-            return self.run_script_fixed(leftover, fast, fast_delay)
+            return self.run_script_fixed(
+                leftover, fast, fast_delay, getattr(a_, "fixed_max_new_tokens", None)
+            )
 
         fast_delay = max(0, min(a_.max_delay, fast_delay))
         slow_delay = max(0, min(a_.max_delay, slow_delay))

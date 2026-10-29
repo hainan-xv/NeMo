@@ -198,6 +198,10 @@ async def ws_handler(request):
         sess_model, arm = app["model3"], "script"
     elif arm_id == "interleaved2" and app.get("alt2") is not None:
         sess_alt, arm = app["alt2"], "interleaved"
+    elif arm_id in ("unified_stream", "unified_offline") and app.get("unified") is not None:
+        # ONE object for both ids: the streaming/offline switch must not be able to
+        # become two different models by accident.
+        sess_model, arm = app["unified"], "script"
     elif arm_id in ("interleaved", "nemotron"):
         arm = arm_id
     else:
@@ -221,6 +225,9 @@ async def ws_handler(request):
         dl = max(0, min(int(a.__dict__.get("max_delay", 4)), dl))
         a.__dict__["fast_delay"] = a.__dict__["slow_delay"] = dl
         a.__dict__["il_delay"] = dl
+        # None leaves generate() on its own default (64), which is correct for the
+        # small chunks; only a whole-utterance arm needs to raise it.
+        a.__dict__["fixed_max_new_tokens"] = fixed.get("max_new_tokens")
 
     # Free-text biasing appended to the base instruction, BEFORE the control
     # clauses that render_control_prompt adds -- so the trained template still
@@ -325,6 +332,17 @@ def main():
     ap.add_argument("--ckpt3_label", default="SCRIPT (third)")
     ap.add_argument("--ckpt3_chunk", type=int, default=14)
     ap.add_argument("--ckpt3_delay", type=int, default=0)
+    # The UNIFIED model: ONE checkpoint trained on chunk_size [14, 1024] that is
+    # exposed as TWO arms. Both resolve to the same model object, so switching
+    # between them in the page changes only the chunk size -- the weights are
+    # identical, which is the whole point of the arm.
+    ap.add_argument("--unified_ckpt", default="", help="SCRIPT model trained at BOTH a streaming and an offline chunk")
+    ap.add_argument("--unified_label", default="SCRIPT unified (encoder-free)")
+    ap.add_argument("--unified_stream_chunk", type=int, default=14)
+    ap.add_argument("--unified_offline_chunk", type=int, default=1024)
+    # PER BLOCK. At chunk 14 the server default of 64 is ample; at 1024 one block
+    # is the whole utterance and 64 truncates past ~21 s of speech.
+    ap.add_argument("--unified_offline_max_new_tokens", type=int, default=256)
     ap.add_argument("--interleaved_ckpt2", default="", help="optional SECOND interleaved arm")
     ap.add_argument("--interleaved_ckpt2_label", default="interleaved (encoder-free)")
     ap.add_argument("--interleaved_ckpt2_chunk", type=int, default=14)
@@ -371,6 +389,23 @@ def main():
                             prompt_control=True)
         model3.eval()
         print(f"  third SCRIPT ready (trained chunks {list(model3.core_cfg.chunk_size)})", flush=True)
+    unified = None
+    if args.unified_ckpt:
+        print("loading unified SCRIPT arm ...", flush=True)
+        unified = load_model(args.unified_ckpt, args.model_class, torch.device(args.device), torch.bfloat16,
+                             prompt_control=True)
+        unified.eval()
+        _uc = [int(c) for c in unified.core_cfg.chunk_size]
+        print(f"  unified ready (trained chunks {_uc})", flush=True)
+        # run_script_fixed REJECTS a chunk the checkpoint never trained, so verify
+        # both operating points up front rather than discovering it mid-session.
+        for _want in (args.unified_stream_chunk, args.unified_offline_chunk):
+            if _want not in _uc:
+                raise SystemExit(
+                    f"--unified_ckpt was trained on chunks {_uc} but the page would offer {_want}. "
+                    "Decoding a chunk size a checkpoint never saw still produces fluent text, "
+                    "which is the dangerous failure rather than a loud one."
+                )
     alt2 = None
     if args.interleaved_ckpt2:
         import copy as _copy
@@ -381,6 +416,7 @@ def main():
     app["model"], app["args"], app["prompt"], app["alt"] = model, args, prompt, alt
     app["nemotron"] = nemotron
     app["model2"], app["alt2"], app["model3"] = model2, alt2, model3
+    app["unified"] = unified
     # Arms whose checkpoint knows ONE chunk size. The handler forces fast==slow
     # for these so the server takes the single-front path -- the two-front one
     # requires slow to be a different exact multiple of fast and would reject it.
@@ -391,6 +427,15 @@ def main():
         app["fixed"]["script3"] = {"chunk": args.ckpt3_chunk, "delay": args.ckpt3_delay}
     if alt2 is not None:
         app["fixed"]["interleaved2"] = {"chunk": args.interleaved_ckpt2_chunk, "delay": 0}
+    if unified is not None:
+        # Same weights, two operating points. The offline arm carries a larger
+        # per-block token budget because its single block is the whole utterance.
+        app["fixed"]["unified_stream"] = {"chunk": args.unified_stream_chunk, "delay": 0}
+        app["fixed"]["unified_offline"] = {
+            "chunk": args.unified_offline_chunk,
+            "delay": 0,
+            "max_new_tokens": args.unified_offline_max_new_tokens,
+        }
     # The page fills its dropdowns from this rather than a hard-coded list: the
     # two checkpoints were trained on DIFFERENT chunk sets ([2,7,14,28,42] vs
     # [2,4,7,10,14,28]), and offering a size a model never saw still yields
@@ -411,6 +456,14 @@ def main():
         arms.append({"id": "script2", "label": args.ckpt2_label, "kind": "script", "fixed": True,
                      "chunks": [int(c) for c in model2.core_cfg.chunk_size],
                      "delays": list(range(args.max_delay + 1))})
+    if unified is not None:
+        _ud = list(range(args.max_delay + 1))
+        arms.append({"id": "unified_stream", "kind": "script", "fixed": True,
+                     "label": f"{args.unified_label} - streaming (chunk {args.unified_stream_chunk})",
+                     "chunks": [int(args.unified_stream_chunk)], "delays": _ud})
+        arms.append({"id": "unified_offline", "kind": "script", "fixed": True,
+                     "label": f"{args.unified_label} - offline (whole utterance)",
+                     "chunks": [int(args.unified_offline_chunk)], "delays": _ud})
     if model3 is not None:
         arms.append({"id": "script3", "label": args.ckpt3_label, "kind": "script", "fixed": True,
                      "chunks": [int(c) for c in model3.core_cfg.chunk_size],

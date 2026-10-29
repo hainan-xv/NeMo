@@ -185,6 +185,23 @@ class ScriptSTTModelConfig(StreamingSTTModelConfig):
     attn_backend: str = "dense"
     activation_checkpointing: bool = False
     bidirectional_audio: bool = False
+    # MODALITY-LOCAL EARLY LAYERS. For the first ``modality_local_layers`` LLM layers,
+    # audio attends ONLY to audio in its own branch -- not to the emitted-text prefix,
+    # and not to the [vs]/[ve]/span tokens beside it. Later layers use the ordinary
+    # SCRIPT rule, so cross-modal mixing still happens, just later.
+    #
+    # Text is already modality-local at EVERY layer and that does not change: a spine
+    # query can only match the spine->spine term, which is the invariant that keeps the
+    # text KV cache reusable across chunks.
+    #
+    # Motivation: in an encoder-free model the lower LLM layers ARE the encoder.
+    # Mel-LLM (arXiv 2606.10231, Table V) found layers 0-23 matter most for turning raw
+    # spectral patterns into linguistic representations while 24+ handle semantics, so
+    # letting the early layers do acoustic work undisturbed is the natural reading.
+    #
+    # 0 disables it and reproduces today's model EXACTLY, which is what makes the sweep
+    # over n a clean ablation rather than a different model.
+    modality_local_layers: int = 0
     prompt_control: bool = False
     # Whether the instruction NAMES the chunk size. Must match the training
     # dataset's data.dataset.prompt_include_chunk_size -- a mismatch decodes
@@ -273,6 +290,23 @@ class ScriptSTTModelConfig(StreamingSTTModelConfig):
     # step time. 0 disables.
     train_wer_every_n_steps: int = 500
     train_wer_max_utts: int = 4
+
+
+def _mask_substituting_forward(orig_forward, mask):
+    """Wrap a decoder layer so it always sees ``mask`` as its attention mask.
+
+    The mask arrives positionally in some HF versions and by keyword in others, so this
+    overrides the keyword and strips a positional second argument when one is present.
+    """
+
+    def forward(hidden_states, *args, **kwargs):
+        if args:
+            args = (mask,) + tuple(args[1:])
+        else:
+            kwargs["attention_mask"] = mask
+        return orig_forward(hidden_states, *args, **kwargs)
+
+    return forward
 
 
 class ScriptSTTModel(StreamingSTTModel):
@@ -514,6 +548,55 @@ class ScriptSTTModel(StreamingSTTModel):
                 llm.set_attn_implementation(prev)
 
     @staticmethod
+    @staticmethod
+    def _script_mask_mod_local(batch: ScriptBatch, bidirectional_audio: bool = False):
+        """The SCRIPT rule with audio confined to its OWN modality.
+
+        Identical to :meth:`_script_mask_mod` except that an AUDIO query may only
+        attend to audio keys inside the same branch. Non-audio queries (the spine, and
+        the emitted span tokens within a branch) keep the ordinary rule, so the text
+        side is untouched.
+
+        Dropping the branch->spine term for audio is the whole point: that term is what
+        currently lets a chunk's audio read the emitted-text prefix, and this makes the
+        early layers do acoustics without that context.
+        """
+        if batch.order_ids is None:
+            raise ValueError(
+                "ScriptBatch.order_ids is None -- the modality-local mask is built from the "
+                "same structural indices as the full rule and cannot fall back to RoPE geometry."
+            )
+        if batch.is_audio is None:
+            raise ValueError(
+                "modality_local_layers > 0 requires ScriptBatch.is_audio: without it the mask "
+                "cannot tell audio from text and would silently train the ordinary rule."
+            )
+        seg, pos, pref, val, aud = (
+            batch.seg_ids,
+            batch.order_ids,
+            batch.prefix_len,
+            batch.valid,
+            batch.is_audio,
+        )
+
+        def mask_mod(b, h, q, kv):
+            qs, ks = seg[b, q], seg[b, kv]
+            qp, kp = pos[b, q], pos[b, kv]
+            q_spine, k_spine = qs == 0, ks == 0
+            causal = kp <= qp
+            same_branch = (qs == ks) & (~q_spine)
+            q_aud = aud[b, q]
+            # Audio queries: own branch, audio keys only. Causal unless the arm trains
+            # bidirectional audio, in which case the window is visible both ways -- the
+            # same choice the full rule makes.
+            audio_rule = same_branch & aud[b, kv] & (causal if not bidirectional_audio else (kp == kp))
+            # Everything else keeps the ordinary SCRIPT rule.
+            own = same_branch & causal
+            other_rule = (q_spine & k_spine & causal) | ((~q_spine) & k_spine & (kp < pref[b, q])) | own
+            return ((q_aud & audio_rule) | ((~q_aud) & other_rule)) & val[b, kv]
+
+        return mask_mod
+
     def _script_mask_mod(batch: ScriptBatch, bidirectional_audio: bool = False):
         """The SCRIPT rule as a FlexAttention predicate.
 
@@ -566,6 +649,59 @@ class ScriptSTTModel(StreamingSTTModel):
                 "path, or train with bidirectional_audio=false."
             )
 
+    def _llm_forward(self, **kwargs):
+        """Refuse a mask PAIR that never passed through :meth:`_per_layer_masks`.
+
+        ``_training_attention`` returns ``(local, full)`` when modality_local_layers > 0.
+        If a caller forwards that straight to the LLM, HF would treat the tuple as one
+        attention mask: at best it raises somewhere deep, at worst a single mask is used
+        for every layer and the arm trains a rule nobody asked for while the config still
+        says modality_local_layers=n. Fail loudly at the boundary instead.
+        """
+        if isinstance(kwargs.get("attention_mask"), tuple):
+            raise ValueError(
+                "a (local, full) mask pair reached _llm_forward -- the caller did not enter "
+                "_per_layer_masks(), so modality_local_layers would be silently wrong."
+            )
+        return super()._llm_forward(**kwargs)
+
+    @contextmanager
+    def _per_layer_masks(self, masks):
+        """Give layers [0, n) the modality-local mask and the rest the full one.
+
+        HF passes ONE attention_mask to every decoder layer, so a per-depth rule has to
+        intercept the layer call itself. Each layer's forward is wrapped to substitute
+        its own mask; the originals are restored on exit, including on exception, so a
+        failed step cannot leave the model permanently patched.
+
+        ``masks`` is None or a single mask (nothing to do) or the (local, full) pair.
+        """
+        if not isinstance(masks, tuple):
+            yield
+            return
+        local_mask, full_mask = masks
+        n_local = int(getattr(self.core_cfg, "modality_local_layers", 0) or 0)
+        layers = list(self._llm_core_layers())
+        if n_local > len(layers):
+            raise ValueError(f"modality_local_layers={n_local} exceeds the LLM's {len(layers)} layers")
+        originals = [lyr.forward for lyr in layers]
+        try:
+            for i, lyr in enumerate(layers):
+                chosen = local_mask if i < n_local else full_mask
+                lyr.forward = _mask_substituting_forward(originals[i], chosen)
+            yield
+        finally:
+            for lyr, fwd in zip(layers, originals):
+                lyr.forward = fwd
+
+    def _llm_core_layers(self):
+        """The decoder layer list, under whatever PEFT/wrapper nesting is present."""
+        llm = self.llm
+        if hasattr(llm, "base_model") and hasattr(llm.base_model, "model"):
+            llm = llm.base_model.model
+        core = llm.model if hasattr(llm, "model") else llm
+        return core.layers
+
     def _training_attention(self, batch: ScriptBatch, dtype):
         """(attn_implementation, attention_mask) for this batch's backend."""
         if self._bidirectional_audio and batch.is_audio is None:
@@ -586,6 +722,18 @@ class ScriptSTTModel(StreamingSTTModel):
                 KV_LEN=T,
                 device=batch.seg_ids.device,
             )
+            n_local = int(getattr(self.core_cfg, "modality_local_layers", 0) or 0)
+            if n_local > 0:
+                local_mask = create_block_mask(
+                    self._script_mask_mod_local(batch, self._bidirectional_audio),
+                    B=B,
+                    H=None,
+                    Q_LEN=T,
+                    KV_LEN=T,
+                    device=batch.seg_ids.device,
+                )
+                # Two masks, swapped at layer n_local by _per_layer_masks().
+                return "flex_attention", (local_mask, block_mask)
             return "flex_attention", block_mask
         if self._attn_backend == "script":
             return "script", None
@@ -860,7 +1008,7 @@ class ScriptSTTModel(StreamingSTTModel):
             pass
         embeds = self._script_input_embeds(sub)
         impl, mask = self._training_attention(sub, embeds.dtype)
-        with self._attn_implementation(impl):
+        with self._attn_implementation(impl), self._per_layer_masks(mask):
             out = self._llm_forward(
                 inputs_embeds=embeds,
                 attention_mask=mask,
@@ -936,7 +1084,11 @@ class ScriptSTTModel(StreamingSTTModel):
         # raises CheckpointError (or, with flex, the BlockMask reaches SDPA and dies
         # on .ndim). Record what this step trained under so backward() can re-enter it.
         self._train_attn_ctx = (impl, plan if self._attn_backend == "script" else None)
-        with self._attn_implementation(impl), _maybe_plan(plan if self._attn_backend == "script" else None):
+        with (
+            self._attn_implementation(impl),
+            _maybe_plan(plan if self._attn_backend == "script" else None),
+            self._per_layer_masks(mask),
+        ):
             out = self._llm_forward(
                 inputs_embeds=input_embeds,
                 attention_mask=mask,
@@ -1501,7 +1653,11 @@ class ScriptSTTModel(StreamingSTTModel):
         # raises CheckpointError (or, with flex, the BlockMask reaches SDPA and dies
         # on .ndim). Record what this step trained under so backward() can re-enter it.
         self._train_attn_ctx = (impl, plan if self._attn_backend == "script" else None)
-        with self._attn_implementation(impl), _maybe_plan(plan if self._attn_backend == "script" else None):
+        with (
+            self._attn_implementation(impl),
+            _maybe_plan(plan if self._attn_backend == "script" else None),
+            self._per_layer_masks(mask),
+        ):
             out = self._llm_forward(
                 inputs_embeds=input_embeds,
                 attention_mask=mask,
