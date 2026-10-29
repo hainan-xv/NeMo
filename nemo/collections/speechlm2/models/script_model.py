@@ -202,6 +202,20 @@ class ScriptSTTModelConfig(StreamingSTTModelConfig):
     # 0 disables it and reproduces today's model EXACTLY, which is what makes the sweep
     # over n a clean ablation rather than a different model.
     modality_local_layers: int = 0
+    # MODALITY-SPECIFIC Q/K/V, scoped to exactly the layers that are modality-local.
+    # In layers [0, modality_local_layers) an audio position is projected by its OWN
+    # q/k/v; from that depth on, where attention is cross-modal again, the projections
+    # are shared. Private connectivity and private parameters start and stop together,
+    # which is one hypothesis rather than two knobs.
+    #
+    # The audio projections are initialised as COPIES of the pretrained text ones, so
+    # at step 0 the model is bit-identical to modality_specific_qkv=False and any later
+    # difference is attributable to training, not to initialisation.
+    #
+    # Implemented as SIBLING modules (audio_q_proj, ...) plus forward hooks rather than
+    # by wrapping q_proj: wrapping would rename q_proj.weight to q_proj.text.weight and
+    # silently break the 317-tensor warm start, since init_from_ckpt matches by key.
+    modality_specific_qkv: bool = False
     prompt_control: bool = False
     # Whether the instruction NAMES the chunk size. Must match the training
     # dataset's data.dataset.prompt_include_chunk_size -- a mismatch decodes
@@ -309,6 +323,54 @@ def _mask_substituting_forward(orig_forward, mask):
     return forward
 
 
+def _install_modality_qkv(layers, n_local):
+    """Give audio its own q/k/v in the first ``n_local`` layers.
+
+    For each of those layers the attention module gains ``audio_q_proj`` /
+    ``audio_k_proj`` / ``audio_v_proj``, deep copies of the pretrained text ones, and a
+    forward hook on each original projection that substitutes the audio rows::
+
+        out = where(is_audio, audio_proj(x), text_proj(x))
+
+    Why hooks on siblings rather than replacing q_proj with a two-branch module: the
+    replacement would nest the pretrained weight at ``q_proj.text.weight``, and
+    init_from_ckpt matches purely by key, so every warm start would silently lose the
+    q/k/v of exactly the layers this feature touches.
+
+    The mask is read through ``mask_fn`` at call time, not captured, because activation
+    checkpointing re-runs this forward during backward and the batch must still be the
+    one the forward saw. ``mask_fn()`` returning None disables the substitution, which
+    is what makes a decode path that never sets it behave like the shared model.
+    """
+    import copy as _copy
+
+    installed = []
+    for lyr in list(layers)[:n_local]:
+        attn = lyr.self_attn
+        for name in ("q_proj", "k_proj", "v_proj"):
+            base = getattr(attn, name)
+            audio_name = f"audio_{name}"
+            if not hasattr(attn, audio_name):
+                setattr(attn, audio_name, _copy.deepcopy(base))
+            audio = getattr(attn, audio_name)
+
+            def _hook(module, inputs, output, _audio=audio, _attn=attn):
+                mask_fn = getattr(_attn, "_script_is_audio_fn", None)
+                m = None if mask_fn is None else mask_fn()
+                if m is None:
+                    return output
+                x = inputs[0]
+                if m.shape[:2] != x.shape[:2]:
+                    raise ValueError(
+                        f"is_audio {tuple(m.shape)} does not match hidden states "
+                        f"{tuple(x.shape[:2])} -- the modality mask belongs to a different batch."
+                    )
+                return torch.where(m.unsqueeze(-1), _audio(x), output)
+
+            installed.append(base.register_forward_hook(_hook))
+    return installed
+
+
 class ScriptSTTModel(StreamingSTTModel):
     """Streaming ASR as conditional text completion.
 
@@ -395,6 +457,35 @@ class ScriptSTTModel(StreamingSTTModel):
                 )
 
         self._bidirectional_audio = bool(self.core_cfg.bidirectional_audio)
+        # Modality mask for the current batch, published for the q/k/v hooks. Read
+        # through a callable so the activation-checkpoint recompute in backward() sees
+        # the same batch the forward did.
+        self._cur_is_audio = None
+        n_local = int(getattr(self.core_cfg, "modality_local_layers", 0) or 0)
+        if bool(getattr(self.core_cfg, "modality_specific_qkv", False)):
+            if n_local <= 0:
+                raise ValueError(
+                    "modality_specific_qkv=True with modality_local_layers=0 selects zero "
+                    "layers, so it would be a silent no-op. Private projections are scoped "
+                    "to the modality-local layers by design; set modality_local_layers > 0."
+                )
+            layers = self._llm_core_layers()
+            if n_local > len(layers):
+                raise ValueError(f"modality_local_layers={n_local} exceeds the LLM's {len(layers)} layers")
+            _install_modality_qkv(layers, n_local)
+            for lyr in list(layers)[:n_local]:
+                lyr.self_attn._script_is_audio_fn = lambda: self._cur_is_audio
+            logging.info(
+                "modality_specific_qkv: audio q/k/v installed on layers 0..%d (+%.1fM params)",
+                n_local - 1,
+                sum(
+                    p_.numel()
+                    for lyr in list(layers)[:n_local]
+                    for n_, p_ in lyr.self_attn.named_parameters()
+                    if n_.startswith("audio_")
+                )
+                / 1e6,
+            )
         # (attn_implementation, plan) the last training forward ran under, so the
         # activation-checkpoint recompute in backward() can re-enter the same one.
         self._train_attn_ctx = None
@@ -702,6 +793,29 @@ class ScriptSTTModel(StreamingSTTModel):
         core = llm.model if hasattr(llm, "model") else llm
         return core.layers
 
+    @contextmanager
+    def _modality_mask_published(self, batch: ScriptBatch):
+        """Expose ``batch.is_audio`` to the audio q/k/v hooks for one forward.
+
+        Cleared on exit so a later forward cannot silently reuse a stale batch's mask;
+        the hooks treat None as 'shared projections', so a decode path that never sets
+        it behaves exactly like modality_specific_qkv=False.
+        """
+        if not bool(getattr(self.core_cfg, "modality_specific_qkv", False)):
+            yield
+            return
+        if batch.is_audio is None:
+            raise ValueError(
+                "modality_specific_qkv=True but ScriptBatch.is_audio is None -- audio would "
+                "be projected by the TEXT weights while the config claims otherwise."
+            )
+        prev = self._cur_is_audio
+        self._cur_is_audio = batch.is_audio
+        try:
+            yield
+        finally:
+            self._cur_is_audio = prev
+
     def _training_attention(self, batch: ScriptBatch, dtype):
         """(attn_implementation, attention_mask) for this batch's backend."""
         if self._bidirectional_audio and batch.is_audio is None:
@@ -1008,7 +1122,7 @@ class ScriptSTTModel(StreamingSTTModel):
             pass
         embeds = self._script_input_embeds(sub)
         impl, mask = self._training_attention(sub, embeds.dtype)
-        with self._attn_implementation(impl), self._per_layer_masks(mask):
+        with self._attn_implementation(impl), self._per_layer_masks(mask), self._modality_mask_published(sub):
             out = self._llm_forward(
                 inputs_embeds=embeds,
                 attention_mask=mask,
@@ -1088,6 +1202,7 @@ class ScriptSTTModel(StreamingSTTModel):
             self._attn_implementation(impl),
             _maybe_plan(plan if self._attn_backend == "script" else None),
             self._per_layer_masks(mask),
+            self._modality_mask_published(batch),
         ):
             out = self._llm_forward(
                 inputs_embeds=input_embeds,
@@ -1657,6 +1772,7 @@ class ScriptSTTModel(StreamingSTTModel):
             self._attn_implementation(impl),
             _maybe_plan(plan if self._attn_backend == "script" else None),
             self._per_layer_masks(mask),
+            self._modality_mask_published(batch),
         ):
             out = self._llm_forward(
                 inputs_embeds=input_embeds,
