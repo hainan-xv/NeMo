@@ -489,6 +489,7 @@ class ScriptSTTModel(StreamingSTTModel):
         # (attn_implementation, plan) the last training forward ran under, so the
         # activation-checkpoint recompute in backward() can re-enter the same one.
         self._train_attn_ctx = None
+        self._train_is_audio = None
         self._attn_backend = str(self.core_cfg.attn_backend or "dense").lower()
         if self._attn_backend not in ("dense", "flex", "script"):
             raise ValueError(f"attn_backend must be dense|flex|script, got {self._attn_backend!r}")
@@ -794,6 +795,16 @@ class ScriptSTTModel(StreamingSTTModel):
         return core.layers
 
     @contextmanager
+    def _publish_is_audio(self, mask):
+        """Expose ``mask`` to the audio q/k/v hooks for the duration of the block."""
+        prev = self._cur_is_audio
+        self._cur_is_audio = mask
+        try:
+            yield
+        finally:
+            self._cur_is_audio = prev
+
+    @contextmanager
     def _modality_mask_published(self, batch: ScriptBatch):
         """Expose ``batch.is_audio`` to the audio q/k/v hooks for one forward.
 
@@ -809,12 +820,15 @@ class ScriptSTTModel(StreamingSTTModel):
                 "modality_specific_qkv=True but ScriptBatch.is_audio is None -- audio would "
                 "be projected by the TEXT weights while the config claims otherwise."
             )
-        prev = self._cur_is_audio
-        self._cur_is_audio = batch.is_audio
-        try:
+        # Recorded for backward(): with activation checkpointing the LLM forward is
+        # REPLAYED inside backward, long after this block has exited. If the replay saw
+        # _cur_is_audio=None it would project audio with the SHARED weights while the
+        # original forward used the private ones, and torch compares the saved tensors'
+        # metadata and raises CheckpointError. This is the same hazard the attention
+        # implementation already works around via _train_attn_ctx.
+        self._train_is_audio = batch.is_audio
+        with self._publish_is_audio(batch.is_audio):
             yield
-        finally:
-            self._cur_is_audio = prev
 
     def _training_attention(self, batch: ScriptBatch, dtype):
         """(attn_implementation, attention_mask) for this batch's backend."""
@@ -1586,6 +1600,10 @@ class ScriptSTTModel(StreamingSTTModel):
                 if impl is not None:
                     stack.enter_context(self._attn_implementation(impl))
                     stack.enter_context(_maybe_plan(plan))
+                # Same reason as the attention implementation above: the replayed
+                # forward must project audio with the same weights the original did.
+                if getattr(self, "_train_is_audio", None) is not None:
+                    stack.enter_context(self._publish_is_audio(self._train_is_audio))
                 if ddp is not None:
                     with ddp.no_sync():
                         super().backward(*args, **kwargs)
