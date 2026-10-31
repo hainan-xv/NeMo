@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH -A nemotron_speechprod_asr
 #SBATCH -J nemotron_speechprod_asr:dfw-eval-mlocal4-cs14
-#SBATCH -p interactive
+#SBATCH -p batch
 #SBATCH -N 1
 #SBATCH --gpus-per-node=8
 #SBATCH -t 04:00:00
@@ -135,6 +135,10 @@ export RUN_AVERAGING="${RUN_AVERAGING:-0}"
 # mlocal4 at its best checkpoint (val_wer 0.1806). Same harness and settings as the
 # unified runs that scored 10.58 @ chunk 14 and 8.56 @ chunk 1024, so the pair of
 # numbers is directly comparable -- which a 1% val_wer edge on mcv11 dev is not.
+# Every arm of the sweep peaks at step 8000, so evaluating that checkpoint is
+# both "latest best progress" AND a MATCHED comparison: same step, same warm
+# start, same data. The earlier mlocal4 result compared its peak against a
+# drifted unified checkpoint, which is why it looked like a 5% win.
 export CKPT="${CKPT:-${DFW}/hainanx/results/SpeechlmDFW/dfw_script_mlocal4_8node/dfw_script_mlocal4_8node/checkpoints/step=8000-val_wer=0.1806.ckpt}"
 export USE_LAST="${USE_LAST:-0}"
 
