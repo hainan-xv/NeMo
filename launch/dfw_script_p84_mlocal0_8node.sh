@@ -484,7 +484,12 @@ ACT_CKPT="${ACT_CKPT:-true}"
 ATTN_BACKEND="${ATTN_BACKEND:-dense}"
 # 8, matching the YAML. The 4 here was inherited from the banded recipe and
 # halved the prefetch available to fill buckets.
-NUM_WORKERS="${NUM_WORKERS:-8}"
+# 4, not the inherited 8. DFW nodes have 128 CPUs against OCI's 248, so 8 ranks x 8
+# workers = 64 readers starves the host and the loader dies with
+#   RuntimeError: DataLoader worker (pid ...) is killed by signal: Killed
+# which is how job 21138375 failed after 13 minutes. Lowering this is what made
+# every other DFW arm in this project train.
+NUM_WORKERS="${NUM_WORKERS:-4}"
 
 # Tokenise in the DATALOADER WORKERS, not the main process.
 #
