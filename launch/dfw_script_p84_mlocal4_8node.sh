@@ -587,7 +587,13 @@ LHOTSE_RND_SEED="${1:-42}"
 # TRAINING batch with FileNotFoundError on .../ASR/YTC/en12/audio_52.tar.
 DATA_ROOT=/lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm
 
-MOUNTS="--container-mounts=${CODE_DIR}:/code,${RESULTS_DIR}:/results,${HFCACHE}:/hfcache,${LUSTRE}:${LUSTRE},${DATA_ROOT}:${DATA_ROOT}"
+# THIRD root, and not optional. ${LUSTRE} is nemotron/PROJECTS/...; the granary
+# manifests live under nemotron/USERS/heh/manifests and are a different mount.
+# Without this the job reaches the training loop and dies on the first shard with
+#   [Errno 2] No such file or directory: .../nemotron/users/heh/manifests/granary_...
+# which is exactly how jobs 21132207/21132208 failed after 30 minutes.
+NEMO_USERS=/lustre/fsw/portfolios/nemotron/users
+MOUNTS="--container-mounts=${CODE_DIR}:/code,${RESULTS_DIR}:/results,${HFCACHE}:/hfcache,${LUSTRE}:${LUSTRE},${DATA_ROOT}:${DATA_ROOT},${NEMO_USERS}:${NEMO_USERS}"
 
 # Do NOT enable xtrace: the command below contains expanded token values.
 read -r -d '' cmd <<EOF
