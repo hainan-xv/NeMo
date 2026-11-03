@@ -172,7 +172,13 @@ model:
       inference_delay_frames: null
       band_chunks: 1
       band_side: later
-      band_layout: chunk_band
+      # 'chunk' (CHAT's default) materialises only the real (b,t,u) triples.
+      # 'chunk_band' packs them into a dense [B, T, W] grid where W is the
+      # batch-wide max span -- ~1.6x faster, but at chunk 2 that grid is 37%
+      # padding (3000 cells for 1880 real nodes), and it is precisely where
+      # memory is tightest. Job 21242319 OOM'd in backward at chunk_size=2 with
+      # CHAT as the ONLY loss. Paying the compute to stop wasting the memory.
+      band_layout: chunk
       delay_word_final_punctuation: false
       target_construction: legacy
       log_target_mismatch_every_n_steps: 500
