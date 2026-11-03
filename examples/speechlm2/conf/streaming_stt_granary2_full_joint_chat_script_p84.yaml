@@ -45,6 +45,12 @@ model:
   chunk_size: [2, 7, 14, 28]   # multi chunk-size: one drawn per batch
   # SCRIPT trains only at chunks >= this. 0 disables the split.
   script_min_chunk_size: 7
+  # One head per batch instead of summing both, chosen per step from global_step
+  # (so every rank agrees). Keeps peak memory at the max of the two heads rather
+  # than their sum.
+  loss_sampling: true
+  chat_loss_prob: 0.5
+  loss_sampling_seed: 1234
   # Left context 84, NOT 70. The Conformer's chunked_limited check requires
   #   att_context_size[0] % (att_context_size[1] + 1) == 0
   # and the right context is set per batch to chunk_size - 1, so the left

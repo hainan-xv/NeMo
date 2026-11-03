@@ -42,6 +42,7 @@ failure the joint model exists to rule out. Mounting the real class keeps CHAT's
 semantics authoritative; we simply never call its ``forward``.
 """
 
+import random
 from collections import defaultdict
 from typing import List, Optional
 
@@ -97,6 +98,19 @@ class JointChatScriptModel(ScriptSTTModel):
         # CHAT's cost at small chunks grows only through the chunk count T, far cheaper.
         self._script_min_chunk = int(cfg.get("script_min_chunk_size", 0) or 0)
 
+        # LOSS SAMPLING. With this on, each step trains ONE head: the whole batch
+        # shares a single loss instead of summing both. The heads still share the
+        # encoder and still see the same latency distribution -- they alternate
+        # batches rather than stacking in one backward graph.
+        #
+        # Memory is the reason. Summed, a single backward holds SCRIPT's packed
+        # activations AND the CHAT joint's ~B*T*W*151670 logits at once; that is what
+        # OOM'd in BACKWARD on jobs 21239593 and 21241337, which SCRIPT's guard does
+        # not recover by design. Sampling makes the peak the max of the two, not the sum.
+        self._loss_sampling = bool(cfg.get("loss_sampling", False))
+        self._chat_loss_prob = float(cfg.get("chat_loss_prob", 0.5))
+        self._loss_sampling_seed = int(cfg.get("loss_sampling_seed", 1234))
+
         # ModelPT only builds dataloaders when these are present; the joint model
         # drives data from the SCRIPT side, so refuse a config that would make the
         # CHAT submodule open its own (silently doubling the input pipeline).
@@ -139,6 +153,24 @@ class JointChatScriptModel(ScriptSTTModel):
         self._train_enc = None
         self._train_enc_len = None
         self._script_ran = True
+
+    def _chat_only_step(self, chunk: int) -> bool:
+        """Whether THIS step trains the CHAT head alone.
+
+        RANK-INVARIANT BY CONSTRUCTION. The draw is seeded from ``global_step``
+        alone -- never from the batch -- so every rank makes the identical choice
+        and runs the identical sequence of collectives. Deriving it from anything
+        rank-local (the cuts, the chunk draw, a bare RNG) would put ranks on
+        different forwards, which is the deadlock this model has already paid for.
+        """
+        # Small chunks are CHAT-only regardless: SCRIPT's branch count scales as
+        # 1/chunk, so that is where its packed forward blows up.
+        if self._script_min_chunk and chunk < self._script_min_chunk:
+            return True
+        if not self._loss_sampling:
+            return False
+        rng = random.Random(self._loss_sampling_seed * 1000003 + int(self.global_step))
+        return rng.random() < self._chat_loss_prob
 
     def _capture_encoder_output(self, _module, _args, output) -> None:
         """Stash the Conformer's ``(B, D, T)`` output and its lengths."""
@@ -190,7 +222,7 @@ class JointChatScriptModel(ScriptSTTModel):
         self._cap_enc = self._cap_enc_len = None
 
         chunk = int(batch.chunk_size)
-        if chunk >= self._script_min_chunk:
+        if not self._chat_only_step(chunk):
             out = super()._training_step_inner(batch, batch_idx)
             script_loss = out["loss"]
         else:
@@ -205,12 +237,20 @@ class JointChatScriptModel(ScriptSTTModel):
             out, script_loss = {}, None
         self._script_ran = script_loss is not None
 
-        chat_loss = self._chat_loss(batch)
-        loss = (
-            self.chat_loss_weight * chat_loss
-            if script_loss is None
-            else script_loss + self.chat_loss_weight * chat_loss
-        )
+        # Under sampling the batch trains exactly one head, so a SCRIPT step skips the
+        # CHAT loss entirely -- that is where the memory saving comes from. The CHAT
+        # head then gets no gradient this step; _allreduce_grads materialises zeros for
+        # it, so the collective count stays rank-invariant.
+        if script_loss is not None and self._loss_sampling:
+            chat_loss = None
+            loss = script_loss
+        else:
+            chat_loss = self._chat_loss(batch)
+            loss = (
+                self.chat_loss_weight * chat_loss
+                if script_loss is None
+                else script_loss + self.chat_loss_weight * chat_loss
+            )
 
         # Only when the WER decode is actually due; holding these every step would
         # pin a (B, D, T) tensor for the whole run for nothing.
@@ -221,7 +261,9 @@ class JointChatScriptModel(ScriptSTTModel):
         else:
             self._train_enc = self._train_enc_len = None
 
-        logs = {"train_loss_chat": chat_loss.detach(), "train_loss_joint": loss.detach()}
+        logs = {"train_loss_joint": loss.detach()}
+        if chat_loss is not None:
+            logs["train_loss_chat"] = chat_loss.detach()
         if script_loss is not None:
             # Omitted rather than zeroed on CHAT-only steps: a 0 would read as a
             # perfectly-fit SCRIPT head instead of an absent one.

@@ -191,6 +191,9 @@ BUCKET_BATCH_SIZE="${BUCKET_BATCH_SIZE:-[38,29,25,22,20,18,17,15,14,13,12,11,10,
 CHUNK_SIZES="${CHUNK_SIZES:-[2,7,14,28]}"
 # SCRIPT trains only at chunks >= this; smaller draws are CHAT-only steps.
 SCRIPT_MIN_CHUNK="${SCRIPT_MIN_CHUNK:-7}"
+# One head per batch (sampled per step) instead of summing both losses.
+LOSS_SAMPLING="${LOSS_SAMPLING:-true}"
+CHAT_LOSS_PROB="${CHAT_LOSS_PROB:-0.5}"
 # val_chunk_size must stay a single int and match the train chunk here.
 VAL_CHUNK_SIZE="${VAL_CHUNK_SIZE:-14}"
 # Scalar fallback only; BAND_BY_CHUNK below is what actually applies.
@@ -422,6 +425,8 @@ echo "*******STARTING********" \
     data.dataset.punctuation_prob=${PUNCT_PROB} \
     ++model.chat_loss_weight=${CHAT_LOSS_WEIGHT} \
     ++model.script_min_chunk_size=${SCRIPT_MIN_CHUNK} \
+    ++model.loss_sampling=${LOSS_SAMPLING} \
+    ++model.chat_loss_prob=${CHAT_LOSS_PROB} \
     ++model.activation_checkpointing=${ACT_CKPT} \
     ++model.attn_backend=${ATTN_BACKEND} \
     data.dataset.num_delay_frames=${DELAY} \
