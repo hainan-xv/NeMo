@@ -309,8 +309,15 @@ class JointChatScriptModel(ScriptSTTModel):
         # Same cadence and same bounded sample as SCRIPT's training_batch_wer, and
         # on the SAME frames this step already encoded -- so the two numbers differ
         # only by the head that decoded them.
+        # global_step is POST-increment here (the optimizer stepped between
+        # training_step and now), so this uses the same convention as SCRIPT's
+        # _maybe_log_training_wer. The stash in _training_step_inner sees the
+        # PRE-increment value and so tests (global_step + 1); the two line up on
+        # the same batch. Testing (global_step + 1) in both places -- which is
+        # what this did at first -- puts them one step apart, and the decode then
+        # never finds a stashed tensor, so the metric never appears at all.
         every = int(getattr(self.core_cfg, "train_wer_every_n_steps", 0) or 0)
-        if every <= 0 or (self.global_step + 1) % every != 0:
+        if every <= 0 or self.global_step == 0 or self.global_step % every != 0:
             return
         enc, enc_len = self._train_enc, self._train_enc_len
         if enc is None or enc_len is None or batch.cuts is None:
