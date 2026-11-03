@@ -640,7 +640,6 @@ class ScriptSTTModel(StreamingSTTModel):
                 llm.set_attn_implementation(prev)
 
     @staticmethod
-    @staticmethod
     def _script_mask_mod_local(batch: ScriptBatch, bidirectional_audio: bool = False):
         """The SCRIPT rule with audio confined to its OWN modality.
 
@@ -689,6 +688,7 @@ class ScriptSTTModel(StreamingSTTModel):
 
         return mask_mod
 
+    @staticmethod
     def _script_mask_mod(batch: ScriptBatch, bidirectional_audio: bool = False):
         """The SCRIPT rule as a FlexAttention predicate.
 

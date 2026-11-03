@@ -29,6 +29,7 @@ from lightning.pytorch import Trainer
 from omegaconf import DictConfig, OmegaConf, open_dict
 
 from nemo.collections.speechlm2 import DataModule, ScriptSTTDataset, ScriptSTTModel
+from nemo.collections.speechlm2.models.joint_chat_script_model import JointChatScriptModel
 from nemo.collections.speechlm2.models.twostream_model import TwoStreamSTTModel
 from nemo.core.config import hydra_runner
 from nemo.utils import logging
@@ -164,7 +165,15 @@ def train(cfg):
         # TWO-STREAM opt-in. Same data path and same lattice; the difference is
         # that text and audio meet only in the LLM's final layer(s), so the band
         # selects lattice cells instead of adding packed segments.
-        _cls = TwoStreamSTTModel if bool(cfg.model.get("two_stream", False)) else ScriptSTTModel
+        # JOINT CHAT+SCRIPT opt-in. A `model.chat` block mounts a CHAT transducer
+        # head on the SAME encoder; both losses are summed on every step and the
+        # per-batch chunk draw drives the latency of both.
+        if cfg.model.get("chat", None) is not None:
+            _cls = JointChatScriptModel
+        elif bool(cfg.model.get("two_stream", False)):
+            _cls = TwoStreamSTTModel
+        else:
+            _cls = ScriptSTTModel
         logging.info("Instantiating %s", _cls.__name__)
         model = _cls(
             OmegaConf.to_container(cfg.model, resolve=True),
