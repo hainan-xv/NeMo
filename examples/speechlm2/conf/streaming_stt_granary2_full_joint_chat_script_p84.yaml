@@ -38,12 +38,13 @@ model:
   # Lookaheads for the JOINT model. 42 is dropped so both heads train on the
   # same four points. Every one divides att_context_size[0]=84, which
   # `chunked_limited` masking requires (left % (right+1) == 0).
-  # chunk 2 REMOVED. It produces ~7x the branches of chunk 14 for the same audio
-  # while bucket_batch_size is keyed on duration only, and it maximises the chunk
-  # count T -- so the CHAT joint's ~B*T*W*151670 logits land hardest exactly where
-  # SCRIPT was already closest to the edge. Job 21239593 died on a backward-pass
-  # CUDA OOM at chunk_size=2, which the OOM guard does not recover by design.
-  chunk_size: [7, 14, 28]   # multi chunk-size: one drawn per batch
+  # chunk 2 is trained by the CHAT head ONLY (see script_min_chunk_size). The draw
+  # is still shared, so the encoder sees chunk-2 look-ahead and CHAT gets real
+  # chunk-2 supervision; SCRIPT's packed forward -- the thing that OOM'd in
+  # backward on job 21239593 -- is what sits out.
+  chunk_size: [2, 7, 14, 28]   # multi chunk-size: one drawn per batch
+  # SCRIPT trains only at chunks >= this. 0 disables the split.
+  script_min_chunk_size: 7
   # Left context 84, NOT 70. The Conformer's chunked_limited check requires
   #   att_context_size[0] % (att_context_size[1] + 1) == 0
   # and the right context is set per batch to chunk_size - 1, so the left

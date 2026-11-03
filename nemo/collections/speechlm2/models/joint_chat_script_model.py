@@ -52,6 +52,7 @@ from nemo.collections.asr.models.chat_bpe_models import EncDecCHATBPEModel
 from nemo.collections.speechlm2.data.script_dataset import ScriptBatch, ScriptSTTDataset
 from nemo.collections.speechlm2.models.script_model import ScriptSTTModel
 from nemo.collections.speechlm2.parts.metrics.wer import WER
+from nemo.collections.speechlm2.parts.optim_setup import is_frozen
 from nemo.collections.speechlm2.parts.script_prompt import apply_text_style
 from nemo.utils import logging
 
@@ -85,6 +86,16 @@ class JointChatScriptModel(ScriptSTTModel):
             chat_cfg = OmegaConf.create(chat_cfg)
 
         self.chat_loss_weight = float(cfg.get("chat_loss_weight", 1.0))
+        # Chunks BELOW this train the CHAT head only. The chunk draw stays shared, so
+        # the encoder still sees this operating point's look-ahead and CHAT still gets
+        # genuine supervision at it -- only SCRIPT's packed forward sits out.
+        #
+        # WHY SCRIPT AND NOT CHAT. At chunk c the branch count scales as 1/c, so chunk 2
+        # is ~7x chunk 14 for the same audio while bucket_batch_size is keyed on duration
+        # alone. That packed forward is what exhausted memory in job 21239593 -- and the
+        # OOM landed in BACKWARD, which SCRIPT's guard does not recover by design.
+        # CHAT's cost at small chunks grows only through the chunk count T, far cheaper.
+        self._script_min_chunk = int(cfg.get("script_min_chunk_size", 0) or 0)
 
         # ModelPT only builds dataloaders when these are present; the joint model
         # drives data from the SCRIPT side, so refuse a config that would make the
@@ -127,6 +138,7 @@ class JointChatScriptModel(ScriptSTTModel):
         # on_train_batch_end (by which time backward has freed the graph).
         self._train_enc = None
         self._train_enc_len = None
+        self._script_ran = True
 
     def _capture_encoder_output(self, _module, _args, output) -> None:
         """Stash the Conformer's ``(B, D, T)`` output and its lengths."""
@@ -177,11 +189,28 @@ class JointChatScriptModel(ScriptSTTModel):
         # rather than pointing at the missing capture.
         self._cap_enc = self._cap_enc_len = None
 
-        out = super()._training_step_inner(batch, batch_idx)
-        script_loss = out["loss"]
+        chunk = int(batch.chunk_size)
+        if chunk >= self._script_min_chunk:
+            out = super()._training_step_inner(batch, batch_idx)
+            script_loss = out["loss"]
+        else:
+            # CHAT-only step. Run the shared encoder (WITH grad -- this is the whole
+            # point) and skip SCRIPT's packed forward entirely.
+            for m in (self.perception.preprocessor, self.perception.encoder, self.llm):
+                if is_frozen(m):
+                    m.eval()
+            self._set_encoder_att_context(chunk, first_chunk_size=getattr(batch, "first_chunk_size", None))
+            self._last_chunk_size = chunk
+            self.perception(input_signal=batch.audios, input_signal_length=batch.audio_lens)
+            out, script_loss = {}, None
+        self._script_ran = script_loss is not None
 
         chat_loss = self._chat_loss(batch)
-        loss = script_loss + self.chat_loss_weight * chat_loss
+        loss = (
+            self.chat_loss_weight * chat_loss
+            if script_loss is None
+            else script_loss + self.chat_loss_weight * chat_loss
+        )
 
         # Only when the WER decode is actually due; holding these every step would
         # pin a (B, D, T) tensor for the whole run for nothing.
@@ -192,14 +221,12 @@ class JointChatScriptModel(ScriptSTTModel):
         else:
             self._train_enc = self._train_enc_len = None
 
-        self.log_dict(
-            {
-                "train_loss_script": script_loss.detach(),
-                "train_loss_chat": chat_loss.detach(),
-                "train_loss_joint": loss.detach(),
-            },
-            on_step=True,
-        )
+        logs = {"train_loss_chat": chat_loss.detach(), "train_loss_joint": loss.detach()}
+        if script_loss is not None:
+            # Omitted rather than zeroed on CHAT-only steps: a 0 would read as a
+            # perfectly-fit SCRIPT head instead of an absent one.
+            logs["train_loss_script"] = script_loss.detach()
+        self.log_dict(logs, on_step=True)
         out["loss"] = loss
         return out
 
@@ -232,7 +259,11 @@ class JointChatScriptModel(ScriptSTTModel):
         return self._cap_enc, self._cap_enc_len
 
     def on_train_batch_end(self, outputs, batch, batch_idx: int) -> None:
-        super().on_train_batch_end(outputs, batch, batch_idx)
+        # SCRIPT's training_batch_wer is a real decode. On a CHAT-only step SCRIPT
+        # never saw this chunk size, so that decode would report an operating point
+        # the model is not trained for and drag the curve around for no reason.
+        if getattr(self, "_script_ran", True):
+            super().on_train_batch_end(outputs, batch, batch_idx)
         # Same cadence and same bounded sample as SCRIPT's training_batch_wer, and
         # on the SAME frames this step already encoded -- so the two numbers differ
         # only by the head that decoded them.
