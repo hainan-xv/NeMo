@@ -188,7 +188,7 @@ CREATE_WANDB="${CREATE_WANDB:-true}"
 MAX_DURATION="${MAX_DURATION:-20}"
 BUCKET_BINS="${BUCKET_BINS:-[4.32,6.0,7.04,7.92,8.8,9.6,10.4,11.12,11.89,12.66,13.47,14.8,16.92,20.0]}"
 BUCKET_BATCH_SIZE="${BUCKET_BATCH_SIZE:-[38,29,25,22,20,18,17,15,14,13,12,11,10,8]}"
-CHUNK_SIZES="${CHUNK_SIZES:-[2,7,14,28]}"
+CHUNK_SIZES="${CHUNK_SIZES:-[7,14,28]}"
 # val_chunk_size must stay a single int and match the train chunk here.
 VAL_CHUNK_SIZE="${VAL_CHUNK_SIZE:-14}"
 # Scalar fallback only; BAND_BY_CHUNK below is what actually applies.
