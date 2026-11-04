@@ -36,9 +36,19 @@ MYDIR=${LUSTRE}/hainanx
 CONTAINER="${CONTAINER:-${HEH}/containers/nemo-26.02-streaming-speechlm.sqsh}"
 CODE_DIR="${CODE_DIR:-${MYDIR}/NeMo_SCRIPT_cc}"
 RUN=dfw_joint_chat_script_p84_summed
-CKPT_SRC="${CKPT_SRC:-${MYDIR}/results/SpeechlmDFW/${RUN}/${RUN}/checkpoints/step=60000-val_wer=0.1091-last.ckpt}"
+# Resolve the NEWEST checkpoint at run time. Hard-coding a "-last.ckpt" name
+# does not work against a live run: that file is renamed at every validation
+# as the step changes, so a pinned name goes stale within minutes (job
+# 21277913 died on exactly that, 12s in).
+CKPT_DIR=${MYDIR}/results/SpeechlmDFW/${RUN}/${RUN}/checkpoints
+CKPT_SRC="${CKPT_SRC:-$(ls -t ${CKPT_DIR}/*.ckpt 2>/dev/null | grep -v unfinished | head -1)}"
+if [[ -z "${CKPT_SRC}" || ! -f "${CKPT_SRC}" ]]; then
+    echo "ERROR: no checkpoint found under ${CKPT_DIR}" >&2; exit 1
+fi
 SNAP_DIR=${MYDIR}/grad_balance
-CKPT=${SNAP_DIR}/step60000_snapshot.ckpt
+# Snapshot name carries the source name, so a later step does not silently
+# reuse an earlier snapshot.
+CKPT=${SNAP_DIR}/$(basename "${CKPT_SRC}" .ckpt)__snapshot.ckpt
 CONFIG=/code/examples/speechlm2/conf/streaming_stt_granary2_full_joint_chat_script_p84.yaml
 VAL_MANIFEST=${HEH}/data/mcv11_en_dev_aligned/mcv11_dev_clean_pcstrip_en_2k_qwen_aligned.json
 
