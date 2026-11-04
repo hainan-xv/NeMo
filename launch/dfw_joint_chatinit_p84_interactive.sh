@@ -33,6 +33,13 @@
 # encoder was ~3000x weaker than SCRIPT's at init, and val_wer_chat was still
 # 0.665 at step 60k against SCRIPT's 0.109. Seeding it removes that asymmetry.
 #
+# LOSS-SIDE ALIGNMENT. The donor was trained with delay 0, target_construction
+# 'partition' and delay_word_final_punctuation on. Scoring its head under our
+# defaults (delay 3, 'legacy', off) would shift every word's chunk assignment
+# and change the target tokens, so the seeded transducer would start by
+# fighting the objective. The delay moves on BOTH sides -- SCRIPT's
+# delay_candidates too -- because the two heads must score one alignment.
+#
 # The encoder TRAINS from step 0 (not frozen). That is the deliberate risk here:
 # SCRIPT's projector is random, so its early gradients are large and will pull
 # the encoder off the CHAT-tuned representation we just imported. Whether that
@@ -177,7 +184,7 @@ LR="${LR:-1e-4}"
 # ---------------------------------------------------------------------------
 
 VAL_CHECK_INTERVAL="${VAL_CHECK_INTERVAL:-2000}"
-DELAY="${DELAY:-3}"
+DELAY="${DELAY:-0}"   # donor is *_nodelay_v2: trained with delay 0
 WARMUP_STEPS="${WARMUP_STEPS:-10000}"
 # wandb logging. Training does NOT need it: val_wer lives in checkpoint
 # FILENAMES, not in wandb, so a run with this off loses live curves only.
@@ -269,7 +276,7 @@ VAL_MAX_NEW_TOKENS="${VAL_MAX_NEW_TOKENS:-24}"
 # A SINGLE delay: the prompt states cap, punct and one delay, and never the
 # chunk size. Naming the chunk size makes two operating points diverge at that
 # digit and destroys the shared KV prefix self-correction depends on.
-DELAY_CANDIDATES="${DELAY_CANDIDATES:-[3]}"
+DELAY_CANDIDATES="${DELAY_CANDIDATES:-[0]}"
 CAP_PROB="${CAP_PROB:-0.5}"
 PUNCT_PROB="${PUNCT_PROB:-0.5}"
 CHAT_LOSS_WEIGHT="${CHAT_LOSS_WEIGHT:-1.0}"
@@ -443,6 +450,10 @@ echo "*******STARTING********" \
     ++model.chat_loss_weight=${CHAT_LOSS_WEIGHT} \
     ++model.script_min_chunk_size=${SCRIPT_MIN_CHUNK} \
     ++init_chat_from_nemo=${CHAT_DONOR} \
+    ++model.chat.forced_alignment.num_delay_frames=0 \
+    ++model.chat.forced_alignment.target_construction=partition \
+    ++model.chat.forced_alignment.delay_word_final_punctuation=true \
+    ++model.val_num_delay_frames=0 \
     ++model.loss_sampling=${LOSS_SAMPLING} \
     ++model.chat_loss_prob=${CHAT_LOSS_PROB} \
     ++model.activation_checkpointing=${ACT_CKPT} \

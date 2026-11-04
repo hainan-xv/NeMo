@@ -70,7 +70,62 @@ def _init_from_chat_nemo(model, path: str) -> None:
         if not members:
             raise ValueError(f"{path} contains no model_weights.ckpt (members: {tf.getnames()[:8]})")
         donor = torch.load(io.BytesIO(tf.extractfile(members[0]).read()), map_location="cpu", weights_only=False)
+        cfg_members = [n for n in tf.getnames() if n.endswith("model_config.yaml")]
+        donor_cfg = (
+            OmegaConf.load(io.StringIO(tf.extractfile(cfg_members[0]).read().decode())) if cfg_members else None
+        )
     donor = donor.get("state_dict", donor)
+
+    # ADOPT THE DONOR'S FEATURE NORMALISATION ALONG WITH ITS ENCODER.
+    #
+    # The perception block carries no preprocessor of its own, so setup_perception
+    # inherits one from `pretrained_asr` (nemotron-0.6b, normalize='NA'). The CHAT
+    # donor was trained on 'per_feature'-normalised log-mel. Seeding its encoder
+    # while feeding it nemotron's features produced an encoder output that differed
+    # from the donor's own by as much as the signal itself (mean |diff| 3.3e-2 vs
+    # mean |x| 3.4e-2), so a 0.082-WER donor decoded '' or 'Uh-huh.'.
+    #
+    # Nothing errored: frame counts and every tensor shape matched exactly. The
+    # encoder and the features it expects have to travel together.
+    want = None if donor_cfg is None else donor_cfg.get("preprocessor", {}).get("normalize", None)
+    if want is not None:
+        feat = getattr(model.perception.preprocessor, "featurizer", None)
+        have = getattr(feat, "normalize", None)
+        if feat is None:
+            raise ValueError("perception.preprocessor has no featurizer; cannot align feature normalisation")
+        if have != want:
+            logging.warning(
+                "init_chat_from_nemo: feature normalisation %r -> %r to match the donor's encoder", have, want
+            )
+            feat.normalize = want
+
+    # ALIGN xscaling TOO, for the same reason and with sharper teeth.
+    #
+    # xscaling multiplies the encoder input by sqrt(d_model) inside the positional
+    # encoding. The donor trained with it ON; nemotron-0.6b (which builds our
+    # perception encoder) has it OFF. That is a 32x scale difference entering
+    # layer 0 -- with byte-identical weights and byte-identical features, the
+    # donor's own layer-0 output differed from ours by 90% of the signal, while
+    # pre_encode (which runs BEFORE the positional encoding) matched exactly.
+    #
+    # Nothing about this is visible in a shape check or a state_dict diff: xscale
+    # is a plain float attribute, not a parameter.
+    if donor_cfg is not None:
+        import math
+
+        enc = model.perception.encoder
+        d_model = int(donor_cfg.encoder.get("d_model", getattr(enc, "d_model", 0)) or 0)
+        want_x = math.sqrt(d_model) if bool(donor_cfg.encoder.get("xscaling", False)) and d_model else None
+        pos_enc = getattr(enc, "pos_enc", None)
+        if pos_enc is None:
+            raise ValueError("perception.encoder has no pos_enc; cannot align xscaling with the donor")
+        have_x = getattr(pos_enc, "xscale", None)
+        if (have_x is None) != (want_x is None) or (
+            have_x is not None and want_x is not None and abs(have_x - want_x) > 1e-6
+        ):
+            logging.warning("init_chat_from_nemo: pos_enc.xscale %r -> %r to match the donor's encoder", have_x, want_x)
+            pos_enc.xscale = want_x
+            enc.xscale = want_x
 
     groups = {"encoder.": "perception.encoder.", "decoder.": "chat.decoder.", "joint.": "chat.joint."}
     own = model.state_dict()
