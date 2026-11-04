@@ -39,6 +39,79 @@ from nemo.utils.trainer_utils import resolve_trainer_cfg
 torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 
 
+def _init_from_chat_nemo(model, path: str) -> None:
+    """Seed the SHARED encoder and the CHAT head from a trained CHAT ``.nemo``.
+
+    The joint model otherwise starts its 203M CHAT head from random, which is the
+    asymmetry the measurements kept running into: at init the CHAT loss pushed on
+    the shared encoder ~3000x more weakly than SCRIPT's, and val_wer_chat was still
+    0.665 at step 60k while SCRIPT sat at 0.109. A trained donor gives the
+    transducer a real starting point AND hands the shared encoder a representation
+    that already serves the CHAT objective.
+
+    Mapping (the donor is a plain EncDecCHATBPEModel, so its top-level groups line
+    up one-for-one with ours):
+
+        encoder.*  ->  perception.encoder.*     the SHARED encoder
+        decoder.*  ->  chat.decoder.*           RNNT prediction network
+        joint.*    ->  chat.joint.*             RNNT attention joint
+
+    SCRIPT's own stack is deliberately NOT touched: its LLM stays at base Qwen3 and
+    its projector stays random, so the only thing it inherits is the encoder.
+
+    Applied AFTER construction, so it overwrites the nemotron donor that
+    setup_perception loaded.
+    """
+    import io
+    import tarfile
+
+    with tarfile.open(path) as tf:
+        members = [n for n in tf.getnames() if n.endswith("model_weights.ckpt")]
+        if not members:
+            raise ValueError(f"{path} contains no model_weights.ckpt (members: {tf.getnames()[:8]})")
+        donor = torch.load(io.BytesIO(tf.extractfile(members[0]).read()), map_location="cpu", weights_only=False)
+    donor = donor.get("state_dict", donor)
+
+    groups = {"encoder.": "perception.encoder.", "decoder.": "chat.decoder.", "joint.": "chat.joint."}
+    own = model.state_dict()
+    remapped, skipped = {}, []
+    counts = {g: 0 for g in groups}
+    for k, v in donor.items():
+        for src, dst in groups.items():
+            if k.startswith(src):
+                nk = dst + k[len(src) :]
+                if nk not in own:
+                    skipped.append((nk, "absent from model"))
+                elif own[nk].shape != v.shape:
+                    skipped.append((nk, f"shape {tuple(v.shape)} vs {tuple(own[nk].shape)}"))
+                else:
+                    remapped[nk] = v
+                    counts[src] += 1
+                break
+
+    # A group matching ZERO tensors means the donor is not the model we think it is,
+    # and load_state_dict(strict=False) would accept that silently -- training would
+    # then run from random weights under a name that says otherwise.
+    empty = [g for g, c in counts.items() if c == 0]
+    if empty:
+        raise ValueError(
+            f"init_chat_from_nemo matched no tensors for group(s) {empty} in {path}. "
+            f"Donor top-level prefixes: {sorted({k.split('.')[0] for k in donor})}"
+        )
+
+    model.load_state_dict(remapped, strict=False)
+    logging.info(
+        "init_chat_from_nemo: %s -> encoder %d, chat.decoder %d, chat.joint %d (%d skipped)",
+        path,
+        counts["encoder."],
+        counts["decoder."],
+        counts["joint."],
+        len(skipped),
+    )
+    for nk, why in skipped[:10]:
+        logging.warning("init_chat_from_nemo: skipped %s (%s)", nk, why)
+
+
 def _init_from_ckpt(model, path: str) -> None:
     """Load WEIGHTS ONLY from a training checkpoint, discarding optimizer state.
 
@@ -187,6 +260,10 @@ def train(cfg):
         ScriptSTTDataset(cfg=val_dataset_cfg, tokenizer=model.tokenizer) if val_dataset_cfg is not None else None
     )
     datamodule = DataModule(cfg.data, tokenizer=model.tokenizer, dataset=dataset, val_dataset=val_dataset)
+
+    chat_nemo = cfg.get("init_chat_from_nemo", None)
+    if chat_nemo:
+        _init_from_chat_nemo(model, str(chat_nemo))
 
     init_ckpt = cfg.get("init_from_ckpt", None)
     if init_ckpt:
