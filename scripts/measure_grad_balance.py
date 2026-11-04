@@ -24,6 +24,11 @@ def main():
     ap.add_argument("--chunks", default="7,14,28")
     ap.add_argument("--batches", type=int, default=3)
     ap.add_argument("--batch_size", type=int, default=4)
+    ap.add_argument("--chat_donor", default=None,
+                    help="Apply init_chat_from_nemo FIRST, so pos_enc.xscale and feature "
+                         "normalisation match the run. These are plain attributes, not "
+                         "parameters, so a checkpoint does NOT carry them -- loading weights "
+                         "without them reproduces the very bug this measures around.")
     ap.add_argument("--overrides", nargs="*", default=[],
                     help="OmegaConf dotlist, to match what the launcher overrode at train time")
     args = ap.parse_args()
@@ -40,6 +45,12 @@ def main():
     # it off. It changes memory, not gradients.
     cfg.model.activation_checkpointing = False
     model = JointChatScriptModel(OmegaConf.to_container(cfg.model, resolve=True)).cuda()
+
+    if args.chat_donor:
+        import sys as _sys
+        _sys.path.insert(0, "/code/examples/speechlm2")
+        from script_train import _init_from_chat_nemo
+        _init_from_chat_nemo(model, args.chat_donor)
 
     sd = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     sd = sd.get("state_dict", sd)
