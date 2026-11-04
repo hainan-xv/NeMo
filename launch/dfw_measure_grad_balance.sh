@@ -73,6 +73,7 @@ export PYTHONPATH="/code/.:\${PYTHONPATH}" \
     --overrides model.attn_backend=dense model.prompt_include_chunk_size=false \
                 data.dataset.prompt_include_chunk_size=false \
                 model.pretrained_llm=${HEH}/pretrained_models/huggingface/Qwen/Qwen3-1.7B \
+                model.pretrained_asr=${HEH}/pretrained_models/huggingface/nvidia/nemotron-speech-streaming-en-0.6b/nemotron-speech-streaming-en-0.6b.nemo \
                 model.chat.tokenizer.dir=${HEH}/pretrained_models/huggingface/Qwen/Qwen3-1.7B
 EOF
 srun --container-image="$CONTAINER" $MOUNTS bash -c "${cmd}"
