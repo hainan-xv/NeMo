@@ -212,6 +212,22 @@ class JointChatScriptModel(ScriptSTTModel):
         if isinstance(output, (tuple, list)) and len(output) >= 2:
             self._cap_enc, self._cap_enc_len = output[0], output[1]
 
+    def _encoder_frame_chunk(self, llm_chunk: int) -> int:
+        """Convert an LLM-frame chunk count into ENCODER frames.
+
+        The CHAT head consumes the encoder's own output (80 ms frames), while
+        batch.chunk_size counts LLM audio positions. With an identity modality
+        adapter those units coincide and the distinction is invisible; with a
+        StackingConnector of factor f they differ by exactly f.
+
+        Getting this wrong is silent: CHAT simply runs at a chunk size it was
+        never trained for. At factor 2 it cost 0.084 -> 0.120 val_wer_chat,
+        because the head was being asked to emit on a 0.56 s grid while the
+        encoder's right context was still 1.12 s.
+        """
+        f = int(getattr(self.perception.modality_adapter, "subsampling_factor", 1) or 1)
+        return int(llm_chunk) * f
+
     def _chat_loss(self, batch: ScriptBatch) -> Optional[torch.Tensor]:
         """Banded transducer loss on the frames the SCRIPT step just encoded."""
         enc, enc_len = self._cap_enc, self._cap_enc_len
@@ -227,7 +243,7 @@ class JointChatScriptModel(ScriptSTTModel):
         # Same latency as the SCRIPT branch this step. `_set_encoder_att_context`
         # has already pinned the encoder's look-ahead to `chunk - 1`; this pins
         # the transducer's chunking to the identical grid.
-        self.chat.joint.chunk_size = int(batch.chunk_size)
+        self.chat.joint.chunk_size = self._encoder_frame_chunk(batch.chunk_size)
         return self.chat._banded_loss(enc, enc_len, batch.cuts)
 
     def _training_step_inner(self, batch: ScriptBatch, batch_idx: int):
@@ -313,7 +329,7 @@ class JointChatScriptModel(ScriptSTTModel):
 
     def _chat_decode(self, enc, enc_len, chunk: int) -> List[str]:
         """Greedy CHAT decode of ``(B, D, T)`` encoder frames into strings."""
-        self.chat.joint.chunk_size = int(chunk)
+        self.chat.joint.chunk_size = self._encoder_frame_chunk(chunk)
         with torch.no_grad():
             out = self.chat.decoding.rnnt_decoder_predictions_tensor(
                 encoder_output=enc, encoded_lengths=enc_len, return_hypotheses=False
