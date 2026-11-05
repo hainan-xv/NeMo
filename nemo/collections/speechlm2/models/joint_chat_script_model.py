@@ -107,6 +107,41 @@ class JointChatScriptModel(ScriptSTTModel):
         # activations AND the CHAT joint's ~B*T*W*151670 logits at once; that is what
         # OOM'd in BACKWARD on jobs 21239593 and 21241337, which SCRIPT's guard does
         # not recover by design. Sampling makes the peak the max of the two, not the sum.
+        # FEATURE/SCALE SETTINGS AS CONFIG, NOT RUNTIME PATCHES.
+        #
+        # When the encoder is seeded from a CHAT donor it must also use that donor's
+        # feature normalisation and xscaling. Those live on the modules as plain
+        # attributes (featurizer.normalize, pos_enc.xscale) and are NOT in the
+        # state_dict -- so a checkpoint does not carry them, and any later rebuild
+        # (eval, averaging, export) silently reverts to the perception donor's
+        # values. Weights trained at xscale=32 then run at xscale=None, which is
+        # exactly the failure that made a 0.082-WER head decode ''.
+        #
+        # Recording them in cfg puts them in hyper_parameters, so every rebuild
+        # restores them automatically.
+        enc_norm = cfg.get("encoder_feature_norm", None)
+        if enc_norm is not None:
+            feat = getattr(self.perception.preprocessor, "featurizer", None)
+            if feat is None:
+                raise ValueError("encoder_feature_norm set but perception.preprocessor has no featurizer")
+            if feat.normalize != enc_norm:
+                logging.info("JointChatScriptModel: feature normalisation %r -> %r", feat.normalize, enc_norm)
+            feat.normalize = enc_norm
+
+        enc_xscaling = cfg.get("encoder_xscaling", None)
+        if enc_xscaling is not None:
+            import math as _math
+
+            pos_enc = getattr(self.perception.encoder, "pos_enc", None)
+            if pos_enc is None:
+                raise ValueError("encoder_xscaling set but perception.encoder has no pos_enc")
+            d_model = int(getattr(self.perception.encoder, "d_model", 0) or 0)
+            want = _math.sqrt(d_model) if bool(enc_xscaling) and d_model else None
+            if getattr(pos_enc, "xscale", None) != want:
+                logging.info("JointChatScriptModel: pos_enc.xscale %r -> %r", getattr(pos_enc, "xscale", None), want)
+            pos_enc.xscale = want
+            self.perception.encoder.xscale = want
+
         self._loss_sampling = bool(cfg.get("loss_sampling", False))
         self._chat_loss_prob = float(cfg.get("chat_loss_prob", 0.5))
         self._loss_sampling_seed = int(cfg.get("loss_sampling_seed", 1234))

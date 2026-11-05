@@ -96,6 +96,7 @@ def load_model(
     prompt_control: bool = False,
     pretrained_llm: str = "",
     pretrained_asr: str = "",
+    cfg_overrides: "list[str] | None" = None,
 ):
     """Rebuild the model from a Lightning checkpoint's own hyper-parameters.
 
@@ -144,6 +145,31 @@ def load_model(
         mods = sorted({k.split(".")[-4] for k in state_dict if ".lora_A." in k})
         cfg["lora"]["target_modules"] = mods or "all-linear"
         _log(f"    recovered lora.target_modules: {cfg['lora']['target_modules']}")
+
+    # Generic KEY=VALUE config injection, applied LAST so it beats every repair above.
+    #
+    # Needed for settings that live on modules rather than in the state_dict --
+    # notably encoder_feature_norm / encoder_xscaling for a CHAT-seeded joint model.
+    # A checkpoint written before those keys existed carries weights that depend on
+    # them, and rebuilding without them is silent, not an error.
+    for item in cfg_overrides or []:
+        if "=" not in item:
+            raise ValueError(f"--cfg_override expects KEY=VALUE, got {item!r}")
+        k, v = item.split("=", 1)
+        if v.lower() in ("true", "false"):
+            parsed = v.lower() == "true"
+        elif v.lower() in ("none", "null"):
+            parsed = None
+        else:
+            try:
+                parsed = int(v)
+            except ValueError:
+                try:
+                    parsed = float(v)
+                except ValueError:
+                    parsed = v
+        _log(f"    cfg override: {k} = {parsed!r}  (was {cfg.get(k, '<unset>')!r})")
+        cfg[k] = parsed
 
     cls = import_class_by_path(model_class_path)
     model = cls(cfg=cfg)
@@ -331,6 +357,12 @@ def parse_args():
 
     p.add_argument("--ckpt_path", type=str, default=None, help="Lightning .ckpt to evaluate")
     p.add_argument(
+        "--cfg_override",
+        action="append",
+        default=[],
+        help="KEY=VALUE applied to the checkpoint's model cfg before instantiation (repeatable).",
+    )
+    parser.add_argument(
         "--model_class",
         type=str,
         default="nemo.collections.speechlm2.models.script_model.ScriptSTTModel",
@@ -529,6 +561,7 @@ def main() -> int:
         prompt_control=args.prompt_control,
         pretrained_llm=args.pretrained_llm,
         pretrained_asr=args.pretrained_asr,
+        cfg_overrides=args.cfg_override,
     )
     args._chat_model = None
     if getattr(args, "chat_nemo", ""):

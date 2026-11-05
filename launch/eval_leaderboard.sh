@@ -76,6 +76,10 @@ EXP_NAME="${1:-${EXP_NAME:-granary2_script_baseline}}"
 PROJECT="${PROJECT:-SpeechlmScriptCC}"
 EVAL_DRIVER="${EVAL_DRIVER:-script_leaderboard_eval.py}"   # which driver under scripts/
 MODEL_CLASS="${MODEL_CLASS:-nemo.collections.speechlm2.models.script_model.ScriptSTTModel}"
+# Space-separated KEY=VALUE pairs injected into the checkpoint's model cfg.
+# Needed for module-level settings a checkpoint cannot carry (encoder_feature_norm,
+# encoder_xscaling on a CHAT-seeded joint model).
+CFG_OVERRIDES="${CFG_OVERRIDES:-}"
 
 # --- Decode configuration ---
 # The model keys its behaviour on the exact training instruction; any drift here
@@ -428,6 +432,7 @@ ${AVG_CLAUSE} \
       --driver /code/scripts/${EVAL_DRIVER} -- \
         --ckpt_path "${CKPT}" \
         --model_class "${MODEL_CLASS}" \
+        ${CFG_OVERRIDES:+$(for kv in ${CFG_OVERRIDES}; do printf -- "--cfg_override %s " "$kv"; done)} \
         --datasets "${DATASETS_CSV}" \
         --cache_dir "${CACHE_DIR}" \
         --output_dir "${SHARD_DIR}" \
