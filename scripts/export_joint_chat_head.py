@@ -65,9 +65,12 @@ def main():
         cfg = OmegaConf.load(cfg_path)
         if args.tokenizer_dir:
             cfg.tokenizer.dir = args.tokenizer_dir
-        for k in ("train_ds", "validation_ds", "test_ds"):
-            if k in cfg:
-                cfg.pop(k)
+        # KEEP train_ds/validation_ds/test_ds. Stripping them looks like tidying a
+        # config we never train from, but the nemotron eval driver reads
+        # cfg.validation_ds -- without it EVERY batch raises ConfigAttributeError
+        # and the harness emits empty hypotheses, yielding a clean-looking 100.00
+        # WER rather than a crash. The donor .nemo carries these sections and the
+        # standalone CHAT baselines were evaluated from exactly such files.
         OmegaConf.save(cfg, cfg_path)
         print(f"config: xscaling={cfg.encoder.get('xscaling')} "
               f"normalize={cfg.preprocessor.get('normalize')} tokenizer={cfg.tokenizer.dir}")
