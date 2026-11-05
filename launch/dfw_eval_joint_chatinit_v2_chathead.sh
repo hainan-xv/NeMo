@@ -51,7 +51,7 @@ TOPK="${TOPK:-5}"
 
 RUN_DIR="${OUTPUT_PREFIX}/results/${PROJECT}/${ARM}"
 AVG_NEMO="${RUN_DIR}/averaged/top${TOPK}-averaged.nemo"
-mkdir -p "${RUN_DIR}/averaged" "${RUN_DIR}/${ARM}/checkpoints"
+mkdir -p "${RUN_DIR}/averaged"
 
 for f in "$JOINT_CKPT" "$DONOR"; do
     [[ -f "$f" ]] || { echo "ERROR: missing $f" >&2; exit 1; }
@@ -74,16 +74,24 @@ fi
 touch "$AVG_NEMO"
 
 resolve_launch_dir() {
-    [[ -n "${SLURM_SUBMIT_DIR:-}" && -f "${SLURM_SUBMIT_DIR}/launch/eval_chat.sh" ]] && { echo "${SLURM_SUBMIT_DIR}/launch"; return; }
-    [[ -n "${SLURM_SUBMIT_DIR:-}" && -f "${SLURM_SUBMIT_DIR}/eval_chat.sh" ]] && { echo "${SLURM_SUBMIT_DIR}"; return; }
-    [[ -f "${CODE_DIR}/launch/eval_chat.sh" ]] && { echo "${CODE_DIR}/launch"; return; }
-    echo "ERROR: cannot locate eval_chat.sh" >&2; exit 1
+    [[ -n "${SLURM_SUBMIT_DIR:-}" && -f "${SLURM_SUBMIT_DIR}/launch/eval_nemotron.sh" ]] && { echo "${SLURM_SUBMIT_DIR}/launch"; return; }
+    [[ -n "${SLURM_SUBMIT_DIR:-}" && -f "${SLURM_SUBMIT_DIR}/eval_nemotron.sh" ]] && { echo "${SLURM_SUBMIT_DIR}"; return; }
+    [[ -f "${CODE_DIR}/launch/eval_nemotron.sh" ]] && { echo "${CODE_DIR}/launch"; return; }
+    echo "ERROR: cannot locate eval_nemotron.sh" >&2; exit 1
 }
 LAUNCH_DIR="$(resolve_launch_dir)" || exit 1
 
-ARM_EXP_NAME="${ARM}" ARM_MODEL_OVERRIDES="" \
-ARM_CONFIG_NAME="nemotron_chat_transducer_granary2_qwen" \
-ARM_TOKENIZER_DIR="${TOKENIZER_DIR}" \
-TOPK="${TOPK}" FORCE_AVERAGE=0 \
-EVAL_TAG="joint_v2_chathead" FRAME_TRIM=0 \
-    bash "${LAUNCH_DIR}/eval_chat.sh"
+# Call eval_nemotron.sh DIRECTLY rather than going through eval_chat.sh. The
+# latter exists to average a training run's checkpoints and then exec's exactly
+# this with MODEL_PATH set -- but it aborts first if the run directory holds no
+# scored checkpoints, which ours never will: the weights come from a joint
+# checkpoint, not from a CHAT training run. Everything after that guard is the
+# single export below.
+#
+# MODE is left at its default, matching how the standalone CHAT baselines were
+# evaluated; changing it here would make the comparison incommensurable.
+export MODEL_PATH="$AVG_NEMO"
+export EXP_NAME="$ARM"
+export EVAL_TAG="${EVAL_TAG:-joint_v2_chathead}"
+export FRAME_TRIM="${FRAME_TRIM:-0}"
+exec bash "${LAUNCH_DIR}/eval_nemotron.sh"

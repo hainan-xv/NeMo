@@ -362,7 +362,7 @@ def parse_args():
         default=[],
         help="KEY=VALUE applied to the checkpoint's model cfg before instantiation (repeatable).",
     )
-    parser.add_argument(
+    p.add_argument(
         "--model_class",
         type=str,
         default="nemo.collections.speechlm2.models.script_model.ScriptSTTModel",
