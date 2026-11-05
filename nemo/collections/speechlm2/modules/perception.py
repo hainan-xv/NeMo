@@ -270,6 +270,47 @@ class AudioPerceptionModule(NeuralModule, Exportable):
             raise ValueError(f"Unsupported encoder type: {type(self.encoder)}")
 
 
+class StackingConnector(nn.Module):
+    """Concatenate every ``factor`` encoder frames, then project back down.
+
+    The Conformer emits one frame per 80 ms (10 ms hop x 8 subsampling). At that
+    rate neighbouring frames are highly redundant, and the LLM pays full attention
+    cost for each one. Stacking ``factor`` of them and projecting gives the LLM a
+    coarser, denser sequence -- factor x fewer audio positions per chunk -- without
+    touching the encoder, which keeps its own 80 ms resolution and its own
+    look-ahead (see ``encoder_chunk_size``).
+
+    Contract matches the other connectors: ``(B, D, T)`` in, ``(B, out, T//factor)``
+    out, plus the divided lengths. ``subsampling_factor`` is read by
+    :attr:`AudioPerceptionModule.token_equivalent_duration`, so the rest of the
+    stack accounts for the longer frames automatically rather than being told twice.
+    """
+
+    def __init__(self, d_model: int, factor: int = 2, output_dim: int | None = None):
+        super().__init__()
+        if factor < 1:
+            raise ValueError(f"StackingConnector factor must be >= 1, got {factor}")
+        self.subsampling_factor = int(factor)
+        self.d_model = int(output_dim or d_model)
+        self.proj = nn.Linear(int(d_model) * self.subsampling_factor, self.d_model)
+
+    def forward(self, audio_signal: torch.Tensor, length: torch.Tensor):
+        f = self.subsampling_factor
+        if f == 1:
+            return audio_signal, length
+        b, d, t = audio_signal.shape
+        pad = (-t) % f
+        if pad:
+            # Right-pad with zeros so the final partial group survives. Dropping it
+            # instead would silently lose up to factor-1 frames of every utterance,
+            # and the lengths below would then disagree with the tensor.
+            audio_signal = torch.nn.functional.pad(audio_signal, (0, pad))
+        x = audio_signal.transpose(1, 2).reshape(b, -1, d * f)
+        x = self.proj(x)
+        out_len = torch.div(length + f - 1, f, rounding_mode="floor")
+        return x.transpose(1, 2), out_len
+
+
 class IdentityConnector(nn.Module):
     """User to pass encoder's representations as-is to the LLM."""
 
