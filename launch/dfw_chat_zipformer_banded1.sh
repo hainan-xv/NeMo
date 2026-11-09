@@ -44,6 +44,13 @@
 # SwooshL/SwooshR definitions. Forward maths is identical; backward goes through
 # autograd rather than k2's fused kernel, costing memory and a little speed.
 #
+# DDP find_unused_parameters=True (set in the config, not here). Zipformer skips
+# layers and masks channels at random during training -- encoder_unmasked_dim plus
+# the warmup bypass schedule -- so on any given step some parameters genuinely do
+# not reach the loss. Lightning's default (False) raises on step 2. icefall never
+# hits this because it does not use Lightning's DDP. The cost is a graph traversal
+# per step; the alternative is not training at all.
+#
 # NOT PORTED: ScaledAdam. Upstream reports material degradation without it, so
 # this run is Zipformer-the-architecture on NeMo's optimizer, not the full
 # upstream recipe. Treat a poor result as inconclusive on that axis.
