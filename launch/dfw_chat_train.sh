@@ -153,7 +153,14 @@ read_required_token() {
 WANDB="$(read_required_token "$HOME/.wandb_token")"
 HF_TOKEN="$(read_required_token "$HOME/.hf_token")"
 
-MOUNTS="--container-mounts=${CODE_DIR}:/code,${RESULTS_DIR}:/results,${HFCACHE}:/hfcache,${LUSTRE}:${LUSTRE},${DATA_ROOT}:${DATA_ROOT}"
+# nemotron/users holds heh's sharded manifests, which the granary input_cfg
+# references by absolute path. Without this mount the shards are invisible
+# INSIDE the container while being plainly present on lustre, so the
+# DataLoader workers die on FileNotFoundError and the trainer then hangs at
+# "Epoch 0: 0/2000" forever -- RUNNING in squeue, doing nothing. Job 21598854
+# sat like that for 19 minutes. Same mount the SCRIPT launchers already add.
+NEMO_USERS="${NEMO_USERS:-/lustre/fsw/portfolios/nemotron/users}"
+MOUNTS="--container-mounts=${CODE_DIR}:/code,${RESULTS_DIR}:/results,${HFCACHE}:/hfcache,${LUSTRE}:${LUSTRE},${DATA_ROOT}:${DATA_ROOT},${NEMO_USERS}:${NEMO_USERS}"
 
 # Do NOT enable xtrace: the command below contains expanded token values.
 BUCKET_BATCH_CLAUSE=""
