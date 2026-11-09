@@ -206,15 +206,30 @@ class ZipformerEncoder(NeuralModule):
         if length is None:
             length = torch.full((x.size(0),), x.size(1), device=x.device, dtype=torch.long)
 
-        # ZERO THE PADDED TAIL BEFORE THE CONV FRONT-END.
+        # TRIM TO max(length) BEFORE THE CONV FRONT-END.
+        #
+        # Conv2dSubsampling derives its output WIDTH from the tensor ((T-7)//2) but
+        # its output LENGTHS from x_lens ((x_lens-7)//2), then asserts the two agree.
+        # NeMo's preprocessor pads a batch to a multiple (pad_to), so the tensor is
+        # routinely wider than the longest utterance and the assert fires --
+        # observed (490, 489) on real data after this looked fine on a probe where
+        # width happened to equal max(length).
+        #
+        # Frames past max(length) are pure padding, so dropping them is lossless.
+        length = length.clamp(max=x.size(1))
+        keep = int(length.max())
+        if x.size(1) > keep:
+            x = x[:, :keep]
+
+        # ZERO THE PADDED TAIL.
         #
         # Zipformer masks ATTENTION via src_key_padding_mask, but Conv2dSubsampling
         # and the CNN modules convolve straight across the padding boundary. Measured
-        # against this encoder: perturbing the padded region changed the last 5 output
+        # on this encoder: perturbing the padded region changed the last 5 output
         # frames (~200 ms) while frames 0..55 stayed bit-identical. NeMo's
-        # ConformerEncoder shows zero contamination on the same test because it masks
-        # first, so without this the two are not comparable -- and the corrupted tail
-        # is exactly where CHAT's banded loss places an utterance's final words.
+        # ConformerEncoder shows zero contamination on the same test, so without this
+        # the two are not comparable -- and that tail is exactly where CHAT's banded
+        # loss places an utterance's final words.
         x = x.masked_fill(make_pad_mask(length, x.size(1)).unsqueeze(-1), 0.0)
 
         x, x_lens = self.encoder_embed(x, length)
