@@ -1,0 +1,271 @@
+name: Nemotron-CHAT-Transducer-Granary2-QwenVocab
+model:
+  sample_rate: 16000
+  compute_eval_loss: false
+  log_prediction: true
+  skip_nan_grad: true
+  rnnt_reduction: mean_volume
+  loss_type: banded
+  forced_alignment:
+    num_delay_frames: 3
+    recover_history_words: 0
+    max_delay_frames: 0
+    inference_delay_frames: null
+    band_chunks: 1
+    band_side: later
+    delay_word_final_punctuation: false
+    target_construction: legacy
+    log_target_mismatch_every_n_steps: 500
+    frame_length_in_secs: 0.04
+  model_defaults:
+    enc_hidden: 768
+    pred_hidden: 640
+    joint_hidden: 640
+  train_ds:
+    use_lhotse: true
+    input_cfg: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/users/dongjig/aligned_amos/granary_v2_en_pnc_qwen_aligned_filtered/granary_v2_en_pnc_qwen_aligned_filtered_safe_iad_s3_audio.yaml
+    manifest_filepath: null
+    skip_missing_manifest_entries: true
+    sample_rate: ${model.sample_rate}
+    shuffle: true
+    shard_seed: randomized
+    num_workers: 8
+    pin_memory: true
+    force_iterable_dataset: true
+    use_bucketing: true
+    bucket_duration_bins:
+    - 4.32
+    - 6.0
+    - 7.04
+    - 7.92
+    - 8.8
+    - 9.6
+    - 10.4
+    - 11.12
+    - 11.89
+    - 12.66
+    - 13.47
+    - 14.8
+    - 16.92
+    - 20.0
+    - 22.4
+    - 29.44
+    - 35.0
+    - 39.6
+    bucket_batch_size:
+    - 38
+    - 29
+    - 25
+    - 22
+    - 20
+    - 18
+    - 17
+    - 15
+    - 14
+    - 13
+    - 12
+    - 11
+    - 10
+    - 8
+    - 7
+    - 6
+    - 5
+    - 4
+    max_duration: 54
+    min_duration: 0.1
+    seed: 42
+    pad_extra_duration: 0.5
+    pad_extra_duration_prob: 1.0
+  validation_ds:
+    use_lhotse: true
+    manifest_filepath: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/users/dongjig/aligned_amos/steve_val_mmlpc_mcv11_2k/mcv11_dev_clean_pcstrip_en_2k_qwen_aligned.json
+    sample_rate: ${model.sample_rate}
+    pad_extra_duration: 0.5
+    pad_extra_duration_prob: 1.0
+    batch_size: 8
+    shuffle: false
+    num_workers: 4
+    pin_memory: true
+  test_ds:
+    manifest_filepath: null
+    sample_rate: ${model.sample_rate}
+    batch_size: 8
+    shuffle: false
+    num_workers: 4
+  tokenizer:
+    dir: /lustre/fsw/portfolios/llmservice/users/heh/pretrained_models/huggingface/Qwen/Qwen3-1.7B
+    type: huggingface
+  preprocessor:
+    _target_: nemo.collections.asr.modules.AudioToMelSpectrogramPreprocessor
+    sample_rate: ${model.sample_rate}
+    normalize: per_feature
+    window_size: 0.025
+    window_stride: 0.01
+    window: hann
+    features: 128
+    n_fft: 512
+    log: true
+    frame_splicing: 1
+    dither: 1.0e-05
+    pad_to: 0
+    pad_value: 0.0
+  spec_augment:
+    _target_: nemo.collections.asr.modules.SpectrogramAugmentation
+    freq_masks: 2
+    time_masks: 10
+    freq_width: 27
+    time_width: 0.05
+  encoder:
+    _target_: nemo.collections.asr.modules.zipformer_encoder.ZipformerEncoder
+    feat_in: 128
+    encoder_dim:
+    - 192
+    - 256
+    - 512
+    - 768
+    - 512
+    - 256
+    num_encoder_layers:
+    - 2
+    - 2
+    - 4
+    - 5
+    - 4
+    - 2
+    downsampling_factor:
+    - 1
+    - 2
+    - 4
+    - 8
+    - 4
+    - 2
+    feedforward_dim:
+    - 512
+    - 768
+    - 1536
+    - 2048
+    - 1536
+    - 768
+    encoder_unmasked_dim:
+    - 192
+    - 192
+    - 256
+    - 320
+    - 256
+    - 192
+    num_heads:
+    - 4
+    - 4
+    - 4
+    - 8
+    - 4
+    - 4
+    cnn_module_kernel:
+    - 31
+    - 31
+    - 15
+    - 15
+    - 15
+    - 31
+    query_head_dim: 32
+    pos_head_dim: 4
+    value_head_dim: 12
+    pos_dim: 48
+    output_downsampling_factor: 2
+    causal: true
+    chunk_size:
+    - 56
+    left_context_frames:
+    - 280
+    dropout: 0.1
+  decoder:
+    _target_: nemo.collections.asr.modules.RNNTDecoder
+    normalization_mode: null
+    random_state_sampling: false
+    blank_as_pad: true
+    prednet:
+      pred_hidden: ${model.model_defaults.pred_hidden}
+      pred_rnn_layers: 2
+      t_max: null
+      dropout: 0.1
+  joint:
+    _target_: nemo.collections.asr.modules.RNNTAttJoint
+    log_softmax: null
+    history_chunks: 0
+    preserve_memory: false
+    fuse_loss_wer: false
+    fused_batch_size: null
+    jointnet:
+      encoder_hidden: ${model.model_defaults.enc_hidden}
+      pred_hidden: ${model.model_defaults.pred_hidden}
+      joint_hidden: ${model.model_defaults.joint_hidden}
+      activation: relu
+      dropout: 0.1
+    chunk_size: 28
+  decoding:
+    strategy: greedy_batch
+    greedy:
+      max_symbols: 10
+    beam:
+      beam_size: 2
+      return_best_hypothesis: false
+      score_norm: true
+      tsd_max_sym_exp: 50
+      alsd_max_target_len: 2.0
+  loss:
+    loss_name: default
+    warprnnt_numba_kwargs:
+      fastemit_lambda: 0.005
+      clamp: -1.0
+  optim:
+    name: adamw
+    lr: 0.001
+    betas:
+    - 0.9
+    - 0.98
+    weight_decay: 0.001
+    sched:
+      name: CosineAnnealing
+      warmup_steps: 2500
+      warmup_ratio: null
+      min_lr: 1.0e-06
+trainer:
+  devices: -1
+  num_nodes: 1
+  max_epochs: -1
+  max_steps: 300000
+  val_check_interval: 4000
+  limit_train_batches: 4000
+  accelerator: gpu
+  use_distributed_sampler: false
+  strategy:
+    _target_: lightning.pytorch.strategies.DDPStrategy
+    gradient_as_bucket_view: true
+    find_unused_parameters: false
+  accumulate_grad_batches: 1
+  gradient_clip_val: 1.0
+  precision: bf16-mixed
+  log_every_n_steps: 100
+  enable_progress_bar: true
+  num_sanity_val_steps: 1
+  check_val_every_n_epoch: 1
+  sync_batchnorm: true
+  enable_checkpointing: false
+  logger: false
+  benchmark: false
+exp_manager:
+  exp_dir: null
+  name: ${name}
+  create_tensorboard_logger: false
+  create_checkpoint_callback: true
+  checkpoint_callback_params:
+    monitor: val_wer
+    mode: min
+    save_top_k: 5
+    always_save_nemo: false
+  resume_if_exists: true
+  resume_ignore_no_checkpoint: true
+  create_wandb_logger: true
+  wandb_logger_kwargs:
+    name: null
+    project: null
