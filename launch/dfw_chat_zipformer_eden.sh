@@ -123,6 +123,19 @@ export BUCKET_BATCH_SIZE='[76,58,50,44,40,36,34,30,28,26,24,22,20,16,14,12,10,8]
 
 export CONFIG_NAME=nemotron_chat_transducer_granary2_qwen_zipformer_eden
 export EXP_NAME="${EXP_NAME:-dfw_chat_zipformer_eden}"
+
+# Eden names its warmup knob warmup_batches, not warmup_steps, and wants 500
+# (upstream) rather than the 5000-step Adam warmup the other arms use. Eden also
+# warms from HALF the base LR, not from zero, so a long ramp is not needed.
+# ScaledAdam's base LR, NOT an Adam LR. dfw_chat_train.sh defaults LR=1e-4 and
+# passes model.optim.lr=${LR} UNCONDITIONALLY, so a launcher that stays silent
+# silently overrides the config. That is what happened to dfw_chat_zipformer_sadam
+# (its checkpoint shows lr=9.9974e-05): it never ran at 0.045 at all, so its slow
+# descent says nothing about ScaledAdam or about Eden.
+export LR=0.045
+
+export WARMUP_KEY=warmup_batches
+export WARMUP_STEPS=500
 # dfw_chat_train.sh defaults DESIGN_NODES to 4 and cannot grep it from $0 (it is
 # exec'd from this wrapper). Left unset, a 2-node allocation would be treated as
 # an undersized smoke test and silently renamed to ..._n2.

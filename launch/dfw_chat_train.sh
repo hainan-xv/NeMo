@@ -77,6 +77,12 @@ INFER_DELAY_FRAMES="${INFER_DELAY_FRAMES:-null}"
 
 LR="${LR:-1e-4}"
 WARMUP_STEPS="${WARMUP_STEPS:-5000}"
+# Which sched key the warmup count is written to. NeMo's CosineAnnealing calls
+# it warmup_steps; icefall's Eden calls it warmup_batches and has no
+# warmup_steps at all, so overriding the old name fails outright:
+#   ConfigAttributeError: Key 'warmup_steps' is not in struct
+# Default is unchanged, so every existing arm behaves exactly as before.
+WARMUP_KEY="${WARMUP_KEY:-warmup_steps}"
 # Per-bucket batch sizes. Empty means "use whatever the YAML says", which is what
 # every arm did until we dropped to 2 nodes. An arm that sets this overrides the
 # YAML wholesale -- an ABSOLUTE list, not a multiplier, so it stays a valid
@@ -221,7 +227,7 @@ print('    tokenizer ->', dst)
     ${BUCKET_BATCH_CLAUSE} \
     model.validation_ds.manifest_filepath=${VAL_MANIFEST} \
     model.optim.lr=${LR} \
-    model.optim.sched.warmup_steps=${WARMUP_STEPS} \
+    model.optim.sched.${WARMUP_KEY}=${WARMUP_STEPS} \
     trainer.max_steps=${MAX_STEPS} \
     trainer.limit_train_batches=${EPOCH_STEPS} \
     trainer.val_check_interval=${EPOCH_STEPS} \
