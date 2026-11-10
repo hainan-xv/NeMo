@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH -A nemotron_speechprod_asr
 #SBATCH -J nemotron_speechprod_asr:ckpt-optstate-probe
-#SBATCH -p interactive
+#SBATCH -p batch
 #SBATCH -N 1
 #SBATCH --gpus-per-node=1
 #SBATCH -t 00:20:00
