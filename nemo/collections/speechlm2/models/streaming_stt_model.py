@@ -1211,6 +1211,46 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
     def configure_optimizers(self):
         return configure_optimizers(self)
 
+    def on_train_start(self) -> None:
+        """Re-assert configured optimizer hyperparameters after a checkpoint restore.
+
+        ``torch.optim.Optimizer.load_state_dict`` replaces ``param_groups``
+        WHOLESALE with the groups stored in the checkpoint -- it keeps only the
+        live ``params`` list and takes every hyperparameter from the saved group.
+        So an implementation flag changed in the config is silently reverted on
+        every resume, and the run keeps using whatever the first leg happened to
+        save.
+
+        This bit us concretely. The conv-encoder arm leaves 46 parameters in fp32
+        while the rest of the model is bf16, and foreach AdamW groups optimizer
+        state by (device, dtype), so resuming died in
+        ``_group_tensors_by_device_and_dtype`` every time -- capping that arm at
+        one 4-hour leg. Setting ``foreach: false`` in the config did nothing,
+        because the checkpoint's ``foreach=True`` won at load.
+
+        Only keys explicitly present in ``cfg.optimizer`` are re-applied, and
+        ``lr`` is deliberately excluded: the LR schedule owns it, and forcing the
+        config's base LR here would silently restart the schedule on every resume.
+        """
+        opt_cfg = self.cfg.get("optimizer", None)
+        if opt_cfg is None:
+            return
+        # Hyperparameters that select an IMPLEMENTATION rather than a value. These
+        # are safe to re-assert; anything the scheduler drives is not.
+        impl_keys = ("foreach", "fused", "capturable", "differentiable")
+        overrides = {k: opt_cfg[k] for k in impl_keys if k in opt_cfg and opt_cfg[k] is not None}
+        if not overrides:
+            return
+        for optimizer in self.trainer.optimizers:
+            for group in optimizer.param_groups:
+                for key, value in overrides.items():
+                    if group.get(key) != value:
+                        logging.info(
+                            f"Re-asserting optimizer {key}={value} after checkpoint restore "
+                            f"(checkpoint had {group.get(key)})"
+                        )
+                        group[key] = value
+
     # ------------------------------------------------------------------
     # Validation
     # ------------------------------------------------------------------
