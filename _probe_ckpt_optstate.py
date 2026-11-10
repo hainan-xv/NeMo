@@ -37,3 +37,11 @@ sd = ck.get("state_dict", {})
 dt = Counter(str(v.dtype) for v in sd.values() if torch.is_tensor(v))
 print("\n=== model state_dict dtypes ===")
 print(dict(dt))
+
+fp32 = [k for k, v in sd.items() if torch.is_tensor(v) and v.dtype == torch.float32]
+print(f"\n=== the {len(fp32)} float32 entries ===")
+for k in fp32:
+    print("   ", k, tuple(sd[k].shape))
+# Which module prefixes do they belong to?
+pref = Counter(".".join(k.split(".")[:3]) for k in fp32)
+print("grouped by module prefix:", dict(pref))
