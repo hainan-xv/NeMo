@@ -1,0 +1,562 @@
+model:
+  pretrained_llm: /lustre/fsw/portfolios/llmservice/users/heh/pretrained_models/huggingface/Qwen/Qwen3-1.7B
+  pretrained_asr: PLACEHOLDER_CITRINET
+  load_llm_weights: true
+  load_asr_weights: true
+  sample_rate: 16000
+  blank_token: ''
+  frame_length_in_secs: 0.08
+  chunk_size:
+  - 14
+  # null, NOT [84, 1]: a ConvASREncoder has no attention, so there is no
+  # look-ahead to match per chunk. Its receptive field is architectural --
+  # 6.02 s of left context and 0.00 s of look-ahead, fixed by future_context=0
+  # on all 23 blocks. Leaving a value here would make _set_encoder_att_context
+  # write dead attributes onto the conv stack every batch.
+  att_context_size: null
+  audio_pad_to: 0
+  attn_backend: flex
+  bidirectional_audio: false
+  modality_local_layers: 0
+  activation_checkpointing: true
+  audio_history_chunks: 0
+  prompt_control: true
+  prompt_include_chunk_size: true
+  val_chunk_size: 14
+  val_num_delay_frames: 3
+  val_capitalization: true
+  val_punctuation: true
+  max_history_tokens: 0
+  encode_batch_size: 8
+  log_detailed_train_metrics: false
+  freeze_speech_encoder: false
+  freeze_modality_adapter: false
+  freeze_modality_proj: false
+  freeze_llm_model: false
+  freeze_llm_head: false
+  freeze_embed_tokens: false
+  freeze_params: []
+  prevent_freeze_params: []
+  perception:
+    modality_adapter:
+      _target_: nemo.collections.speechlm2.modules.perception.IdentityConnector
+      d_model: 1024
+    encoder:
+      feat_in: 80
+      activation: relu
+      conv_mask: true
+      jasper:
+      - filters: 1024
+        repeat: 1
+        kernel:
+        - 5
+        stride:
+        - 1
+        dilation:
+        - 1
+        dropout: 0.0
+        residual: false
+        separable: true
+        se: true
+        se_context_size: -1
+        future_context: 0
+      - filters: 1024
+        repeat: 5
+        kernel:
+        - 11
+        stride:
+        - 2
+        dilation:
+        - 1
+        dropout: 0.1
+        residual: true
+        separable: true
+        se: true
+        se_context_size: -1
+        stride_last: true
+        residual_mode: stride_add
+        kernel_size_factor: 0.25
+        future_context: 0
+      - filters: 1024
+        repeat: 5
+        kernel:
+        - 13
+        stride:
+        - 1
+        dilation:
+        - 1
+        dropout: 0.1
+        residual: true
+        separable: true
+        se: true
+        se_context_size: -1
+        kernel_size_factor: 0.25
+        future_context: 0
+      - filters: 1024
+        repeat: 5
+        kernel:
+        - 15
+        stride:
+        - 1
+        dilation:
+        - 1
+        dropout: 0.1
+        residual: true
+        separable: true
+        se: true
+        se_context_size: -1
+        kernel_size_factor: 0.25
+        future_context: 0
+      - filters: 1024
+        repeat: 5
+        kernel:
+        - 17
+        stride:
+        - 1
+        dilation:
+        - 1
+        dropout: 0.1
+        residual: true
+        separable: true
+        se: true
+        se_context_size: -1
+        kernel_size_factor: 0.25
+        future_context: 0
+      - filters: 1024
+        repeat: 5
+        kernel:
+        - 19
+        stride:
+        - 1
+        dilation:
+        - 1
+        dropout: 0.1
+        residual: true
+        separable: true
+        se: true
+        se_context_size: -1
+        kernel_size_factor: 0.25
+        future_context: 0
+      - filters: 1024
+        repeat: 5
+        kernel:
+        - 21
+        stride:
+        - 1
+        dilation:
+        - 1
+        dropout: 0.1
+        residual: true
+        separable: true
+        se: true
+        se_context_size: -1
+        kernel_size_factor: 0.25
+        future_context: 0
+      - filters: 1024
+        repeat: 5
+        kernel:
+        - 13
+        stride:
+        - 2
+        dilation:
+        - 1
+        dropout: 0.1
+        residual: true
+        separable: true
+        se: true
+        se_context_size: -1
+        stride_last: true
+        residual_mode: stride_add
+        kernel_size_factor: 0.25
+        future_context: 0
+      - filters: 1024
+        repeat: 5
+        kernel:
+        - 15
+        stride:
+        - 1
+        dilation:
+        - 1
+        dropout: 0.1
+        residual: true
+        separable: true
+        se: true
+        se_context_size: -1
+        kernel_size_factor: 0.25
+        future_context: 0
+      - filters: 1024
+        repeat: 5
+        kernel:
+        - 17
+        stride:
+        - 1
+        dilation:
+        - 1
+        dropout: 0.1
+        residual: true
+        separable: true
+        se: true
+        se_context_size: -1
+        kernel_size_factor: 0.25
+        future_context: 0
+      - filters: 1024
+        repeat: 5
+        kernel:
+        - 19
+        stride:
+        - 1
+        dilation:
+        - 1
+        dropout: 0.1
+        residual: true
+        separable: true
+        se: true
+        se_context_size: -1
+        kernel_size_factor: 0.25
+        future_context: 0
+      - filters: 1024
+        repeat: 5
+        kernel:
+        - 21
+        stride:
+        - 1
+        dilation:
+        - 1
+        dropout: 0.1
+        residual: true
+        separable: true
+        se: true
+        se_context_size: -1
+        kernel_size_factor: 0.25
+        future_context: 0
+      - filters: 1024
+        repeat: 5
+        kernel:
+        - 23
+        stride:
+        - 1
+        dilation:
+        - 1
+        dropout: 0.1
+        residual: true
+        separable: true
+        se: true
+        se_context_size: -1
+        kernel_size_factor: 0.25
+        future_context: 0
+      - filters: 1024
+        repeat: 5
+        kernel:
+        - 25
+        stride:
+        - 1
+        dilation:
+        - 1
+        dropout: 0.1
+        residual: true
+        separable: true
+        se: true
+        se_context_size: -1
+        kernel_size_factor: 0.25
+        future_context: 0
+      - filters: 1024
+        repeat: 5
+        kernel:
+        - 25
+        stride:
+        - 2
+        dilation:
+        - 1
+        dropout: 0.1
+        residual: true
+        separable: true
+        se: true
+        se_context_size: -1
+        stride_last: true
+        residual_mode: stride_add
+        kernel_size_factor: 0.25
+        future_context: 0
+      - filters: 1024
+        repeat: 5
+        kernel:
+        - 27
+        stride:
+        - 1
+        dilation:
+        - 1
+        dropout: 0.1
+        residual: true
+        separable: true
+        se: true
+        se_context_size: -1
+        kernel_size_factor: 0.25
+        future_context: 0
+      - filters: 1024
+        repeat: 5
+        kernel:
+        - 29
+        stride:
+        - 1
+        dilation:
+        - 1
+        dropout: 0.1
+        residual: true
+        separable: true
+        se: true
+        se_context_size: -1
+        kernel_size_factor: 0.25
+        future_context: 0
+      - filters: 1024
+        repeat: 5
+        kernel:
+        - 31
+        stride:
+        - 1
+        dilation:
+        - 1
+        dropout: 0.1
+        residual: true
+        separable: true
+        se: true
+        se_context_size: -1
+        kernel_size_factor: 0.25
+        future_context: 0
+      - filters: 1024
+        repeat: 5
+        kernel:
+        - 33
+        stride:
+        - 1
+        dilation:
+        - 1
+        dropout: 0.1
+        residual: true
+        separable: true
+        se: true
+        se_context_size: -1
+        kernel_size_factor: 0.25
+        future_context: 0
+      - filters: 1024
+        repeat: 5
+        kernel:
+        - 35
+        stride:
+        - 1
+        dilation:
+        - 1
+        dropout: 0.1
+        residual: true
+        separable: true
+        se: true
+        se_context_size: -1
+        kernel_size_factor: 0.25
+        future_context: 0
+      - filters: 1024
+        repeat: 5
+        kernel:
+        - 37
+        stride:
+        - 1
+        dilation:
+        - 1
+        dropout: 0.1
+        residual: true
+        separable: true
+        se: true
+        se_context_size: -1
+        kernel_size_factor: 0.25
+        future_context: 0
+      - filters: 1024
+        repeat: 5
+        kernel:
+        - 39
+        stride:
+        - 1
+        dilation:
+        - 1
+        dropout: 0.1
+        residual: true
+        separable: true
+        se: true
+        se_context_size: -1
+        kernel_size_factor: 0.25
+        future_context: 0
+      - filters: 1024
+        repeat: 1
+        kernel:
+        - 41
+        stride:
+        - 1
+        dilation:
+        - 1
+        dropout: 0.0
+        residual: false
+        separable: true
+        se: true
+        se_context_size: -1
+        kernel_size_factor: 0.25
+        future_context: 0
+      _target_: nemo.collections.asr.modules.ConvASREncoder
+    preprocessor:
+      _target_: nemo.collections.asr.modules.AudioToMelSpectrogramPreprocessor
+      sample_rate: 16000
+      normalize: per_feature
+      window_size: 0.025
+      window_stride: 0.01
+      window: hann
+      features: 80
+      n_fft: 512
+      frame_splicing: 1
+      dither: 1.0e-05
+      pad_to: 16
+      stft_conv: false
+  optimizer:
+    _target_: torch.optim.AdamW
+    lr: 0.0001
+    betas:
+    - 0.9
+    - 0.98
+    weight_decay: 0.001
+    foreach: true
+  lr_scheduler:
+    _target_: nemo.core.optim.lr_scheduler.CosineAnnealing
+    warmup_steps: 10000
+    min_lr: 1.0e-06
+    max_steps: ${trainer.max_steps}
+data:
+  dataset:
+    sample_rate: ${model.sample_rate}
+    frame_length_in_secs: ${model.frame_length_in_secs}
+    chunk_size: ${model.chunk_size}
+    audio_history_chunks: ${model.audio_history_chunks}
+    prompt_control: ${model.prompt_control}
+    prompt_include_chunk_size: ${model.prompt_include_chunk_size}
+    delay_candidates:
+    - 0
+    - 1
+    - 2
+    - 3
+    - 4
+    capitalization_prob: 0.5
+    punctuation_prob: 0.5
+    random_first_chunk: false
+    control_seed: 5678
+    num_delay_frames: 3
+    audio_tag: <audio>
+    blank_token: ${model.blank_token}
+    system_role: system
+    system_prompt: You are doing streaming speech recognition. Given the transcript
+      so far and the representation of the next audio chunk, output the words spoken
+      in that chunk.
+  val_dataset_overrides:
+    chunk_size: 14
+    prompt_control: false
+    random_first_chunk: false
+  train_ds:
+    sample_rate: ${data.dataset.sample_rate}
+    input_cfg: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/users/dongjig/aligned_amos/granary_v2_en_pnc_qwen_aligned_filtered/granary_v2_en_pnc_qwen_aligned_filtered_safe_iad_s3_audio.yaml
+    skip_missing_manifest_entries: true
+    manifest_filepath: null
+    seed: 42
+    shuffle: true
+    shard_seed: randomized
+    num_workers: 8
+    force_iterable_dataset: true
+    use_bucketing: true
+    bucket_duration_bins:
+    - 4.32
+    - 6.0
+    - 7.04
+    - 7.92
+    - 8.8
+    - 9.6
+    - 10.4
+    - 11.12
+    - 11.89
+    - 12.66
+    - 13.47
+    - 14.8
+    - 16.92
+    - 20.0
+    - 22.4
+    - 29.44
+    - 35.0
+    - 39.6
+    bucket_batch_size:
+    - 38
+    - 29
+    - 25
+    - 22
+    - 20
+    - 18
+    - 17
+    - 15
+    - 14
+    - 13
+    - 12
+    - 11
+    - 10
+    - 8
+    - 7
+    - 6
+    - 5
+    - 4
+    max_duration: 54
+    pad_extra_duration: 0.5
+    pad_extra_duration_prob: 1.0
+  validation_ds:
+    datasets:
+      mcv_11_dev:
+        manifest_filepath: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/users/dongjig/aligned_amos/steve_val_mmlpc_mcv11_2k/mcv11_dev_clean_pcstrip_en_2k_qwen_aligned.json
+    sample_rate: ${data.dataset.sample_rate}
+    batch_size: 4
+    num_workers: 4
+    seed: 42
+    shard_seed: randomized
+    shuffle: false
+    pad_extra_duration: 0.5
+    pad_extra_duration_prob: 1.0
+trainer:
+  devices: -1
+  accelerator: gpu
+  num_nodes: 1
+  precision: bf16-true
+  logger: false
+  enable_checkpointing: false
+  use_distributed_sampler: false
+  max_steps: 200000
+  limit_train_batches: 2000
+  val_check_interval: ${trainer.limit_train_batches}
+  log_every_n_steps: 10
+  num_sanity_val_steps: 1
+  gradient_clip_val: 1.0
+  accumulate_grad_batches: 1
+  strategy:
+    _target_: lightning.pytorch.strategies.DDPStrategy
+    gradient_as_bucket_view: true
+    find_unused_parameters: true
+exp_manager:
+  exp_dir: null
+  explicit_log_dir: null
+  name: streaming_stt_granary2_script_flex
+  create_tensorboard_logger: true
+  create_checkpoint_callback: true
+  use_datetime_version: true
+  max_time_per_run: 00:03:50:00
+  resume_from_checkpoint: null
+  resume_if_exists: true
+  resume_ignore_no_checkpoint: true
+  create_wandb_logger: false
+  wandb_logger_kwargs:
+    name: ${exp_manager.name}
+    project: null
+    resume: true
+  checkpoint_callback_params:
+    filename: '{step}-{val_wer:.4f}'
+    monitor: val_wer
+    mode: min
+    every_n_train_steps: null
+    every_n_epochs: 1
+    save_top_k: 5
+    always_save_nemo: false
+    save_nemo_on_train_end: false

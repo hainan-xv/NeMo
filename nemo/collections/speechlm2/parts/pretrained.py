@@ -169,6 +169,10 @@ def resolve_perception_sources(perception_cfg, asr_cfg, att_context_size=None):
       constructor that does not accept them. ``att_context_size`` is skipped in
       that case too: a replacement front-end defines its own look-ahead, or has
       none.
+    * ``att_context_size`` is an OVERRIDE, not an injection: it is applied only
+      when the pretrained encoder already declares the key. Warm-starting a
+      conv-only front-end from a conv-only donor (Citrinet) takes the merge
+      branch, and ``ConvASREncoder.__init__`` rejects the key outright.
     """
     user_pre = {}
     if perception_cfg.get("preprocessor", None) is not None:
@@ -188,7 +192,12 @@ def resolve_perception_sources(perception_cfg, asr_cfg, att_context_size=None):
         perception_cfg.encoder = OmegaConf.create(user_enc)
     else:
         perception_cfg.encoder = asr_cfg.encoder
-        if att_context_size is not None:
+        # Only OVERRIDE a look-ahead the pretrained encoder already declares.
+        # A conv-only front-end (ConvASREncoder/Citrinet) has no attention and
+        # its constructor rejects the key -- and when donor and user target are
+        # the SAME class, the wholesale-replace branch above never runs, so this
+        # is the only thing standing between that config and a TypeError.
+        if att_context_size is not None and "att_context_size" in perception_cfg.encoder:
             perception_cfg.encoder.att_context_size = att_context_size
         for key, value in user_enc.items():
             if value is not None:
