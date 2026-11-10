@@ -38,6 +38,7 @@ from torch import nn
 # so any config that builds a Zipformer can select it by name without the
 # training script needing to know the optimizer exists.
 from nemo.collections.asr.parts.submodules.zipformer import nemo_optim  # noqa: F401
+from nemo.collections.asr.parts.submodules.zipformer import nemo_sched  # noqa: F401
 from nemo.collections.asr.parts.submodules.zipformer.subsampling import Conv2dSubsampling
 from nemo.collections.asr.parts.submodules.zipformer.zipformer import Zipformer2
 from nemo.core.classes.common import typecheck
