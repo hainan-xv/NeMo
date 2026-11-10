@@ -65,7 +65,13 @@ export HISTORY_CHUNKS=0
 export MAX_DELAY_FRAMES=0
 export TARGET_CONSTRUCTION=partition
 export DELAY_PUNCT=true
-export WARMUP_STEPS=5000
+# FROM-SCRATCH LR, not the fine-tuning LR every other CHAT launcher uses.
+# Those all warm-start from a trained Conformer, where 5e-5 is right. This run
+# has no donor, and at 5e-5 it flatlined: val_wer 1.0001 for 5 straight epochs
+# (~14k steps) with the loss stuck at ~5.8, i.e. the model learned to emit
+# blanks and stopped. 1e-3 / 2500 are the CONFIG's own defaults, which exist
+# precisely for training this model from scratch.
+export WARMUP_STEPS=2500
 export MAX_STEPS=500000
 export EPOCH_STEPS=2000
 
@@ -98,7 +104,7 @@ export BUCKET_BATCH_SIZE='[76,58,50,44,40,36,34,30,28,26,24,22,20,16,14,12,10,8]
 # NOTE this is deliberately on the conservative side: with the global batch
 # restored above, strict linear scaling would justify keeping 1e-4. If these
 # arms now look SLOW rather than noisy, raising LR is the first thing to try.
-export LR=5e-5
+export LR=1e-3
 # ---------------------------------------------------------------------------
 
 export CONFIG_NAME=nemotron_chat_transducer_granary2_qwen_zipformer
