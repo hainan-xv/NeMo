@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH -A nemotron_speech_asr
-#SBATCH -J nemotron_speechprod_asr:oci-chat-spe1k-fullctx
+#SBATCH -J nemotron_speechprod_asr:oci-chat-convenc-causal
 #SBATCH -p batch_block1,batch_block3,batch_block4
 #SBATCH -N 2
 #SBATCH --gpus-per-node=8
@@ -125,9 +125,14 @@ OCI=/lustre/fsw/portfolios/nemotron/users/hainanx
 # No TOKENIZER_DIR override: oci_chat_train.sh already defaults to QWEN_TOK
 # (Qwen3-1.7B, 151k). The spe1k arm overrode it to a 1024-piece vocabulary;
 # this arm is the Qwen-151k family, so the default is exactly right.
-if [[ ! -f "${TOKENIZER_DIR}/tokenizer.model" ]]; then
-    echo "ERROR: no tokenizer at ${TOKENIZER_DIR}" >&2
-    echo "       Build it first: copy them from DFW (see launch/dfw_build_spe_vocabs.sh)" >&2
+export TOKENIZER_DIR="${TOKENIZER_DIR:-/lustre/fsw/portfolios/llmservice/users/heh/pretrained_models/huggingface/Qwen/Qwen3-1.7B}"
+
+# Accept EITHER tokenizer.model (SentencePiece) or tokenizer.json (HF). The spe1k
+# arm this was forked from checked only for tokenizer.model, which a Qwen
+# tokenizer does not have -- so the Qwen-151k family failed this guard in 6s even
+# with a perfectly good tokenizer directory.
+if [[ ! -f "${TOKENIZER_DIR}/tokenizer.model" && ! -f "${TOKENIZER_DIR}/tokenizer.json" ]]; then
+    echo "ERROR: no tokenizer.model or tokenizer.json at ${TOKENIZER_DIR}" >&2
     exit 1
 fi
 
