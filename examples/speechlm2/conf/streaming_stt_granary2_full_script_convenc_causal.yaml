@@ -417,20 +417,16 @@ model:
     - 0.9
     - 0.98
     weight_decay: 0.001
-    # false, unlike every Conformer arm. The Citrinet front-end leaves 46 of its
-    # parameters in float32 while the rest of the model is bfloat16 (measured in
-    # the step=15062 checkpoint: 1062 bf16 + 46 fp32 params, and the optimizer
-    # state mirrors it). foreach AdamW groups state by (device, dtype) and dies
-    # on that mix when resuming:
-    #   RuntimeError: Tensors of the same index must be on the same device and
-    #   the same dtype except `step` tensors ...
-    # raised from torch._C._group_tensors_by_device_and_dtype. It killed 21647132
-    # and 21661519 at ~4:44, which is why this arm could not pass a 4-hour leg
-    # boundary. The Conformer arms are uniformly bf16, so they never hit it.
+    # The real resume hazard in this arm is SqueezeExcite, not foreach: it flips
+    # its own 46 fc parameters to fp32 on the FIRST FORWARD, after the optimizer
+    # state has been restored and cast to the then-bf16 param dtype. See
+    # StreamingSTTModel._force_squeeze_excite_fp32, which makes that cast eager
+    # and is the actual fix.
     #
-    # foreach=false takes the per-tensor loop instead: identical math, no
-    # grouping. Casting those 46 to bf16 would also 'fix' it, but they are left
-    # fp32 on purpose -- that is a precision change, not a kernel change.
+    # foreach stays false as the conservative setting for a model with mixed
+    # param dtypes: the grouped kernels were the first thing to break here, and
+    # the per-tensor loop is identical math. Worth revisiting for speed once this
+    # arm has resumed cleanly a few times.
     foreach: false
   lr_scheduler:
     _target_: nemo.core.optim.lr_scheduler.CosineAnnealing
