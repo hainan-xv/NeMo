@@ -13,13 +13,15 @@ HEH=${LUSTRE}/users/heh
 MYDIR=${LUSTRE}/hainanx
 CONTAINER="${HEH}/containers/nemo-26.02-streaming-speechlm.sqsh"
 CODE_DIR="${MYDIR}/NeMo_SCRIPT_cc"
-CONV=${MYDIR}/results/SpeechlmDFW/dfw_script_convenc_causal_8node/checkpoints
-STACK=${MYDIR}/results/SpeechlmDFW/dfw_joint_stack3_p84_int/checkpoints
+CONV=${MYDIR}/results/SpeechlmDFW/dfw_script_convenc_causal_8node/dfw_script_convenc_causal_8node/checkpoints
+STACK=${MYDIR}/results/SpeechlmDFW/dfw_joint_stack3_p84_int/dfw_joint_stack3_p84_int/checkpoints
 srun --container-image="$CONTAINER" \
      --container-mounts=${CODE_DIR}:/code,${MYDIR}:${MYDIR},${LUSTRE}:${LUSTRE} \
      bash -c "export PYTHONPATH=/code:\${PYTHONPATH}; cd /code
 C=\$(ls -t ${CONV}/*-last.ckpt 2>/dev/null | head -1)
 S=\$(ls -t ${STACK}/*-last.ckpt 2>/dev/null | head -1)
+[ -n "\$C" ] || { echo 'NO CONV CHECKPOINT FOUND'; exit 1; }
+[ -n "\$S" ] || { echo 'NO STACK CHECKPOINT FOUND'; exit 1; }
 echo '################ CONV (fails to resume):' \$C
 python -u /code/_probe_ckpt_optstate.py \$C
 echo
