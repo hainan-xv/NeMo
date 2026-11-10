@@ -133,7 +133,13 @@ fi
 
 # parakeet-tdt-0.6b-v2, staged from HuggingFace. A .nemo because
 # init_from_nemo_model is what the CHAT trainer exposes.
-export INIT_NEMO="${INIT_NEMO:-/lustre/fsw/portfolios/llmservice/users/heh/pretrained_models/nemo_asr/parakeet-tdt-0.6b-v2.nemo}"
+# CITRINET, not the spe1k arm's parakeet. The encoder in this config IS Citrinet;
+# parakeet is a Conformer/TDT model whose encoder tensors would match almost
+# nothing here, and init_from_nemo_model skips mismatches SILENTLY -- the arm
+# would have trained from scratch while claiming a warm start.
+#
+# Same file as the DFW conv arms (downloaded here separately, 483,819,120 bytes).
+export INIT_NEMO="${INIT_NEMO:-/lustre/fsw/portfolios/nemotron/users/hainanx/pretrained_models/citrinet/stt_en_citrinet_1024_gamma_0_25.nemo}"
 if [[ ! -f "${INIT_NEMO}" ]]; then
     echo "ERROR: parakeet donor not found: ${INIT_NEMO}" >&2
     echo "       Stage it with:" >&2
