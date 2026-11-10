@@ -55,8 +55,12 @@ if [[ -d "$repo/.git" ]]; then
           "$repo/.git/ORIG_HEAD.lock" \
           "$repo/.git/config.lock" \
           "$repo/.git/packed-refs.lock" 2>/dev/null || true
-    # Ref locks live under refs/ only -- a bounded subtree, not the object store.
-    find "$repo/.git/refs" -name '*.lock' -type f -delete 2>/dev/null || true
+    # NO `find` here either. A bounded walk of .git/refs hung for 5+ minutes on
+    # this Lustre mount, so the problem is not how many files are under .git --
+    # when the metadata target is slow, ANY directory walk wedges, and the
+    # process lands in TASK_IDLE where kill -9 cannot reach it. git's own
+    # fetch/checkout clears stale ref locks well enough; the one that actually
+    # wedges a repo is index.lock, removed above by exact path.
     git -C "$repo" "${git_auth[@]}" fetch --force "$url" "$branch:refs/remotes/github/$branch"
     git -C "$repo" checkout -B "$branch" "refs/remotes/github/$branch"
     git -C "$repo" reset --hard "refs/remotes/github/$branch"
