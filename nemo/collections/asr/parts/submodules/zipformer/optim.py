@@ -663,7 +663,13 @@ class ScaledAdam(BatchedOptimizer):
                 grad_ratio.tolist(), batch_param_names, p.grad.unbind(dim=0)
             )
 
-        ratios_names = sorted(ratios_names, reverse=True)
+        # Sort on the RATIO ALONE. Sorting the whole 3-tuple falls through to
+        # comparing the trailing tensors whenever ratio and name both tie --
+        # e.g. a batched group whose grads are all zero -- and raises
+        # "Boolean value of Tensor with more than one value is ambiguous".
+        # This path only runs when clipping is already severe, so a crash here
+        # kills the run at precisely the moment the diagnostic was wanted.
+        ratios_names = sorted(ratios_names, key=lambda rnt: rnt[0], reverse=True)
         ratios_names = ratios_names[:10]
         ratios_names = [
             (ratio, name, largest_index(tensor))
