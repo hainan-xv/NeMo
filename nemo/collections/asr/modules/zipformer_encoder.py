@@ -34,6 +34,10 @@ from typing import Optional, Tuple
 import torch
 from torch import nn
 
+# Importing this registers 'scaled_adam' in NeMo's optimizer registry. Done here
+# so any config that builds a Zipformer can select it by name without the
+# training script needing to know the optimizer exists.
+from nemo.collections.asr.parts.submodules.zipformer import nemo_optim  # noqa: F401
 from nemo.collections.asr.parts.submodules.zipformer.subsampling import Conv2dSubsampling
 from nemo.collections.asr.parts.submodules.zipformer.zipformer import Zipformer2
 from nemo.core.classes.common import typecheck
