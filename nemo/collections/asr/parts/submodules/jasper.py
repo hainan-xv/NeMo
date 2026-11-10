@@ -403,6 +403,46 @@ class GroupShuffle(nn.Module):
         return x
 
 
+def force_squeeze_excite_fp32(module: nn.Module) -> int:
+    """Apply SqueezeExcite's fp32 cast EAGERLY, before an optimizer is built.
+
+    :meth:`SqueezeExcite.forward_for_export` casts its own ``fc`` parameters to
+    float32 the first time it runs -- a deliberate stability measure, but a LAZY
+    one. Under ``bf16-true`` that means a parameter's dtype changes DURING
+    training, which silently breaks any optimizer state created before it:
+
+      1. the model is cast to bf16                 -> SE weights bf16
+      2. optimizer state is restored; torch casts each state tensor to its
+         param's CURRENT dtype                     -> SE exp_avg bf16
+      3. the first forward fires the cast          -> SE params and grads fp32
+      4. the first step combines them::
+
+            RuntimeError: expected dtype c10::BFloat16 for `end` but got float
+
+    A FRESH run never notices, because the optimizer is built after a forward has
+    already flipped them. That asymmetry is the whole bug: a Citrinet-encoder run
+    trains a full leg and then dies on every resume, a few minutes in.
+
+    Call this before constructing the optimizer (e.g. at the top of
+    ``configure_optimizers``, which Lightning runs after precision conversion and
+    before checkpoint restore). The dtype is then final, the restored state is
+    cast to fp32, and the forward-time branch is already satisfied.
+
+    Lives here, next to the module that causes it, because more than one model
+    class needs it -- speechlm2's streaming SCRIPT models and the ASR CHAT
+    models both build Citrinet encoders.
+
+    Returns:
+        The number of SqueezeExcite blocks converted (0 if already fp32).
+    """
+    converted = 0
+    for m in module.modules():
+        if isinstance(m, SqueezeExcite) and m.fc[0].weight.dtype != torch.float32:
+            m.fc.float()
+            converted += 1
+    return converted
+
+
 class SqueezeExcite(nn.Module):
     def __init__(
         self,

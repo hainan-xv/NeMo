@@ -1209,42 +1209,17 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         return {"loss": loss}
 
     def _force_squeeze_excite_fp32(self) -> None:
-        """Apply SqueezeExcite's fp32 cast EAGERLY, before the optimizer exists.
+        """Eagerly apply SqueezeExcite's fp32 cast so checkpoint resume survives.
 
-        ``SqueezeExcite.forward_for_export`` mutates its own parameters the first
-        time it runs::
-
-            if self.fc[0].weight.dtype != torch.float32:
-                self.fc.float()
-
-        a deliberate stability measure, but a lazy one. Under ``bf16-true`` that
-        makes a parameter's dtype change DURING training, which silently breaks
-        any optimizer state created before it:
-
-          1. Lightning casts the model to bf16  -> SE weights bf16
-          2. optimizer state restored; torch casts each state tensor to its
-             param's CURRENT dtype          -> SE exp_avg bf16
-          3. first forward fires the cast    -> SE params (and grads) fp32
-          4. first step: fp32 grad, bf16 state
-             RuntimeError: expected dtype c10::BFloat16 for `end` but got float
-
-        A fresh run never notices, because the optimizer is built after the first
-        forward has already flipped them. That asymmetry is why the conv-encoder
-        arm trained fine for a full leg and died on every resume, and why no
-        Conformer arm has ever hit it -- only Citrinet has SqueezeExcite.
-
-        Doing the cast here makes the dtype final before the optimizer is
-        constructed, so the restored state is cast to fp32 and the forward-time
-        branch is already satisfied. Called from ``configure_optimizers``, which
-        Lightning runs AFTER precision conversion and BEFORE checkpoint restore.
+        Delegates to :func:`~nemo.collections.asr.parts.submodules.jasper.force_squeeze_excite_fp32`,
+        which documents the failure mode in full. Called from
+        ``configure_optimizers`` -- Lightning runs that after precision conversion
+        and before checkpoint restore, which is the only window where fixing the
+        dtype actually helps.
         """
-        from nemo.collections.asr.parts.submodules.jasper import SqueezeExcite
+        from nemo.collections.asr.parts.submodules.jasper import force_squeeze_excite_fp32
 
-        converted = 0
-        for module in self.modules():
-            if isinstance(module, SqueezeExcite) and module.fc[0].weight.dtype != torch.float32:
-                module.fc.float()
-                converted += 1
+        converted = force_squeeze_excite_fp32(self)
         if converted:
             logging.info(
                 f"Forced {converted} SqueezeExcite block(s) to fp32 before building the optimizer "

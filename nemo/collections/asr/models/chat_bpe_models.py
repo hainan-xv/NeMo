@@ -51,6 +51,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from nemo.collections.asr.data.audio_to_text_lhotse import LhotseSpeechToTextBpeDataset
 from nemo.collections.asr.losses.banded_rnnt import BandedLattice, banded_rnnt_loss, build_lattices
+from nemo.collections.asr.models.rnnt_bpe_models import EncDecRNNTBPEModel
 from nemo.collections.asr.parts.numba.banded_rnnt.banded_rnnt_numba import (
     banded_rnnt_loss_cuda,
     build_band_index,
@@ -59,7 +60,7 @@ from nemo.collections.asr.parts.numba.banded_rnnt.banded_rnnt_numba import (
     kernel_is_usable,
     token_band_rnnt_loss,
 )
-from nemo.collections.asr.models.rnnt_bpe_models import EncDecRNNTBPEModel
+from nemo.collections.asr.parts.submodules.jasper import force_squeeze_excite_fp32
 from nemo.collections.asr.parts.utils.chat_alignment import (
     assert_clean_transcript,
     assign_words_to_chunks,
@@ -157,6 +158,28 @@ class _RNNTAutoTokenizer(AutoTokenizer):
 
 class EncDecCHATBPEModel(EncDecRNNTBPEModel):
     """CHAT transducer trainable with either the marginalised or a forced loss."""
+
+    def configure_optimizers(self):
+        """Fix SqueezeExcite dtypes before the optimizer exists, then defer to base.
+
+        A Citrinet (ConvASREncoder) front-end carries SqueezeExcite blocks that
+        cast their own parameters to fp32 on the FIRST FORWARD. Under bf16-true
+        that happens after optimizer state has been restored and cast to the
+        then-bf16 dtype, so every resume dies on the first step with::
+
+            RuntimeError: expected dtype c10::BFloat16 for `end` but got float
+
+        Fresh runs are unaffected, which is what makes it so easy to miss -- a run
+        trains one full 4-hour leg and then fails a few minutes into every
+        restart. No-op for Conformer encoders, which have no SqueezeExcite.
+        """
+        converted = force_squeeze_excite_fp32(self)
+        if converted:
+            logging.info(
+                f"Forced {converted} SqueezeExcite block(s) to fp32 before building the optimizer "
+                "(they would otherwise flip dtype on the first forward and break resume)."
+            )
+        return super().configure_optimizers()
 
     def __init__(self, cfg: DictConfig, trainer=None):
         # EVERY attribute the data-setup path reads must be assigned BEFORE
