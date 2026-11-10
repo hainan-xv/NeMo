@@ -104,7 +104,13 @@ CONFIG_NAME="${CONFIG_NAME:-streaming_stt_granary2_full_script_convenc_causal}"
 # Weights carry over via init_from_ckpt (weights only, optimiser reset): the
 # earlier runs' LOSS was valid -- they already had the normalised read-out -- so
 # the ~1h of training they did is worth keeping even though their WER was not.
-EXP_NAME="${EXP_NAME:-dfw_script_convenc_causal_8node}"
+# MUST differ from the 4-node arm's name. The _n{N} suffix guard below keys off
+# this file's OWN "#SBATCH -N", which is 2 here, so ACTUAL==DESIGN and the guard
+# never fires -- sharing a name would point this job at the batch run's live
+# results dir, where resume_if_exists picks up a 4-node checkpoint and dies in
+# optimizer load ("Tensors of the same index must be on the same device...").
+# That is what killed 21647132.
+EXP_NAME="${EXP_NAME:-dfw_script_convenc_causal_int}"
 
 MAX_STEPS="${MAX_STEPS:-500000}"
 # --- v2 CHANGES: rebalanced buckets, smaller LR ------------------------------
