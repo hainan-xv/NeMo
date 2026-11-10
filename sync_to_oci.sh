@@ -164,7 +164,16 @@ fi
 
 if [[ -d "$repo/.git" ]]; then
     # A killed job can leave stale lock files behind and wedge every later fetch.
-    find "$repo/.git" -name '*.lock' -type f -delete 2>/dev/null || true
+    # Exact paths, never `find .git -name '*.lock'`. That walk visits every
+    # loose-object directory; on a Lustre mount with a slow metadata target it
+    # hangs for 30+ minutes in TASK_IDLE where kill -9 cannot reach it, and
+    # repeated runs stack up and wedge the login node. Seen on DFW 2026-11-10.
+    rm -f "$repo/.git/index.lock" \
+          "$repo/.git/HEAD.lock" \
+          "$repo/.git/FETCH_HEAD.lock" \
+          "$repo/.git/ORIG_HEAD.lock" \
+          "$repo/.git/config.lock" \
+          "$repo/.git/packed-refs.lock" 2>/dev/null || true
     git -C "$repo" "${git_auth[@]}" fetch --force "$url" "$branch:refs/remotes/github/$branch"
     git -C "$repo" checkout -B "$branch" "refs/remotes/github/$branch"
     git -C "$repo" reset --hard "refs/remotes/github/$branch"
