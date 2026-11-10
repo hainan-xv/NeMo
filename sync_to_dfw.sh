@@ -42,7 +42,21 @@ fi
 
 if [[ -d "$repo/.git" ]]; then
     # A killed job can leave stale lock files behind and wedge every later fetch.
-    find "$repo/.git" -name '*.lock' -type f -delete 2>/dev/null || true
+    #
+    # Delete the KNOWN lock paths, never `find .git -name '*.lock'`. That walk
+    # visits every loose-object directory, and on Lustre it takes ~10 MINUTES --
+    # it was the entire cost of this script. Worse, an interrupted sync leaves the
+    # find in uninterruptible I/O wait where even kill -9 will not touch it, so
+    # repeated runs pile up and slow each other (four were stacked at once).
+    # Git only ever writes these few lock paths; enumerating them is O(1).
+    rm -f "$repo/.git/index.lock" \
+          "$repo/.git/HEAD.lock" \
+          "$repo/.git/FETCH_HEAD.lock" \
+          "$repo/.git/ORIG_HEAD.lock" \
+          "$repo/.git/config.lock" \
+          "$repo/.git/packed-refs.lock" 2>/dev/null || true
+    # Ref locks live under refs/ only -- a bounded subtree, not the object store.
+    find "$repo/.git/refs" -name '*.lock' -type f -delete 2>/dev/null || true
     git -C "$repo" "${git_auth[@]}" fetch --force "$url" "$branch:refs/remotes/github/$branch"
     git -C "$repo" checkout -B "$branch" "refs/remotes/github/$branch"
     git -C "$repo" reset --hard "refs/remotes/github/$branch"
