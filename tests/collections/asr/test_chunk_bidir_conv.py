@@ -188,3 +188,73 @@ def test_encoder_is_causal_across_chunks_and_bidirectional_within():
     ), "future input leaked backwards past a chunk boundary"
     # And the current chunk must react (otherwise the mixer is doing nothing).
     assert delta[chunk_start : chunk_start + CS].sum().item() > 0
+
+
+def test_block_keys_match_a_plain_ConvASREncoder_exactly():
+    """Donor warm-start compatibility.
+
+    Inserting mixers INTO the nn.Sequential renumbers every later block, so a
+    Citrinet donor's `encoder.17.*` lands on index 18 and load_state_dict fails:
+        RuntimeError: Error(s) in loading state_dict for EncDecCHATBPEModel
+    The mixers must therefore live outside the stack. This pins that.
+    """
+    from nemo.collections.asr.modules.conv_asr import ConvASREncoder
+
+    def blk(filters, kernel, stride=1):
+        return {
+            "filters": filters,
+            "repeat": 1,
+            "kernel": [kernel],
+            "stride": [stride],
+            "dilation": [1],
+            "dropout": 0.0,
+            "residual": False,
+            "separable": True,
+            "se": False,
+            "future_context": 0,
+        }
+
+    jasper = [blk(16, 3), blk(16, 3, stride=2), blk(16, 3), blk(16, 3)]
+    plain = ConvASREncoder(jasper=jasper, activation="relu", feat_in=8)
+    mixed = _small_encoder(chunk_size=4, mixer_positions=[2, 3])
+
+    plain_keys = set(plain.state_dict())
+    mixed_keys = set(mixed.state_dict())
+
+    assert plain_keys <= mixed_keys, f"donor keys lost: {sorted(plain_keys - mixed_keys)[:5]}"
+    extra = mixed_keys - plain_keys
+    assert extra and all(
+        k.startswith("chunk_mixers.") for k in extra
+    ), f"unexpected extra keys outside chunk_mixers: {sorted(k for k in extra if not k.startswith('chunk_mixers.'))[:5]}"
+
+
+def test_donor_state_dict_loads_with_strict_false_and_lands():
+    """A plain-encoder state dict must actually populate the jasper blocks."""
+    from nemo.collections.asr.modules.conv_asr import ConvASREncoder
+
+    def blk(filters, kernel, stride=1):
+        return {
+            "filters": filters,
+            "repeat": 1,
+            "kernel": [kernel],
+            "stride": [stride],
+            "dilation": [1],
+            "dropout": 0.0,
+            "residual": False,
+            "separable": True,
+            "se": False,
+            "future_context": 0,
+        }
+
+    jasper = [blk(16, 3), blk(16, 3, stride=2), blk(16, 3), blk(16, 3)]
+    donor = ConvASREncoder(jasper=jasper, activation="relu", feat_in=8)
+    for p in donor.parameters():
+        torch.nn.init.constant_(p, 0.123)
+
+    mixed = _small_encoder(chunk_size=4, mixer_positions=[2, 3])
+    missing, unexpected = mixed.load_state_dict(donor.state_dict(), strict=False)
+    assert not unexpected, f"donor had keys the model does not: {unexpected[:5]}"
+    assert all(k.startswith("chunk_mixers.") for k in missing), f"jasper blocks left unloaded: {missing[:5]}"
+
+    loaded = [p for n, p in mixed.named_parameters() if not n.startswith("chunk_mixers.")]
+    assert loaded and all(torch.allclose(p, torch.full_like(p, 0.123)) for p in loaded)

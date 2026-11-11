@@ -27,6 +27,7 @@ from omegaconf import ListConfig
 
 from nemo.collections.asr.modules.conv_asr import ConvASREncoder
 from nemo.collections.asr.parts.submodules.chunk_bidir_conv import ChunkBidirMixer
+from nemo.core.classes.common import typecheck
 from nemo.utils import logging
 
 __all__ = ["ChunkBidirConvASREncoder"]
@@ -94,19 +95,26 @@ class ChunkBidirConvASREncoder(ConvASREncoder):
                 )
 
         channels = self._feat_out
-        rebuilt = []
-        for i, blk in enumerate(blocks):
-            rebuilt.append(blk)
-            if i in mixer_positions:
-                rebuilt.append(
-                    ChunkBidirMixer(
-                        channels=channels,
-                        chunk_size=chunk_size,
-                        kernel_size=mixer_kernel_size,
-                        dropout=mixer_dropout,
-                    )
+
+        # Mixers live in a SEPARATE ModuleList and self.encoder is left exactly as
+        # ConvASREncoder built it. Inserting them into the Sequential instead
+        # renumbers every later block, so the donor's `encoder.encoder.17.*` keys
+        # land on index 18 and a Citrinet warm start dies with
+        #   RuntimeError: Error(s) in loading state_dict for EncDecCHATBPEModel
+        # Keeping the stack untouched means donor keys map 1:1 and the mixers are
+        # simply new parameters the donor does not have.
+        self.chunk_mixers = torch.nn.ModuleList(
+            [
+                ChunkBidirMixer(
+                    channels=channels,
+                    chunk_size=chunk_size,
+                    kernel_size=mixer_kernel_size,
+                    dropout=mixer_dropout,
                 )
-        self.encoder = torch.nn.Sequential(*rebuilt)
+                for _ in mixer_positions
+            ]
+        )
+        self._mixer_at = {p: k for k, p in enumerate(mixer_positions)}
 
         self.chunk_size = int(chunk_size)
         self.mixer_positions = mixer_positions
@@ -115,3 +123,17 @@ class ChunkBidirConvASREncoder(ConvASREncoder):
             f"{mixer_positions} (last stride-bearing block {last_stride_idx}), chunk_size={chunk_size}, "
             f"kernel={mixer_kernel_size or 2 * chunk_size - 1}, channels={channels}"
         )
+
+    @typecheck()
+    def forward(self, audio_signal, length):
+        """Run the jasper stack, applying a chunk-local mixer after selected blocks."""
+        self.update_max_sequence_length(seq_length=audio_signal.size(2), device=audio_signal.device)
+        state = ([audio_signal], length)
+        for i, block in enumerate(self.encoder):
+            state = block(state)
+            if i in self._mixer_at:
+                state = self.chunk_mixers[self._mixer_at[i]](state)
+        s_input, length = state
+        if length is None:
+            return s_input[-1]
+        return s_input[-1], length
