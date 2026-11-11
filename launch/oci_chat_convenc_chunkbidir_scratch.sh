@@ -152,7 +152,10 @@ fi
 # mixes ARCHITECTURE with DONOR QUALITY. With no warm start on either side,
 # the encoder architecture is the only thing left that differs.
 export INIT_NEMO=none
-if [[ ! -f "${INIT_NEMO}" ]]; then
+# Skip the donor check when there is no donor. The guard is inherited from a
+# warm-started arm and would otherwise try to stat a file literally named
+# "none" and abort in 6 seconds.
+if [[ "${INIT_NEMO}" != "none" && ! -f "${INIT_NEMO}" ]]; then
     echo "ERROR: parakeet donor not found: ${INIT_NEMO}" >&2
     echo "       Stage it with:" >&2
     echo "       curl -L -H \"Authorization: Bearer \$(cat ~/.hf_token)\" \\" >&2
