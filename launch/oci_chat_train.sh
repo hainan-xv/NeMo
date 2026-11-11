@@ -110,6 +110,22 @@ EXP_NAME="${EXP_NAME:-oci_granary2_chat_${LOSS_TYPE}}"
 # DFW data and model paths.
 QWEN_TOK=${HEH}/pretrained_models/huggingface/Qwen/Qwen3-1.7B
 INIT_NEMO="${INIT_NEMO:-${HEH}/pretrained_models/huggingface/nvidia/nemotron-speech-streaming-en-0.6b/nemotron-speech-streaming-en-0.6b.nemo}"
+
+# INIT_NEMO=none means TRAIN FROM SCRATCH: emit no init_from_nemo_model override
+# at all. Passing the literal string "none" as a path would be accepted by Hydra
+# and then fail when the trainer tries to restore it. Mirrors dfw_chat_train.sh.
+if [[ "${INIT_NEMO}" == "none" ]]; then
+    INIT_CLAUSE=""
+    echo "==> NO warm start: encoder/decoder/joint all train from scratch"
+else
+    if [[ ! -f "${INIT_NEMO}" ]]; then
+        echo "ERROR: warm-start model not found: ${INIT_NEMO}" >&2
+        exit 1
+    fi
+    INIT_CLAUSE="+init_from_nemo_model.model0.path=${INIT_NEMO} \
+    +init_from_nemo_model.model0.include=${INIT_INCLUDE} \
+    +init_from_nemo_model.model0.exclude=${INIT_EXCLUDE:-'[\"prediction.embed\"]'}"
+fi
 # WHICH tensors the warm start transfers. The defaults are sized for the DONOR
 # nemotron ASR, whose vocabulary differs from ours: joint.joint_net is omitted
 # from the include list and the vocab-shaped tensors are excluded, because they
@@ -203,6 +219,8 @@ echo "*******STARTING********" \
      python -c "
 import os, tarfile
 src, dst = '${INIT_NEMO}', '${TOKENIZER_DIR}'
+# (only reached when TOKENIZER_DIR lacks a tokenizer; with INIT_NEMO=none that
+#  combination is a configuration error and failing loudly here is correct)
 os.makedirs(dst, exist_ok=True)
 with tarfile.open(src, 'r:') as tf:
     for m in tf.getmembers():
@@ -239,9 +257,7 @@ print('    tokenizer ->', dst)
     trainer.val_check_interval=${EPOCH_STEPS} \
     trainer.devices=${GPUS_PER_NODE} \
     trainer.num_nodes=\${SLURM_JOB_NUM_NODES} \
-    +init_from_nemo_model.model0.path=${INIT_NEMO} \
-    +init_from_nemo_model.model0.include=${INIT_INCLUDE} \
-    +init_from_nemo_model.model0.exclude=${INIT_EXCLUDE:-'["prediction.embed"]'} \
+    ${INIT_CLAUSE} \
     ++exp_manager.exp_dir=/results/ \
     ++exp_manager.name=${EXP_NAME} \
     ++exp_manager.max_time_per_run=00:03:55:00 \
