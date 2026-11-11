@@ -1,0 +1,181 @@
+#!/bin/bash
+#SBATCH -A nemotron_speech_asr
+#SBATCH -J nemotron_speechprod_asr:oci-chat-conformer-causal
+#SBATCH -p batch_block1,batch_block3,batch_block4
+#SBATCH -N 2
+#SBATCH --gpus-per-node=8
+#SBATCH -t 04:00:00
+#SBATCH --time-min 04:00:00
+#SBATCH --exclusive
+#SBATCH --overcommit
+#SBATCH --mem=0
+#SBATCH --mail-type=FAIL
+#SBATCH --ntasks-per-node=8
+#SBATCH --output=slurm_out/%x=%j --error=slurm_out/%x=%j
+# pool0-01815 carries an old NVIDIA driver (12020) and fails torch's CUDA init
+# outright; it killed job 18686485 in 103s. pool0-00407 is the reference recipe's
+# known-bad node.
+
+# ============================================================================
+# FULL-CONTEXT CHAT with the 1k SentencePiece vocabulary.
+#
+#   sbatch launch/dfw_chat_spe1k_both_fullctx.sh      <- no arguments
+#
+# WHY 1k. The streaming sweep finished with 1k/4k/8k tied at 4.81/4.83/4.82
+# macro-7 and 16k/32k ~0.13 worse, so 1k is (jointly) the best vocabulary we
+# have and the cheapest. The only full-context arm we have used 16k and scored
+# 4.35; this asks whether the low end helps there too, or whether the
+# full-context encoder prefers a larger vocabulary than the streaming one does.
+#
+# HELD IDENTICAL to dfw_chat_spe16k_both_fullctx.sh in every other knob --
+# same [152,...] batch, same LR, same parakeet encoder-only warm start, same
+# banded band-1 both-side objective, same 2 nodes -- so a delta against its
+# 4.35 is the vocabulary alone.
+#
+# NOT STREAMABLE: full attention plus non-causal downsampling and convolution
+# means no output exists until the audio ends. A reference point, not a
+# deployable configuration.
+#
+# NOTE ON DECODE: a 1k vocabulary needs ~23 tokens on a probe sentence where
+# 16k needs 13, and max_symbols is a PER-CHUNK cap, so evaluate at
+# max_symbols>=15. Measured on a dedicated GPU, 1k also decodes ~10% slower
+# than 8k for that reason -- fewer, wider softmaxes beat more, narrower steps.
+# ============================================================================
+
+export LOSS_TYPE=banded
+export DELAY_FRAMES=0
+export RECOVER_WORDS=0
+export BAND_CHUNKS=1
+export BAND_SIDE=both
+export HISTORY_CHUNKS=0
+export MAX_DELAY_FRAMES=0
+export TARGET_CONSTRUCTION=partition
+export DELAY_PUNCT=true
+export WARMUP_STEPS=5000
+export MAX_STEPS=500000
+export EPOCH_STEPS=2000
+
+# --- BATCH x2 vs the streaming arms -----------------------------------------
+#
+# x10 WAS TRIED FIRST AND OOM'd, job 18956472, before a single logged step.
+# It was not marginal: two ranks died with ~280 MiB free of a 79.11 GiB card
+# while asking for ~585 MiB, i.e. the card was saturated, not just over.
+#
+#   GPU 4: 79.11 GiB total, 302.94 MiB free -- tried to allocate 586.00 MiB
+#   GPU 5: 79.11 GiB total, 266.94 MiB free -- tried to allocate 582.00 MiB
+#
+# That is the ladder's x2 rung, reached by SKIPPING x5. The skip is deliberate:
+# full attention is quadratic in utterance length, the bucket sizes were all
+# measured against a [70,13] streaming window, and the Qwen full-context sibling
+# carries a "WATCH MEMORY" warning while running the 1x list. x5 would have been
+# another guess at a number this project has now OOM'd six times by guessing.
+#
+# This is the streaming arms' list x2.
+#
+# CORRECTION: an earlier version of this comment claimed the Qwen full-context
+# arm (dfw_chat_banded1_both_fullctx_parakeet.sh) also runs this list. It does
+# NOT -- it runs [76,58,...,8], half of this. So a WER comparison between that
+# arm and this one confounds vocabulary with batch size, and is not a clean
+# vocabulary result. Absolute, not a multiplier, so a YAML retune cannot
+# silently change it.
+export BUCKET_BATCH_SIZE='[152,116,100,88,80,72,68,60,56,52,48,44,40,32,28,24,20,16]'
+#
+# If this OOMs too, the only rung left is x1:
+#   [76,58,50,44,40,36,34,30,28,26,24,22,20,16,14,12,10,8]
+#
+# STEP COUNTS ARE STILL NOT COMPARABLE to the streaming arms -- 2x batch means
+# 2x samples per step. Compare samples-seen or wall-clock, not the step counter.
+#
+# LR UNCHANGED at the streaming arms' 5e-5. At x2 this is far less of a concern
+# than it was at x10: it is the same batch/LR pairing the other v2 arms and the
+# Qwen full-context arm already run, so this arm now differs from
+# dfw_granary2_chat_spe16k_both in the ENCODER ALONE -- which is the comparison
+# the 2x2 actually wants.
+# 1e-3, matching the Qwen CHAT baseline this arm swaps the encoder in. NOT the
+# spe1k arm's 5e-5, and NOT the oci_chat_train.sh default of 1e-4 -- that
+# default is applied unconditionally via model.optim.lr, and a launcher that
+# stays silent silently overrides its own config (it cost us the whole
+# dfw_chat_zipformer_sadam arm, which ran at 1e-4 while its config said 0.045).
+export LR=1e-3
+# ---------------------------------------------------------------------------
+
+# The UNMODIFIED Qwen baseline config -- it already is the Conformer twin.
+# Verified by diff: it differs from the conv config only in the encoder block,
+# preprocessor.features (128 vs 80), and two keys the conv arm must state
+# explicitly (frame_length_in_secs, joint.chunk_size) which the Conformer
+# DERIVES to the identical values (0.08 s, 14 frames). So no forked config.
+export CONFIG_NAME=nemotron_chat_transducer_granary2_qwen_causal_ctrl
+export EXP_NAME="${EXP_NAME:-oci_chat_conformer_causal}"
+# oci_chat_train.sh defaults DESIGN_NODES to 4 and cannot grep it from $0 (it is
+# exec'd from this wrapper). Left unset, a 2-node allocation would be treated as
+# an undersized smoke test and silently renamed to ..._n2.
+export DESIGN_NODES=2
+
+# ENCODER ONLY, for two compounding reasons: parakeet-tdt-0.6b-v2 is a TDT model
+# whose prediction network and joint carry duration outputs this model does not
+# have, AND its vocabulary is 1,024 SentencePiece pieces against this arm's
+# 16,384. Widening this list would not warm-start more -- init_from_nemo_model
+# skips shape mismatches SILENTLY, so the tensors would sit at init while the
+# load reported success.
+export INIT_INCLUDE='["encoder."]'
+export INIT_EXCLUDE='[]'
+
+OCI=/lustre/fsw/portfolios/nemotron/users/hainanx
+
+# The purpose-built 16k vocabulary, from launch/dfw_build_spe_vocabs.sh. The
+# trainer only extracts a donor SentencePiece when this directory holds no
+# tokenizer.model, so pointing at a built one is enough to override it. Same
+# directory as the streaming spe16k arm, deliberately: an identical vocabulary
+# is what makes the two comparable.
+# No TOKENIZER_DIR override: oci_chat_train.sh already defaults to QWEN_TOK
+# (Qwen3-1.7B, 151k). The spe1k arm overrode it to a 1024-piece vocabulary;
+# this arm is the Qwen-151k family, so the default is exactly right.
+export TOKENIZER_DIR="${TOKENIZER_DIR:-/lustre/fsw/portfolios/llmservice/users/heh/pretrained_models/huggingface/Qwen/Qwen3-1.7B}"
+
+# Accept EITHER tokenizer.model (SentencePiece) or tokenizer.json (HF). The spe1k
+# arm this was forked from checked only for tokenizer.model, which a Qwen
+# tokenizer does not have -- so the Qwen-151k family failed this guard in 6s even
+# with a perfectly good tokenizer directory.
+if [[ ! -f "${TOKENIZER_DIR}/tokenizer.model" && ! -f "${TOKENIZER_DIR}/tokenizer.json" ]]; then
+    echo "ERROR: no tokenizer.model or tokenizer.json at ${TOKENIZER_DIR}" >&2
+    exit 1
+fi
+
+# parakeet-tdt-0.6b-v2, staged from HuggingFace. A .nemo because
+# init_from_nemo_model is what the CHAT trainer exposes.
+# CITRINET, not the spe1k arm's parakeet. The encoder in this config IS Citrinet;
+# parakeet is a Conformer/TDT model whose encoder tensors would match almost
+# nothing here, and init_from_nemo_model skips mismatches SILENTLY -- the arm
+# would have trained from scratch while claiming a warm start.
+#
+# Same file as the DFW conv arms (downloaded here separately, 483,819,120 bytes).
+# nemotron, the Conformer's own donor -- the exact counterpart of Citrinet for
+# the conv arm. Encoder tensors only (INIT_INCLUDE above), so both arms get the
+# same treatment: pretrained encoder, everything else fresh.
+export INIT_NEMO="${INIT_NEMO:-/lustre/fsw/portfolios/llmservice/users/heh/pretrained_models/huggingface/nvidia/nemotron-speech-streaming-en-0.6b/nemotron-speech-streaming-en-0.6b.nemo}"
+if [[ ! -f "${INIT_NEMO}" ]]; then
+    echo "ERROR: parakeet donor not found: ${INIT_NEMO}" >&2
+    echo "       Stage it with:" >&2
+    echo "       curl -L -H \"Authorization: Bearer \$(cat ~/.hf_token)\" \\" >&2
+    echo "         -o ${INIT_NEMO} \\" >&2
+    echo "         https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2/resolve/main/parakeet-tdt-0.6b-v2.nemo" >&2
+    exit 1
+fi
+
+find_launch_dir() {
+    if [[ -n "${SLURM_SUBMIT_DIR:-}" ]]; then
+        [[ -f "${SLURM_SUBMIT_DIR}/oci_chat_train.sh" ]] && { echo "${SLURM_SUBMIT_DIR}"; return; }
+        [[ -f "${SLURM_SUBMIT_DIR}/launch/oci_chat_train.sh" ]] && { echo "${SLURM_SUBMIT_DIR}/launch"; return; }
+    fi
+    local here; here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    [[ -f "${here}/oci_chat_train.sh" ]] && { echo "${here}"; return; }
+    # ABSOLUTE fallback, and it is not belt-and-braces -- it is the only thing that
+    # works on a REQUEUE. Slurm hands the requeued job SLURM_SUBMIT_DIR pointing at
+    # the scratch ROOT rather than the directory the job was submitted from, and $0
+    # is the spool copy, so both of the lookups above miss.
+    local repo="${OCI_CODE_DIR:-${OCI}/NeMo_SCRIPT_cc}"
+    [[ -f "${repo}/launch/oci_chat_train.sh" ]] && { echo "${repo}/launch"; return; }
+    echo "ERROR: cannot locate oci_chat_train.sh (SLURM_SUBMIT_DIR=${SLURM_SUBMIT_DIR:-<unset>}, repo=${repo})" >&2
+    exit 1
+}
+exec bash "$(find_launch_dir)/oci_chat_train.sh" "$@"
