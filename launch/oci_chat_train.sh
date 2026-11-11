@@ -260,7 +260,13 @@ print('    tokenizer ->', dst)
     ${INIT_CLAUSE} \
     ++exp_manager.exp_dir=/results/ \
     ++exp_manager.name=${EXP_NAME} \
-    ++exp_manager.max_time_per_run=00:03:55:00 \
+    # 03:20, not 03:55, against a 4h Slurm limit. Lightning only checks max_time
+    # at hook boundaries, so a run that trips it mid-epoch keeps going until the
+    # epoch and its validation finish -- an epoch here is 2000 steps (~50 min),
+    # so a 5-minute margin is nowhere near enough. Every one of six legs was
+    # killed by Slurm at exactly 04:00:0x instead of stopping itself, losing the
+    # steps since the last checkpoint each time.
+    ++exp_manager.max_time_per_run=00:03:20:00 \
     ++exp_manager.create_wandb_logger=true \
     ++exp_manager.wandb_logger_kwargs.name=${EXP_NAME} \
     ++exp_manager.wandb_logger_kwargs.project=${PROJECT_NAME}
