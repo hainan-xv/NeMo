@@ -645,6 +645,22 @@ model:
     # backward-looking, so it adds context without adding latency. Independent of
     # loss_type -- both arms may use it.
     history_chunks: 0
+    # EXPLICIT, because RNNTAttJoint cannot infer it here. It normally reads the
+    # encoder's chunked_limited attention and takes chunk = right_context + 1;
+    # a ConvASREncoder has no attention at all, so it reports 'regular' and the
+    # joint raises:
+    #   ValueError: RNNTAttJoint requires encoder with
+    #   att_context_style='chunked_limited', got 'regular'
+    #
+    # 14 is NOT arbitrary: the FastConformer baseline runs att_context_size
+    # [70, 13], i.e. right=13 -> chunk 14 frames -> 1.12 s commit granularity.
+    # Matching it keeps the encoder the only variable.
+    #
+    # Note the latency asymmetry this creates, in our favour: the baseline buys
+    # its 14-frame chunk with 13 frames (1.04 s) of encoder LOOKAHEAD. This arm
+    # commits on the same grid with ZERO lookahead, so it remains strictly lower
+    # latency than the model it is measured against.
+    chunk_size: 14
     preserve_memory: false
     fuse_loss_wer: false
     fused_batch_size: null
