@@ -139,7 +139,15 @@ model:
     # 0 disables.
     log_target_mismatch_every_n_steps: 500
     # Seconds per ENCODER frame; defaults to window_stride * subsampling_factor.
-    frame_length_in_secs: null
+    # 0.08 EXPLICITLY, not null. chat_bpe_models.py derives this as
+    #   window_stride * cfg.encoder.subsampling_factor
+    # only when it is null -- and subsampling_factor is a Conformer key that a
+    # ConvASREncoder does not have, so leaving it null dies at startup with
+    #   ConfigAttributeError: Key 'subsampling_factor' is not in struct
+    # The value is not a guess: Citrinet subsamples 8x (stride-2 at blocks 1, 7
+    # and 14) on a 0.01 s stride, so 0.01 * 8 = 0.08 -- the same frame rate the
+    # FastConformer baseline produces, which is why the alignment carries over.
+    frame_length_in_secs: 0.08
 
   model_defaults:
     enc_hidden: 1024
