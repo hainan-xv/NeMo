@@ -91,6 +91,17 @@ INFER_DELAY_FRAMES="${INFER_DELAY_FRAMES:-null}"
 
 LR="${LR:-1e-4}"
 WARMUP_STEPS="${WARMUP_STEPS:-5000}"
+# Self-stop margin before the 4h Slurm wall. Lightning only checks max_time at
+# hook boundaries, so a run that trips it mid-epoch continues until that epoch
+# AND its validation finish -- an epoch here is 2000 steps (~50 min), so a
+# 5-minute margin never fired and every leg was killed at exactly 04:00:0x.
+#
+# NB: this must stay a shell variable. Putting the explanation inline next to
+# the override does not work -- these lines are inside the heredoc that builds
+# $cmd, run later via `bash -c "$cmd"`, where a # comments out the REST OF THE
+# COMMAND. Doing exactly that silently dropped max_time_per_run and both wandb
+# flags from three runs.
+MAX_TIME_PER_RUN="${MAX_TIME_PER_RUN:-00:03:20:00}"
 # Per-bucket batch sizes. Empty means "use whatever the YAML says", which is what
 # every arm did until we dropped to 2 nodes. An arm that sets this overrides the
 # YAML wholesale -- an ABSOLUTE list, not a multiplier, so it stays a valid
@@ -260,13 +271,7 @@ print('    tokenizer ->', dst)
     ${INIT_CLAUSE} \
     ++exp_manager.exp_dir=/results/ \
     ++exp_manager.name=${EXP_NAME} \
-    # 03:20, not 03:55, against a 4h Slurm limit. Lightning only checks max_time
-    # at hook boundaries, so a run that trips it mid-epoch keeps going until the
-    # epoch and its validation finish -- an epoch here is 2000 steps (~50 min),
-    # so a 5-minute margin is nowhere near enough. Every one of six legs was
-    # killed by Slurm at exactly 04:00:0x instead of stopping itself, losing the
-    # steps since the last checkpoint each time.
-    ++exp_manager.max_time_per_run=00:03:20:00 \
+    ++exp_manager.max_time_per_run=${MAX_TIME_PER_RUN} \
     ++exp_manager.create_wandb_logger=true \
     ++exp_manager.wandb_logger_kwargs.name=${EXP_NAME} \
     ++exp_manager.wandb_logger_kwargs.project=${PROJECT_NAME}
