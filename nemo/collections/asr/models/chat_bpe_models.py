@@ -1148,7 +1148,14 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
         if self.loss_type == "confidence_rnnt":
             if AccessMixin.is_access_enabled(self.model_guid):
                 AccessMixin.reset_registry(self)
-            signal, signal_len, transcript, transcript_len, _cuts = batch
+            # The batch carries `cuts` only for the alignment-based losses that
+            # need them; the full-sum path gets a plain 4-tuple. Unpacking 5
+            # unconditionally dies with
+            #   ValueError: not enough values to unpack (expected 5, got 4)
+            if len(batch) == 5:
+                signal, signal_len, transcript, transcript_len, _cuts = batch
+            else:
+                signal, signal_len, transcript, transcript_len = batch
             encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
             del signal
             loss_value = self.add_auxiliary_losses(
