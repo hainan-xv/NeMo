@@ -29,7 +29,6 @@ from typing import Optional, Tuple
 
 import torch
 
-from nemo.collections.asr.losses.confidence_rnnt import compose_effective_logprobs
 from nemo.collections.asr.parts.numba.confidence_rnnt.confidence_rnnt_kernel import (
     HAVE_NUMBA,
     compute_alphas_kernel,
@@ -55,23 +54,36 @@ def kernel_is_usable(log_py: torch.Tensor) -> Tuple[bool, str]:
     return True, ""
 
 
-def _gather_columns(log_eff: torch.Tensor, targets: torch.Tensor, blank_id: int):
-    """Pull the two arcs the recursion needs out of the full distribution.
+def _compose_gathered(log_py: torch.Tensor, log_pc: torch.Tensor, targets: torch.Tensor, blank_id: int):
+    """Compose the two heads DIRECTLY into the two columns the lattice needs.
 
-    Returns ``blank_lp`` and ``label_lp``, both (B, T, U+1). The label column at
-    u == U is unused by the recursion (no token u+1 exists) and is filled with a
-    finite dummy so the kernel never reads uninitialised memory.
+    Returns ``blank_lp`` and ``label_lp``, both (B, T, U+1):
+
+        blank_lp = logaddexp(log P_c(1) + log P_y(blank),  log P_c(0))
+        label_lp =           log P_c(1) + log P_y(y_{u+1})
+
+    Deliberately never materialises the full (B, T, U+1, V+1) effective
+    distribution. Doing so costs two extra tensors of that size -- one for the
+    add, one for a defensive clone -- which at a 151k vocabulary is ~11 GiB each
+    and OOMs in backward on an 80 GiB card. Only these two columns are ever read
+    by the recursion, so the rest is pure waste.
     """
-    B, T, U1, _ = log_eff.shape
-    blank_lp = log_eff[..., blank_id].contiguous()
+    B, T, U1, _ = log_py.shape
+    log_c1 = log_pc[..., 1]  # (B, T, U+1)
+    log_c0 = log_pc[..., 0]
+
+    blank_lp = torch.logaddexp(log_py[..., blank_id] + log_c1, log_c0).contiguous()
 
     U = U1 - 1
     if U > 0:
         idx = targets[:, :U].view(B, 1, U, 1).expand(B, T, U, 1)
-        label_lp = log_eff[:, :, :U, :].gather(-1, idx).squeeze(-1)
+        label_py = log_py[:, :, :U, :].gather(-1, idx).squeeze(-1)
+        label_lp = label_py + log_c1[:, :, :U]
     else:
-        label_lp = log_eff.new_zeros((B, T, 0))
-    pad = log_eff.new_zeros((B, T, 1))
+        label_lp = log_py.new_zeros((B, T, 0))
+    # u == U has no token u+1; the recursion never reads it, but the kernel
+    # indexes the full width so it must be finite.
+    pad = log_py.new_zeros((B, T, 1))
     label_lp = torch.cat([label_lp, pad], dim=2).contiguous()
     return blank_lp, label_lp
 
@@ -160,8 +172,7 @@ def confidence_rnnt_loss_cuda(
     if not ok:
         raise RuntimeError(f"confidence RNN-T CUDA path unusable: {why}")
 
-    log_eff = compose_effective_logprobs(log_py, log_pc, blank_id)
-    blank_lp, label_lp = _gather_columns(log_eff, targets, blank_id)
+    blank_lp, label_lp = _compose_gathered(log_py, log_pc, targets, blank_id)
     nll = _ConfidenceRNNTFunction.apply(blank_lp, label_lp, input_lens, target_lens)
 
     if reduction == "mean":

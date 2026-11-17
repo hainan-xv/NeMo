@@ -110,10 +110,7 @@ def test_alpha_beta_agree_on_the_likelihood():
     from nemo.collections.asr.parts.numba.confidence_rnnt import confidence_rnnt_numba as m
 
     py, pc, tgt, il, tl = _make(2, 6, 3, seed=13)
-    from nemo.collections.asr.losses.confidence_rnnt import compose_effective_logprobs
-
-    eff = compose_effective_logprobs(py, pc, BLANK)
-    blank_lp, label_lp = m._gather_columns(eff, tgt, BLANK)
+    blank_lp, label_lp = m._compose_gathered(py, pc, tgt, BLANK)
 
     B, T, U1 = blank_lp.shape
     dev = blank_lp.device
@@ -155,3 +152,26 @@ def test_alpha_beta_agree_on_the_likelihood():
     )
     torch.cuda.current_stream(dev).synchronize()
     torch.testing.assert_close(llf, llb, rtol=1e-4, atol=1e-4)
+
+
+def test_gathered_composition_matches_full_composition():
+    """The memory-efficient path must equal composing the full distribution.
+
+    The CUDA path never materialises (B, T, U+1, V+1) -- two tensors of that
+    size at a 151k vocabulary are ~11 GiB each and OOM'd in backward. This pins
+    the shortcut to the readable version it replaced.
+    """
+    from nemo.collections.asr.losses.confidence_rnnt import compose_effective_logprobs
+    from nemo.collections.asr.parts.numba.confidence_rnnt import confidence_rnnt_numba as m
+
+    py, pc, tgt, il, tl = _make(2, 5, 3, seed=17)
+    blank_lp, label_lp = m._compose_gathered(py, pc, tgt, BLANK)
+
+    eff = compose_effective_logprobs(py, pc, BLANK)
+    ref_blank = eff[..., BLANK]
+    U = py.shape[2] - 1
+    idx = tgt[:, :U].view(py.shape[0], 1, U, 1).expand(py.shape[0], py.shape[1], U, 1)
+    ref_label = eff[:, :, :U, :].gather(-1, idx).squeeze(-1)
+
+    torch.testing.assert_close(blank_lp, ref_blank, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(label_lp[:, :, :U], ref_label, rtol=1e-5, atol=1e-6)
