@@ -825,7 +825,13 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
             )
 
         g, _, _ = self.decoder(targets=transcript, target_length=transcript_len)
-        log_py, log_pc = self.joint.joint_with_confidence(encoded, g, encoded_len)
+
+        # RNNTAttJoint.forward() transposes BOTH tensors before calling joint():
+        #   encoder (B, D, T) -> (B, T, D);  decoder (B, D, U) -> (B, U, D)
+        # joint_with_confidence sits at the joint() level, so the caller owes it
+        # the same layout. Passing the raw encoder output instead produced
+        #   RuntimeError: shape '[7, 74, -1, 1024]' is invalid for input of size ...
+        log_py, log_pc = self.joint.joint_with_confidence(encoded.transpose(1, 2), g.transpose(1, 2), encoded_len)
 
         # After chunking, the lattice's time axis is chunks, not frames.
         lens = self.joint.num_chunks_per_utterance
