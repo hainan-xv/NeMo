@@ -103,6 +103,24 @@ EXP_NAME="${EXP_NAME:-dfw_granary2_chat_${LOSS_TYPE}}"
 QWEN_TOK=${HEH}/pretrained_models/huggingface/Qwen/Qwen3-1.7B
 INIT_NEMO="${INIT_NEMO:-${HEH}/pretrained_models/huggingface/nvidia/nemotron-speech-streaming-en-0.6b/nemotron-speech-streaming-en-0.6b.nemo}"
 
+# WHICH tensors the warm start transfers. The defaults are sized for the DONOR
+# nemotron ASR, whose vocabulary differs from ours: joint.joint_net is omitted
+# from the include list and the vocab-shaped tensors are excluded, because they
+# cannot be loaded across a vocabulary change.
+#
+# An arm warm-starting from a SIBLING arm with the SAME vocabulary should widen
+# both -- the 151k embedding and the 151k output projection are the largest and
+# slowest-to-learn tensors in the model, and leaving them at init discards most
+# of the benefit of warm starting at all.
+INIT_INCLUDE="${INIT_INCLUDE:-[\"encoder.\",\"decoder.\",\"joint.enc.\",\"joint.pred.\"]}"
+#
+# NOTE: this default must be set BEFORE the INIT_CLAUSE branch below, which
+# references ${INIT_INCLUDE}. It used to sit after it, so under `set -u` any arm
+# that did not export INIT_INCLUDE itself died with
+#   dfw_chat_train.sh: line 117: INIT_INCLUDE: unbound variable
+# before the container even started. Dormant only because the arms in use all
+# happened to export it.
+
 # INIT_NEMO=none means TRAIN FROM SCRATCH: emit no init_from_nemo_model override
 # at all. Needed for encoders with no donor (e.g. Zipformer) -- passing the path
 # 'none' would fail, and pointing at a Conformer donor would silently match zero
@@ -116,16 +134,6 @@ else
     +init_from_nemo_model.model0.include=${INIT_INCLUDE} \
     +init_from_nemo_model.model0.exclude=${INIT_EXCLUDE:-'[\"prediction.embed\"]'}"
 fi
-# WHICH tensors the warm start transfers. The defaults are sized for the DONOR
-# nemotron ASR, whose vocabulary differs from ours: joint.joint_net is omitted
-# from the include list and the vocab-shaped tensors are excluded, because they
-# cannot be loaded across a vocabulary change.
-#
-# An arm warm-starting from a SIBLING arm with the SAME vocabulary should widen
-# both -- the 151k embedding and the 151k output projection are the largest and
-# slowest-to-learn tensors in the model, and leaving them at init discards most
-# of the benefit of warm starting at all.
-INIT_INCLUDE="${INIT_INCLUDE:-[\"encoder.\",\"decoder.\",\"joint.enc.\",\"joint.pred.\"]}"
 TRAIN_INPUT_CFG="${TRAIN_INPUT_CFG:-${HEH}/data_configs/granary_v2_en_full_d0.5_b0.5_dfw_qwen_aligned.yaml}"
 VAL_MANIFEST="${VAL_MANIFEST:-${HEH}/data/mcv11_en_dev_aligned/mcv11_dev_clean_pcstrip_en_2k_qwen_aligned.json}"
 TOKENIZER_DIR="${TOKENIZER_DIR:-${QWEN_TOK}}"
