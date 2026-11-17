@@ -52,6 +52,7 @@ from omegaconf import DictConfig, OmegaConf
 from nemo.collections.asr.data.audio_to_text_lhotse import LhotseSpeechToTextBpeDataset
 from nemo.collections.asr.losses.banded_rnnt import BandedLattice, banded_rnnt_loss, build_lattices
 from nemo.collections.asr.models.rnnt_bpe_models import EncDecRNNTBPEModel
+from nemo.collections.asr.modules.rnnt_confidence_joint import RNNTAttConfidenceJoint
 from nemo.collections.asr.parts.numba.banded_rnnt.banded_rnnt_numba import (
     banded_rnnt_loss_cuda,
     build_band_index,
@@ -78,7 +79,7 @@ from nemo.utils import logging
 
 __all__ = ["EncDecCHATBPEModel"]
 
-LOSS_TYPES = ("rnnt", "forced_alignment", "banded")
+LOSS_TYPES = ("rnnt", "forced_alignment", "banded", "confidence_rnnt")
 
 
 class _RNNTAutoTokenizer(AutoTokenizer):
@@ -798,6 +799,53 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
         as_t = lambda x: torch.tensor(x, dtype=torch.long, device=device)  # noqa: E731
         return as_t(b_all), as_t(t_all), as_t(u_all), as_t(lab_all), pred_input, pred_lens.to(device)
 
+    def _confidence_rnnt_loss(self, encoded, encoded_len, transcript, transcript_len) -> torch.Tensor:
+        """Two-head confidence transducer loss over the FULL RNN-T lattice.
+
+        Unlike the banded and forced-alignment paths this uses no alignment at
+        all: every alignment is summed over, exactly as in loss_type="rnnt".
+        The only difference is that each arc carries a composed probability from
+        two heads rather than one. See docs/reports/confidence_rnnt.tex.
+
+        NOTE the known caveat: the likelihood is invariant to how mass splits
+        between P_c(0) and P_y(blank), so where the confidence head settles is
+        determined by initialisation and the shared backbone rather than by the
+        data. This path exists to measure that empirically.
+        """
+        from nemo.collections.asr.parts.numba.confidence_rnnt.confidence_rnnt_numba import (
+            confidence_rnnt_loss_cuda,
+            kernel_is_usable,
+        )
+
+        if not isinstance(self.joint, RNNTAttConfidenceJoint):
+            raise TypeError(
+                "loss_type='confidence_rnnt' requires model.joint._target_ to be "
+                "nemo.collections.asr.modules.rnnt_confidence_joint.RNNTAttConfidenceJoint, "
+                f"got {type(self.joint).__name__}"
+            )
+
+        g, _, _ = self.decoder(targets=transcript, target_length=transcript_len)
+        log_py, log_pc = self.joint.joint_with_confidence(encoded, g, encoded_len)
+
+        # After chunking, the lattice's time axis is chunks, not frames.
+        lens = self.joint.num_chunks_per_utterance
+        if lens is None:
+            lens = encoded_len
+
+        blank = self.joint.num_classes_with_blank - 1
+        ok, why = kernel_is_usable(log_py)
+        if not ok:
+            raise RuntimeError(f"confidence_rnnt requires the CUDA path: {why}")
+
+        loss = confidence_rnnt_loss_cuda(
+            log_py, log_pc, transcript, lens, transcript_len, blank_id=blank, reduction="mean"
+        )
+        # Expose the learned split so it can be watched during training; this is
+        # the quantity the identifiability caveat is about.
+        with torch.no_grad():
+            self.log("train_p_confident", log_pc[..., 1].exp().mean())
+        return loss
+
     def _banded_loss(self, encoded, encoded_len, cuts) -> torch.Tensor:
         """RNN-T forward summed over paths within ``band_chunks`` of the alignment.
 
@@ -1097,6 +1145,20 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
         a WER that appeared for one arm and not the other would make exactly the
         comparison this model exists to support impossible.
         """
+        if self.loss_type == "confidence_rnnt":
+            if AccessMixin.is_access_enabled(self.model_guid):
+                AccessMixin.reset_registry(self)
+            signal, signal_len, transcript, transcript_len, _cuts = batch
+            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
+            del signal
+            loss_value = self.add_auxiliary_losses(
+                self._confidence_rnnt_loss(encoded, encoded_len, transcript, transcript_len)
+            )
+            self.log("train_loss", loss_value)
+            self.log("learning_rate", self._optimizer.param_groups[0]["lr"])
+            self.log("global_step", torch.tensor(self.trainer.global_step, dtype=torch.float32))
+            return {"loss": loss_value}
+
         if self.loss_type == "rnnt":
             # The window trim applies to the marginalised loss too, and means the
             # same thing: the last d frames of each chunk have not arrived yet.

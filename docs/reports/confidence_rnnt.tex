@@ -1,0 +1,237 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{hyperref}
+
+\newtheorem{proposition}{Proposition}
+\newcommand{\blank}{\varnothing}
+\newcommand{\Py}{P_{\mathrm{y}}}
+\newcommand{\Pc}{P_{\mathrm{c}}}
+\newcommand{\Peff}{P_{\mathrm{eff}}}
+
+\title{A Confidence Head in the RNNT Forward Recursion}
+\author{Working note}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{Motivation}
+
+In a full-context transducer, $P(\text{token} \mid t, \text{history})$ is well posed:
+the encoder has observed the whole utterance, so the time index $t$ merely selects
+a position in a fully observed sequence. The blank symbol $\blank$ then carries a
+single, unambiguous meaning: \emph{nothing is emitted here, advance time}.
+
+In the streaming setting the encoder at chunk $t$ has observed audio only up to
+chunk $t$. The blank symbol becomes overloaded, conflating two situations that
+call for different downstream behaviour:
+
+\begin{enumerate}
+  \item \textbf{Confident emptiness.} There is genuinely nothing to emit at this
+        chunk. The decision is final and will not be revised.
+  \item \textbf{Deferral under uncertainty.} The model cannot yet determine what
+        to emit and would prefer to observe more audio before committing.
+\end{enumerate}
+
+Both produce the same symbol, the same lattice transition, and the same gradient.
+The proposal examined here is to add a second output head emitting an explicit
+binary confidence at every lattice position, so that the two cases become
+distinguishable.
+
+\section{Notation}
+
+Let $X$ be the input and $Y = (y_1,\dots,y_U)$ the target token sequence. The
+lattice node $(t,u)$ denotes ``$t$ chunks consumed, $u$ tokens emitted'', with
+$1 \le t \le T$ and $0 \le u \le U$.
+
+\paragraph{Token head.} $\Py(k \mid t,u)$ is a distribution over
+$V \cup \{\blank\}$, where $V$ is the token vocabulary.
+
+\paragraph{Confidence head.} $\Pc(1 \mid t,u)$ and $\Pc(0 \mid t,u)$ with
+$\Pc(1)+\Pc(0)=1$, interpreted as confident / not confident.
+
+Where no ambiguity arises the arguments $(t,u)$ are suppressed.
+
+\section{The standard recursion}
+
+With a single head, the forward variable
+$\alpha(t,u) = P(\text{reach } (t,u))$ obeys
+\begin{equation}
+  \alpha(t,u) \;=\; \alpha(t-1,u)\,\Py(\blank \mid t-1,u)
+                 \;+\; \alpha(t,u-1)\,\Py(y_u \mid t,u-1),
+  \label{eq:rnnt}
+\end{equation}
+with $\alpha(1,0)=1$, and the sequence likelihood
+$P(Y \mid X) = \alpha(T,U)\,\Py(\blank \mid T,U)$.
+
+Every path through the lattice is one alignment; \eqref{eq:rnnt} sums over all of
+them. Crucially, in the full-sum formulation the alignment is \emph{latent}: no
+supervision identifies which chunk a given word ``should'' have been emitted at.
+
+\section{First formulation: confidence gates commitment}
+\label{sec:gating}
+
+The natural reading of the confidence bit is that it gates committing. If
+confident, the model emits a token or a genuine blank; if not confident, it
+declines to emit and advances time. The transitions out of $(t,u)$ are then
+
+\begin{center}
+\begin{tabular}{lll}
+\textbf{action} & \textbf{probability} & \textbf{successor} \\[2pt]
+emit $y_{u+1}$                 & $\Pc(1)\,\Py(y_{u+1})$ & $(t,\,u+1)$ \\
+blank, confident               & $\Pc(1)\,\Py(\blank)$  & $(t+1,\,u)$ \\
+blank, not confident (defer)   & $\Pc(0)$               & $(t+1,\,u)$ \\
+\end{tabular}
+\end{center}
+
+\noindent giving the recursion
+\begin{equation}
+  \alpha(t,u) \;=\; \alpha(t-1,u)\big[\Pc(1)\Py(\blank) + \Pc(0)\big]
+                 \;+\; \alpha(t,u-1)\,\Pc(1)\Py(y_u).
+  \label{eq:gated}
+\end{equation}
+
+\subsection{This formulation is unidentifiable}
+
+\begin{proposition}
+Under \eqref{eq:gated} the likelihood $P(Y \mid X)$ depends on the two heads only
+through the composite quantities
+\begin{equation}
+  \Peff(\blank) \;=\; \Pc(1)\Py(\blank) + \Pc(0),
+  \qquad
+  \Peff(y) \;=\; \Pc(1)\Py(y) \quad (y \in V).
+  \label{eq:peff}
+\end{equation}
+Consequently infinitely many pairs $(\Pc,\Py)$ attain the same loss, and the
+confidence head is not identified.
+\end{proposition}
+
+\begin{proof}
+First, $\Peff$ is a valid distribution:
+\[
+  \sum_{y \in V}\Peff(y) + \Peff(\blank)
+  = \Pc(1)\Big[\sum_{y\in V}\Py(y) + \Py(\blank)\Big] + \Pc(0)
+  = \Pc(1) + \Pc(0) = 1 .
+\]
+Substituting \eqref{eq:peff} into \eqref{eq:gated} yields
+\[
+  \alpha(t,u) = \alpha(t-1,u)\,\Peff(\blank \mid t-1,u)
+              + \alpha(t,u-1)\,\Peff(y_u \mid t,u-1),
+\]
+which is exactly \eqref{eq:rnnt} with $\Py$ replaced by $\Peff$. Hence the loss is
+a function of $\Peff$ alone. The defining relation
+$\Peff(\blank) = \Pc(1)\Py(\blank) + \Pc(0)$ is a single equation in the two
+unknowns $\Pc(0)$ and $\Py(\blank)$, so for any target $\Peff(\blank) \in (0,1)$
+there is a one-parameter family of solutions, all with identical likelihood.
+\end{proof}
+
+\paragraph{Consequences.}
+\begin{itemize}
+  \item Gradient descent places $\Pc$ arbitrarily within the family; whatever it
+        converges to reflects initialisation and optimiser dynamics, not a
+        property of the data.
+  \item Adding a cost $\lambda\,\Pc(0)$ to discourage deferral does not repair
+        this. Both blank transitions reach the same successor $(t+1,u)$, so the
+        deferral branch confers no compensating benefit and the penalised
+        optimum is simply $\Pc(0) \equiv 0$.
+  \item The underlying reason is structural: \emph{two actions that lead to the
+        same successor state and differ only in label are exchangeable.} Any fix
+        must make the two blanks differ in consequence, not merely in name.
+\end{itemize}
+
+\section{Second formulation: deferral with a budget}
+\label{sec:budget}
+
+Augment the lattice state with a counter $d$ recording the number of
+\emph{consecutive} deferrals, $0 \le d \le k$ for a fixed budget $k$. The node is
+now $(t,u,d)$. Transitions out of $(t,u,d)$:
+
+\begin{center}
+\begin{tabular}{llll}
+\textbf{action} & \textbf{probability} & \textbf{successor} & \textbf{condition} \\[2pt]
+emit $y_{u+1}$               & $\Pc(1)\Py(y_{u+1})$ & $(t,\,u+1,\,0)$ & --- \\
+blank, confident             & $\Pc(1)\Py(\blank)$  & $(t+1,\,u,\,0)$ & --- \\
+defer                        & $\Pc(0)$             & $(t+1,\,u,\,d+1)$ & $d < k$ \\
+\end{tabular}
+\end{center}
+
+At $d = k$ the deferral branch is removed and the confidence head is masked so
+that $\Pc(1) \equiv 1$; the distribution therefore remains normalised at every
+node. Both committing actions reset the counter.
+
+The forward recursion splits by whether the counter is zero:
+\begin{align}
+  \alpha(t,u,0) &= \sum_{d'=0}^{k} \alpha(t-1,u,d')\,
+                     \Pc(1 \mid t-1,u,d')\,\Py(\blank \mid t-1,u,d') \notag \\
+                &\quad + \sum_{d'=0}^{k} \alpha(t,u-1,d')\,
+                     \Pc(1 \mid t,u-1,d')\,\Py(y_u \mid t,u-1,d'),
+  \label{eq:budget0} \\[4pt]
+  \alpha(t,u,d) &= \alpha(t-1,u,d-1)\,\Pc(0 \mid t-1,u,d-1),
+                   \qquad 1 \le d \le k,
+  \label{eq:budgetd}
+\end{align}
+with $\alpha(1,0,0)=1$ and all other $\alpha(1,\cdot,\cdot)=0$. The likelihood is
+\begin{equation}
+  P(Y \mid X) \;=\; \sum_{d=0}^{k} \alpha(T,U,d)\,
+                    \Pc(1 \mid T,U,d)\,\Py(\blank \mid T,U,d),
+\end{equation}
+requiring the sequence to terminate on a confident blank.
+
+\subsection{Why this is identifiable}
+
+Deferral now has a consequence: it consumes budget, and budget exhaustion
+forecloses continuations that would otherwise be available. Two parameterisations
+that agree on $\Peff$ but differ in how mass splits between $\Pc(0)$ and
+$\Py(\blank)$ reach different distributions over $d$, hence different sets of
+reachable paths, hence different likelihoods. The collapse of
+Section~\ref{sec:gating} no longer applies.
+
+The limiting behaviour is a useful check. As $k \to \infty$ the budget never
+binds, the counter becomes irrelevant, and the model degenerates to
+\eqref{eq:gated} --- unidentifiable again. \emph{Finiteness of $k$ is exactly what
+makes the confidence head learnable.}
+
+\subsection{Cost}
+
+The lattice grows by a factor of $k+1$. For the intended regime ($k = 2$ or $3$)
+this is a small constant. Equations \eqref{eq:budget0}--\eqref{eq:budgetd} retain
+the same dependency structure as \eqref{eq:rnnt}, so the usual parallel
+forward--backward schedule over anti-diagonals still applies.
+
+\subsection{Interpretation of $k$}
+
+$k$ is simultaneously (i) the regulariser that makes $\Pc$ identifiable and
+(ii) a hard upper bound on emission latency, in chunks. At chunk duration
+$0.08\,\mathrm{s} \times 14 = 1.12\,\mathrm{s}$, a budget of $k=2$ bounds extra
+deferral at $2.24\,\mathrm{s}$.
+
+\section{Open questions}
+
+\begin{enumerate}
+  \item \textbf{Does this merely relabel the band?} A budget of $k$ permits a word
+        to be emitted at most $k$ chunks after it first could have been, which is
+        close to what a fixed alignment band enforces --- except allocated by the
+        model rather than fixed in advance. The claim worth testing is that
+        \emph{learned, input-dependent} allocation beats a \emph{fixed} band at
+        equal mean latency. This is directly testable against an existing banded
+        arm.
+
+  \item \textbf{Does $\Pc$ mean what we want it to mean?} Nothing in the objective
+        forces $\Pc(0)$ to track uncertainty; it marks ``took the budgeted path''.
+        Whether that coincides with low per-token correctness is empirical, and
+        should be measured (e.g.\ correlation of $\Pc$ with per-word correctness,
+        and calibration, not merely ranking) rather than assumed.
+
+  \item \textbf{Where is the confidence head conditioned?} The recursions above
+        assume $\Pc$ is a function of the same node representation as $\Py$. If
+        $\Pc$ is instead conditioned on a narrower or wider context, the
+        identifiability argument is unchanged but the inductive bias differs.
+
+  \item \textbf{Inference.} The threshold on $\Pc$ is an inference-time concern and
+        is best kept out of the trained model, so that operating points can be
+        swept on a fixed checkpoint. Evaluation should be a WER / mean-latency
+        curve rather than a single operating point.
+\end{enumerate}
+
+\end{document}
