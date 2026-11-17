@@ -144,7 +144,16 @@ export RUN_AVERAGING="${RUN_AVERAGING:-0}"
 # MATCHED at step 16000: both p84 arms have this checkpoint and both are at or
 # within 0.0003 of their own best there (n=0 0.0873, n=4 0.0864), so this is a
 # like-for-like comparison rather than peak-vs-drifted.
-export CKPT="${CKPT:-${DFW}/hainanx/results/SpeechlmDFW/dfw_script_p84_mlocal0_8node/dfw_script_p84_mlocal0_8node/checkpoints/step=16000-val_wer=0.0873.ckpt}"
+# MATCHED AT STEP 38000. All three arms in this comparison have a checkpoint
+# at exactly this step, so the numbers differ by MODEL, not by how long each
+# happened to train. RUN_AVERAGING stays 0 for all three, so none of them
+# gets the smoothing advantage of a weight average either.
+#
+# This line was previously a HARDCODED p84 path that EXP_NAME did not
+# override -- forking the launcher and changing only EXP_NAME silently
+# evaluated the p84 checkpoint under another arm's name. Two evals were
+# thrown away to that.
+export CKPT="${CKPT:-${DFW}/hainanx/results/SpeechlmDFW/dfw_script_conf_matched/dfw_script_conf_matched/checkpoints/step=38000-val_wer=0.0865.ckpt}"
 export USE_LAST="${USE_LAST:-0}"
 
 if [[ ! -d "${CACHE_DIR}" ]] || [[ -z "$(ls -A "${CACHE_DIR}" 2>/dev/null)" ]]; then
