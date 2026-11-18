@@ -188,6 +188,29 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
         # inside it, so anything set afterwards does not exist yet and the model
         # dies with AttributeError at construction.
         self.loss_type = str(cfg.get("loss_type", "rnnt"))
+        # Optional multi-chunk training. When set, each TRAINING batch draws one
+        # chunk size and both the encoder look-ahead and the joint's chunking are
+        # set to it together.
+        #
+        # Why the model does this rather than the encoder: ConformerEncoder can
+        # hold a LIST of att_context_sizes and sample one per batch, but it keeps
+        # the choice in a local variable, so RNNTAttJoint cannot discover which
+        # context was used and refuses to run at all:
+        #   ValueError: RNNTAttJoint requires a single [left, right] attention
+        #   context, got [[84, 13], [84, 6]]
+        # Driving both from here keeps a single source of truth and mirrors how
+        # SCRIPT does it (_set_encoder_att_context), which also makes the two
+        # families comparable.
+        cands = cfg.get("chunk_size_candidates", None)
+        self.chunk_size_candidates = [int(c) for c in cands] if cands else None
+        if self.chunk_size_candidates:
+            bad = [c for c in self.chunk_size_candidates if int(self.cfg.encoder.att_context_size[0]) % c]
+            if bad:
+                raise ValueError(
+                    f"att_context_size[0]={self.cfg.encoder.att_context_size[0]} is not divisible by "
+                    f"chunk sizes {bad}; the Conformer requires left %% chunk == 0"
+                )
+
         if self.loss_type not in LOSS_TYPES:
             raise ValueError(f"model.loss_type must be one of {LOSS_TYPES}, got {self.loss_type!r}")
 
@@ -799,6 +822,25 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
         as_t = lambda x: torch.tensor(x, dtype=torch.long, device=device)  # noqa: E731
         return as_t(b_all), as_t(t_all), as_t(u_all), as_t(lab_all), pred_input, pred_lens.to(device)
 
+    def _apply_chunk_size(self, chunk: int) -> None:
+        """Point the encoder look-ahead AND the joint at the same chunk size."""
+        left = int(self.cfg.encoder.att_context_size[0])
+        self.encoder.att_context_size = [left, chunk - 1]
+        self.joint.chunk_size = chunk
+
+    def on_validation_epoch_start(self) -> None:
+        """Validate at ONE fixed chunk so val_wer means the same thing each time.
+
+        Without this, a multi-chunk arm would validate at whatever chunk the last
+        training batch happened to draw, and the curve would be unreadable.
+        The first candidate is the canonical one.
+        """
+        if self.chunk_size_candidates:
+            self._apply_chunk_size(self.chunk_size_candidates[0])
+        parent = getattr(super(), "on_validation_epoch_start", None)
+        if parent is not None:
+            parent()
+
     def _confidence_rnnt_loss(self, encoded, encoded_len, transcript, transcript_len) -> torch.Tensor:
         """Two-head confidence transducer loss over the FULL RNN-T lattice.
 
@@ -1151,6 +1193,9 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
         a WER that appeared for one arm and not the other would make exactly the
         comparison this model exists to support impossible.
         """
+        if self.chunk_size_candidates:
+            self._apply_chunk_size(random.choice(self.chunk_size_candidates))
+
         if self.loss_type == "confidence_rnnt":
             if AccessMixin.is_access_enabled(self.model_guid):
                 AccessMixin.reset_registry(self)

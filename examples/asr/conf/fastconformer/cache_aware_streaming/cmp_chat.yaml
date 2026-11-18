@@ -66,6 +66,11 @@ model:
   #
   # Everything else -- architecture, vocabulary, data, decoding -- is shared, so
   # a difference between the two runs is a difference in the objective alone.
+  # Chunks 14 and 7, drawn per TRAINING batch; validation pins the first (14)
+  # so val_wer means one thing across steps. Encoder att_context_size above is
+  # a SINGLE pair because RNNTAttJoint rejects a list outright -- the model
+  # sets encoder look-ahead and joint chunk together each batch instead.
+  chunk_size_candidates: [14, 7]
   loss_type: banded
 
   forced_alignment:
@@ -261,7 +266,7 @@ model:
     # Written as RIGHT context = chunk - 1. Writing [84,14]/[84,7] instead would
     # mean chunks 15 and 8, and 84 %% 15 and 84 %% 8 are non-zero -> hard
     # ValueError at conformer_encoder.py:959.
-    att_context_size: [[84, 13], [84, 6]]
+    att_context_size: [84, 13]
     att_context_style: chunked_limited
     xscaling: true
     untie_biases: true
