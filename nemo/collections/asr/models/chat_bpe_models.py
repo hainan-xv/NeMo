@@ -203,11 +203,15 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
         # families comparable.
         cands = cfg.get("chunk_size_candidates", None)
         self.chunk_size_candidates = [int(c) for c in cands] if cands else None
+        # Read from the LOCAL cfg and cache: self.cfg does not exist yet at this
+        # point in __init__ (AttributeError: object has no attribute 'cfg'), and
+        # caching also keeps _apply_chunk_size independent of it at runtime.
+        self._att_left = int(cfg.encoder.att_context_size[0]) if self.chunk_size_candidates else None
         if self.chunk_size_candidates:
-            bad = [c for c in self.chunk_size_candidates if int(self.cfg.encoder.att_context_size[0]) % c]
+            bad = [c for c in self.chunk_size_candidates if self._att_left % c]
             if bad:
                 raise ValueError(
-                    f"att_context_size[0]={self.cfg.encoder.att_context_size[0]} is not divisible by "
+                    f"att_context_size[0]={self._att_left} is not divisible by "
                     f"chunk sizes {bad}; the Conformer requires left %% chunk == 0"
                 )
 
@@ -824,8 +828,7 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
 
     def _apply_chunk_size(self, chunk: int) -> None:
         """Point the encoder look-ahead AND the joint at the same chunk size."""
-        left = int(self.cfg.encoder.att_context_size[0])
-        self.encoder.att_context_size = [left, chunk - 1]
+        self.encoder.att_context_size = [self._att_left, chunk - 1]
         self.joint.chunk_size = chunk
 
     def on_validation_epoch_start(self) -> None:
