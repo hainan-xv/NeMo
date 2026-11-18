@@ -1296,8 +1296,12 @@ class EncDecCHATBPEModel(EncDecRNNTBPEModel):
         the normaliser rather than the model. That has been misread as a quality
         difference more than once.
 
-        So this adds ``val_wer_norm`` alongside, computed the way speechlm2 does,
-        and leaves ``val_wer`` untouched -- it is the checkpoint monitor, and every
+        So this REPLACES ``val_wer`` with the normalised number and moves the
+        verbatim one aside to ``val_wer_verbatim``. An earlier version added a
+        separate ``val_wer_norm`` key instead; that name is NO LONGER LOGGED, and
+        pointing ModelCheckpoint at it fails at the first validation with
+        "could not find the monitored key". Computed the way speechlm2 does,
+        and leaving the verbatim number available -- it is the checkpoint monitor, and every
         existing run's save_top_k was selected against its current meaning.
 
         COST: one extra decode of the validation batch. Validation runs every

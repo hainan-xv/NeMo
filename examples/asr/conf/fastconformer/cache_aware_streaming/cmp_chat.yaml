@@ -391,12 +391,14 @@ exp_manager:
   create_tensorboard_logger: false
   create_checkpoint_callback: true
   checkpoint_callback_params:
-    # val_wer_norm, NOT val_wer. CHAT logs val_wer VERBATIM while speechlm2
-    # (every SCRIPT model) logs it Whisper-NORMALISED -- on one manifest that
-    # is ~0.15 vs ~0.087, almost entirely the normaliser rather than the model.
-    # Monitoring the normalised metric makes checkpoint selection AND the wandb
-    # series directly comparable to the SCRIPT arm, which is the whole point.
-    monitor: "val_wer_norm"
+    # val_wer here is ALREADY Whisper-normalised: validation_pass moves the
+    # verbatim number aside to val_wer_verbatim and overwrites val_wer with the
+    # normalised one, so it matches the SCRIPT arm's metric directly.
+    #
+    # The docstring claiming a separate normalised key is added alongside is
+    # STALE -- no such key is logged, and pointing ModelCheckpoint at it dies at
+    # the first validation with "could not find the monitored key".
+    monitor: "val_wer"
     mode: "min"
     save_top_k: 5
     always_save_nemo: false

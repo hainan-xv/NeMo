@@ -367,12 +367,14 @@ exp_manager:
   create_tensorboard_logger: false
   create_checkpoint_callback: true
   checkpoint_callback_params:
-    # val_wer_norm: CHAT logs val_wer VERBATIM, speechlm2 logs it Whisper-
-    # NORMALISED. All three arms of this comparison are monitored and plotted on
-    # the normalised metric so the curves mean the same thing. The normaliser
-    # also folds case and punctuation, which keeps a 1k ASR vocabulary from being
-    # penalised against the 151k arms for formatting it never emits.
-    monitor: "val_wer_norm"
+    # val_wer here is ALREADY Whisper-normalised: validation_pass moves the
+    # verbatim number aside to val_wer_verbatim and overwrites val_wer with the
+    # normalised one, so it matches the SCRIPT arm's metric directly.
+    #
+    # The docstring claiming a separate normalised key is added alongside is
+    # STALE -- no such key is logged, and pointing ModelCheckpoint at it dies at
+    # the first validation with "could not find the monitored key".
+    monitor: "val_wer"
     mode: "min"
     save_top_k: 5
     always_save_nemo: false
