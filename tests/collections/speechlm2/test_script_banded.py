@@ -1087,3 +1087,58 @@ def test_encoder_chunk_size_one_is_strictly_causal():
         left, right = m.perception.encoder.att_context_size
         assert right == 0, f"llm chunk {llm_chunk} leaked look-ahead: right={right}"
         assert left % (right + 1) == 0, "violates the Conformer chunked_limited rule"
+
+
+# ---------------------------------------------------------------------------
+# Nested checkpointing: the group checkpoint must not wrap HF's layer ones
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_group_forward_disables_the_llm_s_own_layer_checkpointing():
+    """``_banded_logprobs_grouped`` wraps each group in ``torch.utils.checkpoint``.
+
+    With ``activation_checkpointing=true`` the LLM also checkpoints every decoder
+    layer, and the two do not compose: the inner frames save a different tensor
+    sequence on the recompute than on the forward, so the outer frame's metadata
+    check kills the step with
+
+        torch.utils.checkpoint: Recomputed values for the following tensors
+        have different metadata than during the forward pass
+
+    Job 22363647 died that way at step 0 on all 12 ranks. Ablated on a real model:
+    the trigger is activation_checkpointing alone -- FAIL at 1 for both fp32 and
+    bf16, PASS at 0 for both -- independent of precision, LoRA and the band.
+
+    The flag has to be cleared INSIDE the checkpointed callable, because
+    ``checkpoint`` re-runs that callable during backward(), long after a context
+    entered around the calling loop has exited. Restoring it afterwards matters
+    just as much: the fused path and the next step still want it on.
+    """
+    from nemo.collections.speechlm2.models.script_model import ScriptSTTModel
+
+    class _Layer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gradient_checkpointing = True
+
+    class _Stub:
+        _llm_layer_checkpointing_disabled = ScriptSTTModel._llm_layer_checkpointing_disabled
+
+        def __init__(self):
+            self.llm = torch.nn.Sequential(_Layer(), _Layer(), _Layer())
+
+    stub = _Stub()
+    layers = [m for m in stub.llm.modules() if hasattr(m, "gradient_checkpointing")]
+    assert layers and all(m.gradient_checkpointing for m in layers)
+
+    with stub._llm_layer_checkpointing_disabled():
+        assert not any(m.gradient_checkpointing for m in layers), "inner checkpointing still on"
+    assert all(m.gradient_checkpointing for m in layers), "flag not restored"
+
+    # Restored even when the body raises -- a failing step must not silently turn
+    # activation checkpointing off for the rest of the run.
+    with pytest.raises(RuntimeError):
+        with stub._llm_layer_checkpointing_disabled():
+            raise RuntimeError("boom")
+    assert all(m.gradient_checkpointing for m in layers), "flag not restored after an exception"

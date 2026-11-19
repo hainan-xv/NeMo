@@ -1097,6 +1097,43 @@ class ScriptSTTModel(StreamingSTTModel):
             tok_parts.append(torch.where(t == IGNORE_INDEX, torch.zeros_like(tk), tk))
         return torch.cat(tok_parts, dim=1), torch.cat(stop_parts, dim=1)
 
+    @contextmanager
+    def _llm_layer_checkpointing_disabled(self):
+        """HF's per-layer gradient checkpointing OFF for the duration.
+
+        WHY: ``_banded_logprobs_grouped`` wraps each group in
+        ``torch.utils.checkpoint``. With ``activation_checkpointing=true`` the LLM
+        ALSO checkpoints every decoder layer, so the group checkpoint nests around
+        28 inner ones -- and the two do not compose. The inner frames save a
+        different tensor sequence on the recompute than on the forward, and the
+        outer frame's metadata check fails the step:
+
+            torch.utils.checkpoint: Recomputed values for the following tensors
+            have different metadata than during the forward pass
+
+        Job 22363647 died this way at step 0 on all 12 ranks. Ablated locally:
+        the trigger is activation_checkpointing alone (PASS at 0 for both fp32
+        and bf16, FAIL at 1 for both) -- not precision, and not the band.
+
+        WHERE IT MUST GO: INSIDE the checkpointed callable. ``checkpoint`` re-runs
+        that callable during backward(), long after a context entered around the
+        calling loop has exited -- so setting it there would leave the forward
+        with inner checkpointing off and the recompute with it on, the identical
+        mismatch with the sign flipped.
+
+        Costs nothing in peak memory: the enclosing group checkpoint already
+        discards the whole group's activations, so the live set is one group
+        either way -- which is precisely what branch_group_tokens bounds.
+        """
+        mods = [m for m in self.llm.modules() if getattr(m, "gradient_checkpointing", False)]
+        for m in mods:
+            m.gradient_checkpointing = False
+        try:
+            yield
+        finally:
+            for m in mods:
+                m.gradient_checkpointing = True
+
     def _forward_branch_group(
         self,
         batch: ScriptBatch,
@@ -1136,7 +1173,12 @@ class ScriptSTTModel(StreamingSTTModel):
             pass
         embeds = self._script_input_embeds(sub)
         impl, mask = self._training_attention(sub, embeds.dtype)
-        with self._attn_implementation(impl), self._per_layer_masks(mask), self._modality_mask_published(sub):
+        with (
+            self._llm_layer_checkpointing_disabled(),
+            self._attn_implementation(impl),
+            self._per_layer_masks(mask),
+            self._modality_mask_published(sub),
+        ):
             out = self._llm_forward(
                 inputs_embeds=embeds,
                 attention_mask=mask,
