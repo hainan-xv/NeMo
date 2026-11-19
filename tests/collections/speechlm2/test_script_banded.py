@@ -445,6 +445,7 @@ def test_branch_targets_are_the_transcript_read_from_the_cut():
 _BANDED_YAMLS = [
     "examples/speechlm2/conf/streaming_stt_granary2_lora_script_banded1.yaml",
     "examples/speechlm2/conf/cmp_script_band.yaml",
+    "examples/speechlm2/conf/cmp_script_bandchunk.yaml",
 ]
 
 

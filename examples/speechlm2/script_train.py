@@ -123,7 +123,9 @@ def _init_from_chat_nemo(model, path: str) -> None:
         if (have_x is None) != (want_x is None) or (
             have_x is not None and want_x is not None and abs(have_x - want_x) > 1e-6
         ):
-            logging.warning("init_chat_from_nemo: pos_enc.xscale %r -> %r to match the donor's encoder", have_x, want_x)
+            logging.warning(
+                "init_chat_from_nemo: pos_enc.xscale %r -> %r to match the donor's encoder", have_x, want_x
+            )
             pos_enc.xscale = want_x
             enc.xscale = want_x
 
@@ -268,7 +270,16 @@ def train(cfg):
     # which candidate cuts exist, the model runs the dynamic program over them. If
     # only one side is banded, the batch and the loss disagree about what a branch
     # even is.
-    for key, default in (("loss_type", "forced"), ("target_construction", "legacy"), ("band_side", "later")):
+    # band_unit rides here too: it decides whether band_words counts WORDS or
+    # CHUNKS, and the two differ by 2.6-7x in candidate cuts at the chunk sizes
+    # in use. The dataset builds the candidates and the model runs the DP over
+    # them, so a silent disagreement is a silently different objective.
+    for key, default in (
+        ("loss_type", "forced"),
+        ("target_construction", "legacy"),
+        ("band_side", "later"),
+        ("band_unit", "word"),
+    ):
         m_val = str(cfg.model.get(key, default) or default).lower()
         d_val = str(dataset_cfg.get(key, default) or default).lower()
         if m_val != d_val:
