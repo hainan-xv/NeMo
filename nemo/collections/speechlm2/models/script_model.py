@@ -1718,9 +1718,35 @@ class ScriptSTTModel(StreamingSTTModel):
         Zeroed gradients are NOT equivalent to skipping: Adam still advances its
         moment estimates and the LR schedule on a zero grad, so a dropped batch
         would quietly decay the model rather than be a no-op.
+
+        THE CLOSURE MUST STILL RUN. Lightning's automatic optimization requires
+        ``optimizer_step`` to execute ``optimizer_closure`` -- it is the closure
+        that runs training_step and backward -- and asserts afterwards that it
+        did. Returning early without calling it kills the run with
+
+            MisconfigurationException: The closure hasn't been executed
+
+        which is how job 22365485 died at step 45: a real backward OOM was caught
+        and dropped correctly on every rank, and then THIS hook turned a
+        recoverable skip into a fatal error. The guard had never actually worked
+        -- cmp_script_band logged zero skips in 78000 steps, so it never fired --
+        so every SCRIPT arm was one unlucky batch from dying.
+
+        Known wart, deliberately left alone: the flag is set DURING the closure
+        (inside backward), so it is read on the FOLLOWING batch. The OOM batch
+        itself therefore still takes one zero-gradient Adam step, and the batch
+        after it is computed and discarded. That is wasteful but harmless, and
+        fixing it means running the closure here instead of delegating to
+        ``super()``, which would take gradient clipping (gradient_clip_val=1.0)
+        out of Lightning's hands on a path every arm shares.
         """
         if getattr(self, "_skip_optimizer_step", False):
             self._skip_optimizer_step = False
+            closure = kwargs.get("optimizer_closure")
+            if closure is None and len(args) > 3:
+                closure = args[3]
+            if closure is not None:
+                closure()
             self.zero_grad(set_to_none=True)
             return
         out = super().optimizer_step(*args, **kwargs)

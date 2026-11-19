@@ -1142,3 +1142,47 @@ def test_group_forward_disables_the_llm_s_own_layer_checkpointing():
         with stub._llm_layer_checkpointing_disabled():
             raise RuntimeError("boom")
     assert all(m.gradient_checkpointing for m in layers), "flag not restored after an exception"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("pass_kwarg", [True, False])
+def test_oom_skip_still_executes_the_optimizer_closure(pass_kwarg):
+    """Skipping the UPDATE must not skip the CLOSURE.
+
+    Lightning's automatic optimization runs training_step and backward inside
+    ``optimizer_closure`` and asserts the hook executed it. Returning early
+    without calling it raises
+
+        MisconfigurationException: The closure hasn't been executed
+
+    and kills the run -- which is how job 22365485 died at step 45, turning a
+    backward OOM that had been caught and dropped correctly on every rank into a
+    fatal error. Covers both call styles, since Lightning passes the closure by
+    keyword and older paths pass it positionally.
+    """
+    from nemo.collections.speechlm2.models.script_model import ScriptSTTModel
+
+    calls = {"closure": 0, "zero_grad": 0, "super": 0}
+
+    class _Stub:
+        optimizer_step = ScriptSTTModel.optimizer_step
+
+        def zero_grad(self, set_to_none=True):
+            calls["zero_grad"] += 1
+
+    # _Stub has no parent hook on purpose: if the skip branch ever delegates to
+    # super() instead of returning, this test fails loudly with AttributeError.
+
+    def closure():
+        calls["closure"] += 1
+
+    stub = _Stub()
+    stub._skip_optimizer_step = True
+    if pass_kwarg:
+        stub.optimizer_step(0, 7, object(), optimizer_closure=closure)
+    else:
+        stub.optimizer_step(0, 7, object(), closure)
+
+    assert calls["closure"] == 1, "the closure was not executed -- Lightning will raise"
+    assert calls["zero_grad"] == 1, "gradients from the discarded closure were not cleared"
+    assert stub._skip_optimizer_step is False, "the skip flag must be consumed exactly once"

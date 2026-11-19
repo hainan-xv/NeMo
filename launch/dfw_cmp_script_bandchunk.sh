@@ -494,7 +494,12 @@ BRANCH_GROUP_SIZE="${BRANCH_GROUP_SIZE:-0}"
 #   MisconfigurationException: The closure hasn't been executed
 # which kills the job rather than skipping the batch. Grouping is the memory
 # bound; with the nesting bug fixed it is also safe.
-BRANCH_GROUP_TOKENS="${BRANCH_GROUP_TOKENS:-2000}"
+# 1000, half the usual 2000. The budget bounds the activation memory of ONE
+# group, and job 22365485 died of a BACKWARD OOM at step 45 at 2000. Halving it
+# halves the backward peak while leaving bucket_batch_size untouched, so the arm
+# runs more, smaller groups rather than seeing less audio per step -- which
+# matters here because this arm is already the most data-starved of the six.
+BRANCH_GROUP_TOKENS="${BRANCH_GROUP_TOKENS:-1000}"
 # Rows of the vocab projection materialised at once. The (B, L, 151936)
 # logits and their float32 copy measured 48-63% of peak; this caps them.
 LOGIT_CHUNK="${LOGIT_CHUNK:-1024}"
