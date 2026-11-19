@@ -440,7 +440,12 @@ def test_branch_targets_are_the_transcript_read_from_the_cut():
 # Config defaults and the shipped recipe
 # ---------------------------------------------------------------------------
 
-_BANDED_YAML = "examples/speechlm2/conf/streaming_stt_granary2_lora_script_banded1.yaml"
+# EVERY shipped banded SCRIPT recipe. The guards below fail on the GRID, after
+# an allocation has been granted, so each new banded arm has to be listed here.
+_BANDED_YAMLS = [
+    "examples/speechlm2/conf/streaming_stt_granary2_lora_script_banded1.yaml",
+    "examples/speechlm2/conf/cmp_script_band.yaml",
+]
 
 
 @pytest.mark.unit
@@ -454,7 +459,8 @@ def test_loss_type_defaults_to_forced_on_both_sides():
 
 
 @pytest.mark.unit
-def test_the_shipped_banded_recipe_satisfies_every_guard():
+@pytest.mark.parametrize("_BANDED_YAML", _BANDED_YAMLS)
+def test_the_shipped_banded_recipe_satisfies_every_guard(_BANDED_YAML):
     """The config the launch script runs must satisfy what the model enforces.
 
     Each of these makes the (chunk, cut) dynamic program invalid rather than
@@ -483,7 +489,8 @@ def test_the_shipped_banded_recipe_satisfies_every_guard():
 
 
 @pytest.mark.unit
-def test_the_shipped_banded_recipe_mirrors_every_paired_key():
+@pytest.mark.parametrize("_BANDED_YAML", _BANDED_YAMLS)
+def test_the_shipped_banded_recipe_mirrors_every_paired_key(_BANDED_YAML):
     """script_train.py refuses a model/dataset mismatch; the recipe must interpolate.
 
     If only one side is banded, the batch and the loss disagree about what a
@@ -762,7 +769,8 @@ def test_band_side_is_validated():
 
 
 @pytest.mark.unit
-def test_shipped_recipe_uses_the_one_sided_band():
+@pytest.mark.parametrize("_BANDED_YAML", _BANDED_YAMLS)
+def test_shipped_recipe_uses_the_one_sided_band(_BANDED_YAML):
     import os
 
     from omegaconf import OmegaConf
