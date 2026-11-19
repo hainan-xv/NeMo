@@ -481,21 +481,20 @@ BRANCH_GROUP_SIZE="${BRANCH_GROUP_SIZE:-0}"
 # Measured locally, 13.7s utterance, Qwen3-1.7B:
 #     chunk 14 band 1:  grouped 1.57s  ->  fused 0.54s   (2.90x)
 #     chunk  2 band 7:  59 groups 9.35s -> ~4 groups 4.41s (1.59x)
-# 8000, NOT the 2000 every other arm uses. _banded_training_step takes the
-# GROUPED path only when _plan_groups returns more than one group; one group
-# falls through to the fused forward. At chunk 14 / C=5.12 the segments total
-# ~1800-2200 packed positions, so a 2000 budget splits them and job 22363647
-# died at step 0 with 12 ranks raising
+# 2000, the same as every other arm. This was briefly set to 8000 to force the
+# FUSED path after job 22363647 died at step 0 inside _banded_logprobs_grouped
+# with
 #   torch.utils.checkpoint: Recomputed values ... different metadata
-# (empty CPU tensors, bf16 saved vs float32 recomputed) inside
-# _banded_logprobs_grouped. That path had never run: cmp_script_band's L~829
-# fits 2000 easily, so every batch of every prior arm took the fused forward.
-# 8000 keeps this arm on that same proven path. The feature stays nominally ON
-# so _disarm_ddp_reducer() is still called on every rank -- turning it off
-# entirely would re-arm DDP's bucket reducer on the banded path.
-# Memory is covered: fused at batch 4 x L~2299 is ~9.2k positions against
-# cmp_script_band's 13 x 829 ~ 10.8k, and logit_chunk still caps the logits.
-BRANCH_GROUP_TOKENS="${BRANCH_GROUP_TOKENS:-8000}"
+# That was the wrong call twice over. The real defect was nested checkpointing --
+# the group checkpoint wrapping HF's 28 per-layer ones -- now fixed in
+# script_model.py (_llm_layer_checkpointing_disabled) and verified exact against
+# the fused loss by scripts/verify_branch_group_equiv.py --backward. And forcing
+# the fused path removed the very mechanism that bounds memory: job 22364442 then
+# OOMed at step 18, and the OOM guard turned that into
+#   MisconfigurationException: The closure hasn't been executed
+# which kills the job rather than skipping the batch. Grouping is the memory
+# bound; with the nesting bug fixed it is also safe.
+BRANCH_GROUP_TOKENS="${BRANCH_GROUP_TOKENS:-2000}"
 # Rows of the vocab projection materialised at once. The (B, L, 151936)
 # logits and their float32 copy measured 48-63% of peak; this caps them.
 LOGIT_CHUNK="${LOGIT_CHUNK:-1024}"
