@@ -85,6 +85,19 @@ fi
 # The 2000 MCV11-dev utterances val_wer is computed on, staged into the
 # leaderboard cache and decoded through the SAME path and normalizer as the
 # 7-dataset run -- so this number is comparable to val_wer AND to the macro.
+# KEEP_HISTORY: give this run its OWN results directory.
+#
+# eval_nemotron.sh builds its path as eval_<ckpt_ts>/<DECODE_LABEL>, and
+# DECODE_LABEL is "chunk<N>_<mode>[_pad<x>]" -- it does NOT mention the dataset.
+# So the leaderboard run and this MCV run of the SAME checkpoint resolve to the
+# SAME directory, and whichever finishes last silently overwrites the other.
+# That is exactly what happened on 2026-11-20: all five CHAT leaderboard results
+# were replaced by their MCV counterparts, and the jobs still reported COMPLETED.
+# (eval_leaderboard.sh, which the SCRIPT arms use, prefixes the dataset into the
+# leaf and so was never affected.) KEEP_HISTORY=1 appends the job id, so the MCV
+# run lands beside the leaderboard result instead of on top of it.
+export KEEP_HISTORY="${KEEP_HISTORY:-1}"
+
 export DATASETS="${DATASETS:-mcv11_dev:dev}"
 
 resolve_launch_dir() {
