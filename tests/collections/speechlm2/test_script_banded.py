@@ -446,6 +446,8 @@ _BANDED_YAMLS = [
     "examples/speechlm2/conf/streaming_stt_granary2_lora_script_banded1.yaml",
     "examples/speechlm2/conf/cmp_script_band.yaml",
     "examples/speechlm2/conf/cmp_script_bandchunk.yaml",
+    "examples/speechlm2/conf/cmp_script_band1k.yaml",
+    "examples/speechlm2/conf/cmp_script_band1k_multi.yaml",
 ]
 
 
@@ -771,7 +773,7 @@ def test_band_side_is_validated():
 
 @pytest.mark.unit
 @pytest.mark.parametrize("_BANDED_YAML", _BANDED_YAMLS)
-def test_shipped_recipe_uses_the_one_sided_band(_BANDED_YAML):
+def test_shipped_recipe_band_side_is_valid_and_mirrored(_BANDED_YAML):
     import os
 
     from omegaconf import OmegaConf
@@ -781,7 +783,18 @@ def test_shipped_recipe_uses_the_one_sided_band(_BANDED_YAML):
     if not os.path.isfile(path):
         pytest.skip(f"{_BANDED_YAML} not present")
     cfg = OmegaConf.load(path)
-    assert cfg.model.band_side == "later"
+    # "later" is the DEFAULT choice and the one most arms make: a word whose
+    # audio ends just after a boundary cannot honestly be emitted before that
+    # audio arrives, and one side costs a third less than two (candidates per
+    # chunk go as B+1 rather than 2B+1).
+    #
+    # "both" is legitimate and deliberate where the band is being used to give
+    # the ALIGNER slack rather than to model emission latency --
+    # cmp_script_band1k_multi asks for N words either side. What must never
+    # differ is the two sides of the mirror: the dataset builds the candidate
+    # cuts and the model runs the DP over them, so a disagreement is a silently
+    # different objective.
+    assert cfg.model.band_side in ("later", "both", "earlier")
     assert cfg.data.dataset.band_side == cfg.model.band_side
 
 

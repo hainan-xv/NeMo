@@ -196,6 +196,8 @@ async def ws_handler(request):
         sess_model, arm = app["model2"], "script"
     elif arm_id == "script3" and app.get("model3") is not None:
         sess_model, arm = app["model3"], "script"
+    elif arm_id == "script4" and app.get("model4") is not None:
+        sess_model, arm = app["model4"], "script"
     elif arm_id == "interleaved2" and app.get("alt2") is not None:
         sess_alt, arm = app["alt2"], "interleaved"
     elif arm_id in ("unified_stream", "unified_offline") and app.get("unified") is not None:
@@ -332,6 +334,18 @@ def main():
     ap.add_argument("--ckpt3_label", default="SCRIPT (third)")
     ap.add_argument("--ckpt3_chunk", type=int, default=14)
     ap.add_argument("--ckpt3_delay", type=int, default=0)
+    ap.add_argument("--ckpt4", default="", help="optional FOURTH SCRIPT arm")
+    ap.add_argument("--ckpt4_label", default="SCRIPT (fourth)")
+    ap.add_argument("--ckpt4_chunk", type=int, default=14)
+    ap.add_argument("--ckpt4_delay", type=int, default=3)
+    # A vocabulary-transplant arm (model.text_vocab_from_asr) rebuilds its
+    # embedding at LOAD time by reading the SentencePiece model out of the ASR
+    # .nemo named in its config. That config records the path it trained under,
+    # which does not exist here -- and load_model's _hubify repair turns a
+    # missing path into a HUB ID, which extract_spm_from_nemo cannot open. So
+    # this arm needs a real local .nemo file, not a repaired path.
+    ap.add_argument("--ckpt4_pretrained_asr", default="",
+                    help="local ASR .nemo for a text_vocab_from_asr checkpoint")
     # The UNIFIED model: ONE checkpoint trained on chunk_size [14, 1024] that is
     # exposed as TWO arms. Both resolve to the same model object, so switching
     # between them in the page changes only the chunk size -- the weights are
@@ -389,6 +403,14 @@ def main():
                             prompt_control=True)
         model3.eval()
         print(f"  third SCRIPT ready (trained chunks {list(model3.core_cfg.chunk_size)})", flush=True)
+    model4 = None
+    if args.ckpt4:
+        print("loading fourth SCRIPT arm ...", flush=True)
+        model4 = load_model(args.ckpt4, args.model_class, torch.device(args.device), torch.bfloat16,
+                            prompt_control=True, pretrained_asr=args.ckpt4_pretrained_asr)
+        model4.eval()
+        print(f"  fourth SCRIPT ready (trained chunks {list(model4.core_cfg.chunk_size)}, "
+              f"vocab {len(model4.tokenizer)})", flush=True)
     unified = None
     if args.unified_ckpt:
         print("loading unified SCRIPT arm ...", flush=True)
@@ -416,6 +438,7 @@ def main():
     app["model"], app["args"], app["prompt"], app["alt"] = model, args, prompt, alt
     app["nemotron"] = nemotron
     app["model2"], app["alt2"], app["model3"] = model2, alt2, model3
+    app["model4"] = model4
     app["unified"] = unified
     # Arms whose checkpoint knows ONE chunk size. The handler forces fast==slow
     # for these so the server takes the single-front path -- the two-front one
@@ -425,6 +448,8 @@ def main():
         app["fixed"]["script2"] = {"chunk": args.ckpt2_chunk, "delay": args.ckpt2_delay}
     if model3 is not None:
         app["fixed"]["script3"] = {"chunk": args.ckpt3_chunk, "delay": args.ckpt3_delay}
+    if model4 is not None:
+        app["fixed"]["script4"] = {"chunk": args.ckpt4_chunk, "delay": args.ckpt4_delay}
     if alt2 is not None:
         app["fixed"]["interleaved2"] = {"chunk": args.interleaved_ckpt2_chunk, "delay": 0}
     if unified is not None:
@@ -467,6 +492,10 @@ def main():
     if model3 is not None:
         arms.append({"id": "script3", "label": args.ckpt3_label, "kind": "script", "fixed": True,
                      "chunks": [int(c) for c in model3.core_cfg.chunk_size],
+                     "delays": list(range(args.max_delay + 1))})
+    if model4 is not None:
+        arms.append({"id": "script4", "label": args.ckpt4_label, "kind": "script", "fixed": True,
+                     "chunks": [int(c) for c in model4.core_cfg.chunk_size],
                      "delays": list(range(args.max_delay + 1))})
     if alt is not None:
         arms.append({"id": "interleaved", "label": args.interleaved_label, "kind": "interleaved",
