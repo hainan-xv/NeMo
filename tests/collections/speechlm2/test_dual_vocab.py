@@ -128,3 +128,35 @@ def test_split_rejects_a_band_list_of_the_wrong_length():
     base = OmegaConf.create({"chunk_size": [2, 7, 14], "band_words_by_chunk": [3, 1]})
     with pytest.raises(ValueError, match="entries but chunk_size"):
         _split_dataset_cfg(base, [2], [2, 7, 14])
+
+
+# ---------------------------------------------------------------------------
+# Entry-point structure
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_hydra_runner_decorates_train_in_script_train():
+    """``@hydra_runner`` must stay bound to ``train``, nothing else.
+
+    Inserting a helper between the decorator and ``def train`` silently rebinds
+    the decorator to the helper. Nothing fails at import -- the file parses, the
+    tests import fine -- and the only symptom is on the grid, where Hydra never
+    supplies ``cfg`` and every rank dies with
+
+        TypeError: train() missing 1 required positional argument: 'cfg'
+
+    That is exactly how job 22663174 failed at step 0. Parsed with ast rather
+    than imported, because importing script_train pulls in NeMo's distributed
+    setup and needs LOCAL_RANK.
+    """
+    import ast
+    import os
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(here, "..", "..", "..", "examples", "speechlm2", "script_train.py")
+    if not os.path.isfile(path):
+        pytest.skip("script_train.py not present")
+    tree = ast.parse(open(path).read())
+    decorated = [n.name for n in tree.body if isinstance(n, ast.FunctionDef) and n.decorator_list]
+    assert decorated == ["train"], f"@hydra_runner must decorate train alone, found {decorated}"

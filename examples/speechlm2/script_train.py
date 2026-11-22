@@ -218,7 +218,6 @@ def _init_from_ckpt(model, path: str) -> None:
         logging.warning("init_from_ckpt: shape mismatch, left at init: %s", line)
 
 
-@hydra_runner(config_path="conf", config_name="streaming_stt_granary2_lora_script")
 def _val_tokenizer(cfg, model, val_cfg):
     """The tokenizer matching the chunk size validation decodes at.
 
@@ -237,6 +236,7 @@ def _val_tokenizer(cfg, model, val_cfg):
     return model._vocab_bundles[name].tokenizer
 
 
+@hydra_runner(config_path="conf", config_name="streaming_stt_granary2_lora_script")
 def train(cfg):
     OmegaConf.resolve(cfg)
     torch.distributed.init_process_group(backend="nccl")
