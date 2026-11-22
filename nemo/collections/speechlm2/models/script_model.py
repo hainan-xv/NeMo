@@ -267,6 +267,16 @@ class ScriptSTTModelConfig(StreamingSTTModelConfig):
     # simply does not fit, and limping on would train on a quietly easier
     # distribution -- the batches that OOM are the long-audio, small-chunk ones.
     oom_skip_limit: int = 25
+    # DUAL VOCABULARY. When true, the model carries TWO text vocabularies on one
+    # LLM body: the ASR encoder's 1024-piece SentencePiece model for the chunk
+    # sizes in small_vocab_chunks, and the LLM's own for the rest. Selected per
+    # BATCH -- the chunk size is drawn per batch, so a batch is never mixed.
+    # Mutually exclusive with text_vocab_from_asr, which replaces the only table.
+    dual_vocab: bool = False
+    # Which chunk sizes use the SMALL vocabulary. Must be a non-empty proper
+    # subset of chunk_size: if it covered every chunk the large table would
+    # never receive a gradient.
+    small_vocab_chunks: Optional[List[int]] = None
     val_position_scheme: str = "continuous"
     val_chunk_size: Optional[int] = None
     # SECOND validation operating point, decoded in the same pass and logged as
@@ -510,6 +520,21 @@ class ScriptSTTModel(StreamingSTTModel):
         self._eot_id = hf_tok.eos_token_id
         if self._eot_id is None:
             raise ValueError("Tokenizer has no eos_token_id; it is required as the branch end-of-turn token.")
+
+        # --- DUAL VOCABULARY -------------------------------------------------
+        # Built AFTER the single-vocab ids above, so the large bundle can simply
+        # adopt what was already resolved and the two code paths cannot drift.
+        self._dual_vocab = bool(getattr(self.core_cfg, "dual_vocab", False))
+        self._vocab_bundles = {}
+        self._small_vocab_chunks = set()
+        if self._dual_vocab:
+            if bool(getattr(self.core_cfg, "text_vocab_from_asr", False)):
+                raise ValueError(
+                    "dual_vocab and text_vocab_from_asr are mutually exclusive: the latter REPLACES the "
+                    "only embedding table, leaving nothing for the large half of the split."
+                )
+            self._init_dual_vocab()
+        # --------------------------------------------------------------------
 
         # Read/write gate. Resolved here so decode strips exactly the ids the
         # dataset supervised; a mismatch would leave gate tokens in the output.
@@ -1133,6 +1158,91 @@ class ScriptSTTModel(StreamingSTTModel):
         finally:
             for m in mods:
                 m.gradient_checkpointing = True
+
+    def _init_dual_vocab(self) -> None:
+        """Build both vocabulary bundles and register both tables.
+
+        Both stay registered so both keep optimizer state and both are seen by
+        DDP. Only one is pointed at by ``self.embed_tokens`` / ``llm.lm_head``
+        at a time; the other's parameters simply receive no gradient for that
+        batch, which the banded path's manual all-reduce already handles by
+        filling missing grads with zeros.
+        """
+        from nemo.collections.speechlm2.parts.dual_vocab import (
+            VocabBundle,
+            build_asr_vocab_bundle,
+            resolve_special_ids,
+            validate_chunk_split,
+        )
+
+        chunks = (
+            list(self.core_cfg.chunk_size)
+            if isinstance(self.core_cfg.chunk_size, (list, tuple))
+            else [int(self.core_cfg.chunk_size)]
+        )
+        small = list(getattr(self.core_cfg, "small_vocab_chunks", None) or [])
+        large_chunks = validate_chunk_split(chunks, small)
+        self._small_vocab_chunks = {int(c) for c in small}
+
+        ids = resolve_special_ids(
+            self.tokenizer, ScriptSTTDataset.audio_open_token, ScriptSTTDataset.audio_close_token
+        )
+        large = VocabBundle(
+            name="llm",
+            tokenizer=self.tokenizer,
+            embed=self.embed_tokens,
+            head=self._lm_head_module,
+            **ids,
+        )
+        smallb = build_asr_vocab_bundle(
+            self.core_cfg.pretrained_asr,
+            self.tokenizer,
+            self.embed_tokens.weight.data,
+            ScriptSTTDataset.audio_open_token,
+            ScriptSTTDataset.audio_close_token,
+        )
+        self._vocab_bundles = {"llm": large, "asr": smallb}
+        # Registered under their own names so BOTH sets of parameters exist for
+        # the optimizer and for DDP, regardless of which one embed_tokens points
+        # at right now.
+        self._vocab_tables = torch.nn.ModuleDict(
+            {"llm_embed": large.embed, "asr_embed": smallb.embed, "asr_head": smallb.head}
+        )
+        self._active_vocab = "llm"
+        logging.info(
+            "dual-vocab: chunks %s -> small (%d pieces), chunks %s -> large (%d pieces)",
+            sorted(self._small_vocab_chunks),
+            len(smallb),
+            large_chunks,
+            len(large),
+        )
+
+    def _select_vocab_for_chunk(self, chunk_size) -> None:
+        """Point the model at the vocabulary this batch's chunk size uses.
+
+        Re-points the two attributes every read goes through -- embed_tokens
+        (``_embed_tokens``, ``_embed_ref_tensor``) and llm.lm_head
+        (``_lm_head_module``) -- plus the tokenizer and the ids the packed
+        layout is built from. Anything that reads those picks up the change with
+        no further plumbing.
+        """
+        if not self._dual_vocab:
+            return
+        want = "asr" if int(chunk_size) in self._small_vocab_chunks else "llm"
+        if want == getattr(self, "_active_vocab", None):
+            return
+        b = self._vocab_bundles[want]
+        self.embed_tokens = b.embed
+        self.llm.lm_head = b.head
+        self.llm.config.vocab_size = len(b)
+        self.tokenizer = b.tokenizer
+        self._vision_start_id, self._vision_end_id = b.vision_start_id, b.vision_end_id
+        self._eot_id = b.eot_id
+        # text_pad_id is a PROPERTY derived from self.tokenizer, so it follows
+        # the line above on its own -- assigning it raises (no setter), and the
+        # bundle's pad_id is kept only so the dataset side can be checked
+        # against it.
+        self._active_vocab = want
 
     def _forward_branch_group(
         self,
@@ -1823,6 +1933,10 @@ class ScriptSTTModel(StreamingSTTModel):
         # Text grid and encoder grid must move TOGETHER: shifting the branch
         # boundaries without shifting the mask would leave each branch's right
         # context ending at the wrong frame.
+        # Vocabulary and encoder look-ahead are both functions of THIS batch's
+        # chunk size and must move together: the targets in the batch were
+        # tokenized by whichever vocabulary the dataset used for this chunk.
+        self._select_vocab_for_chunk(batch.chunk_size)
         self._set_encoder_att_context(batch.chunk_size, first_chunk_size=getattr(batch, "first_chunk_size", None))
         self._last_chunk_size = batch.chunk_size
 
@@ -2139,6 +2253,7 @@ class ScriptSTTModel(StreamingSTTModel):
         Sub-batched because a single full-batch encode of long, length-sorted
         clips can overflow 32-bit CUDA indexing in the subsampling convolution.
         """
+        self._select_vocab_for_chunk(chunk_size)
         self._set_encoder_att_context(chunk_size)
         B = audios.shape[0]
         frames: List[Optional[Tensor]] = [None] * B

@@ -29,8 +29,10 @@ from lightning.pytorch import Trainer
 from omegaconf import DictConfig, OmegaConf, open_dict
 
 from nemo.collections.speechlm2 import DataModule, ScriptSTTDataset, ScriptSTTModel
+from nemo.collections.speechlm2.data.script_dataset import DualVocabScriptSTTDataset
 from nemo.collections.speechlm2.models.joint_chat_script_model import JointChatScriptModel
 from nemo.collections.speechlm2.models.twostream_model import TwoStreamSTTModel
+from nemo.collections.speechlm2.parts.dual_vocab import split_dataset_cfg
 from nemo.core.config import hydra_runner
 from nemo.utils import logging
 from nemo.utils.exp_manager import exp_manager
@@ -217,6 +219,24 @@ def _init_from_ckpt(model, path: str) -> None:
 
 
 @hydra_runner(config_path="conf", config_name="streaming_stt_granary2_lora_script")
+def _val_tokenizer(cfg, model, val_cfg):
+    """The tokenizer matching the chunk size validation decodes at.
+
+    Validation pins ONE chunk (val_dataset_overrides.chunk_size). Under
+    dual_vocab that chunk determines the vocabulary, and getting it wrong would
+    tokenize the references with a vocabulary the model will not be using --
+    val_wer would measure a tokenization mismatch rather than recognition.
+    """
+    if not bool(cfg.model.get("dual_vocab", False)):
+        return model.tokenizer
+    small = {int(c) for c in (cfg.model.get("small_vocab_chunks", None) or [])}
+    vc = val_cfg.get("chunk_size", None)
+    vc = int(vc[0]) if isinstance(vc, (list, tuple)) else int(vc)
+    name = "asr" if vc in small else "llm"
+    logging.info("dual-vocab val: chunk %d -> %s vocabulary", vc, name)
+    return model._vocab_bundles[name].tokenizer
+
+
 def train(cfg):
     OmegaConf.resolve(cfg)
     torch.distributed.init_process_group(backend="nccl")
@@ -321,9 +341,27 @@ def train(cfg):
             dataset_cls=ScriptSTTDataset,
         )
 
-    dataset = ScriptSTTDataset(cfg=dataset_cfg, tokenizer=model.tokenizer)
+    if bool(cfg.model.get("dual_vocab", False)):
+        _all = [int(c) for c in cfg.model.chunk_size]
+        _small = [int(c) for c in (cfg.model.get("small_vocab_chunks", None) or [])]
+        _large = [c for c in _all if c not in set(_small)]
+        # The model already built and validated both bundles; take the tokenizers
+        # from it rather than rebuilding, so the dataset cannot tokenize with a
+        # vocabulary the model does not have a table for.
+        _tok_small = model._vocab_bundles["asr"].tokenizer
+        _tok_large = model._vocab_bundles["llm"].tokenizer
+        logging.info("dual-vocab data: chunks %s -> small vocab, %s -> large vocab", _small, _large)
+        dataset = DualVocabScriptSTTDataset(
+            ScriptSTTDataset(cfg=split_dataset_cfg(dataset_cfg, _small, _all), tokenizer=_tok_small),
+            ScriptSTTDataset(cfg=split_dataset_cfg(dataset_cfg, _large, _all), tokenizer=_tok_large),
+            seed=int(dataset_cfg.get("chunk_size_seed", 1234) or 1234),
+        )
+    else:
+        dataset = ScriptSTTDataset(cfg=dataset_cfg, tokenizer=model.tokenizer)
     val_dataset = (
-        ScriptSTTDataset(cfg=val_dataset_cfg, tokenizer=model.tokenizer) if val_dataset_cfg is not None else None
+        ScriptSTTDataset(cfg=val_dataset_cfg, tokenizer=_val_tokenizer(cfg, model, val_dataset_cfg))
+        if val_dataset_cfg is not None
+        else None
     )
     datamodule = DataModule(cfg.data, tokenizer=model.tokenizer, dataset=dataset, val_dataset=val_dataset)
 

@@ -875,3 +875,47 @@ class ScriptSTTDataset(StreamingSTTDataset):
             chunk_size=chunk_size,
             first_chunk_size=first_chunk_size,
         )
+
+
+class DualVocabScriptSTTDataset:
+    """Routes each batch to one of two ScriptSTTDatasets, by chunk size.
+
+    WHY A WRAPPER rather than two tokenizers inside ScriptSTTDataset. The
+    dataset derives a dozen things from its tokenizer at construction -- the
+    audio-span delimiter ids, whether a leading space is its own piece (which
+    the band's word-start cuts depend on), the pad id -- and each would have to
+    become a pair, selected at every use. Two fully-built datasets, each already
+    self-consistent, cannot get that pairing wrong.
+
+    The two hold DISJOINT chunk lists, so the chunk a batch reports uniquely
+    determines which vocabulary tokenized it. The model re-derives the
+    vocabulary from ``batch.chunk_size`` alone (ScriptSTTModel._select_vocab_for_chunk),
+    so there is no tag to keep in sync and no way for the two to disagree.
+
+    Routing is weighted by how many chunk sizes each side owns, which reproduces
+    the uniform draw over the full chunk list that a single dataset would make.
+    """
+
+    def __init__(self, small: "ScriptSTTDataset", large: "ScriptSTTDataset", seed: int = 1234):
+        self.small, self.large = small, large
+        n_s = len(small._chunk_size_candidates or [small.cfg.chunk_size])
+        n_l = len(large._chunk_size_candidates or [large.cfg.chunk_size])
+        self._p_small = n_s / float(n_s + n_l)
+        self._rngs: dict = {}
+        self._seed = int(seed)
+        # Mirror the attribute DataModule and script_train read off the dataset.
+        self.tokenizer = large.tokenizer
+        self.cfg = large.cfg
+
+    def _rng(self):
+        import torch as _torch
+
+        info = _torch.utils.data.get_worker_info()
+        wid = info.id if info is not None else 0
+        if wid not in self._rngs:
+            self._rngs[wid] = np.random.default_rng(self._seed + wid)
+        return self._rngs[wid]
+
+    def __getitem__(self, cuts):
+        use_small = self._rng().random() < self._p_small
+        return (self.small if use_small else self.large)[cuts]
