@@ -191,3 +191,39 @@ def split_dataset_cfg(base, keep_chunks: Sequence[int], all_chunks: Sequence[int
             pos = {int(c): i for i, c in enumerate(all_chunks)}
             out.band_words_by_chunk = [bwc[pos[int(c)]] for c in keep_chunks]
     return out
+
+
+CANONICAL_LARGE_KEY = "_vocab_tables.llm_embed.weight"
+ALIAS_KEYS = ("embed_tokens.weight", "llm.lm_head.weight")
+
+
+def canonicalize_saved_aliases(state_dict: Dict[str, Any], llm_weight) -> None:
+    """Force the aliased keys to the LARGE table before a checkpoint is written.
+
+    ``embed_tokens`` and ``llm.lm_head`` are re-pointed per batch, so they would
+    otherwise be saved with whatever shape was active -- 1050 rows after a
+    chunk-2 batch, 151936 after a chunk-14 one. A restart builds the model with
+    the large vocabulary active and dies on the mismatch before step 1. The
+    small table is untouched; it lives under its own key and is the only copy.
+    """
+    for k in ALIAS_KEYS:
+        if k in state_dict:
+            state_dict[k] = llm_weight
+
+
+def repair_loaded_aliases(state_dict: Dict[str, Any]) -> bool:
+    """Rebuild the aliases from the canonical large table when loading.
+
+    Returns True if anything was repaired. This is what makes checkpoints
+    written BEFORE the save hook existed still resumable, rather than the arm
+    having to restart from step 0.
+    """
+    canon = state_dict.get(CANONICAL_LARGE_KEY, None)
+    if canon is None:
+        return False
+    fixed = False
+    for k in ALIAS_KEYS:
+        if k in state_dict and state_dict[k].shape != canon.shape:
+            state_dict[k] = canon
+            fixed = True
+    return fixed

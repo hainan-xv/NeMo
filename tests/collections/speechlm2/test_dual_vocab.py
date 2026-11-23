@@ -160,3 +160,57 @@ def test_hydra_runner_decorates_train_in_script_train():
     tree = ast.parse(open(path).read())
     decorated = [n.name for n in tree.body if isinstance(n, ast.FunctionDef) and n.decorator_list]
     assert decorated == ["train"], f"@hydra_runner must decorate train alone, found {decorated}"
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint aliasing -- the failure that only shows up on RESUME
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_saved_aliases_are_always_the_large_table():
+    """A checkpoint written while the SMALL vocabulary was active must still
+    carry large-shaped aliases, or the next restart dies with a size mismatch
+    before a single step runs -- which is how cmp_script_dualvocab failed on
+    every resume after its first leg."""
+    import torch
+
+    from nemo.collections.speechlm2.parts.dual_vocab import canonicalize_saved_aliases
+
+    big, small = torch.randn(151, 8), torch.randn(10, 8)
+    # a checkpoint saved mid-chunk-2: the aliases carry the SMALL shape
+    ckpt = {
+        "state_dict": {
+            "embed_tokens.weight": small.clone(),
+            "llm.lm_head.weight": small.clone(),
+            "_vocab_tables.llm_embed.weight": big.clone(),
+            "_vocab_tables.asr_embed.weight": small.clone(),
+        }
+    }
+    canonicalize_saved_aliases(ckpt["state_dict"], big)
+    assert ckpt["state_dict"]["embed_tokens.weight"].shape[0] == 151
+    assert ckpt["state_dict"]["llm.lm_head.weight"].shape[0] == 151
+    # the small table must survive untouched -- it is the only copy
+    assert ckpt["state_dict"]["_vocab_tables.asr_embed.weight"].shape[0] == 10
+
+
+@pytest.mark.unit
+def test_loading_repairs_aliases_written_before_the_fix():
+    """Checkpoints already on disk carry whichever shape was active. The load
+    hook must rebuild the aliases from the canonical table so those remain
+    resumable rather than needing the arm restarted from scratch."""
+    import torch
+
+    from nemo.collections.speechlm2.parts.dual_vocab import repair_loaded_aliases
+
+    big, small = torch.randn(151, 8), torch.randn(10, 8)
+    ckpt = {
+        "state_dict": {
+            "embed_tokens.weight": small.clone(),
+            "llm.lm_head.weight": small.clone(),
+            "_vocab_tables.llm_embed.weight": big.clone(),
+        }
+    }
+    assert repair_loaded_aliases(ckpt["state_dict"]) is True
+    assert ckpt["state_dict"]["embed_tokens.weight"].shape[0] == 151
+    assert ckpt["state_dict"]["llm.lm_head.weight"].shape[0] == 151

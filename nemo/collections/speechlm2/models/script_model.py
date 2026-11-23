@@ -1217,6 +1217,34 @@ class ScriptSTTModel(StreamingSTTModel):
             len(large),
         )
 
+    # --- dual vocab: keep the ALIASES canonical in checkpoints -------------
+    #
+    # embed_tokens and llm.lm_head are re-pointed per batch, so they appear in
+    # the state_dict with whatever shape was active when the checkpoint was
+    # written -- chunk 2 saves 1050 rows, chunk 14 saves 151936. A restart
+    # constructs the model with the LARGE vocabulary active and then dies with
+    #   size mismatch for llm.lm_head.weight: copying a param with shape
+    #   [1050, 2048] ... current model is [151936, 2048]
+    # which is how cmp_script_dualvocab failed on every resume after its first
+    # leg. The canonical tables live under _vocab_tables.* and are always
+    # correct; these two hooks make the aliases agree with them in both
+    # directions, so a checkpoint is readable whatever was active at save time.
+
+    def on_save_checkpoint(self, checkpoint) -> None:
+        super().on_save_checkpoint(checkpoint)
+        if getattr(self, "_dual_vocab", False) and checkpoint.get("state_dict", None):
+            from nemo.collections.speechlm2.parts.dual_vocab import canonicalize_saved_aliases
+
+            canonicalize_saved_aliases(checkpoint["state_dict"], self._vocab_bundles["llm"].embed.weight.detach())
+
+    def on_load_checkpoint(self, checkpoint) -> None:
+        if getattr(self, "_dual_vocab", False) and checkpoint.get("state_dict", None):
+            from nemo.collections.speechlm2.parts.dual_vocab import repair_loaded_aliases
+
+            if repair_loaded_aliases(checkpoint["state_dict"]):
+                logging.info("dual-vocab: repaired aliased embed/lm_head keys from the canonical table")
+        super().on_load_checkpoint(checkpoint)
+
     def _select_vocab_for_chunk(self, chunk_size) -> None:
         """Point the model at the vocabulary this batch's chunk size uses.
 
